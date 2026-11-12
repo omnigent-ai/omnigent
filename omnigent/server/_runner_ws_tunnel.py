@@ -52,6 +52,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     WSOpenFrame,
     encode_frame,
 )
+from omnigent.server.runtime_compatibility import RuntimeSupportError
 
 if TYPE_CHECKING:
     from omnigent.runner.routing import RunnerRouter
@@ -86,6 +87,14 @@ class RunnerUnavailableWSError(RuntimeError):
     ``1013`` so the client re-dials with backoff instead of dead-ending on
     the generic ``4500``.
     """
+
+
+class RunnerRuntimeSupportWSError(RuntimeError):
+    """Carry runtime admission failures to terminal clients with an actionable remedy."""
+
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # Match the runner-side WS attach path that
@@ -182,6 +191,11 @@ def make_tunnel_ws_factory(
                 raise WrongReplicaWSError(str(exc)) from exc
             if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
                 raise RunnerUnavailableWSError(str(exc)) from exc
+            if (
+                isinstance(exc, RuntimeSupportError)
+                or exc.code == ErrorCode.RUNNER_CAPABILITY_MISMATCH
+            ):
+                raise RunnerRuntimeSupportWSError(str(exc), exc.code) from exc
             raise RuntimeError(str(exc)) from exc
         if routed is None:
             raise RuntimeError(f"no runner pinned for conversation {conversation_id!r}")

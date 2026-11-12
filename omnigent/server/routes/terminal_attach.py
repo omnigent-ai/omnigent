@@ -84,7 +84,11 @@ from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
 )
-from omnigent.server._runner_ws_tunnel import RunnerUnavailableWSError, WrongReplicaWSError
+from omnigent.server._runner_ws_tunnel import (
+    RunnerRuntimeSupportWSError,
+    RunnerUnavailableWSError,
+    WrongReplicaWSError,
+)
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
@@ -221,6 +225,12 @@ def create_terminal_attach_router(
                 await websocket.close(
                     code=_WS_CLOSE_TRY_AGAIN_LATER,
                     reason="session runner is not connected",
+                )
+                return
+            except RunnerRuntimeSupportWSError as exc:
+                await websocket.close(
+                    code=_WS_CLOSE_INTERNAL_ERROR,
+                    reason=f"{exc.code}: upgrade host/runner or restore the session agent bundle",
                 )
                 return
             except Exception:  # noqa: BLE001
