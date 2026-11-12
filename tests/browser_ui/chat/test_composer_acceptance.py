@@ -133,22 +133,20 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
             }
         ),
     )
-    page.route(
-        f"**/v1/sessions/{session_id}/child_sessions",
-        lambda route: route.fulfill(
-            json={
-                "data": [
-                    {
-                        "id": "acceptance-child",
-                        "busy": True,
-                        "title": "Review changes",
-                        "task_summary": "Review changes",
-                        "tool": "agent",
-                        "labels": {},
-                    }
-                ]
-            }
-        ),
+    chat.contract.json(
+        f"/v1/sessions/{session_id}/child_sessions",
+        {
+            "data": [
+                {
+                    "id": "acceptance-child",
+                    "busy": True,
+                    "title": "Review changes",
+                    "task_summary": "Review changes",
+                    "tool": "agent",
+                    "labels": {},
+                }
+            ]
+        },
     )
     page.emulate_media(color_scheme=theme)
     page.add_init_script(f"localStorage.setItem('web-theme', '{theme}')")
