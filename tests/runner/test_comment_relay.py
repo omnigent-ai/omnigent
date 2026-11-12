@@ -112,6 +112,8 @@ class _StubResourceRegistry:
     def set_session_status_publisher(
         self,
         publisher: Callable[[str, str], None],
+        *,
+        accepts_inferred_status: Callable[[], bool] | None = None,
     ) -> None:
         """
         Accept the session-status publisher installed by the runner app.
@@ -120,8 +122,10 @@ class _StubResourceRegistry:
         callback (unused) to satisfy ``create_runner_app``'s wiring.
 
         :param publisher: Callable ``(session_id, status) -> None``.
+        :param accepts_inferred_status: Unused server capability check.
         :returns: None.
         """
+        del accepts_inferred_status
         self._session_status_publisher = publisher
 
     def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
@@ -147,6 +151,10 @@ class _StubResourceRegistry:
 
     def uses_copy_on_write(self, session_id: str) -> bool:
         """The stub has no sandbox environment."""
+        return False
+
+    def session_has_background_agents(self, session_id: str) -> bool:
+        """No terminal is running, so no background agent outlives a turn."""
         return False
 
     def compute_default_env_root(self, session_id: str, agent_spec: Any) -> str:
@@ -459,6 +467,9 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_get_info",
         "sys_session_rename",
         "sys_session_message",
+        "sys_project_list",
+        "sys_session_update",
+        "sys_project_update",
         "ui_open_file",
         "sys_agent_list",
         "sys_agent_get",
@@ -555,7 +566,8 @@ async def test_native_observer_uses_first_original_and_skips_git_reads(
         }
     )
     read.side_effect = None
-    assert read.await_count == 2
+    # The recovered original adds a read of the patched text for the revert check.
+    assert read.await_count == 3
     assert resolve.call_count == 1
     for path in ("failed.txt", "continued.txt"):
         record = registry.get_changed_file(relay_env.session_id, path)
@@ -613,12 +625,42 @@ async def test_native_observer_uses_first_original_and_skips_git_reads(
         assert app.state.filesystem_registry.get_baseline(path) == original
         record = app.state.filesystem_registry.get_changed_file(relay_env.session_id, path)
         assert record is not None and record["status"] == "modified"
-    assert read.await_count == resolve.call_count == 2
+    assert resolve.call_count == 2
+    assert read.await_count == 4
     for call in read.await_args_list:
         assert call.kwargs == {"max_bytes": 1_048_576, "regular_only": True}
     subprocess.run(["git", "init", str(tmp_path / "repo")], check=True, capture_output=True)
     await patch_file("repo/file.txt", "@@ -1 +1 @@\n-old\n+new\n")
-    assert read.await_count == resolve.call_count == 2
+    assert resolve.call_count == 2
+    assert read.await_count == 4
+
+    for path in ("known.txt", "unknown.txt"):
+        (tmp_path / path).write_text("old\n")
+        await patch_file(path, "@@ -1 +1 @@\n-second\n+old\n")
+    assert registry.get_changed_file(relay_env.session_id, "known.txt") is None
+    record = registry.get_changed_file(relay_env.session_id, "unknown.txt")
+    assert record is not None and record["status"] == "modified"
+
+    edit = {"hook_event_name": "PostToolUse", "tool_name": "Edit", "tool_input": {}}
+    (tmp_path / "edited.txt").write_text("after\n")
+    await observe(
+        {**edit, "tool_response": {"filePath": "edited.txt", "originalFile": "before\n"}}
+    )
+    record = registry.get_changed_file(relay_env.session_id, "edited.txt")
+    assert record is not None and record["status"] == "modified"
+    (tmp_path / "edited.txt").write_text("before\n")
+    await observe({**edit, "tool_response": {"filePath": "edited.txt", "originalFile": "after\n"}})
+    assert registry.get_changed_file(relay_env.session_id, "edited.txt") is None
+
+    # A truncated or base64 read of these files would equal their original.
+    for path, original, content in (
+        ("grown.txt", "x" * 1_048_576, b"x" * 1_048_577),
+        ("binary.txt", "AAE=", b"\0\1"),
+    ):
+        (tmp_path / path).write_bytes(content)
+        await observe({**edit, "tool_response": {"filePath": path, "originalFile": original}})
+        record = registry.get_changed_file(relay_env.session_id, path)
+        assert record is not None and record["status"] == "modified"
 
 
 @pytest.mark.asyncio

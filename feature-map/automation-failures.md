@@ -8,6 +8,8 @@ session, while session-linked failures keep their existing session Inbox entry.
 
 - `card-warning`: latest failed runs show a red warning with “Last run failed”.
 - `paused-warning`: pausing a failed automation preserves its warning.
+- `source-session-missing`: an automation created from a session whose copy is gone fails
+  its run with `source_session_missing` and pauses itself.
 - `inbox-failure`: Inbox All and Unread show the automation name, time and failure reason.
 - `session-deduplication`: a failure linked to a session creates no automation Inbox item,
   even when the session is already read or outside the loaded session pages.

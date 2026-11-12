@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.extensions import ExtensionManifest, ExtensionPluginState
 from omnigent.extensions.assets import ASSET_SCRIPT, ASSET_STYLES, ResolvedBundle
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import AuthProvider, effective_admin
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores.permission_store import PermissionStore
 
@@ -160,7 +160,7 @@ async def _require_admin(
     if user_id is None:
         raise OmnigentError("Authentication required", code=ErrorCode.UNAUTHORIZED)
     is_admin = await asyncio.to_thread(permission_store.is_admin, user_id)
-    if not is_admin:
+    if not effective_admin(is_admin):
         raise OmnigentError(
             "Admin privileges required to inspect extension diagnostics",
             code=ErrorCode.FORBIDDEN,

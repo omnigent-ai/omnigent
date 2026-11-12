@@ -212,6 +212,14 @@ openshell = ["openshell>=0.1.0,<1"]
 # package and imports the official client lazily, so only users of the
 # provider need this extra.
 kubernetes = ["kubernetes>=36,<38"]
+# AWS Lambda MicroVMs launcher (server-managed `sandbox.provider:
+# lambda_microvm`). The launcher module ships in the base package and imports
+# boto3 lazily, so only users of the provider need this extra. Floor is the
+# `lambda-microvms` service-model GA release (botocore 1.43.35 and its matching
+# boto3), NOT the looser bedrock/s3 pin — an older boto3 passes the import
+# probe and then fails at `boto3.client("lambda-microvms")` with
+# UnknownServiceError.
+lambda-microvm = ["boto3>=1.43.35,<2", "botocore>=1.43.35,<2"]
 # Vault Transit backend for the credential store's SecretCipher — the
 # non-AWS alternative to the built-in KMS cipher (selected by
 # OMNIGENT_CREDENTIAL_VAULT_KEY). hvac is imported lazily, like boto3, so
