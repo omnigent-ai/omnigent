@@ -92,6 +92,7 @@ function BlockedBy({ reason, children }: { reason: string | null; children: Reac
 
 export function SharingPage() {
   const info = useServerInfo();
+  const capabilitiesLoading = info === "loading";
   // Plain header/single-user mode: no auth endpoints exist. The nav + route
   // already hide Sharing here; this stays as a fallback for a direct hit.
   const isSingleUser = isSingleUserMode(info);
@@ -106,13 +107,13 @@ export function SharingPage() {
   // Admin probe via the mode-agnostic `/v1/me` identity (works under OIDC
   // too). Skipped in single-user mode where no auth endpoints exist.
   useEffect(() => {
-    if (isSingleUser) return;
+    if (isSingleUser || capabilitiesLoading) return;
     void (async () => {
       const userId = await resolveIdentity();
       if (userId === null) return;
       setMeIsAdmin(getCurrentIsAdmin());
     })();
-  }, [isSingleUser]);
+  }, [isSingleUser, capabilitiesLoading]);
 
   if (!isSingleUser && meIsAdmin === null) {
     return (

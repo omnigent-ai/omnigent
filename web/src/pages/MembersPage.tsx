@@ -53,6 +53,7 @@ import { isSingleUserMode } from "@/lib/capabilities";
 
 export function MembersPage() {
   const info = useServerInfo();
+  const capabilitiesLoading = info === "loading";
   // Password-based management (invite / reset / remove) only exists in
   // accounts mode — OIDC identities are owned by the IdP, so under OIDC
   // this page is a read-only user list (no action column, no modals).
@@ -92,7 +93,7 @@ export function MembersPage() {
   // mode since no auth endpoints exist. isSingleUser is a stable boolean
   // so it is safe as a dep without risking infinite re-renders.
   useEffect(() => {
-    if (isSingleUser) return;
+    if (isSingleUser || capabilitiesLoading) return;
     void (async () => {
       const userId = await resolveIdentity();
       if (userId === null) {
@@ -106,7 +107,7 @@ export function MembersPage() {
       setMeIsAdmin(isAdmin);
       if (isAdmin) await refresh();
     })();
-  }, [refresh, isSingleUser]);
+  }, [refresh, isSingleUser, capabilitiesLoading]);
 
   if (isSingleUser) {
     return (

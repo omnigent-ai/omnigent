@@ -425,6 +425,7 @@ function AddDefaultPolicyDialog({
 
 export function PoliciesPage() {
   const info = useServerInfo();
+  const capabilitiesLoading = info === "loading";
   // Explicit single-user local runtime: no auth endpoints exist, so skip the
   // admin probe. A multi-user header-auth deploy (same accounts_enabled:false
   // / login_url:null shape) is NOT single-user and keeps its admin gate.
@@ -449,13 +450,13 @@ export function PoliciesPage() {
   // too, unlike the accounts-only `/auth/me`). Skipped in single-user mode
   // because no auth endpoints exist and the backend skips admin enforcement.
   useEffect(() => {
-    if (isSingleUser) return;
+    if (isSingleUser || capabilitiesLoading) return;
     void (async () => {
       const userId = await resolveIdentity();
       if (userId === null) return;
       setMeIsAdmin(getCurrentIsAdmin());
     })();
-  }, [isSingleUser]);
+  }, [isSingleUser, capabilitiesLoading]);
 
   if (!isSingleUser && meIsAdmin === null) {
     return (

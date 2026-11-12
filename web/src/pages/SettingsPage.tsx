@@ -1979,8 +1979,7 @@ function AdminViewControl() {
   if (
     !eligible ||
     info === "loading" ||
-    !info.admin_view ||
-    (isAdminViewEnabled() && (info.single_user || isDatabricksWorkspace()))
+    (isAdminViewEnabled() && (!info.admin_view || info.single_user || isDatabricksWorkspace()))
   )
     return null;
   return (
@@ -2766,6 +2765,7 @@ function UpdatesSection() {
 
 function AccountSection() {
   const info = useServerInfo();
+  const capabilitiesLoading = info === "loading";
   const accountsEnabled = info !== "loading" && info.accounts_enabled;
   // Identity for display. Sourced from the mode-agnostic `/v1/me` probe so it
   // works under OIDC too (the accounts-only `/auth/me` doesn't exist there).
@@ -2782,11 +2782,12 @@ function AccountSection() {
   const [pwDone, setPwDone] = useState(false);
 
   useEffect(() => {
+    if (capabilitiesLoading) return;
     void (async () => {
       const userId = await resolveIdentity();
       setMe(userId === null ? null : { id: userId, is_admin: getCurrentIsAdmin() });
     })();
-  }, []);
+  }, [capabilitiesLoading]);
 
   const onSignOut = useCallback(() => signOutOfBrowserSession(accountsEnabled), [accountsEnabled]);
 

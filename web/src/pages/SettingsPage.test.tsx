@@ -395,23 +395,31 @@ describe("SettingsPage", () => {
     expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
   });
 
-  it.each([false, true])("keeps admin view recoverable while off (workspace=%s)", (workspace) => {
-    mocks.me = { id: "admin", is_admin: true };
-    mocks.effectiveAdmin = false;
-    mocks.singleUser = false;
-    vi.spyOn(host, "isDatabricksWorkspace").mockReturnValue(workspace);
-    document.cookie = "omnigent_admin_view=off; Path=/";
-    const update = vi.spyOn(adminView, "setAdminViewEnabled").mockImplementation(() => {});
-    try {
-      renderPage("/settings/general");
-      const control = screen.getByRole("switch", { name: "Admin view" });
-      expect(control).not.toBeChecked();
-      fireEvent.click(control);
-      expect(update).toHaveBeenCalledWith(true);
-    } finally {
-      document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
-    }
-  });
+  it.each([
+    { workspace: false, supported: true },
+    { workspace: true, supported: true },
+    { workspace: false, supported: undefined },
+  ])(
+    "keeps admin view recoverable while off (workspace=$workspace, support=$supported)",
+    ({ workspace, supported }) => {
+      mocks.me = { id: "admin", is_admin: true };
+      mocks.effectiveAdmin = false;
+      mocks.adminViewSupported = supported;
+      mocks.singleUser = false;
+      vi.spyOn(host, "isDatabricksWorkspace").mockReturnValue(workspace);
+      document.cookie = "omnigent_admin_view=off; Path=/";
+      const update = vi.spyOn(adminView, "setAdminViewEnabled").mockImplementation(() => {});
+      try {
+        renderPage("/settings/general");
+        const control = screen.getByRole("switch", { name: "Admin view" });
+        expect(control).not.toBeChecked();
+        fireEvent.click(control);
+        expect(update).toHaveBeenCalledWith(true);
+      } finally {
+        document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
+      }
+    },
+  );
 
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
