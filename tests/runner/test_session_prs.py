@@ -1597,6 +1597,28 @@ def test_an_uncalled_function_body_is_not_a_command_for_pr_attribution() -> None
     assert was_created is False
 
 
+def test_a_function_called_before_its_definition_is_not_run() -> None:
+    refs, was_created = extract_prs(
+        "Bash",
+        {
+            "command": "f; f() { gh pr create --fill; }; "
+            "echo https://github.com/example/one/pull/41"
+        },
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+
+
+def test_repeated_calls_splice_only_a_bounded_number_of_bodies() -> None:
+    # Each call adds three items, so the splice budget stops the expansion before 2000 calls.
+    command = "f() { gh pr create --fill; }; " + "f; " * 2000
+    items = pr_observer._shell_items(command)
+    assert items is not None
+    spliced = sum(1 for item in items if item == ["gh", "pr", "create", "--fill"])
+    assert spliced <= pr_observer._MAX_SPLICED_ITEMS // 3 + 1
+
+
 def test_a_long_operator_free_command_lexes_in_bounded_time() -> None:
     # The lexer rebuilt its prefix per character before, which took about 20 seconds here.
     command = "echo " * 19_999 + "x"
@@ -1904,6 +1926,70 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
             {},
             ["/start"],
             id="uncalled-brace-function-body-runs-nothing",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "f() (cd /other); f; git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="called-subshell-function-keeps-its-boundary",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "f() { cd /w; git push; }; cd /other || f"},
+            "/start",
+            {},
+            [],
+            id="skipped-function-body-runs-nothing",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": 'cd /a || eval "cd /b; git -C /c status"; git status'},
+            "/start",
+            {},
+            ["/a"],
+            id="skipped-eval-body-runs-nothing",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "f() { cd /w; }; f | cat; git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="function-in-a-pipeline-stays-in-its-child",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "f() { cd /w; }; f; git status"},
+            "/start",
+            {},
+            ["/w"],
+            id="called-function-changes-the-current-shell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "case $x in a) cd /a;; git) echo;; esac"},
+            "/start",
+            {},
+            [],
+            id="case-pattern-words-are-not-commands",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(if true; then case $x in a) cd /a;; esac; fi); git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="case-after-then-keeps-the-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(( git = 1 ))"},
+            "/start",
+            {},
+            [],
+            id="arithmetic-command-is-not-a-git-call",
         ),
         pytest.param(
             "Bash",

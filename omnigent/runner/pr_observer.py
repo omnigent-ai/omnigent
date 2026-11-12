@@ -321,7 +321,8 @@ def _shell_steps(
         if nested is None:
             continue
         if tokens[0].rsplit("/", 1)[-1] == "eval":
-            steps.extend(nested)
+            # ``eval`` runs in this shell, as one operand of the surrounding list.
+            steps.extend(["{", *nested, "}"])
         else:
             steps.extend(["(", *nested, ")"])
     if output_eligible:
@@ -332,13 +333,17 @@ def _shell_steps(
     ]
 
 
-# A ``case`` header, with or without its first pattern.
-_CASE_HEADER = re.compile(r"case\s+\S+\s+in\b")
+# A ``case`` header, with or without its first pattern, after any leading keywords.
+_CASE_KEYWORDS = r"(?:(?:if|then|else|elif|do|while|until)\s+)*"
+_CASE_HEADER = re.compile(_CASE_KEYWORDS + r"case\s+\S+\s+in\b")
 # A ``case`` header that ends at a separator, so its patterns follow on later lines.
-_CASE_OPEN = re.compile(r"case\s+\S+\s+in")
+_CASE_OPEN = re.compile(_CASE_KEYWORDS + r"case\s+\S+\s+in")
 # A function name before its ``()``.
 _FUNCTION_NAME = re.compile(r"(?:function\s+)?[A-Za-z_][\w.-]*")
 _EMPTY_PARENS = re.compile(r"\(\s*\)")
+# A call splices in a body of at most this many items, and a command at most this many in all.
+_MAX_CALL_ITEMS = 256
+_MAX_SPLICED_ITEMS = 4096
 
 
 def _shell_items(command: str, depth: int = 0) -> list[list[str] | str] | None:
@@ -346,11 +351,11 @@ def _shell_items(command: str, depth: int = 0) -> list[list[str] | str] | None:
 
     Quotes and backslashes are honored while scanning, so ``"("`` and ``\\(`` stay
     words. The characters of ``>&``, ``<&``, ``&>`` and ``>|`` are not separators.
-    The ``)`` and ``|`` of a ``case`` pattern are words, so the pattern does not
-    open or close a group. A function body (``f() ( … )`` or ``f() { … }``) is
-    skipped, since defining a function runs nothing. Returns None when the command
-    cannot be lexed. A body whose name is called in the same command is spliced in
-    at the call. A function runs in the current shell, so its effects are kept.
+    The words of a ``case`` header or pattern are not commands. ``((…))`` is an
+    arithmetic command, one word. A function body is recorded where it is defined
+    and spliced in only at a later call of its name. A subshell body is wrapped in
+    ``(`` and ``)``, and a brace body or ``eval`` in ``{`` and ``}``, the current
+    shell. Returns None when the command cannot be lexed.
     """
     if depth > MAX_SHELL_NESTING:
         return None
@@ -367,8 +372,17 @@ def _shell_items(command: str, depth: int = 0) -> list[list[str] | str] | None:
 
     def flush() -> None:
         nonlocal chunk
-        items.append(shlex.split("".join(chunk)))
+        words = shlex.split("".join(chunk))
         chunk = []
+        body = definitions.get(words[0]) if words else None
+        if (
+            body is not None
+            and len(body) <= _MAX_CALL_ITEMS
+            and len(items) + len(body) <= _MAX_SPLICED_ITEMS
+        ):
+            items.extend(body)
+        else:
+            items.append(words)
 
     try:
         while index < len(command):
@@ -395,17 +409,24 @@ def _shell_items(command: str, depth: int = 0) -> list[list[str] | str] | None:
                     raise ValueError("unterminated array literal")
                 chunk.append(command[index:end])
                 index = end
+            elif command.startswith("((", index) and not chunk:
+                # An arithmetic command is one word; its parentheses are not a subshell.
+                end = _balanced_end(command, index)
+                if end is None:
+                    raise ValueError("unterminated arithmetic command")
+                chunk.append(command[index:end])
+                index = end
             elif (
                 char == "("
                 and _EMPTY_PARENS.match(command, index)
                 and _FUNCTION_NAME.fullmatch("".join(chunk).strip())
             ):
-                # ``name()`` followed by a body: the body runs only where ``name`` is called.
+                # ``name()`` and its body: recorded here, run only where ``name`` is called.
                 name = "".join(chunk).split()[-1]
-                chunk.append("()")
                 parens = _EMPTY_PARENS.match(command, index)
                 if parens is None:
                     raise ValueError("unreachable: checked by the branch condition")
+                chunk.append("()")
                 index = parens.end()
                 body = index
                 while body < len(command) and command[body] in " \t\r\n":
@@ -417,7 +438,8 @@ def _shell_items(command: str, depth: int = 0) -> list[list[str] | str] | None:
                     nested = _shell_items(command[body + 1 : end - 1], depth + 1)
                     if nested is None:
                         raise ValueError("unsupported function body")
-                    definitions[name] = nested
+                    wrapper = ("(", ")") if command[body] == "(" else ("{", "}")
+                    definitions[name] = [wrapper[0], *nested, wrapper[1]]
                     index = end
             else:
                 operator = next(
@@ -452,24 +474,26 @@ def _shell_items(command: str, depth: int = 0) -> list[list[str] | str] | None:
                 at_case_level = bool(case_depths) and paren_depth == case_depths[-1]
                 if operator == ")" and _CASE_HEADER.match(text.lstrip()):
                     # The first pattern of a case statement, on the same line as its header.
-                    flush()
+                    chunk = []
                     items.append(";")
                     case_depths.append(paren_depth)
                     pattern_expected = False
                     index += 1
                     continue
                 if operator == ")" and at_case_level and pattern_expected:
-                    flush()
+                    chunk = []
                     items.append(";")
                     pattern_expected = False
                     index += 1
                     continue
                 if _CASE_OPEN.fullmatch(text.strip()):
                     # A header ended by a separator: its patterns come next.
+                    chunk = []
                     case_depths.append(paren_depth)
                     pattern_expected = True
                     at_case_level = True
-                flush()
+                else:
+                    flush()
                 items.append(";" if operator == "\n" else operator)
                 if operator == "(":
                     paren_depth += 1
@@ -481,25 +505,7 @@ def _shell_items(command: str, depth: int = 0) -> list[list[str] | str] | None:
         flush()
     except ValueError:
         return None
-    return _splice_function_calls(items, definitions, depth)
-
-
-def _splice_function_calls(
-    items: list[list[str] | str], definitions: dict[str, list[list[str] | str]], depth: int
-) -> list[list[str] | str]:
-    """Replace each call of a defined function with that function's body."""
-    spliced: list[list[str] | str] = []
-    for item in items:
-        if (
-            isinstance(item, list)
-            and item
-            and item[0] in definitions
-            and depth < MAX_SHELL_NESTING
-        ):
-            spliced.extend(_splice_function_calls(definitions[item[0]], definitions, depth + 1))
-        else:
-            spliced.append(item)
-    return spliced
+    return items
 
 
 def _balanced_end(command: str, start: int) -> int | None:
@@ -816,7 +822,7 @@ class _CheckoutWalker:
         while self._position < len(self._steps):
             ok, fail = self._list(directories)
             directories = _merge_directories(ok, fail)
-            if self._peek_operator() == ")":  # A closer with no opener, e.g. from a case pattern.
+            if self._peek_operator() in {")", "}"}:  # A closer with no opener.
                 self._position += 1
 
     def _peek(self) -> ShellSegment | str | None:
@@ -873,6 +879,13 @@ class _CheckoutWalker:
             if self._peek_operator() == ")":
                 self._position += 1
             return directories, directories
+        if step == "{":
+            # A brace group runs in the current shell, so its directory changes carry out.
+            self._position += 1
+            outcome = self._list(directories)
+            if self._peek_operator() == "}":
+                self._position += 1
+            return outcome
         if isinstance(step, ShellSegment):
             self._position += 1
             return self._simple(directories, step)
