@@ -49,18 +49,22 @@ export function WorkflowDialog({
   blockedReason = null,
   savedWorkflow = null,
 }: WorkflowDialogProps) {
+  // A described workflow starts with the review checked; a saved one runs without it.
+  const reviewByDefault = savedWorkflow === null;
   const [description, setDescription] = useState(initialDescription);
-  const [reviewPlanFirst, setReviewPlanFirst] = useState(true);
+  const [reviewPlanFirst, setReviewPlanFirst] = useState(reviewByDefault);
   const descriptionId = useId();
   const reviewId = useId();
   const initialDescriptionRef = useRef(initialDescription);
   initialDescriptionRef.current = initialDescription;
+  const reviewByDefaultRef = useRef(reviewByDefault);
+  reviewByDefaultRef.current = reviewByDefault;
 
-  // Each opening starts from the caller's description, with the review checked.
+  // Each opening starts from the caller's description and the default review.
   useEffect(() => {
     if (!open) return;
     setDescription(initialDescriptionRef.current);
-    setReviewPlanFirst(true);
+    setReviewPlanFirst(reviewByDefaultRef.current);
   }, [open]);
 
   // A saved workflow runs without details: the agent asks for any it needs.

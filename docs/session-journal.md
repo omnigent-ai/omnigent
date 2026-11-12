@@ -126,6 +126,8 @@ Once you have saved workflows, **Run a workflow** lists them, with a search
 field and **New workflow** below them. Pick one, add this run's
 details, and choose **Run workflow**: the agent loads the saved workflow with
 `sys_workflow_load` and uses its steps as the plan, filling in the details.
+For a saved workflow, **Review the plan before work starts** is off by
+default; check it to approve the plan first.
 The saved steps are a starting point, so the agent can still replan. You can
 also ask for a saved workflow by name in chat ("run my flaky-test triage
 workflow").
