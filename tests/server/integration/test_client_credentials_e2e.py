@@ -373,7 +373,8 @@ async def test_mixed_case_machine_principal_is_shared_and_leaves_by_its_exact_id
 ) -> None:
     """A login user shares with the case-sensitive machine subject, which can read and leave.
 
-    The lowercase spelling is a separate human identity that the machine cannot remove.
+    The lowercase spelling is a separate human identity that the machine cannot remove, even
+    after the configured subject changes while its token stays valid.
     """
     from omnigent.db.utils import clear_engine_cache
 
@@ -408,6 +409,8 @@ async def test_mixed_case_machine_principal_is_shared_and_leaves_by_its_exact_id
             f"{session_url}/permissions/{human_id}", headers=machine_auth
         )
         assert cross_leave.status_code == 403, cross_leave.text
+        monkeypatch.setenv("OMNIGENT_MACHINE_SUB", "OtherBot@Example.com")
+        assert (await client.get(session_url, headers=machine_auth)).status_code == 200
         left = await client.delete(
             f"{session_url}/permissions/{machine_sub}", headers=machine_auth
         )

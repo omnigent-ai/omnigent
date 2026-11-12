@@ -631,7 +631,10 @@ async def test_mixed_case_revoke_and_leave_remove_the_login_identity_grant(
     client: httpx.AsyncClient,
     tmp_path: Path,
 ) -> None:
-    """Revoking or leaving by another casing removes the canonical grant, never an owner's."""
+    """Revoking by another casing removes the canonical grant; leaving removes only the caller's.
+
+    Neither removes an owner's grant.
+    """
     admin_headers = _cookie_header(await _login(client, _ADMIN_USERNAME, _ADMIN_PASSWORD))
     alice_headers = await _register_user(
         client, admin_headers, "alice@example.com", "alice-pw-123456"
@@ -655,11 +658,17 @@ async def test_mixed_case_revoke_and_leave_remove_the_login_identity_grant(
         f"/v1/sessions/{session_id}/permissions", json=grant, headers=admin_headers
     )
     assert grant_resp.status_code == 200, grant_resp.text
+    permission_store = SqlAlchemyPermissionStore(f"sqlite:///{tmp_path}/test.db")
+    permission_store.ensure_user("ALICE@EXAMPLE.COM")
+    permission_store.grant("ALICE@EXAMPLE.COM", session_id, LEVEL_READ)
     leave_resp = await client.delete(
         f"/v1/sessions/{session_id}/permissions/ALICE@EXAMPLE.COM", headers=alice_headers
     )
     assert leave_resp.status_code == 204, leave_resp.text
-    assert await _grantees(client, session_id, admin_headers) == {_ADMIN_USERNAME: 4}
+    assert await _grantees(client, session_id, admin_headers) == {
+        _ADMIN_USERNAME: 4,
+        "ALICE@EXAMPLE.COM": LEVEL_READ,
+    }
 
     grant_resp = await client.put(
         f"/v1/sessions/{session_id}/permissions",
@@ -667,7 +676,6 @@ async def test_mixed_case_revoke_and_leave_remove_the_login_identity_grant(
         headers=admin_headers,
     )
     assert grant_resp.status_code == 200, grant_resp.text
-    permission_store = SqlAlchemyPermissionStore(f"sqlite:///{tmp_path}/test.db")
     permission_store.ensure_user("Admin")
     permission_store.grant("Admin", session_id, LEVEL_READ)
     owner_alias_resp = await client.delete(
@@ -677,6 +685,7 @@ async def test_mixed_case_revoke_and_leave_remove_the_login_identity_grant(
     assert await _grantees(client, session_id, admin_headers) == {
         _ADMIN_USERNAME: 4,
         "Admin": LEVEL_READ,
+        "ALICE@EXAMPLE.COM": LEVEL_READ,
         "alice@example.com": LEVEL_MANAGE,
     }
 
@@ -704,3 +713,18 @@ async def test_revoke_by_typed_id_removes_both_spellings_idempotently(
         )
         assert revoke_resp.status_code == 204, revoke_resp.text
         assert await _grantees(client, session_id, admin_headers) == {_ADMIN_USERNAME: 4}
+
+
+async def test_mixed_case_public_alias_keeps_the_public_level_ceiling(
+    client: httpx.AsyncClient,
+) -> None:
+    """``__PUBLIC__`` resolves to the public grantee, so public sharing stays capped at read."""
+    admin_headers = _cookie_header(await _login(client, _ADMIN_USERNAME, _ADMIN_PASSWORD))
+    session_id = await _create_session(client, admin_headers)
+    grant_resp = await client.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={"user_id": "__PUBLIC__", "level": LEVEL_MANAGE},
+        headers=admin_headers,
+    )
+    assert grant_resp.status_code == 400, grant_resp.text
+    assert await _grantees(client, session_id, admin_headers) == {_ADMIN_USERNAME: 4}

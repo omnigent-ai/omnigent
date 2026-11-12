@@ -245,9 +245,13 @@ def register_permissions_routes(
         # exists and is visible to the caller without leaking others' via
         # 403/404.
         canonical_target = _canonical_user_id(auth_provider, target_user_id)
-        # A grant stored before canonicalization keeps the typed ID, so both spellings go.
+        # A manager revoke also removes a grant stored under the typed ID before
+        # canonicalization. Leaving removes only the caller's grant, since the other
+        # spelling may be a distinct principal such as an earlier machine subject.
         target_ids = list(dict.fromkeys((target_user_id, canonical_target)))
         leaving_self = user_id in target_ids
+        if leaving_self:
+            target_ids = [target for target in target_ids if target == user_id]
         await _require_access(
             user_id,
             session_id,
@@ -293,7 +297,7 @@ def register_permissions_routes(
         # The leaver's own tab drops the row via the client mutation's success
         # handler; their other tabs converge on the next watch-set diff, which
         # reports the now-inaccessible id as removed. No extra push needed.
-        add_audit_attrs(target_user_id=canonical_target, left_self=leaving_self)
+        add_audit_attrs(target_user_id=target_ids[-1], left_self=leaving_self)
         return Response(status_code=204)
 
     @router.get(
