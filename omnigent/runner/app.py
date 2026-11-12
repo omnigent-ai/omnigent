@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -1626,11 +1627,12 @@ def create_runner_app(
     def _native_pane_shows_live_work(
         terminals: Any, session_id: str, terminal_name: str, *, include_pane_activity: bool = True
     ) -> bool:
-        """Whether a native pane shows the live work the pane reaper spares it for.
+        """Whether a native pane shows live agent work the status edge can miss.
 
-        A pane parked on a permission prompt is quiet and can read ``idle``, and a
-        pane still redrawing output can too, so the status edge alone misses them.
-        Reads the same in-memory signals the reaper uses, not its tmux calls.
+        A pane still redrawing output can read ``idle``, so the status edge alone
+        misses it. Reads the same in-memory signals the reaper uses, not its
+        tmux calls. A permission hook parked on a verdict is a human wait, which
+        ``_human_wait_holds`` bounds instead.
 
         :param terminals: Terminal registry holding the pane instance.
         :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
@@ -1638,15 +1640,12 @@ def create_runner_app(
         :param include_pane_activity: Whether recent pane input or output counts.
             Viewing a pane (attach, resize, a redraw) produces both, so callers
             asking about agent work rather than pane liveness pass ``False``.
-        :returns: ``True`` when a permission hook is parked, a background agent
-            outlives the settled turn, or, with *include_pane_activity*, the
-            pane shows recent input or output.
+        :returns: ``True`` when a background agent outlives the settled turn,
+            or, with *include_pane_activity*, the pane shows recent input or
+            output.
         """
-        from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
 
-        if approval_wait_is_fresh(session_id):
-            return True
         if resource_registry.session_has_background_agents(session_id):
             return True
         if not include_pane_activity:
@@ -1665,18 +1664,13 @@ def create_runner_app(
     _sessions_with_background_shell: set[str] = set()
 
     _human_wait_hold_s = _resolve_human_wait_hold_s()
-    # Dialog each native turn is parked on, from its latest ``running`` edge's
-    # ``blocked_on`` reason, e.g. ``"permission prompt"``.
+    # Dialog each native turn is parked on: its latest ``running`` edge's ``blocked_on``.
     _native_dialog_waits: dict[str, str] = {}
-    # Monotonic time the idle watchdog first saw each human-wait episode: a
-    # prompt waiter, keyed by its task so a replacement waiter starts fresh, or
-    # a dialog, which the next status edge ends. Ending episodes on state
-    # changes rather than on watchdog polls keeps a new wait from inheriting an
-    # expired timer: the watchdog skips them while a turn runs or the session
-    # is inside its idle window.
+    # Start and logged expiry of each human-wait episode (see ``_human_wait_holds``).
     _human_wait_since: dict[tuple[str, object], float] = {}
-    # Expired episodes already logged, so each expiry is logged once.
     _human_wait_expired: set[tuple[str, object]] = set()
+    # The parent-death thread checks for active work too.
+    _human_wait_lock = threading.Lock()
 
     def _record_native_pane_status(
         session_id: str, status: str, blocked_on: object = None
@@ -1700,17 +1694,27 @@ def create_runner_app(
         _forget_dialog_wait(session_id)
 
     def _forget_dialog_wait(session_id: str) -> None:
-        if _native_dialog_waits.pop(session_id, None) is not None:
+        if _native_dialog_waits.pop(session_id, None) is None:
+            return
+        with _human_wait_lock:
             _human_wait_since.pop((session_id, "dialog"), None)
             _human_wait_expired.discard((session_id, "dialog"))
 
-    def _human_wait_holds(session_ids: set[str]) -> bool:
+    def _human_wait_holds(session_ids: set[str], approval_waits: dict[str, list[str]]) -> bool:
         """Whether a session parked on a human still holds the idle watchdog open.
 
-        A native dialog nobody answers (a turn parked on it, or a queued-message
-        prompt waiter behind it) is not agent work, so it holds the runner for
-        at most ``_human_wait_hold_s`` from when the watchdog first sees that
-        wait. ``0`` keeps the old unbounded hold.
+        A native dialog nobody answers is not agent work: a turn parked on it, a
+        permission hook parked on its verdict, or a queued-message prompt
+        waiter behind it. Each such wait holds the runner for at most
+        ``_human_wait_hold_s`` from the first active-work check that sees it;
+        ``0`` keeps the old unbounded hold. A wait ends where its state
+        changes, not on a later check, since nothing checks while a turn runs:
+        the next status edge ends a dialog, and a waiter task or hook marker
+        identifies its own wait, so a new one starts fresh.
+
+        :param session_ids: Sessions the runner currently tracks.
+        :param approval_waits: Fresh permission-hook marker names per session.
+        :returns: ``True`` while any human wait is inside its hold.
         """
         episodes: set[tuple[str, object]] = set(_claude_prompt_waiters.items())
         episodes.update(
@@ -1718,24 +1722,32 @@ def create_runner_app(
             for session_id in session_ids
             if _native_awaiting_human(session_id)
         )
-        for episode in _human_wait_since.keys() - episodes:
-            del _human_wait_since[episode]
-        _human_wait_expired.intersection_update(episodes)
-        now = time.monotonic()
+        episodes.update(
+            (session_id, marker)
+            for session_id, markers in approval_waits.items()
+            for marker in markers
+        )
+        newly_expired: list[tuple[tuple[str, object], float]] = []
         held = False
-        for episode in episodes:
-            waited_s = now - _human_wait_since.setdefault(episode, now)
-            if _human_wait_hold_s <= 0 or waited_s < _human_wait_hold_s:
-                held = True
-            elif episode not in _human_wait_expired:
-                _human_wait_expired.add(episode)
-                _logger.info(
-                    "session %s has waited on a human for %.0fs; no longer holding the "
-                    "runner open",
-                    episode[0],
-                    waited_s,
-                    extra={"session_id": episode[0]},
-                )
+        with _human_wait_lock:
+            for episode in _human_wait_since.keys() - episodes:
+                _human_wait_since.pop(episode, None)
+            _human_wait_expired.intersection_update(episodes)
+            now = time.monotonic()
+            for episode in episodes:
+                waited_s = now - _human_wait_since.setdefault(episode, now)
+                if _human_wait_hold_s <= 0 or waited_s < _human_wait_hold_s:
+                    held = True
+                elif episode not in _human_wait_expired:
+                    _human_wait_expired.add(episode)
+                    newly_expired.append((episode, waited_s))
+        for (session_id, _), waited_s in newly_expired:
+            _logger.info(
+                "session %s has waited on a human for %.0fs; no longer holding the runner open",
+                session_id,
+                waited_s,
+                extra={"session_id": session_id},
+            )
         return held
 
     def _has_active_work(*, include_pane_activity: bool = True) -> bool:
@@ -1750,10 +1762,14 @@ def create_runner_app(
         if pending_approvals.has_any_pending():
             return True
         session_ids = set(_session_start_cache) | set(_session_agent_ids)
+        # Permission hooks parked on a verdict, per native pane's session.
+        approval_waits: dict[str, list[str]] = {}
         # Terminal ensure can start native work before any harness or web turn.
         # Read current resources so deleting a terminal also retires this pin.
         terminals = resource_registry.terminal_registry
         if terminals is not None:
+            from omnigent.harnesses.claude_native.bridge import fresh_approval_wait_markers
+
             for session_id, name, _ in terminals.native_panes():
                 if not is_native_harness(
                     resource_registry.terminal_resource_role(
@@ -1768,13 +1784,19 @@ def create_runner_app(
                     terminals, session_id, name, include_pane_activity=include_pane_activity
                 ):
                     return True
+                if markers := fresh_approval_wait_markers(session_id):
+                    approval_waits[session_id] = markers
         if process_manager is not None and any(
             process_manager.has_active_turn(session_id) for session_id in session_ids
         ):
             return True
-        if any(_native_turn_in_flight(session_id) for session_id in session_ids):
+        # A turn parked on a permission hook waits on a human, not on agent work.
+        if any(
+            session_id not in approval_waits and _native_turn_in_flight(session_id)
+            for session_id in session_ids
+        ):
             return True
-        return _human_wait_holds(session_ids)
+        return _human_wait_holds(session_ids, approval_waits)
 
     def _native_turn_in_flight(session_id: str) -> bool:
         """Whether a native terminal still reports this session's turn as in flight.

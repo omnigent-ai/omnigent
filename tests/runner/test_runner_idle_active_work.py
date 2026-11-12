@@ -29,6 +29,8 @@ from omnigent.runner.app import (
 from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import NullServerClient
 
+_HUMAN_WAIT_HOLD_ENV = "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S"
+
 
 @pytest.fixture(autouse=True)
 def _clean_global_active_work_state(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -40,7 +42,7 @@ def _clean_global_active_work_state(monkeypatch: pytest.MonkeyPatch) -> None:
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    monkeypatch.delenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", raising=False)
+    monkeypatch.delenv(_HUMAN_WAIT_HOLD_ENV, raising=False)
     pending_approvals.reset_for_tests()
     for session_timers in list(_session_timers.values()):
         for task in list(session_timers.values()):
@@ -380,17 +382,22 @@ async def _post_status(client: Any, conv_id: str, status: str) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["running", "waiting"])
-async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: str) -> None:
+async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
     """A native terminal's in-flight status holds the watchdog until it settles.
 
     Native delivery leaves ``active_turns`` once the prompt is typed, so the
     terminal's ``running`` / ``waiting`` edge is the only sign of live work.
+    It is agent work, so a human-wait hold shorter than the check never ends it.
 
+    :param monkeypatch: Pytest monkeypatch fixture.
     :param status: In-flight native status to exercise.
     :returns: None.
     """
     from tests.runner.conftest import _runner_client
 
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.01")
     conv_id = "conv_native_in_flight"
     app = await _native_app_with_session(conv_id)
     async with _runner_client(app) as client:
@@ -407,9 +414,6 @@ async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: s
             has_active_work=app.state.has_active_work,
             release=_release,
         )
-
-
-_HUMAN_WAIT_HOLD_ENV = "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S"
 
 
 def _publish_native_status(
@@ -453,31 +457,6 @@ async def test_native_dialog_hold_is_bounded_but_running_is_not(
         await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
 
         _publish_native_status(app, conv_id, "running", None)
-        assert app.state.has_active_work() is True
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["running", "waiting"])
-async def test_native_work_status_is_not_bounded_by_the_human_wait_hold(
-    monkeypatch: pytest.MonkeyPatch, status: str
-) -> None:
-    """A running turn or background-work ``waiting`` edge is real work, never bounded.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param status: Native work status with no dialog reason.
-    :returns: None.
-    """
-    from tests.runner.conftest import _runner_client
-
-    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.01")
-    conv_id = "conv_native_work_unbounded"
-    app = await _native_app_with_session(conv_id)
-    async with _runner_client(app) as client:
-        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
-        assert created.status_code == 201, created.text
-        await _post_status(client, conv_id, status)
-        assert app.state.has_active_work() is True
-        await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- outlast the hold
         assert app.state.has_active_work() is True
 
 
@@ -536,23 +515,88 @@ async def test_new_dialog_after_running_gets_a_fresh_hold(
 
 
 @pytest.mark.asyncio
-async def test_claude_prompt_waiter_hold_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A queued-message prompt waiter stops holding the watchdog after the hold.
+async def test_permission_hook_wait_is_bounded_per_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permission hook parked on its verdict holds the watchdog only for the hold.
 
+    The parked turn still reads ``running``, so the hook's marker marks the human
+    wait. Each hook owns its marker, so a later hook gets a fresh hold, and a
+    hook that hands off to Claude's own prompt leaves a dialog with its own.
+
+    :param tmp_path: Pytest temp dir for the approval-wait marker root.
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.runner.native import NativeLaunchContext
+    from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.runner.helpers import make_test_terminal_instance
+
     monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
-    app = _scaffold_app()
-    waiter = asyncio.create_task(asyncio.sleep(3600))
-    app.state.claude_prompt_waiters["conv_unanswered_prompt"] = waiter
-    try:
-        assert app.state.has_active_work() is True
-        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
-    finally:
-        waiter.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await waiter
+    conv_id = "conv_parked_permission_hook"
+    terminals = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", Mock())
+    monkeypatch.setattr(instance, "close", AsyncMock())
+    monkeypatch.setattr(instance, "screen_changed_within", Mock(return_value=False))
+    monkeypatch.setattr(instance, "client_interaction_within", Mock(return_value=False))
+    approval_root = tmp_path / "approval-waits"
+    approval_root.mkdir()
+    monkeypatch.setattr(bridge, "_APPROVAL_WAIT_ROOT", approval_root)
+    first_hook = bridge.approval_wait_marker_path(conv_id)
+    second_hook = first_hook.with_name(f"{first_hook.name.split('.')[0]}.999999.wait")
+    spec = AgentSpec(
+        spec_version=1,
+        name="claude-native-ui",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def launch(ctx: NativeLaunchContext):
+        terminals._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+        return await ctx.resource_registry.observe_required_terminal(
+            conv_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+        )
+
+    monkeypatch.setattr("omnigent.runner.native._launch_claude", launch)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"id": conv_id, "agent_id": "ag"})
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as server_client:
+        app = create_runner_app(
+            spec_resolver=await _spec_resolver_returning(spec),
+            server_client=server_client,
+            terminal_registry=terminals,
+        )
+        async with _runner_client(app) as client:
+            ensured = await client.post(
+                f"/v1/sessions/{conv_id}/resources/terminals",
+                json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+            )
+            assert ensured.status_code == 200, ensured.text
+            _publish_native_status(app, conv_id, "running", None)
+            bridge.touch_approval_wait_marker(first_hook)
+            assert app.state.has_active_work() is True
+            await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+            assert app.state.has_sandbox_work() is False
+
+            bridge.touch_approval_wait_marker(second_hook)
+            assert app.state.has_active_work() is True
+            await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+
+            # Both hooks give up and Claude shows its own permission prompt.
+            bridge.clear_approval_wait_marker(first_hook)
+            bridge.clear_approval_wait_marker(second_hook)
+            _publish_native_status(app, conv_id, "running", "permission prompt")
+            assert app.state.has_active_work() is True
+            await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+
+            # Answering it resumes the running turn, which is agent work again.
+            _publish_native_status(app, conv_id, "running", None)
+            assert app.state.has_active_work() is True
 
 
 @pytest.mark.asyncio
