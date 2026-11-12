@@ -1573,6 +1573,14 @@ def test_shell_continuation_respects_quoting(quote: str, created: bool) -> None:
     assert was_created is created
 
 
+def test_redirect_ampersand_stays_in_its_word_and_the_pipeline_still_splits() -> None:
+    segments = _shell_segments("gh pr create --title x 2>&1 | tail -2")
+    assert [segment.invocation_tokens for segment in segments] == [
+        ("gh", "pr", "create", "--title", "x", "2>&1"),
+        ("tail", "-2"),
+    ]
+
+
 @pytest.mark.parametrize(
     "command,words",
     [
@@ -1745,22 +1753,6 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
         ),
         pytest.param(
             "Bash",
-            {"command": 'printf "%s;%s" "&&" git pp'},
-            "/repo",
-            {},
-            [],
-            id="quoted-and-operator-is-a-word",
-        ),
-        pytest.param(
-            "Bash",
-            {"command": "printf \\( git pp"},
-            "/repo",
-            {},
-            [],
-            id="escaped-parenthesis-is-a-word",
-        ),
-        pytest.param(
-            "Bash",
             {"command": "false || cd a; false || cd b; false || cd c; git pp"},
             "/repo",
             {},
@@ -1777,11 +1769,54 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
         ),
         pytest.param(
             "Bash",
+            {
+                "command": "git pp; false || cd a; false || cd b; false || cd c; "
+                "false || cd d; git pp"
+            },
+            "/repo",
+            {},
+            ["/repo"],
+            id="checkouts-found-before-the-cap-are-kept",
+        ),
+        pytest.param(
+            "Bash",
             {"command": " || ".join(f"cd d{index}" for index in range(14)) + "; git pp"},
             "/repo",
             {},
             ["/repo/d0"],
             id="chained-or-cd-stays-linear",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic 2>&1 && git pp"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="stream-redirect-before-and-keeps-the-cd",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic && make 2>&1; git pp"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="stream-redirect-in-a-command-keeps-the-cd",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic &>/dev/null; git pp"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="ampersand-redirect-keeps-the-cd",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic && git pp 2>&1 | tail -3"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="pipeline-after-a-redirect-keeps-the-cd",
         ),
     ],
 )

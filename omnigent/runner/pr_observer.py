@@ -361,10 +361,15 @@ def _shell_items(command: str) -> list[list[str] | str] | None:
                 chunk.append(char)
                 index += 1
             else:
+                # The ``&`` of ``>&``, ``<&`` and ``&>`` is part of a redirection, not a separator.
+                redirect_ampersand = char == "&" and (
+                    command.startswith("&>", index)
+                    or (bool(chunk) and chunk[-1][-1:] in ("<", ">"))
+                )
                 operator = next(
                     (op for op in _SHELL_OPERATORS if command.startswith(op, index)), None
                 )
-                if operator is None:
+                if operator is None or redirect_ampersand:
                     chunk.append(char)
                     index += 1
                     continue
