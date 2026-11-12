@@ -35,11 +35,8 @@ _PDF_FILE_PATH = "sample.pdf"
 
 _PDF_LINK_URL = "https://review.external.example/pulls/1"
 
-# A minimal, valid single-page PDF drawing the text "Hello PDF" and an "Open pull
-# request" URI link annotation. Kept ASCII so it survives the filesystem PUT
-# endpoint's UTF-8 text path (binary/base64 can't be seeded there). pdf.js
-# renders the text into the selectable text layer, which is what the test
-# asserts on.
+# Minimal single-page PDF: "Hello PDF" text plus an "Open pull request" URI link.
+# Kept ASCII so it survives the filesystem PUT endpoint's UTF-8 text path.
 _PDF_CONTENT = f"""\
 %PDF-1.4
 1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
