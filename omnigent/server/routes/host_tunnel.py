@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 import anyio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from packaging.version import InvalidVersion, Version
 from starlette.websockets import WebSocketState
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
@@ -36,6 +37,7 @@ from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
     CAP_HARNESS_ACCOUNTS,
+    HOST_ID_CONFLICT_CLOSE_CODE,
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     SERVER_CAPABILITIES,
     SERVER_CAPABILITIES_HEADER,
@@ -423,6 +425,25 @@ def create_host_tunnel_router(
                 return
 
             stage = "registration"
+            connected = host_registry.get(host_id)
+            if connected is not None and _is_older_host_build(
+                frame.version, connected.hello.version
+            ):
+                # Close reasons are capped at 123 bytes; the host id is in its own logs.
+                reason = (
+                    f"newer omnigent host {connected.hello.version} is connected with this host id"
+                )
+                reason = reason.encode()[:123].decode(errors="ignore")
+                _logger.warning(
+                    "Refusing host %s: an older build (%s) tried to replace the "
+                    "connected %s build (connection %s)",
+                    host_id,
+                    frame.version,
+                    connected.hello.version,
+                    connected.hello.connection_id,
+                )
+                await ws.close(code=HOST_ID_CONFLICT_CLOSE_CODE, reason=reason)
+                return
             persisted_host = await asyncio.to_thread(
                 host_store.upsert_on_connect,
                 host_id=host_id,
@@ -547,6 +568,8 @@ def create_host_tunnel_router(
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
+                    if conn.retirement_reason == "replaced":
+                        await _close_replaced_tunnel(ws, conn)
                     for task in done:
                         exc = task.exception() if not task.cancelled() else None
                         if exc is not None:
@@ -701,6 +724,39 @@ def create_host_tunnel_router(
                 )
 
     return router
+
+
+def _is_older_host_build(incoming: str, connected: str) -> bool:
+    """Return whether a connecting host runs an older build than the connected one.
+
+    :param incoming: Hello-reported version of the connecting host, e.g.
+        ``"0.17.0"``.
+    :param connected: Hello-reported version of the live connection for the
+        same host id, e.g. ``"0.22.0.dev0+build.20261110"``.
+    :returns: ``True`` only when both parse as PEP 440 and ``incoming`` is
+        strictly older; equal or unparseable versions keep newest-wins.
+    """
+    try:
+        return Version(incoming) < Version(connected)
+    except InvalidVersion:
+        return False
+
+
+async def _close_replaced_tunnel(ws: WebSocket, conn: HostConnection) -> None:
+    """Close a tunnel replaced by a newer connection for the same host id.
+
+    An explicit code lets the displaced host back off instead of treating the
+    drop as an ingress recycle and reconnecting within a second.
+
+    :param ws: The replaced connection's WebSocket.
+    :param conn: The retired connection; records the requested close code.
+    """
+    conn.close_requested_code = HOST_ID_CONFLICT_CLOSE_CODE
+    with anyio.move_on_after(_DISCONNECT_CLEANUP_TIMEOUT_S), contextlib.suppress(RuntimeError):
+        await ws.close(
+            code=HOST_ID_CONFLICT_CLOSE_CODE,
+            reason="replaced by another connection for this host id",
+        )
 
 
 async def _send_connection_error(

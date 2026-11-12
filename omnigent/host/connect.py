@@ -72,6 +72,7 @@ from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
+    HOST_ID_CONFLICT_CLOSE_CODE,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     RUNNER_LOG_TAIL_HEADING,
     SERVER_CAPABILITIES_HEADER,
@@ -552,6 +553,10 @@ _RECONNECT_OPEN_TIMEOUT_S = 3.0
 # to normal backoff. An ingress cycle is brief; sustained 502 responses are an
 # outage and shouldn't hammer the endpoint twice a second.
 _RECYCLE_PROMPT_MAX_STREAK = 10
+# Reconnect delay after the server reports another connection owns this host id;
+# doubles per consecutive conflict up to the cap.
+_HOST_ID_CONFLICT_BACKOFF_S = 30.0
+_HOST_ID_CONFLICT_BACKOFF_CAP_S = 300.0
 # Fresh hosts get a short auth-retry window for Databricks OAuth refreshes.
 # Established hosts retry auth failures indefinitely to preserve sessions.
 _MAX_CONSECUTIVE_AUTH_ERRORS = 3
@@ -1409,6 +1414,8 @@ class HostProcess:
         # Past a bound the reconnect loop escalates instead of fast-recycling.
         self._recycle_streak = 0
         self._silent_connect_streak = 0
+        # Consecutive disconnects closed with HOST_ID_CONFLICT_CLOSE_CODE.
+        self._host_id_conflict_streak = 0
         # Per-connection markers feeding the silent-connect streak.
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
@@ -5222,6 +5229,26 @@ class HostProcess:
                             classified_recycle = False
                     recycle = woke or classified_recycle
                     wait_s = _RECONNECT_BASE_S if recycle else backoff
+                    if close_code == HOST_ID_CONFLICT_CLOSE_CODE:
+                        # Another process holds this host id; reconnecting promptly
+                        # would evict it and both would flap indefinitely.
+                        self._host_id_conflict_streak += 1
+                        recycle = False
+                        wait_s = min(
+                            _HOST_ID_CONFLICT_BACKOFF_S * 2 ** (self._host_id_conflict_streak - 1),
+                            _HOST_ID_CONFLICT_BACKOFF_CAP_S,
+                        )
+                        conflict_reason = websocket_close_reason(exc) or "no reason given"
+                        cause = (
+                            f"Another omnigent host process is connected with host id "
+                            f"{self._identity.host_id} ({conflict_reason}). Stop the "
+                            f"other process, or run `{cli_invocation()} host reset-id`."
+                        )
+                        _logger.error("%s Retrying in %.0fs.", cause, wait_s)
+                        if self._host_id_conflict_streak == 1:
+                            _print_host_status(f"⚠ {cause}", stderr=True)
+                    else:
+                        self._host_id_conflict_streak = 0
                     _logger.warning(
                         "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
                         exc,
