@@ -628,18 +628,24 @@ async function postPullRequestPreference(
 
 /**
  * Save the account / base-repo selection through the runner or host fallback,
- * update the info cache, and invalidate the selected PR's files and diff.
+ * update the info cache, and invalidate the selected PR's files, diff, and
+ * merge options (which name the account's last-used method).
  */
 export function useSetPullRequestPreference(conversationId: string | undefined) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (body: PullRequestPreferenceInput) =>
       postPullRequestPreference(conversationId!, body),
-    onSuccess: (info) => {
-      queryClient.setQueryData(["github-info", conversationId], info);
+    onSuccess: (info, body) => {
+      // A `pr_url` reply describes that PR, so it belongs in that PR's query.
+      queryClient.setQueryData(
+        ["github-info", conversationId, ...(body.pr_url ? [body.pr_url] : [])],
+        info,
+      );
       queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
       queryClient.invalidateQueries({ queryKey: ["github-changed-files", conversationId] });
       queryClient.invalidateQueries({ queryKey: ["github-pr-diff", conversationId] });
+      queryClient.invalidateQueries({ queryKey: ["github-merge-options", conversationId] });
     },
   });
 }

@@ -25,7 +25,9 @@ import {
   useDisablePullRequestAutoMerge,
   useMergePullRequest,
   usePullRequestMergeOptions,
+  useSetPullRequestPreference,
   type PullRequest,
+  type PullRequestAuth,
   type PullRequestMergeMethod,
 } from "@/hooks/usePullRequests";
 
@@ -155,6 +157,70 @@ function MergeMethodPicker({
   );
 }
 
+/** The accounts a merge can run as, from the PR's info; omit when the provider can't switch. */
+export type MergeAccounts = Pick<PullRequestAuth, "accounts" | "selected_account">;
+
+/**
+ * Picks the signed-in account the merge runs as, saved as the PR's account.
+ * An account that can read a PR may still be refused the merge (an Enterprise
+ * Managed User on a public repository), so the choice is offered here even
+ * though the panel hides its account selector once the repository resolves.
+ * Renders nothing with fewer than two accounts.
+ */
+function MergeAccountPicker({
+  accounts,
+  setPref,
+  prUrl,
+  disabled,
+  onChange,
+}: {
+  accounts: MergeAccounts;
+  setPref: ReturnType<typeof useSetPullRequestPreference>;
+  prUrl: string;
+  disabled: boolean;
+  onChange: () => void;
+}) {
+  const options = accounts.accounts ?? [];
+  if (options.length <= 1) return null;
+  // The host saved (or is saving) this account; the info refetch catches up after.
+  const requested = setPref.isPending || setPref.isSuccess ? setPref.variables?.account : null;
+  const selected = requested ?? accounts.selected_account ?? undefined;
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-2">
+        <span aria-hidden className="shrink-0 text-ui text-muted-foreground">
+          Merge as
+        </span>
+        <Select
+          value={selected}
+          onValueChange={(login) => {
+            onChange();
+            setPref.mutate({ account: login, pr_url: prUrl });
+          }}
+          disabled={disabled || setPref.isPending}
+        >
+          <SelectTrigger aria-label="Merge as" className="h-8 min-w-0 flex-1 text-ui">
+            <SelectValue placeholder="Account" />
+          </SelectTrigger>
+          <SelectContent>
+            {options.map((account) => (
+              <SelectItem key={account.login} value={account.login}>
+                {account.login}
+                {account.active ? " (active)" : ""}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+      {setPref.isError && (
+        <p role="alert" className="text-ui text-destructive">
+          Couldn’t switch accounts: {setPref.error.message}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** Confirms the merge and picks its method; the head is fixed when the dialog opens. */
 function PullRequestMergeDialog({
   conversationId,
@@ -162,6 +228,7 @@ function PullRequestMergeDialog({
   pr,
   headSha,
   warning,
+  accounts,
   unavailable = false,
   onClose,
   onMerged,
@@ -172,12 +239,14 @@ function PullRequestMergeDialog({
   headSha: string;
   /** A caveat GitHub still merges with, e.g. failing optional checks. */
   warning?: string;
+  accounts?: MergeAccounts;
   unavailable?: boolean;
   onClose: () => void;
   onMerged: () => void;
 }) {
   const options = usePullRequestMergeOptions(conversationId, prUrl, true);
   const merge = useMergePullRequest(conversationId);
+  const setPref = useSetPullRequestPreference(conversationId);
   const [chosen, setChosen] = useState<PullRequestMergeMethod | null>(null);
   const methods = options.data?.methods ?? [];
   const method = chosen && methods.includes(chosen) ? chosen : (options.data?.default ?? null);
@@ -188,7 +257,7 @@ function PullRequestMergeDialog({
   // `isPending` updates after a render, so a fast second click needs this guard.
   const submitting = useRef(false);
   const confirm = () => {
-    if (!method || unavailable || submitting.current) return;
+    if (!method || unavailable || setPref.isPending || submitting.current) return;
     submitting.current = true;
     merge.mutate(
       { prUrl, mergeMethod: method, expectedHead: headSha },
@@ -230,6 +299,16 @@ function PullRequestMergeDialog({
           disabled={merge.isPending}
           onChange={setChosen}
         />
+        {accounts && (
+          <MergeAccountPicker
+            accounts={accounts}
+            setPref={setPref}
+            prUrl={prUrl}
+            disabled={merge.isPending || unavailable}
+            // The refusal was the previous account's.
+            onChange={merge.reset}
+          />
+        )}
         {merge.isError && (
           <p role="alert" className="text-ui text-destructive">
             {merge.error.message}
@@ -241,7 +320,7 @@ function PullRequestMergeDialog({
           </Button>
           <Button
             className={MERGE_BUTTON_CLASS}
-            disabled={!method || unavailable || merge.isPending}
+            disabled={!method || unavailable || merge.isPending || setPref.isPending}
             onClick={confirm}
           >
             {merge.isPending && <Spinner aria-hidden />}
@@ -303,6 +382,7 @@ export function PullRequestMerge({
   conversationId,
   prUrl,
   pr,
+  accounts,
   compact = false,
   showTrigger = true,
   unavailable = false,
@@ -313,6 +393,8 @@ export function PullRequestMerge({
   conversationId: string;
   prUrl: string;
   pr: PullRequest;
+  /** The accounts the dialog offers to merge as; omit when the provider can't switch. */
+  accounts?: MergeAccounts;
 }) {
   // The full button uses the default method; compact rows load methods on confirmation.
   const options = usePullRequestMergeOptions(conversationId, prUrl, !pr.auto_merge && !compact);
@@ -370,6 +452,7 @@ export function PullRequestMerge({
           pr={pr}
           headSha={confirmingHead}
           unavailable={unavailable}
+          accounts={accounts}
           warning={state.kind === "ready" ? state.hint : undefined}
           onMerged={() => setMergedHead(confirmingHead)}
           onClose={() => setConfirmingHead(null)}

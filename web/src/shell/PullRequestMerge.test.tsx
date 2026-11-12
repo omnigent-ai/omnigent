@@ -6,12 +6,13 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PullRequest, PullRequestMergeMethod } from "@/hooks/usePullRequests";
-import { mergeButtonState, PullRequestMerge } from "./PullRequestMerge";
+import { mergeButtonState, PullRequestMerge, type MergeAccounts } from "./PullRequestMerge";
 
 const PR_URL = "https://github.com/acme/app/pull/7";
 const MERGE_PATH = "/v1/sessions/conv_1/resources/github/merge";
 const DISABLE_PATH = "/v1/sessions/conv_1/resources/github/disable-auto-merge";
 const OPTIONS_PATH = "/v1/sessions/conv_1/resources/github/merge-options";
+const PREFERENCES_PATH = "/v1/sessions/conv_1/resources/github/preferences";
 const HEAD = "a".repeat(40);
 const AUTO_MERGE = { merge_method: "MERGE", enabled_by: "dev", enabled_at: "2026-10-21T06:02:55Z" };
 
@@ -68,12 +69,18 @@ function stubFetch(options: () => Response) {
   return { fetch, posts };
 }
 
-function renderMerge(pr: PullRequest, compact = false) {
+function renderMerge(pr: PullRequest, compact = false, accounts?: MergeAccounts) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const invalidate = vi.spyOn(client, "invalidateQueries");
   const tree = (next: PullRequest) => (
     <QueryClientProvider client={client}>
-      <PullRequestMerge conversationId="conv_1" prUrl={PR_URL} pr={next} compact={compact} />
+      <PullRequestMerge
+        conversationId="conv_1"
+        prUrl={PR_URL}
+        pr={next}
+        compact={compact}
+        accounts={accounts}
+      />
     </QueryClientProvider>
   );
   const view = render(tree(pr));
@@ -287,6 +294,91 @@ it("says why the dialog can't merge when merge options fail to load", async () =
   expect(
     within(screen.getByRole("dialog")).getByRole("button", { name: "Merge pull request" }),
   ).toBeDisabled();
+});
+
+describe("merging as another account", () => {
+  const twoAccounts: MergeAccounts = {
+    accounts: [
+      { login: "work", active: true, state: "success", host: "github.com" },
+      { login: "personal", active: false, state: "success", host: "github.com" },
+    ],
+    selected_account: "work",
+  };
+
+  it("switches the PR's account after a refusal, then merges as it", async () => {
+    const { posts } = stubFetch(allMethods);
+    const { invalidate } = renderMerge(pullRequest(), false, twoAccounts);
+
+    await openDialog();
+    const dialog = screen.getByRole("dialog");
+    const confirm = within(dialog).getByRole("button", { name: "Squash and merge" });
+    fireEvent.click(confirm);
+    await waitFor(() => expect(posts).toHaveLength(1));
+    const refusal = "The GitHub account on the host cannot merge this pull request.";
+    await act(async () => {
+      posts[0].respond(json({ detail: refusal }, 400));
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent(refusal);
+
+    const picker = within(dialog).getByRole("combobox", { name: "Merge as" });
+    expect(picker).toHaveTextContent("work");
+    fireEvent.click(picker);
+    fireEvent.click(screen.getByRole("option", { name: "personal" }));
+    await waitFor(() => expect(posts).toHaveLength(2));
+    expect(posts[1]).toMatchObject({
+      path: PREFERENCES_PATH,
+      body: { account: "personal", pr_url: PR_URL },
+    });
+    // The refusal was the previous account's, and no merge starts mid-switch.
+    expect(screen.queryByText(refusal)).not.toBeInTheDocument();
+    expect(picker).toHaveTextContent("personal");
+    expect(confirm).toBeDisabled();
+
+    await act(async () => {
+      posts[1].respond(json({ object: "session.github.info" }));
+    });
+    await waitFor(() => expect(confirm).toBeEnabled());
+    // The default method is the account's own.
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["github-merge-options", "conv_1"] });
+    expect(picker).toHaveTextContent("personal");
+
+    fireEvent.click(confirm);
+    await waitFor(() => expect(posts).toHaveLength(3));
+    expect(posts[2]).toMatchObject({
+      path: MERGE_PATH,
+      body: { pr_url: PR_URL, merge_method: "squash", expected_head: HEAD },
+    });
+  });
+
+  it("says when the account can't be switched", async () => {
+    const { posts } = stubFetch(allMethods);
+    renderMerge(pullRequest(), false, twoAccounts);
+
+    await openDialog();
+    const picker = within(screen.getByRole("dialog")).getByRole("combobox", { name: "Merge as" });
+    fireEvent.click(picker);
+    fireEvent.click(screen.getByRole("option", { name: "personal" }));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    await act(async () => {
+      posts[0].respond(json({ detail: "Host offline" }, 400));
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Couldn’t switch accounts: Host offline",
+    );
+    expect(picker).toHaveTextContent("work");
+  });
+
+  it("offers no account choice with one signed-in account", async () => {
+    stubFetch(allMethods);
+    renderMerge(pullRequest(), false, {
+      accounts: [twoAccounts.accounts![0]],
+      selected_account: "work",
+    });
+
+    await openDialog();
+    expect(screen.queryByRole("combobox", { name: "Merge as" })).not.toBeInTheDocument();
+  });
 });
 
 describe("a change the refetch hasn't shown", () => {

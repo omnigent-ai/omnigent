@@ -227,6 +227,11 @@ def test_merge_runs_gh_pr_merge_pinned_to_the_head_as_the_pr_account(
         ),
         ("HTTP 403: Resource not accessible by integration", "cannot merge this pull request"),
         (
+            "GraphQL: Unauthorized: As an Enterprise Managed User, you cannot access this "
+            "content (mergePullRequest)",
+            "The GitHub account on the host cannot merge this pull request.",
+        ),
+        (
             "X Pull request acme/widgets#17 is not mergeable: the base branch policy prohibits "
             "the merge.\nTo have the pull request merged after all the requirements...",
             "could not merge this pull request: Pull request acme/widgets#17 is not mergeable",

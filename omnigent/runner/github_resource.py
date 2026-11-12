@@ -2024,7 +2024,13 @@ def _merge_error(stderr: str, *, action: str) -> str:
             "The pull request's branch changed since the panel loaded. "
             "Review the new commits, then merge again."
         )
-    if re.search(r"\(HTTP 40[13]\)|Resource not accessible|must have (?:write|push)", stderr):
+    # An Enterprise Managed User can read public repositories outside its
+    # enterprise but not write to them; GitHub says so in a GraphQL error, not a 403.
+    if re.search(
+        r"\(HTTP 40[13]\)|Resource not accessible|must have (?:write|push)"
+        r"|As an Enterprise Managed User",
+        stderr,
+    ):
         return f"The GitHub account on the host cannot {action}."
     detail = next((line.strip() for line in stderr.splitlines() if line.strip()), "")
     # gh prefixes GraphQL errors and its failure marks; neither helps the reader.

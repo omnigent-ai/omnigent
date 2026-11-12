@@ -186,7 +186,8 @@ function codeSpans(text: string): React.ReactNode {
  * resolves, the account is correct — surfacing the knob then would just invite a
  * misconfiguration, so it's absent from the header and the `no-pr` state. Renders
  * nothing with a single account (nothing to choose) or when the provider can't
- * switch accounts.
+ * switch accounts. The merge dialog has its own account picker, because an
+ * account that can read a PR may still be refused the merge.
  */
 function GithubAccountSelector({
   conversationId,
@@ -935,6 +936,7 @@ function PullRequestListRow({
             conversationId={conversationId}
             prUrl={association.url}
             pr={cachedPr}
+            accounts={data?.capabilities.account_switching ? data.auth : undefined}
           />
         )}
       </div>
@@ -1849,6 +1851,7 @@ function PullRequestPanelDetails({
                   conversationId={conversationId}
                   prUrl={data.selected_pr_url}
                   pr={pr}
+                  accounts={data.capabilities.account_switching ? data.auth : undefined}
                 />
               )
             }
