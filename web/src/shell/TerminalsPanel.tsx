@@ -153,6 +153,8 @@ export function TerminalsPanel({
       ref={ref}
       data-testid="terminals-panel"
       data-state={open ? "open" : "closed"}
+      // It closes on Escape, so page-wide Escape shortcuts leave keys inside it alone.
+      data-escape-owner={open ? "" : undefined}
       data-expanded={expanded}
       data-fluid={fluid}
       style={panelStyle}

@@ -63,10 +63,27 @@ def _kill_quietly(proc: subprocess.Popen) -> None:
         proc.wait(timeout=10)
 
 
-def test_matches_by_cmdline_reference(data_dir: Path) -> None:
-    """A process whose argv references the data dir is attributed."""
+@pytest.mark.parametrize(
+    "unreadable_error",
+    [None, IndexError("empty stat"), psutil.NoSuchProcess(1), psutil.AccessDenied(1), OSError()],
+    ids=["readable", "empty-stat", "vanished", "denied", "os-error"],
+)
+def test_matches_by_cmdline_reference(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, unreadable_error: Exception | None
+) -> None:
+    """An unreadable earlier PID does not hide a process referencing the data dir."""
     child = _spawn(_SLEEP_CHILD, "omnigent-server", f"sqlite:///{data_dir}/chat.db")
     try:
+        if unreadable_error is not None:
+            process_class = psutil.Process
+
+            def read_process(pid: int) -> psutil.Process:
+                if pid == 1:
+                    raise unreadable_error
+                return process_class(pid)
+
+            monkeypatch.setattr(psutil, "pids", lambda: [1, child.pid])
+            monkeypatch.setattr(psutil, "Process", read_process)
         found = find_leaked_omnigent_processes(data_dir)
         assert child.pid in {p.pid for p in found}
     finally:

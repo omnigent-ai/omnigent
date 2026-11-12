@@ -47,8 +47,8 @@ DetectedKind = Literal["key", "subscription", "local", "cli-config"]
 # ``subscription`` is a logged-in CLI; ``local`` is a self-hosted endpoint;
 # ``cli-config`` is a custom model provider a harness CLI's own config file
 # defines (today: a ``[model_providers.X]`` table in ``~/.codex/config.toml``
-# that carries its own auth, e.g. the Databricks Unity Gateway written by
-# ``isaac configure codex``).
+# that carries its own auth, e.g. the Databricks Unity Gateway set up by a
+# wrapper's Codex setup).
 KEY_KIND: DetectedKind = "key"
 SUBSCRIPTION_KIND: DetectedKind = "subscription"
 LOCAL_KIND: DetectedKind = "local"
@@ -64,13 +64,12 @@ _OLLAMA_URL = f"http://{_OLLAMA_HOST}:{_OLLAMA_PORT}"
 _OLLAMA_PROBE_TIMEOUT = 0.25
 
 # Claude Code's enterprise "managed settings" chain, highest precedence first.
-# An enterprise install (the shape ``isaac configure claude`` writes) configures
-# Claude Code here and nowhere else: an ``env`` block pinning
-# ``ANTHROPIC_BASE_URL`` at a gateway plus a top-level ``apiKeyHelper`` that
-# prints the bearer token. Managed settings win at Claude Code's own launch, so
-# this file alone is a complete, working credential — but it belongs to Claude
-# Code, not omnigent: we reflect it (readiness + label), we never adopt it into
-# a ``providers:`` shape (see ``claude_managed_gateway``).
+# An enterprise install configures Claude Code here and nowhere else: an
+# ``env`` block pinning ``ANTHROPIC_BASE_URL`` at a gateway plus a top-level
+# ``apiKeyHelper`` that prints the bearer token. Managed settings win at Claude
+# Code's own launch, so this file alone is a complete, working credential — but
+# it belongs to Claude Code, not omnigent: we reflect it (readiness + label), we
+# never adopt it into a ``providers:`` shape (see ``claude_managed_gateway``).
 _CLAUDE_CODE_MACOS_MANAGED_DIR = Path("/Library/Application Support/ClaudeCode")
 _CLAUDE_CODE_LINUX_MANAGED_DIR = Path("/etc/claude-code")
 CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
@@ -265,7 +264,7 @@ class CodexConfigProvider:
 def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | None:
     """Detect a custom, auth-carrying default model provider in a Codex config.
 
-    ``isaac configure codex`` (and similar enterprise tooling) configures
+    Enterprise setup tooling configures
     Codex by writing ``~/.codex/config.toml`` only: a custom
     ``[model_providers.X]`` table whose ``[X.auth]`` command prints a
     bearer token, selected via a top-level ``model_provider = "X"``. No
@@ -328,8 +327,8 @@ class CodexConfigTransport:
 
     The runtime-routing counterpart of :class:`CodexConfigProvider` (which
     only carries the id / display name for the setup menu). This reads the
-    fields a harness needs to actually talk to the provider — the ones
-    ``isaac configure codex`` writes for the Databricks Unity Gateway.
+    fields a harness needs to actually talk to the provider, the ones a
+    Codex setup writes for the Databricks Unity Gateway.
 
     :param base_url: The provider table's ``base_url``, e.g.
         ``"https://<workspace>.ai-gateway.cloud.databricks.com/codex/v1"``.
@@ -815,7 +814,7 @@ def detect_providers() -> list[DetectedProvider]:
        a login (see :func:`_claude_login_detected`).
     3. A custom, auth-carrying model provider in ``~/.codex/config.toml``
        (see :func:`codex_config_custom_provider`) — e.g. the Databricks AI
-       Gateway provider that ``isaac configure codex`` writes. Ordered
+       Gateway provider that a Codex setup writes. Ordered
        before the codex login check so the auto-default matches Codex's own
        resolution (config.toml's default provider beats auth.json).
     4. A logged-in Codex CLI (``~/.codex/auth.json`` exists *and* carries a
@@ -916,12 +915,11 @@ def _detect_providers_now() -> list[DetectedProvider]:
         )
 
     # 3. A custom model provider in ~/.codex/config.toml (e.g. the
-    #    Databricks Unity Gateway written by ``isaac configure codex``, which
-    #    writes config.toml only — never auth.json — so the login check
-    #    below cannot see it). Ordered BEFORE the codex login check so that
-    #    on a machine with both, the auto-default matches what a plain
-    #    ``codex`` invocation does: config.toml's default model_provider
-    #    wins over auth.json.
+    #    Databricks Unity Gateway, whose setup writes config.toml only, never
+    #    auth.json, so the login check below cannot see it). Ordered BEFORE the
+    #    codex login check so that on a machine with both, the auto-default
+    #    matches what a plain ``codex`` invocation does: config.toml's default
+    #    model_provider wins over auth.json.
     codex_config_det = codex_config_detection()
     if codex_config_det is not None:
         detected.append(codex_config_det)

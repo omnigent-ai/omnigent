@@ -469,6 +469,13 @@ jobs:
               raise SystemExit(f"::error::Cannot read required database review guidance at {database_guidance_path}: {exc}") from exc
           if not database_guidance.strip():
               raise SystemExit(f"::error::Required database review guidance is empty: {database_guidance_path}")
+          reference_policy_path = pathlib.Path("dev/lint/lint_reference_policy.py").resolve()
+          try:
+              reference_policy = reference_policy_path.read_text(encoding="utf-8")
+          except (OSError, UnicodeError) as exc:
+              raise SystemExit(f"::error::Cannot read required reference policy at {reference_policy_path}: {exc}") from exc
+          if not reference_policy.strip():
+              raise SystemExit(f"::error::Required reference policy is empty: {reference_policy_path}")
 
           # The "missing visual demonstration" nudge targets external contributors
           # only — core team members (OWNER / MEMBER / COLLABORATOR) are assumed to
@@ -682,6 +689,23 @@ jobs:
           - Format multiple sub-points as a list.
 
           Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract (including mandatory database best practices), creates a real security risk, or includes changes clearly unrelated to the stated goal; otherwise downgrade to non-blocking.
+
+          **Reference policy** — treat new violations as blocking contract violations.
+          Read `{reference_policy_path}` from the trusted checkout for the
+          prohibited patterns and public-host exceptions. Include this absolute path and
+          the policy requirements in every reviewer task. If the policy cannot be
+          read, report an incomplete review; do not claim a clean review. Check added code,
+          filenames, tests, comments, docs, and generated text. Also flag clearly
+          evidenced non-public deployment details, real workspace addresses or IDs,
+          and organization-specific access instructions that the patterns miss.
+          Existing unchanged references are not new findings; public API integration
+          and generic examples are allowed. Test fixtures and parametrized values
+          are not exempt: use reserved example domains, not plausible deployment
+          addresses. Do not explain prohibited names or repeat matched values in
+          feedback: cite the location and request generic wording. Review the checker,
+          its exemptions, and its tests for bypasses. Only the policy definition may
+          list prohibited patterns; tests must not duplicate prohibited literals or
+          describe deployment details.
 
           **Database best practices** — apply every relevant section of the reference
           document to the changed schema, queries, transactions, and storage code.

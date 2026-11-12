@@ -11,7 +11,11 @@
 
 import { useEffect, useRef } from "react";
 
+import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+
+/** Glyphs for the chord `isVoiceDictationHotkey` matches; shown in control tooltips. */
+export const VOICE_DICTATION_KEYS = [MOD_KEY, ALT_KEY, "V"] as const;
 
 /** Selector for surfaces that own their keystrokes (terminals, code editor). */
 const HOTKEY_OWNING_SURFACES = ".xterm, .monaco-editor";

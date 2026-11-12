@@ -45,6 +45,7 @@ from omnigent.harness_plugins import (
     PI_NATIVE_CODING_AGENT,
     harness_capabilities,
 )
+from omnigent.native.elicitation_reattach import PRE_RESOLVED_ELICITATION_TTL_S
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
@@ -521,7 +522,7 @@ _NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 _PI_EXTENSION_UI_HOOK_TIMEOUT_S = 86400.0
 
 
-_HARNESS_PRE_RESOLVED_ELICITATION_TTL_S = 300.0
+_HARNESS_PRE_RESOLVED_ELICITATION_TTL_S = PRE_RESOLVED_ELICITATION_TTL_S
 
 
 _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
@@ -670,6 +671,13 @@ _session_background_task_count_cache: WorkspaceScopedCache[str, int] = Workspace
 # ``_publish_status``) so a reload/reconnect can restore it. Absent when the
 # count cache is absent, or when a runner reported only the count with no detail.
 _session_background_tasks_cache: WorkspaceScopedCache[str, list[BackgroundTaskInfo]] = (
+    WorkspaceScopedCache()
+)
+
+
+# Background agents a finished claude-native turn left running, as of this
+# replica's last ``waiting`` edge. Any other status edge drops the entry.
+_session_background_agents_cache: WorkspaceScopedCache[str, list[BackgroundTaskInfo]] = (
     WorkspaceScopedCache()
 )
 
@@ -1297,6 +1305,7 @@ __all__ = [
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",
+    "_session_background_agents_cache",
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_blocked_on_cache",
