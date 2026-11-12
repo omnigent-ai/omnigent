@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -25,10 +27,88 @@ from omnigent.harnesses.codex_native.app_server import (
     codex_terminal_env,
 )
 from omnigent.runner.native.orchestration import _native_terminal_start_error_payload
+from tests._helpers.polling import poll_until_async
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
+    _set_codex_version,
     _test_app_server,
 )
+
+
+@pytest.mark.parametrize("outcome", ["ready", "cancelled", "write-error"])
+async def test_start_keeps_loop_responsive_during_private_model_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """Slow configuration storage cannot freeze the loop or outlive cancelled startup."""
+    source = tmp_path / "source"
+    source.mkdir()
+    original = 'model = "source-model"\nmodel_reasoning_effort = "high"\n'
+    (source / "config.toml").write_text(original)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    _disable_codex_startup_rpc(monkeypatch)
+    _set_codex_version(monkeypatch, (0, 129, 0))
+    server = _test_app_server(tmp_path, tmp_path / "private", tmp_path / "bridge", workspace)
+    server.pinned_model = "session-model"
+    server.pinned_effort = "medium"
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+    original_write = Path.write_text
+
+    def slow_write(path: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        if (
+            path == server.codex_home / "config.toml"
+            and 'model = "session-model"' in data
+            and not finished.is_set()
+        ):
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(timeout=5.0)
+            finished.set()
+            if outcome == "write-error":
+                raise OSError("private model write failed")
+        return original_write(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", slow_write)
+    startup = asyncio.create_task(server.start())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10.0)
+        assert not finished.is_set(), "private config write blocked the event loop"
+        assert server.proc is None
+        if outcome == "cancelled":
+            startup.cancel()
+            await poll_until_async(lambda: startup.cancelling() == 1, timeout_s=1.0)
+            await asyncio.sleep(0)
+            assert not startup.done(), "cancelled startup left its config writer running"
+            startup.cancel()
+            await asyncio.sleep(0)
+            assert not startup.done(), "repeated cancellation abandoned the config writer"
+        release.set()
+        if outcome == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await startup
+            assert finished.is_set()
+            assert server.proc is None
+        elif outcome == "write-error":
+            with pytest.raises(OSError, match="private model write failed"):
+                await startup
+            assert server.proc is None
+        else:
+            await startup
+            config = tomllib.loads((server.codex_home / "config.toml").read_text())
+            assert config["model"] == "session-model"
+            assert config["model_reasoning_effort"] == "medium"
+            assert "omnigent" in config["mcp_servers"]
+        assert (source / "config.toml").read_text() == original
+    finally:
+        release.set()
+        if not startup.done():
+            startup.cancel()
+        with contextlib.suppress(asyncio.CancelledError, OSError):
+            await startup
+        await server.close()
 
 
 @pytest.mark.parametrize("reused_home", [False, True], ids=["fresh", "resumed"])

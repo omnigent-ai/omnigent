@@ -92,7 +92,7 @@ from omnigent.harnesses.codex_native.timeouts import (
     APP_SERVER_READY_TIMEOUT_SECONDS as _APP_SERVER_READY_TIMEOUT_SECONDS,
 )
 from omnigent.inner import _proc
-from omnigent.inner._subprocess_lifecycle import subprocess_exited
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task, subprocess_exited
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
@@ -2622,6 +2622,71 @@ class CodexNativeAppServer:
             name="codex-native-app-server-stderr",
         )
 
+    def _prepare_home_config(
+        self,
+        config_source: Path,
+        *,
+        codex_version: tuple[int, int, int] | None,
+        routed_spawns: bool,
+        minimal_config: bool,
+        model_migration_target: str | None,
+        catalog: object,
+    ) -> tuple[str | None, str | None]:
+        """Populate and pin the private home before the app-server can read it."""
+        mcp_servers = read_codex_mcp_servers(
+            config_source,
+            self.config_profile,
+            codex_version=codex_version,
+            minimal_config=minimal_config,
+        )
+        _populate_codex_home_config(
+            self.codex_home,
+            config_source,
+            inject_hooks=self.router_hooks_registered,
+            extend_model_catalog=codex_extended_catalog_requested(self.env),
+            supported_efforts=CODEX_NATIVE_EFFORTS,
+            minimal_config=minimal_config,
+        )
+        compose_profile_instructions = _materialize_codex_profile_for_start(
+            self.codex_home,
+            config_source,
+            self.config_profile,
+            codex_version=codex_version,
+            agent_instructions=self.developer_instructions,
+        )
+        if self.trust_project:
+            _trust_codex_project(self.codex_home, self.cwd)
+        _add_codex_writable_roots(self.codex_home, self.writable_roots)
+        # Write the MCP server config into config.toml so the app-server
+        # discovers it at config load. The -c overrides may not be honored
+        # by `codex app-server`, so we write directly to the file.
+        _inject_mcp_server_config(
+            self.codex_home,
+            self.bridge_dir,
+            self.python_executable,
+            mcp_servers=mcp_servers,
+            routed_spawns=routed_spawns,
+        )
+        if self.pinned_model:
+            _pin_codex_config_model(self.codex_home, self.pinned_model)
+            if model_migration_target is not None:
+                _acknowledge_codex_model_migration(
+                    self.codex_home,
+                    self.pinned_model,
+                    model_migration_target,
+                )
+        effective_model = self.pinned_model or read_codex_home_config_model(self.codex_home)
+        requested_effort = self.pinned_effort or read_codex_home_config_effort(self.codex_home)
+        effective_effort = clamp_codex_effort_for_model(requested_effort, effective_model, catalog)
+        if effective_effort and (self.pinned_effort or effective_effort != requested_effort):
+            _pin_codex_config_effort(self.codex_home, effective_effort, effective_model)
+        _sync_codex_developer_instructions(
+            self.codex_home,
+            self.developer_instructions,
+            use_current_base=compose_profile_instructions,
+        )
+        return effective_model, effective_effort
+
     async def start(self) -> None:
         """
         Start the Codex app-server and wait for the socket.
@@ -2681,12 +2746,6 @@ class CodexNativeAppServer:
         self.router_hooks_registered = router_bridge_dir is not None and policy_hooks_supported
         routed_spawns = router_bridge_dir is not None
         minimal_config = codex_minimal_config_requested()
-        mcp_servers = read_codex_mcp_servers(
-            config_source,
-            self.config_profile,
-            codex_version=codex_version,
-            minimal_config=minimal_config,
-        )
         model_migration_target: str | None = None
         catalog: object = self.model_catalog_rows
         if self.trust_project and self.pinned_model:
@@ -2702,57 +2761,24 @@ class CodexNativeAppServer:
                     timeout=_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS,
                 )
             model_migration_target = _codex_model_upgrade_target(catalog, self.pinned_model)
-        # Off the loop: this copies/symlinks a home AND (on a Smart Routing
-        # session) shells out to ``codex debug models`` with a 10s timeout. Run
-        # inline it stalled every other session sharing this event loop for that
-        # long — which is also why a plain session must never reach the probe.
-        await asyncio.to_thread(
-            _populate_codex_home_config,
-            self.codex_home,
-            config_source,
-            inject_hooks=self.router_hooks_registered,
-            extend_model_catalog=codex_extended_catalog_requested(self.env),
-            supported_efforts=CODEX_NATIVE_EFFORTS,
-            minimal_config=minimal_config,
+        preparation = asyncio.create_task(
+            asyncio.to_thread(
+                self._prepare_home_config,
+                config_source,
+                codex_version=codex_version,
+                routed_spawns=routed_spawns,
+                minimal_config=minimal_config,
+                model_migration_target=model_migration_target,
+                catalog=catalog,
+            )
         )
-        compose_profile_instructions = _materialize_codex_profile_for_start(
-            self.codex_home,
-            config_source,
-            self.config_profile,
-            codex_version=codex_version,
-            agent_instructions=self.developer_instructions,
-        )
-        if self.trust_project:
-            _trust_codex_project(self.codex_home, self.cwd)
-        _add_codex_writable_roots(self.codex_home, self.writable_roots)
-        # Write the MCP server config into config.toml so the app-server
-        # discovers it at config load. The -c overrides may not be honored
-        # by `codex app-server`, so we write directly to the file.
-        _inject_mcp_server_config(
-            self.codex_home,
-            self.bridge_dir,
-            self.python_executable,
-            mcp_servers=mcp_servers,
-            routed_spawns=routed_spawns,
-        )
-        if self.pinned_model:
-            _pin_codex_config_model(self.codex_home, self.pinned_model)
-            if model_migration_target is not None:
-                _acknowledge_codex_model_migration(
-                    self.codex_home,
-                    self.pinned_model,
-                    model_migration_target,
-                )
-        effective_model = self.pinned_model or read_codex_home_config_model(self.codex_home)
-        requested_effort = self.pinned_effort or read_codex_home_config_effort(self.codex_home)
-        effective_effort = clamp_codex_effort_for_model(requested_effort, effective_model, catalog)
-        if effective_effort and (self.pinned_effort or effective_effort != requested_effort):
-            _pin_codex_config_effort(self.codex_home, effective_effort, effective_model)
-        _sync_codex_developer_instructions(
-            self.codex_home,
-            self.developer_instructions,
-            use_current_base=compose_profile_instructions,
-        )
+        try:
+            effective_model, effective_effort = await asyncio.shield(preparation)
+        except asyncio.CancelledError:
+            # The writer must finish before callers can clean up or reuse the home.
+            with contextlib.suppress(Exception):
+                await await_cleanup_task(preparation)
+            raise
         self.config_overrides = await prepare_codex_provider_config(
             self.codex_home,
             self.config_overrides,
