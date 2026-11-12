@@ -110,6 +110,7 @@ from omnigent.server.scheduled.dispatch_scheduler import (
 )
 from omnigent.server.scheduled.harness_settings import (
     inherited_approval_skipping_problem,
+    permission_mode_launch_options,
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
@@ -1512,17 +1513,14 @@ async def _permission_mode_launch_options(
             "Restore access to the agent and retry.",
             error_code="permission_harness_unresolved",
         )
-    args = PERMISSION_LAUNCH_ARGS.get(harness, {}).get(task.permission_mode)
-    if args is None:
+    options = permission_mode_launch_options(harness, task.permission_mode)
+    if options is None:
         raise _CannotLaunchScheduledFire(
             f"Saved permission setting {task.permission_mode!r} is not supported by {harness!r}. "
             "Edit the automation to choose a supported permission or clear the override.",
             error_code="permission_mode_unsupported",
         )
-    labels = {}
-    if harness == "codex-native" and task.permission_mode == "bypass":
-        labels[CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
-    return list(args) or None, labels
+    return options
 
 
 async def _spec_reasoning_effort(deps: FireDeps, task: ScheduledTask) -> str | None:

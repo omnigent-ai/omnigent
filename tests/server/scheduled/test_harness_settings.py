@@ -1,4 +1,4 @@
-"""Save-time permission checks for automations."""
+"""Permission settings for automations and the sessions their runs start."""
 
 from __future__ import annotations
 
@@ -9,9 +9,11 @@ import pytest
 from omnigent.errors import OmnigentError
 from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.server.scheduled.harness_settings import (
+    automation_session_launch_options,
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
 )
+from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
 
 _NULL_HINT = "JSON null (not the string 'null') for the agent default"
 
@@ -94,3 +96,68 @@ def test_unknown_mode_rejection_lists_every_vocabulary(mode: str) -> None:
     for harness, modes in PERMISSION_LAUNCH_ARGS.items():
         assert f"{harness}: {', '.join(map(repr, modes))}" in message
     assert message.index(_NULL_HINT) < message.index("claude-sdk") < message.index("claude-native")
+
+
+class _TaskStore:
+    def __init__(self, permission_mode: str | None, user_id: str | None = "alice") -> None:
+        self._task = SimpleNamespace(id="task_1", user_id=user_id, permission_mode=permission_mode)
+
+    def get(self, scheduled_task_id: str) -> SimpleNamespace | None:
+        return self._task if scheduled_task_id == self._task.id else None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "mode", "expected"),
+    [
+        (
+            "codex-native",
+            "approve-for-me",
+            (PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"], {}),
+        ),
+        ("claude-native", "auto", (["--permission-mode", "auto"], {})),
+        ("codex-native", "bypass", (None, {CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"})),
+        ("codex-native", "default", (None, {})),
+    ],
+)
+async def test_session_started_by_an_automation_run_uses_its_mode(
+    harness: str, mode: str, expected: tuple[list[str] | None, dict[str, str]]
+) -> None:
+    options = await automation_session_launch_options(
+        _TaskStore(mode), "task_1", user_id="alice", harness=harness
+    )
+    assert options == expected
+
+
+@pytest.mark.asyncio
+async def test_single_user_automation_applies_to_the_local_user() -> None:
+    options = await automation_session_launch_options(
+        _TaskStore("auto", user_id=None), "task_1", user_id=None, harness="claude-native"
+    )
+    assert options == (["--permission-mode", "auto"], {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("store", "task_id", "user_id", "harness"),
+    [
+        pytest.param(None, "task_1", "alice", "codex-native", id="no-task-store"),
+        pytest.param(_TaskStore("approve-for-me"), None, "alice", "codex-native", id="not-a-run"),
+        pytest.param(_TaskStore("approve-for-me"), "gone", "alice", "codex-native", id="deleted"),
+        pytest.param(_TaskStore(None), "task_1", "alice", "codex-native", id="no-mode"),
+        pytest.param(
+            _TaskStore("approve-for-me"), "task_1", "bob", "codex-native", id="other-owner"
+        ),
+        pytest.param(
+            _TaskStore("approve-for-me"), "task_1", "alice", "claude-native", id="unsupported"
+        ),
+        pytest.param(_TaskStore("approve-for-me"), "task_1", "alice", None, id="no-harness"),
+    ],
+)
+async def test_session_keeps_its_agent_default_without_an_applicable_mode(
+    store: _TaskStore | None, task_id: str | None, user_id: str, harness: str | None
+) -> None:
+    options = await automation_session_launch_options(
+        store, task_id, user_id=user_id, harness=harness
+    )
+    assert options is None

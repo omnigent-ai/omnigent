@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
@@ -551,6 +552,78 @@ async def test_scheduled_origin_allows_new_controls_children_and_reads(
         conversations.get_conversation(scheduled_id).labels[SCHEDULED_TASK_ORIGIN_LABEL_KEY]
         == task.id
     )
+
+
+@pytest.mark.parametrize(
+    ("permission_mode", "scheduled_origin", "launch_args"),
+    [
+        ("approve-for-me", True, PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]),
+        ("approve-for-me", False, None),
+        (None, True, None),
+    ],
+)
+async def test_scheduled_origin_workers_use_the_automation_permission_mode(
+    auth_client,
+    auth_app,
+    peers,
+    db_uri,
+    monkeypatch,
+    permission_mode,
+    scheduled_origin,
+    launch_args,
+):
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+    from tests.server.helpers import build_agent_bundle
+
+    source, _target, _captured = peers
+    uploaded = await auth_client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(
+                    "codex-worker", executor={"config": {"harness": "codex-native"}}
+                ),
+                "application/gzip",
+            )
+        },
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    worker_agent_id = uploaded.json()["agent_id"]
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    task = schedules.create(
+        scheduled_task_id=uuid4().hex,
+        name="Trigger watcher",
+        prompt="Start a worker for each new item",
+        rrule="FREQ=HOURLY",
+        user_id="alice",
+        agent_id=worker_agent_id,
+        timezone="UTC",
+        execution_target="managed_sandbox",
+        permission_mode=permission_mode,
+    )
+    monkeypatch.setattr(auth_app.state, "scheduled_task_store", schedules)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    if scheduled_origin:
+        conversations.set_labels(source["id"], {SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id})
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": worker_agent_id, "placement": "managed"}),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert result.get("conversation_id"), result
+    worker = conversations.get_conversation(result["conversation_id"])
+    assert worker.terminal_launch_args == launch_args
 
 
 @pytest.mark.parametrize("placement", ["same_host", "managed"])

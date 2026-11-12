@@ -13,6 +13,8 @@ from omnigent.native.permission_modes import (
     APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
 )
+from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.stores.conversation_store import CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
 
 _logger = logging.getLogger(__name__)
 
@@ -74,6 +76,55 @@ async def scheduled_agent_harness(agent: Any, agent_cache: Any) -> str | None:
     """Resolve the saved agent; return None when its harness cannot be determined."""
     harness, _ = await _scheduled_agent_executor(agent, agent_cache)
     return harness
+
+
+def permission_mode_launch_options(
+    harness: str, permission_mode: str
+) -> tuple[list[str] | None, dict[str, str]] | None:
+    """Launch args and labels that start ``harness`` in ``permission_mode``.
+
+    ``None`` when the harness has no such mode; ``None`` args keep the CLI's own default.
+    """
+    args = PERMISSION_LAUNCH_ARGS.get(harness, {}).get(permission_mode)
+    if args is None:
+        return None
+    labels = {}
+    if harness == "codex-native" and permission_mode == "bypass":
+        labels[CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
+    return list(args) or None, labels
+
+
+async def automation_session_launch_options(
+    scheduled_task_store: Any,
+    scheduled_task_id: str | None,
+    *,
+    user_id: str | None,
+    harness: str | None,
+) -> tuple[list[str] | None, dict[str, str]] | None:
+    """The automation's permission mode for a session that one of its runs creates.
+
+    ``None`` keeps the new session's agent default: the creator is not an automation
+    run, the automation is gone, has no mode or belongs to another user, or the new
+    session's harness has no such mode.
+    """
+    if scheduled_task_store is None or not scheduled_task_id or harness is None:
+        return None
+    task = await asyncio.to_thread(scheduled_task_store.get, scheduled_task_id)
+    if task is None or task.permission_mode is None:
+        return None
+    if (task.user_id or RESERVED_USER_LOCAL) != (user_id or RESERVED_USER_LOCAL):
+        return None
+    harness = canonicalize_harness(harness) or harness
+    options = permission_mode_launch_options(harness, task.permission_mode)
+    if options is None:
+        _logger.info(
+            "Automation %s permission mode %r does not apply to harness %r; "
+            "the new session uses its agent default",
+            task.id,
+            task.permission_mode,
+            harness,
+        )
+    return options
 
 
 async def scheduled_agent_default_permission_mode(agent: Any, agent_cache: Any) -> str | None:
