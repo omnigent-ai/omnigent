@@ -172,6 +172,87 @@ async def test_get_session_survives_agent_row_read_failure(
     assert body.get("llm_model") is None
 
 
+_OWNER = {"X-Forwarded-Email": "owner@example.test"}
+
+
+async def _create_owned_session(auth_client: httpx.AsyncClient) -> str:
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
+
+    response = await post_session_bundle(
+        auth_client.post, "/v1/sessions", build_agent_bundle(name="hello_world"), headers=_OWNER
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["session_id"]
+
+
+def _failing_statement(db_uri: str) -> None:
+    """Fail one SQL statement on a read maker that joins the request's shared read scope."""
+    from sqlalchemy import text
+
+    with make_managed_session_maker(get_or_create_engine(db_uri))() as session:
+        session.execute(text("SELECT * FROM table_that_does_not_exist"))
+
+
+async def test_get_session_reads_owner_grant_after_agent_row_failure(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The side-chat owner read after a failed agent-row read still runs in the shared scope.
+
+    On PostgreSQL the failure aborts the shared transaction, so the owner-grant
+    read that follows only succeeds because the failure was rolled back.
+    """
+    session_id = await _create_owned_session(auth_client)
+
+    def failing_get(self: SqlAlchemyAgentStore, agent_id: str) -> None:
+        _failing_statement(db_uri)
+
+    monkeypatch.setattr(SqlAlchemyAgentStore, "get", failing_get)
+    resp = await auth_client.get(f"/v1/sessions/{session_id}", headers=_OWNER)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["id"] == session_id
+    assert body.get("agent_name") is None
+    assert body["side_chat_allowed"] is True
+
+
+async def test_list_sessions_recovers_between_batches_after_pull_request_read_failure(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed PR-summary read in one list batch leaves the next batch's reads working.
+
+    PR summaries are each batch's last read, so two one-row batches put the
+    second batch's grant read after the failure; on PostgreSQL it succeeds only
+    because the failure was rolled back.
+    """
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.stores.session_pull_request_store import SessionPullRequestStore
+
+    first_id = await _create_owned_session(auth_client)
+    second_id = await _create_owned_session(auth_client)
+    monkeypatch.setattr(routes_core, "_SESSION_LIST_BATCH_SIZE", 1)
+    original_summaries = SessionPullRequestStore.summaries
+    calls: list[list[str]] = []
+
+    def summaries_failing_once(self: SessionPullRequestStore, conversation_ids: list[str]):
+        calls.append(list(conversation_ids))
+        if len(calls) == 1:
+            _failing_statement(db_uri)
+        return original_summaries(self, conversation_ids)
+
+    monkeypatch.setattr(SessionPullRequestStore, "summaries", summaries_failing_once)
+    resp = await auth_client.get(
+        "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=mine", headers=_OWNER
+    )
+    assert resp.status_code == 200, resp.text
+    assert {row["id"] for row in resp.json()["data"]} == {first_id, second_id}
+    assert len(calls) == 2, "expected one PR-summary read per one-row batch"
+
+
 async def test_get_session_not_found(client: httpx.AsyncClient) -> None:
     """Getting a nonexistent session returns 404."""
     resp = await client.get("/v1/sessions/4fe12335002377c209e501c3fe3bcffc")
