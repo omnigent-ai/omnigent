@@ -995,6 +995,19 @@
   );
 }
 
+/* The Tasks tab's header stays pinned while tasks scroll under it.
+ * Light panels are opaque, so it is too; dark panels are translucent over the
+ * shell's glow, so it frosts what scrolls beneath, like the session header. */
+.tasks-header {
+  background: var(--card-solid);
+}
+
+.dark .tasks-header {
+  background-color: color-mix(in srgb, var(--app-shell-bg) 60%, transparent);
+  -webkit-backdrop-filter: blur(12px) saturate(145%);
+  backdrop-filter: blur(12px) saturate(145%);
+}
+
 @starting-style {
   .workspace-panel-motion[data-state="open"][data-animate-visibility] {
     width: 0 !important;
@@ -1463,12 +1476,12 @@ html[data-electron-mac] .breadcrumb-folder {
 }
 
 /* Native shells render beneath the status bar at every width. Keep floating
- * chat controls and the pinned Plan tracker below its safe area. Wide headers
+ * chat controls and the pinned task preview below its safe area. Wide headers
  * have too little space around 44px controls to overlap the status-bar inset. */
 :is([data-ios-native], [data-android-native]) .chat-header {
   top: max(0px, calc(var(--omnigent-safe-top) - var(--omnigent-header-top-overlap, 0px)));
 }
-:is([data-ios-native], [data-android-native]) .chat-plan-accordion {
+:is([data-ios-native], [data-android-native]) .chat-tasks-preview {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
 }
 

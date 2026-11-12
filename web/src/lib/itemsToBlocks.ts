@@ -64,6 +64,7 @@ import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
 import { isClaudeAgentMessageContent, taskNotificationMarkerContent } from "./systemMessage";
 import { readSubagentActivity } from "./subagentActivity";
+import { readTaskActivity } from "./taskActivity";
 
 // Claude built-ins whose call is a question TO the user rather than work
 // the agent did on its own. The elicitation that carried the card is
@@ -242,7 +243,8 @@ function answersFromToolResult(
 
 function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBlock | null {
   const data = item as unknown as Record<string, unknown>;
-  if (readSubagentActivity(data)) {
+  // Task markers place and fold like sub-agent markers, so they share the notice kind.
+  if (readSubagentActivity(data) || readTaskActivity(data)) {
     return {
       type: "native_tool",
       ctx: ctxFor(item),

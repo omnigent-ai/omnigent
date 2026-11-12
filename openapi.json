@@ -2163,6 +2163,37 @@
         "title": "CreateSessionPolicyRequest",
         "type": "object"
       },
+      "CreateWorkflowRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /v1/workflows`.",
+        "properties": {
+          "description": {
+            "description": "What the workflow is for, at most 2,000 characters.",
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "description": "One line of at most 80 characters, unique among the caller's workflows.",
+            "title": "Name",
+            "type": "string"
+          },
+          "steps": {
+            "description": "The graph: unique step IDs, dependencies inside it, no cycles, at most 100 steps.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "steps"
+        ],
+        "title": "CreateWorkflowRequest",
+        "type": "object"
+      },
       "CreatedEvent": {
         "description": "Initial event emitted at the start of every streaming response.\n\nCarries the freshly-allocated\n`omnigent.server.schemas.ResponseObject` (status will\nbe `\"queued\"` or `\"in_progress\"` depending on whether the\ntask started immediately).",
         "properties": {
@@ -6719,6 +6750,11 @@
             "title": "Session Fork Workspaces",
             "type": "boolean"
           },
+          "session_journal": {
+            "default": false,
+            "title": "Session Journal",
+            "type": "boolean"
+          },
           "session_list_scoped_archives": {
             "default": true,
             "title": "Session List Scoped Archives",
@@ -6789,6 +6825,11 @@
           },
           "smart_routing_sources": {
             "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
+          },
+          "workflows": {
+            "default": false,
+            "title": "Workflows",
+            "type": "boolean"
           }
         },
         "required": [
@@ -6854,6 +6895,7 @@
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
+            "session.journal.appended": "#/components/schemas/SessionJournalAppendedEvent",
             "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
@@ -6950,6 +6992,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionChildSessionUpdatedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionJournalAppendedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionChangedFilesInvalidatedEvent"
@@ -8420,6 +8465,292 @@
           }
         },
         "title": "SessionItemList",
+        "type": "object"
+      },
+      "SessionJournalAppendRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /v1/sessions/{id}/journal`, sent by the session's runner.",
+        "properties": {
+          "idempotency_key": {
+            "description": "Names the write, e.g. `\"tool:<tool call ID>\"`; a retry with the same key returns the first attempt's entry.",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "kind": {
+            "description": "The kind the agent writes.",
+            "enum": [
+              "status",
+              "note",
+              "plan"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "description": "The kind's fields, e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}`.",
+            "title": "Payload",
+            "type": "object"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The plan step the entry is about.",
+            "title": "Step"
+          }
+        },
+        "required": [
+          "kind",
+          "payload",
+          "idempotency_key"
+        ],
+        "title": "SessionJournalAppendRequest",
+        "type": "object"
+      },
+      "SessionJournalAppendedEvent": {
+        "description": "An entry was appended to the session's journal.\n\nTransient: the journal itself is the source of truth, and a client that\nreconnects catches up with `GET \u2026/journal?order=asc&after=<last entry ID>`.",
+        "properties": {
+          "conversation_id": {
+            "description": "The session whose journal grew.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "entry": {
+            "$ref": "#/components/schemas/SessionJournalEntry",
+            "description": "The new entry."
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.journal.appended",
+            "description": "Always `\"session.journal.appended\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "entry"
+        ],
+        "title": "SessionJournalAppendedEvent",
+        "type": "object"
+      },
+      "SessionJournalAuthor": {
+        "description": "Who wrote a journal entry, derived from its kind and, for plans, its source.",
+        "properties": {
+          "type": {
+            "description": "`\"agent\"` for the session's agent, `\"omnigent\"` for entries Omnigent writes.",
+            "enum": [
+              "agent",
+              "omnigent"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "SessionJournalAuthor",
+        "type": "object"
+      },
+      "SessionJournalEntry": {
+        "description": "One entry of a session's journal.",
+        "properties": {
+          "author": {
+            "$ref": "#/components/schemas/SessionJournalAuthor"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds when it was appended.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Entry ID, a bare 32-character hex UUID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "description": "The entry kind; `payload` holds its fields.",
+            "enum": [
+              "status",
+              "note",
+              "dispatch",
+              "dispatch_result",
+              "plan",
+              "plan_status"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "description": "e.g. `{\"status\": \"done\", \"text\": \"PR merged\"}` for a status, `{\"body\": \"\u2026\"}` for a note, or `{\"version\": 2, \"source\": \"agent\", \"steps\": [...]}` for a plan.",
+            "title": "Payload",
+            "type": "object"
+          },
+          "position": {
+            "description": "The entry's place in the journal: 0, 1, 2, \u2026",
+            "format": "int64",
+            "title": "Position",
+            "type": "integer"
+          },
+          "scheduled_task_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The automation run the session was serving, or `None`.",
+            "title": "Scheduled Task Run Id"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The plan step it is about, e.g. `\"propose\"`, or `None`.",
+            "title": "Step"
+          }
+        },
+        "required": [
+          "id",
+          "position",
+          "created_at",
+          "author",
+          "kind",
+          "payload"
+        ],
+        "title": "SessionJournalEntry",
+        "type": "object"
+      },
+      "SessionJournalInputRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /v1/sessions/{id}/journal/input-requests`, sent by the session's runner.",
+        "properties": {
+          "idempotency_key": {
+            "description": "Names the request, e.g. `\"tool:<tool call ID>\"`; a retry with the same key reuses the first attempt's status and question.",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "questions": {
+            "description": "1 to 3 questions, each with a `question`, a short `header`, 2 to 4 `options` (`label`, optional `description`) and an optional `recommended` option label.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Questions",
+            "type": "array"
+          },
+          "step": {
+            "description": "The task in the current plan that waits for the answer, e.g. `\"deploy\"`.",
+            "title": "Step",
+            "type": "string"
+          }
+        },
+        "required": [
+          "step",
+          "questions",
+          "idempotency_key"
+        ],
+        "title": "SessionJournalInputRequest",
+        "type": "object"
+      },
+      "SessionJournalInputRequested": {
+        "description": "Response of `POST /v1/sessions/{id}/journal/input-requests`.",
+        "properties": {
+          "elicitation_id": {
+            "description": "The question's elicitation; the runner waits for its answer.",
+            "title": "Elicitation Id",
+            "type": "string"
+          },
+          "entry": {
+            "$ref": "#/components/schemas/SessionJournalEntry",
+            "description": "The task's `needs_input` status."
+          }
+        },
+        "required": [
+          "entry",
+          "elicitation_id"
+        ],
+        "title": "SessionJournalInputRequested",
+        "type": "object"
+      },
+      "SessionJournalPage": {
+        "description": "One page of a session's journal, for `GET /v1/sessions/{id}/journal`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SessionJournalEntry"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SessionJournalPage",
         "type": "object"
       },
       "SessionLabelsResponse": {
@@ -13204,6 +13535,53 @@
         "title": "UpdateSessionRequest",
         "type": "object"
       },
+      "UpdateWorkflowRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `PATCH /v1/workflows/{workflow_id}`; `None` keeps a field.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A new description.",
+            "title": "Description"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A new name.",
+            "title": "Name"
+          },
+          "steps": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/WorkflowStep"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New steps, replacing the old ones.",
+            "title": "Steps"
+          }
+        },
+        "title": "UpdateWorkflowRequest",
+        "type": "object"
+      },
       "UpsertMCPServerRequest": {
         "description": "Request body for creating or updating a session agent MCP server.\n\n`env` is still excluded. `headers` is accepted for HTTP servers;\nwhen omitted, existing headers in the bundle are preserved unchanged.",
         "properties": {
@@ -13483,6 +13861,228 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "WorkflowDeleted": {
+        "description": "Response for `DELETE /v1/workflows/{workflow_id}`.",
+        "properties": {
+          "deleted": {
+            "const": true,
+            "default": true,
+            "description": "Always `True`.",
+            "title": "Deleted",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "The deleted workflow's ID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "object": {
+            "const": "workflow.deleted",
+            "default": "workflow.deleted",
+            "description": "Discriminator; always `\"workflow.deleted\"`.",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "WorkflowDeleted",
+        "type": "object"
+      },
+      "WorkflowList": {
+        "description": "One page of the caller's workflows by name, for `GET /v1/workflows`.",
+        "properties": {
+          "data": {
+            "description": "The page's workflows, without their steps.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowSummary"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The page's first workflow ID, or `None` when empty.",
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "description": "Whether another page follows.",
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The page's last workflow ID; pass it as `after` for the next page.",
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "description": "Discriminator; always `\"list\"`.",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "WorkflowList",
+        "type": "object"
+      },
+      "WorkflowObject": {
+        "description": "A saved workflow with its steps, the plan a run copies into a journal.",
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "object": {
+            "const": "workflow",
+            "default": "workflow",
+            "title": "Object",
+            "type": "string"
+          },
+          "steps": {
+            "description": "The workflow's graph.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          },
+          "updated_at": {
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "created_at",
+          "updated_at",
+          "steps"
+        ],
+        "title": "WorkflowObject",
+        "type": "object"
+      },
+      "WorkflowStep": {
+        "additionalProperties": false,
+        "description": "One step of a saved workflow, in the journal plan's step format.",
+        "properties": {
+          "depends_on": {
+            "description": "IDs of the steps that must be done before it.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Depends On",
+            "type": "array"
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the step achieves, at most 300 characters, or `None`.",
+            "title": "Goal"
+          },
+          "id": {
+            "description": "Stable step ID, e.g. `\"build\"`: lowercase letters, digits, `-` and `_`, starting with a letter or digit; at most 64 characters.",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "description": "One line of at most 80 characters, e.g. `\"Build\"`.",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "WorkflowStep",
+        "type": "object"
+      },
+      "WorkflowSummary": {
+        "description": "A saved workflow as a list page returns it, without its steps.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds when it was saved.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "description": {
+            "description": "What the workflow is for.",
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "description": "Workflow ID, a bare 32-character hex UUID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "description": "One line, unique among the owner's workflows.",
+            "title": "Name",
+            "type": "string"
+          },
+          "object": {
+            "const": "workflow",
+            "default": "workflow",
+            "description": "Discriminator; always `\"workflow\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "Unix epoch seconds of the last write.",
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "WorkflowSummary",
         "type": "object"
       }
     },
@@ -18908,6 +19508,251 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/journal": {
+      "get": {
+        "description": "One page of the session's journal by position; requires read access.\n\n`after` continues in the sort order and `before` goes against it,\nboth taking entry IDs, as for conversation items.",
+        "operationId": "list_session_journal_v1_sessions__session_id__journal_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "default": "asc",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "title": "Order",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "status",
+                    "note",
+                    "dispatch",
+                    "dispatch_result",
+                    "plan",
+                    "plan_status"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "step",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Step"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionJournalPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Journal",
+        "tags": [
+          "session_journal"
+        ]
+      },
+      "post": {
+        "description": "Append an entry written by the session's agent; only its runner calls this.",
+        "operationId": "append_session_journal_entry_v1_sessions__session_id__journal_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionJournalAppendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionJournalEntry"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append Session Journal Entry",
+        "tags": [
+          "session_journal"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/journal/input-requests": {
+      "post": {
+        "description": "Mark a task waiting for the user and ask them; only the session's runner calls this.\n\nThe task gets a `needs_input` status naming the first question, and the\nquestions go out as an elicitation with the web's question form. A retry\nwith the same idempotency key reuses the status and the elicitation ID.",
+        "operationId": "request_session_journal_input_v1_sessions__session_id__journal_input_requests_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionJournalInputRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionJournalInputRequested"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Request Session Journal Input",
+        "tags": [
+          "session_journal"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/labels": {
       "get": {
         "description": "Return only the labels for a session.\n\nNative runner bridge setup needs labels during harness spawn,\nbut the full session snapshot also loads history, skills,\nrunner status, and agent metadata. This endpoint keeps that\nspawn-time dependency to one authorized conversation read.\n\n**Returns:** The session id and labels.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
@@ -23115,6 +23960,262 @@
         "summary": "Get Usage",
         "tags": [
           "usage"
+        ]
+      }
+    },
+    "/v1/workflows": {
+      "get": {
+        "description": "List the caller's workflows by name, without their steps.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 400 for an `after` that isn't one of the caller's workflows.",
+        "operationId": "list_workflows_v1_workflows_get",
+        "parameters": [
+          {
+            "description": "Page size, e.g. `50`.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The previous page's `last_id`.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "description": "Only the workflow with this exact name, for `/workflow <name>`.",
+            "in": "query",
+            "name": "name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Workflows",
+        "tags": [
+          "workflows"
+        ]
+      },
+      "post": {
+        "description": "Save a workflow owned by the caller.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 400 for an invalid field or steps too large to store, 409 if the caller already has a workflow with this name.",
+        "operationId": "create_workflow_v1_workflows_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkflowRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Workflow",
+        "tags": [
+          "workflows"
+        ]
+      }
+    },
+    "/v1/workflows/{workflow_id}": {
+      "delete": {
+        "description": "Delete one of the caller's workflows.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow.",
+        "operationId": "delete_workflow_v1_workflows__workflow_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowDeleted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Workflow",
+        "tags": [
+          "workflows"
+        ]
+      },
+      "get": {
+        "description": "Return one of the caller's workflows, with its steps.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow.",
+        "operationId": "get_workflow_v1_workflows__workflow_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Workflow",
+        "tags": [
+          "workflows"
+        ]
+      },
+      "patch": {
+        "description": "Change one of the caller's workflows; fields left out keep their values.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 400 for an invalid field, 404 if the caller has no such workflow, 409 if another of the caller's workflows has the new name.",
+        "operationId": "update_workflow_v1_workflows__workflow_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWorkflowRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Workflow",
+        "tags": [
+          "workflows"
         ]
       }
     }

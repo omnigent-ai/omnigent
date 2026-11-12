@@ -10006,12 +10006,22 @@ async def test_post_external_session_todos_publishes_session_todos(
     assert resp.status_code == 202, resp.text
     assert resp.json() == {"queued": False}
 
-    # Exactly one session.todos event must be published; no extra events.
-    assert [ev["type"] for _, ev in published] == ["session.todos"]
-    assert published[0][0] == session["id"]
+    # One chat marker each for the task that completed and the one that
+    # started, then exactly one session.todos event.
+    assert [ev["type"] for _, ev in published] == [
+        "response.output_item.done",
+        "response.output_item.done",
+        "session.todos",
+    ]
+    markers = [ev["item"]["resource"] for _, ev in published[:2]]
+    assert [(m["name"], m["status"]) for m in markers] == [
+        ("Write tests", "done"),
+        ("Fix the bug", "started"),
+    ]
+    assert {session_id for session_id, _ in published} == {session["id"]}
     # The full todos list is forwarded verbatim to subscribers.
-    assert published[0][1]["todos"] == todos
-    assert published[0][1]["conversation_id"] == session["id"]
+    assert published[2][1]["todos"] == todos
+    assert published[2][1]["conversation_id"] == session["id"]
 
 
 async def test_post_external_session_todos_updates_snapshot(

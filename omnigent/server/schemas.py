@@ -3252,6 +3252,224 @@ class SessionPullRequestList(BaseModel):
     synced: bool = False
 
 
+JournalEntryKind = Literal["status", "note", "dispatch", "dispatch_result", "plan", "plan_status"]
+
+
+class SessionJournalAuthor(BaseModel):
+    """
+    Who wrote a journal entry, derived from its kind and, for plans, its source.
+
+    :param type: ``"agent"`` for the session's agent, ``"omnigent"`` for
+        entries Omnigent writes.
+    """
+
+    type: Literal["agent", "omnigent"]
+
+
+class SessionJournalEntry(BaseModel):
+    """
+    One entry of a session's journal.
+
+    :param id: Entry ID, a bare 32-character hex UUID.
+    :param position: The entry's place in the journal: 0, 1, 2, …
+    :param created_at: Unix epoch seconds when it was appended.
+    :param scheduled_task_run_id: The automation run the session was serving,
+        or ``None``.
+    :param step: The plan step it is about, e.g. ``"propose"``, or ``None``.
+    :param kind: The entry kind; ``payload`` holds its fields.
+    :param payload: e.g. ``{"status": "done", "text": "PR merged"}`` for a
+        status, ``{"body": "…"}`` for a note, or ``{"version": 2, "source":
+        "agent", "steps": [...]}`` for a plan.
+    """
+
+    id: str
+    position: int
+    created_at: int
+    scheduled_task_run_id: str | None = None
+    step: str | None = None
+    author: SessionJournalAuthor
+    kind: JournalEntryKind
+    payload: dict[str, Any]
+
+
+class SessionJournalPage(BaseModel):
+    """
+    One page of a session's journal, for ``GET /v1/sessions/{id}/journal``.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[SessionJournalEntry] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class WorkflowStep(BaseModel):
+    """
+    One step of a saved workflow, in the journal plan's step format.
+
+    :param id: Stable step ID, e.g. ``"build"``: lowercase letters, digits,
+        ``-`` and ``_``, starting with a letter or digit; at most 64 characters.
+    :param name: One line of at most 80 characters, e.g. ``"Build"``.
+    :param goal: What the step achieves, at most 300 characters, or ``None``.
+    :param depends_on: IDs of the steps that must be done before it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    goal: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
+
+
+class WorkflowSummary(BaseModel):
+    """
+    A saved workflow as a list page returns it, without its steps.
+
+    :param id: Workflow ID, a bare 32-character hex UUID.
+    :param object: Discriminator; always ``"workflow"``.
+    :param name: One line, unique among the owner's workflows.
+    :param description: What the workflow is for.
+    :param created_at: Unix epoch seconds when it was saved.
+    :param updated_at: Unix epoch seconds of the last write.
+    """
+
+    id: str
+    object: Literal["workflow"] = "workflow"
+    name: str
+    description: str
+    created_at: int
+    updated_at: int
+
+
+class WorkflowObject(WorkflowSummary):
+    """
+    A saved workflow with its steps, the plan a run copies into a journal.
+
+    :param steps: The workflow's graph.
+    """
+
+    steps: list[WorkflowStep]
+
+
+class WorkflowList(BaseModel):
+    """
+    One page of the caller's workflows by name, for ``GET /v1/workflows``.
+
+    :param object: Discriminator; always ``"list"``.
+    :param data: The page's workflows, without their steps.
+    :param first_id: The page's first workflow ID, or ``None`` when empty.
+    :param last_id: The page's last workflow ID; pass it as ``after`` for the
+        next page.
+    :param has_more: Whether another page follows.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[WorkflowSummary] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class CreateWorkflowRequest(BaseModel):
+    """
+    Request body for ``POST /v1/workflows``.
+
+    :param name: One line of at most 80 characters, unique among the caller's
+        workflows.
+    :param description: What the workflow is for, at most 2,000 characters.
+    :param steps: The graph: unique step IDs, dependencies inside it, no
+        cycles, at most 100 steps.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str
+    steps: list[WorkflowStep]
+
+
+class UpdateWorkflowRequest(BaseModel):
+    """
+    Request body for ``PATCH /v1/workflows/{workflow_id}``; ``None`` keeps a field.
+
+    :param name: A new name.
+    :param description: A new description.
+    :param steps: New steps, replacing the old ones.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    description: str | None = None
+    steps: list[WorkflowStep] | None = None
+
+
+class WorkflowDeleted(BaseModel):
+    """
+    Response for ``DELETE /v1/workflows/{workflow_id}``.
+
+    :param id: The deleted workflow's ID.
+    :param object: Discriminator; always ``"workflow.deleted"``.
+    :param deleted: Always ``True``.
+    """
+
+    id: str
+    object: Literal["workflow.deleted"] = "workflow.deleted"
+    deleted: Literal[True] = True
+
+
+class SessionJournalAppendRequest(BaseModel):
+    """
+    Body of ``POST /v1/sessions/{id}/journal``, sent by the session's runner.
+
+    :param kind: The kind the agent writes.
+    :param payload: The kind's fields, e.g. ``{"status": "done", "text": "PR merged"}``.
+    :param step: The plan step the entry is about.
+    :param idempotency_key: Names the write, e.g. ``"tool:<tool call ID>"``; a
+        retry with the same key returns the first attempt's entry.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["status", "note", "plan"]
+    payload: dict[str, Any]
+    step: str | None = None
+    idempotency_key: str = Field(min_length=1, max_length=128)
+
+
+class SessionJournalInputRequest(BaseModel):
+    """
+    Body of ``POST /v1/sessions/{id}/journal/input-requests``, sent by the session's runner.
+
+    :param step: The task in the current plan that waits for the answer, e.g. ``"deploy"``.
+    :param questions: 1 to 3 questions, each with a ``question``, a short
+        ``header``, 2 to 4 ``options`` (``label``, optional ``description``) and
+        an optional ``recommended`` option label.
+    :param idempotency_key: Names the request, e.g. ``"tool:<tool call ID>"``; a
+        retry with the same key reuses the first attempt's status and question.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    step: str
+    questions: list[dict[str, Any]]
+    idempotency_key: str = Field(min_length=1, max_length=128)
+
+
+class SessionJournalInputRequested(BaseModel):
+    """
+    Response of ``POST /v1/sessions/{id}/journal/input-requests``.
+
+    :param entry: The task's ``needs_input`` status.
+    :param elicitation_id: The question's elicitation; the runner waits for its answer.
+    """
+
+    entry: SessionJournalEntry
+    elicitation_id: str
+
+
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.
@@ -5458,6 +5676,23 @@ class SessionChildSessionUpdatedEvent(_SSEEventBase):
     child: dict[str, Any]
 
 
+class SessionJournalAppendedEvent(_SSEEventBase):
+    """
+    An entry was appended to the session's journal.
+
+    Transient: the journal itself is the source of truth, and a client that
+    reconnects catches up with ``GET …/journal?order=asc&after=<last entry ID>``.
+
+    :param type: Always ``"session.journal.appended"``.
+    :param conversation_id: The session whose journal grew.
+    :param entry: The new entry.
+    """
+
+    type: Literal["session.journal.appended"]
+    conversation_id: str
+    entry: SessionJournalEntry
+
+
 class SessionChangedFilesInvalidatedEvent(_SSEEventBase):
     """
     The session's changed-files list may have changed — refetch it.
@@ -5602,6 +5837,7 @@ ServerStreamEvent = Annotated[
     | SessionResourceCreatedEvent
     | SessionResourceDeletedEvent
     | SessionChildSessionUpdatedEvent
+    | SessionJournalAppendedEvent
     | SessionChangedFilesInvalidatedEvent
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────

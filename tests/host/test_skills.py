@@ -34,11 +34,13 @@ def _skill(name: str, *, hidden: bool = False) -> str:
 
 
 def _bundle(files: dict[str, str], **config: object) -> bytes:
+    """A gzipped agent bundle; it leaves out the framework ``workflow`` skill unless asked."""
     config = {
         "spec_version": 1,
         "name": "test-agent",
         "llm": {"model": "test", "connection": {"api_key": "test-key"}},
         "executor": {"config": {"harness": "claude-sdk"}},
+        "tool_groups": {"journal": False},
         **config,
     }
     output = io.BytesIO()
@@ -103,6 +105,23 @@ def test_session_catalog_matches_invocation_scope(
     assert resolved[0].skill_dir == runner_bundle / "skills" / "bundled"
 
 
+def test_session_catalog_ends_with_the_framework_workflow_skill(tmp_path: Path) -> None:
+    """Agents with the journal tools get ``/workflow``; their own skill of that name wins."""
+    plain = _bundle({"skills/bundled/SKILL.md": _skill("bundled")}, tool_groups={})
+    own = _bundle({"skills/workflow/SKILL.md": _skill("workflow")}, tool_groups={})
+    frame = HostSkillsFrame("request", "session", str(tmp_path), "session", "agent", "1")
+
+    catalog = HostSkillDiscovery(lambda _: _response(plain)).discover(frame, tmp_path)
+    assert [skill["name"] for skill in catalog] == ["bundled", "workflow"]
+    assert catalog[1]["description"].startswith("Plan and run a multi-step workflow")
+    spec = load(plain, dest=tmp_path / "runner-bundle", expand_env=False)
+    resolved = resolve_session_skills(spec, (tmp_path,), tmp_path / "runner-bundle")
+    assert catalog == [{"name": s.name, "description": s.description} for s in resolved]
+
+    overridden = HostSkillDiscovery(lambda _: _response(own)).discover(frame, tmp_path)
+    assert overridden == [{"name": "workflow", "description": "workflow description"}]
+
+
 @pytest.mark.parametrize("remove_link", [True, False], ids=["removed", "permission-denied"])
 def test_session_catalog_handles_host_skill_symlink_race(
     tmp_path: Path,
@@ -157,6 +176,7 @@ def test_nested_subagent_uses_directory_name_and_own_filter(tmp_path: Path) -> N
             "llm": {"model": "test", "connection": {"api_key": "test"}},
             "skills": "none",
             "executor": {"config": {"harness": "claude-sdk"}},
+            "tool_groups": {"journal": False},
         }
     )
     bundle = _bundle(

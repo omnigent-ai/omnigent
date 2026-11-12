@@ -308,6 +308,11 @@ export interface ServerInfo {
    */
   session_pull_requests?: boolean;
   /**
+   * True when the server keeps session journals (``/v1/sessions/{id}/journal`` and
+   * ``session.journal.appended``), which the Tasks tab shows; absent on older servers (off).
+   */
+  session_journal?: boolean;
+  /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
    */
@@ -654,6 +659,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_pull_requests: data.session_pull_requests === true,
+          session_journal: data.session_journal === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),

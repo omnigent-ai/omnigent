@@ -623,6 +623,10 @@ class SqlSessionPermission(OmnigentBase):
     )
 
 
+# Largest stored value of a new compressed column: under the 16 KiB per-value
+# limit in docs/DATABASE_BEST_PRACTICES.md, which forbids exactly 16,384 bytes.
+MAX_STORED_VALUE_BYTES = 16 * 1024 - 1
+
 # MySQL stores these documents as BLOB (at most 65,535 bytes), so writes that
 # compress past that fail before reaching MySQL. Other dialects keep the uncapped codec.
 _MYSQL_BLOB_TEXT = CompressedText().with_variant(CompressedText(max_stored_bytes=65_535), "mysql")
@@ -1780,4 +1784,191 @@ class SqlScheduledTaskRun(OmnigentBase):
             "status",
             "id",
         ),
+    )
+
+
+class SqlSessionJournalEntry(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_journal_entries`` table.
+
+    One append-only entry in a session's journal: a plan, a step status, a note,
+    or a record of work sent to another session. Entries are never updated and
+    are deleted only with their session.
+
+    :param conversation_id: The session that owns the journal (relates to
+        ``conversations.id``; no DB foreign key, Rule R032).
+    :param position: The entry's place in the session's journal, 0, 1, 2, …,
+        allocated from ``session_journal_heads.next_position`` under its lock.
+    :param created_at: Unix epoch seconds when the entry was appended. Set once;
+        a deployment can partition the table on it.
+    :param id: UUID of the entry, stored as 16 raw bytes.
+    :param kind: The entry kind as a ``JOURNAL_ENTRY_KIND`` code
+        (``omnigent.db.enum_codecs``).
+    :param scheduled_task_run_id: The automation run the session was serving
+        (relates to ``scheduled_task_runs.id``; no DB foreign key); ``None``
+        outside automation runs.
+    :param workflow_id: The workflow the entry was written under, a UUID in the
+        session ID's format; ``None`` outside workflows. Nothing writes it yet:
+        it ships now so the phase that gives workflows IDs needs no migration.
+    :param step: The plan step the entry is about, e.g. ``"propose"``; ``None``
+        for entries about no step, such as plans.
+    :param idempotency_key: Names the write that appended the entry, e.g.
+        ``"tool:toolu_01…"``, so a retried append returns the existing entry.
+    :param payload: The kind's fields as compressed JSON, at most
+        :data:`MAX_STORED_VALUE_BYTES` bytes stored.
+    """
+
+    __tablename__ = "session_journal_entries"
+
+    # A new table takes no database defaults; writes always name the workspace.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # In the PK so a deployment can partition by time with pure DDL; no unique
+    # key may leave it out. Immutable: entries are insert/delete-only.
+    created_at: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    # No CHECK, so adding a kind needs no migration.
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    scheduled_task_run_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Unindexed until a query reads it.
+    workflow_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    step: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False
+    )
+
+    # Every index is non-unique and ends with the primary key: the heads lock,
+    # not the database, keeps positions and idempotency keys unique.
+    __table_args__ = (
+        # Resolves an entry ID to its position for after/before cursors.
+        Index(
+            "ix_session_journal_entries_id",
+            "workspace_id",
+            "conversation_id",
+            "id",
+            "position",
+            "created_at",
+        ),
+        # Finds an earlier attempt of a retried append.
+        Index(
+            "ix_session_journal_entries_idempotency_key",
+            "workspace_id",
+            "conversation_id",
+            "idempotency_key",
+            "position",
+            "created_at",
+        ),
+        # Pages one kind in order, e.g. the current plan and plan history.
+        Index(
+            "ix_session_journal_entries_kind",
+            "workspace_id",
+            "conversation_id",
+            "kind",
+            "position",
+            "created_at",
+        ),
+        # Pages one kind for one step, e.g. a step's newest status.
+        Index(
+            "ix_session_journal_entries_kind_step",
+            "workspace_id",
+            "conversation_id",
+            "kind",
+            "step",
+            "position",
+            "created_at",
+        ),
+        # One kind recorded during one automation run, e.g. its statuses for the
+        # run history. A run serves a single session.
+        Index(
+            "ix_session_journal_entries_scheduled_task_run_id",
+            "workspace_id",
+            "scheduled_task_run_id",
+            "conversation_id",
+            "kind",
+            "position",
+            "created_at",
+        ),
+        # Pages one step's entries of every kind in order, for the step drawer.
+        Index(
+            "ix_session_journal_entries_step",
+            "workspace_id",
+            "conversation_id",
+            "step",
+            "position",
+            "created_at",
+        ),
+    )
+
+
+class SqlSessionJournalHead(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_journal_heads`` table.
+
+    A session's journal counter. Appends lock this row, so a session's appends
+    run one at a time without waiting on its metadata row. Created by the
+    session's first append and deleted with the session.
+
+    :param conversation_id: The session (relates to ``conversations.id``; no DB
+        foreign key, Rule R032).
+    :param next_position: The position the session's next entry gets.
+    """
+
+    __tablename__ = "session_journal_heads"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    next_position: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class SqlWorkflow(OmnigentBase):
+    """
+    SQLAlchemy model for the ``workflows`` table.
+
+    A saved workflow: a named plan its owner can run. A run copies the plan into
+    the session's journal, whose entries then carry the workflow's ID in
+    ``session_journal_entries.workflow_id``. Workflows have no versions: an edit
+    rewrites the row, and each run's journal keeps the plan it ran.
+
+    :param id: UUID of the workflow, in the session ID's format (bare hex).
+    :param user_id: The owning user, or ``None`` in single-user mode. Names are
+        unique per owner, checked by the store rather than by a unique key.
+    :param name: One line, e.g. ``"nightly-build"``; a run's plan takes this name.
+    :param description: What the workflow is for; a run gives it to the agent as
+        the goal.
+    :param plan: The plan in the journal's plan format, as compressed JSON, at
+        most :data:`MAX_STORED_VALUE_BYTES` bytes stored.
+    :param created_at: Unix epoch seconds when the workflow was saved.
+    :param updated_at: Unix epoch seconds of the last write; ``created_at`` until
+        the first edit.
+    """
+
+    __tablename__ = "workflows"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, nullable=False, default=current_workspace_id
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # String(128) matches every other user-identity column.
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # A run's plan takes this name, and plan names are at most 80 characters.
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    # A few paragraphs: at most 8,000 bytes in UTF-8.
+    description: Mapped[str] = mapped_column(String(2000), nullable=False)
+    # Deferred so whole-row reads skip it; list pages never need it.
+    plan: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False, deferred=True
+    )
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        # An owner's workflows by name: the list, `/workflow <name>` and the
+        # store's duplicate-name check. Not unique: NULL owners never collide.
+        Index("ix_workflows_user_id_name", "workspace_id", "user_id", "name", "id"),
     )
