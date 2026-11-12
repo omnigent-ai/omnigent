@@ -1802,6 +1802,43 @@ describe("Sidebar failed session indicator", () => {
     }
   });
 
+  it("offers Create a grid on other session rows and saves the chosen side", async () => {
+    projectRowsRef.current = [];
+    mockConversations([conv("conv_a", "Codex"), conv("conv_b", "Codex")]);
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("local");
+    const resolve = vi.spyOn(identity, "resolveIdentity").mockResolvedValue("local");
+    const key = `omnigent:session-grids:${getOmnigentServerIdentity() ?? "default"}:local`;
+    try {
+      await act(async () => {
+        renderSessionSidebar("/c/conv_a", true);
+      });
+      fireEvent.contextMenu(screen.getByRole("link", { name: "conv_a" }));
+      expect(await screen.findByRole("menu")).toBeVisible();
+      expect(screen.queryByRole("menuitem", { name: "Create a grid" })).toBeNull();
+      fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+      fireEvent.contextMenu(screen.getByRole("link", { name: "conv_b" }));
+      fireEvent.keyDown(await screen.findByRole("menuitem", { name: "Create a grid" }), {
+        key: "ArrowRight",
+      });
+      const sides = await screen.findAllByRole("menuitem", { name: /^To the / });
+      expect(sides.map((item) => item.textContent)).toEqual([
+        "To the left",
+        "To the right",
+        "To the top",
+        "To the bottom",
+      ]);
+      fireEvent.click(screen.getByRole("menuitem", { name: "To the right" }));
+      expect(JSON.parse(localStorage.getItem(key)!)[0].layout).toEqual({
+        axis: "columns",
+        children: ["conv_a", "conv_b"],
+      });
+    } finally {
+      viewer.mockRestore();
+      resolve.mockRestore();
+    }
+  });
+
   it("replaces an unread dot with the error icon and keeps it after marking read", () => {
     const session = conv("conv_error", "Codex", {
       status: "failed",

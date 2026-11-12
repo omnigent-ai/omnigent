@@ -508,9 +508,9 @@ def test_session_grid_drag_persist_live_updates_and_close(
         expect(page.get_by_role("region", name="Grids")).to_have_count(0)
         # The row context menu is the keyboard alternative to dragging.
         page.locator('aside [data-sidebar-session-id="grid-1"]').click(button="right")
-        page.get_by_role("menuitem", name="Open in grid", exact=True).focus()
+        page.get_by_role("menuitem", name="Create a grid", exact=True).focus()
         page.keyboard.press("ArrowRight")
-        page.get_by_role("menuitem", name="Session · split bottom", exact=True).click()
+        page.get_by_role("menuitem", name="To the bottom", exact=True).click()
         expect(page.locator("[data-grid-session]")).to_have_count(2)
         reopened_url = page.url
         page.get_by_role("link", name="Open Grid session 0 full screen").click()
@@ -578,7 +578,7 @@ def test_grid_flag_off_and_unknown_local_grid(
         expect(page.locator("[data-grid-session]")).to_have_count(0)
         expect(page.get_by_role("button", name="Expand grid workspace")).to_have_count(0)
         row.click(button="right")
-        expect(page.get_by_role("menuitem", name="Open in grid", exact=True)).to_have_count(0)
+        expect(page.get_by_role("menuitem", name="Create a grid", exact=True)).to_have_count(0)
         page.keyboard.press("Escape")
         assert row.locator("a").evaluate("""node => node.draggable &&
             node.dispatchEvent(new DragEvent('dragstart', {bubbles: true, cancelable: true}))""")
@@ -660,7 +660,7 @@ def test_grid_mobile_entry_points(
         else:
             row.get_by_test_id("conversation-actions").click()
         expect(page.get_by_role("menu")).to_be_visible()
-        expect(page.get_by_role("menuitem", name="Open in grid", exact=True)).to_have_count(
+        expect(page.get_by_role("menuitem", name="Create a grid", exact=True)).to_have_count(
             int(desktop)
         )
         page.keyboard.press("Escape")

@@ -73,6 +73,7 @@ import {
   ListFilterIcon,
   LaptopIcon,
   LayoutDashboardIcon,
+  LayoutGridIcon,
   Loader2Icon,
   MailIcon,
   MailOpenIcon,
@@ -4792,6 +4793,8 @@ function ConversationMenuItems({
   const gridLayout = grids?.enabled
     ? (grids.activeGrid?.layout ?? grids.conversationId)
     : undefined;
+  // On a single session page the menu starts a new grid beside the open session.
+  const createsGrid = typeof gridLayout === "string";
   const gridOptions = gridLayout
     ? gridSessionIds(gridLayout).flatMap((targetId, index) =>
         SPLIT_EDGES.filter(
@@ -4799,7 +4802,7 @@ function ConversationMenuItems({
         ).map((edge) => ({
           targetId,
           edge,
-          label: `${typeof gridLayout === "string" ? "Session" : `Pane ${index + 1}`} · split ${edge}`,
+          label: createsGrid ? `To the ${edge}` : `Pane ${index + 1} · split ${edge}`,
         })),
       )
     : [];
@@ -4876,7 +4879,10 @@ function ConversationMenuItems({
       )}
       {!isArchived && gridOptions.length > 0 && (
         <C.Sub>
-          <C.SubTrigger className="mobile-touch-target">Open in grid</C.SubTrigger>
+          <C.SubTrigger className="mobile-touch-target">
+            <LayoutGridIcon className="size-3.5" />
+            {createsGrid ? "Create a grid" : "Open in grid"}
+          </C.SubTrigger>
           <C.SubContent>
             {gridOptions.map(({ targetId, edge, label }) => (
               <C.Item
