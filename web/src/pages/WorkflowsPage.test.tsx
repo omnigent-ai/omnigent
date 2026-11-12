@@ -7,6 +7,7 @@ import {
   useDeleteWorkflow,
   useSavedWorkflows,
 } from "@/hooks/useSavedWorkflows";
+import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
 import type * as RoutingModule from "@/lib/routing";
 import { createWorkflowPrompt } from "@/lib/workflow";
 
@@ -144,7 +145,7 @@ describe("WorkflowsPage", () => {
     expect(refresh).toHaveBeenCalledOnce();
   });
 
-  it("creates a workflow in a new session that drafts it", () => {
+  it("starts a session that drafts the new workflow", () => {
     mockWorkflows({ workflows: WORKFLOWS });
     render(<WorkflowsPage />);
 
@@ -165,11 +166,14 @@ describe("WorkflowsPage", () => {
     });
     fireEvent.click(within(dialog).getByTestId("new-workflow-create"));
 
-    expect(navigate).toHaveBeenCalledWith(
-      `/?prompt=${encodeURIComponent(
-        createWorkflowPrompt("Upgrade a dependency", "Bump one package and fix what breaks"),
-      )}`,
-    );
+    // The new-session page starts the session itself, from its usual defaults.
+    const location = navigate.mock.calls[0]![0] as string;
+    const token = new URLSearchParams(location.split("?")[1]).get(NEW_SESSION_HANDOFF_PARAM);
+    expect(peekNewSessionHandoff(token)).toEqual({
+      text: createWorkflowPrompt("Upgrade a dependency", "Bump one package and fix what breaks"),
+      files: [],
+      start: true,
+    });
     expect(screen.queryByRole("dialog", { name: "New workflow" })).toBeNull();
   });
 });

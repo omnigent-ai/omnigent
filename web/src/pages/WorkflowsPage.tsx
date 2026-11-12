@@ -2,9 +2,9 @@
  * Workflows page (`/workflows`): the user's saved workflows, a search, and a
  * "New workflow" button. Laid out like the Automations page.
  *
- * New workflow opens the new-session page with a request for the agent to draft
- * and save the workflow. Delete removes one; Run, Edit and Create automation
- * aren't connected yet.
+ * New workflow starts a session, from the new-session page's defaults, that asks
+ * the agent to draft and save the workflow. Delete removes one; Run, Edit and
+ * Create automation aren't connected yet.
  */
 
 import { useMemo, useState } from "react";
@@ -17,6 +17,7 @@ import { showToast } from "@/components/ui/toast";
 import { NewWorkflowDialog } from "@/components/workflows/NewWorkflowDialog";
 import { WorkflowRow } from "@/components/workflows/WorkflowRow";
 import { useDeleteWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import { newSessionLocation } from "@/lib/newSessionHandoff";
 import { useNavigate } from "@/lib/routing";
 import { createWorkflowPrompt } from "@/lib/workflow";
 
@@ -116,7 +117,7 @@ export function WorkflowsPage() {
         open={creating}
         onOpenChange={setCreating}
         onCreate={({ name, description }) =>
-          navigate(`/?prompt=${encodeURIComponent(createWorkflowPrompt(name, description))}`)
+          navigate(newSessionLocation(createWorkflowPrompt(name, description), [], { start: true }))
         }
         takenNames={takenNames}
       />

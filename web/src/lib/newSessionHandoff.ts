@@ -9,14 +9,24 @@ export const NEW_SESSION_HANDOFF_PARAM = "handoff";
 export interface NewSessionHandoff {
   text: string;
   files: File[];
+  /** Start the session as soon as the composer can, as Start would. */
+  start?: boolean;
 }
 
 const handoffs = new Map<string, NewSessionHandoff>();
 
-/** The new-session composer's location, holding `text` and `files` as its whole draft. */
-export function newSessionLocation(text: string, files: File[]): string {
+/**
+ * The new-session composer's location, holding `text` and `files` as its whole draft.
+ *
+ * @param options.start Start the session once the composer's defaults allow it.
+ */
+export function newSessionLocation(
+  text: string,
+  files: File[],
+  options: { start?: boolean } = {},
+): string {
   const token = randomUUID();
-  handoffs.set(token, { text, files });
+  handoffs.set(token, { text, files, ...(options.start ? { start: true } : {}) });
   return `/?${new URLSearchParams({ [NEW_SESSION_HANDOFF_PARAM]: token })}`;
 }
 
