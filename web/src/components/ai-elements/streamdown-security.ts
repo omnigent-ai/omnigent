@@ -17,6 +17,10 @@ type StreamdownHardenOptions = {
 type StreamdownHardenPlugin = StreamdownPluginTuple & {
   1: StreamdownHardenOptions;
 };
+type StreamdownSanitizeSchema = { protocols?: Record<string, string[] | undefined> };
+type StreamdownSanitizePlugin = StreamdownPluginTuple & {
+  1: StreamdownSanitizeSchema;
+};
 
 export const STREAMDOWN_PLUGINS = {
   cjk,
@@ -99,6 +103,61 @@ export function shortFileCitationLabel(text: string): string | null {
   const slash = path.lastIndexOf("/");
   if (slash < 0 || slash === path.length - 1) return null;
   return text.slice(slash + 1);
+}
+
+// An Omnigent session deep link, `omnigent://<host[:port]>/c/<session_id>`, which
+// the desktop app registers. Matched on the raw href, so there are no
+// credentials, query, fragment, or dot segments.
+const OMNIGENT_SESSION_LINK =
+  /^omnigent:\/\/((?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?)\/c\/([A-Za-z0-9_-]+)\/?$/;
+
+/** The server host (`host[:port]`) and session an Omnigent session link names, or null. */
+export function parseOmnigentSessionLink(href: string): { host: string; sessionId: string } | null {
+  const match = OMNIGENT_SESSION_LINK.exec(href);
+  if (!match) return null;
+  // The pattern admits some authorities no URL can name, such as `[.]` or port 99999.
+  try {
+    new URL(`http://${match[1]}`);
+  } catch {
+    return null;
+  }
+  return { host: match[1].toLowerCase(), sessionId: match[2] };
+}
+
+/**
+ * The in-app chat path for a session link to the server `page` is served from, or
+ * null. The authority is canonicalized with the page's scheme, so a default port
+ * (`example.test:443` on an HTTPS page) still matches.
+ */
+export function sameServerSessionPath(
+  href: string,
+  page: { protocol: string; host: string },
+): string | null {
+  const link = parseOmnigentSessionLink(href);
+  if (!link || (page.protocol !== "http:" && page.protocol !== "https:")) return null;
+  const linkHost = new URL(`${page.protocol}//${link.host}`).host;
+  return linkHost === page.host.toLowerCase() ? `/c/${link.sessionId}` : null;
+}
+
+/** Whether `href` is exactly an Omnigent session deep link. */
+export function isOmnigentSessionLink(href: string): boolean {
+  return parseOmnigentSessionLink(href) !== null;
+}
+
+/**
+ * Drops the href of every `omnigent:` link that is not a session deep link.
+ * Sanitize admits the whole scheme; harden then marks the rest " [blocked]".
+ */
+export function restrictOmnigentLinks() {
+  return (tree: HastElement) => {
+    visitElements(tree, (node) => {
+      const href = node.properties?.href;
+      if (node.tagName !== "a" || typeof href !== "string") return;
+      if (!/^\s*omnigent:/i.test(href) || isOmnigentSessionLink(href)) return;
+      const { href: _dropped, ...rest } = node.properties ?? {};
+      node.properties = rest;
+    });
+  };
 }
 
 // Where a file link's href is parked once the path moves to the data
@@ -312,6 +371,40 @@ function isStreamdownHardenPlugin(
   return Array.isArray(plugin) && plugin.length >= 2 && isHardenOptions(plugin[1]);
 }
 
+function isStreamdownSanitizePlugin(
+  plugin: StreamdownRehypePlugin,
+): plugin is StreamdownSanitizePlugin {
+  return (
+    Array.isArray(plugin) &&
+    plugin.length >= 2 &&
+    typeof plugin[1] === "object" &&
+    plugin[1] !== null
+  );
+}
+
+/** Sanitize with `omnigent:` hrefs admitted, narrowed to session links right after. */
+function withOmnigentSessionLinks(plugin: StreamdownRehypePlugin): StreamdownRehypePlugins {
+  if (!isStreamdownSanitizePlugin(plugin)) {
+    throw new Error("Streamdown sanitize plugin must be a [plugin, schema] tuple");
+  }
+  const schema = plugin[1];
+  // A schema without an href allowlist allows every scheme; adding one would block web links.
+  const hrefProtocols = schema.protocols?.href;
+  if (!hrefProtocols) {
+    throw new Error("Streamdown sanitize schema must restrict href protocols");
+  }
+  return [
+    [
+      plugin[0],
+      {
+        ...schema,
+        protocols: { ...schema.protocols, href: [...hrefProtocols, "omnigent"] },
+      },
+    ] satisfies StreamdownPluginTuple,
+    restrictOmnigentLinks,
+  ];
+}
+
 function isHardenOptions(value: unknown): value is StreamdownHardenOptions {
   return (
     typeof value === "object" &&
@@ -334,8 +427,9 @@ function createStreamdownRehypePlugins(
     if (key === "sanitize") {
       sawSanitize = true;
       if (markFileLinks) plugins.push(rewriteFileUriLinks);
+      plugins.push(...withOmnigentSessionLinks(plugin));
+      continue;
     }
-
     if (key !== "harden") {
       plugins.push(plugin);
       continue;
