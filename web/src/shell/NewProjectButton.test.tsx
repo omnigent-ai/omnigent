@@ -460,6 +460,41 @@ describe("NewProjectButton project repositories", () => {
     expect(mocks.createProject).not.toHaveBeenCalled();
   });
 
+  it("keeps a branch typed before Add when the URL is added to the selection", async () => {
+    mocks.serverInfo = projectServerInfo;
+    renderButton([laptop]);
+
+    nameProject("Garden");
+    chooseRepositorySource();
+    typeRepository(repoUrl, "release");
+    fireEvent.click(screen.getByTestId("new-project-repo-add"));
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+
+    await waitFor(() => expect(mocks.createProject).toHaveBeenCalledTimes(1));
+    expect(mocks.cloneRepository).toHaveBeenCalledWith(
+      expect.objectContaining({ url: repoUrl, branch: "release" }),
+    );
+    expect(mocks.createProject.mock.calls[0][0].config.repository).toEqual({
+      url: repoUrl,
+      branch: "release",
+    });
+  });
+
+  it("rejects a branch typed without a repository URL", () => {
+    mocks.serverInfo = projectServerInfo;
+    renderButton([laptop]);
+
+    nameProject("Garden");
+    chooseRepositorySource();
+    typeRepository("", "main");
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Add the repository this branch belongs to.",
+    );
+    expect(mocks.createProject).not.toHaveBeenCalled();
+  });
+
   it("rejects an invalid repository URL before any side effect", () => {
     mocks.serverInfo = projectServerInfo;
     renderButton([laptop]);

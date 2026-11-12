@@ -1743,6 +1743,22 @@ describe("NewChatLandingScreen project repository prefill", () => {
     expect(body.workspaces).toEqual([repoUrl]);
   });
 
+  it("ignores a saved repository URL the picker rejects and leaves submit usable", async () => {
+    setProjectConfig({
+      host_id: "__sandbox__",
+      repository: { url: "not a url" },
+    });
+    serveProfile("modal");
+    renderSandboxLanding();
+
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-repo-chip")).toBeVisible());
+    await pickProfile("modal");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    const body = await submitAndReadBody();
+    expect(body.workspaces).toEqual([]);
+  });
+
   it("ignores a legacy string repository and leaves the composer usable", async () => {
     setProjectConfig({
       host_id: "__sandbox__",

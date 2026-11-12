@@ -234,12 +234,15 @@ export function NewProjectButton({
     const branch = repoBranch;
     const destination = (destinationOverride ?? destinationDefault).trim();
     const locking = repositoryMode && url !== "";
-    if (locking) {
+    if (repositoryMode) {
+      // Also catches a branch typed without a URL.
       const problem = sandboxRepoProblem(url, branch);
       if (problem) {
         setSubmitError(problem.message);
         return;
       }
+    }
+    if (locking) {
       if (runOn === null) {
         setSubmitError("Choose where to run the repository.");
         return;
@@ -495,6 +498,8 @@ export function NewProjectButton({
                     setWorkspace(null);
                     setCreatedWorkspace(null);
                     setCreateWorkspaceFolder(false);
+                    setCloneParent("~");
+                    setDestinationOverride(null);
                   }
                   setRunOn(next);
                   setSubmitError(null);
@@ -558,7 +563,20 @@ export function NewProjectButton({
               <SandboxRepositoryPicker
                 selections={repositories}
                 onChange={(next) => {
-                  setRepositories(next);
+                  // The picker adds a URL with a blank branch; keep the branch typed for it.
+                  const typedBranch = pendingRepoBranch.trim();
+                  if (repositories.length === 0) {
+                    setRepositories(
+                      next.map((repo) =>
+                        repo.branch === "" && typedBranch !== ""
+                          ? { ...repo, branch: typedBranch }
+                          : repo,
+                      ),
+                    );
+                    setPendingRepoBranch("");
+                  } else {
+                    setRepositories(next);
+                  }
                   setSubmitError(null);
                 }}
                 maxRepos={1}
@@ -693,11 +711,6 @@ export function NewProjectButton({
                 />
               </CollapsibleContent>
             </Collapsible>
-          )}
-          {runsOnSandbox && (
-            <p className="text-xs text-muted-foreground">
-              Saved with this project. The repository will be prepared when you start a session.
-            </p>
           )}
           {(submitError || createProject.isError) && (
             <p className="text-ui text-destructive" role="alert">

@@ -917,8 +917,8 @@ class HostCloneRepositoryResultFrame:
     :param path: Absolute path of the new checkout on success.
     :param error: Human-readable failure message, ``None`` on success.
     :param error_code: Stable failure class: ``"invalid_input"``,
-        ``"clone_destination_conflict"``, or ``"clone_timeout"``. ``None``
-        for an unclassified git failure.
+        ``"clone_destination_conflict"``, ``"clone_timeout"``, or
+        ``"clone_failed"`` for any other git failure.
     """
 
     request_id: str

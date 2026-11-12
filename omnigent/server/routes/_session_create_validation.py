@@ -65,7 +65,11 @@ async def resolve_project_session_create(
 
     # Nested agents inherit filing, while the composer or MCP chooses their placement.
     config = {} if getattr(body, "sibling_source_id", None) else project.config
-    managed = getattr(body, "host_type", None) == "managed"
+    # A child runs on its parent's host, so the project's new-target defaults don't apply.
+    managed = (
+        getattr(body, "host_type", None) == "managed"
+        and getattr(body, "parent_session_id", None) is None
+    )
     repository = _saved_managed_repository(config) if managed else None
     updates: dict[str, Any] = {}
     for field in ("agent_id", "workspace", "git"):

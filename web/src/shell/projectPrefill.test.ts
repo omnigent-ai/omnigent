@@ -286,6 +286,8 @@ describe("projectRepository", () => {
     ["ignores a blank url", { url: "  " }, undefined],
     ["ignores a non-string url", { url: 3 }, undefined],
     ["ignores a non-string branch", { url, branch: 7 }, undefined],
+    ["ignores a url the picker rejects", { url: "not a url" }, undefined],
+    ["ignores a branch the picker rejects", { url, branch: "bad..branch" }, undefined],
   ])("%s", (_label, value, expected) => {
     expect(projectRepository(value)).toEqual(expected);
   });

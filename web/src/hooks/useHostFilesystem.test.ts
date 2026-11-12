@@ -284,10 +284,7 @@ describe("createHostDirectory", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// cloneHostRepository — POSTs to /v1/hosts/{id}/repositories/clone and keeps the
-// server's detail so the New project dialog can explain a failed clone.
-// ---------------------------------------------------------------------------
+// cloneHostRepository: POSTs the clone route and surfaces the server's detail on failure.
 
 describe("cloneHostRepository", () => {
   const fetchMock = vi.fn();

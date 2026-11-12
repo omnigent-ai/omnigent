@@ -2,6 +2,7 @@ import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import type { ProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
+import { sandboxRepoProblem } from "@/lib/sandboxRepositories";
 
 type ProjectPrefillPhase = "location" | "settled";
 
@@ -14,9 +15,9 @@ export interface ProjectRepository {
 /**
  * Read a stored project repository, or `undefined` when the value is not one.
  *
- * Project config is opaque client JSON, so a legacy bare string or a malformed
- * object is ignored rather than seeded (a string would crash the composer's
- * `url.trim()`).
+ * Project config is opaque client JSON, so a legacy bare string, a malformed
+ * object, or a URL or branch the picker would reject is ignored rather than
+ * seeded (a string would crash the composer's `url.trim()`).
  *
  * @param value The raw `config.repository` value, e.g. `{ url: "https://git.example.com/team/app.git" }`.
  * @returns The repository, with a trimmed URL and an absent branch when blank.
@@ -26,8 +27,10 @@ export function projectRepository(value: unknown): ProjectRepository | undefined
   const { url, branch } = value as { url?: unknown; branch?: unknown };
   if (typeof url !== "string" || url.trim() === "") return undefined;
   if (branch !== undefined && typeof branch !== "string") return undefined;
+  const trimmedUrl = url.trim();
   const trimmedBranch = branch?.trim() ?? "";
-  return trimmedBranch === "" ? { url: url.trim() } : { url: url.trim(), branch: trimmedBranch };
+  if (sandboxRepoProblem(trimmedUrl, trimmedBranch) !== null) return undefined;
+  return trimmedBranch === "" ? { url: trimmedUrl } : { url: trimmedUrl, branch: trimmedBranch };
 }
 
 /**

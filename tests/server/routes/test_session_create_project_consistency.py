@@ -782,6 +782,29 @@ async def test_non_managed_and_placement_creates_take_no_saved_repository(db_uri
     assert external.body.workspace == "/work/project"
 
 
+async def test_managed_child_inherits_its_parent_instead_of_project_defaults(db_uri: str) -> None:
+    """A child of a managed session keeps its parent's placement, not the project's."""
+    project_store = SqlAlchemyProjectStore(db_uri)
+    project = project_store.create(
+        "887b7cb7ac30abf4debfaa578d052ec6",
+        "child-inherits",
+        ALICE,
+        MANAGED_PROJECT_CONFIG,
+    )
+    child = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest(
+            project_id=project.id,
+            agent_id=CUSTOM_AGENT_ID,
+            host_type="managed",
+            parent_session_id="conv_parent",
+        ),
+        user_id=ALICE,
+        project_store=project_store,
+    )
+    assert child.body.sandbox_provider is None
+    assert child.body.workspaces is None
+
+
 async def test_legacy_string_repository_is_ignored_without_failing_the_create(db_uri: str) -> None:
     """A repository saved as a bare string or with extra keys is ignored, not an error."""
     project_store = SqlAlchemyProjectStore(db_uri)
