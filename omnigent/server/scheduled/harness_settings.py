@@ -95,10 +95,8 @@ def permission_mode_launch_options(
     return list(args) or None, labels
 
 
-# Sessions a legacy timer fire has created but not yet recorded a run for, mapped to
-# their task. Its prompt is sent before the run row is written, so a worker the
-# turn starts in between would otherwise not count as the run's. Legacy timers
-# fire in this process (see ``_IN_FLIGHT_TASKS`` in ``fire.py``).
+# Legacy fire session -> task id until its run row is written. In-process only, like
+# legacy timers themselves (see ``_IN_FLIGHT_TASKS`` in ``fire.py``).
 _UNRECORDED_LEGACY_RUN_SESSIONS: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
