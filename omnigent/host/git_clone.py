@@ -51,7 +51,7 @@ def clone_repository(frame: HostCloneRepositoryFrame) -> HostCloneRepositoryResu
     except FileExistsError:
         return failed("clone_destination_conflict", "The clone destination already exists")
     except OSError:
-        return failed("clone_destination_conflict", "The parent folder is unavailable")
+        return failed("invalid_input", "The parent folder doesn't exist or isn't writable")
     command = [
         "git",
         "clone",
@@ -60,7 +60,14 @@ def clone_repository(frame: HostCloneRepositoryFrame) -> HostCloneRepositoryResu
         frame.url,
         str(destination),
     ]
-    environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+    # No prompts: an empty GIT_ASKPASS also overrides an inherited SSH_ASKPASS.
+    environment = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS_REQUIRE": "never",
+        "GCM_INTERACTIVE": "never",
+    }
     returncode: int | None
     try:
         with subprocess.Popen(

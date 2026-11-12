@@ -16,15 +16,6 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => mocks.info }));
 
-vi.mock("@/hooks/useHosts", () => ({
-  useHosts: () => ({
-    data: [
-      { host_id: "host_1", name: "Laptop", owner: "me", status: "online" },
-      { host_id: "host_2", name: "Desktop", owner: "me", status: "online" },
-    ],
-  }),
-}));
-
 vi.mock("@/hooks/useConversations", () => ({
   useCreateProject: () => ({
     mutate: mocks.createProject,
@@ -63,12 +54,16 @@ vi.mock("./WorkspacePickerDialog", () => ({
 }));
 
 const queryClient = new QueryClient();
+const hosts = [
+  { host_id: "host_1", name: "Laptop", owner: "me", status: "online" as const },
+  { host_id: "host_2", name: "Desktop", owner: "me", status: "online" as const },
+];
 
 function projectButton(hostId: string | null) {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <NewProjectButton onCreated={vi.fn()} hostId={hostId} hostsLoading={false} />
+        <NewProjectButton onCreated={vi.fn()} hostId={hostId} hosts={hosts} hostsLoading={false} />
       </TooltipProvider>
     </QueryClientProvider>
   );
@@ -433,6 +428,24 @@ describe("NewProjectButton", () => {
       fireEvent.change(screen.getByLabelText("Clone into"), { target: { value: "~/other" } });
       fireEvent.click(screen.getByTestId("new-project-confirm"));
       await waitFor(() => expect(mocks.cloneRepository).toHaveBeenCalledTimes(2));
+    });
+
+    it("keeps a host chosen in Folder mode without a folder", async () => {
+      renderButton();
+      fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+        target: { value: "Sample" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+      fireEvent.change(screen.getByRole("combobox", { name: "Run on" }), {
+        target: { value: "host_2" },
+      });
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+      await waitFor(() =>
+        expect(mocks.createProject).toHaveBeenCalledWith(
+          { name: "Sample", config: { host_id: "host_2" } },
+          expect.any(Object),
+        ),
+      );
     });
 
     it("asks for a target before saving a repository with none selected", () => {

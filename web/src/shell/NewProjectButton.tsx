@@ -16,7 +16,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { useCreateProject, useProjects } from "@/hooks/useConversations";
 import { cloneHostRepository, useCreateHostDirectory } from "@/hooks/useHostFilesystem";
-import { useHosts } from "@/hooks/useHosts";
+import type { Host } from "@/hooks/useHosts";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
@@ -122,10 +122,13 @@ function friendlyProjectError(error: unknown): string {
 export function NewProjectButton({
   onCreated,
   hostId,
+  hosts: allHosts,
   hostsLoading,
 }: {
   onCreated: (name: string) => void;
   hostId: string | null;
+  /** Hosts the caller already loaded; sandbox hosts are skipped. */
+  hosts: Host[];
   hostsLoading: boolean;
 }) {
   const [open, setOpen] = useState(false);
@@ -133,13 +136,15 @@ export function NewProjectButton({
   const [icon, setIcon] = useState<string | undefined>(undefined);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const info = useServerInfo();
+  const hosts = allHosts.filter((host) => !host.sandbox_provider);
   const repositoryCreation = info !== "loading" && info.project_repository_creation === true;
-  const { data: hosts = [] } = useHosts({ enabled: open && repositoryCreation });
   const { data: projects = [] } = useProjects({ enabled: open });
   const sandboxProviders =
     repositoryCreation && info.managed_sandboxes_enabled ? sandboxProviderOptions(info) : [];
   // A connected host id, or a sandboxHostChoice() value.
   const [runOn, setRunOn] = useState<string | null>(null);
+  // The initial target is only a suggestion; an explicit pick becomes a saved default.
+  const runOnChosen = useRef(false);
   const sandboxProvider = runOn === null ? undefined : sandboxHostChoiceProvider(runOn);
   const sandboxSelected = sandboxProvider !== undefined;
   const dialogHostId = sandboxSelected ? null : runOn;
@@ -189,6 +194,7 @@ export function NewProjectButton({
   }, [runOn, hostId, open]);
 
   const reset = () => {
+    runOnChosen.current = false;
     setName("");
     setIcon(undefined);
     setRunOn(hostId);
@@ -289,8 +295,8 @@ export function NewProjectButton({
       config.host_id = selectedWorkspace.hostId;
       config.workspace = selectedWorkspace.path;
     }
-    // Without a repository URL, the chosen host is still the project's default.
-    if (repositoryMode && !sandboxSelected && !repository && dialogHostId !== null) {
+    // Without a workspace, a host the user chose is still the project's default.
+    if (!config.host_id && dialogHostId !== null && (repositoryMode || runOnChosen.current)) {
       config.host_id = dialogHostId;
     }
     if (repositoryMode && sandboxSelected) {
@@ -444,6 +450,7 @@ export function NewProjectButton({
                       value={runOn ?? ""}
                       onChange={(event) => {
                         setRunOn(event.target.value || null);
+                        runOnChosen.current = true;
                         setCloneParent("~");
                         setCloneDestination(null);
                         setWorkspace(null);

@@ -719,6 +719,8 @@ async def test_import_with_unowned_or_unknown_project_is_404(
             None,
             {"host_id": "connected-host", "workspace": "/work/project"},
         ),
+        # A repository value this server can't parse is ignored, not a create error.
+        ({}, None, None, {"host_id": "__sandbox__", "repository": "https://legacy.example.com"}),
     ],
 )
 async def test_managed_repository_project_defaults_respect_presence(
@@ -737,8 +739,8 @@ async def test_managed_repository_project_defaults_respect_presence(
         "Repository",
         ALICE,
         {
-            **(project_placement or {"host_id": "__sandbox__", "sandbox_provider": "provider"}),
             "repository": {"url": "https://git.example.com/team/sample.git", "branch": "release"},
+            **(project_placement or {"host_id": "__sandbox__", "sandbox_provider": "provider"}),
         },
     )
     values = {"project_id": project.id, "host_type": "managed", **explicit}

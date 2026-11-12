@@ -68,19 +68,21 @@ async def resolve_project_session_create(
     config = {} if getattr(body, "sibling_source_id", None) else project.config
     updates: dict[str, Any] = {}
     managed = getattr(body, "host_type", None) == "managed"
+    # Config is client-owned JSON; a repository value this server can't parse is not a default.
+    try:
+        repository = parse_project_repository(config["repository"]) if managed else None
+    except (KeyError, ValueError):
+        repository = None
     # A managed session clones the project's repository; a host-local path does not apply.
-    repository = config.get("repository") if managed else None
     for field in ("agent_id",) if repository else ("agent_id", "workspace", "git"):
         if field not in fields_set and field in config and field in body.__class__.model_fields:
             updates[field] = config[field]
     if managed and "sandbox_provider" not in fields_set and "sandbox_provider" in config:
         updates["sandbox_provider"] = config["sandbox_provider"]
     if repository and not {"workspace", "workspaces"} & fields_set:
-        try:
-            parsed = parse_project_repository(repository)
-        except ValueError as exc:
-            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from None
-        updates["workspaces"] = [f"{parsed.url}#{parsed.branch}" if parsed.branch else parsed.url]
+        updates["workspaces"] = [
+            f"{repository.url}#{repository.branch}" if repository.branch else repository.url
+        ]
     resolved_data = body.model_dump()
     resolved_data.update(updates)
     # Re-validate project hints because config is intentionally stored as
