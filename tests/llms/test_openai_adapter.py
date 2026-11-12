@@ -242,12 +242,12 @@ def test_chat_request_preserves_existing_tag_headers(monkeypatch, existing_tags)
     assert extra_headers == {REQUEST_TAGS_HEADER.lower(): existing_tags, "X-Caller": "policy"}
 
 
-def test_ci_policy_model_uses_tagged_databricks_chat_transport(monkeypatch):
+@pytest.mark.parametrize("model", ["databricks-policy-test-model", "system.ai.policy-test-model"])
+def test_ci_policy_model_uses_tagged_databricks_chat_transport(monkeypatch, model):
     from omnigent.runtime.policies.builder import _build_policy_llm_client
     from omnigent.spec.types import LLMConfig
 
     monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"flake-stress-e2e","run_id":"123"}')
-    model = "databricks-policy-test-model"
     response = {
         "id": "reply",
         "model": model,
@@ -261,6 +261,7 @@ def test_ci_policy_model_uses_tagged_databricks_chat_transport(monkeypatch):
         {
             "base_url": "https://dbc-test.cloud.databricks.com/ai-gateway/mlflow/v1",
             "api_key": "test-api-key",
+            "extra_headers": {"X-Caller": "policy"},
         },
     )
     assert client is not None
@@ -271,15 +272,16 @@ def test_ci_policy_model_uses_tagged_databricks_chat_transport(monkeypatch):
             max_tokens=17,
         )
     )
-    assert result.output[0].content[0].text == "ALLOW"
     assert len(requests) == 1
     request = requests[0]
     assert request.url.path == "/ai-gateway/mlflow/v1/chat/completions"
+    assert result.output[0].content[0].text == "ALLOW"
     assert json.loads(request.headers[REQUEST_TAGS_HEADER]) == {
         "pipeline": "flake-stress-e2e",
         "run_id": "123",
     }
     assert request.headers["Authorization"] == "Bearer test-api-key"
+    assert request.headers["X-Caller"] == "policy"
     assert request.extensions["timeout"] == {"connect": 11, "read": 11, "write": 11, "pool": 11}
     assert json.loads(request.content) == {
         "model": model,

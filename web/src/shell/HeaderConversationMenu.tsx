@@ -55,12 +55,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isIndentedSibling } from "@/lib/sessionFamilies";
+import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { exportSessionTranscript } from "@/lib/sessionsApi";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
-  PINNED_LABEL_KEY,
   type Conversation,
   useArchiveConversation,
   useMoveToProject,
@@ -167,7 +166,8 @@ export function HeaderConversationMenu({
   const automationSourceOf = automationDeletedWith(info, conversation);
   const deleteSourceAutomations = useDeleteSourceAutomations();
   const previousConversationId = useRef(conversation.id);
-  const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
+  const isPinned = isSessionPinned(conversation);
+  const canPin = !isIndentedSibling(conversation);
   const isArchived = conversation.archived === true;
   const canAddAgent = !isArchived && info !== "loading" && info.sibling_sessions;
   const addAgentPath = `/?sibling=${encodeURIComponent(conversation.id)}`;
@@ -307,7 +307,9 @@ export function HeaderConversationMenu({
       : togglePinned.mutate({ id: conversation.id, pinned: true });
   // Desktop Session → Pin (⌥⌘P), Archive (⇧⌘A) and Fork (⌥⌘F) act on the session shown here.
   // Like the menu item, Pin waits out a pending pin write (from any row).
-  useDesktopCommand("toggle-pin-session", pinSaving ? null : togglePin, { active: isPinned });
+  useDesktopCommand("toggle-pin-session", pinSaving || !canPin ? null : togglePin, {
+    active: isPinned,
+  });
   useDesktopCommand("archive-session", archiveConversation, { active: isArchived });
   useDesktopCommand("fork-session", canFork && !forkDisabledReason ? onFork : null);
   const desktopShortcuts = supportsDesktopCommands();
@@ -330,18 +332,20 @@ export function HeaderConversationMenu({
       )}
       {/* Chat/Terminal renders its own trailing separator (null on other sessions). */}
       {viewItems}
-      <DropdownMenuItem
-        data-testid="header-pin-conversation"
-        className={itemClass}
-        disabled={pinSaving}
-        onSelect={togglePin}
-      >
-        {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
-        {isPinned ? "Unpin" : "Pin"}
-        {desktopShortcuts && (
-          <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />
-        )}
-      </DropdownMenuItem>
+      {canPin && (
+        <DropdownMenuItem
+          data-testid="header-pin-conversation"
+          className={itemClass}
+          disabled={pinSaving}
+          onSelect={togglePin}
+        >
+          {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+          {isPinned ? "Unpin" : "Pin"}
+          {desktopShortcuts && (
+            <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />
+          )}
+        </DropdownMenuItem>
+      )}
       {canShare && (
         <DropdownMenuItem
           data-testid="header-share-conversation"

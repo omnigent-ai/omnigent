@@ -1131,6 +1131,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       ...(p.native_delivery
         ? { nativeDelivery: parseNativePermissionDelivery(p.native_delivery) }
         : {}),
+      ...(p.is_blocking === false ? { isBlocking: false as const } : {}),
       elicitationId,
       targetSessionId:
         typeof targetSessionId === "string" && targetSessionId ? targetSessionId : null,

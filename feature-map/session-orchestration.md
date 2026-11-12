@@ -45,6 +45,9 @@ MCP independent creation.
   accepted work continue; session creation keeps its separate orchestration gate.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
+  An optional `permission_mode` starts the session in a mode of its harness;
+  modes that skip approval are refused, and on a server that doesn't advertise
+  `session_create_permission_modes` the tool refuses the call before creating anything.
   With `sibling_sessions` enabled they share one sidebar family and do not appear
   as child agents; with it disabled they remain standalone.
   Managed creation uses the server's configured default sandbox provider. A
@@ -89,9 +92,13 @@ MCP independent creation.
   change only how the session is listed, so running sessions, including the
   caller, keep their turn. Archiving stops the target and its running
   sub-agents, as the sidebar's Archive does, so the server refuses an
-  agent-tool archive of the caller or any session it runs under (its parent
-  chain or a side chat's source), and the tool also refuses a session on the
-  caller's runner. An archive cannot also file the session into a project that
+  agent-tool archive of any session the caller runs under (its parent chain
+  or a side chat's source), and the tool also refuses another session on the
+  caller's runner. A session may archive itself, for example an ephemeral
+  check that is done: the server keeps its runner until that turn ends (at
+  most an hour), and an Undo before then keeps it running. The wait is held in
+  that server's memory, so a server restart during it leaves the runner up
+  until its idle timeout. An archive cannot also file the session into a project that
   does not exist yet, so a refused archive never leaves a new empty project. `sys_project_update` renames a project or sets or clears
   its emoji icon, keeping its other stored defaults; like the sidebar's
   rename it re-files sessions that still belong through the legacy label,
@@ -172,6 +179,44 @@ MCP independent creation.
   Pick a template, fill in the trigger builder, and save: the polling automation's kept session starts one worker per new match
   with `sys_session_create`. Covered by
   `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_polling_manager_task`.
+
+### Scripted review sessions
+
+With the server release flag `scripted_sessions` enabled (default off),
+`sys_session_create` also accepts `placement="host"`, an owned connected
+`host_id`, an absolute `workspace`, and optional
+`git: {branch_name, base_branch}`. The workspace is the source repository;
+the session starts in the new worktree. The caller can be hostless. Source
+privacy, host ownership, workspace validation and destination policy still
+apply. Omit the new fields to retain existing child, same-host or managed
+placement. Older servers refuse the tool's new options through the
+`/v1/info` capability check before creating a session. Dedicated orchestrated
+host-create and PR-link routes also reject requests that reach older replicas
+in a mixed-version deployment.
+
+Independent creates can use an existing owned `project_id` instead of
+`project_name`; never supply both. Project defaults do not replace the
+explicit agent, workspace or git selection. `sys_session_link_pr` takes
+`url`, optional `session_id` (defaults to this session), and `action` (`attach`
+or `remove`, default `attach`). It uses the target session's host and requires
+edit access there and an authorized private or read-only-shared source. The
+host or runner must be online and able to read the PR. An uncertain response
+requires checking the session before retrying.
+
+`sys_session_list(project="Reviews")` filters the global sessions view without
+creating a project; `project=""` lists unfiled sessions. Keep the same filter
+when continuing a cursor. The sub-agent view is unchanged.
+
+For a manual check, enable `scripted_sessions` on a test server and obtain an
+owned host ID from a session's `sys_session_get_info` response. Create a review
+session with `placement="host"`, that host ID, the repository path,
+`git={"branch_name":"review-example","base_branch":"main"}` and a project ID.
+Confirm the session starts in the new worktree and appears under that project.
+Link a PR with `sys_session_link_pr`, then remove it and confirm the PR panel
+updates. Coverage is in `tests/runner/test_session_orchestration.py`,
+`tests/runner/test_discovery_list_pagination.py`,
+`tests/server/integration/test_session_orchestration.py`, and
+`tests/server/integration/test_session_orchestration_projects.py`.
 
 ## Driving it with the repro environment
 

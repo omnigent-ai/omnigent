@@ -54,6 +54,7 @@ NO_CAPABILITIES = {
     "details_editing": False,
     "attachment_uploads": False,
     "commit_history": False,
+    "merge_as_account": False,
 }
 LEGACY_FIELDS = {"gh_available", "authenticated", "accounts", "selected_account"}
 CHANGES = [

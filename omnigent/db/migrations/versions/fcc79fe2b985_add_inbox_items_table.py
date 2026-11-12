@@ -42,10 +42,6 @@ _SQLITE_FAMILY = frozenset({"sqlite", "cloudflare_d1"})
 _SQLITE_CHECKS: tuple[tuple[str, str], ...] = (
     ("user_id IS NULL OR length(CAST(user_id AS BLOB)) <= 512", "ck_inbox_items_user_id_bytes"),
     (
-        "prompt_version IS NULL OR length(CAST(prompt_version AS BLOB)) <= 256",
-        "ck_inbox_items_prompt_version_bytes",
-    ),
-    (
         "dedupe_key IS NULL OR length(CAST(dedupe_key AS BLOB)) <= 512",
         "ck_inbox_items_dedupe_key_bytes",
     ),
@@ -89,9 +85,6 @@ def upgrade() -> None:
         # The session whose agent posted the item, and that agent.
         sa.Column("source_session_id", Uuid16(), nullable=False),
         sa.Column("agent_id", Uuid16(), nullable=False),
-        # Content hash of the agent bundle that posted the item, so acceptance
-        # can be compared across prompt revisions. NULL for an unversioned agent.
-        sa.Column("prompt_version", sa.String(64), nullable=True),
         # Versioned duplicate key, "v1:" + a hash of the kind, primary link, and
         # topic; unique per owner.
         sa.Column("dedupe_key", sa.String(128), nullable=False),
