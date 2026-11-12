@@ -551,16 +551,14 @@ def test_task_scoped_merge_excludes_ambient_user_mcp_servers(
     _user_config(
         monkeypatch,
         tmp_path,
-        '{"mcp": {"servers": {'
-        '"aseprite": {"type": "remote", "url": "https://m/aseprite"},'
-        '"blender": {"type": "remote", "url": "https://m/blender"},'
-        '"chrome": {"type": "remote", "url": "https://m/chrome"},'
-        '"context": {"type": "remote", "url": "https://m/context"},'
-        '"meshy": {"type": "remote", "url": "https://m/meshy"},'
-        '"playwright": {"type": "remote", "url": "https://m/playwright"},'
-        '"safari": {"type": "remote", "url": "https://m/safari"},'
-        '"unrelated": {"type": "remote", "url": "https://m/unrelated"}'
-        "}}}",
+        json.dumps(
+            {
+                "mcp": {"servers": {"ambient": {"type": "remote", "url": "https://m/ambient"}}},
+                "providers": {"local": {"settings": {"baseURL": "http://localhost:1234/v1"}}},
+                "model": "local/test-model",
+                "plugins": ["/opt/user-plugin"],
+            }
+        ),
     )
     config: dict[str, object] = {
         "mcp": {"servers": {"omnigent": {"type": "local", "command": ["relay"]}}}
@@ -569,6 +567,9 @@ def test_task_scoped_merge_excludes_ambient_user_mcp_servers(
     result = maybe_merge_user_provider_config(config, include_user_mcp_servers=False)
 
     assert result["mcp"] == config["mcp"]
+    assert result["providers"] == {"local": {"settings": {"baseURL": "http://localhost:1234/v1"}}}
+    assert result["model"] == "local/test-model"
+    assert result["plugins"] == ["/opt/user-plugin"]
 
 
 def test_merge_forces_codemode_off_on_user_mcp_servers(
