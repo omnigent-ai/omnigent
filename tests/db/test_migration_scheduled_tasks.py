@@ -221,9 +221,9 @@ def test_scheduled_task_shares_rejects_duplicate_grantee(db_engine: Engine) -> N
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_scheduled_task_shares_bounds_grantee_bytes(db_engine: Engine) -> None:
-    """A grantee over 128 characters is rejected on every engine.
+    """Enforces each dialect's grantee size bound.
 
-    SQLite and D1 ignore VARCHAR(128) and enforce a 512-byte cap instead, so
+    SQLite and D1 ignore VARCHAR(128) and cap stored bytes at 512 instead, so
     128 characters of four-byte text (exactly 512 bytes) must still be accepted.
     """
     shares = sa.Table("scheduled_task_shares", sa.MetaData(), autoload_with=db_engine)
