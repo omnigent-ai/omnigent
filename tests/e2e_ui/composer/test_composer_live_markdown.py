@@ -1615,6 +1615,11 @@ def _assert_quote_block(page: Page, textarea: Locator) -> dict[str, Any]:
     # of the box (its own gradient cancels out): no seam between rows.
     left, top, bottom = rows[0]["box"][0], rows[0]["box"][2], rows[-1]["box"][3]
     radius = float(corners[0][0].removesuffix("px"))
+    # Only the part scrolled into the textarea's view is painted.
+    visible = textarea.bounding_box()
+    assert visible is not None
+    top = max(top, visible["y"] - radius)
+    bottom = min(bottom, visible["y"] + visible["height"] + radius)
     strip = Image.open(
         io.BytesIO(
             page.screenshot(
@@ -1895,7 +1900,8 @@ def test_compact_preview_closes_marker_gaps_and_clicks_place_the_caret(
         }))"""
     )
     assert faces["bold"] == ["600", "normal", "0px"], faces
-    assert faces["it"] == ["400", "italic", "0px"], faces
+    normal_weight = view.evaluate("v => getComputedStyle(v).fontWeight")
+    assert faces["it"] == [normal_weight, "italic", "0px"], faces
     card.screenshot(path=tmp_path / f"composer-compact-{theme}.png", animations="disabled")
     compact = gaps(view, shown)
     space = _char_rect(view, shown, " and")["right"] - _char_rect(view, shown, " and")["left"]
@@ -2027,6 +2033,10 @@ def test_compact_preview_first_tap_focuses_with_the_caret_there(
     composer.evaluate("t => t.blur()")
     view = _compact_view(composer)
     expect(view).to_be_visible()
+    # The mobile composer eases its layout after a blur; aim once it settles.
+    page.wait_for_function(
+        "() => !document.getAnimations().some((animation) => animation instanceof CSSTransition)"
+    )
     shown = "Tap bold or code here"
     target = _char_rect(view, shown, "here", 2)
     page.touchscreen.tap(target["left"] + 1, (target["top"] + target["bottom"]) / 2)
@@ -2080,7 +2090,9 @@ def test_compact_preview_opens_at_the_line_the_textarea_showed(
     starts = [0]
     for line in lines[:-1]:
         starts.append(starts[-1] + len(line) + 1)
-    line_height = composer.evaluate("t => parseFloat(getComputedStyle(t).lineHeight)")
+    # No line wraps, so this is the laid-out line pitch, which can differ from the
+    # computed line height by a fraction of a pixel per line.
+    line_height = composer.evaluate("t => t.scrollHeight") / len(lines)
     if where == "middle":
         # An item line near the middle at the textarea's top (no line wraps here).
         top = next(k for k in range(len(lines) // 2, len(lines)) if lines[k][0].isdigit())
