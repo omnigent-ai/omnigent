@@ -199,12 +199,12 @@ def test_wrapper_guard_blocks_naked_call_end_to_end() -> None:
     """With the toggle set, a naked call is refused before any CLI dispatch."""
     result = _run_entrypoint(
         "--help",
-        env={REQUIRE_WRAPPER_ENV: "1", WRAPPER_COMMAND_ENV: "isaac omni"},
+        env={REQUIRE_WRAPPER_ENV: "1", WRAPPER_COMMAND_ENV: "example-wrapper omni"},
     )
 
     assert result.returncode == 2
     assert "running `omnigent` directly is disabled" in result.stderr
-    assert "`isaac omni`" in result.stderr
+    assert "`example-wrapper omni`" in result.stderr
     # The block short-circuits before click renders help.
     assert "Usage: python -m omnigent" not in result.stdout
 
@@ -215,7 +215,7 @@ def test_wrapper_guard_bypass_reaches_cli_end_to_end() -> None:
         "--help",
         env={
             REQUIRE_WRAPPER_ENV: "1",
-            WRAPPER_COMMAND_ENV: "isaac omni",
+            WRAPPER_COMMAND_ENV: "example-wrapper omni",
             WRAPPER_BYPASS_ENV: "1",
         },
     )
@@ -252,18 +252,18 @@ def test_removed_ad_hoc_detection(argv: list[str], expected: bool) -> None:
 
 def test_wrapper_guard_inactive_when_toggle_unset() -> None:
     """No block without the opt-in toggle, whatever else is set."""
-    assert _wrapper_guard_error({WRAPPER_COMMAND_ENV: "isaac omni"}, "omni") is None
+    assert _wrapper_guard_error({WRAPPER_COMMAND_ENV: "example-wrapper omni"}, "omni") is None
 
 
 def test_wrapper_guard_blocks_naked_call_and_suggests_redirect() -> None:
     """A naked call is refused with the configured redirect command."""
-    env = {REQUIRE_WRAPPER_ENV: "1", WRAPPER_COMMAND_ENV: "isaac omni"}
+    env = {REQUIRE_WRAPPER_ENV: "1", WRAPPER_COMMAND_ENV: "example-wrapper omni"}
 
     message = _wrapper_guard_error(env, "omni")
 
     assert message is not None
     assert "running `omni` directly is disabled" in message
-    assert "`isaac omni`" in message
+    assert "`example-wrapper omni`" in message
     assert f"set {WRAPPER_BYPASS_ENV}=1" in message
 
 
@@ -280,7 +280,7 @@ def test_wrapper_guard_bypass_passes_through() -> None:
     """The wrapper's bypass token lets the wrapped call proceed."""
     env = {
         REQUIRE_WRAPPER_ENV: "1",
-        WRAPPER_COMMAND_ENV: "isaac omni",
+        WRAPPER_COMMAND_ENV: "example-wrapper omni",
         WRAPPER_BYPASS_ENV: "1",
     }
 
@@ -996,7 +996,7 @@ def test_codex_cli_persists_raw_args_not_config_merged(
     """The codex CLI persists RAW pass-through. ``harness.codex-native.args`` is
     merged by the daemon runner's native-terminal auto-create (the single merge
     point every launch reaches), not here — merging in both layers wrapped a
-    managed session twice (``isaac codex -- codex -- ...``)."""
+    managed session twice (``example-wrapper codex -- codex -- ...``)."""
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         "omnigent.cli._load_effective_config",

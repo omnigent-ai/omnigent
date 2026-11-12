@@ -688,7 +688,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # spawn the wrong auth mode while the operator set the switch on the CLI.
         # Not a secret.
         "OMNIGENT_AUTH_ENABLED",
-        # Wrapper CLI name (e.g. ``isaac omni``). Runner-side hints built by
+        # Wrapper CLI name (e.g. ``example-wrapper omni``). Runner-side hints built by
         # cli_invocation() must name the command the user actually runs.
         # Not a secret.
         "OMNIGENT_WRAPPER_COMMAND",
@@ -722,8 +722,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Safe to propagate: not a secret.
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX",
         # Native-Claude launcher plugin selector: the entry-point NAME of a
-        # launcher registered in the ``omnigent.claude_launcher`` group (e.g.
-        # ``isaac``). Read by omnigent.claude_launcher.resolve_claude_launch in
+        # launcher registered in the ``omnigent.claude_launcher`` group. Read by
+        # omnigent.claude_launcher.resolve_claude_launch in
         # the managed-host runner (``_auto_create_claude_terminal``) to wrap the
         # Claude launch through a downstream binary.
         # The daemon→runner env strip would otherwise drop it, leaving the
