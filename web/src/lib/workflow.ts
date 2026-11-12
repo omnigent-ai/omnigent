@@ -6,12 +6,14 @@ export const WORKFLOW_SKILL = "workflow";
 
 /**
  * Added to the workflow message when the user reviews the plan before work starts. The agent
- * explores first, so the plan the user approves rests on what it found.
+ * explores first, so the plan the user approves is specific and rests on what it found.
  */
 export const REVIEW_PLAN_FIRST =
-  "Make the plan's first step exploring enough to plan the work well, without changing " +
-  "anything, and its second step my review of the plan, with every later step depending on " +
-  "the review. Once you've explored, update the plan with what you found: drop the " +
+  "Make the plan's first step exploring the work, without changing anything, deeply enough " +
+  "that the plan you write from it is reasonably specific: each step a concrete piece of " +
+  "work, such as one change or one PR, rather than a broad phase like implementing " +
+  "everything. Make its second step my review of the plan, with every later step depending " +
+  "on the review. Once you've explored, update the plan with what you found: drop the " +
   "exploration step, make my review the first step, and make every other step depend on it. " +
   "Then ask me to approve the plan before you start anything else; if I ask for changes, " +
   "replan and ask again.";
