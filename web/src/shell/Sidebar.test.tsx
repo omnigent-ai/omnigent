@@ -1802,9 +1802,9 @@ describe("Sidebar failed session indicator", () => {
     }
   });
 
-  it("offers Create a grid on other session rows and saves the chosen side", async () => {
+  it("offers Create a grid on other session rows and Open in grid inside one", async () => {
     projectRowsRef.current = [];
-    mockConversations([conv("conv_a", "Codex"), conv("conv_b", "Codex")]);
+    mockConversations([conv("conv_a", "Codex"), conv("conv_b", "Codex"), conv("conv_c", "Codex")]);
     const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("local");
     const resolve = vi.spyOn(identity, "resolveIdentity").mockResolvedValue("local");
     const key = `omnigent:session-grids:${getOmnigentServerIdentity() ?? "default"}:local`;
@@ -1833,6 +1833,20 @@ describe("Sidebar failed session indicator", () => {
         axis: "columns",
         children: ["conv_a", "conv_b"],
       });
+
+      // The new grid is open now, so other rows add a pane instead.
+      fireEvent.contextMenu(screen.getByRole("link", { name: "conv_c" }));
+      expect(screen.queryByRole("menuitem", { name: "Create a grid" })).toBeNull();
+      fireEvent.keyDown(await screen.findByRole("menuitem", { name: "Open in grid" }), {
+        key: "ArrowRight",
+      });
+      const panes = await screen.findAllByRole("menuitem", { name: /^Pane / });
+      expect(panes.map((item) => item.textContent)).toEqual([
+        "Pane 1 · split top",
+        "Pane 1 · split bottom",
+        "Pane 2 · split top",
+        "Pane 2 · split bottom",
+      ]);
     } finally {
       viewer.mockRestore();
       resolve.mockRestore();
