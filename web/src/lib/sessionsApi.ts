@@ -575,7 +575,8 @@ function postEventResponseFromWire(wire: {
  *   session under as a child, e.g. "conv_parent987".
  * @param options.subAgentName - Sub-agent name for parent-spec-tree
  *   resolution; null/omitted for user-added agents.
- * @param options.title - Child title, e.g. "ui:claude-native-ui:1".
+ * @param options.title - The session's title, e.g. "Create workflow Triage flaky
+ *   tests", or a child's, e.g. "ui:claude-native-ui:1".
  * @param options.hostId - Connected host to run on, e.g. "host_1".
  * @param options.workspace - Absolute directory on that host.
  * @param options.sandbox - Run in a new sandbox instead: the provider (null
