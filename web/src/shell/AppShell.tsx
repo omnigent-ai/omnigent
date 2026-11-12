@@ -987,6 +987,7 @@ function AppShellImpl() {
     shellsPanelOpen,
     rightPanelOpen,
     rightPanelMaximized,
+    sidebarOpen,
   };
   const railSelectionRef = useRef(railSelection);
   railSelectionRef.current = railSelection;
@@ -1522,12 +1523,13 @@ function AppShellImpl() {
         if (!terminalFirst) setPanelInitialKeyState(null);
       }
       const maximized = !!conversationId && !!urlFilePath && urlFileFullscreen;
-      if (maximized && !rightPanelMaximized) {
+      const currentLayout = railSelectionRef.current;
+      if (maximized && !currentLayout.rightPanelMaximized) {
         if (!sessionJustRestored || !restoredWorkspace?.exitedMaximized) {
-          sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
+          sidebarOpenBeforeMaximizeRef.current = currentLayout.sidebarOpen;
         }
         setSidebarOpen(false);
-      } else if (!maximized && rightPanelMaximized) {
+      } else if (!maximized && currentLayout.rightPanelMaximized) {
         restoreSidebarAfterMaximize();
       }
       setRightPanelMaximized(maximized);

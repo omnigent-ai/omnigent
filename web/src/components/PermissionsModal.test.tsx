@@ -1442,30 +1442,46 @@ describe("PermissionsModal", () => {
       },
     );
 
-    it("waits for the session workspace before enabling file sharing controls", async () => {
-      listMock.mockResolvedValue([]);
-      useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
-      render(
-        <PermissionsModal
-          sessionId="conv_abc"
-          filePath="report.html"
-          open
-          onOpenChange={() => {}}
-        />,
-        {
-          wrapper: createWrapper(),
-        },
-      );
-      await screen.findByText("No grants yet.");
-      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
-        target: { value: "carol" },
-      });
+    it.each([null, new Error("Could not load the session")])(
+      "keeps grants revocable while file sharing waits for the session (error: %s)",
+      async (sessionError) => {
+        listMock.mockResolvedValue([
+          { user_id: "bob", conversation_id: "conv_abc", level: 1 },
+          { user_id: "__public__", conversation_id: "conv_abc", level: 1 },
+        ]);
+        revokeMock.mockResolvedValue(undefined);
+        useSessionMock.mockReturnValue({
+          session: null,
+          isLoading: !sessionError,
+          error: sessionError,
+        });
+        render(
+          <PermissionsModal
+            sessionId="conv_abc"
+            filePath="report.html"
+            open
+            onOpenChange={() => {}}
+          />,
+          { wrapper: createWrapper() },
+        );
+        await screen.findByText("bob");
+        fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+          target: { value: "carol" },
+        });
 
-      expect(screen.getByRole("button", { name: "Grant" })).toBeDisabled();
-      expect(screen.getByRole("button", { name: "Copy link" })).toBeDisabled();
-      expect(screen.getByRole("button", { name: "Open in mobile app" })).toBeDisabled();
-      expect(updateSessionMock).not.toHaveBeenCalled();
-    });
+        expect(screen.getByRole("button", { name: "Grant" })).toBeDisabled();
+        expect(screen.getByRole("button", { name: "Copy link" })).toBeDisabled();
+        expect(screen.getByRole("button", { name: "Open in mobile app" })).toBeDisabled();
+        expect(screen.getByRole("combobox", { name: "Permission level for bob" })).toBeDisabled();
+        if (sessionError) expect(screen.getByText(sessionError.message)).toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+        await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "bob"));
+        await chooseGeneralAccess("No access");
+        await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
+        expect(grantMock).not.toHaveBeenCalled();
+        expect(updateSessionMock).not.toHaveBeenCalled();
+      },
+    );
 
     it("explains session access and grants new recipients read access", async () => {
       listMock.mockResolvedValue([]);

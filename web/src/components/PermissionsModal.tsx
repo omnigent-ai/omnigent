@@ -86,7 +86,7 @@ export function PermissionsModal({
   const sharingMode = info === "loading" ? "on" : info.sharing_mode;
   const sharingOff = sharingMode === "off";
   const sharingReadOnly = sharingMode === "read_only" || sharingMode === "restricted_read_only";
-  const { session } = useSession(open && !sharingOff ? sessionId : null);
+  const { session, error: sessionError } = useSession(open && !sharingOff ? sessionId : null);
   const sharingWorkspace = workspace ?? (filePath ? session?.workspace : undefined);
   const workspaceBlocked =
     sharingMode === "restricted_read_only" && workspaceSharingBlocked(sharingWorkspace);
@@ -128,6 +128,7 @@ export function PermissionsModal({
   const workspaceShared = session?.shareWorkspaceFiles ?? false;
   const fileShareUnavailable = !!filePath && (!session || workspaceBlocked);
   const shareBusy = grant.isPending || revoke.isPending || shareWorkspace.isPending;
+  const visibleError = error ?? (fileShareUnavailable ? sessionError?.message : null);
 
   async function prepareFileShare() {
     if (!filePath) return;
@@ -199,7 +200,7 @@ export function PermissionsModal({
   }
 
   async function handleChangeLevel(userId: string, level: number) {
-    if (workspaceBlocked) return;
+    if (workspaceBlocked || fileShareUnavailable) return;
     setError(null);
     await grantAccess(userId, level);
   }
@@ -377,6 +378,7 @@ export function PermissionsModal({
                     onRevoke={handleRevoke}
                     onChangeLevel={handleChangeLevel}
                     busy={shareBusy}
+                    levelDisabled={fileShareUnavailable}
                     readOnly={sharingReadOnly}
                   />
                 ))}
@@ -441,7 +443,7 @@ export function PermissionsModal({
           </Button>
         </form>
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {visibleError && <p className="text-sm text-destructive">{visibleError}</p>}
 
         {/* Keep the default stacking below sm: one row of Copy link + QR +
             Done overflows a phone-width dialog and widens the whole grid. */}
@@ -818,12 +820,14 @@ function GrantRow({
   onRevoke,
   onChangeLevel,
   busy,
+  levelDisabled,
   readOnly,
 }: {
   permission: Permission;
   onRevoke: (userId: string) => void;
   onChangeLevel: (userId: string, level: number) => void;
   busy: boolean;
+  levelDisabled: boolean;
   readOnly: boolean;
 }) {
   const isOwner = permission.level === 4;
@@ -851,7 +855,7 @@ function GrantRow({
         <Select
           value={String(permission.level)}
           onValueChange={(v) => onChangeLevel(permission.user_id, parseInt(v, 10))}
-          disabled={busy}
+          disabled={busy || levelDisabled}
         >
           <SelectTrigger
             className="h-8 w-28"

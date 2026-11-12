@@ -4548,6 +4548,8 @@ describe("AppShell fullscreen file links", () => {
     expect(screen.getByTestId("url-params")).toHaveTextContent(/^file=README.md$/);
 
     fireEvent.click(screen.getByTestId("nav-session"));
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
     fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
 
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "AGENTS.md");
@@ -4558,7 +4560,7 @@ describe("AppShell fullscreen file links", () => {
 
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "AGENTS.md");
     expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
     expect(screen.getByTestId("url-params")).toHaveTextContent("file=AGENTS.md");
     expect(screen.getByTestId("url-params").textContent).not.toContain("fullscreen");
   });
