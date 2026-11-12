@@ -145,6 +145,32 @@ describe("resolveServerInfo sandbox_providers", () => {
     });
   });
 
+  it("keeps a provider's automation notice", async () => {
+    const result = await probe({
+      sandbox_provider_capabilities: {
+        agent_sandbox: { multi_repo: false, automation_notice: "Keep your laptop signed in." },
+      },
+    });
+    expect(result.sandbox_provider_capabilities?.agent_sandbox).toEqual({
+      multi_repo: false,
+      automation_notice: "Keep your laptop signed in.",
+      repo_catalog: [],
+    });
+  });
+
+  it.each([null, 42, "", "   ", ["note"]])(
+    "drops a malformed automation notice (%j)",
+    async (automation_notice) => {
+      const result = await probe({
+        sandbox_provider_capabilities: { agent_sandbox: { multi_repo: false, automation_notice } },
+      });
+      expect(result.sandbox_provider_capabilities?.agent_sandbox).toEqual({
+        multi_repo: false,
+        repo_catalog: [],
+      });
+    },
+  );
+
   it.each([undefined, false, "true", true])(
     "requires an explicit durable-input capability (%s)",
     async (value) => {

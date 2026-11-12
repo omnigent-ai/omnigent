@@ -154,6 +154,8 @@ export interface ServerInfo {
       inference_models?: boolean;
       default_models?: boolean;
       repo_catalog?: { name: string; url: string }[];
+      /** The provider's note on what its unattended runs need from their owner. */
+      automation_notice?: string;
     }
   >;
   /**
@@ -540,11 +542,15 @@ function parseSandboxProviderCapabilities(
       ) {
         return [];
       }
+      const { automation_notice: automationNotice, ...flags } = capabilities;
       return [
         [
           provider,
           {
-            ...capabilities,
+            ...flags,
+            ...(typeof automationNotice === "string" && automationNotice.trim() !== ""
+              ? { automation_notice: automationNotice }
+              : {}),
             repo_catalog: Array.isArray(capabilities.repo_catalog)
               ? capabilities.repo_catalog.filter(
                   (repo: unknown): repo is { name: string; url: string } =>

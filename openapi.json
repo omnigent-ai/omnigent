@@ -6621,9 +6621,7 @@
           },
           "sandbox_provider_capabilities": {
             "additionalProperties": {
-              "additionalProperties": {
-                "type": "boolean"
-              },
+              "additionalProperties": true,
               "type": "object"
             },
             "default": {},

@@ -1834,6 +1834,7 @@ async def test_list_runs_returns_history_for_owned_task(
         newer_id,
         scheduled_at=2000,
         status="failed",
+        error="the sandbox did not register within 720 seconds — " + "x" * 2000,
         error_code="incomplete",
         finished_at=2002,
         conversation_id=conv_id,
@@ -1849,8 +1850,12 @@ async def test_list_runs_returns_history_for_owned_task(
     assert newest["finished_at"] == 2002
     assert newest["conversation_id"] == conv_id
     assert newest["scheduled_task_id"] == task_id
-    # The free-text error blob is not exposed on the run list.
+    # The free-text error reaches the run list only as a capped detail.
     assert "error" not in newest
+    detail = newest["error_detail"]
+    assert detail.startswith("the sandbox did not register within 720 seconds — ")
+    assert len(detail) == 1000
+    assert runs[1]["error_detail"] is None
     # The run's session doesn't exist, so it carries no session read state.
     assert newest["conversation_updated_at"] is None
     assert newest["conversation_status"] is None

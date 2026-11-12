@@ -2365,6 +2365,31 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
     }
 
 
+def test_provider_ui_capabilities_carry_a_providers_automation_notice() -> None:
+    """A provider's automation notice reaches /v1/info for the automation form; a
+    provider without one adds no key."""
+
+    class _NoticeFake(FakeSandboxLauncher):
+        automation_notice = "Keep your laptop's credentials fresh."
+
+    deployment = ManagedSandboxDeployment(
+        configs=tuple(
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider=provider,
+                token_ttl_s=3600,
+                launcher_factory=factory,
+            )
+            for provider, factory in (("noted", _NoticeFake), ("plain", FakeSandboxLauncher))
+        )
+    )
+
+    capabilities = deployment.provider_ui_capabilities()
+
+    assert capabilities["noted"]["automation_notice"] == "Keep your laptop's credentials fresh."
+    assert "automation_notice" not in capabilities["plain"]
+
+
 def test_provider_ui_capabilities_report_which_providers_take_a_moved_session() -> None:
     """A provider that manages sandbox profiles is reported as no destination for
     a move, which the move route refuses, whether profile discovery is on or not."""

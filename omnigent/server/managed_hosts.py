@@ -1008,9 +1008,9 @@ class ManagedSandboxDeployment:
             if config.managed_launch_supported and config.provider is not None
         )
 
-    def provider_ui_capabilities(self) -> dict[str, dict[str, bool]]:
+    def provider_ui_capabilities(self) -> dict[str, dict[str, object]]:
         """
-        UI-relevant capability flags per launchable provider, for ``/v1/info``.
+        UI-relevant capabilities per launchable provider, for ``/v1/info``.
 
         Only the flags the web branches on are exposed (not the full internal
         :class:`SandboxCapabilities`), so the wire contract stays small — add an
@@ -1020,9 +1020,10 @@ class ManagedSandboxDeployment:
         ponytail: builds launchers on each call; memoize on the deployment only
         if /v1/info shows up hot (provider count is tiny, __init__ does no I/O).
 
-        :returns: Capability flags for each launchable provider, in configured order.
+        :returns: Capabilities for each launchable provider, in configured order:
+            flags, plus the provider's ``automation_notice`` text when it sets one.
         """
-        caps: dict[str, dict[str, bool]] = {}
+        caps: dict[str, dict[str, object]] = {}
         for config in self.configs:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
@@ -1046,6 +1047,8 @@ class ManagedSandboxDeployment:
                     config.host_config, config.model_discovery
                 ):
                     caps[config.provider]["default_models"] = True
+                if launcher.automation_notice:
+                    caps[config.provider]["automation_notice"] = launcher.automation_notice
         return caps
 
 
