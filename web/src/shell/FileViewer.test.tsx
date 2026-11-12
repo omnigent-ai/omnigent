@@ -3150,7 +3150,7 @@ it("names its own file in a copied link when the page URL names another", () => 
   const writeText = vi.fn().mockResolvedValue(undefined);
   useCommentsMock.mockReturnValue(makeCommentsQuery([]));
   vi.stubGlobal("navigator", { clipboard: { writeText } });
-  window.history.replaceState(null, "", "/c/conv_1?file=other.md&line=4&column=2");
+  window.history.replaceState(null, "", "/c/conv_1?file=other.md&line=4&column=2&comment=c9");
   try {
     renderViewer({ open: true, path: "docs/guide.md" });
     fireEvent.click(screen.getByRole("button", { name: "Copy link to file" }));
@@ -3159,6 +3159,7 @@ it("names its own file in a copied link when the page URL names another", () => 
     expect(copied.searchParams.get("file")).toBe("docs/guide.md");
     expect(copied.searchParams.has("line")).toBe(false);
     expect(copied.searchParams.has("column")).toBe(false);
+    expect(copied.searchParams.has("comment")).toBe(false);
   } finally {
     window.history.replaceState(null, "", "/");
     vi.unstubAllGlobals();

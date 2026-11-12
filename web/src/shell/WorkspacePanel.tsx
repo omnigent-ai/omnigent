@@ -1662,19 +1662,22 @@ function WorkspacePanelImpl({
   const treeShown = filesPanelActive && rightRailTab !== "changes";
   const previewShown = treeSplitEnabled && treeSplitFits && treeShown && previewPath !== null;
   const viewerShown = standaloneShown || previewShown;
-  // The file beside the tree loads once shown, then stays loaded in this session while hidden.
+  // The file beside the tree loads once the editor holds it (beside the tree, or as the same
+  // tab), then stays loaded in this session. Guards rely on it: leaving a tab keeps it open.
   const [loadedPreview, setLoadedPreview] = useState<{ session: string; path: string } | null>(
     null,
   );
+  const editorHoldsPreview =
+    previewPath !== null && (previewShown || standalonePath === previewPath);
   const previewLoaded =
     previewPath !== null &&
     loadedPreview?.session === conversationId &&
     loadedPreview.path === previewPath;
-  if (previewShown && !previewLoaded)
+  if (editorHoldsPreview && !previewLoaded)
     setLoadedPreview({ session: conversationId, path: previewPath });
   // One editor for the rail: the selected file tab's file, else the file beside the tree.
   // It stays mounted while hidden (another tab, a narrow rail, lost access), keeping drafts.
-  const documentPath = standalonePath ?? (previewShown || previewLoaded ? previewPath : null);
+  const documentPath = standalonePath ?? (editorHoldsPreview || previewLoaded ? previewPath : null);
   // Desktop Close (⌘W / Ctrl+W) while the rail, or its embedded browser view,
   // has focus: close the tab on screen, or hide the rail on a fixed page.
   // Otherwise AppShell's handler leaves the session.
@@ -1856,6 +1859,10 @@ function WorkspacePanelImpl({
   useDesktopCommand("previous-tab", tabCommandsActive ? () => showAdjacentTab(-1) : null);
   useDesktopCommand("next-tab", tabCommandsActive ? () => showAdjacentTab(1) : null);
   useDesktopCommand("reopen-closed-tab", tabCommandsActive ? reopenClosedTab : null);
+  // A phone's full-screen viewer closes back to its drawer; the file beside the tree just closes.
+  const mobileFileClose = isMobile ? onMobileFileClose : undefined;
+  const viewerClose = standaloneShown ? (mobileFileClose ?? onShowScopeView) : closeTreePreview;
+  const viewerCloseTab = standaloneShown ? (mobileFileClose ?? handleCloseTab) : closeTreePreview;
   const rail = (
     <aside
       aria-label="Workspace"
@@ -2329,22 +2336,8 @@ function WorkspacePanelImpl({
                 path={documentPath}
                 // Hidden but still the tab's file, it keeps its citation and the view it implies.
                 position={documentPath === standalonePath ? filePosition : undefined}
-                onClose={
-                  !standaloneShown
-                    ? closeTreePreview
-                    : isMobile && onMobileFileClose
-                      ? onMobileFileClose
-                      : onShowScopeView
-                }
-                onCloseTab={
-                  !viewerShown
-                    ? undefined
-                    : !standaloneShown
-                      ? closeTreePreview
-                      : isMobile && onMobileFileClose
-                        ? onMobileFileClose
-                        : handleCloseTab
-                }
+                onClose={viewerClose}
+                onCloseTab={viewerShown ? viewerCloseTab : undefined}
                 onNavigateTo={viewerShown ? openFileViewer : undefined}
                 permissionLevel={permissionLevel}
                 onCommentsOpenChange={onCommentsOpenChange}

@@ -149,28 +149,23 @@ describe.each([
   });
 });
 
-it("updates a mounted final-answer fold reader on import", () => {
-  const { result } = renderHook(() => useFoldAssistantNarration());
+it.each([
+  {
+    reader: "final-answer fold",
+    key: FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+    use: useFoldAssistantNarration,
+  },
+  {
+    reader: "always-open-files",
+    key: ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY,
+    use: useAlwaysOpenFilesInTab,
+  },
+])("updates a mounted $reader reader on import", ({ key, use }) => {
+  const { result } = renderHook(() => use());
   expect(result.current).toBe(false);
 
   act(() => {
-    applyImportedSettings({
-      version: 1,
-      settings: { [FOLD_ASSISTANT_NARRATION_STORAGE_KEY]: "true" },
-    });
-  });
-  expect(result.current).toBe(true);
-});
-
-it("updates a mounted always-open-files reader on import", () => {
-  const { result } = renderHook(() => useAlwaysOpenFilesInTab());
-  expect(result.current).toBe(false);
-
-  act(() => {
-    applyImportedSettings({
-      version: 1,
-      settings: { [ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY]: "true" },
-    });
+    applyImportedSettings({ version: 1, settings: { [key]: "true" } });
   });
   expect(result.current).toBe(true);
 });

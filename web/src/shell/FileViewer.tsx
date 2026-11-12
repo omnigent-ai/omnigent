@@ -622,7 +622,7 @@ function FileViewerBody({
     }
     if (url.searchParams.get("file") !== path) {
       url.searchParams.set("file", path);
-      for (const key of ["line", "column", "endLine"]) url.searchParams.delete(key);
+      for (const key of ["line", "column", "endLine", "comment"]) url.searchParams.delete(key);
     }
     return url;
   }, [syncUrl, rebasePath, conversationId, path]);
@@ -1024,7 +1024,7 @@ function FileViewerBody({
     if (position && viewMode === "editor" && samePath) {
       guardDirty(apply, () => dismissFilePosition(position));
     } else if (!position && samePath && viewMode === "source" && fileViewMode !== "source") {
-      // Clearing a citation would leave edited source for a preview; keeping edits keeps it.
+      // A cleared citation would switch edited source to the preview, so confirm first.
       guardDirty(apply);
     } else {
       apply();

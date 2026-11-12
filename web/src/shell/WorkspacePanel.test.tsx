@@ -2455,6 +2455,35 @@ describe("WorkspacePanel file tree split", () => {
     expect(openFileInTree).not.toHaveBeenCalled();
   });
 
+  it("keeps the editor when a tab that is also the never-shown preview is left", async () => {
+    // No room for the split: the saved preview has never been shown beside the tree.
+    const fileGuard = vi.fn<FileNavigationGuard>((destination, _options, commit) => {
+      // Like the real viewer of docs/a.md, it asks only when another file replaces it.
+      if (destination === "docs/a.md") commit();
+    });
+    const { rerender, onRightRailTabChange } = renderWorkspace({
+      ...split,
+      showBrowserTab: true,
+      treePreviewPath: "docs/a.md",
+      openFiles: ["docs/a.md"],
+      selectedFilePath: "docs/a.md",
+      fileGuard,
+    });
+    const editor = viewer();
+    typeDraft("Keep this draft");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+    expect(fileGuard).toHaveBeenCalledWith("docs/a.md", undefined, expect.any(Function));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+
+    rerender({ selectedFilePath: null, rightRailTab: "browser" });
+    expect(viewer()).toBe(editor);
+    expect(draftIn(editor)).toHaveValue("Keep this draft");
+  });
+
   it("loads a saved preview only once it is shown", () => {
     const resize = measureRail(400);
     renderWorkspace({ ...split, treePreviewPath: "docs/a.md" });
@@ -2503,6 +2532,7 @@ describe("WorkspacePanel desktop menu commands", () => {
 
   afterEach(() => {
     resetDesktopCommandsForTests();
+    vi.unstubAllGlobals();
   });
 
   /** Put keyboard focus on the rail's tab strip, as a click inside the rail would. */
@@ -2525,7 +2555,6 @@ describe("WorkspacePanel desktop menu commands", () => {
     close();
     expect(onCloseTreePreview).toHaveBeenCalledOnce();
     expect(onHide).not.toHaveBeenCalled();
-    vi.unstubAllGlobals();
   });
 
   it("closes the shell on screen when the rail has focus", () => {
@@ -3252,36 +3281,25 @@ describe("WorkspacePanel desktop menu commands", () => {
     }
     const reopen = () => sendCommand({ command: "reopen-closed-tab", browserViewId: null });
 
-    it("keeps a closed file in the history while the previewed file's edits are kept", () => {
+    it.each([
+      {
+        holder: "an open file tab",
+        session: "conv_keep_file",
+        state: { openFiles: ["src/a.ts", "src/b.ts"], selectedFilePath: "src/b.ts" },
+      },
+      {
+        holder: "the file beside the tree",
+        session: "conv_keep_preview",
+        state: {
+          fileTreeSplitEnabled: true,
+          treePreviewPath: "docs/a.md",
+          openFiles: ["src/a.ts"],
+        },
+      },
+    ])("keeps a closed file in the history while $holder keeps its edits", ({ session, state }) => {
       measureRail(800);
       const { allow, fileGuard } = guardedFile();
-      const { openFileViewer } = renderWorkspace({
-        conversationId: "conv_keep_preview",
-        fileTreeSplitEnabled: true,
-        treePreviewPath: "docs/a.md",
-        openFiles: ["src/c.ts"],
-        fileGuard,
-      });
-      fireEvent.click(screen.getByRole("button", { name: "Close c.ts" }));
-
-      reopen();
-      expect(fileGuard).toHaveBeenLastCalledWith("src/c.ts", undefined, expect.any(Function));
-      expect(openFileViewer).not.toHaveBeenCalled();
-      reopen();
-      expect(fileGuard).toHaveBeenCalledTimes(2);
-      act(() => allow[1]!());
-      expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/c.ts");
-      vi.unstubAllGlobals();
-    });
-
-    it("keeps a closed file in the history while the open file's edits are kept", () => {
-      const { allow, fileGuard } = guardedFile();
-      const { openFileViewer } = renderWorkspace({
-        conversationId: "conv_keep_file",
-        openFiles: ["src/a.ts", "src/b.ts"],
-        selectedFilePath: "src/b.ts",
-        fileGuard,
-      });
+      const { openFileViewer } = renderWorkspace({ conversationId: session, ...state, fileGuard });
       fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
 
       reopen();

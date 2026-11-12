@@ -46,6 +46,10 @@ export function ResponsiveViewerSlot({
       }
     };
     const rememberScroll = (event: Event) => {
+      // Forget elements a file switch removed, so the map never holds detached editors.
+      for (const element of scrollOffsets.current.keys()) {
+        if (!host.contains(element)) scrollOffsets.current.delete(element);
+      }
       if (event.target instanceof Element && event.target.getClientRects().length > 0) {
         const { scrollTop: top, scrollLeft: left } = event.target;
         scrollOffsets.current.set(event.target, { top, left });

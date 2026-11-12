@@ -998,11 +998,11 @@ function FileRowItem({
         onContextMenu={reveal.onContextMenu}
         className={cn(
           "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1",
-          isDeleted
-            ? "opacity-50"
-            : selected
-              ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))]"
-              : "hover:bg-muted",
+          isDeleted && "opacity-50",
+          !isDeleted &&
+            selected &&
+            "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))]",
+          !isDeleted && !selected && "hover:bg-muted",
         )}
         style={{ paddingLeft: `${indentFor(depth)}px` }}
       >
