@@ -281,6 +281,27 @@ try:
     if sandbox_config is not None:
         logger.info("Managed sandbox hosts configured from the server config")
 
+    # Databricks account connection: per-user OAuth tokens, which the
+    # `databricks` sandbox provider needs to run each sandbox as its owner.
+    from omnigent.server.databricks_app import DatabricksConfig
+
+    databricks_config = DatabricksConfig.from_env()
+    databricks_store = None
+    if databricks_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        dbx_cipher = build_secret_cipher()
+        if dbx_cipher is None:
+            logger.error(
+                "Databricks account connection is configured but disabled: set the "
+                "credential store's key (OMNIGENT_CREDENTIAL_KMS_KEY_ID or "
+                "OMNIGENT_CREDENTIAL_VAULT_KEY) to enable it."
+            )
+        else:
+            from omnigent.connections.databricks import DatabricksConnectionStore
+
+            databricks_store = DatabricksConnectionStore(DB_URI, dbx_cipher)
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -295,6 +316,8 @@ try:
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
         sandbox_config=sandbox_config,
+        databricks_config=databricks_config,
+        databricks_store=databricks_store,
     )
 
     if __name__ == "__main__":

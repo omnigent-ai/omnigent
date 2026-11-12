@@ -99,6 +99,13 @@ deploy/
 ├── microsandbox/      ← microsandbox sandbox-provider guide (local libkrun
 │   └── README.md         microVMs, embedded SDK, no daemon); NOT a server target.
 │
+├── aws-lambda-microvm/ ← AWS Lambda MicroVMs sandbox-provider guide + MicroVM
+│   ├── Dockerfile        image build inputs (hooks shim on the host image);
+│   ├── entrypoint.sh     server-managed only. NOT a server deploy target.
+│   ├── hooks_server.py
+│   ├── start_host.sh
+│   └── README.md
+│
 ├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
 │   ├── databricks.yml     bundle declarative config
 │   ├── deploy.py          build + `bundle deploy`/`run` orchestrator
@@ -293,9 +300,14 @@ session authenticated for that specific ticket; ordinary browser sessions,
 runner tokens, and refresh-issued tokens cannot approve it. Existing sessions
 remain valid elsewhere. Generic OIDC ticket flows require fresh IdP authentication
 and a signed ID token with `auth_time` at or after the reauthentication request.
-Verify that your IdP honors `prompt=login` and `max_age=0` and supplies `auth_time`;
+Verify that your IdP honors `prompt=login` with a positive `max_age` (300 seconds
+by default; `OMNIGENT_OIDC_REAUTH_MAX_AGE` changes it) and supplies `auth_time`;
 missing or stale claims fail closed. GitHub OAuth may reuse its provider session,
 but still requires ticket-specific browser sign-in and approval.
+For an IdP that cannot supply a fresh `auth_time` (for example, Cloudflare
+Access), set `OMNIGENT_OIDC_REQUIRE_REAUTH=0`. The server still sends
+`prompt=login` and requires PKCE, ticket-specific sign-in, and approval, but it
+no longer verifies that the IdP asked for credentials again.
 Polling responses forbid caching, including successful credential responses.
 CLI and Slack display a comparison code; native mobile apps currently rely
 on explicit browser approval without displaying that code in the app. Include
@@ -363,6 +375,36 @@ Gensee reads `GENSEE_CONTROLLER_API_TOKEN`; see
 All credentials come from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
+
+**Host token expiry.** Set `sandbox.token_ttl_s` to control the token validity
+window in seconds. Omitted or `null` keeps the provider default (seven days
+for most providers; Modal uses 25 hours, and Blaxel, E2B, and CoreWeave derive
+it from sandbox lifetime). Values must be integers from `300` to `31536000`
+(5 minutes to 365 days). Allow enough time for sandbox startup and repository
+setup before the first host connection.
+
+```yaml
+sandbox:
+  server_url: https://your-host
+  token_ttl_s: 86400                 # shared default: 1 day
+  providers:
+    - provider: daytona
+    - provider: kubernetes
+      token_ttl_s: 604800            # override: 7 days
+```
+
+With a single `provider`, put `token_ttl_s` beside it. In a `providers` list,
+an entry can override the shared value or use `null` to restore its provider
+default. Restart the server after editing the configuration. The setting
+applies to newly issued tokens and future renewals; lowering it does not
+shorten an expiry already granted to an existing token.
+
+Connected hosts renew the same token halfway through this window, on the next
+heartbeat. Ordinary heartbeats keep their existing cost. Expiry is measured
+from the last renewal; disconnected hosts receive no renewals, and an expired
+token cannot open a new connection. Renewal also extends the validity of any
+leaked copy of that token. This setting does not change sandbox lifetime or
+Mac/Arca user-login credentials.
 
 The optional reaper runs once for the whole `sandbox:` deployment, including
 multi-provider configurations. It queries managed host rows directly and
@@ -670,9 +712,33 @@ shows the Omnigent mascot, never your logo.
 `server_name` names this particular server, so people who connect the desktop
 app to several servers can tell them apart. It is published in the
 unauthenticated `GET /.well-known/omnigent.json` manifest, not in `/v1/info`.
-Desktop builds that read it always show the host next to it, and an MDM-provided
-name (`omnigentServerName`) takes precedence. When unset, the desktop shows the
+Desktop builds that read it always show the host next to it, and a name set by
+device policy (`omnigentServerName`) takes precedence. When unset, the desktop shows the
 host; it does not fall back to `app_name`.
+
+## Curating the New Chat picker
+
+Limit and order what New Chat offers, and choose where a fresh chat starts, with
+two optional keys in the same server config as `branding:` (`omnigent server -c
+config.yaml`, or `/data/config.yaml` in the Docker stack). A plain `omnigent
+server` without `-c` does not read them. Takes effect on the next server start.
+
+```yaml
+restrict_to_agent_names: [polly, claude-native-ui]  # New Chat offers only these, in this order
+default_agent_name: polly                            # where a user with no history starts
+```
+
+With `restrict_to_agent_names` set, New Chat shows one flat list: no Harnesses
+heading, no "Other..." submenus, no "Create custom agent" and no Smart Routing.
+A user's own earlier pick wins over `default_agent_name` while it is still
+offered. The server logs a warning at startup for a name it can't offer.
+
+This is display only, not access control: the API, the CLI, the automation and
+project-default pickers, and existing sessions still reach every agent. To
+remove packaged agents everywhere, use `OMNIGENT_SEEDED_AGENTS` ([Trimming the
+packaged built-in agents](docker/README.md#trimming-the-packaged-built-in-agents));
+an agent it removes stays hidden even when `restrict_to_agent_names` lists it.
+Both keys are served on the unauthenticated `GET /v1/info`.
 
 ## Adding a new deploy target
 

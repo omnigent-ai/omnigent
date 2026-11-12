@@ -54,3 +54,24 @@ def bind_session_runner(
         **request_options,
     )
     response.raise_for_status()
+
+
+def send_user_text(
+    client: httpx.Client,
+    *,
+    session_id: str,
+    text: str,
+) -> None:
+    """Post text through the session events API using the caller's client."""
+    resp = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        },
+        timeout=30.0,
+    )
+    resp.raise_for_status()

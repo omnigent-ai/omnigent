@@ -107,10 +107,12 @@ name: no-guardrails
         conversation_id=conv.id,
         conversation_store=conversation_store,
     )
-    # No user-declared guardrails, but the hardcoded
-    # ask_on_add_policy guard is always present.
-    assert len(engine.policies) == 2
-    assert engine.policies[0].spec.name == "__ask_on_add_policy"
+    # No user-declared guardrails, but the hardcoded approval guards
+    # are always present.
+    assert [p.spec.name for p in engine.policies] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
     assert engine.label_defs == {}
     assert engine.labels == {}
 
@@ -139,8 +141,10 @@ guardrails: {}
         conversation_store=conversation_store,
     )
     # Mandatory approval guards remain even without configured policies.
-    assert len(engine.policies) == 2
-    assert engine.policies[0].spec.name == "__ask_on_add_policy"
+    assert [p.spec.name for p in engine.policies] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
     assert engine.label_defs == {}
     assert engine.labels == {}
 
@@ -187,8 +191,8 @@ guardrails:
     # Names in YAML order — regression would reorder alphabet
     # or reverse direction.
     names = [p.spec.name for p in engine.policies]
-    # Declared policies in YAML order, plus the hardcoded
-    # ask_on_add_policy guard appended by the builder.
+    # Declared policies in YAML order, plus the mandatory approval
+    # guards appended by the builder.
     assert names == [
         "alpha",
         "bravo",
@@ -632,11 +636,10 @@ def test_empty_default_policies_preserves_existing_behaviour(
         conversation_store=conversation_store,
         default_policies=[],
     )
-    # Only the hardcoded ask_on_add_policy guard.
-    assert len(engine_none.policies) == 2
-    assert engine_none.policies[0].spec.name == "__ask_on_add_policy"
-    assert len(engine_empty.policies) == 2
-    assert engine_empty.policies[0].spec.name == "__ask_on_add_policy"
+    # Only the two hardcoded approval guards.
+    guards = ["__ask_on_add_policy", "__ask_on_scheduled_task_change"]
+    assert [p.spec.name for p in engine_none.policies] == guards
+    assert [p.spec.name for p in engine_empty.policies] == guards
 
 
 # ── Sub-agent cost roll-up (subtree usage aggregation) ──
@@ -1500,7 +1503,8 @@ def test_delete_of_a_root_inherited_key_does_not_resurrect_from_the_snapshot(
     assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == 0.05
 
     engine.apply_state_updates(
-        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)]
+        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)],
+        approved=True,
     )
 
     assert SESSION_COST_ASK_APPROVED_STATE_KEY not in engine.session_state, engine.session_state
@@ -1543,12 +1547,14 @@ def test_delete_of_the_same_key_name_on_a_top_level_session_removes_it(
                 action=StateUpdateAction.SET,
                 value=0.05,
             )
-        ]
+        ],
+        approved=True,
     )
     assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == 0.05
 
     engine.apply_state_updates(
-        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)]
+        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)],
+        approved=True,
     )
 
     assert SESSION_COST_ASK_APPROVED_STATE_KEY not in engine.session_state, engine.session_state

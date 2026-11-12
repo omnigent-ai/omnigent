@@ -13,7 +13,7 @@ each proxies the Omnigent server's existing REST endpoints over
   the agent bound to any accessible session).
 - ``sys_agent_download`` → ``GET /v1/sessions/{id}/agent/contents``
   (download a session's agent bundle ``.tar.gz`` to the agent's local
-  disk; returns the path).
+  disk; READ callers receive a redacted bundle and the path).
 - ``sys_agent_list`` → ``GET /v1/agents`` + ``GET /v1/sessions`` + a
   local-disk scan (built-in/template agents, agents bound to sessions,
   and locally-authored configs).
@@ -61,9 +61,11 @@ class SysAgentGetTool(Tool):
             "guardrail policies. Global read — any session you can "
             "access. Requires session_id (an agent is only inspectable "
             "while running in some session). The returned agent_id "
-            "launches the same agent directly via sys_session_create. "
-            "Use sys_agent_download only to fetch the agent's full "
-            "bundle for inspection or forking."
+            "launches the same agent via sys_session_create when you have "
+            "EDIT on a session using it (READ is not enough for another "
+            "user's session-scoped agent). "
+            "Use sys_agent_download to fetch a bundle for inspection; "
+            "READ access returns a redacted bundle, while EDIT returns the full bundle."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -102,9 +104,10 @@ class SysAgentDownloadTool(Tool):
     """
     Download a session's agent bundle ``.tar.gz`` to local disk.
 
-    A **global read**: downloads the agent bundle bound to any session
-    the caller is permitted to access (bounded by the server's per-user
-    permission model). The bundle is written to the agent's local
+    Downloads the agent bundle bound to a session on which the caller has
+    READ access. Without EDIT, the archive contains only a minimal config
+    and cannot reproduce the source agent's private configuration.
+    The bundle is written to the agent's local
     working directory (the same filesystem ``sys_os_read`` /
     ``sys_os_shell`` operate on) and the tool returns the path —
     path-only by design. To inspect the config, extract the archive
@@ -134,8 +137,9 @@ class SysAgentDownloadTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "Download a session's agent bundle (.tar.gz) to local disk "
-            "and return the path. Global read — any session you can "
-            "access. Requires session_id. Path-only: extract the "
+            "and return the path and redacted status. Requires READ access "
+            "and its session_id; EDIT returns the full bundle. "
+            "Path-only: extract the "
             "archive with sys_os_shell, then read config.yaml with "
             "sys_os_read. Optionally pass dest_filename to control the "
             "output filename. Only needed to inspect or fork an "
@@ -195,8 +199,8 @@ class SysAgentListTool(Tool):
       (``GET /v1/agents``);
     - **session-bound**: the agents bound to sessions the caller can
       access (``GET /v1/sessions``), each with its ``agent_id`` (for a
-      direct ``sys_session_create`` launch) and its ``session_id`` (so
-      the caller can ``sys_agent_get`` / ``sys_agent_download`` it); and
+      direct ``sys_session_create`` launch) and its ``session_id`` (for
+      ``sys_agent_get`` metadata and, with EDIT access, bundle download); and
     - **local configs**: agent config YAMLs authored locally with
       ``sys_os_write`` (e.g. following the ``build-omnigent`` skill) — a
       scan of the working directory's agent-config subdir.
@@ -230,9 +234,10 @@ class SysAgentListTool(Tool):
             "agent never needs its bundle downloaded or re-uploaded. "
             "Builtins include available_on_host (true, false, or null for unknown) "
             "and unavailable_reason; do not launch entries marked false. "
-            "Use sys_agent_get / sys_agent_download (with a "
-            "session_agents row's session_id) only to inspect or fork "
-            "an agent's config. Calls without pagination keep the complete "
+            "Use sys_agent_get with a session_agents row's session_id for "
+            "metadata. Use sys_agent_download to inspect its config; "
+            "READ access yields a redacted archive. Calls without "
+            "pagination keep the complete "
             "result while it fits the tool-output budget; larger results "
             "return a page with has_more metadata and an opaque "
             "next_cursor. Pass that cursor to continue."

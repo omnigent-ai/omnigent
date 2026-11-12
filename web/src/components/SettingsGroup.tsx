@@ -21,7 +21,10 @@ export function SettingsGroup({
   return (
     <section className={cn("flex flex-col gap-3", className)} data-testid={testId}>
       <h2 className="text-ui font-medium">{title}</h2>
-      <div className={cn("rounded-xl border border-border bg-card p-4", contentClassName)}>
+      <div
+        data-slot="settings-group-card"
+        className={cn("rounded-xl border border-border bg-card p-4", contentClassName)}
+      >
         {children}
       </div>
     </section>

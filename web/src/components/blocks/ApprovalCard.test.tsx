@@ -1,9 +1,27 @@
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENTER_KEY, ESC_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import type { ClaudeQuestion, ClaudeQuestionOption } from "@/lib/askUserQuestion";
+import {
+  askUserQuestionSignature,
+  clearAskUserQuestionDraft,
+  getAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
+import type { AnyBlock } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { buildBubbles, type RenderItem } from "@/lib/renderItems";
 import { parseEventLines } from "@/lib/sse";
@@ -35,6 +53,122 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(screen.getByRole("button", { name: /approve/i })).toBeDefined();
     expect(screen.getByRole("button", { name: /reject/i })).toBeDefined();
     expect(screen.queryByTestId("approval-card-options")).toBeNull();
+  });
+
+  describe("the approve chord in the Approve button tooltip", () => {
+    const pending = (elicitationId: string, requestedSchema: object = {}) => ({
+      type: "elicitation",
+      elicitationId,
+      status: "pending",
+      requestedSchema,
+    });
+    const FIELD_SCHEMA = {
+      type: "object",
+      properties: { branch: { type: "string" } },
+      required: ["branch"],
+    };
+
+    afterEach(() => {
+      useChatStore.setState({ blocks: [] });
+    });
+
+    it.each([
+      {
+        name: "shows on the prompt the chord approves",
+        bound: true,
+        blocks: [pending("elic_chord")],
+        keys: [MOD_KEY, ENTER_KEY],
+      },
+      {
+        name: "hides on an older prompt, since the chord approves the newer one",
+        bound: true,
+        blocks: [pending("elic_chord"), pending("elic_newer")],
+        keys: [],
+      },
+      {
+        name: "hides on an older approval behind a newer form",
+        bound: true,
+        blocks: [pending("elic_chord"), pending("elic_form", FIELD_SCHEMA)],
+        keys: [],
+      },
+      {
+        name: "hides where nothing binds the chord, as on the standalone approval page",
+        bound: false,
+        blocks: [pending("elic_chord")],
+        keys: [],
+      },
+    ])("$name", async ({ bound, blocks, keys }) => {
+      useChatStore.setState({ blocks: blocks as AnyBlock[] });
+      if (bound) renderHook(() => useApproveHotkey());
+      render(
+        <ApprovalCard
+          elicitationId="elic_chord"
+          message="Approve running ls?"
+          phase="tool_call"
+          policyName="approve_shell_commands"
+          contentPreview="ls"
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+        />,
+      );
+      fireEvent.pointerMove(screen.getByRole("button", { name: "Approve" }), {
+        pointerType: "mouse",
+      });
+      const tooltip = await screen.findByRole("tooltip");
+      expect(tooltip).toHaveTextContent("Approve");
+      const shown = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+      expect(shown.map((key) => key.textContent)).toEqual(keys);
+    });
+
+    it.each([
+      {
+        name: "the prompt Esc declines",
+        blocks: [pending("elic_chord")],
+        inChat: true,
+        keys: [ESC_KEY],
+      },
+      {
+        name: "an older prompt",
+        blocks: [pending("elic_chord"), pending("elic_newer")],
+        inChat: true,
+        keys: [],
+      },
+      {
+        name: "the prompt's copy in Inbox, where Esc leaves it pending",
+        blocks: [pending("elic_chord")],
+        inChat: false,
+        keys: [],
+      },
+    ])("names Esc on the Reject button of $name only", async ({ blocks, inChat, keys }) => {
+      const submitApproval = vi.fn();
+      useChatStore.setState({ blocks: blocks as AnyBlock[], submitApproval });
+      renderHook(() => useApproveHotkey());
+      render(
+        <ApprovalCard
+          inChat={inChat}
+          elicitationId="elic_chord"
+          message="Approve running ls?"
+          phase="tool_call"
+          policyName="approve_shell_commands"
+          contentPreview="ls"
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+        />,
+      );
+      fireEvent.pointerMove(screen.getByRole("button", { name: "Reject" }), {
+        pointerType: "mouse",
+      });
+      const tooltip = await screen.findByRole("tooltip");
+      expect(tooltip).toHaveTextContent("Reject");
+      const shown = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+      expect(shown.map((key) => key.textContent)).toEqual(keys);
+      // Esc declines exactly when the button names it.
+      fireEvent.keyDown(document.body, { key: "Escape" });
+      if (keys.length > 0) expect(submitApproval).toHaveBeenCalledWith("elic_chord", "decline");
+      else expect(submitApproval).not.toHaveBeenCalled();
+    });
   });
 
   it("shows the harness name instead of the synthetic policy stamp on native prompts", () => {
@@ -221,44 +355,56 @@ describe("ApprovalCard — approve & switch to auto mode", () => {
     expect(screen.queryByRole("button", { name: /switch to auto mode/i })).toBeNull();
   });
 
-  it("preserves the server capability through parsing, reduction, and rendering", () => {
-    const events = [
-      ...parseEventLines([
-        JSON.stringify({
-          event: "response.elicitation_request",
-          data: {
-            type: "response.elicitation_request",
-            elicitation_id: props.elicitationId,
-            params: {
-              mode: "form",
-              message: props.message,
-              phase: props.phase,
-              policy_name: props.policyName,
-              requestedSchema: {},
-              allow_auto_mode: true,
+  it.each([
+    {
+      hint: { allow_auto_mode: true },
+      button: /approve & switch to auto mode/i,
+      content: { allow_auto_mode: true },
+    },
+    {
+      hint: { permission_directories: ["/worktrees/branch", "/mount/real-branch"] },
+      button: /approve & allow directories for this session/i,
+      content: { allow_directories: true },
+    },
+  ])(
+    "preserves $content through parsing, reduction, and rendering",
+    ({ hint, button, content }) => {
+      const events = [
+        ...parseEventLines([
+          JSON.stringify({
+            event: "response.elicitation_request",
+            data: {
+              type: "response.elicitation_request",
+              elicitation_id: props.elicitationId,
+              params: {
+                mode: "form",
+                message: props.message,
+                phase: props.phase,
+                policy_name: props.policyName,
+                requestedSchema: {},
+                ...hint,
+              },
             },
-          },
-        }),
-      ]),
-    ];
-    const blocks = new BlockStream().reduceSync(events);
-    const bubbles = buildBubbles(blocks, null);
-    const bubble = bubbles[0];
-    expect(bubble.kind).toBe("assistant");
-    if (bubble.kind !== "assistant") throw new Error("Expected an assistant bubble");
-    const item = bubble.items[0];
-    expect(item.kind).toBe("elicitation");
-    if (item.kind !== "elicitation") throw new Error("Expected an elicitation card");
-    const submitSpy = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ submitApproval: submitSpy });
+          }),
+        ]),
+      ];
+      const blocks = new BlockStream().reduceSync(events);
+      const bubbles = buildBubbles(blocks, null);
+      const bubble = bubbles[0];
+      expect(bubble.kind).toBe("assistant");
+      if (bubble.kind !== "assistant") throw new Error("Expected an assistant bubble");
+      const item = bubble.items[0];
+      expect(item.kind).toBe("elicitation");
+      if (item.kind !== "elicitation") throw new Error("Expected an elicitation card");
+      const submitSpy = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ submitApproval: submitSpy });
 
-    render(<ElicitationCard item={item} />);
-    fireEvent.click(screen.getByRole("button", { name: /approve & switch to auto mode/i }));
+      render(<ElicitationCard item={item} />);
+      fireEvent.click(screen.getByRole("button", { name: button }));
 
-    expect(submitSpy).toHaveBeenCalledExactlyOnceWith(props.elicitationId, "accept", {
-      allow_auto_mode: true,
-    });
-  });
+      expect(submitSpy).toHaveBeenCalledExactlyOnceWith(props.elicitationId, "accept", content);
+    },
+  );
 
   it("keeps ordinary approval and rejection separate from the mode switch", () => {
     const onSubmit = vi.fn();
@@ -307,6 +453,73 @@ describe("ApprovalCard — approve & switch to auto mode", () => {
     );
     expect(screen.getByText(label)).toBeDefined();
     expect(screen.queryByRole("button", { name: /switch to auto mode/i })).toBeNull();
+  });
+});
+
+describe("ApprovalCard — session directory access", () => {
+  const props = {
+    elicitationId: "elic_directories",
+    message: "Claude wants to call **Edit**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: "Edit({})",
+    requestedSchema: {},
+    permissionDirectories: ["/worktrees/branch", "/mount/real branch"],
+    status: "pending",
+    response: null,
+  } as const;
+
+  it("shows the exact directories and requires a separate click to grant session access", () => {
+    const onSubmit = vi.fn();
+    render(
+      <ApprovalCard
+        {...props}
+        permissionDirectories={[...props.permissionDirectories]}
+        allowAutoMode
+        allowAllEdits
+        rememberScope={{ tool: "Edit" }}
+        onSubmit={onSubmit}
+      />,
+    );
+    for (const directory of props.permissionDirectories) {
+      expect(screen.getByText(directory, { selector: "code" })).toBeDefined();
+    }
+    expect(screen.queryByRole("button", { name: /switch to auto mode/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /allow all edits/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /don't ask again/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    expect(onSubmit).toHaveBeenLastCalledWith(props.elicitationId, "accept");
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    expect(onSubmit).toHaveBeenLastCalledWith(props.elicitationId, "decline");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Approve & allow directories for this session" }),
+    );
+    expect(onSubmit).toHaveBeenLastCalledWith(props.elicitationId, "accept", {
+      allow_directories: true,
+    });
+  });
+
+  it.each([
+    ["accept", true, true, "Approved · directory access for this session"],
+    ["accept", false, true, "Approved"],
+    ["decline", true, true, "Rejected"],
+    ["accept", true, false, "Approved"],
+  ] as const)("shows %s with consent %s and scope %s", (action, consent, hasScope, label) => {
+    render(
+      <ApprovalCard
+        {...props}
+        permissionDirectories={hasScope ? [...props.permissionDirectories] : undefined}
+        status="responded"
+        response={{ action, content: { allow_directories: consent } }}
+      />,
+    );
+    expect(screen.getByText(label)).toBeDefined();
+    expect(screen.queryByRole("button")).toBeNull();
+    if (action === "accept" && consent && hasScope) {
+      for (const directory of props.permissionDirectories) {
+        expect(screen.getByText(directory, { selector: "code" })).toBeDefined();
+      }
+    }
   });
 });
 
@@ -819,7 +1032,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(checkboxes[0]!.getAttribute("type")).toBe("checkbox");
   });
 
-  it("gates Submit until every question has at least one selection", () => {
+  it("gates Submit until a multi-select question has at least one selection", () => {
     // Without this gate Submit fires with half-filled answers and
     // the user can't tell which questions still need attention.
     render(
@@ -828,7 +1041,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
         message="Claude wants to call AskUserQuestion"
         phase="pre_tool_use"
         policyName="claude_native_permission"
-        contentPreview={sampleSinglePreview}
+        contentPreview={sampleMultiPreview}
         requestedSchema={{}}
         status="pending"
         response={null}
@@ -838,11 +1051,13 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     const submit = screen.getByRole("button", { name: /submit/i });
     expect(submit.hasAttribute("disabled")).toBe(true);
 
-    fireEvent.click(screen.getByLabelText("React"));
+    fireEvent.click(screen.getByLabelText("Popcorn"));
     expect(submit.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(screen.getByLabelText("Popcorn"));
+    expect(submit.hasAttribute("disabled")).toBe(true);
   });
 
-  it("submits gathered answers via submitApproval on click", () => {
+  it.each(["React", "Vue"])("submits the chosen answer %s only on Submit", (answer) => {
     // The chat store gets ``{action: "accept", content}`` where
     // ``content`` IS the flat answers map — each question text is
     // a top-level key, with the selected label as the value.
@@ -856,7 +1071,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
     render(
       <ApprovalCard
-        elicitationId="elic_submit"
+        elicitationId={`elic_submit_${answer}`}
         message="Claude wants to call AskUserQuestion"
         phase="pre_tool_use"
         policyName="claude_native_permission"
@@ -867,11 +1082,14 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       />,
     );
 
-    fireEvent.click(screen.getByLabelText("Vue"));
+    expect(screen.getByLabelText("React")).toBeChecked();
+    expect(screen.getByLabelText("Vue")).not.toBeChecked();
+    expect(submitSpy).not.toHaveBeenCalled();
+    if (answer === "Vue") fireEvent.click(screen.getByLabelText("Vue"));
     fireEvent.click(screen.getByRole("button", { name: /submit/i }));
 
-    expect(submitSpy).toHaveBeenCalledWith("elic_submit", "accept", {
-      "Which framework?": "Vue",
+    expect(submitSpy).toHaveBeenCalledWith(`elic_submit_${answer}`, "accept", {
+      "Which framework?": answer,
     });
   });
 
@@ -980,16 +1198,44 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.queryByText("Claude has questions")).toBeNull();
   });
 
-  it("labels Cursor structured input prompts as Cursor prompts", () => {
-    // Cursor's AskQuestion reuses the same AskUserQuestion renderer (the
-    // runner translates it into the preview shape), so the title must reflect
-    // the producer rather than defaulting to "Claude has questions".
+  it.each([
+    {
+      name: "Cursor policy",
+      policyName: "cursor_native_permission",
+      phase: "pre_tool_use",
+      title: "Cursor has questions",
+    },
+    {
+      name: "Devin policy",
+      policyName: "devin_native_ask_question",
+      phase: "pre_tool_use",
+      title: "Devin needs your input",
+    },
+    {
+      name: "Devin phase without a policy",
+      policyName: "",
+      phase: "devin_ask_question",
+      title: "Devin needs your input",
+    },
+    {
+      name: "Antigravity phase ahead of Cursor policy",
+      policyName: "cursor_native_permission",
+      phase: "agy_ask_question",
+      title: "Antigravity needs your input",
+    },
+    {
+      name: "the legacy default for unknown prefixes",
+      policyName: "question_policy",
+      phase: "pre_tool_use",
+      title: "Claude has questions",
+    },
+  ])("labels structured input prompts using $name", ({ policyName, phase, title }) => {
     render(
       <ApprovalCard
-        elicitationId="elic_cursor_label"
+        elicitationId="elic_question_label"
         message="AskQuestion Demo"
-        phase="pre_tool_use"
-        policyName="cursor_native_permission"
+        phase={phase}
+        policyName={policyName}
         contentPreview=""
         requestedSchema={{}}
         status="pending"
@@ -1007,9 +1253,101 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       />,
     );
 
-    expect(screen.getByText("Cursor has questions")).toBeDefined();
-    expect(screen.queryByText("Claude has questions")).toBeNull();
+    expect(screen.getByText(title)).toBeDefined();
   });
+
+  it.each([
+    {
+      name: "select",
+      harness: "Pi",
+      options: [{ label: "Allow" }, { label: "Block" }],
+      isOther: false,
+      value: "Allow",
+      textInput: undefined,
+    },
+    {
+      name: "input",
+      harness: "Pi",
+      options: [],
+      isOther: true,
+      value: "hello world",
+      textInput: undefined,
+    },
+    ...["original note", "Keep as-is", "", "  two\nlines\n"].map((value) => ({
+      name: `editor ${JSON.stringify(value)}`,
+      harness: "Pi",
+      options: [],
+      isOther: true,
+      value,
+      textInput: { default: "original note" },
+    })),
+    {
+      name: "plan choice",
+      harness: "Codex",
+      options: [{ label: "Implement the plan" }, { label: "Keep planning" }],
+      isOther: false,
+      value: "Implement the plan",
+      textInput: undefined,
+    },
+  ])(
+    "submits a $harness $name using its supported inputs",
+    ({ name, options, isOther, value, harness, textInput }) => {
+      // A spied submit keeps the draft, so each case gets its own card.
+      const elicitationId = `elic_pi_${name}`;
+      const submitSpy = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ submitApproval: submitSpy } as Partial<
+        ReturnType<typeof useChatStore.getState>
+      >);
+      render(
+        <ApprovalCard
+          elicitationId={elicitationId}
+          message="Pi question"
+          phase={harness === "Pi" ? "pi_extension_ui" : "codex_request_user_input"}
+          policyName={
+            harness === "Pi" ? "pi_native_extension_ui" : "codex_native_request_user_input"
+          }
+          contentPreview=""
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+          askUserQuestion={{
+            questions: [
+              {
+                id: "0",
+                question: "Pi question",
+                options,
+                multiSelect: false,
+                isOther,
+                textInput,
+              },
+            ],
+          }}
+        />,
+      );
+      expect(
+        screen.getByText(harness === "Pi" ? "Pi needs your input" : "Codex needs input"),
+      ).toBeDefined();
+      expect(screen.queryByText("Claude has questions")).toBeNull();
+      const submit = screen.getByTestId("ask-user-question-submit");
+      expect(submit.hasAttribute("disabled")).toBe(!textInput && options.length === 0);
+      if (textInput) {
+        expect(screen.getByTestId("ask-user-question-custom-input")).toHaveValue(textInput.default);
+      }
+      if (isOther) {
+        if (value !== textInput?.default) {
+          fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+            target: { value },
+          });
+        }
+      } else {
+        expect(screen.queryByTestId("ask-user-question-custom-input")).toBeNull();
+        expect(screen.getByLabelText(value)).toBeChecked();
+      }
+      expect(submit.hasAttribute("disabled")).toBe(false);
+      fireEvent.click(submit);
+      expect(submitSpy).toHaveBeenCalledWith(elicitationId, "accept", { "0": value });
+    },
+  );
 
   it("submits multi-select answers as an array", () => {
     const submitSpy = vi.fn().mockResolvedValue(undefined);
@@ -1121,11 +1459,15 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.getByText("First?")).toBeDefined();
   });
 
-  it("hides Submit until the carousel is on the final question", () => {
+  it("submits every default after navigating to the final question", () => {
     // Submit is the only path to commit the form, so it only
     // makes sense on the last slide — earlier slides expose Next.
     // Without this, users could submit prematurely and the LLM
     // sees half-filled answers.
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
     render(
       <ApprovalCard
         elicitationId="elic_submit_last"
@@ -1156,8 +1498,12 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     );
 
     expect(screen.queryByTestId("ask-user-question-submit")).toBeNull();
+    expect(screen.getByLabelText("A")).toBeChecked();
     fireEvent.click(screen.getByTestId("ask-user-question-next"));
-    expect(screen.getByTestId("ask-user-question-submit")).toBeDefined();
+    expect(screen.getByLabelText("B")).toBeChecked();
+    expect(submitSpy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+    expect(submitSpy).toHaveBeenCalledWith("elic_submit_last", "accept", { Q1: "A", Q2: "B" });
   });
 
   it("accepts a custom-text answer that wins over the radio selection", () => {
@@ -1261,10 +1607,15 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.getByTestId("ask-user-question-submit").hasAttribute("disabled")).toBe(false);
   });
 
-  it("renders the preview of selected options that carry a preview field", () => {
-    // Selected option's `preview` ride through into a <pre> below
-    // the options. Unselected previews stay hidden so the card
-    // doesn't dump every preview at once.
+  const twoPane = {
+    label: "Two-pane",
+    description: "Side-by-side",
+    preview: "[editor] | [output]",
+  };
+  const single = { label: "Single", description: "One pane", preview: "[editor only]" };
+  const keepCurrent = { label: "Keep current", description: "No change" };
+
+  function renderLayoutQuestion(options: ClaudeQuestionOption[], multiSelect = false) {
     render(
       <ApprovalCard
         elicitationId="elic_preview"
@@ -1275,39 +1626,61 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
         requestedSchema={{}}
         status="pending"
         response={null}
-        askUserQuestion={{
-          questions: [
-            {
-              question: "Layout?",
-              header: "",
-              options: [
-                {
-                  label: "Two-pane",
-                  description: "Side-by-side",
-                  preview: "[editor] | [output]",
-                },
-                { label: "Single", description: "One pane", preview: "[editor only]" },
-              ],
-              multiSelect: false,
-            },
-          ],
-        }}
+        askUserQuestion={{ questions: [{ question: "Layout?", header: "", options, multiSelect }] }}
       />,
     );
+  }
 
-    // No selection yet → no preview block.
-    expect(screen.queryByTestId("ask-user-question-previews")).toBeNull();
+  const previewText = () => screen.queryByTestId("ask-user-question-previews")?.textContent ?? null;
+
+  it("preselects the first option and previews it, then follows the selection", () => {
+    renderLayoutQuestion([twoPane, single, keepCurrent]);
+
+    expect(previewText()).toContain("[editor] | [output]");
+    expect(previewText()).not.toContain("[editor only]");
+    expect(screen.getByLabelText(/Two-pane/)).toBeChecked();
+    expect(screen.getAllByRole("radio", { checked: true })).toHaveLength(1);
+    expect(screen.getByTestId("ask-user-question-submit")).toBeEnabled();
 
     // Description is concatenated into the label text by the DOM
-    // so a literal ``getByLabelText("Two-pane")`` doesn't match;
+    // so a literal ``getByLabelText("Single")`` doesn't match;
     // a regex picks out the label by its prefix.
-    fireEvent.click(screen.getByLabelText(/Two-pane/));
-    const previews = screen.getByTestId("ask-user-question-previews");
-    expect(previews.textContent).toContain("[editor] | [output]");
-    expect(previews.textContent).not.toContain("[editor only]");
+    fireEvent.click(screen.getByLabelText(/Single/));
+    expect(previewText()).toContain("[editor only]");
+    expect(previewText()).not.toContain("[editor] | [output]");
+
+    fireEvent.click(screen.getByLabelText(/Keep current/));
+    expect(previewText()).toBeNull();
+
+    fireEvent.click(screen.getByTestId("ask-user-question-custom-toggle"));
+    expect(previewText()).toBeNull();
+    expect(screen.getByTestId("ask-user-question-submit")).toBeDisabled();
+    fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+      target: { value: "A different layout" },
+    });
+    expect(screen.getByTestId("ask-user-question-submit")).toBeEnabled();
+    expect(previewText()).toBeNull();
+  });
+
+  it("preselects the first option even when it has no preview", () => {
+    renderLayoutQuestion([keepCurrent, twoPane, single]);
+
+    expect(previewText()).toBeNull();
+    expect(screen.getByLabelText(/Keep current/)).toBeChecked();
+    expect(screen.getByTestId("ask-user-question-submit")).toBeEnabled();
+  });
+
+  it("shows multi-select previews only for checked options", () => {
+    renderLayoutQuestion([twoPane, single, keepCurrent], true);
+    expect(previewText()).toBeNull();
+    expect(screen.queryAllByRole("checkbox", { checked: true })).toHaveLength(0);
 
     fireEvent.click(screen.getByLabelText(/Single/));
-    expect(screen.getByTestId("ask-user-question-previews").textContent).toContain("[editor only]");
+    expect(previewText()).toContain("[editor only]");
+    expect(previewText()).not.toContain("[editor] | [output]");
+
+    fireEvent.click(screen.getByLabelText(/Single/));
+    expect(previewText()).toBeNull();
   });
 
   it("renders 'Submitted' with the answer summary in the responded state", () => {
@@ -1336,6 +1709,200 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     // ("wants to call AskUserQuestion") would read as if the prompt
     // were still outstanding.
     expect(screen.queryByText(/wants to call/)).toBeNull();
+  });
+
+  describe("unsent answers across a remount", () => {
+    const draftQuestions: ClaudeQuestion[] = [
+      {
+        question: "Pick a codename",
+        header: "",
+        options: [
+          { label: "Alpha", description: "" },
+          { label: "Bravo", description: "" },
+        ],
+        multiSelect: false,
+      },
+      {
+        question: "Describe the rollout",
+        header: "",
+        options: [{ label: "Staged", description: "" }],
+        multiSelect: false,
+      },
+    ];
+
+    function pendingQuestionsCard(elicitationId: string, questions: ClaudeQuestion[]) {
+      return (
+        <ApprovalCard
+          elicitationId={elicitationId}
+          message="Claude wants to call AskUserQuestion"
+          phase="pre_tool_use"
+          policyName="claude_native_permission"
+          contentPreview=""
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+          askUserQuestion={{ questions }}
+        />
+      );
+    }
+
+    function savedDraft(elicitationId: string, questions: ClaudeQuestion[]) {
+      return getAskUserQuestionDraft(elicitationId, askUserQuestionSignature(questions));
+    }
+
+    function renderPendingQuestions(elicitationId: string, questions: ClaudeQuestion[]) {
+      return render(pendingQuestionsCard(elicitationId, questions));
+    }
+
+    function answerFirstAndTypeSecond() {
+      fireEvent.click(screen.getByLabelText("Bravo"));
+      fireEvent.click(screen.getByTestId("ask-user-question-next"));
+      fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+        target: { value: "Keep this partial answer" },
+      });
+    }
+
+    function expectFreshCard() {
+      expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 1 of 2:");
+      expect(screen.getByLabelText("Alpha")).toBeChecked();
+      expect(screen.getByLabelText("Bravo")).not.toBeChecked();
+      fireEvent.click(screen.getByTestId("ask-user-question-next"));
+      expect((screen.getByTestId("ask-user-question-custom-input") as HTMLInputElement).value).toBe(
+        "",
+      );
+    }
+
+    it("restores the carousel position, selection and typed text", () => {
+      const first = renderPendingQuestions("elic_draft_restore", draftQuestions);
+      answerFirstAndTypeSecond();
+      first.unmount();
+
+      renderPendingQuestions("elic_draft_restore", structuredClone(draftQuestions));
+
+      expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 2 of 2:");
+      expect((screen.getByTestId("ask-user-question-custom-input") as HTMLInputElement).value).toBe(
+        "Keep this partial answer",
+      );
+      expect(
+        (screen.getByTestId("ask-user-question-custom-toggle") as HTMLInputElement).checked,
+      ).toBe(true);
+      fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+      expect(screen.getByLabelText("Bravo")).toBeChecked();
+    });
+
+    it("starts fresh when a mounted card's questions change", () => {
+      const first = renderPendingQuestions("elic_draft_replaced", draftQuestions);
+      answerFirstAndTypeSecond();
+      const [firstQuestion, ...rest] = draftQuestions;
+      const replaced = [{ ...firstQuestion!, question: "Pick another codename" }, ...rest];
+
+      first.rerender(pendingQuestionsCard("elic_draft_replaced", replaced));
+      expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 1 of 2:");
+      expect(screen.getByLabelText("Alpha")).toBeChecked();
+      first.unmount();
+
+      renderPendingQuestions("elic_draft_replaced", replaced);
+      expectFreshCard();
+    });
+
+    it("keeps answers when an equivalent payload replaces the questions", () => {
+      const card = renderPendingQuestions("elic_draft_equivalent", draftQuestions);
+      answerFirstAndTypeSecond();
+      clearAskUserQuestionDraft("elic_draft_equivalent");
+      // The structured payload of the same prompt: no empty fields, other key order.
+      const structured = draftQuestions.map(({ question, options, multiSelect }) => ({
+        multiSelect,
+        options: options.map(({ label }) => ({ label })),
+        question,
+      }));
+
+      card.rerender(pendingQuestionsCard("elic_draft_equivalent", structured));
+
+      expect((screen.getByTestId("ask-user-question-custom-input") as HTMLInputElement).value).toBe(
+        "Keep this partial answer",
+      );
+      expect(savedDraft("elic_draft_equivalent", draftQuestions)).toBeUndefined();
+    });
+
+    it("keeps no draft for an untouched card with a prefilled text answer", () => {
+      const prefilled: ClaudeQuestion[] = [
+        {
+          question: "Name the branch",
+          options: [],
+          multiSelect: false,
+          textInput: { default: "main" },
+        },
+      ];
+      renderPendingQuestions("elic_draft_prefilled", prefilled).unmount();
+
+      expect(savedDraft("elic_draft_prefilled", prefilled)).toBeUndefined();
+    });
+
+    it("drops the draft once a restored card's answers are undone", () => {
+      const regionQuestions: ClaudeQuestion[] = [
+        {
+          question: "Pick regions",
+          header: "",
+          options: [{ label: "eu-west", description: "" }],
+          multiSelect: true,
+        },
+      ];
+      const first = renderPendingQuestions("elic_draft_undone", regionQuestions);
+      fireEvent.click(screen.getByLabelText("eu-west"));
+      first.unmount();
+      expect(savedDraft("elic_draft_undone", regionQuestions)).toBeDefined();
+
+      renderPendingQuestions("elic_draft_undone", regionQuestions);
+      fireEvent.click(screen.getByLabelText("eu-west"));
+
+      expect(savedDraft("elic_draft_undone", regionQuestions)).toBeUndefined();
+    });
+
+    it.each([
+      [
+        "typed",
+        () =>
+          fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+            target: { value: "sk-not-for-storage" },
+          }),
+      ],
+      ["chosen", () => fireEvent.click(screen.getByLabelText("Use another saved token"))],
+    ])("does not keep a %s answer to a secret question", (how, answerSecret) => {
+      const secretQuestions: ClaudeQuestion[] = [
+        {
+          id: "token",
+          question: "Paste the API token",
+          options: [{ label: "Use the saved token" }, { label: "Use another saved token" }],
+          multiSelect: false,
+          isSecret: true,
+        },
+        { id: "region", question: "Pick a region", options: [], multiSelect: false },
+      ];
+      const elicitationId = `elic_draft_secret_${how}`;
+      const first = renderPendingQuestions(elicitationId, secretQuestions);
+      answerSecret();
+      expect(savedDraft(elicitationId, secretQuestions)).toBeUndefined();
+      fireEvent.click(screen.getByTestId("ask-user-question-next"));
+      fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+        target: { value: "eu-west" },
+      });
+      first.unmount();
+
+      renderPendingQuestions(elicitationId, secretQuestions);
+
+      expect((screen.getByTestId("ask-user-question-custom-input") as HTMLInputElement).value).toBe(
+        "eu-west",
+      );
+      fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+      expect(screen.getByLabelText("Use the saved token")).toBeChecked();
+      expect(screen.getByLabelText("Use another saved token")).not.toBeChecked();
+      expect((screen.getByTestId("ask-user-question-custom-input") as HTMLInputElement).value).toBe(
+        "",
+      );
+      expect(
+        (screen.getByTestId("ask-user-question-custom-toggle") as HTMLInputElement).checked,
+      ).toBe(false);
+    });
   });
 });
 
@@ -1521,6 +2088,159 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
     expect(screen.getByTestId("plan-rejection-feedback").textContent).toContain(
       "Too risky, split it up.",
     );
+  });
+});
+
+describe("ApprovalCard — file edit diff", () => {
+  const editInput = {
+    file_path: "/repo/config.py",
+    old_string: "TIMEOUT = 30\nRETRIES = 3\n",
+    new_string: "TIMEOUT = 60\nRETRIES = 3\n",
+    replace_all: false,
+  };
+  const props = {
+    elicitationId: "elic_edit",
+    message: "Claude wants to call **Edit**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: `Edit(${JSON.stringify(editInput)})`,
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+
+  it("shows a gated edit from the event stream as a diff in place of its JSON", () => {
+    const events = parseEventLines([
+      JSON.stringify({
+        event: "response.elicitation_request",
+        data: {
+          type: "response.elicitation_request",
+          elicitation_id: props.elicitationId,
+          params: {
+            mode: "form",
+            message: props.message,
+            phase: props.phase,
+            policy_name: props.policyName,
+            content_preview: props.contentPreview,
+            requestedSchema: {},
+            file_edit: { tool_name: "Edit", tool_input: editInput },
+          },
+        },
+      }),
+    ]);
+    const bubble = buildBubbles(new BlockStream().reduceSync([...events]), null)[0];
+    if (bubble.kind !== "assistant") throw new Error("Expected an assistant bubble");
+    const item = bubble.items[0];
+    if (item.kind !== "elicitation") throw new Error("Expected an elicitation card");
+
+    const { container } = render(
+      <TooltipProvider>
+        <ElicitationCard item={item} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText("+1").parentElement?.textContent).toBe("/repo/config.py+1-1");
+    expect(container.textContent).toContain("-TIMEOUT = 30");
+    expect(container.textContent).toContain("+TIMEOUT = 60");
+    expect(container.textContent).not.toContain('"old_string"');
+    expect(screen.getByRole("button", { name: /^approve$/i })).toBeInTheDocument();
+  });
+
+  it("shows a write over a file as its full content", () => {
+    const content = "# Notes\n";
+    const { container } = render(
+      <TooltipProvider>
+        <ApprovalCard
+          {...props}
+          message="Claude wants to call **Write**"
+          contentPreview="Write({...})"
+          fileEdit={{ toolName: "Write", toolInput: { file_path: "/repo/notes.md", content } }}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText("/repo/notes.md (whole file written)")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy file" })).toBeInTheDocument();
+    expect(container.textContent).toContain("# Notes");
+  });
+
+  it("says when an edit in a batch replaces every occurrence", () => {
+    // WHY: the diff renders a replace-all edit the same as a single replacement.
+    const edits = [
+      { old_string: "a", new_string: "b" },
+      { old_string: "c", new_string: "d" },
+    ];
+    const note = /replaces every occurrence/i;
+    const renderBatch = (batch: Record<string, unknown>[]) =>
+      render(
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            message="Claude wants to call **MultiEdit**"
+            contentPreview="MultiEdit({...})"
+            fileEdit={{
+              toolName: "MultiEdit",
+              toolInput: { file_path: "/repo/a.py", edits: batch },
+            }}
+          />
+        </TooltipProvider>,
+      );
+
+    renderBatch(edits);
+    expect(screen.queryByText(note)).toBeNull();
+    cleanup();
+    renderBatch([edits[0]!, { ...edits[1]!, replace_all: true }]);
+    expect(screen.getByText(note)).toBeVisible();
+  });
+
+  it("shows the full request on demand", () => {
+    render(
+      <TooltipProvider>
+        <ApprovalCard {...props} fileEdit={{ toolName: "Edit", toolInput: editInput }} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.queryByTestId("tool-value-view")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show request" }));
+    expect(screen.getByTestId("tool-value-view")).toHaveTextContent("Replace allNo");
+  });
+
+  it("previews a long diff and expands it in full", () => {
+    const oldLines = Array.from({ length: 120 }, (_, i) => `old ${i}`);
+    const newLines = Array.from({ length: 120 }, (_, i) => `new ${i}`);
+    const { container } = render(
+      <TooltipProvider>
+        <ApprovalCard
+          {...props}
+          fileEdit={{
+            toolName: "Edit",
+            toolInput: {
+              file_path: "/repo/big.py",
+              old_string: oldLines.join("\n"),
+              new_string: newLines.join("\n"),
+            },
+          }}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(container.textContent).not.toContain("+new 119");
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(container.textContent).toContain("+new 119");
+  });
+
+  it.each([
+    { label: "no file edit", fileEdit: null },
+    { label: "an unsupported tool", fileEdit: { toolName: "NotebookEdit", toolInput: editInput } },
+    {
+      label: "an edit with no change",
+      fileEdit: { toolName: "Edit", toolInput: { ...editInput, new_string: editInput.old_string } },
+    },
+  ])("keeps the JSON preview for $label", ({ fileEdit }) => {
+    const { container } = render(<ApprovalCard {...props} fileEdit={fileEdit} />);
+
+    expect(container.textContent).toContain('"old_string"');
+    expect(screen.queryByRole("button", { name: "Copy diff" })).toBeNull();
   });
 });
 
@@ -1827,4 +2547,151 @@ describe("ApprovalCard — gating message emphasis", () => {
     expect(within(card).getByText(message)).toBeDefined();
     expect(card.querySelector("strong, em")).toBeNull();
   });
+});
+
+describe("Kiro approval delivery", () => {
+  const props = {
+    elicitationId: "kiro-request",
+    message: "Kiro wants approval for Running: pwd",
+    phase: "pre_tool_use",
+    policyName: "kiro_native_permission",
+    contentPreview: "Running: pwd",
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+
+  it("keeps sending distinct from delivered and retries only the current attempt", () => {
+    const submit = vi.fn();
+    const { rerender } = render(
+      <MemoryRouter>
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            onSubmit={submit}
+            nativeDelivery={{ state: "sending", attempt: "first", action: "accept" }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("Waiting for Kiro to confirm")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+    rerender(
+      <MemoryRouter>
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            onSubmit={submit}
+            nativeDelivery={{ state: "unconfirmed", attempt: "second", action: "accept" }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/previous attempt may still be pending/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry sending approval" }));
+    expect(submit).toHaveBeenCalledExactlyOnceWith("kiro-request", "accept", undefined, {
+      native_delivery_attempt: "second",
+    });
+    rerender(
+      <MemoryRouter>
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            status="responded"
+            response={{ action: "auto_resolved" }}
+            nativeDelivery={{ state: "unconfirmed", attempt: "second", action: "accept" }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("Resolved in Kiro")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+  });
+
+  it("retries a rejection without turning it into an approval", () => {
+    const submit = vi.fn();
+    render(
+      <MemoryRouter>
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            onSubmit={submit}
+            nativeDelivery={{ state: "unconfirmed", attempt: "reject-attempt", action: "decline" }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry sending rejection" }));
+    expect(submit).toHaveBeenCalledExactlyOnceWith("kiro-request", "decline", undefined, {
+      native_delivery_attempt: "reject-attempt",
+    });
+  });
+});
+
+describe("question custom selection and editing", () => {
+  it.each([false, true])(
+    "retains edited text and selections across navigation (multi=%s)",
+    async (multiSelect) => {
+      const user = userEvent.setup();
+      const submit = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ conversationId: "conv_custom", submitApproval: submit });
+      render(
+        <ApprovalCard
+          elicitationId="custom-focus"
+          message="Choose"
+          phase="pre_tool_use"
+          policyName="claude_native_permission"
+          contentPreview=""
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+          askUserQuestion={{
+            questions: [
+              { question: "First", options: [{ label: "Preset" }], multiSelect },
+              { question: "Second", options: [{ label: "Done" }], multiSelect: false },
+            ],
+          }}
+        />,
+      );
+      expect(screen.getByRole("button", { name: "Prev" })).toBeDisabled();
+      await user.click(screen.getByLabelText("Preset"));
+      const toggle = screen.getByRole(multiSelect ? "checkbox" : "radio", {
+        name: "Select custom answer",
+      });
+      const editor = screen.getByRole("textbox", { name: "Custom answer" });
+      const selectionLabel = toggle.closest("label")!;
+      expect(selectionLabel).not.toContainElement(editor);
+      await user.click(editor);
+      expect(editor).toHaveFocus();
+      expect(toggle).not.toBeChecked();
+      await user.click(selectionLabel);
+      expect(toggle).toBeChecked();
+      expect(editor).not.toHaveFocus();
+      if (multiSelect) {
+        await user.click(selectionLabel);
+        expect(toggle).not.toBeChecked();
+        await user.click(selectionLabel);
+        expect(toggle).toBeChecked();
+      }
+      await user.click(editor);
+      expect(editor).toHaveFocus();
+      expect(toggle).toBeChecked();
+      await user.type(editor, "Custom text");
+      expect(submit).not.toHaveBeenCalled();
+      await user.click(screen.getByRole("button", { name: "Next" }));
+      expect(screen.getByLabelText("Done")).toBeChecked();
+      expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled();
+      await user.click(screen.getByLabelText("Done"));
+      await user.click(screen.getByRole("button", { name: "Prev" }));
+      expect(screen.getByRole("textbox", { name: "Custom answer" })).toHaveValue("Custom text");
+      expect(screen.getByTestId("ask-user-question-custom-toggle")).toBeChecked();
+      expect(screen.getByLabelText("Preset").matches(":checked")).toBe(multiSelect);
+      await user.click(screen.getByRole("button", { name: "Next" }));
+      await user.click(screen.getByRole("button", { name: "Submit" }));
+      expect(submit).toHaveBeenCalledExactlyOnceWith("custom-focus", "accept", {
+        First: multiSelect ? ["Preset", "Custom text"] : "Custom text",
+        Second: "Done",
+      });
+    },
+  );
 });
