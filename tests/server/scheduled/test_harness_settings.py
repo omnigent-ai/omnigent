@@ -7,7 +7,13 @@ from types import SimpleNamespace
 import pytest
 
 from omnigent.errors import OmnigentError
-from omnigent.server.scheduled.harness_settings import validate_scheduled_permission_support
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
+from omnigent.server.scheduled.harness_settings import (
+    validate_scheduled_permission_mode,
+    validate_scheduled_permission_support,
+)
+
+_NULL_HINT = "JSON null (not the string 'null') for the agent default"
 
 
 class _AgentCache:
@@ -53,3 +59,38 @@ async def test_explicit_approval_skipping_mode_can_be_saved(harness: str, mode: 
     await validate_scheduled_permission_support(
         permission_mode=mode, agent=_AGENT, agent_cache=_AgentCache(harness, None)
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-sdk", "acp"])
+async def test_sdk_agent_rejects_any_mode_and_asks_for_null(harness: str) -> None:
+    """SDK agents take their mode from the spec, so the rejection must say to send null."""
+    with pytest.raises(OmnigentError) as raised:
+        await validate_scheduled_permission_support(
+            permission_mode="auto", agent=_AGENT, agent_cache=_AgentCache(harness, None)
+        )
+    message = str(raised.value)
+    assert f"{harness!r} has no automation permission modes" in message
+    assert _NULL_HINT in message
+
+
+@pytest.mark.asyncio
+async def test_native_agent_rejection_lists_its_own_modes() -> None:
+    with pytest.raises(OmnigentError) as raised:
+        await validate_scheduled_permission_support(
+            permission_mode="acceptEdits",
+            agent=_AGENT,
+            agent_cache=_AgentCache("codex-native", None),
+        )
+    codex_modes = ", ".join(map(repr, PERMISSION_LAUNCH_ARGS["codex-native"]))
+    assert f"Use one of {codex_modes}, or {_NULL_HINT}" in str(raised.value)
+
+
+@pytest.mark.parametrize("mode", ["null", "unknown-permission-mode"])
+def test_unknown_mode_rejection_lists_every_vocabulary(mode: str) -> None:
+    with pytest.raises(OmnigentError) as raised:
+        validate_scheduled_permission_mode(mode)
+    message = str(raised.value)
+    for harness, modes in PERMISSION_LAUNCH_ARGS.items():
+        assert f"{harness}: {', '.join(map(repr, modes))}" in message
+    assert message.index(_NULL_HINT) < message.index("claude-sdk") < message.index("claude-native")

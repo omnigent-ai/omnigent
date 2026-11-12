@@ -2360,9 +2360,31 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "single": {"multi_repo": False},
-        "multi": {"multi_repo": True},
+        "single": {"multi_repo": False, "accepts_session_move": True},
+        "multi": {"multi_repo": True, "accepts_session_move": True},
     }
+
+
+def test_provider_ui_capabilities_report_which_providers_take_a_moved_session() -> None:
+    """A provider that manages sandbox profiles is reported as no destination for
+    a move, which the move route refuses, whether profile discovery is on or not."""
+    deployment = ManagedSandboxDeployment(
+        configs=tuple(
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider=provider,
+                token_ttl_s=3600,
+                launcher_factory=FakeSandboxLauncher,
+                manages_profiles=manages_profiles,
+            )
+            for provider, manages_profiles in (("plain", False), ("profiled", True))
+        )
+    )
+
+    capabilities = deployment.provider_ui_capabilities()
+
+    assert capabilities["plain"]["accepts_session_move"] is True
+    assert capabilities["profiled"]["accepts_session_move"] is False
 
 
 def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -> None:
@@ -2388,9 +2410,13 @@ def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "kubernetes": {"multi_repo": False},
-        "modal": {"multi_repo": False},
-        "agent_sandbox": {"multi_repo": False, "inference_models": True},
+        "kubernetes": {"multi_repo": False, "accepts_session_move": True},
+        "modal": {"multi_repo": False, "accepts_session_move": True},
+        "agent_sandbox": {
+            "multi_repo": False,
+            "accepts_session_move": True,
+            "inference_models": True,
+        },
     }
 
 
@@ -2442,12 +2468,12 @@ def test_provider_ui_capabilities_advertise_default_models_for_unbound_discovery
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "hooked": {"multi_repo": False, "default_models": True},
-        "discovered": {"multi_repo": False, "default_models": True},
-        "static": {"multi_repo": False},
-        "bound": {"multi_repo": False, "inference_models": True},
-        "malformed": {"multi_repo": False},
-        "malformed-inference": {"multi_repo": False},
+        "hooked": {"multi_repo": False, "accepts_session_move": True, "default_models": True},
+        "discovered": {"multi_repo": False, "accepts_session_move": True, "default_models": True},
+        "static": {"multi_repo": False, "accepts_session_move": True},
+        "bound": {"multi_repo": False, "accepts_session_move": True, "inference_models": True},
+        "malformed": {"multi_repo": False, "accepts_session_move": True},
+        "malformed-inference": {"multi_repo": False, "accepts_session_move": True},
     }
 
 
@@ -6373,7 +6399,13 @@ async def test_recreated_sandbox_records_and_publishes_workspace_reset_notice(
             assert session_id == "conv_1"
             assert host_id == "host_1"
             assert workspace == "/root/workspace/omnigent"
-            return SimpleNamespace(id=session_id, host_id=host_id, workspace=workspace)
+            return SimpleNamespace(
+                id=session_id,
+                host_id=host_id,
+                workspace=workspace,
+                labels={},
+                terminal_launch_args=None,
+            )
 
         def append(self, session_id: str, items: list[object]) -> list[object]:
             assert session_id == "conv_1"
@@ -6718,6 +6750,60 @@ def test_parse_contributed_provider_builds_registry_backed_factory(
     # The `sandbox.acme` block reached the launcher through the config_model
     # the registry documents, rather than being silently dropped.
     assert launcher.config.namespace == "sandboxes"
+
+
+@pytest.mark.parametrize(
+    ("manages_profiles", "default_profile_id", "error"),
+    [
+        (True, "build", None),
+        (True, None, None),
+        (False, "build", "requires a provider that manages sandbox profiles"),
+        (True, "Build!", "must be a profile id"),
+        (True, 7, "must be a profile id"),
+    ],
+)
+def test_parse_default_profile_id(
+    contributed_acme_provider: None,
+    monkeypatch: pytest.MonkeyPatch,
+    manages_profiles: bool,
+    default_profile_id: object,
+    error: str | None,
+) -> None:
+    """`sandbox.default_profile_id` names a profile only for a profile-managing provider."""
+    from omnigent.onboarding.sandboxes import registry
+
+    metadata = registry.get_provider_metadata("acme")
+    assert metadata is not None
+    monkeypatch.setitem(
+        registry.plugin_state().providers,
+        "acme",
+        replace(metadata, manages_profiles=manages_profiles),
+    )
+    raw = {
+        "provider": "acme",
+        "server_url": "https://s.example.com",
+        "acme": {"namespace": "sandboxes"},
+        "default_profile_id": default_profile_id,
+    }
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            parse_sandbox_config(raw)
+        return
+    cfg = parse_sandbox_config(raw)
+    assert cfg is not None
+    assert cfg.default.default_profile_id == default_profile_id
+
+
+def test_default_profile_id_belongs_inside_a_provider_entry() -> None:
+    """Shared keys reach every listed provider, so a top-level default would mis-apply."""
+    with pytest.raises(ValueError, match=r"inside that provider's 'sandbox\.providers' entry"):
+        parse_sandbox_config(
+            {
+                "server_url": "https://s.example.com",
+                "default_profile_id": "build",
+                "providers": [{"provider": "kubernetes"}],
+            }
+        )
 
 
 def test_contributed_provider_config_is_validated(

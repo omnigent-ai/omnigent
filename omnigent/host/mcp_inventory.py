@@ -122,33 +122,36 @@ def _managed_mcp_paths() -> tuple[Path, ...]:
     return claude_code_managed_mcp_paths()
 
 
-def _managed_claude_servers() -> list[ConfiguredMcpServer]:
-    """Servers an organization pins via Claude Code's ``managed-mcp.json``.
+def managed_claude_mcp_config() -> tuple[bool, Mapping[str, object]]:
+    """Whether Claude Code's ``managed-mcp.json`` exists, and the servers it pins.
 
-    Absent on an ordinary install; where it exists these are often the servers that
-    need an interactive sign-in, so the inventory has to know about them.
+    Like Claude Code, an unreadable file still counts as present but pins nothing.
+
+    :returns: ``(present, mcpServers table)``, e.g. ``(False, {})`` on an ordinary install.
     """
-    out: list[ConfiguredMcpServer] = []
+    paths = _managed_mcp_paths()
     # The first readable, object-shaped file decides, as Claude Code (and
     # ``claude_managed_gateway``) read this chain: a lower-precedence file is
     # ignored even when the winning one pins no servers.
-    for path in _managed_mcp_paths():
+    for path in paths:
         data = _read_config(path, "claude managed")
-        if data is None:
-            continue
-        for name, config in _servers_in(data).items():
-            summary = _summary(name, config, "claude", managed=True)
-            if isinstance(config, Mapping) and summary is not None:
-                out.append(ConfiguredMcpServer(summary, config))
-        break
-    return out
+        if data is not None:
+            return True, _servers_in(data)
+    return any(os.path.exists(path) for path in paths), {}
 
 
 def _claude_servers(home: Path, env: Mapping[str, str]) -> list[ConfiguredMcpServer]:
-    """Managed, user-scope, and enabled-plugin ``mcpServers`` for Claude Code."""
-    out = _managed_claude_servers()
-    # Enterprise policy outranks user config, so a managed server keeps its name.
-    managed = {server.summary["name"] for server in out}
+    """Claude Code's managed ``mcpServers``, or else its user-scope and enabled-plugin ones."""
+    managed_present, managed_table = managed_claude_mcp_config()
+    out = [
+        ConfiguredMcpServer(summary, config)
+        for name, config in managed_table.items()
+        if isinstance(config, Mapping)
+        and (summary := _summary(name, config, "claude", managed=True)) is not None
+    ]
+    if managed_present:
+        # The enterprise config keeps exclusive control: Claude Code loads no other server.
+        return out
     configured = env.get("CLAUDE_CONFIG_DIR")
     config_dir = Path(configured).expanduser() if configured else None
     data = _read_config((config_dir or home) / ".claude.json", "claude")
@@ -157,7 +160,6 @@ def _claude_servers(home: Path, env: Mapping[str, str]) -> list[ConfiguredMcpSer
         for name, config in _servers_in(data).items()
         if isinstance(config, Mapping)
         and (summary := _summary(name, config, "claude")) is not None
-        and summary["name"] not in managed
     ]
     ctx = SkillSourceContext(
         roots=(),
@@ -179,7 +181,6 @@ def _claude_servers(home: Path, env: Mapping[str, str]) -> list[ConfiguredMcpSer
                     isinstance(config, Mapping)
                     and summary is not None
                     and summary["name"] not in seen
-                    and summary["name"] not in managed
                 ):
                     seen.add(summary["name"])
                     summary["source_id"] = _plugin_asset_id(key, "mcp", summary["name"])
@@ -220,8 +221,24 @@ def _cursor_servers(home: Path) -> list[ConfiguredMcpServer]:
     ]
 
 
+def _pi_servers(env: Mapping[str, str]) -> list[ConfiguredMcpServer]:
+    """``mcp.json`` in Pi's agent dir, which managed Pi sessions link into their own.
+
+    An entry with no ``command``, ``url`` or ``type`` only overrides a server Pi
+    defines elsewhere, so ``_summary`` leaves it out.
+    """
+    from omnigent.harnesses.pi_native.credentials import global_pi_agent_dir
+
+    data = _read_config(global_pi_agent_dir(env=env) / "mcp.json", "pi")
+    return [
+        ConfiguredMcpServer(summary, config)
+        for name, config in _servers_in(data).items()
+        if isinstance(config, Mapping) and (summary := _summary(name, config, "pi")) is not None
+    ]
+
+
 def configured_mcp_servers() -> list[ConfiguredMcpServer]:
-    """List user-level MCP servers across Claude, Codex, and Cursor on this host.
+    """List user-level MCP servers across Claude, Codex, Cursor, and Pi on this host.
 
     Each harness is read independently, so a missing or broken config for one
     never hides another's servers.
@@ -231,6 +248,7 @@ def configured_mcp_servers() -> list[ConfiguredMcpServer]:
         ("claude", lambda: _claude_servers(home, os.environ)),
         ("codex", _codex_servers),
         ("cursor", lambda: _cursor_servers(home)),
+        ("pi", lambda: _pi_servers(os.environ)),
     )
     out: list[ConfiguredMcpServer] = []
     for harness, read in readers:

@@ -92,14 +92,17 @@ let startupData = STARTUP;
 let startupError: ApiError | null = null;
 const startupCalls = vi.fn();
 const accountRefreshCalls = vi.fn();
+const hostsCalls = vi.fn();
 let hosts: Host[] = [];
+let hostsPending = false;
 vi.mock("@/hooks/useHosts", async (importActual) => ({
   ...(await importActual()),
-  useHosts: () => {
+  useHosts: (options?: unknown) => {
+    hostsCalls(options);
     return useQuery({
-      queryKey: ["hosts", { includeSandbox: false }],
-      queryFn: async () => hosts,
-      initialData: hosts,
+      queryKey: hostsPending ? ["hosts", "pending"] : ["hosts", { includeSandbox: false }],
+      queryFn: () => (hostsPending ? new Promise<Host[]>(() => {}) : Promise.resolve(hosts)),
+      initialData: hostsPending ? undefined : hosts,
     });
   },
   useHarnessStartup: (hostId: string, harness: string) => {
@@ -142,10 +145,15 @@ const INVENTORY: HarnessInventory = {
   },
 };
 let inventory: HarnessInventory = INVENTORY;
+let inventoryFamilies: readonly string[] | undefined;
 vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
   ...(await importActual()),
-  useHarnessInventory: (_host: Host, options: { includePluginMetadata: boolean }) => {
+  useHarnessInventory: (
+    _host: Host,
+    options: { includePluginMetadata: boolean; families?: readonly string[] },
+  ) => {
     pluginMetadataRequested = options.includePluginMetadata;
+    inventoryFamilies = options.families;
     return inventory;
   },
 }));
@@ -267,6 +275,8 @@ afterEach(() => {
   fixDialogProps.mockReset();
   startupCalls.mockClear();
   accountRefreshCalls.mockClear();
+  hostsCalls.mockClear();
+  hostsPending = false;
   startupData = STARTUP;
   startupError = null;
 });
@@ -290,6 +300,37 @@ describe("Harnesses grid", () => {
     expect(startupCalls).toHaveBeenCalledWith("host & two", "claude-native");
     fireEvent.click(screen.getByRole("link", { name: /Harnesses/ }));
     expect(screen.getByRole("button", { name: "session-host" })).toBeInTheDocument();
+  });
+
+  it("asks for a session's linked host even when it is a sandbox the picker hides", () => {
+    hosts = [{ ...ONLINE, host_id: "sandbox_1", sandbox_provider: "example-sandbox" }];
+    renderHarnesses("claude-native", "?host=sandbox_1&tab=settings");
+    // fetchHosts keeps a sandbox host only when it is named as the source host.
+    expect(hostsCalls).toHaveBeenCalledWith({ refetchOnFocus: true, sourceHostId: "sandbox_1" });
+    expect(startupCalls).toHaveBeenCalledWith("sandbox_1", "claude-native");
+    expect(screen.queryByText(/Connect an online host/)).toBeNull();
+    // In-section links drop `?host`; the linked sandbox host must stay listed.
+    fireEvent.click(screen.getByRole("link", { name: /Harnesses/ }));
+    expect(hostsCalls).toHaveBeenLastCalledWith({
+      refetchOnFocus: true,
+      sourceHostId: "sandbox_1",
+    });
+  });
+
+  it("reads the shared hosts list when no host is linked", () => {
+    hosts = [ONLINE];
+    renderHarnesses();
+    // `null` would key a separate cache entry from every other `useHosts()` caller.
+    expect(hostsCalls).toHaveBeenCalled();
+    for (const [options] of hostsCalls.mock.calls)
+      expect((options as { sourceHostId?: unknown }).sourceHostId).toBeUndefined();
+  });
+
+  it("shows hosts loading rather than asking to connect one while the list loads", () => {
+    hostsPending = true;
+    renderHarnesses("claude-native", "?host=sandbox_1&tab=settings");
+    expect(screen.getByText("Loading hosts…")).toBeTruthy();
+    expect(screen.queryByTestId("harness-no-host")).toBeNull();
   });
 
   it.each([
@@ -560,11 +601,50 @@ describe("Harness details", () => {
   });
 
   it("says the catalog isn't listed for a ready harness the inventory doesn't cover", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "opencode-native": true } }];
+    renderHarnesses("opencode-native");
+
+    expect(screen.getByText(/aren't listed for OpenCode yet/)).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: /MCP servers/ })).toBeNull();
+  });
+
+  it("lists Pi's MCP servers without offering a tool probe", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "pi-native": true } }];
+    inventory = {
+      ...INVENTORY,
+      context: {
+        ...INVENTORY.context,
+        mcps: [
+          ...INVENTORY.context.mcps,
+          { id: "pi:wiki", name: "wiki", harness: "pi", detail: "wiki.example.com" },
+        ],
+      },
+    };
     renderHarnesses("pi-native");
 
-    expect(screen.getByText(/aren't listed for Pi yet/)).toBeTruthy();
-    expect(screen.queryByRole("tab", { name: /MCP servers/ })).toBeNull();
+    expect(inventoryFamilies).toEqual(["pi"]);
+    expect(screen.getByRole("tab", { name: "MCP servers · 1" })).toBeTruthy();
+    const wiki = screen.getByTestId("catalog-row-wiki");
+    expect(within(wiki).getByText("wiki.example.com")).toBeTruthy();
+    expect(wiki.tagName).not.toBe("BUTTON");
+    expect(screen.queryByTestId("catalog-row-github")).toBeNull();
+    expect(mcpLookups).toEqual([]);
+  });
+
+  it("lists Pi's skills without opening their contents", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "pi-native": true } }];
+    inventory = {
+      ...INVENTORY,
+      context: {
+        ...INVENTORY.context,
+        skills: [...INVENTORY.context.skills, { id: "pi:plan", name: "plan", harness: "pi" }],
+      },
+    };
+    renderHarnesses("pi-native");
+
+    selectTab("Skills · 1");
+    expect(screen.getByTestId("catalog-row-plan").tagName).not.toBe("BUTTON");
+    expect(contentLookup).toBeNull();
   });
 
   it("uses the credential card as the warning for a missing credential", () => {

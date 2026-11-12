@@ -68,6 +68,7 @@ export type FeatureKey =
   | "grid_sessions_display_ui"
   | "automations_v2"
   | "splittable_terminal_view_ui"
+  | "sidebar_windowed_rows"
   | "session_orchestration";
 
 /** Deployment-wide release-feature values advertised by the server. */
@@ -146,6 +147,8 @@ export interface ServerInfo {
     string,
     {
       multi_repo?: boolean;
+      /** Whether a session can move onto a new sandbox of this provider (Switch host). */
+      accepts_session_move?: boolean;
       inference_models?: boolean;
       default_models?: boolean;
       repo_catalog?: { name: string; url: string }[];
@@ -274,6 +277,13 @@ export interface ServerInfo {
   /** True when sandbox forks accept an explicit `workspaces` list; absent on older servers. */
   session_fork_workspaces?: boolean;
   /**
+   * True when ``POST /v1/sessions/{id}/managed-host`` can move a session onto
+   * a new sandbox. Gates Switch host's sandbox rows: an older server lacks the
+   * route, and the switch releases the runner before calling it. Fails to
+   * ``false``.
+   */
+  move_to_managed_sandbox?: boolean;
+  /**
    * True when the server stores user agents (``omnigent agent add``,
    * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
    * and the Import bundle button. Absent on older servers (off).
@@ -295,6 +305,11 @@ export interface ServerInfo {
    * and ``Conversation.pull_request``); absent on older servers (off).
    */
   session_pull_requests?: boolean;
+  /**
+   * True when the server stores each user's session title instructions
+   * (``/v1/settings/session-title-instructions``); absent on older servers (off).
+   */
+  session_title_instructions?: boolean;
   /**
    * Which uploads Claude Code and Codex sessions receive as files. Null on
    * older servers, whose policy is the default extension list.
@@ -452,6 +467,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
+  move_to_managed_sandbox: false,
   branding: null,
   picker: UNRESTRICTED_PICKER,
 };
@@ -627,6 +643,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
+          move_to_managed_sandbox: data.move_to_managed_sandbox === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
           agent_config_edit: data.agent_config_edit === true,
@@ -635,6 +652,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_pull_requests: data.session_pull_requests === true,
+          session_title_instructions: data.session_title_instructions === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,

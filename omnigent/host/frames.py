@@ -397,6 +397,9 @@ class HostLaunchRunnerFrame:
         falls back to stopping every runner launched for ``session_id``; an
         empty tuple stops none, e.g. after /clear moved the old runner to
         another session.
+    :param session_env_handoff_id: Opaque ID of the launching CLI's local
+        forwarded-environment handoff, e.g. ``"3qA0x_7Kp2..."``. ``None`` when
+        no CLI handed values to this launch, as for a server-driven restart.
     """
 
     request_id: str
@@ -408,6 +411,7 @@ class HostLaunchRunnerFrame:
     superseded_runner_ids: tuple[str, ...] | None = None
     scheduled_run: ScheduledRunLogContext | None = None
     mcp_disabled_servers_active_harnesses: list[str] | None = None
+    session_env_handoff_id: str | None = None
 
 
 @dataclass
@@ -1726,6 +1730,7 @@ def encode_host_frame(frame: HostFrame) -> str:
             "session_id": frame.session_id,
             "harness": frame.harness,
             "inference_config": frame.inference_config,
+            "session_env_handoff_id": frame.session_env_handoff_id,
         }
         if frame.mcp_disabled_servers_active_harnesses is not None:
             payload["mcp_disabled_servers_active_harnesses"] = (
@@ -2870,6 +2875,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
             if "superseded_runner_ids" in msg
             else None
         ),
+        session_env_handoff_id=_optional_nullable_str(msg, "session_env_handoff_id"),
     )
 
 
