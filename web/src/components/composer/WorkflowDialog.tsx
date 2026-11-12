@@ -92,8 +92,10 @@ export function WorkflowDialog({
                 {savedWorkflow ? `Run ${savedWorkflow.name}` : "Run a workflow"}
               </span>
             </DialogTitle>
+            {/* A saved workflow's description shows three lines; the tooltip has the rest. */}
             <DialogDescription
-              className={savedWorkflow ? "whitespace-pre-line" : undefined}
+              className={savedWorkflow ? "line-clamp-3 whitespace-pre-line" : undefined}
+              title={savedWorkflow?.description}
               data-testid="workflow-dialog-about"
             >
               {savedWorkflow
