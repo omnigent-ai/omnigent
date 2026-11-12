@@ -8,6 +8,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   CalendarClockIcon,
+  ChevronRightIcon,
+  CornerDownRightIcon,
+  FolderIcon,
   InboxIcon,
   type LucideIcon,
   PanelLeftIcon,
@@ -19,11 +22,14 @@ import {
 import { useNavigate } from "@/lib/routing";
 import {
   type ConversationsPage,
+  type ProjectSummary,
+  useProjects,
   useConversations,
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
@@ -118,6 +124,8 @@ interface PaletteSession {
   agent: string;
   archived: boolean;
   snippet: string | null;
+  parent: string | null;
+  project: string | null;
 }
 
 /** Flatten list pages into palette rows, dropping repeated ids and, unless
@@ -129,7 +137,13 @@ function paletteSessions(
     includeArchived = false,
     excludeIds = new Set(),
     newestFirst = false,
-  }: { includeArchived?: boolean; excludeIds?: ReadonlySet<string>; newestFirst?: boolean } = {},
+    projects = [],
+  }: {
+    includeArchived?: boolean;
+    excludeIds?: ReadonlySet<string>;
+    newestFirst?: boolean;
+    projects?: readonly ProjectSummary[];
+  } = {},
 ): PaletteSession[] {
   const seen = new Set(excludeIds);
   const out: PaletteSession[] = [];
@@ -147,6 +161,16 @@ function paletteSessions(
       // Present only when the match was in chat content (not the title);
       // the server omits it otherwise. Shown as a dimmed second line.
       snippet: c.search_snippet ?? null,
+      parent:
+        c.family?.representative_id && c.family.representative_id !== c.id
+          ? (c.family.representative_title ??
+            rows.find((row) => row.id === c.family?.representative_id)?.title ??
+            "Session group")
+          : null,
+      project:
+        projects.find((project) => project.id !== null && project.id === c.project_id)?.name ??
+        c.labels?.[PROJECT_LABEL_KEY] ??
+        null,
     });
   }
   return out;
@@ -162,6 +186,7 @@ export function CommandPalette({
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
+  const { data: projects = [] } = useProjects({ enabled: open });
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [pageLimit, setPageLimit] = useState(SESSION_SEARCH_PAGE_BATCH);
@@ -299,9 +324,10 @@ export function CommandPalette({
   ]);
 
   const sessions = useMemo(() => {
-    if (searching) return paletteSessions(titleSearch.data?.pages ?? [], { includeArchived: true });
+    if (searching)
+      return paletteSessions(titleSearch.data?.pages ?? [], { includeArchived: true, projects });
     // Rows archived after they loaded are still cached here, so drop them.
-    const out = paletteSessions(data?.pages ?? [], { newestFirst: true });
+    const out = paletteSessions(data?.pages ?? [], { newestFirst: true, projects });
     if (sessionsOnly) {
       if (!query.trim()) return out;
       return out
@@ -311,7 +337,7 @@ export function CommandPalette({
     }
     // The full first page would push Actions below the fold.
     return out.slice(0, IDLE_SESSION_LIMIT);
-  }, [data, titleSearch.data, query, searching, sessionsOnly]);
+  }, [data, titleSearch.data, query, searching, sessionsOnly, projects]);
   // Excludes title matches again in case a rename moved a session between the
   // two groups' requests: cmdk needs each item value to be unique.
   const contentSessions = useMemo(
@@ -319,10 +345,11 @@ export function CommandPalette({
       searching
         ? paletteSessions(contentSearch.data?.pages ?? [], {
             includeArchived: true,
+            projects,
             excludeIds: new Set(sessions.map((s) => s.id)),
           })
         : [],
-    [contentSearch.data, searching, sessions],
+    [contentSearch.data, searching, sessions, projects],
   );
   const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
   const searchGroups = [titleSearch, contentSearch];
@@ -400,6 +427,37 @@ export function CommandPalette({
         <span className="truncate text-left">
           <HighlightedText text={s.label} query={sessionsOnly ? query : debouncedQuery} />
         </span>
+        {(s.project || s.parent) && (
+          <span
+            className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground"
+            aria-label={[
+              s.project && `Project: ${s.project}`,
+              s.parent && `Nested under: ${s.parent}`,
+            ]
+              .filter(Boolean)
+              .join("; ")}
+          >
+            {s.project && (
+              <>
+                <FolderIcon aria-hidden="true" className="size-3 shrink-0" />
+                <span className="truncate" title={s.project}>
+                  {s.project}
+                </span>
+              </>
+            )}
+            {s.project && s.parent && (
+              <ChevronRightIcon aria-hidden="true" className="size-3 shrink-0" />
+            )}
+            {s.parent && (
+              <>
+                <CornerDownRightIcon aria-hidden="true" className="size-3 shrink-0" />
+                <span className="truncate" title={s.parent}>
+                  {s.parent}
+                </span>
+              </>
+            )}
+          </span>
+        )}
         {s.snippet && (
           // Where the match was found in the chat body — the session is often
           // unidentifiable from the title alone.

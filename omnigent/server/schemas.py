@@ -2278,6 +2278,7 @@ class BackgroundTaskInfo(BaseModel):
 class SessionFamily(BaseModel):
     id: str
     representative_id: str | None
+    representative_title: str | None = None
     pinned: bool = False
     pinned_at: str | None = None
 
