@@ -161,30 +161,97 @@ export function selectableIndices(rows: readonly QuickPickRow<unknown>[]): numbe
 export type QuickPickNavigation =
   | { type: "next" }
   | { type: "previous" }
+  | { type: "nextGroup" }
+  | { type: "previousGroup" }
   | { type: "pageDown"; pageSize: number }
   | { type: "pageUp"; pageSize: number }
   | { type: "first" }
   | { type: "last" };
 
-/** Returns the row index to activate, or -1 when nothing is selectable. */
+export interface QuickPickNavigationOptions {
+  /** Next and previous wrap around at the ends; off by default, as in a menu. */
+  loop?: boolean;
+}
+
+/**
+ * Each row's group, as the index of the heading that names it: a heading owns
+ * itself, an item the heading of its own group above it, and an ungrouped item -1.
+ */
+function owningHeadings(rows: readonly QuickPickRow<unknown>[]): number[] {
+  let heading = -1;
+  let label: string | undefined;
+  return rows.map((row, index) => {
+    if (row.kind === "heading") {
+      heading = index;
+      label = row.label;
+      return index;
+    }
+    if (heading !== -1 && row.item.group === label) return heading;
+    heading = -1;
+    return -1;
+  });
+}
+
+/**
+ * The first enabled row of the nearest group after (or before) the active row's
+ * group that has one, or -1 when the active row is ungrouped or none is found.
+ */
+function adjacentGroupStart(
+  rows: readonly QuickPickRow<unknown>[],
+  selectable: readonly number[],
+  activeIndex: number,
+  direction: 1 | -1,
+): number {
+  const owners = owningHeadings(rows);
+  const ownHeading = activeIndex === -1 ? -1 : owners[activeIndex];
+  if (ownHeading === -1) return -1;
+  const headings = rows.flatMap((row, index) => (row.kind === "heading" ? [index] : []));
+  for (
+    let position = headings.indexOf(ownHeading) + direction;
+    position >= 0 && position < headings.length;
+    position += direction
+  ) {
+    const first = selectable.find((index) => owners[index] === headings[position]);
+    if (first !== undefined) return first;
+  }
+  return -1;
+}
+
+/**
+ * The row index to activate: the current one when a move has nowhere to go,
+ * or -1 when nothing is selectable.
+ */
 export function navigateQuickPick(
   rows: readonly QuickPickRow<unknown>[],
   activeIndex: number,
   navigation: QuickPickNavigation,
+  { loop = false }: QuickPickNavigationOptions = {},
 ): number {
   const selectable = selectableIndices(rows);
   if (selectable.length === 0) return -1;
   const position = selectable.indexOf(activeIndex);
   const last = selectable.length - 1;
+  const step = (direction: 1 | -1): number => {
+    if (position === -1) return direction === 1 ? selectable[0] : activeIndex;
+    const target = position + direction;
+    if (target >= 0 && target <= last) return selectable[target];
+    return loop ? selectable[direction === 1 ? 0 : last] : activeIndex;
+  };
   switch (navigation.type) {
     case "first":
       return selectable[0];
     case "last":
       return selectable[last];
     case "next":
-      return selectable[position === -1 || position === last ? 0 : position + 1];
+      return step(1);
     case "previous":
-      return selectable[position <= 0 ? last : position - 1];
+      return step(-1);
+    case "nextGroup":
+    case "previousGroup": {
+      const direction = navigation.type === "nextGroup" ? 1 : -1;
+      const groupStart = adjacentGroupStart(rows, selectable, activeIndex, direction);
+      return groupStart !== -1 ? groupStart : step(direction);
+    }
     case "pageDown":
       return selectable[Math.min(last, Math.max(position, 0) + navigation.pageSize)];
     case "pageUp":
