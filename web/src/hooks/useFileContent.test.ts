@@ -97,9 +97,11 @@ describe("workspaceFileMediaUrl", () => {
   });
 
   it("is null when the host has no media resolver, so callers fall back to fetching", () => {
+    setSessionHost("sess_abc", "host_1");
     resolveMediaUrl.mockReturnValue(null);
 
     expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBeNull();
+    expect(resolveMediaUrl).toHaveBeenCalled();
   });
 
   it("routes the headerless media load to the session host's replica", () => {

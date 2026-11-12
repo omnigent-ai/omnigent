@@ -265,26 +265,72 @@ describe("managed first-message routing", () => {
     expect(resolve).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["explicit-key", "standalone", "create", "snapshot"])(
-    "leaves %s requests outside managed first-message recovery",
-    async (mode) => {
-      const { authenticatedFetch, resolve } = await setup();
-      if (mode === "standalone") isWorkspace.mockReturnValue(false);
-      const url =
-        mode === "create"
-          ? "/v1/sessions"
-          : mode === "snapshot"
-            ? `/v1/sessions/${SESSION_ID}`
-            : EVENTS_URL;
-      const headers = mode === "explicit-key" ? { [SLICE_KEY]: "caller-host" } : undefined;
-      const original = wrongReplica();
-      fetchMock.mockResolvedValueOnce(original);
+  it.each([
+    ["explicit-key", 1],
+    ["standalone", 1],
+    ["create", 2],
+    ["snapshot", 2],
+  ])("leaves %s requests outside the forced host refresh", async (mode, calls) => {
+    const { authenticatedFetch, resolve } = await setup();
+    if (mode === "standalone") isWorkspace.mockReturnValue(false);
+    const url =
+      mode === "create"
+        ? "/v1/sessions"
+        : mode === "snapshot"
+          ? `/v1/sessions/${SESSION_ID}`
+          : EVENTS_URL;
+    const headers = mode === "explicit-key" ? { [SLICE_KEY]: "caller-host" } : undefined;
+    fetchMock.mockImplementation(async () => wrongReplica());
 
-      expect(await authenticatedFetch(url, { headers })).toBe(original);
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(resolve.mock.calls.every((call) => call[1]?.force !== true)).toBe(true);
-    },
-  );
+    expect((await authenticatedFetch(url, { headers })).status).toBe(400);
+    // A client-keyed create or snapshot still tries the unkeyed default replica once.
+    expect(fetchMock).toHaveBeenCalledTimes(calls);
+    if (calls === 2) expect(requestHeaders(1).has(SLICE_KEY)).toBe(false);
+    expect(resolve.mock.calls.every((call) => call[1]?.force !== true)).toBe(true);
+  });
+
+  it("recovers an unknown-host archive PATCH on the host, then the default replica", async () => {
+    const { authenticatedFetch, isHostKeyless } = await setup();
+    const body = JSON.stringify({ archived: true });
+    fetchMock
+      .mockResolvedValueOnce(wrongReplica())
+      .mockResolvedValueOnce(wrongReplica())
+      .mockResolvedValueOnce(Response.json({}));
+
+    const response = await authenticatedFetch(`/v1/sessions/${SESSION_ID}`, {
+      method: "PATCH",
+      body,
+    });
+
+    expect(response.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(requestHeaders(0).get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
+    expect(requestHeaders(1).get(SLICE_KEY)).toBe("new-host");
+    expect(requestHeaders(2).has(SLICE_KEY)).toBe(false);
+    for (const [, request] of fetchMock.mock.calls) {
+      expect(request).toMatchObject({ method: "PATCH", body });
+    }
+    expect(isHostKeyless("new-host")).toBe(true);
+  });
+
+  it("retries a scheduled-task create on the updates key unkeyed after a miss", async () => {
+    const { authenticatedFetch, setSessionHost, resolveModalHost, isHostKeyless } = await setup();
+    setSessionHost("other-session", "host_modal");
+    resolveModalHost();
+    fetchMock.mockResolvedValueOnce(wrongReplica()).mockResolvedValueOnce(Response.json({}));
+
+    const response = await authenticatedFetch("/v1/scheduled-tasks", {
+      method: "POST",
+      body: JSON.stringify({ name: "Nightly" }),
+    });
+
+    expect(response.ok).toBe(true);
+    expect(requestHeaders(0).get(SLICE_KEY)).toBe("host_modal");
+    expect(requestHeaders(1).has(SLICE_KEY)).toBe(false);
+    expect(fetchMock.mock.calls[1][2]).toEqual({ unkeyed: true });
+    // The updates key isn't treated as a host proven keyless.
+    expect(isHostKeyless("host_modal")).toBe(false);
+  });
 });
 
 describe("managed create routing by a chosen host id", () => {

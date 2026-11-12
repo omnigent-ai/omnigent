@@ -660,11 +660,16 @@ describe("authenticatedFetch", () => {
       await authenticatedFetch("/v1/projects/proj_1", { method: "PATCH", body: "{}" });
       await authenticatedFetch("/v1/scheduled-tasks/task_1/run", { method: "POST" });
       await authenticatedFetch("/v1/scheduled-tasks", { method: "POST", body: "{}" });
+      // A task edit or create naming a connected host is validated on that host's replica.
+      await authenticatedFetch("/v1/scheduled-tasks/task_1", {
+        method: "PATCH",
+        body: JSON.stringify({ name: "Renamed", host_id: "host_task", workspace: "/repo" }),
+      });
 
       const keys = fetchMock.mock.calls.map(([, init]) =>
         new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
       );
-      expect(keys).toEqual([CLIENT_KEY, "host_modal", "host_modal", "host_modal"]);
+      expect(keys).toEqual([CLIENT_KEY, "host_modal", "host_modal", "host_modal", "host_task"]);
     });
 
     it("keys a session sub-path with an unknown host by the client key", async () => {

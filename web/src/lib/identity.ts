@@ -159,6 +159,23 @@ const _hostResolveAttempted = new Set<string>();
 // itself. The list (/v1/sessions?query) and create (POST /v1/sessions) have no
 // /{id} and also don't match.
 const SESSION_SUBPATH_RE = /\/v1\/sessions\/([^/?#]+)\/[^?#]/;
+const SESSION_ROOT_RE = /\/v1\/sessions\/([^/?#]+)(?:[?#]|$)/;
+
+/**
+ * The session whose host a wrong_replica miss should refresh: a sub-path's, or a
+ * root mutation's (e.g. an archive PATCH). A root GET is the host lookup itself,
+ * so it never triggers another lookup.
+ */
+function sessionIdForRecovery(url: string, method: string | undefined): string | null {
+  const subpathSessionId = sessionIdForHostResolve(url);
+  if (subpathSessionId !== null) return subpathSessionId;
+  const verb = (method ?? "GET").toUpperCase();
+  if (verb === "GET" || verb === "HEAD") return null;
+  const match = url.match(SESSION_ROOT_RE);
+  if (match === null) return null;
+  const sessionId = decodeURIComponent(match[1]);
+  return SESSION_COLLECTION_ROUTES.has(sessionId) ? null : sessionId;
+}
 
 /**
  * Bootstrap the session→host map for one session id so its host-scoped traffic
@@ -314,6 +331,22 @@ function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined):
 // `session_added`) reach only updates streams on the replica that handled them.
 const DISCOVERY_PUBLISHING_WRITE_RE =
   /\/v1\/(?:projects(?:[/?#]|$)|scheduled-tasks(?:[?#]|$|\/[^/?#]+\/run(?:[?#]|$)))/;
+
+const SCHEDULED_TASK_WRITE_RE = /\/v1\/scheduled-tasks(?:\/[^/?#]+)?(?:[?#]|$)/;
+
+// A scheduled-task create or edit naming a connected host is validated against
+// that host's workspace over its tunnel, so it routes to the host's replica.
+function scheduledTaskHostId(url: string, init: RequestInit | undefined): string | null {
+  const verb = (init?.method ?? "GET").toUpperCase();
+  if ((verb !== "POST" && verb !== "PATCH") || typeof init?.body !== "string") return null;
+  if (!SCHEDULED_TASK_WRITE_RE.test(url)) return null;
+  try {
+    const hostId = (JSON.parse(init.body) as { host_id?: unknown }).host_id;
+    return typeof hostId === "string" && hostId ? hostId : null;
+  } catch {
+    return null;
+  }
+}
 
 function isDiscoveryPublishingWrite(url: string, method: string | undefined): boolean {
   const verb = (method ?? "GET").toUpperCase();
@@ -610,6 +643,8 @@ export async function authenticatedFetch(
       derivedHostId = scope.hostId;
     } else if (isBodyHostKeyedRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);
+    } else if (scheduledTaskHostId(url, init) !== null) {
+      derivedHostId = scheduledTaskHostId(url, init);
     } else if (isDiscoveryPublishingWrite(url, init?.method)) {
       headers.set(SLICE_KEY_HEADER, updatesRoutingKey());
     }
@@ -676,39 +711,41 @@ export async function authenticatedFetch(
     isDatabricksWorkspace() &&
     (await _isWrongReplica(res))
   ) {
-    // A session request with an unknown host missed on the client key. The first
-    // managed message can outlive provisioning and acquire a host, so refresh the
-    // lookup and try that host's key, then the unkeyed default replica, which
-    // holds hosts whose tunnels connected without a key.
-    const sessionId = sessionIdForHostResolve(url);
+    // A request on the client or updates key missed. For a session request,
+    // refresh its host (the first managed message can outlive provisioning) and
+    // try that host's key; then try the unkeyed default replica, which holds
+    // hosts whose tunnels connected without a key.
+    const sessionId = sessionIdForRecovery(url, init?.method);
+    let hostId: string | null = null;
+    let demoted = false;
     if (sessionId !== null) {
       init?.signal?.throwIfAborted();
       await resolveSessionHost(sessionId, { force: true });
       init?.signal?.throwIfAborted();
-      const hostId = getSessionHost(sessionId);
-      const demoted = hostId !== null && isHostKeyless(hostId);
+      hostId = getSessionHost(sessionId);
+      demoted = hostId !== null && isHostKeyless(hostId);
       if (hostId !== null && !demoted) {
         const retryHeaders = new Headers(headers);
         retryHeaders.set(SLICE_KEY_HEADER, hostId);
         res = await hostFetch(url, { ...init, headers: retryHeaders, cache: "no-store" });
       }
-      if (await _isWrongReplica(res)) {
-        const retryHeaders = new Headers(headers);
-        retryHeaders.delete(SLICE_KEY_HEADER);
-        res = await hostFetch(
-          url,
-          { ...init, headers: retryHeaders, cache: "no-store" },
-          { unkeyed: true },
-        );
-        if (hostId !== null && res.ok) {
-          markHostKeyless(hostId);
-        } else if (demoted && (await _isWrongReplica(res))) {
-          // The default replica missed too, so the demotion is stale: try the host's key.
-          clearHostKeyless(hostId);
-          const keyedHeaders = new Headers(headers);
-          keyedHeaders.set(SLICE_KEY_HEADER, hostId);
-          res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
-        }
+    }
+    if (await _isWrongReplica(res)) {
+      const retryHeaders = new Headers(headers);
+      retryHeaders.delete(SLICE_KEY_HEADER);
+      res = await hostFetch(
+        url,
+        { ...init, headers: retryHeaders, cache: "no-store" },
+        { unkeyed: true },
+      );
+      if (hostId !== null && res.ok) {
+        markHostKeyless(hostId);
+      } else if (hostId !== null && demoted && (await _isWrongReplica(res))) {
+        // The default replica missed too, so the demotion is stale: try the host's key.
+        clearHostKeyless(hostId);
+        const keyedHeaders = new Headers(headers);
+        keyedHeaders.set(SLICE_KEY_HEADER, hostId);
+        res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
       }
     }
   } else if (
