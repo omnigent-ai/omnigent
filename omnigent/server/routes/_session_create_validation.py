@@ -65,10 +65,19 @@ async def resolve_project_session_create(
 
     # Nested agents inherit filing, while the composer or MCP chooses their placement.
     config = {} if getattr(body, "sibling_source_id", None) else project.config
+    managed = getattr(body, "host_type", None) == "managed"
+    repository = _saved_managed_repository(config) if managed else None
     updates: dict[str, Any] = {}
     for field in ("agent_id", "workspace", "git"):
+        if repository is not None and field in ("workspace", "git"):
+            continue
         if field not in fields_set and field in config and field in body.__class__.model_fields:
             updates[field] = config[field]
+    if repository is not None and not {"workspace", "workspaces"} & fields_set:
+        updates["workspaces"] = [repository]
+    saved_provider = config.get("sandbox_provider")
+    if managed and "sandbox_provider" not in fields_set and isinstance(saved_provider, str):
+        updates["sandbox_provider"] = saved_provider
     resolved_data = body.model_dump()
     resolved_data.update(updates)
     # Re-validate project hints because config is intentionally stored as
@@ -92,6 +101,26 @@ async def resolve_project_session_create(
         )
 
     return ProjectCreateResolution(body=resolved, project_id=project_id)
+
+
+def _saved_managed_repository(config: dict[str, Any]) -> str | None:
+    """The project's saved repository as a managed workspace, or ``None``.
+
+    A malformed saved value is ignored rather than failing the create, since
+    config is opaque client JSON.
+
+    :param config: The project's opaque config object.
+    :returns: ``url`` or ``url#branch``, e.g. ``"https://git.example.com/team/app.git#main"``.
+    """
+    from omnigent.server.managed_hosts import parse_project_repository
+
+    if "repository" not in config:
+        return None
+    try:
+        parsed = parse_project_repository(config["repository"])
+    except ValueError:
+        return None
+    return parsed.url if parsed.branch is None else f"{parsed.url}#{parsed.branch}"
 
 
 def validate_session_model_metadata(

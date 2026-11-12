@@ -17,9 +17,11 @@ from omnigent.native._native_supersession import clear_replacement_create_body
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.server.routes._session_create_validation import (
     resolve_project_session_create,
 )
+from omnigent.server.routes.sessions import routes_core
 from omnigent.server.schemas import (
     ProjectSessionCreateRequest,
     SessionCreateRequest,
@@ -29,8 +31,10 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import build_agent_bundle
 
 pytestmark = pytest.mark.asyncio
@@ -607,3 +611,193 @@ async def test_import_with_unowned_or_unknown_project_is_404(
         )
         assert response.status_code == 404, response.text
         assert "Project not found" in response.text
+
+
+PROJECT_REPOSITORY_URL = "https://git.example.com/team/app.git"
+OTHER_REPOSITORY_URL = "https://git.example.com/team/other.git"
+
+
+@pytest.fixture()
+def managed_project_app(
+    project_create_app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> FastAPI:
+    """The project app with two sandbox providers and a recorder for managed launches.
+
+    :param project_create_app: The shared project-create app.
+    :param db_uri: Database the managed host store reads.
+    :param monkeypatch: Replaces the background launch with a recorder.
+    :returns: The same app, now able to provision managed sandboxes.
+    """
+    project_create_app.state.host_store = HostStore(db_uri)
+    project_create_app.state.sandbox_config = parse_sandbox_config(
+        {
+            "server_url": "https://managed-test.example.com",
+            "providers": [{"provider": "modal"}, {"provider": "daytona"}],
+        }
+    )
+    launches: list[dict[str, object]] = []
+
+    async def record_launch(**kwargs: object) -> None:
+        launches.append(kwargs)
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", record_launch)
+    project_create_app.state.recorded_launches = launches
+    return project_create_app
+
+
+def _launched(app: FastAPI) -> tuple[list[str], str | None]:
+    """The repositories and provider of the single managed launch the app recorded."""
+    (launch,) = app.state.recorded_launches
+    repos = [
+        repo.url if repo.branch is None else f"{repo.url}#{repo.branch}"
+        for repo in launch["repos"]
+    ]
+    return repos, launch["provider"]
+
+
+async def _await_launch(app: FastAPI) -> None:
+    await poll_until_async(lambda: app.state.recorded_launches, timeout_s=5)
+
+
+MANAGED_PROJECT_CONFIG: dict[str, object] = {
+    "agent_id": CUSTOM_AGENT_ID,
+    "repository": {"url": PROJECT_REPOSITORY_URL, "branch": "main"},
+    "sandbox_provider": "modal",
+}
+
+
+@pytest.mark.parametrize("shape", ["json", "multipart"])
+async def test_managed_project_defaults_reach_the_launch(
+    managed_project_app: FastAPI,
+    project_create_client: httpx.AsyncClient,
+    shape: str,
+) -> None:
+    """A managed create from a sandbox project launches its saved repository and provider."""
+    project_id = await _project(project_create_client, MANAGED_PROJECT_CONFIG)
+    if shape == "json":
+        response = await project_create_client.post(
+            "/v1/sessions",
+            json={"project_id": project_id, "host_type": "managed"},
+            headers=_headers(),
+        )
+    else:
+        response = await project_create_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps({"project_id": project_id, "host_type": "managed"})},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(name="managed-project-upload"),
+                    "application/gzip",
+                )
+            },
+            headers=_headers(),
+        )
+    assert response.status_code == 201, response.text
+    await _await_launch(managed_project_app)
+    assert _launched(managed_project_app) == ([f"{PROJECT_REPOSITORY_URL}#main"], "modal")
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected_repos", "expected_provider"),
+    [
+        ({}, [f"{PROJECT_REPOSITORY_URL}#main"], "modal"),
+        ({"workspaces": []}, [], "modal"),
+        ({"workspace": None}, [], "modal"),
+        ({"workspaces": None}, [], "modal"),
+        ({"sandbox_provider": None}, [f"{PROJECT_REPOSITORY_URL}#main"], None),
+        (
+            {"sandbox_provider": "daytona", "workspaces": [OTHER_REPOSITORY_URL]},
+            [OTHER_REPOSITORY_URL],
+            "daytona",
+        ),
+    ],
+    ids=[
+        "omitted",
+        "empty-workspaces-list-wins",
+        "null-workspace-wins",
+        "null-workspaces-wins",
+        "null-provider-wins",
+        "explicit-provider-and-repos",
+    ],
+)
+async def test_explicit_managed_fields_override_project_defaults(
+    managed_project_app: FastAPI,
+    project_create_client: httpx.AsyncClient,
+    extra: dict[str, object],
+    expected_repos: list[str],
+    expected_provider: str | None,
+) -> None:
+    """Only omitted fields take the project's repository and provider."""
+    project_id = await _project(project_create_client, MANAGED_PROJECT_CONFIG)
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "host_type": "managed", **extra},
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    await _await_launch(managed_project_app)
+    assert _launched(managed_project_app) == (expected_repos, expected_provider)
+
+
+async def test_non_managed_and_placement_creates_take_no_saved_repository(db_uri: str) -> None:
+    """Connected-host, sibling and non-managed creates never inherit the saved repository."""
+    project_store = SqlAlchemyProjectStore(db_uri)
+    project = project_store.create(
+        "687b7cb7ac30abf4debfaa578d052ec6",
+        "placement-matrix",
+        ALICE,
+        {**MANAGED_PROJECT_CONFIG, "workspace": "/work/project"},
+    )
+
+    host = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest(
+            project_id=project.id, host_id="host_abc", workspace="/work/other"
+        ),
+        user_id=ALICE,
+        project_store=project_store,
+    )
+    assert host.body.workspaces is None
+    assert host.body.workspace == "/work/other"
+
+    sibling = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest(
+            project_id=project.id,
+            agent_id=CUSTOM_AGENT_ID,
+            host_type="managed",
+            sibling_source_id="conv_source",
+        ),
+        user_id=ALICE,
+        project_store=project_store,
+    )
+    assert sibling.body.workspaces is None
+    assert sibling.body.sandbox_provider is None
+
+    external = await resolve_project_session_create(
+        body=ProjectSessionCreateRequest(project_id=project.id),
+        user_id=ALICE,
+        project_store=project_store,
+    )
+    assert external.body.workspaces is None
+    assert external.body.workspace == "/work/project"
+
+
+async def test_legacy_string_repository_is_ignored_without_failing_the_create(db_uri: str) -> None:
+    """A repository saved as a bare string or with extra keys is ignored, not an error."""
+    project_store = SqlAlchemyProjectStore(db_uri)
+    for index, repository in enumerate(
+        [PROJECT_REPOSITORY_URL, {"url": PROJECT_REPOSITORY_URL, "extra": 1}]
+    ):
+        project = project_store.create(
+            f"787b7cb7ac30abf4debfaa578d05{index}ec6",
+            f"legacy-repository-{index}",
+            ALICE,
+            {"agent_id": CUSTOM_AGENT_ID, "repository": repository, "sandbox_provider": "modal"},
+        )
+        resolved = await resolve_project_session_create(
+            body=ProjectSessionCreateRequest(project_id=project.id, host_type="managed"),
+            user_id=ALICE,
+            project_store=project_store,
+        )
+        assert resolved.body.workspaces is None
+        assert resolved.body.sandbox_provider == "modal"

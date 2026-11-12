@@ -1,8 +1,34 @@
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import type { ProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
+import type { LastSandboxRepo } from "@/lib/repoPreferences";
 
 type ProjectPrefillPhase = "location" | "settled";
+
+/** A project's saved repository: a clone URL and an optional branch. */
+export interface ProjectRepository {
+  url: string;
+  branch?: string;
+}
+
+/**
+ * Read a stored project repository, or `undefined` when the value is not one.
+ *
+ * Project config is opaque client JSON, so a legacy bare string or a malformed
+ * object is ignored rather than seeded (a string would crash the composer's
+ * `url.trim()`).
+ *
+ * @param value The raw `config.repository` value, e.g. `{ url: "https://git.example.com/team/app.git" }`.
+ * @returns The repository, with a trimmed URL and an absent branch when blank.
+ */
+export function projectRepository(value: unknown): ProjectRepository | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const { url, branch } = value as { url?: unknown; branch?: unknown };
+  if (typeof url !== "string" || url.trim() === "") return undefined;
+  if (branch !== undefined && typeof branch !== "string") return undefined;
+  const trimmedBranch = branch?.trim() ?? "";
+  return trimmedBranch === "" ? { url: url.trim() } : { url: url.trim(), branch: trimmedBranch };
+}
 
 /**
  * A project's session defaults, as the composer consumes them: its stored
@@ -33,6 +59,10 @@ export interface ProjectPrefillConfig {
   /** Agent the project's last session started with. Unlike `agentId` it is a
    *  hint: it seeds only once the pickable list confirms it still exists. */
   launchAgentId?: string;
+  /** Sandbox provider a sandbox project runs on; seeded with the sandbox pick. */
+  sandboxProvider?: string;
+  /** Repository a project was created with; seeded into a sandbox pick. */
+  repository?: ProjectRepository;
 }
 
 /**
@@ -111,6 +141,11 @@ interface ProjectPrefillWrites {
   /** Select the managed sandbox as the target (config.hostId was the sandbox
    *  sentinel). Distinct from `hostId` — the sandbox is not a real host id. */
   selectSandbox?: boolean;
+  /** Provider to select with the sandbox; the composer falls back to its default
+   *  when the stored one is not offered. */
+  sandboxProvider?: string;
+  /** Repositories the sandbox clones, from the project's saved repository. */
+  sandboxRepos?: LastSandboxRepo[];
 }
 
 /**
@@ -189,6 +224,12 @@ function locationStep(
   if (config?.hostId === SANDBOX_HOST_CHOICE) {
     if (inputs.managedSandboxesEnabled && !inputs.sandboxSelected && selectedHostId === null) {
       writes.selectSandbox = true;
+      if (config.sandboxProvider !== undefined) writes.sandboxProvider = config.sandboxProvider;
+      if (config.repository !== undefined) {
+        writes.sandboxRepos = [
+          { url: config.repository.url, branch: config.repository.branch ?? "" },
+        ];
+      }
     }
     return settled(state);
   }

@@ -288,6 +288,7 @@ describe("resolveServerInfo session_search_scope", () => {
 
 describe.each([
   "scheduled_task_projects",
+  "project_repository_creation",
   "scheduled_task_harness_settings",
   "scheduled_task_approval_skipping_modes",
   "scheduled_task_subhour",

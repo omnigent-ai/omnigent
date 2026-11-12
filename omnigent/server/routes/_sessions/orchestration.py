@@ -12291,7 +12291,7 @@ async def _create_session_from_existing_agent(
     created_by_project_id: str | None = None,
     created_by_scheduled_task_id: str | None = None,
     created_by_labels: Mapping[str, str] | None = None,
-) -> tuple[SessionResponse, Conversation]:
+) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
     """
     Create a session bound to an already-registered agent.
 
@@ -12327,7 +12327,8 @@ async def _create_session_from_existing_agent(
         any. A worker whose request carries no launch args runs in its permission mode.
     :param created_by_labels: That source's labels. A worker that picks no MCP
         services of its own starts with the source's.
-    :returns: The newly created session snapshot and its conversation row.
+    :returns: The newly created session snapshot, its conversation row, and
+        the request body after project defaults were applied.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
         fails authorization.
@@ -13327,7 +13328,7 @@ async def _create_session_from_existing_agent(
         conversation=conv,
         request=request,
     )
-    return response, conv
+    return response, conv, body
 
 
 def _create_session_from_bundle(

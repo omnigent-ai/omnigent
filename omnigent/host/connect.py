@@ -76,6 +76,7 @@ from omnigent.host.frames import (
     RUNNER_LOG_TAIL_HEADING,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -148,6 +149,7 @@ from omnigent.host.frames import (
     parse_server_capabilities,
     workspace_missing_message,
 )
+from omnigent.host.git_clone import clone_repository
 from omnigent.host.git_worktree import (
     WorktreeError,
     create_worktree,
@@ -6060,6 +6062,13 @@ class HostProcess:
         elif isinstance(frame, HostCreateDirFrame):
             create_dir_result = await asyncio.to_thread(self._handle_create_dir, frame)
             await self._send_text(ws, self._encode_frame(create_dir_result))
+        elif isinstance(frame, HostCloneRepositoryFrame):
+            # git runs for minutes; the owned-subprocess guard keeps the orphan
+            # reaper from collecting its exit status.
+            clone_result = await self._run_host_subprocess_in_thread(
+                lambda: clone_repository(frame)
+            )
+            await self._send_text(ws, self._encode_frame(clone_result))
         elif isinstance(frame, HostInstallHarnessFrame):
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.

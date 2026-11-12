@@ -108,6 +108,13 @@ the header menu), and each place is a separate entry point.
   project folder from the row menu, the header menu, or the header's folder tag.
   Agents file sessions the same way with `sys_session_update` (see
   [session orchestration](session-orchestration.md)).
+- `project-create-run-on`: New project's **Run on** picks a connected host or a
+  sandbox provider (behind the `project_repository_creation` server capability).
+  On a host, **Folder** keeps the optional working directory; **Repository** clones
+  a URL and optional branch into **Clone into** (default `~/<repo>`) before the
+  project is saved, and the dialog stays locked until the clone and save finish.
+  On a sandbox, only the repository is offered and it is saved, not cloned, until a
+  session starts. Older servers keep the folder-only dialog.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
   Agents rename projects and set their emoji with `sys_project_update`, and
