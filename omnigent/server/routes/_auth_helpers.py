@@ -31,6 +31,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     AuthProvider,
+    effective_admin,
     local_single_user_enabled,
 )
 from omnigent.server.permissions import (
@@ -343,7 +344,7 @@ def _require_access_and_level_sync(
         # check_session_access's admin short-circuit, which never reads the
         # conversation). A missing conversation is left for the snapshot builder
         # to 404 on, exactly as today.
-        if access.is_admin:
+        if effective_admin(access.is_admin):
             return SessionAccess(level=level, conversation=None)
 
         conv = conversation_store.get_conversation(conversation_id)
@@ -454,7 +455,7 @@ def _can_mutate_agent(
     """Whether the caller satisfies the agent-ownership mutation gate."""
     if permission_store is None or local_single_user_enabled():
         return True
-    if user_id is not None and permission_store.is_admin(user_id):
+    if user_id is not None and effective_admin(permission_store.is_admin(user_id)):
         return True
     return agent.created_by is not None and user_id == agent.created_by
 

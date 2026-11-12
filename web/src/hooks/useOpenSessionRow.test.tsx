@@ -111,6 +111,9 @@ describe("fetchConversationById", () => {
     // Session-scoped requests route through these maps before any list row loads.
     expect(getSessionParent("conv_old")).toBe("conv_parent");
     expect(getSessionHost("conv_old")).toBe("host_1");
+    const client = newQueryClient();
+    rememberOpenSessionRow(client, conversation("conv_old", { owner: "owner" }));
+    expect(await fetchConversationById("conv_old", client)).toMatchObject({ owner: "owner" });
   });
 
   it("returns null for a deleted session", async () => {

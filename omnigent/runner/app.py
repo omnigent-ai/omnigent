@@ -5659,6 +5659,15 @@ def create_runner_app(
         _own_task = asyncio.current_task()
         _turn_message_bodies[conv] = msg_body
         _own_epoch = _turn_bind_epoch.get(conv)
+
+        def owns_turn() -> bool:
+            """Whether this task still owns the session's turn generation."""
+            return (
+                _own_task is not None
+                and _active_turns.get(conv) is _own_task
+                and _turn_bind_epoch.get(conv) == _own_epoch
+            )
+
         # A fresh turn is binding: whatever desync the previous turn ended on is
         # resolved now. Also clear a stale publish-once token (e.g. left set by a
         # wedged stream that never reached its own _on_proxy_stream_end) so it
@@ -5679,6 +5688,7 @@ def create_runner_app(
                 # error event) is never shadowed by the generic except below.
                 raise
             except asyncio.CancelledError as exc:
+                owns_active_turn = owns_turn()
                 _logger.error(
                     "turn cancelled for %s: %s",
                     conv,
@@ -5694,20 +5704,25 @@ def create_runner_app(
                         interrupt_marked=conv in _interrupted_sessions,
                         desync_marked=conv in _desynced_sessions,
                         handed_to_harness=handed_off[0],
-                        owns_active_turn=_active_turns.get(conv) is _own_task,
+                        owns_active_turn=owns_active_turn,
                         task_cancel_count=_own_task.cancelling() if _own_task else None,
                     ),
                 )
-                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                if owns_active_turn:
+                    _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
                 raise
             except Exception as exc:
-                _logger.error(
+                owns_active_turn = owns_turn()
+                _logger.log(
+                    logging.ERROR if owns_active_turn else logging.WARNING,
                     "turn setup failed for %s: %s",
                     conv,
                     exc,
                     exc_info=True,
                     extra={"session_id": conv},
                 )
+                if not owns_active_turn:
+                    return
                 error: dict[str, object] = {"message": f"turn setup failed: {exc}"}
                 if not handed_off[0]:
                     identity = _input_identity(msg_body)
@@ -5734,7 +5749,7 @@ def create_runner_app(
                 # clobber the newer turn (the same class of bug the ExecutorAdapter
                 # identity CAS fixes). When the slot is a None sentinel or a
                 # different task, this turn is already accounted for — skip.
-                if _active_turns.get(conv) is _own_task and _own_task is not None:
+                if owns_turn():
                     _on_proxy_stream_end(conv)
                 if _turn_message_bodies.get(conv) is msg_body:
                     _turn_message_bodies.pop(conv, None)
@@ -6229,6 +6244,7 @@ def create_runner_app(
         conv_id: str,
         dispatch: TurnDispatch | None = None,
     ) -> Response:
+        stream_turn_epoch = _turn_bind_epoch.get(conv_id, 0)
         manager = cast(HarnessProcessManager, process_manager)
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
         spawn_env = (
@@ -6507,6 +6523,15 @@ def create_runner_app(
             )
 
             turn_input_identity = _input_identity(body)
+            _response_id: str | None = None
+
+            def _owns_live_turn() -> bool:
+                return _turn_bind_epoch.get(conv_id, 0) == stream_turn_epoch and (
+                    _response_id is None or _live_response_id.get(conv_id) == _response_id
+                )
+
+            if not _owns_live_turn():
+                return
 
             if _eager_spec_error is not None:
                 _err_type, _err_msg = _eager_spec_error
@@ -6590,9 +6615,10 @@ def create_runner_app(
             _ds_sa = _session_sub_agent_names.get(conv_id)
             if _ds_sa and _session_sub_agent_resolved.get(conv_id) is False:
                 _warn_unresolved_sub_agent(conv_id, _ds_sa)
+            if not _owns_live_turn():
+                return
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
-            _response_id: str | None = None
             _response_data: _JsonObject = {}
             _terminal_response_type: str | None = None
             _dispatch_tasks: list[_asyncio.Task[object]] = []
@@ -6611,15 +6637,14 @@ def create_runner_app(
                 _publish_event(conv_id, _held_refusal)
                 _held_refusal = None
 
-            def _owns_live_turn() -> bool:
-                live = _live_response_id.get(conv_id)
-                return _response_id is None or live == _response_id
-
             async def _finish_harness_stream() -> _JsonObject | None:
                 """Settle the owned outcome after stream close and pending dispatches."""
                 nonlocal _held_refusal
                 if _dispatch_tasks:
                     await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
+                if not _owns_live_turn():
+                    _report_held_refusal()
+                    return None
                 lifecycle_event: _JsonObject | None = None
                 lifecycle_error: _JsonObject | None = None
                 cancelled = _terminal_response_type == "response.cancelled"
@@ -6679,6 +6704,8 @@ def create_runner_app(
                     timeout=None,
                 ) as harness_resp:
                     if harness_resp.status_code != 200:
+                        if not _owns_live_turn():
+                            return
                         _logger.error(
                             "harness rejected turn delivery for %s with status %d",
                             conv_id,
@@ -6755,6 +6782,35 @@ def create_runner_app(
                                     event = None
                             else:
                                 event = None
+
+                            if not _owns_live_turn():
+                                _report_held_refusal()
+                                # Preserve a refused input without settling the successor's turn.
+                                if (
+                                    isinstance(event, dict)
+                                    and event.get("type") == "response.failed"
+                                ):
+                                    response = event.get("response")
+                                    error = event.get("error") or (
+                                        response.get("error")
+                                        if isinstance(response, dict)
+                                        else None
+                                    )
+                                    if (
+                                        harness_name == "claude-native"
+                                        and isinstance(error, dict)
+                                        and error.get("code") == "databricks_sign_in_pending"
+                                        and error.get("undelivered") is True
+                                        and (
+                                            "input_stable_id" in turn_input_identity
+                                            or {"pending_id", "delivery_attempt_id"}
+                                            <= turn_input_identity.keys()
+                                        )
+                                    ):
+                                        event.update(turn_input_identity)
+                                        _publish_event(conv_id, event)
+                                        yield _encode_sse_event(event)
+                                continue
 
                             _defer_publish = False
                             if event is not None:
@@ -7160,6 +7216,9 @@ def create_runner_app(
                     yield _encode_sse_event(terminal_event)
 
             except _ContextWindowOverflow as overflow:
+                if not _owns_live_turn():
+                    _report_held_refusal()
+                    return
                 _report_held_refusal()
                 _error = {
                     "code": "context_length_exceeded",
@@ -7184,6 +7243,22 @@ def create_runner_app(
                 )
 
             except (httpx.HTTPError, RuntimeError) as exc:
+                if not _owns_live_turn():
+                    _report_held_refusal()
+                    _logger.warning(
+                        "Retired harness stream failed for %s; preserving the newer turn",
+                        conv_id,
+                        exc_info=True,
+                        extra=debug_event(
+                            "retired_harness_stream_failed",
+                            session_id=conv_id,
+                            response_id=_response_id,
+                            turn_epoch=stream_turn_epoch,
+                            current_turn_epoch=_turn_bind_epoch.get(conv_id, 0),
+                            exception_type=type(exc).__name__,
+                        ),
+                    )
+                    return
                 if isinstance(exc, httpx.HTTPError) and _terminal_response_type is not None:
                     if terminal_event := await _finish_harness_stream():
                         yield _encode_sse_event(terminal_event)

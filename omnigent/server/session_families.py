@@ -169,9 +169,11 @@ def project_families(
         members = members_by_family.get(family_id, [])
         owned = [member for member in members if member.id in member_owners]
         active = [member for member in owned if not member.archived]
+        representative = (active or owned)[0] if owned else None
         info = SessionFamily(
             id=family_id,
-            representative_id=(active or owned)[0].id if owned else None,
+            representative_id=representative.id if representative else None,
+            representative_title=representative.title if representative else None,
             pinned=pin_key in item.labels,
             pinned_at=item.labels.get(pin_key),
         )
