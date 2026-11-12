@@ -1627,10 +1627,10 @@ function AppShellImpl() {
       fileNavigationGuardsRef.current.delete(guard);
     };
   }, []);
-  const guardVisit = useRef({ sessionId: conversationId, version: 0 });
-  if (guardVisit.current.sessionId !== conversationId) {
-    guardVisit.current = { sessionId: conversationId, version: guardVisit.current.version + 1 };
-  }
+  const guardVisit = useRef({});
+  useLayoutEffect(() => {
+    guardVisit.current = {};
+  }, [conversationId]);
   const guardFileNavigation = useCallback(
     (path: string | null, options: OpenFileOptions | undefined, commit: () => void) => {
       const visit = guardVisit.current;
@@ -2149,7 +2149,11 @@ function AppShellImpl() {
         return false;
       }
       useChatStore.setState({
-        sideChatToOpen: { childId: subagentTabId(childSessionId), parentId: conversationId },
+        sideChatToOpen: {
+          childId: subagentTabId(childSessionId),
+          parentId: conversationId,
+          persistOpen: true,
+        },
       });
       return true;
     },
@@ -3058,8 +3062,8 @@ function AppShellImpl() {
                     showContentSearch={railTabsAvailable["content-search"]}
                     showBrowserTab={railTabsAvailable.browser}
                     onReveal={revealRightPanel}
-                    onRevealSideChat={() => {
-                      revealRightPanel(false);
+                    onRevealSideChat={(remember) => {
+                      revealRightPanel(remember);
                       if (isMobileViewport()) openSideChatsPanel();
                     }}
                     onHide={rightPanelOpen ? toggleRightPanel : undefined}

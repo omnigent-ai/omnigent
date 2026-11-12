@@ -1628,6 +1628,17 @@ async def forward_claude_transcript_to_session(
                                 bridge_dir=bridge_dir,
                                 seq=dismiss_seq,
                             )
+                        # Cost uses the latest completed child scan. A running
+                        # history scan checkpoints its cursor independently.
+                        await _forward_session_cost(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            parent_transcript_path=transcript_path,
+                            subagent_state=subagent_state,
+                            dedupe=dedupe,
+                            cost_cache=cost_cache,
+                        )
                         # Child history is an independent lane: a large backlog
                         # must never delay the next parent delta/transcript poll.
                         if subagent_task is None:
@@ -1648,22 +1659,13 @@ async def forward_claude_transcript_to_session(
                                         status_retry_tracker=subagent_status_retries,
                                         batch_capability=session_event_batch_capability,
                                         status_capability=subagent_status_capability,
+                                        cost_dedupe=dedupe,
+                                        cost_cache=cost_cache,
                                     ),
                                     timeout=_FORWARD_LOOP_STALL_DEADLINE_S,
                                 ),
                                 name=f"claude-child-history-{current_session_id}",
                             )
-                        # Cost uses the latest completed child scan. A running
-                        # history scan checkpoints its cursor independently.
-                        await _forward_session_cost(
-                            client=client,
-                            session_id=current_session_id,
-                            bridge_dir=bridge_dir,
-                            parent_transcript_path=transcript_path,
-                            subagent_state=subagent_state,
-                            dedupe=dedupe,
-                            cost_cache=cost_cache,
-                        )
                         # Mirror the live statusLine model EVERY poll (not just
                         # when a turn produced new transcript items, which
                         # _forward_available_items early-returns without). This
@@ -2787,6 +2789,8 @@ async def _forward_available_subagents(
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability | None = None,
     status_capability: _SubagentStatusCapability | None = None,
+    cost_dedupe: _ForwardDedupeState | None = None,
+    cost_cache: dict[Path, _TranscriptCostCacheEntry] | None = None,
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
@@ -2819,6 +2823,8 @@ async def _forward_available_subagents(
         event arrays. A new cache is created for direct callers that omit it.
     :param status_capability: Process-local cache of whether the server accepts
         idle observations. A new cache is created for direct callers that omit it.
+    :param cost_dedupe: Optional display-attribution state for the child-history lane.
+    :param cost_cache: Size-keyed transcript pricing cache for attribution.
     :returns: Updated state with new sub-agents registered and
         existing sub-agents' cursors advanced.
     """
@@ -3046,6 +3052,14 @@ async def _forward_available_subagents(
                 exc_info=result,
                 extra={"session_id": parent_session_id},
             )
+    if cost_dedupe is not None and cost_cache is not None:
+        await _forward_child_costs(
+            client=client,
+            parent_transcript_path=transcript_path,
+            subagent_state=checkpoint.state,
+            dedupe=cost_dedupe,
+            cost_cache=cost_cache,
+        )
     return checkpoint.state
 
 
@@ -3199,8 +3213,24 @@ async def _forward_child_costs(
                 and exc.response.status_code not in (408, 429)
             ):
                 dedupe.attribution_disabled_children.add(child_id)
+                _logger.warning(
+                    "Disabling Claude child cost attribution; child=%s http_status=%s",
+                    child_id,
+                    _http_status_for_log(exc),
+                )
                 continue
-            dedupe.attribution_retry_at = time.monotonic() + 30
+            delay = 30.0
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                retry_after = exc.response.headers.get("retry-after")
+                with contextlib.suppress(ValueError):
+                    delay = max(delay, float(retry_after)) if retry_after else delay
+            dedupe.attribution_retry_at = time.monotonic() + delay
+            _logger.warning(
+                "Failed to forward Claude child cost; child=%s http_status=%s retry_in=%.1fs",
+                child_id,
+                _http_status_for_log(exc),
+                delay,
+            )
             return
         dedupe.attributed_costs[child_id] = cost
 
@@ -3266,13 +3296,6 @@ async def _forward_session_cost(
         mutated in place.
     :returns: None.
     """
-    await _forward_child_costs(
-        client=client,
-        parent_transcript_path=parent_transcript_path,
-        subagent_state=subagent_state,
-        dedupe=dedupe,
-        cost_cache=cost_cache,
-    )
     if time.monotonic() < dedupe.cost_retry_not_before:
         return
     status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)

@@ -1034,9 +1034,11 @@ async def test_subagent_client_gets_a_longer_post_timeout_than_the_live_client(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_lane", ["history", "attribution"])
 async def test_parent_output_forwards_while_child_history_is_blocked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    blocked_lane: str,
 ) -> None:
     """A stuck child request cannot prevent the next live parent poll."""
     bridge_dir = tmp_path / "bridge"
@@ -1080,6 +1082,12 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
             "transcript_path": str(transcript_path),
         },
     )
+    cost = [1.0]
+    monkeypatch.setattr(
+        forwarder, "read_claude_context_state", lambda *_: {"total_cost_usd": cost[0]}
+    )
+    monkeypatch.setattr(forwarder, "_transcript_cost_size_cached", lambda *args, **kwargs: 0.5)
+    parent_cost_forwarded = asyncio.Event()
     child_request_started = asyncio.Event()
     release_child = asyncio.Event()
     parent_item_forwarded = asyncio.Event()
@@ -1087,14 +1095,27 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8")) if request.content else {}
         if isinstance(body, list):
-            child_request_started.set()
-            await release_child.wait()
+            if blocked_lane == "history":
+                child_request_started.set()
+                await release_child.wait()
             return httpx.Response(
                 202,
                 json=[
                     {"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)
                 ],
             )
+        if isinstance(body, dict) and body.get("type") == "external_session_usage":
+            if (
+                request.url.path == "/v1/sessions/conv_blocked_child/events"
+                and blocked_lane == "attribution"
+            ):
+                child_request_started.set()
+                await release_child.wait()
+            if (
+                request.url.path == "/v1/sessions/conv_parent/events"
+                and body["data"].get("policy_cost_usd") == 2.0
+            ):
+                parent_cost_forwarded.set()
         if (
             request.url.path == "/v1/sessions/conv_parent/events"
             and isinstance(body, dict)
@@ -1124,6 +1145,7 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
     )
     try:
         await asyncio.wait_for(child_request_started.wait(), timeout=2.0)
+        cost[0] = 2.0
         with transcript_path.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
@@ -1139,6 +1161,7 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
                 + "\n"
             )
         await asyncio.wait_for(parent_item_forwarded.wait(), timeout=1.0)
+        await asyncio.wait_for(parent_cost_forwarded.wait(), timeout=1.0)
     finally:
         release_child.set()
         task.cancel()

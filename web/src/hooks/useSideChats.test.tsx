@@ -18,6 +18,23 @@ afterEach(() => {
 });
 
 describe("side-chat soft tabs", () => {
+  it("registers arrivals without selecting and resolves aliases from current storage", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.open("first"));
+    const delayedOpen = result.current.open;
+    act(() => delayedOpen(subagentTabId("child"), { select: false }));
+    expect(result.current.tabs).toEqual(["first", subagentTabId("child")]);
+    expect(result.current.selected).toBe("first");
+    writeSessionWorkspaceState("session-a", {
+      openSideChats: ["first", "child"],
+      openSubagentTabs: [],
+      selectedSideChatId: "first",
+    });
+    act(() => delayedOpen(subagentTabId("child")));
+    expect(result.current.tabs).toEqual(["first", "child"]);
+    expect(result.current.selected).toBe("child");
+  });
+
   it("opens an empty pending tab, then rekeys it in place to the real child", () => {
     const { result } = renderHook(() => useSideChats("session-a"));
     let pendingId = "";

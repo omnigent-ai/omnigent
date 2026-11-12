@@ -1082,6 +1082,52 @@ describe("chatStore — lazy subtree usage", () => {
       });
     });
 
+    it.each(["resolve", "reject"])(
+      "keeps newer hydration loading when a superseded request settles (%s)",
+      async (outcome) => {
+        let finishOld!: (response: Response) => void;
+        let rejectOld!: (error: Error) => void;
+        let finishNew!: (response: Response) => void;
+        const oldRequest = new Promise<Response>((resolve, reject) => {
+          finishOld = resolve;
+          rejectOld = reject;
+        });
+        const newRequest = new Promise<Response>((resolve) => {
+          finishNew = resolve;
+        });
+        const readUsage = vi.fn().mockReturnValueOnce(oldRequest).mockReturnValueOnce(newRequest);
+        routeUsage("conv_usage", readUsage);
+        await useChatStore.getState().switchTo("conv_usage");
+        const entry = conversationRegistry.peek("conv_usage")!;
+        const oldController = entry.getState().abortController!;
+        onTestFinished(() => oldController.abort());
+        let finishMetadata!: (response: Response) => void;
+        routeUsage(
+          "conv_usage",
+          readUsage,
+          new Promise<Response>((resolve) => {
+            finishMetadata = resolve;
+          }),
+        );
+        await useChatStore.getState().switchTo("conv_other");
+        await useChatStore.getState().switchTo("conv_usage");
+        entry.setState({ abortController: new AbortController() });
+        finishMetadata(snapshot("conv_usage"));
+        await drainAsync();
+        expect(readUsage).toHaveBeenCalledTimes(2);
+        expect(entry.getState().sessionUsageLoading).toBe(true);
+        if (outcome === "resolve") finishOld(usage("conv_usage", 99));
+        else rejectOld(new Error("superseded read failed"));
+        await drainAsync();
+        expect(entry.getState().sessionUsageLoading).toBe(true);
+        expect(entry.getState().sessionCostUsd).toBeNull();
+        finishNew(usage("conv_usage", 3.5));
+        await drainAsync();
+        expect(entry.getState().sessionUsageLoading).toBe(false);
+        expect(entry.getState().sessionCostUsd).toBe(3.5);
+      },
+    );
+
     it("deduplicates pending usage without blocking periodic status reconciliation", async () => {
       let finishUsage!: (response: Response) => void;
       const pending = new Promise<Response>((resolve) => {
@@ -3391,6 +3437,7 @@ describe("chatStore — send (first-send ordering)", () => {
         const { gets } = failSnapshots("conv_missing", [status]);
         const failingFetch = fetchMock.getMockImplementation()!;
         let previousController: AbortController | null = null;
+        onTestFinished(() => previousController?.abort());
         if (replaced) {
           fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
             if (String(input).split("?")[0] === "/v1/sessions/conv_missing") {
@@ -3409,7 +3456,6 @@ describe("chatStore — send (first-send ordering)", () => {
         if (replaced) expect(state.conversationLoadError).toBeNull();
         else expect(state.conversationLoadError).toMatchObject({ status });
         expect(gets.metadata).toHaveLength(1);
-        (previousController as AbortController | null)?.abort();
       },
     );
 

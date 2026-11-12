@@ -94,21 +94,21 @@ export function useSideChats(conversationId: string) {
     return id;
   }, [update]);
 
-  /** Add a child id as a tab and select it. Idempotent: an already-open child
-   *  is re-selected, not duplicated (a create both returns the id and fires a
-   *  `session_created`, so `open` can be reached twice for one child). */
+  /** Register a child tab, selecting unless navigation acceptance is pending.
+   *  Repeated arrivals reuse existing tabs and resolve sub-agent aliases. */
   const open = useCallback(
-    (childId: string) =>
+    (childId: string, { select: shouldSelect = true }: { select?: boolean } = {}) =>
       update((current) => {
-        const key = subagentSessionIdFromTab(childId) === null ? "tabs" : "subagentTabs";
+        const subagentId = subagentSessionIdFromTab(childId);
+        const target =
+          subagentId !== null && current.tabs.includes(subagentId) ? subagentId : childId;
+        const key = subagentSessionIdFromTab(target) === null ? "tabs" : "subagentTabs";
         const list = current[key];
         return {
           ...current,
-          [key]: list.includes(childId) ? list : [...list, childId],
-          closed: current.closed.filter(
-            (id) => id !== (subagentSessionIdFromTab(childId) ?? childId),
-          ),
-          selected: childId,
+          [key]: list.includes(target) ? list : [...list, target],
+          closed: current.closed.filter((id) => id !== (subagentId ?? childId)),
+          selected: shouldSelect ? target : current.selected,
         };
       }),
     [update],

@@ -713,8 +713,8 @@ interface WorkspacePanelProps {
    * file + its comments + URL) so they can't drift from the tab state.
    */
   onRightRailTabChange: (next: RightRailTab | null) => void;
-  /** Reveal an automatically queued side chat without changing the Workspace preference. */
-  onRevealSideChat?: () => void;
+  /** Reveal a side chat, remembering only explicit user opens after navigation acceptance. */
+  onRevealSideChat?: (remember: boolean) => void;
   /** Unpinned built-in pages opened as closable tabs for this session. */
   openPanels: DefaultWorkspaceTab[];
   onClosePanel: (tab: DefaultWorkspaceTab) => void;
@@ -1143,17 +1143,13 @@ function WorkspacePanelImpl({
         useChatStore.getState().clearSideChatComposer(awaiting);
       }
     }
+    sideChats.open(childId, { select: false });
     const visit = sessionVisitRef.current;
     const commit = () => {
       if (sessionVisitRef.current !== visit) return;
-      if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
-        // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
-        sideChats.select(subagentId);
-      } else {
-        sideChats.open(childId);
-      }
+      sideChats.open(childId);
       onRightRailTabChange("sidechat");
-      onRevealSideChat?.();
+      onRevealSideChat?.(sideChatToOpen.persistOpen === true);
     };
     if (guardFileNavigation) guardFileNavigation(null, undefined, commit);
     else commit();

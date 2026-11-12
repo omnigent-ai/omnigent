@@ -3228,20 +3228,27 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
   });
 
-  it("keeps automatic side-chat reveals out of the saved Workspace preference", () => {
-    writeWorkspacePanelDefault("collapsed");
-    writeSessionWorkspaceState("conv_auto", { open: false });
-    mockConversations([{ id: "conv_auto", permission_level: null }]);
-    renderShell("/c/conv_auto");
-    act(() =>
-      useChatStore.setState({
-        sideChatToOpen: { childId: "pending:auto", parentId: "conv_auto" },
-      }),
-    );
-    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
-    expect(readSessionWorkspaceState("conv_auto").open).toBe(false);
-    expect(readDefaultWorkspacePanelOpen()).toBe(false);
-  });
+  it.each([false, true])(
+    "persists a guarded side-chat reveal only for explicit intent (%s)",
+    (persistOpen) => {
+      writeWorkspacePanelDefault("collapsed");
+      writeSessionWorkspaceState("conv_auto", { open: false });
+      mockConversations([{ id: "conv_auto", permission_level: null }]);
+      renderShell("/c/conv_auto", undefined, { dirtyFileViewer: true });
+      act(() =>
+        useChatStore.setState({
+          sideChatToOpen: { childId: "pending:auto", parentId: "conv_auto", persistOpen },
+        }),
+      );
+      expect(readSessionWorkspaceState("conv_auto").open).toBe(false);
+      expect(readDefaultWorkspacePanelOpen()).toBe(false);
+      expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+      expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+      expect(readSessionWorkspaceState("conv_auto").open).toBe(persistOpen);
+      expect(readDefaultWorkspacePanelOpen()).toBe(persistOpen);
+    },
+  );
 
   it("remembers overview dismissal when opening the Agents workspace", () => {
     const baseMatchMedia = window.matchMedia;

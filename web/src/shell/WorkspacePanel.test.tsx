@@ -1971,24 +1971,30 @@ describe("WorkspacePanel sub-agent tabs", () => {
     });
   });
 
-  it("retires a declined queued reveal without changing tabs or replaying on remount", () => {
-    const guard = vi.fn();
-    const first = renderWorkspace({
-      selectedFilePath: "notes.md",
-      openFiles: ["notes.md"],
-      fileGuard: guard,
-    });
-    act(() =>
-      useChatStore.setState({ sideChatToOpen: { childId: SUBAGENT_TAB, parentId: "conv_ws" } }),
-    );
-    expect(guard).toHaveBeenCalledOnce();
-    expect(first.onRightRailTabChange).not.toHaveBeenCalled();
-    expect(useChatStore.getState().sideChatToOpen).toBeNull();
-    expect(readSessionWorkspaceState("conv_ws").selectedSideChatId).toBeUndefined();
-    first.view.unmount();
-    renderWorkspace({ fileGuard: guard });
-    expect(guard).toHaveBeenCalledOnce();
-  });
+  it.each(["conv_arrived", SUBAGENT_TAB])(
+    "registers a declined queued reveal without selecting it or replaying on remount (%s)",
+    (childId) => {
+      const guard = vi.fn();
+      const first = renderWorkspace({
+        selectedFilePath: "notes.md",
+        openFiles: ["notes.md"],
+        fileGuard: guard,
+      });
+      act(() => useChatStore.setState({ sideChatToOpen: { childId, parentId: "conv_ws" } }));
+      expect(guard).toHaveBeenCalledOnce();
+      expect(first.onRightRailTabChange).not.toHaveBeenCalled();
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      expect(
+        readSessionWorkspaceState("conv_ws")[
+          childId === SUBAGENT_TAB ? "openSubagentTabs" : "openSideChats"
+        ],
+      ).toEqual([childId]);
+      expect(readSessionWorkspaceState("conv_ws").selectedSideChatId).toBeNull();
+      first.view.unmount();
+      renderWorkspace({ fileGuard: guard });
+      expect(guard).toHaveBeenCalledOnce();
+    },
+  );
 
   it("does not apply a queued reveal accepted after its owning session changed", () => {
     let accept: (() => void) | undefined;

@@ -1045,8 +1045,9 @@ export interface ConversationState {
    * session metadata and updated by ``session.usage`` SSE events.
    * ``null`` while unknown or unpriced, never a misleading ``$0.00``.
    */
-  sessionUsageLoading: boolean;
   sessionCostUsd: number | null;
+  /** True until the initial session usage request settles. */
+  sessionUsageLoading: boolean;
   /**
    * Per-model usage breakdown over the active session's subtree (itself +
    * sub-agents), keyed by raw harness model id. Hydrated separately on
@@ -1212,7 +1213,7 @@ export interface AppChatState {
    * navigated to another conversation is NOT dropped into the wrong parent's
    * tabs.
    */
-  sideChatToOpen: { childId: string; parentId: string } | null;
+  sideChatToOpen: { childId: string; parentId: string; persistOpen?: boolean } | null;
   /** Visible, writable side chat that receives selections from its parent. */
   sideChatSelectionTarget: { childId: string; parentId: string } | null;
   /**
@@ -5593,7 +5594,11 @@ async function hydrateSessionUsage(id: string): Promise<void> {
   } catch {
     // Usage is optional display data; retain known totals or leave them unknown.
   } finally {
-    if (!controller.signal.aborted && conversationRegistry.peek(id) === entry)
+    if (
+      !controller.signal.aborted &&
+      conversationRegistry.peek(id) === entry &&
+      entry.getState().abortController === controller
+    )
       entrySetter(entry)({ sessionUsageLoading: false });
     sessionUsageHydrations.delete(controller);
   }
