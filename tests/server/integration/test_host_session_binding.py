@@ -3006,7 +3006,7 @@ async def test_managed_launch_action_required_reaches_snapshot_and_stream(
     from omnigent.server.managed_hosts import SandboxStageObserver
 
     env = managed_session_env
-    details = "Refresh your dbcert on your laptop."
+    details = "Refresh your provider credentials."
     subscribed = asyncio.Event()
     finish = asyncio.Event()
 

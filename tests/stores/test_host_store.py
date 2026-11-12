@@ -1112,7 +1112,7 @@ def test_list_hosts_filters_by_owner(
         "af2aefbe4a416df7641bf8ca520f838f", "bob-laptop", "bob@example.com"
     )
     host_store.upsert_on_connect(
-        "58d8ac102d1d1b3db3f5056a7c8e196b", "alice-arca", "alice@example.com"
+        "58d8ac102d1d1b3db3f5056a7c8e196b", "alice-devbox", "alice@example.com"
     )
 
     alice_hosts = host_store.list_hosts("alice@example.com")
@@ -1190,14 +1190,14 @@ def test_upsert_conflict_preserves_created_at(
     """
     original = host_store.upsert_on_connect(
         "4a7dab2e281a9dc8db539e9f59919109",
-        "arca",
+        "devbox",
         "frank@example.com",
     )
     original_created = original.created_at
 
     host_store.upsert_on_connect(
         "a9dac0e66482a6e9ab8a4aae5135f59b",
-        "arca",
+        "devbox",
         "frank@example.com",
     )
 

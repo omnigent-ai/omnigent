@@ -6250,22 +6250,24 @@ _CODEX_LOGIN_EXPIRED_DETAIL = (
     "unexpected status 401 Unauthorized: Provided authentication token is expired."
 )
 _CODEX_PROVIDER_AUTH_DETAIL = (
-    "provider auth command `isaac` exited with status exit status: 1: [INFO] Access token "
+    "provider auth command `token-helper` exited with status exit status: 1: [INFO] Access token "
     "expiring. Attempting silent refresh.\n[ERROR] Silent token refresh failed: Failed to "
-    "refresh token: HTTP Error 400: Bad Request.\nError: Could not get an AI DevTools access "
-    "token. Run `isaac` to log in and try again."
+    "refresh token: HTTP Error 400: Bad Request.\nError: Could not get a provider access "
+    "token. Run `token-helper` to log in and try again."
 )
 _CODEX_PROVIDER_AUTH_CARD = {
     "code": "codex_provider_auth_failed",
     "title": "Codex couldn't get a model provider token",
     "cause": (
-        "The model provider's token command `isaac` failed on the host: Error: Could not "
-        "get an AI DevTools access token. Run `isaac` to log in and try again."
+        "The model provider's token command `token-helper` failed on the host: Error: Could not "
+        "get a provider access token. Run `token-helper` to log in and try again."
     ),
-    "remediation": "Run `isaac` on the host to sign in again, then send your message again.",
+    "remediation": (
+        "Run `token-helper` on the host to sign in again, then send your message again."
+    ),
 }
 _CODEX_PROVIDER_DISK_FULL_DETAIL = (
-    "provider auth command `isaac` exited with status exit status: 1: "
+    "provider auth command `token-helper` exited with status exit status: 1: "
     "Traceback (most recent call last):\n"
     '  File "/opt/token-helper/pex/bootstrap.py", line 20, in bootstrap_venv\n'
     "    create_venv()\n"
@@ -6277,7 +6279,7 @@ _CODEX_PROVIDER_DISK_FULL_CARD = {
     "code": "codex_provider_auth_failed",
     "title": "Host storage is full",
     "cause": (
-        "The model provider's token command `isaac` failed on the host: "
+        "The model provider's token command `token-helper` failed on the host: "
         "OSError: [Errno 28] No space left on device: '/tmp/token-helper-example'"
     ),
     "remediation": (
