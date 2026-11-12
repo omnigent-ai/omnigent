@@ -1520,9 +1520,22 @@ conversationRegistry.subscribeDisposed((id) => {
   streamTurnEdgeRevisions.delete(id);
 });
 
+// Normal stream completion leaves pending history/usage owned by this binding.
+const sessionBindControllers = new WeakMap<ConversationEntry, AbortController>();
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
 const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; models: number }>();
+
+function ownsSessionBind(entry: ConversationEntry, controller: AbortController): boolean {
+  const liveController = entry.getState().abortController;
+  return (
+    !entry.disposed &&
+    conversationRegistry.peek(entry.id) === entry &&
+    !controller.signal.aborted &&
+    sessionBindControllers.get(entry) === controller &&
+    (liveController === null || liveController === controller)
+  );
+}
 
 // Snapshot reconciliation must teach the already-running stream pump which
 // native preview messages have finalized, including warm session revisits.
@@ -5189,16 +5202,17 @@ async function bindStream(
 ): Promise<void> {
   racedNativeModelOptions.delete(id);
   const entry = conversationRegistry.peek(id);
+  if (entry === undefined || entry.disposed) return;
   const controller = new AbortController();
+  sessionBindControllers.set(entry, controller);
   const ignoredNativeMessageIds = new Set<string>();
   nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
   // held by other tabs opens over budget (no slot) and raises the banner.
   await acquireStreamSlot(id, controller);
-  if (isConversationDisposed(id)) {
-    // Switched away / evicted while awaiting the slot — don't open a dead
-    // entry's stream, and hand any slot we took back to the origin.
+  if (!ownsSessionBind(entry, controller)) {
+    // Disposed or rebound while awaiting the slot; return only our own slot.
     releaseOwnedStreamSlot(id, controller);
     return;
   }
@@ -5226,10 +5240,8 @@ async function bindStream(
       // Best-effort: a failed resolve (bad id, transient) falls through to the
       // client-keyed open; the snapshot fetch surfaces the real error.
     }
-    // Liveness, not the visible id: a background bind must survive a switch away
-    // (that is the whole feature). Only a dispose (evicted) bails — and then the
-    // slot taken above has to go back to the origin.
-    if (isConversationDisposed(id)) {
+    // Background binds survive switching away; disposal or rebinding retires them.
+    if (!ownsSessionBind(entry, controller)) {
       releaseOwnedStreamSlot(id, controller);
       return;
     }
@@ -5325,14 +5337,7 @@ async function bindStream(
         ),
       ),
     ]);
-    if (
-      entry === undefined ||
-      entry.disposed ||
-      conversationRegistry.peek(id) !== entry ||
-      controller.signal.aborted ||
-      get().abortController !== controller
-    )
-      return;
+    if (!ownsSessionBind(entry, controller)) return;
     const items = page.items;
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
@@ -5550,13 +5555,7 @@ async function bindStream(
     else set({ sessionUsageLoading: false });
     racedNativeModelOptions.delete(id);
   } catch (err) {
-    if (
-      isConversationDisposed(id) ||
-      conversationRegistry.peek(id) !== entry ||
-      controller.signal.aborted ||
-      get().abortController !== controller
-    )
-      return;
+    if (!ownsSessionBind(entry, controller)) return;
     set({
       loadingConversation: false,
       sessionUsageLoading: false,
@@ -5569,13 +5568,12 @@ async function bindStream(
 async function hydrateSessionUsage(id: string): Promise<void> {
   const entry = conversationRegistry.peek(id);
   const before = entry?.getState();
-  const controller = before?.abortController;
+  const controller = entry === undefined ? undefined : sessionBindControllers.get(entry);
   if (
     entry === undefined ||
-    entry.disposed ||
     before === undefined ||
-    controller == null ||
-    controller.signal.aborted ||
+    controller === undefined ||
+    !ownsSessionBind(entry, controller) ||
     sessionUsageHydrations.has(controller)
   ) {
     return;
@@ -5584,12 +5582,7 @@ async function hydrateSessionUsage(id: string): Promise<void> {
   const revisionsBeforeFetch = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
   try {
     const usage = await getSessionUsage(id, { signal: controller.signal });
-    if (
-      usage.id !== id ||
-      controller.signal.aborted ||
-      conversationRegistry.peek(id) !== entry ||
-      entry.getState().abortController !== controller
-    ) {
+    if (usage.id !== id || !ownsSessionBind(entry, controller)) {
       return;
     }
     const revisions = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
@@ -5607,12 +5600,7 @@ async function hydrateSessionUsage(id: string): Promise<void> {
   } catch {
     // Usage is optional display data; retain known totals or leave them unknown.
   } finally {
-    if (
-      !controller.signal.aborted &&
-      conversationRegistry.peek(id) === entry &&
-      entry.getState().abortController === controller
-    )
-      entrySetter(entry)({ sessionUsageLoading: false });
+    if (ownsSessionBind(entry, controller)) entrySetter(entry)({ sessionUsageLoading: false });
     sessionUsageHydrations.delete(controller);
   }
 }

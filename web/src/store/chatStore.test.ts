@@ -817,39 +817,136 @@ describe("chatStore — lazy subtree usage", () => {
     },
   );
 
-  it("finishes binding before usage, then hydrates the full cost and model map", async () => {
-    seedSession("conv_usage", [userMessage("resp_1", "hello")]);
-    let finishUsage!: (response: Response) => void;
-    const pending = new Promise<Response>((resolve) => {
-      finishUsage = resolve;
-    });
-    routeUsage("conv_usage", () => pending);
+  it.each(["resolve", "reject"])(
+    "ignores old history after a replacement bind also closes (%s)",
+    async (outcome) => {
+      seedSession("conv_usage", [userMessage("resp_old", "old history")]);
+      const oldHistory = defaultFetchHandler("/v1/sessions/conv_usage/items");
+      let finishHistory!: (response: Response) => void;
+      const history = new Promise<Response>((resolve) => {
+        finishHistory = resolve;
+      });
+      const streams: StreamSink[] = [];
+      let historyReads = 0;
+      let metadata = snapshot("conv_usage", { usage_included: true, total_cost_usd: 99 });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input).split("?")[0];
+        if (path === "/v1/sessions/conv_usage") return metadata;
+        if (path === "/v1/sessions/conv_usage/stream") {
+          const sink = pushableStream();
+          streams.push(sink);
+          return mockResponse(null, { bodyStream: sink.stream });
+        }
+        if (path === "/v1/sessions/conv_usage/items" && historyReads++ === 0) return history;
+        return defaultFetchHandler(input, init);
+      });
 
-    await useChatStore.getState().switchTo("conv_usage");
+      const binding = useChatStore.getState().switchTo("conv_usage");
+      await tick();
+      const entry = conversationRegistry.peek("conv_usage")!;
+      const oldController = entry.getState().abortController!;
+      streams[0]!.push("data: [DONE]\n\n");
+      streams[0]!.close();
+      await tick();
+      expect(entry.getState().abortController).toBeNull();
 
-    expect(useChatStore.getState().loadingConversation).toBe(false);
-    expect(useChatStore.getState().conversationLoadError).toBeNull();
-    expect(useChatStore.getState().blocks).toHaveLength(1);
-    expect(useChatStore.getState().sessionCostUsd).toBeNull();
-    expect(useChatStore.getState().sessionUsageByModel).toBeNull();
-    expect(useChatStore.getState().sessionUsageLoading).toBe(true);
+      seedSession("conv_usage", [userMessage("resp_new", "new history")]);
+      metadata = snapshot("conv_usage", {
+        agent_id: "agent_replacement",
+        usage_included: true,
+        total_cost_usd: 3.5,
+      });
+      entry.setState({ conversationLoadError: new Error("Reload requested") });
+      await retryConversationLoad("conv_usage");
+      expect(conversationRegistry.peek("conv_usage")).toBe(entry);
+      streams[1]!.push("data: [DONE]\n\n");
+      streams[1]!.close();
+      await tick();
+      expect(entry.getState().abortController).toBeNull();
+      expect(oldController.signal.aborted).toBe(false);
+      const replacementBlocks = entry.getState().blocks;
+      expect(replacementBlocks).toHaveLength(1);
 
-    finishUsage(usage("conv_usage", 3.5));
-    await tick();
+      finishHistory(
+        outcome === "resolve" ? oldHistory : mockResponse({}, { ok: false, status: 404 }),
+      );
+      await binding;
+      expect(entry.getState()).toMatchObject({
+        abortController: null,
+        boundAgentId: "agent_replacement",
+        loadingConversation: false,
+        sessionUsageLoading: false,
+        sessionCostUsd: 3.5,
+        conversationLoadError: null,
+      });
+      expect(entry.getState().blocks).toBe(replacementBlocks);
+    },
+  );
 
-    expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
-    expect(useChatStore.getState().sessionUsageLoading).toBe(false);
-    expect(useChatStore.getState().sessionUsageByModel).toEqual({
-      "model-a": {
-        inputTokens: 100,
-        outputTokens: null,
-        totalTokens: null,
-        cacheReadInputTokens: null,
-        cacheCreationInputTokens: null,
-        totalCostUsd: 3.5,
-      },
-    });
-  });
+  it.each([false, true])(
+    "hydrates history before usage (stream already done=%s)",
+    async (streamDone) => {
+      seedSession("conv_usage", [userMessage("resp_1", "hello")]);
+      let finishUsage!: (response: Response) => void;
+      const pending = new Promise<Response>((resolve) => {
+        finishUsage = resolve;
+      });
+      routeUsage("conv_usage", () => pending);
+
+      const routed = fetchMock.getMockImplementation()!;
+      const sink = pushableStream();
+      let finishHistory!: (response: Response) => void;
+      const history = new Promise<Response>((resolve) => {
+        finishHistory = resolve;
+      });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input).split("?")[0];
+        if (path === "/v1/sessions/conv_usage/stream") {
+          return mockResponse(null, { bodyStream: sink.stream });
+        }
+        if (path === "/v1/sessions/conv_usage/items") return history;
+        return routed(input, init);
+      });
+      onTestFinished(() => sink.error());
+      const binding = useChatStore.getState().switchTo("conv_usage");
+      await tick();
+      const controller = conversationRegistry.peek("conv_usage")!.getState().abortController!;
+      expect(controller).not.toBeNull();
+      if (streamDone) {
+        sink.push("data: [DONE]\n\n");
+        sink.close();
+        await tick();
+        expect(useChatStore.getState().abortController).toBeNull();
+        expect(controller.signal.aborted).toBe(false);
+      }
+      expect(useChatStore.getState().loadingConversation).toBe(true);
+      finishHistory(defaultFetchHandler("/v1/sessions/conv_usage/items"));
+      await binding;
+
+      expect(useChatStore.getState().loadingConversation).toBe(false);
+      expect(useChatStore.getState().conversationLoadError).toBeNull();
+      expect(useChatStore.getState().blocks).toHaveLength(1);
+      expect(useChatStore.getState().sessionCostUsd).toBeNull();
+      expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+      expect(useChatStore.getState().sessionUsageLoading).toBe(true);
+
+      finishUsage(usage("conv_usage", 3.5));
+      await tick();
+
+      expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+      expect(useChatStore.getState().sessionUsageLoading).toBe(false);
+      expect(useChatStore.getState().sessionUsageByModel).toEqual({
+        "model-a": {
+          inputTokens: 100,
+          outputTokens: null,
+          totalTokens: null,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: 3.5,
+        },
+      });
+    },
+  );
 
   it("keeps the metadata query independent of a held usage snapshot", async () => {
     let finishUsage!: (response: Response) => void;
@@ -1137,20 +1234,8 @@ describe("chatStore — lazy subtree usage", () => {
         routeUsage("conv_usage", readUsage);
         await useChatStore.getState().switchTo("conv_usage");
         const entry = conversationRegistry.peek("conv_usage")!;
-        const oldController = entry.getState().abortController!;
-        onTestFinished(() => oldController.abort());
-        let finishMetadata!: (response: Response) => void;
-        routeUsage(
-          "conv_usage",
-          readUsage,
-          new Promise<Response>((resolve) => {
-            finishMetadata = resolve;
-          }),
-        );
-        await useChatStore.getState().switchTo("conv_other");
-        await useChatStore.getState().switchTo("conv_usage");
-        entry.setState({ abortController: new AbortController() });
-        finishMetadata(snapshot("conv_usage"));
+        entry.setState({ conversationLoadError: new Error("Reload requested") });
+        await retryConversationLoad("conv_usage");
         await drainAsync();
         expect(readUsage).toHaveBeenCalledTimes(2);
         expect(entry.getState().sessionUsageLoading).toBe(true);
