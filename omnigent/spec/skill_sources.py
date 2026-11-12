@@ -445,6 +445,26 @@ def _plugin_install_paths(
     # skipped so a tampered/odd manifest can't turn an arbitrary directory into
     # a discovery root.
     plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
+    # Profile managers (e.g. ccs) symlink ``plugins/cache`` to a cache shared
+    # across config dirs; its target is as trusted as the root that links it.
+    plugin_roots = [plugins_root]
+    cache_link = plugins_root / "cache"
+    try:
+        if cache_link.is_symlink():
+            # Strict: a non-strict resolve can lexically collapse ``..`` past a
+            # loop and name a real directory the link can't actually reach.
+            cache_target = cache_link.resolve(strict=True)
+            if cache_target.is_dir():
+                plugin_roots.append(cache_target)
+            else:
+                _log.warning(
+                    "Ignoring plugins cache %s: target %s is not a directory",
+                    cache_link,
+                    cache_target,
+                )
+    except (OSError, RuntimeError) as exc:
+        # A loop or dangling link raises here; the root alone keeps other plugins usable.
+        _log.warning("Ignoring unresolvable plugins cache %s: %s", cache_link, exc)
     out: dict[str, Path] = {}
     for key, entries in plugins.items():
         if (enabled is not None and key not in enabled) or not isinstance(entries, list):
@@ -459,15 +479,44 @@ def _plugin_install_paths(
             # A relative installPath is resolved against the plugins root
             # (its only sensible base), never the runner's cwd.
             path_obj = Path(path)
-            resolved = (path_obj if path_obj.is_absolute() else plugins_root / path_obj).resolve()
-            if not resolved.is_relative_to(plugins_root):
+            try:
+                resolved = (
+                    path_obj if path_obj.is_absolute() else plugins_root / path_obj
+                ).resolve()
+            except (OSError, RuntimeError) as exc:
                 _log.warning(
-                    "Skipping plugin %r: installPath %r is outside %s",
+                    "Skipping entry for plugin %r: installPath %r is unresolvable: %s",
                     key,
                     path,
-                    plugins_root,
+                    exc,
                 )
-                break
+                continue
+            if not any(resolved.is_relative_to(root) for root in plugin_roots):
+                _log.warning(
+                    "Skipping entry for plugin %r: installPath %r is outside the trusted roots %s",
+                    key,
+                    path,
+                    ", ".join(str(root) for root in plugin_roots),
+                )
+                continue
+            # Python 3.13+ returns a dead path for a symlink loop instead of
+            # raising; only an existing directory can be the plugin's install.
+            # On 3.12, ``is_dir`` raises for an unsearchable parent directory.
+            try:
+                is_dir = resolved.is_dir()
+            except OSError as exc:
+                _log.warning(
+                    "Skipping entry for plugin %r: installPath %r is unreadable: %s",
+                    key,
+                    path,
+                    exc,
+                )
+                continue
+            if not is_dir:
+                _log.warning(
+                    "Skipping entry for plugin %r: installPath %r is not a directory", key, path
+                )
+                continue
             out[key] = resolved
             break
     return out

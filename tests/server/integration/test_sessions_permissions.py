@@ -805,6 +805,40 @@ async def test_edit_grant_allows_post_but_blocks_permission_management(
     )
 
 
+async def test_move_to_managed_sandbox_requires_owner_access(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Moving a session onto a new sandbox is owner-only, like binding a
+    runner: an editor or a manager gets 403 and a user without access 404,
+    and none of them changes the session.
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    session_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+    for target_user, level in (("user-b", LEVEL_EDIT), ("user-d", LEVEL_MANAGE)):
+        resp = await _grant_permission(
+            auth_client,
+            session_id,
+            granter="user-a",
+            target_user=target_user,
+            level=level,
+        )
+        assert resp.status_code == 200
+    owner = {"X-Forwarded-Email": "user-a"}
+    before = (await auth_client.get(f"/v1/sessions/{session_id}", headers=owner)).json()
+
+    for caller, expected_status in (("user-b", 403), ("user-d", 403), ("user-c", 404)):
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/managed-host",
+            json={},
+            headers={"X-Forwarded-Email": caller},
+        )
+        assert resp.status_code == expected_status, (caller, resp.text)
+
+    after = (await auth_client.get(f"/v1/sessions/{session_id}", headers=owner)).json()
+    for field in ("host_id", "workspace", "runner_id", "labels"):
+        assert after[field] == before[field], field
+
+
 async def test_archive_requires_owner_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
@@ -1126,6 +1160,7 @@ async def test_single_user_local_can_access_own_session(
     identity, which gets an owner auto-grant on sessions it creates
     — the bare `omnigent run` / local web UI flow.
     """
+    assert (await local_auth_client.get("/v1/info")).json()["admin_view"] is False
     agent = await create_test_agent(local_auth_client, user="bryan")
 
     # Omit X-Forwarded-Email to trigger the "local" fallback —
@@ -1159,6 +1194,7 @@ async def test_admin_user_bypasses_permission_checks(
     server startup behavior (the CLI calls
     ``ensure_user("local", is_admin=True)``).
     """
+    assert (await auth_client.get("/v1/info")).json()["admin_view"] is True
     agent = await create_test_agent(auth_client, user="bryan")
     s1 = await _create_session_as(auth_client, agent["id"], "user-a")
     session_id = s1["id"]
@@ -1188,6 +1224,42 @@ async def test_admin_user_bypasses_permission_checks(
     assert resp.status_code == 200, (
         f"admin user should be able to list permissions, got {resp.status_code}."
     )
+
+    auth_client.cookies.set("omnigent_admin_view", "off")
+    headers = {"X-Forwarded-Email": "admin-user"}
+    session_url = f"/v1/sessions/{session_id}"
+    assert (await auth_client.get("/v1/sharing", headers=headers)).status_code == 403
+    assert (await auth_client.get(session_url, headers=headers)).status_code in (403, 404)
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
+    ).status_code in (403, 404)
+    assert perm_store.is_admin("admin-user")
+
+    own = await _create_session_as(auth_client, agent["id"], "admin-user")
+    assert (
+        await auth_client.patch(
+            f"/v1/sessions/{own['id']}", headers=headers, json={"title": "Mine"}
+        )
+    ).status_code == 200
+    await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="admin-user", level=LEVEL_READ
+    )
+    assert (await auth_client.get(session_url, headers=headers)).json()[
+        "permission_level"
+    ] == LEVEL_READ
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
+    ).status_code == 403
+
+    auth_client.cookies.set("omnigent_admin_view", "on")
+    assert (await auth_client.get("/v1/sharing", headers=headers)).status_code == 200
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Admin edit"})
+    ).status_code == 200
+    auth_client.cookies.set("omnigent_admin_view", "off")
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
+    ).status_code == 403
 
 
 # ── Revoke nonexistent: idempotent 204 ──────────────────────
