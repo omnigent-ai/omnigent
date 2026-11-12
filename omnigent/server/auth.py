@@ -40,13 +40,6 @@ from typing import TYPE_CHECKING
 
 from starlette.requests import HTTPConnection
 
-from omnigent.server.admin_mode import (
-    bind_credential_admin_allowed,
-    credential_admin_allowed,
-    credential_admin_scope,
-    effective_admin,
-)
-
 logger = logging.getLogger(__name__)
 
 # Opt-in multi-user switch.
@@ -431,7 +424,6 @@ class _ConnectionIdentity:
     workspace_id: int
     user_id: str | None
     generation: str | None
-    admin_allowed: bool
 
 
 class UnifiedAuthProvider(AuthProvider):
@@ -494,7 +486,7 @@ class UnifiedAuthProvider(AuthProvider):
             if header_strip_prefix is not None
             else resolve_auth_header_strip_prefix()
         )
-        self._cookie_cache: dict[str, tuple[str, float, bool]] = {}
+        self._cookie_cache: dict[str, tuple[str, float]] = {}
         # Set by create_app when a device-grant store is wired. Returns
         # True if a grant_id has been revoked (or is unknown → fail
         # closed). Consulted only for delegated tokens (those carrying a
@@ -529,7 +521,9 @@ class UnifiedAuthProvider(AuthProvider):
 
         :param user_id: The deleted account, e.g. ``"alice"``.
         """
-        stale = [key for key, cached in self._cookie_cache.items() if cached[0] == user_id]
+        stale = [
+            key for key, (cached_user, _) in self._cookie_cache.items() if cached_user == user_id
+        ]
         for key in stale:
             del self._cookie_cache[key]
 
@@ -585,14 +579,12 @@ class UnifiedAuthProvider(AuthProvider):
         from omnigent.db.db_models import current_workspace_id
 
         clear_account_authority()
-        bind_credential_admin_allowed(True)
         identity = request.scope.get(_CONNECTION_IDENTITY_KEY)
         if (
             isinstance(identity, _ConnectionIdentity)
             and identity.provider is self
             and identity.workspace_id == current_workspace_id()
         ):
-            bind_credential_admin_allowed(identity.admin_allowed)
             if identity.user_id is not None and identity.generation is not None:
                 bind_account_authority(identity.user_id, identity.generation)
             return identity.user_id
@@ -632,7 +624,6 @@ class UnifiedAuthProvider(AuthProvider):
             ttl_seconds,
             self._source,
             account_generation=account_generation(user_id),
-            admin_allowed=effective_admin(True),
         )
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:
@@ -656,8 +647,6 @@ class UnifiedAuthProvider(AuthProvider):
 
         from omnigent.server.oidc import hmac_digest
 
-        bind_credential_admin_allowed(True)
-
         # Both OIDC and accounts modes use the same cookie machinery
         # — read the active config wherever it lives. The two configs
         # share `cookie_secret` and `session_cookie_name` properties
@@ -678,7 +667,6 @@ class UnifiedAuthProvider(AuthProvider):
         cache_key = hmac_digest(token, cookie_config.cookie_secret)
         cached = self._cookie_cache.get(cache_key)
         if self._account_check is None and cached is not None and cached[1] > time.monotonic():
-            bind_credential_admin_allowed(cached[2])
             return cached[0]
 
         try:
@@ -692,9 +680,6 @@ class UnifiedAuthProvider(AuthProvider):
 
         user_id = payload.get("sub")
         if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
-            return None
-        admin_allowed = payload.get("admin_allowed", True)
-        if not isinstance(admin_allowed, bool):
             return None
 
         # Machine-issued tokens carry ``grant_id`` (store-backed grant),
@@ -733,19 +718,13 @@ class UnifiedAuthProvider(AuthProvider):
             # replaced, so it keeps that authority (revocable via ``grant_id``).
             if scope is not None and not delegated_path_allowed(request.url.path):
                 return None
-            bind_credential_admin_allowed(admin_allowed)
             return user_id
 
         if self._account_check is None:
             remaining = payload.get("exp", 0) - time.time()
             if remaining > 0:
-                self._cookie_cache[cache_key] = (
-                    user_id,
-                    time.monotonic() + remaining,
-                    admin_allowed,
-                )
+                self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining)
 
-        bind_credential_admin_allowed(admin_allowed)
         return user_id
 
     def _check_header(self, request: HTTPConnection) -> str | None:
@@ -863,7 +842,6 @@ class AccountAuthenticationMiddleware:
             current_workspace_id(),
             user_id,
             account_generation(user_id) if user_id is not None else None,
-            credential_admin_allowed(),
         )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -872,7 +850,7 @@ class AccountAuthenticationMiddleware:
             return
         from omnigent.db.account_authority import account_authority_scope
 
-        with account_authority_scope(None, None), credential_admin_scope(True):
+        with account_authority_scope(None, None):
             connection = HTTPConnection(scope)
             identity = await asyncio.to_thread(self._authenticate, connection)
             scope[_CONNECTION_IDENTITY_KEY] = identity

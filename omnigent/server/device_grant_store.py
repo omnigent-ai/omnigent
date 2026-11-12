@@ -76,7 +76,6 @@ def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
         approved_at=row.approved_at,
         last_polled_at=row.last_polled_at,
         account_generation=row.account_generation,
-        admin_allowed=row.admin_allowed,
     )
 
 
@@ -162,7 +161,6 @@ class DeviceGrantStore:
         client_id: str | None,
         refresh_token_hash: str,
         created_at: int,
-        admin_allowed: bool = True,
     ) -> DeviceGrant:
         """Persist a grant born ``redeemed`` — no device-code consent step.
 
@@ -193,7 +191,6 @@ class DeviceGrantStore:
             generation = require_active_account(session, user_id)
             row = SqlDeviceGrant(
                 account_generation=generation,
-                admin_allowed=admin_allowed,
                 id=grant_id,
                 device_code_hash=device_code_hash,
                 user_code=user_code,
@@ -291,7 +288,6 @@ class DeviceGrantStore:
         *,
         user_id: str,
         now_epoch_seconds: int,
-        admin_allowed: bool = True,
     ) -> DeviceGrant | None:
         """Atomically bind a ``pending`` grant to an approving identity.
 
@@ -330,7 +326,6 @@ class DeviceGrantStore:
                         user_id=user_id,
                         account_generation=generation,
                         approved_at=now_epoch_seconds,
-                        admin_allowed=admin_allowed,
                     )
                 ),
             )

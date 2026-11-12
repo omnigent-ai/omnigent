@@ -50,7 +50,6 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Account, AccountToken
-from omnigent.server.admin_mode import credential_admin_scope
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
@@ -299,7 +298,6 @@ class SqlAlchemyAccountStore:
                 SqlHost.user_id.label("host_owner"),
                 SqlHost.account_generation.label("host_generation"),
                 SqlConversationMetadata.id.label("session_id"),
-                SqlConversationMetadata.runner_admin_allowed,
             )
             .join(
                 SqlConversationMetadata,
@@ -343,10 +341,7 @@ class SqlAlchemyAccountStore:
             ).one_or_none()
             if current != snapshot:
                 return None
-            with (
-                account_authority_scope(owner, generation),
-                credential_admin_scope(snapshot.runner_admin_allowed),
-            ):
+            with account_authority_scope(owner, generation):
                 return issue(owner)
 
         return run_write_transaction(self._session_immediate, "authorize_runner", write)

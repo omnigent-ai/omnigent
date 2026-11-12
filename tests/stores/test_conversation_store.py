@@ -4481,35 +4481,6 @@ def test_set_host_id_keeps_git_branch_with_its_workspace(
     assert fetched.updated_at == conv.updated_at
 
 
-@pytest.mark.parametrize("binding", ["set", "replace", "compare-and-set"])
-def test_runner_binding_retains_admin_limit(
-    conversation_store: SqlAlchemyConversationStore, binding: str
-) -> None:
-    from omnigent.server.admin_mode import admin_mode_scope
-
-    conversation = conversation_store.create_conversation()
-    if binding == "compare-and-set":
-        conversation_store.set_runner_id(conversation.id, "old-runner")
-    with admin_mode_scope(False):
-        if binding == "set":
-            assert conversation_store.set_runner_id(conversation.id, "ordinary-runner")
-        else:
-            conversation_store.replace_runner_id(
-                conversation.id,
-                "ordinary-runner",
-                expected_runner_id="old-runner" if binding == "compare-and-set" else None,
-            )
-    # A relaunch outside the original browser request must preserve its ceiling.
-    conversation_store.clear_runner_id(conversation.id)
-    assert conversation_store.set_runner_id(conversation.id, "renewed-runner")
-    saved = conversation_store.get_conversation(conversation.id)
-    assert saved is not None and saved.runner_admin_allowed is False
-    child = conversation_store.create_conversation(
-        parent_conversation_id=conversation.id, runner_id="renewed-runner"
-    )
-    assert child.runner_admin_allowed is False
-
-
 def test_clear_host_binding_nulls_all_binding_fields(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,

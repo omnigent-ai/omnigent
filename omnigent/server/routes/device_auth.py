@@ -62,7 +62,6 @@ from starlette.datastructures import FormData
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.admin_mode import effective_admin
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
 from omnigent.server.routes._oauth import (
@@ -200,7 +199,6 @@ def mint_delegated_token(
     jti: str,
     scope: str | None = DELEGATED_SCOPE,
     account_generation: str | None = None,
-    admin_allowed: bool = True,
 ) -> str:
     """Mint a grant-derived or client-credential access token.
 
@@ -252,8 +250,6 @@ def mint_delegated_token(
         "jti": jti,
         "act": {"client_id": client_id},
     }
-    if not admin_allowed:
-        payload["admin_allowed"] = False
     if account_generation is not None:
         payload["account_generation"] = account_generation
     if grant_id is not None:
@@ -339,7 +335,6 @@ def issue_login_grant(
     *,
     user_id: str,
     cookie_secret: bytes,
-    admin_allowed: bool | None = None,
 ) -> str:
     """Create a redeemed refresh grant for an interactive login.
 
@@ -363,7 +358,6 @@ def issue_login_grant(
         client_id=LOGIN_GRANT_CLIENT_ID,
         refresh_token_hash=hash_secret(refresh_token, cookie_secret),
         created_at=int(time.time()),
-        admin_allowed=effective_admin(True) if admin_allowed is None else admin_allowed,
     )
     return refresh_token
 
@@ -454,7 +448,6 @@ def create_oauth_token_router(
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
             account_generation=grant.account_generation,
-            admin_allowed=grant.admin_allowed and effective_admin(True),
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
@@ -693,7 +686,6 @@ def create_device_auth_router(
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
             account_generation=grant.account_generation,
-            admin_allowed=grant.admin_allowed and effective_admin(True),
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
@@ -917,7 +909,6 @@ def create_device_auth_router(
             grant.id,
             user_id=user_id,
             now_epoch_seconds=now,
-            admin_allowed=effective_admin(True),
         )
         if approved is None:
             return HTMLResponse(

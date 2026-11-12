@@ -17,7 +17,6 @@ import jwt
 import pytest
 
 from omnigent.server.admin_list import AdminList
-from omnigent.server.admin_mode import admin_mode_scope
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.oidc import OIDCConfig, derive_code_challenge
 from omnigent.server.routes import auth as auth_routes
@@ -150,15 +149,13 @@ def _client(transport: httpx.ASGITransport) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=transport, base_url="http://test", follow_redirects=False)
 
 
-@pytest.mark.parametrize("admin_enabled", [False, True])
-async def test_native_sign_in_delivers_code_and_exchanges_for_session(admin_enabled: bool) -> None:
+async def test_native_sign_in_delivers_code_and_exchanges_for_session() -> None:
     """The full loopback flow ends with a session token, and the browser gets none."""
     grant_store = MagicMock()
     with patch.object(auth_routes, "issue_login_grant", return_value="refresh-abc") as issue:
         async with _client(_transport(device_grant_store=grant_store)) as client:
             idp_state, state_cookie = await _start(client)
-            with admin_mode_scope(admin_enabled):
-                callback = await _callback(client, idp_state, state_cookie)
+            callback = await _callback(client, idp_state, state_cookie)
             query = _loopback_query(callback)
             assert query["state"] == _NATIVE_STATE
             assert "ap_session" not in callback.cookies
@@ -178,11 +175,6 @@ async def test_native_sign_in_delivers_code_and_exchanges_for_session(admin_enab
     assert body["refresh_token"] == "refresh-abc"
     issue.assert_called_once()
     assert issue.call_args.kwargs["user_id"] == "alice@example.com"
-    assert issue.call_args.kwargs["admin_allowed"] is admin_enabled
-    assert (
-        jwt.decode(body["token"], _TEST_SECRET, algorithms=["HS256"]).get("admin_allowed", True)
-        is admin_enabled
-    )
 
 
 async def test_native_token_omits_refresh_without_grant_store() -> None:

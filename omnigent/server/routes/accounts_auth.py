@@ -38,7 +38,7 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 from omnigent.db.account_authority import bind_account_authority, target_account_scope
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
-from omnigent.server.admin_mode import credential_admin_allowed, effective_admin
+from omnigent.server.admin_mode import effective_admin
 from omnigent.server.auth import _RESERVED_USERS, RESERVED_USER_LOCAL, UnifiedAuthProvider
 from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.passwords import (
@@ -267,18 +267,6 @@ def create_accounts_auth_router(
     _session_cookie = config.session_cookie_name
     _session_max_age = config.session_ttl_hours * 3600
 
-    def _export_login_token(session_jwt: str, user_id: str, generation: str | None) -> str:
-        if effective_admin(True):
-            return session_jwt
-        return mint_session_cookie(
-            user_id=user_id,
-            cookie_secret=config.cookie_secret,
-            ttl_hours=config.session_ttl_hours,
-            provider="accounts",
-            account_generation=generation,
-            admin_allowed=False,
-        )
-
     def _reissue_session_cookie(response: Response, user_id: str, generation: str) -> None:
         """Keep the caller signed in after rotating their own account generation."""
         bind_account_authority(user_id, generation)
@@ -288,7 +276,6 @@ def create_accounts_auth_router(
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=generation,
-            admin_allowed=credential_admin_allowed(),
         )
         _set_session_cookie(
             response,
@@ -366,7 +353,7 @@ def create_accounts_auth_router(
         if user is None or user.account_generation != generation:
             return JSONResponse(status_code=401, content={"error": "invalid username or password"})
         body_payload: dict[str, object] = {
-            "token": _export_login_token(session_jwt, user.id, user.account_generation),
+            "token": session_jwt,
             "expires_in": _session_max_age,
             "user": {"id": user.id, "is_admin": user.is_admin},
         }
@@ -533,7 +520,7 @@ def create_accounts_auth_router(
         resp = JSONResponse(
             status_code=200,
             content={
-                "token": _export_login_token(session_jwt, user.id, user.account_generation),
+                "token": session_jwt,
                 "expires_in": _session_max_age,
                 "user": {"id": user.id, "is_admin": user.is_admin},
             },
@@ -636,7 +623,7 @@ def create_accounts_auth_router(
         resp = JSONResponse(
             status_code=200,
             content={
-                "token": _export_login_token(session_jwt, user.id, user.account_generation),
+                "token": session_jwt,
                 "expires_in": _session_max_age,
                 "user": {"id": user.id, "is_admin": user.is_admin},
             },

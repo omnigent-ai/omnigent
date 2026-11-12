@@ -13,12 +13,6 @@ from unittest.mock import MagicMock
 import jwt
 import pytest
 
-from omnigent.server.admin_mode import (
-    admin_mode_scope,
-    credential_admin_allowed,
-    credential_admin_scope,
-    effective_admin,
-)
 from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
     UnifiedAuthProvider,
@@ -105,7 +99,6 @@ def test_mint_session_cookie_produces_valid_jwt() -> None:
     payload = jwt.decode(token, _TEST_SECRET, algorithms=["HS256"])
     assert payload["sub"] == "alice@example.com"
     assert payload["provider"] == "google"
-    assert "admin_allowed" not in payload
     # exp should be ~8 hours from now.
     assert payload["exp"] > time.time()
     assert payload["exp"] <= time.time() + (8 * 3600) + 5
@@ -146,7 +139,6 @@ def test_mint_session_token_produces_valid_jwt_with_seconds_ttl() -> None:
     payload = jwt.decode(token, _TEST_SECRET, algorithms=["HS256"])
     assert payload["sub"] == "alice@example.com"
     assert payload["provider"] == "accounts"
-    assert "admin_allowed" not in payload
     # exp is ~120 seconds out, not hours.
     assert time.time() < payload["exp"] <= time.time() + 120 + 5
 
@@ -166,12 +158,6 @@ def test_mint_session_token_short_ttl_expires() -> None:
     )
     with pytest.raises(jwt.ExpiredSignatureError):
         jwt.decode(token, _TEST_SECRET, algorithms=["HS256"])
-
-
-@pytest.mark.parametrize("mint", [mint_session_cookie, mint_session_token])
-def test_session_mint_can_restrict_admin_authority(mint) -> None:
-    token = mint("alice@example.com", _TEST_SECRET, 3600, "oidc", admin_allowed=False)
-    assert jwt.decode(token, _TEST_SECRET, algorithms=["HS256"])["admin_allowed"] is False
 
 
 def test_hmac_digest_is_deterministic() -> None:
@@ -676,73 +662,6 @@ def test_oidc_source_caches_validated_cookie() -> None:
     # Second call should use the cache (same result, no new entry).
     assert provider.get_user_id(request) == "alice@example.com"
     assert len(provider._cookie_cache) == 1
-
-
-@pytest.mark.parametrize("transport", ["cookie", "bearer"])
-def test_signed_admin_ceiling_survives_cache_and_identity_changes(
-    transport: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = _make_oidc_config()
-    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
-    requests = {}
-    with credential_admin_scope(True):
-        for allowed in (False, True):
-            token = mint_session_cookie(
-                "alice@example.com", _TEST_SECRET, 8, "oidc", admin_allowed=allowed
-            )
-            requests[allowed] = (
-                _mock_request(cookies={config.session_cookie_name: token})
-                if transport == "cookie"
-                else _mock_request(headers={"Authorization": f"Bearer {token}"})
-            )
-            assert provider.get_user_id(requests[allowed]) == "alice@example.com"
-            assert credential_admin_allowed() is allowed
-        assert len(provider._cookie_cache) == 2
-        with monkeypatch.context() as cached:
-            cached.setattr(jwt, "decode", lambda *args, **kwargs: pytest.fail("cache missed"))
-            for allowed in (False, True, False):
-                assert provider.get_user_id(requests[allowed]) == "alice@example.com"
-                with admin_mode_scope(True):
-                    assert effective_admin(True) is allowed
-        header = UnifiedAuthProvider(source="header", local_single_user=False)
-        assert header.get_user_id(_mock_request(headers={"X-Forwarded-Email": "bob"})) == "bob"
-        assert credential_admin_allowed()
-        assert provider.get_user_id(requests[False]) == "alice@example.com"
-        assert not credential_admin_allowed()
-        assert provider.get_user_id(_mock_request()) is None
-        assert credential_admin_allowed()
-        provider.revoke_user_sessions("alice@example.com")
-        assert not provider._cookie_cache
-
-
-@pytest.mark.parametrize("claim", [True, False, None, 0, 1, "false", [], {}])
-def test_admin_allowed_claim_requires_a_boolean(claim: object) -> None:
-    config = _make_oidc_config()
-    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
-    token = jwt.encode(
-        {"sub": "alice@example.com", "exp": int(time.time()) + 3600, "admin_allowed": claim},
-        _TEST_SECRET,
-        algorithm="HS256",
-    )
-    with credential_admin_scope(True):
-        identity = provider.get_user_id(_mock_request(cookies={config.session_cookie_name: token}))
-        if isinstance(claim, bool):
-            assert identity == "alice@example.com"
-            assert credential_admin_allowed() is claim
-        else:
-            assert identity is None
-            assert not provider._cookie_cache
-
-
-@pytest.mark.parametrize("browser_enabled,credential_enabled", [(True, False), (False, True)])
-def test_runner_token_intersects_browser_and_credential_authority(
-    browser_enabled: bool, credential_enabled: bool
-) -> None:
-    provider = UnifiedAuthProvider(source="oidc", oidc_config=_make_oidc_config())
-    with admin_mode_scope(browser_enabled), credential_admin_scope(credential_enabled):
-        token = provider.mint_runner_token("alice@example.com", 1800)
-    assert token is not None
-    assert jwt.decode(token, _TEST_SECRET, algorithms=["HS256"])["admin_allowed"] is False
 
 
 def test_oidc_source_accepts_bearer_token() -> None:

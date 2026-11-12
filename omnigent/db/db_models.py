@@ -527,9 +527,6 @@ class SqlDeviceGrant(OmnigentBase):
 
     __tablename__ = "device_grants"
     account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    admin_allowed: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, server_default=true()
-    )
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -678,9 +675,6 @@ class SqlConversationMetadata(OmnigentBase):
     # Enum stored as a stable int code (CONVERSATION_KIND: default=1, sub_agent=2).
     kind: Mapped[int] = mapped_column(SmallInteger, default=1)
     runner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    runner_admin_allowed: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, server_default=true()
-    )
     # No FK: host records are managed outside this table.
     host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     sub_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
