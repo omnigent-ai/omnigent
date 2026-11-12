@@ -305,11 +305,16 @@ def test_a_selected_account_without_a_token_never_runs_as_another(
     saved = "personal" if operation == "merge as" else "work"
     monkeypatch.setattr(github._config, "github_account_preference", lambda _repo: saved)
     calls: list[GhCall] = []
-    monkeypatch.setattr(
-        github,
-        "_gh",
-        _fake_gh(calls, [(1, "", "no oauth token found for github.com account work")]),
-    )
+
+    def gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int, str, str]:
+        assert cwd == "/workspace"
+        calls.append((argv, token))
+        # Only `work` lacks a token, so falling back to `personal` would succeed.
+        if argv[:4] == ["auth", "token", "--user", "personal"]:
+            return 0, "token-personal\n", ""
+        return 1, "", "no oauth token found for github.com account work"
+
+    monkeypatch.setattr(github, "_gh", gh)
     reference = PullRequestRef.from_url(PR_URL)
 
     with pytest.raises(ValueError, match="account work isn't signed in on the host"):
@@ -326,7 +331,7 @@ def test_a_selected_account_without_a_token_never_runs_as_another(
         else:
             github._disable_auto_merge("/workspace", reference)
 
-    assert [argv[:2] for argv, _token in calls] == [["auth", "token"]]
+    assert calls == [(["auth", "token", "--user", "work", "-h", "github.com"], None)]
 
 
 def test_without_a_selected_account_gh_runs_as_its_active_account(

@@ -408,9 +408,16 @@ describe("merging as another account", () => {
     );
   }
 
-  it.each(["names the account", "fails too"])(
+  it.each([
+    ["names the account", ["work", "personal"], true],
+    ["fails too", null, true],
+    // An account lookup can fail while the PR still reads; a merge then stays bound.
+    ["lists no accounts", [], false],
+    ["lists only another account", ["work"], false],
+    ["lists only the saved account", ["personal"], true],
+  ] as const)(
     "fails closed after a failed switch until the refetch %s",
-    async (refetch) => {
+    async (_refetch, logins, merges) => {
       const infoRequests: ((response: Response) => void)[] = [];
       const { fetch, posts } = stubFetch(
         allMethods,
@@ -419,11 +426,14 @@ describe("merging as another account", () => {
             infoRequests.push(respond);
           }),
       );
-      const info = (selected: string) =>
+      const info = (selected: string, listed: readonly string[] = ["work", "personal"]) =>
         json({
           object: "session.github.info",
           selected_pr_url: PR_URL,
-          auth: { ...twoAccounts, selected_account: selected },
+          auth: {
+            accounts: twoAccounts.accounts!.filter((account) => listed.includes(account.login)),
+            selected_account: selected,
+          },
         });
       const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       render(
@@ -460,8 +470,22 @@ describe("merging as another account", () => {
       await waitFor(() => expect(infoRequests).toHaveLength(2));
       await waitFor(() => expect(optionLoads()).toBeGreaterThan(loadsBefore));
 
-      if (refetch === "names the account") {
-        await act(async () => infoRequests[1](info("personal")));
+      if (logins) {
+        await act(async () => infoRequests[1](info("personal", logins)));
+        await waitFor(() =>
+          expect(
+            client.getQueryData<PullRequestInfo>(["github-info", "conv_1", PR_URL])?.auth?.accounts,
+          ).toHaveLength(logins.length),
+        );
+      }
+      if (!merges) {
+        // Nothing on screen names the account, so the dialog can't merge, even unbound.
+        expect(picker).toHaveTextContent("Choose an account");
+        expect(confirm).toBeDisabled();
+        expect(posts.map((post) => post.path)).toEqual([PREFERENCES_PATH]);
+        return;
+      }
+      if (logins) {
         await waitFor(() => expect(picker).toHaveTextContent("personal"));
       } else {
         await act(async () => infoRequests[1](json({ detail: "Host offline" }, 503)));
