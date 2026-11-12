@@ -11,6 +11,7 @@ import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -36,6 +37,7 @@ from omnigent.runner.native import NativeLaunchContext, _resolve_native_spawn_en
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
+from omnigent.runner.session_history import build_session_history
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
 from tests._helpers.providers import isolate_provider_resolution
 from tests.budgets import budget
@@ -2999,6 +3001,70 @@ class _NativeSeedServerClient(NullServerClient):
         if isinstance(body, dict):
             self.posted_events.append(body)
         return await super().post(url, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_anchor", "activity"),
+    [
+        (None, "unchanged"),
+        ("earlier", "unchanged"),
+        (None, "advance"),
+        ("earlier", "advance"),
+        ("earlier", "clear"),
+    ],
+)
+async def test_native_anchor_seed_preserves_concurrent_activity(
+    initial_anchor: str | None, activity: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delayed startup read cannot move a newer compaction boundary backward."""
+    session_id = "native-anchor-race"
+    anchors = {} if initial_anchor is None else {session_id: initial_anchor}
+    server_client = _NativeSeedServerClient()
+    read_started, release_read = asyncio.Event(), asyncio.Event()
+    get = server_client.get
+
+    async def paused_get(url: str, **kwargs: Any) -> Any:
+        response = await get(url, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return response
+
+    monkeypatch.setattr(server_client, "get", paused_get)
+    loader = build_session_history(
+        _background_tasks=set(),
+        _last_server_item_id=anchors,
+        _persist_cancellation_items=AsyncMock(),
+        _session_histories={},
+        _session_spec_cache={},
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    seed = asyncio.create_task(loader.seed_last_server_item_id(session_id))
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=budget(5))
+        if activity == "advance":
+            anchors[session_id] = "newer-live-item"
+        elif activity == "clear":
+            anchors.pop(session_id)
+        release_read.set()
+        await asyncio.wait_for(seed, timeout=budget(5))
+        expected_anchor = {
+            "unchanged": "item_latest",
+            "advance": "newer-live-item",
+            "clear": None,
+        }[activity]
+        assert anchors.get(session_id) == expected_anchor
+        persisted = await loader.handle_harness_compaction(session_id, {"summary": "summary"})
+        assert persisted is (expected_anchor is not None)
+        if persisted:
+            assert server_client.posted_events[0]["data"]["last_item_id"] == expected_anchor
+        else:
+            assert server_client.posted_events == []
+    finally:
+        release_read.set()
+        if not seed.done():
+            seed.cancel()
+        await asyncio.gather(seed, return_exceptions=True)
 
 
 @pytest.mark.asyncio
