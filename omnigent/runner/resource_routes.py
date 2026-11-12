@@ -64,6 +64,7 @@ from omnigent.runner.native import (
     _resolved_spec_workdir,
     _unwrap_resolved_spec,
 )
+from omnigent.runner.native.claude_mcp_sign_in import ClaudeMcpSignInTracker
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
@@ -149,6 +150,7 @@ def register_resource_routes(
     _search_registry_for_root: Callable[[Path], FilesystemRegistry],
     _session_comment_relays: dict[str, _CommentRelayBinding],
     auth_token_factory: Callable[[], str | None] | None,
+    claude_mcp_sign_in: ClaudeMcpSignInTracker,
     filesystem_registry: FilesystemRegistry | None,
     resource_registry: SessionResourceRegistry,
     server_client: httpx.AsyncClient,
@@ -433,6 +435,7 @@ def register_resource_routes(
                     # carries its skills rather than the parent's.
                     claude_entry = await _resolve_session_spec_entry(session_id)
                     claude_agent_spec = _unwrap_resolved_spec(claude_entry)
+                    await asyncio.to_thread(claude_mcp_sign_in.note_launching, session_id)
                     return dataclasses.replace(
                         ctx,
                         agent_spec=claude_entry,
@@ -522,6 +525,10 @@ def register_resource_routes(
                 conflict_message=_ensure_conflict,
                 finalize=_ensure_finalize,
             )
+            if terminal_name == "claude" and terminal_registry is not None:
+                claude_mcp_sign_in.note_launched(
+                    session_id, terminal_registry.get(session_id, "claude", "main")
+                )
             if _ensure_result is not None:
                 return _ensure_result
 

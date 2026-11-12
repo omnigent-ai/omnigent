@@ -27,6 +27,8 @@ export interface SessionLiveMcpServers {
   reason?: "not_running" | "unsupported" | "unavailable" | null;
   detail?: string | null;
   servers: LiveMcpServer[];
+  /** Only the servers the session knows it can't use are listed (claude-native). */
+  partial?: boolean;
   /** On a reconnect response, the harness's reason it refused. */
   reconnect_error?: string | null;
 }

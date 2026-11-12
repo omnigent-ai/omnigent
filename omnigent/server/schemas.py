@@ -203,6 +203,9 @@ class SessionLiveMCPServers(BaseModel):
         not answer). ``None`` when ``live`` is true.
     :param detail: Readable explanation for ``"unavailable"``, or ``None``.
     :param servers: The harness's servers; empty unless ``live``.
+    :param partial: ``True`` when the harness reports only the servers it knows
+        it can't use (claude-native), so a server missing from ``servers`` may
+        well be connected rather than not loaded.
     :param reconnect_error: On a reconnect response, the harness's reason the
         reconnect failed, or ``None`` when it succeeded.
     """
@@ -211,6 +214,7 @@ class SessionLiveMCPServers(BaseModel):
     reason: Literal["not_running", "unsupported", "unavailable"] | None = None
     detail: str | None = None
     servers: list[LiveMCPServerStatus] = Field(default_factory=list)
+    partial: bool = False
     reconnect_error: str | None = None
 
 

@@ -1118,18 +1118,9 @@ def _release_client_cli(relay: _ManagedMcpRelay | None, launcher: str | None) ->
 
 def _claude_mcp_auth_statuses() -> dict[str, str]:
     """The host sign-in manager's account state for each Claude MCP server, by name."""
-    try:
-        from omnigent.host.mcp_inventory import read_auth_status_overlay
+    from omnigent.host.mcp_inventory import harness_auth_statuses
 
-        overlay = read_auth_status_overlay(pathlib.Path.home())
-    except Exception:
-        logger.warning("Reading MCP auth status failed", exc_info=True)
-        return {}
-    return {
-        name: fields["auth_status"]
-        for (harness, name), fields in overlay.items()
-        if harness == "claude"
-    }
+    return harness_auth_statuses("claude")
 
 
 def _inventory_mcp_server_name(live_name: str) -> str:

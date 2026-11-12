@@ -322,6 +322,33 @@ def test_auth_status_is_stamped_on_the_servers_it_names(home: Path) -> None:
     ]
 
 
+def test_harness_sign_in_is_keyed_by_the_name_the_harness_reports(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plugin's server reads ``plugin:<plugin>:<server>``; unknown or disabled ones drop out."""
+    from omnigent.mcp_disabled_servers import ServerKey, set_disabled
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(home / "omnigent-config"))
+    _write_json(home / ".claude.json", {"mcpServers": {"linear": _stdio(), "docs": _stdio()}})
+    _write_claude_plugin(home / ".claude")
+    set_disabled(ServerKey("claude", "docs"), True)
+    _write_auth_status(
+        home,
+        [
+            {"harness": "claude", "name": "linear", "status": "sign_in_required"},
+            {"harness": "claude", "name": "figma", "status": "connected"},
+            {"harness": "claude", "name": "docs", "status": "connected"},
+            {"harness": "claude", "name": "ghost", "status": "connected"},
+            {"harness": "codex", "name": "linear", "status": "connected"},
+        ],
+    )
+
+    assert mcp_inventory.harness_sign_in_by_live_name("claude") == {
+        "linear": "sign_in_required",
+        "plugin:figma:figma": "connected",
+    }
+
+
 @pytest.mark.parametrize(
     "entry",
     [
