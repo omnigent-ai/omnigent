@@ -3257,6 +3257,38 @@ async def test_list_child_sessions_allows_read_grant(
         f"read-granted user-b should see the seeded child {child.id!r}, got {child_ids}"
     )
 
+    # Root -> grantless parent (``child``) -> running grandchild. READ on the
+    # root reaches the grandchild only through the chain, so the READ viewer
+    # must list it without settling it; the owner may settle it.
+    grandchild = conv_store.create_conversation(
+        agent_id=agent["id"],
+        kind="sub_agent",
+        title="coder:auth",
+        parent_conversation_id=child.id,
+    )
+    assert conv_store.set_runner_id(grandchild.id, f"runner_{grandchild.id}")
+    conv_store.set_session_live_status(grandchild.id, "running")
+    # Listing the grantless parent has no direct level, in both modes.
+    listing_id = child.id
+    listing_params = {"descendants": "true"} if descendants else None
+
+    resp = await auth_client.get(
+        f"/v1/sessions/{listing_id}/child_sessions",
+        params=listing_params,
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert grandchild.id in [row["id"] for row in resp.json()["data"]]
+    assert conv_store.get_conversation(grandchild.id).live_status == "running"  # type: ignore[union-attr]
+
+    resp = await auth_client.get(
+        f"/v1/sessions/{listing_id}/child_sessions",
+        params=listing_params,
+        headers={"X-Forwarded-Email": "user-a"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert conv_store.get_conversation(grandchild.id).live_status == "idle"  # type: ignore[union-attr]
+
 
 # ── SSE stream presence (who-is-viewing circles) ─────────────
 #

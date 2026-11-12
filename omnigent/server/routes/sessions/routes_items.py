@@ -27,6 +27,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -79,18 +80,45 @@ def register_items_routes(
 ) -> None:
     """Register the items routes on router."""
 
+    async def _may_settle_children(
+        user_id: str | None, session_id: str, displayed_level: int | None
+    ) -> bool:
+        """Whether the caller may settle the orphaned children of *session_id*.
+
+        The displayed level skips the parent chain, so a sub-agent whose READ
+        is inherited from its root reads as ``None``; ownership is therefore
+        resolved through the chain. Permissions off settles for everyone.
+
+        :param user_id: The authenticated caller.
+        :param session_id: The parent whose children are listed.
+        :param displayed_level: The caller's level from the access check.
+        :returns: ``True`` when the caller owns the parent (or is admin).
+        """
+        if permission_store is None:
+            return True
+        if displayed_level is not None and displayed_level >= LEVEL_OWNER:
+            return True
+        return await asyncio.to_thread(
+            check_session_access,
+            user_id,
+            session_id,
+            LEVEL_OWNER,
+            permission_store,
+            conversation_store,
+        )
+
     async def _settle_children(
-        request: Request, rows: list[Conversation], parent_level: int | None
+        request: Request, rows: list[Conversation], may_settle: bool
     ) -> None:
         """Settle orphaned ``running`` children as the session list does, so
         the tree and runners polling this list never see a dead turn as live.
-        Only the parent's owner may settle (``None`` = permissions off)."""
+        Only the parent's owner may settle; see :func:`_may_settle_children`."""
         await _settle_orphaned_running_rows(
             rows,
             conversation_store=conversation_store,
             liveness_lookup=liveness_lookup,
             host_store=getattr(request.app.state, "host_store", None),
-            may_settle=lambda _conv: parent_level is None or parent_level >= LEVEL_OWNER,
+            may_settle=lambda _conv: may_settle,
         )
 
     @router.get(
@@ -229,9 +257,10 @@ def register_items_routes(
             parent = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if parent is None:
             raise _session_not_found()
+        may_settle = await _may_settle_children(user_id, session_id, access.level)
         if descendants:
             subtree = await _list_descendant_sessions(
-                request, parent, access.level, limit=limit, after=after, max_depth=max_depth
+                request, parent, may_settle, limit=limit, after=after, max_depth=max_depth
             )
             if subtree is not None:
                 return subtree
@@ -249,7 +278,7 @@ def register_items_routes(
             sort_by="created_at",
             title=title_filter,
         )
-        await _settle_children(request, page.data, access.level)
+        await _settle_children(request, page.data, may_settle)
         data = await _child_session_summaries_from_conversations(
             page.data,
             session_id,
@@ -265,7 +294,7 @@ def register_items_routes(
     async def _list_descendant_sessions(
         request: Request,
         parent: Conversation,
-        parent_level: int | None,
+        may_settle: bool,
         *,
         limit: int,
         after: str | None,
@@ -333,7 +362,7 @@ def register_items_routes(
                 raise StaleCursorError(after)
             start = position + 1
         window = ordered[start : start + limit]
-        await _settle_children(request, window, parent_level)
+        await _settle_children(request, window, may_settle)
         summaries = await _child_session_summaries_from_conversations(
             window, parent.id, conversation_store, parent_ids=parent_ids
         )
