@@ -5573,8 +5573,8 @@ def test_pi_version_probe_runs_inside_requested_sandbox(
     workspace.mkdir()
     home = tmp_path / "home"
     home.mkdir()
-    executable = tmp_path / "install" / "pi"
-    executable.parent.mkdir()
+    executable = tmp_path / "install" / "bin" / "pi"
+    executable.parent.mkdir(parents=True)
     secret = tmp_path / "private.txt"
     secret.write_text("private canary")
     monkeypatch.setenv("HOME", str(home))
