@@ -10,8 +10,16 @@ import Foundation
 /// modules (unavoidable for cross-target sharing without a framework), but the
 /// source is maintained in one place.
 final class MockHTTPServer {
+  /// A received request; header names are lowercased.
+  struct Request {
+    let method: String
+    let path: String
+    let headers: [String: String]
+    let body: Data
+  }
+
   private(set) var port: Int = 0
-  private let handler: (String, String) -> (Int, [String: String], Data)
+  private let handler: (Request) -> (Int, [String: String], Data)
   private var listenFD: Int32 = -1
   private var source: DispatchSourceRead?
   private let queue = DispatchQueue(label: "omnigent.mock-http-server")
@@ -20,7 +28,13 @@ final class MockHTTPServer {
   ///   `(statusCode, headerField -> value, body)`. Header names are lowercased
   ///   on the way out.
   init(handler: @escaping (String, String) -> (Int, [String: String], Data)) throws {
-    self.handler = handler
+    self.handler = { handler($0.method, $0.path) }
+    try start()
+  }
+
+  /// - Parameter requestHandler: Like `handler`, but also receives headers and the body.
+  init(requestHandler: @escaping (Request) -> (Int, [String: String], Data)) throws {
+    self.handler = requestHandler
     try start()
   }
 
@@ -93,15 +107,33 @@ final class MockHTTPServer {
       if buffer.count > 64 * 1024 { break }
     }
 
-    let request = String(data: buffer, encoding: .utf8) ?? ""
-    let firstLine = request.split(separator: "\r\n", maxSplits: 1).first.map(String.init) ?? ""
-    let parts = firstLine.split(separator: " ")
+    let headerEnd = buffer.range(of: terminator)?.upperBound ?? buffer.endIndex
+    let head = String(data: buffer[..<headerEnd], encoding: .utf8) ?? ""
+    let lines = head.components(separatedBy: "\r\n")
+    let parts = (lines.first ?? "").split(separator: " ")
     let method = parts.first.map(String.init)?.uppercased() ?? "GET"
     let path = parts.count > 1 ? String(parts[1]) : "/"
+    var requestHeaders: [String: String] = [:]
+    for line in lines.dropFirst() {
+      guard let colon = line.firstIndex(of: ":") else { continue }
+      requestHeaders[line[..<colon].lowercased()] =
+        line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+    }
+    let contentLength = min(Int(requestHeaders["content-length"] ?? "") ?? 0, 64 * 1024)
+    var body = Data(buffer[headerEnd...])
+    while body.count < contentLength, Date() < deadline {
+      let n = read(fd, &tmp, tmp.count)
+      if n <= 0 {
+        usleep(1_000)
+        continue
+      }
+      body.append(tmp, count: n)
+    }
 
-    let (status, headers, body) = handler(method, path)
+    let (status, headers, responseBody) = handler(
+      Request(method: method, path: path, headers: requestHeaders, body: body))
     writeResponse(
-      fd: fd, status: status, headers: headers, body: body, includeBody: method != "HEAD")
+      fd: fd, status: status, headers: headers, body: responseBody, includeBody: method != "HEAD")
   }
 
   private func writeResponse(

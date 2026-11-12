@@ -546,7 +546,10 @@ export function GoalDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg" aria-describedby={undefined}>
+      <DialogContent
+        className="sm:max-w-lg max-h-[85dvh] grid-rows-[auto_1fr_auto]"
+        aria-describedby={undefined}
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <TargetIcon className="size-4" />
@@ -554,7 +557,7 @@ export function GoalDialog({
           </DialogTitle>
         </DialogHeader>
 
-        <div className="space-y-3">
+        <div className="min-h-0 space-y-3 overflow-y-auto">
           <GoalSummary loading={loading} goal={goal} />
           <GoalEditor
             objective={state.objective}

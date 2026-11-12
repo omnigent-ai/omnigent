@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import httpx
 import pytest
 
 from omnigent.harnesses.codex_native import hook as codex_native_hook
+from omnigent.harnesses.codex_native.app_server import _codex_policy_hook_command
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     codex_home_for_bridge_dir,
@@ -18,8 +22,8 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
     write_policy_hook_config,
 )
-from omnigent.native import native_policy_hook
-from tests.native_hook_helpers import make_failing_client
+from omnigent.native import native_policy_hook, policy_allow_cache
+from tests.native_hook_helpers import make_failing_client, make_verdict_client
 
 
 class _DenyHttpxClient:
@@ -35,7 +39,7 @@ class _DenyHttpxClient:
 
     captured: dict[str, object] = {}
 
-    def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+    def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
         """
         Capture constructor inputs for later assertions.
 
@@ -553,6 +557,121 @@ def test_pre_tool_use_falls_back_to_policy_hook_json_when_relay_has_no_session_i
     assert _DenyHttpxClient.captured["headers"] == {"Authorization": "Bearer direct-token"}
 
 
+_NO_POLICY_ALLOW: dict[str, object] = {
+    "result": "POLICY_ACTION_ALLOW",
+    "allow_cache_seconds": 60.0,
+}
+
+
+def test_no_policy_allow_lets_installed_command_answer_in_shell(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    The hook records the server's allow window for the command's shell guard.
+
+    The installed command then answers the next tool call itself. The server
+    is unreachable, so a call that got past the guard would fail closed with
+    deny output instead of exiting silently.
+    """
+    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:9", ap_auth_headers={})
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_verdict_client(_NO_POLICY_ALLOW))
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+
+    assert _run_hook(bridge_dir, payload, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", _codex_policy_hook_command(bridge_dir, sys.executable)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_answer_for_a_switched_session_opens_no_window(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An answer for the session the hook read cannot open the next session's window.
+
+    The switch lands after the hook reads the bridge state and before its
+    request, so the server answers for the old session.
+    """
+    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:9", ap_auth_headers={})
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_verdict_client(_NO_POLICY_ALLOW))
+    read_state = codex_native_hook.read_bridge_state
+
+    def read_then_switch(path: Path) -> CodexNativeBridgeState | None:
+        state = read_state(path)
+        write_bridge_state(
+            path,
+            CodexNativeBridgeState(
+                session_id="conv_rotated",
+                socket_path=str(path / "app-server.sock"),
+                thread_id="thread_new",
+                codex_home=str(path / "codex-home"),
+            ),
+        )
+        return state
+
+    monkeypatch.setattr(codex_native_hook, "read_bridge_state", read_then_switch)
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+
+    assert _run_hook(bridge_dir, payload, monkeypatch) == 0
+
+    assert policy_allow_cache._read_state(bridge_dir)[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("relay_session_id", "window_opens"),
+    [("conv_active", True), ("conv_previous", False)],
+    ids=["relay_for_this_session", "relay_for_previous_session"],
+)
+def test_relay_answer_opens_window_only_for_the_hooks_session(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relay_session_id: str,
+    window_opens: bool,
+) -> None:
+    """Through the relay the server evaluated the relay's session, which can trail a switch."""
+    from omnigent.harnesses.claude_native.bridge import _TOOL_RELAY_FILE
+
+    (bridge_dir / _TOOL_RELAY_FILE).write_text(
+        json.dumps(
+            {"url": "http://127.0.0.1:19999", "token": "tok", "session_id": relay_session_id}
+        )
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", make_verdict_client(_NO_POLICY_ALLOW))
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {}}
+
+    assert _run_hook(bridge_dir, payload, monkeypatch) == 0
+
+    assert (policy_allow_cache._read_state(bridge_dir)[0] > 0) is window_opens
+
+
+def test_bridge_state_write_closes_allow_window(bridge_dir: Path) -> None:
+    """A new or rotated session's policies were never checked, so its hooks must ask."""
+    generation = policy_allow_cache.generation(bridge_dir)
+    policy_allow_cache.record(bridge_dir, generation, _NO_POLICY_ALLOW, requested_at=time.time())
+
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="conv_rotated",
+            socket_path=str(bridge_dir / "app-server.sock"),
+            thread_id="thread_new",
+            codex_home=str(bridge_dir / "codex-home"),
+        ),
+    )
+
+    assert policy_allow_cache._read_state(bridge_dir)[0] == 0
+
+
 # ── route-turn (first-message model routing) ────────────────────────
 
 
@@ -1063,14 +1182,14 @@ _LIVE_CATALOG: list[dict[str, object]] = [
 
 
 @pytest.mark.parametrize(
-    ("routed", "applied"),
+    ("routed", "applied", "effort"),
     [
         # The routed arm arrives as a catalog id; codex only has metadata for
         # its own dotted slug, and ``/model`` only highlights that one.
-        ("databricks-gpt-5-6-luna", "gpt-5.6-luna"),
+        ("databricks-gpt-5-6-luna", "gpt-5.6-luna", None),
         # Extended-catalog rows are listed under the catalog spelling, which
         # IS codex's id for them — translating must not mangle it.
-        ("system.ai.glm-5-2", "system.ai.glm-5-2"),
+        ("system.ai.glm-5-2", "system.ai.glm-5-2", "medium"),
     ],
 )
 def test_apply_thread_model_switches_in_codex_spelling(
@@ -1078,21 +1197,133 @@ def test_apply_thread_model_switches_in_codex_spelling(
     monkeypatch: pytest.MonkeyPatch,
     routed: str,
     applied: str,
+    effort: str | None,
 ) -> None:
     """The thread switch and the config.toml mirror both speak codex."""
-    from omnigent.harnesses.codex_native.bridge import read_codex_config_model
+    from omnigent.harnesses.codex_native.bridge import (
+        read_codex_config_effort,
+        read_codex_config_model,
+    )
 
     codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
     client = _install_fake_client(monkeypatch, _FakeAppServerClient(_LIVE_CATALOG))
 
     assert codex_native_hook._apply_thread_model(bridge_dir, routed) is None
 
+    settings = {"threadId": "thread_abc", "model": applied}
+    if effort is not None:
+        settings["effort"] = effort
     assert client.requests == [
         ("model/list", {"includeHidden": True}),
-        ("thread/settings/update", {"threadId": "thread_abc", "model": applied}),
+        ("thread/settings/update", settings),
     ]
     assert client.closed is True
     assert read_codex_config_model(bridge_dir) == applied
+    assert read_codex_config_effort(bridge_dir) == effort
+
+
+@pytest.mark.parametrize(("inherited", "expected"), [("max", "xhigh"), ("high", "high")])
+def test_routed_model_switch_checks_inherited_effort(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inherited: str,
+    expected: str,
+) -> None:
+    """Routing corrects an incompatible effort and preserves an already supported one."""
+    from omnigent.harnesses.codex_native.bridge import read_codex_config_effort
+
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text(
+        f'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "{inherited}"\n'
+    )
+    catalog = [
+        {
+            "id": "gpt-5.4",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": value} for value in ("low", "medium", "high", "xhigh")
+            ],
+        }
+    ]
+
+    client = _FakeAppServerClient(catalog)
+    _install_fake_client(monkeypatch, client)
+
+    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-4") is None
+
+    update: dict[str, object] = {
+        "threadId": "thread_abc",
+        "model": "gpt-5.4",
+        "effort": expected,
+    }
+    assert client.requests[-1] == ("thread/settings/update", update)
+    assert read_codex_config_effort(bridge_dir) == expected
+
+
+@pytest.mark.parametrize(("config_rewritten", "expected"), [(False, "high"), (True, "low")])
+def test_routed_model_switch_keeps_an_effort_whose_config_write_failed(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_rewritten: bool,
+    expected: str,
+) -> None:
+    """Routing inherits the applied effort, not a stale config, until the config is replaced."""
+    from omnigent.harnesses.codex_native.bridge import write_unmirrored_codex_settings
+
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / "config.toml"
+    config.write_text('model = "gpt-5.6-sol"\nmodel_reasoning_effort = "low"\n')
+    # The runner applied high, but its config write failed.
+    write_unmirrored_codex_settings(bridge_dir, {"effort": "high"})
+    if config_rewritten:
+        # A later terminal pick replaces the config and supersedes the record.
+        replacement = home / "config.toml.terminal"
+        replacement.write_text(config.read_text())
+        os.replace(replacement, config)
+    catalog = [
+        {
+            "id": "gpt-5.4",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": value} for value in ("low", "medium", "high", "xhigh")
+            ],
+        }
+    ]
+    client = _FakeAppServerClient(catalog)
+    _install_fake_client(monkeypatch, client)
+
+    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-4") is None
+
+    assert client.requests[-1] == (
+        "thread/settings/update",
+        {"threadId": "thread_abc", "model": "gpt-5.4", "effort": expected},
+    )
+
+
+def test_routed_model_switch_records_an_effort_it_could_not_mirror(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routed switch whose effort write fails leaves the applied effort for later readers."""
+    from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text('model = "gpt-5.6-sol"\nmodel_reasoning_effort = "max"\n')
+    catalog = [
+        {
+            "id": "gpt-5.4",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": value} for value in ("low", "medium", "high", "xhigh")
+            ],
+        }
+    ]
+    _install_fake_client(monkeypatch, _FakeAppServerClient(catalog))
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_effort", lambda *_: False)
+
+    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-4") is None
+
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {"effort": "xhigh"}
 
 
 def test_apply_thread_model_declines_a_model_this_pane_cannot_serve(

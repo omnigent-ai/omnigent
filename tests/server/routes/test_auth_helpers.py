@@ -3,7 +3,7 @@
 Focused on :func:`require_access_and_level`, which folds ``require_access``
 and ``get_permission_level`` into a single resolution. The behaviour it must
 preserve is the 403-vs-404 distinction, the admin bypass, sub-agent parent
-delegation, and the user-vs-public displayed-level asymmetry — all exercised
+delegation, and the effective direct/public permission level — all exercised
 here against real SQLite-backed stores (no mocks) so the resolution matches
 production exactly.
 """
@@ -20,10 +20,12 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
+    delegated_path_allowed,
 )
 from omnigent.server.routes import _auth_helpers
 from omnigent.server.routes._auth_helpers import (
     can_mutate_session_agent,
+    require_access,
     require_access_and_level,
     require_agent_owner,
 )
@@ -156,31 +158,27 @@ async def test_admin_allowed_and_bypasses_conversation_fetch(
 
 
 @pytest.mark.asyncio
-async def test_public_grant_allows_but_level_reports_user_grant(
+async def test_public_edit_elevates_displayed_level_without_granting_owner(
     perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
 ) -> None:
-    """Access via a higher public grant; displayed level is the user's own.
+    """The displayed level agrees with authorization after capping a public grant."""
+    from omnigent.server.sharing_settings import PublicSharingMaxLevel, public_sharing_policy_scope
 
-    The regression guard for the combined helper: a low user grant plus a
-    higher ``__public__`` grant must still report the user's own level
-    (matching ``get_permission_level``) while granting access via the
-    public grant (matching ``check_access``).
-    """
     conv = conv_store.create_conversation()
     perm_store.ensure_user(ALICE)
     perm_store.ensure_user(RESERVED_USER_PUBLIC)
     perm_store.grant(ALICE, conv.id, LEVEL_READ)  # user: read
     perm_store.grant(RESERVED_USER_PUBLIC, conv.id, LEVEL_OWNER)  # public: owner
 
-    access = await require_access_and_level(ALICE, conv.id, LEVEL_EDIT, perm_store, conv_store)
+    with public_sharing_policy_scope(lambda: PublicSharingMaxLevel.EDIT):
+        access = await require_access_and_level(ALICE, conv.id, LEVEL_EDIT, perm_store, conv_store)
+        assert perm_store.get_permission_level(ALICE, conv.id) == LEVEL_EDIT
+        assert not perm_store.check_access(ALICE, conv.id, LEVEL_OWNER)
 
     # Allowed (no raise) because the public grant satisfies EDIT ...
     assert access.conversation is not None
     assert access.conversation.id == conv.id, "must reuse the asked-for session"
-    # ... but the displayed level is Alice's own read grant, unchanged.
-    assert access.level == LEVEL_READ, (
-        f"displayed level must be the user's own read grant, got {access.level}"
-    )
+    assert access.level == LEVEL_EDIT
 
 
 @pytest.mark.asyncio
@@ -323,6 +321,36 @@ async def test_missing_conversation_raises_404(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("combined", [False, True])
+@pytest.mark.parametrize("permissions_enabled", [False, True])
+async def test_provisional_session_never_reaches_stores(
+    perm_store: SqlAlchemyPermissionStore,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    combined: bool,
+    permissions_enabled: bool,
+) -> None:
+    """Client-only route IDs must not reach stores with numeric session keys."""
+
+    def unexpected_lookup(*args: object, **kwargs: object) -> None:
+        pytest.fail("A provisional session reached a backing store")
+
+    monkeypatch.setattr(perm_store, "resolve_access", unexpected_lookup)
+    monkeypatch.setattr(conv_store, "get_conversation", unexpected_lookup)
+    monkeypatch.setattr(_auth_helpers, "check_session_access", unexpected_lookup)
+    check = require_access_and_level if combined else require_access
+    with pytest.raises(OmnigentError) as exc:
+        await check(
+            ALICE,
+            "temp:0123456789abcdef0123456789abcdef",
+            LEVEL_READ,
+            perm_store if permissions_enabled else None,
+            conv_store,
+        )
+    assert exc.value.code == ErrorCode.NOT_FOUND
+
+
+@pytest.mark.asyncio
 async def test_access_check_shares_a_single_pool_checkout(
     perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
 ) -> None:
@@ -435,3 +463,8 @@ def test_agent_owner_legacy_null_is_admin_only(
     perm_store.ensure_user(BOB)
     perm_store.set_admin(BOB, True)
     require_agent_owner(BOB, agent, perm_store)
+
+
+def test_delegated_runner_credentials_allow_gateway_only():
+    assert delegated_path_allowed("/v1/mcp/tracker")
+    assert not delegated_path_allowed("/v1/mcp-registry/services/tracker/connection")

@@ -8,12 +8,14 @@ import logging
 import re
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, cast
 from urllib.parse import unquote, urlsplit
 
 import httpx
 from websockets.exceptions import ConnectionClosed
 
+from omnigent.errors import ErrorCode
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
     EventBatchFrame,
@@ -24,10 +26,22 @@ _logger = logging.getLogger(__name__)
 _EVENTS_PATH = re.compile(r"/v1/sessions/([^/]+)/events$")
 _MAX_EVENTS = 32
 _MAX_BATCH_BYTES = 256 * 1024
+_MAX_PENDING_BATCHES = 34  # Two active workers plus 32 queued batches.
 
 
 class TunnelIngestUnsupported(Exception):
     """The connected server does not support event ingestion on this tunnel."""
+
+
+@dataclass
+class _QueuedEvents:
+    """An admitted source batch retaining its lock and acknowledged prefix."""
+
+    session_id: str
+    events: list[dict[str, Any]]
+    result: asyncio.Future[EventAckFrame]
+    lock: asyncio.Lock
+    applied: int = 0
 
 
 class RunnerEventDispatcher:
@@ -44,17 +58,28 @@ class RunnerEventDispatcher:
         self._ever_ready = False
         self._send: Callable[[str], Awaitable[None]] | None = None
         self._pending: dict[str, asyncio.Future[EventAckFrame]] = {}
-        self._queue: asyncio.Queue[
-            tuple[str, list[dict[str, Any]], asyncio.Future[EventAckFrame]]
-        ] = asyncio.Queue(maxsize=32)
+        self._queue: asyncio.Queue[_QueuedEvents] = asyncio.Queue(maxsize=_MAX_PENDING_BATCHES)
+        # Retries retain their admission slot, leaving room to requeue without
+        # both workers blocking behind producers that filled the queue.
+        self._capacity = asyncio.BoundedSemaphore(_MAX_PENDING_BATCHES)
         self._locks: dict[str, asyncio.Lock] = {}
         self._workers: list[asyncio.Task[None]] = []
         self._outstanding = 0
+        self._last_dispatch_at: float | None = None
 
     @property
     def has_pending(self) -> bool:
         """Keep the runner alive while durable source events await an ACK."""
         return self._outstanding > 0
+
+    @property
+    def last_dispatch_at(self) -> float | None:
+        """Loop time of the last server-acknowledged batch, if any.
+
+        The runner idle watchdog reads this so an actively forwarding native
+        sub-agent counts as runner work while its parent session is idle.
+        """
+        return self._last_dispatch_at
 
     def _set_state(self, state: str) -> None:
         self._state = state
@@ -129,48 +154,81 @@ class RunnerEventDispatcher:
             ]
         result: asyncio.Future[EventAckFrame] = asyncio.get_running_loop().create_future()
         self._outstanding += 1
+        lock = self._locks.setdefault(session_id, asyncio.Lock())
+        owns_lock = False
+        owns_capacity = False
         try:
-            await self._queue.put((session_id, events, result))
+            # Wait before taking a worker so one stalled session cannot occupy
+            # both workers. The queued item owns the lock through delivery cleanup.
+            await lock.acquire()
+            owns_lock = True
+            await self._capacity.acquire()
+            owns_capacity = True
+            self._queue.put_nowait(_QueuedEvents(session_id, events, result, lock))
+            owns_lock = False
+            owns_capacity = False
             return await result
         finally:
             self._outstanding -= 1
             if not result.done():
                 result.cancel()
+            if owns_lock:
+                lock.release()
+            if owns_capacity:
+                self._capacity.release()
 
     async def _worker(self) -> None:
         while True:
-            session_id, events, result = await self._queue.get()
+            batch = await self._queue.get()
+            result = batch.result
+            requeued = False
             try:
                 if result.cancelled():
                     continue
-                async with self._locks.setdefault(session_id, asyncio.Lock()):
-                    delivery = asyncio.create_task(self._deliver(session_id, events))
+                delivery = asyncio.create_task(
+                    self._deliver(batch.session_id, batch.events[batch.applied :])
+                )
 
-                    def stop_abandoned(
-                        future: asyncio.Future[EventAckFrame],
-                        delivery_task: asyncio.Task[EventAckFrame] = delivery,
-                    ) -> None:
-                        if future.cancelled():
-                            delivery_task.cancel()
+                def stop_abandoned(
+                    future: asyncio.Future[EventAckFrame],
+                    delivery_task: asyncio.Task[EventAckFrame] = delivery,
+                ) -> None:
+                    if future.cancelled():
+                        delivery_task.cancel()
 
-                    result.add_done_callback(stop_abandoned)
-                    try:
-                        ack = await delivery
-                    finally:
-                        result.remove_done_callback(stop_abandoned)
-                if not result.done():
-                    result.set_result(ack)
+                result.add_done_callback(stop_abandoned)
+                try:
+                    ack = await delivery
+                finally:
+                    result.remove_done_callback(stop_abandoned)
+                if result.done():
+                    continue
+                batch.applied += ack.applied
+                if batch.applied == len(batch.events):
+                    result.set_result(EventAckFrame(ack.id, batch.applied))
+                elif not ack.retryable:
+                    result.set_result(EventAckFrame(ack.id, batch.applied, ack.error))
+                elif all(event["type"] == "external_output_text_delta" for event in batch.events):
+                    raise ConnectionError("preview backpressure")
+                else:
+                    await asyncio.sleep(0.25)
+                    if not result.done():
+                        self._queue.put_nowait(batch)
+                        requeued = True
             except asyncio.CancelledError:
-                if not result.cancelled():
+                worker = asyncio.current_task()
+                if not result.cancelled() or (worker is not None and worker.cancelling()):
                     raise
             except Exception as exc:  # noqa: BLE001 - propagate to the waiting producer.
                 if not result.done():
                     result.set_exception(exc)
             finally:
+                if not requeued:
+                    batch.lock.release()
+                    self._capacity.release()
                 self._queue.task_done()
 
     async def _deliver(self, session_id: str, events: list[dict[str, Any]]) -> EventAckFrame:
-        remaining = events
         preview = all(event["type"] == "external_output_text_delta" for event in events)
         while True:
             if not await self._mode(initial_fallback=False, preview=preview):
@@ -182,27 +240,25 @@ class RunnerEventDispatcher:
             future: asyncio.Future[EventAckFrame] = asyncio.get_running_loop().create_future()
             self._pending[batch_id] = future
             try:
-                await send(encode_frame(EventBatchFrame(batch_id, session_id, remaining)))
+                await send(encode_frame(EventBatchFrame(batch_id, session_id, events)))
                 ack = await asyncio.wait_for(future, timeout=30.0)
             except (ConnectionError, ConnectionClosed, OSError, TimeoutError):
                 # An ACK can disappear after the server committed the item.
                 # All durable events admitted here carry a stable source_id.
                 if preview:
                     raise
-                await asyncio.sleep(0.25)
-                continue
+                return EventAckFrame(batch_id, 0, retryable=True)
             finally:
                 self._pending.pop(batch_id, None)
-            if ack.applied < 0 or ack.applied > len(remaining):
+                # A disconnect may fail the future after its waiter stopped; mark it retrieved.
+                if future.done() and not future.cancelled():
+                    future.exception()
+            # Only an acknowledged batch counts: a send that never reached the
+            # server must not look like forwarder progress to the watchdog.
+            self._last_dispatch_at = asyncio.get_running_loop().time()
+            if ack.applied < 0 or ack.applied > len(events):
                 raise ValueError("invalid event acknowledgement")
-            remaining = remaining[ack.applied :]
-            if not remaining:
-                return EventAckFrame(ack.id, len(events))
-            if not ack.retryable:
-                return EventAckFrame(ack.id, len(events) - len(remaining), ack.error)
-            if preview:
-                raise ConnectionError("preview backpressure")
-            await asyncio.sleep(0.25)
+            return ack
 
 
 class TunnelEventClient(httpx.AsyncClient):
@@ -244,13 +300,16 @@ class TunnelEventClient(httpx.AsyncClient):
             return await super().post(*args, **kwargs)
         # Child-history callers inspect each item_id in the HTTP batch
         # acknowledgement; even a one-entry array needs a list response.
+        session_id = unquote(match.group(1))
         if (
             (
                 isinstance(value, list)
                 and any(event.get("type") == "external_conversation_item" for event in events)
             )
             or len(events) > _MAX_EVENTS
-            or len(encode_frame(EventBatchFrame("", "", events)).encode("utf-8"))
+            # The dispatcher assigns a 32-character UUID; both IDs count toward
+            # the server's wire limit, even when the event payload alone fits.
+            or len(encode_frame(EventBatchFrame("0" * 32, session_id, events)).encode("utf-8"))
             > _MAX_BATCH_BYTES
         ):
             return await super().post(*args, **kwargs)
@@ -258,22 +317,29 @@ class TunnelEventClient(httpx.AsyncClient):
             return await super().post(*args, **kwargs)
         request = self.build_request("POST", url)
         try:
-            submit = self._event_dispatcher.submit(unquote(match.group(1)), events)
+            submit = self._event_dispatcher.submit(session_id, events)
             if all(event["type"] == "external_output_text_delta" for event in events):
                 ack = await asyncio.wait_for(submit, timeout=2.0)
             else:
                 ack = await submit
         except TunnelIngestUnsupported:
             return await super().post(*args, **kwargs)
-        except (ConnectionError, TimeoutError):
+        except (ConnectionClosed, OSError):
             # Preview is best-effort. Final transcript items retain their
             # source cursor and will be retried after the tunnel returns.
             _logger.debug("Native event preview could not reach the server")
             return await self._synthetic_response(503, request=request)
         if ack.applied == len(events):
             return await self._synthetic_response(202, request=request, json={"queued": False})
+        if ack.retryable:
+            status = 503
+        elif ack.error == ErrorCode.FORBIDDEN:
+            # Wrong-runner refusal (session moved to another host), not a malformed event.
+            status = 403
+        else:
+            status = 422
         return await self._synthetic_response(
-            503 if ack.retryable else 422,
+            status,
             json={"detail": ack.error or "event batch was not accepted"},
             request=request,
         )

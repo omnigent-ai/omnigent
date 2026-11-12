@@ -73,7 +73,7 @@ final class DatabricksOAuthAttemptTests: XCTestCase {
     XCTAssertEqual(query["response_type"], "code")
     XCTAssertEqual(query["scope"], "all-apis offline_access")
     XCTAssertEqual(query["state"], attempt.state)
-    XCTAssertEqual(query["code_challenge"], DatabricksOAuthAttempt.challenge(for: attempt.verifier))
+    XCTAssertEqual(query["code_challenge"], OAuthSupport.challenge(for: attempt.verifier))
     XCTAssertEqual(query["code_challenge_method"], "S256")
     XCTAssertNil(query["code_verifier"])
     XCTAssertEqual(query["o"], "123")
@@ -83,7 +83,7 @@ final class DatabricksOAuthAttemptTests: XCTestCase {
 
   func testPKCEMatchesRFC7636Vector() {
     XCTAssertEqual(
-      DatabricksOAuthAttempt.challenge(for: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+      OAuthSupport.challenge(for: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
       "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
   }
 

@@ -19,6 +19,7 @@ import yaml
 
 from omnigent.config import global_config_path
 from omnigent.host import identity_env
+from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
 
@@ -53,6 +54,32 @@ class HostIdentity:
     name: str
 
 
+HOST_SLICE_KEY_ENABLED_ENV_VAR = "OMNIGENT_HOST_SLICE_KEY_ENABLED"
+
+
+def export_configured_slice_key(path: Path) -> None:
+    """Export ``host.slice_key_enabled`` from *path* as the slice-key env var.
+
+    A managed launch writes the setting into the sandbox's config; exporting it
+    once at host startup lets the request-header builder and the host's runners
+    (which inherit the env var) all agree. An env var already set wins.
+
+    :param path: The host's ``config.yaml``.
+    """
+    if os.environ.get(HOST_SLICE_KEY_ENABLED_ENV_VAR) is not None or not path.exists():
+        return
+    try:
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+    except yaml.YAMLError:
+        # Malformed config is reported by the identity load, not here.
+        return
+    host_section = cfg.get("host") if isinstance(cfg, dict) else None
+    enabled = host_section.get("slice_key_enabled") if isinstance(host_section, dict) else None
+    if isinstance(enabled, bool):
+        os.environ[HOST_SLICE_KEY_ENABLED_ENV_VAR] = "1" if enabled else "0"
+
+
 def host_config_path(path: Path | None = None) -> Path:
     """Return the effective config path used for host identity."""
     return path if path is not None else global_config_path(CONFIG_PATH)
@@ -71,9 +98,8 @@ def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
     process from the env override or config file, turns that confusing
     remote rejection into a loud, local, actionable error.
 
-    Reuses the server's own ``uuid_to_bytes`` (imported lazily so the host
-    CLI's common auto-generate path never pulls in the DB/sqlalchemy
-    module) so the client and server accept exactly the same id shapes.
+    Reuses the database column's canonical normalizer without importing the
+    server's ORM models into the host process.
 
     :param host_id: The raw host id from the env override or config file.
     :param source: Where it came from, named in the error (e.g. the env var).
@@ -81,8 +107,6 @@ def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
     :returns: The normalized (to bare hex, legacy-prefix-stripped) host id.
     :raises ValueError: If *host_id* is not a valid uuid-shaped host id.
     """
-    from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
-
     try:
         # Validate and normalize to bare hex (16 bytes -> 32-char hex string)
         normalized = uuid_to_bytes(host_id).hex()

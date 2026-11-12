@@ -8,7 +8,9 @@ import { FolderIcon, GitBranchIcon, GitPullRequestIcon } from "lucide-react";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import type { Conversation } from "@/hooks/useConversations";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { useConversationReadState } from "@/hooks/useUnseenConversations";
+import { gitProviderCopy } from "@/lib/gitProviders";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
@@ -36,6 +38,13 @@ function stateLabel(state: SessionState | null, status: Conversation["status"]):
   }
 }
 
+/** The PR link's tooltip: its title and last fetched state, with that state's age once stale. */
+function pullRequestTooltip(pr: CanvasPullRequest): string {
+  if (!pr.state) return pr.title;
+  const asOf = stateAsOf(pr.state_checked_at);
+  return `${pr.title} (${pr.state.toLowerCase()}${asOf ? `, as of ${asOf}` : ""})`;
+}
+
 function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
   const { conversation, pullRequest, onOpen } = data;
   const optimisticTitle = useOptimisticTitle(conversation.id);
@@ -50,6 +59,8 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
   const titleProvisional = !conversation.title && optimisticTitle !== undefined;
   const label = stateLabel(state, conversation.status);
   const workspace = conversation.workspace?.trim() || "No working directory";
+  const prCopy = gitProviderCopy(pullRequest?.provider, undefined, pullRequest?.provider_display);
+  const prNumberPrefix = prCopy.prNumberPrefix;
 
   const openFromKeyboard = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "Enter" && event.key !== " ") return;
@@ -68,11 +79,16 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
       data-testid="session-card"
       data-state={state?.kind ?? "idle"}
       role="button"
+      aria-pressed={selected ?? false}
       tabIndex={0}
       aria-label={`${title}. ${label}. ${workspace}`}
       onClick={(event) => {
-        // Pointer clicks select (and start drags); only keyboard activation opens.
-        if (event.detail === 0) onOpen(conversation.id);
+        // React Flow distinguishes pointer clicks from drags; virtual clicks
+        // activate here without also bubbling to the node's click handler.
+        if (event.detail === 0) {
+          event.stopPropagation();
+          onOpen(conversation.id);
+        }
       }}
       onKeyDown={openFromKeyboard}
     >
@@ -116,14 +132,15 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
           rel="noopener noreferrer"
           // `nodrag` keeps React Flow from turning a click on the link into a card drag.
           className="nodrag flex min-w-0 items-center gap-1.5 text-xs font-medium text-brand-accent hover:underline"
-          title={`${pullRequest.title} (${pullRequest.state.toLowerCase()})`}
-          aria-label={`Open pull request #${pullRequest.number}`}
+          title={pullRequestTooltip(pullRequest)}
+          aria-label={`Open ${prCopy.requestName} ${prNumberPrefix}${pullRequest.number}`}
           onClick={stopCardEvents}
           onDoubleClick={stopCardEvents}
         >
           <GitPullRequestIcon aria-hidden className="size-3.5 shrink-0" />
           <span className="truncate">
-            #{pullRequest.number} {pullRequest.title}
+            {prNumberPrefix}
+            {pullRequest.number} {pullRequest.title}
           </span>
         </a>
       )}

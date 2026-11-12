@@ -110,7 +110,7 @@ export function ThemeColorPicker({
 
   return (
     <div className="flex items-center justify-between gap-4 border-b border-border/70 py-3 last:border-b-0">
-      <span className="text-ui font-medium">{label}</span>
+      <span className="text-ui font-normal md:font-medium">{label}</span>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button
@@ -118,7 +118,7 @@ export function ThemeColorPicker({
             aria-label={`${label}: ${value.toUpperCase()}`}
             data-testid={`${testId}-trigger`}
             className={cn(
-              "group flex h-10 w-44 items-center gap-2 rounded-xl border bg-background p-1.5 text-left shadow-xs outline-none transition-[border-color,box-shadow,transform]",
+              "group flex h-10 w-44 items-center gap-2 rounded-xl border border-input bg-background p-1.5 text-left shadow-xs outline-none transition-[border-color,box-shadow,transform] dark:bg-input",
               "hover:border-border-strong hover:shadow-sm focus-visible:ring-2 focus-visible:ring-ring/40 active:scale-[0.99]",
               open && "border-primary/60 ring-2 ring-primary/15",
             )}

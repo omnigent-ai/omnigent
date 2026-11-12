@@ -43,11 +43,15 @@ before Step 1.
      implementation-specific expectations invented by the repro bot, or
      assertions that contradict the intended behavior.
    - Never change correct product behavior merely to satisfy a bad test.
-   - If the intended behavior is ambiguous, stop with `needs_more_info` rather
-     than choosing a product requirement yourself.
+   - Use `resolve-investigate` to check historical rationale and competing
+     explanations. Separate observed failure from a proposed policy change;
+     ambiguous intent follows its PR proposal path, not an automatic stop.
 
 3. **Run the audited test on the current, unfixed base before changing product
    code or checking the candidate PR's result.**
+
+   For a policy proposal, label the baseline as existing behavior and retain the
+   incomplete proposal outcome; a fail→pass transition does not prove a defect.
 
    - Record the exact base SHA, command, environment/feature gates, and observed
      assertion failure in `test_audit`.
@@ -72,7 +76,9 @@ before Step 1.
      behavior is genuinely corrected report `nothing_to_fix` and cite the
      fixing commit or PR.
    - If you cannot establish a reliable reproduction, stop with `needs_more_info`
-     instead of manufacturing a fix or approving an unverified PR.
+     instead of manufacturing a fix or approving an unverified PR. This covers
+     missing behavioral evidence, not a remaining choice between supported
+     policies: keep that proposal explicit and incomplete for PR review.
 
 5. **Carry the same audited assertions to the candidate fix.**
 

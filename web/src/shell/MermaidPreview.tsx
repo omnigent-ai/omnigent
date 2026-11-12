@@ -3,8 +3,9 @@
 // whether the file is read or edited. Streamdown's mermaid plugin sanitises the
 // SVG internally — the same trusted path chat messages use.
 
-import { mermaid } from "@streamdown/mermaid";
+import { mermaid } from "@/components/ai-elements/mermaidPlugin";
 import { Streamdown } from "streamdown";
+import { MERMAID_STREAMDOWN_PROPS } from "@/components/ai-elements/MermaidBlock";
 import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";
 import { mermaidOptionsForTheme } from "@/components/ai-elements/MermaidError";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
@@ -25,6 +26,7 @@ export function MermaidPreview({ source }: { source: string }) {
         {/* Mermaid renders async with no cancellation. Remount on source or theme
             changes to discard a superseded in-flight render. */}
         <Streamdown
+          {...MERMAID_STREAMDOWN_PROPS}
           key={`${themeMode}:${trimmed}`}
           plugins={MERMAID_STREAMDOWN_PLUGINS}
           mermaid={mermaidOptionsForTheme(themeMode)}

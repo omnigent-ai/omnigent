@@ -51,9 +51,10 @@ live facet, the **exact fail reason** — the "from" half of your fail→pass pr
 
 ### 2B.2 — Root-cause
 
-Find *why* the test fails. Read the code the journey and `evidence` point at. Use
-repro-agent's root-cause leads as hypotheses, but confirm them against the code.
-State the root cause concretely before you change anything.
+Apply `resolve-investigate`: match the reported path and configuration, check
+competing explanations, and find the historical rationale. State the supported
+cause before editing. If policy must change, distinguish that proposal from
+repairing an implementation defect and retain unresolved choices for PR review.
 
 ### 2B.3 — Implement the fix
 
@@ -62,6 +63,12 @@ surrounding conventions, as small as the root cause allows. Do not touch the tes
 to make it pass; the *code* must change to satisfy it.
 
 ### 2B.4 — Select permanent regression coverage
+
+Read `tests/README.md` and `tests/_helpers/README.md` in the product checkout
+before writing setup (or nearby fixtures when that repository has no catalog).
+Follow its API examples and the selection policy below. In `test_audit`, name
+the nearest test/helper considered, explain any new setup, and report permanent
+test/support additions and deletions including helper changes.
 
 Choose which tests belong in the final PR. Search existing tests by behavior
 and fixture, and read the nearest scenarios. If one already drives the relevant
@@ -183,6 +190,10 @@ than shipping a hollow green.
 journey to prepare the recording, even if the earlier run left no video.
 See [`dev/recording-lanes.md`](../../../recording-lanes.md) for setup and recording
 steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
+Burn step-by-step timed captions into each new after-clip with
+`dev/caption_recording.py`, then inspect the rendered actions and final outcome
+before adding it to the handoff or PR Demo. Follow the shared guide's captioning
+fallback if rendering is blocked; keep any usable footage.
 
 - Record the user action and the corrected product behavior. Tests may drive
   and verify the interaction, but the clip must show the product, not pytest,
@@ -191,8 +202,10 @@ steps, including `OMNIGENT_E2E_RECORD_DIR` (`--video on` does not work here).
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the corrected error message.
 - Record your fix on the author path, or the reviewed PR head on the review
-  path. Save the clip as `recordings/<slug>/after-<facet>.<ext>` with
-  `kind: "after"`, and include it in the PR Demo section and handoff.
+  path. Save the raw capture as `recordings/<slug>/raw/after-<facet>.<ext>`.
+  Render to `recordings/<slug>/after-<facet>.mp4`, inspect it, then declare
+  that final path with `kind: "after"` in the PR Demo and handoff. If captioning
+  fails, use the shared guide's explicit fallback path instead.
 - Keep any recovered before-clip unchanged. A missing before-clip is not a
   reason to skip the after-clip; note the missing before-clip in your evidence.
 - For internal/API-only results with no visible user interaction, written

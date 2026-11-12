@@ -30,6 +30,8 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.picker_routes import OWN_AGENTS
+from tests._helpers.polling import poll_until_async
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
@@ -37,7 +39,6 @@ from tests.e2e_ui.start_session.test_start_session import (
     _close_entry_models,
     _open_entry_models,
     _run_in_fresh_loop,
-    _wait_until,
 )
 
 # The two native wrapper agents Smart Routing routes between. Both must be in
@@ -164,6 +165,7 @@ async def _register_routing_routes(
     await page.route(
         re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
     )
+    await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
     # The landing needs a working directory before Send enables, and the
     # stubbed host has no browsable filesystem.
     await page.add_init_script(
@@ -215,7 +217,7 @@ async def _drive_smart_routing_harness(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("refactor the auth module")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["harness_override"] == "auto", body
             # The router scores the typed message at create time.
@@ -276,7 +278,7 @@ async def _drive_smart_routing_model_option(base_url: str, session_id: str) -> N
             await page.get_by_test_id("new-chat-landing-input").fill("fix the flaky test")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_claude_e2e", body
             assert body["cost_control_mode_override"] == "on", body

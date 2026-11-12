@@ -16,13 +16,17 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
-from omnigent.runner.native.orchestration import _codex_native_launch_config
+from omnigent.runner.native.orchestration import (
+    _codex_native_launch_config,
+    _pi_native_launch_config,
+)
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.budgets import budget
 
 _OWNER = "owner@example.com"
 _READER = "reader@example.com"
@@ -163,23 +167,76 @@ async def test_snapshot_can_skip_usage_without_exposing_parent_only_cost(
     load_usage.assert_not_called()
 
 
+@pytest.mark.parametrize("complete", [True, False, None])
+async def test_pi_launch_restores_only_own_usage_without_loading_display_usage(
+    usage_app: _UsageApp,
+    usage_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    complete: bool | None,
+) -> None:
+    """Real HTTP snapshot and runner decoding exclude the parent's children."""
+    monkeypatch.setattr(orchestration, "_resolve_harness", lambda *_args, **_kwargs: "pi-native")
+    monkeypatch.setattr(
+        orchestration,
+        "load_session_usage",
+        Mock(side_effect=AssertionError("native launch must not aggregate the tree")),
+    )
+    usage_app.conversations.set_session_usage(
+        usage_app.parent_id,
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 30,
+            "total_cost_usd": 0.25,
+            "native_cost_complete": complete,
+        },
+    )
+    usage_app.conversations.set_session_usage(
+        usage_app.child_id,
+        {
+            "input_tokens": 9000,
+            "output_tokens": 8000,
+            "cache_read_input_tokens": 7000,
+            "total_cost_usd": 99.5,
+        },
+    )
+    launch = await _pi_native_launch_config(
+        session_id=usage_app.parent_id, server_client=usage_client
+    )
+    expected = {
+        "cumulative_input_tokens": 130,
+        "cumulative_output_tokens": 20,
+        "cumulative_cache_read_input_tokens": 30,
+    }
+
+    if complete is True:
+        expected["cumulative_cost_usd"] = 0.25
+    assert launch.native_usage_baseline == expected
+
+
 async def test_real_codex_launch_config_does_not_load_usage(
     usage_app: _UsageApp,
     usage_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exercise the actual launch callback against the authorized server route."""
+    """Legacy clients can still fetch launch fields from the authorized route."""
     load_usage = Mock(side_effect=AssertionError("Codex launch must not load usage"))
     monkeypatch.setattr(orchestration, "load_session_usage", load_usage)
     usage_app.conversations.update_conversation(
-        usage_app.parent_id, model_override="gpt-5", reasoning_effort="high"
+        usage_app.parent_id,
+        model_override="gpt-5",
+        reasoning_effort="high",
+        terminal_launch_args=["--config", "approval_policy=on-request"],
     )
+    usage_app.conversations.set_external_session_id(usage_app.parent_id, "thread-resumed")
     config = await _codex_native_launch_config(
         session_id=usage_app.parent_id, server_client=usage_client
     )
     assert config.workspace == usage_app.workspace
     assert config.model_override == "gpt-5"
     assert config.reasoning_effort == "high"
+    assert config.terminal_launch_args == ["--config", "approval_policy=on-request"]
+    assert config.external_session_id == "thread-resumed"
     load_usage.assert_not_called()
 
 
@@ -386,7 +443,7 @@ async def test_slow_usage_request_does_not_hold_session_metadata(
 
     def delayed_usage(*args: Any, **kwargs: Any) -> dict[str, Any]:
         loop.call_soon_threadsafe(usage_started.set)
-        assert release_usage.wait(timeout=10), "test did not release the usage read"
+        assert release_usage.wait(timeout=budget(10)), "test did not release the usage read"
         return original_loader(*args, **kwargs)
 
     monkeypatch.setattr(orchestration, "load_session_usage", delayed_usage)
@@ -394,13 +451,13 @@ async def test_slow_usage_request_does_not_hold_session_metadata(
         usage_client.get(f"/v1/sessions/{usage_app.parent_id}", params=_USAGE_SNAPSHOT_PARAMS)
     )
     try:
-        await asyncio.wait_for(usage_started.wait(), timeout=3)
+        await asyncio.wait_for(usage_started.wait(), timeout=budget(3))
         snapshot = await asyncio.wait_for(
             usage_client.get(
                 f"/v1/sessions/{usage_app.parent_id}",
                 params={**_USAGE_SNAPSHOT_PARAMS, "include_usage": "false"},
             ),
-            timeout=3,
+            timeout=budget(3),
         )
         assert snapshot.status_code == 200, snapshot.text
         assert snapshot.json()["usage_included"] is False

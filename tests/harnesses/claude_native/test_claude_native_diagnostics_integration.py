@@ -139,7 +139,7 @@ async def test_diagnostics_continue_before_transcript_discovery_and_follow_sessi
         if session_id == "cleared-session":
             loop.call_soon_threadsafe(rotated_poll.set)
 
-    follower = SimpleNamespace(poll=Mock(side_effect=poll), close=Mock())
+    follower = SimpleNamespace(poll=Mock(side_effect=poll), close=Mock(), health_snapshot=dict)
     make_follower = Mock(return_value=follower)
     transcript_discovery = Mock(return_value=None)
     monkeypatch.setattr(forwarder, "ClaudeDebugLogFollower", make_follower)
@@ -205,7 +205,7 @@ async def test_server_client_start_failure_drains_diagnostics_before_first_poll(
         async def __aexit__(self, *_args: object) -> None:
             return None
 
-    follower = SimpleNamespace(poll=Mock(), close=Mock())
+    follower = SimpleNamespace(poll=Mock(), close=Mock(), health_snapshot=dict)
     make_follower = Mock(return_value=follower)
     monkeypatch.setattr(forwarder, "ClaudeDebugLogFollower", make_follower)
     monkeypatch.setattr(forwarder, "read_active_session_id", lambda _bridge: "active-child")
@@ -336,7 +336,7 @@ async def test_diagnostic_failures_preserve_the_original_forwarder_error(
     failure_point: str,
 ) -> None:
     monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
-    follower = SimpleNamespace(poll=Mock(), close=Mock())
+    follower = SimpleNamespace(poll=Mock(), close=Mock(), health_snapshot=dict)
     monkeypatch.setattr(forwarder, "ClaudeDebugLogFollower", lambda _path: follower)
     if failure_point == "session_metadata":
         malformed = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid bridge metadata")
@@ -382,7 +382,9 @@ async def test_blocked_diagnostic_io_leaves_loop_responsive_and_drains_after_pol
         order.append("close")
         loop.call_soon_threadsafe(closed.set)
 
-    follower = SimpleNamespace(poll=Mock(side_effect=poll), close=Mock(side_effect=close))
+    follower = SimpleNamespace(
+        poll=Mock(side_effect=poll), close=Mock(side_effect=close), health_snapshot=dict
+    )
     monkeypatch.setattr(forwarder, "ClaudeDebugLogFollower", lambda _path: follower)
     monkeypatch.setattr(forwarder, "read_active_session_id", lambda _path: "active-session")
 
@@ -434,7 +436,9 @@ async def test_direct_collector_cancellation_serializes_close_and_preserves_orig
         order.append("poll")
 
     follower = SimpleNamespace(
-        poll=Mock(side_effect=poll), close=Mock(side_effect=lambda _session: order.append("close"))
+        poll=Mock(side_effect=poll),
+        close=Mock(side_effect=lambda _session: order.append("close")),
+        health_snapshot=dict,
     )
     monkeypatch.setattr(forwarder, "ClaudeDebugLogFollower", lambda _path: follower)
     original_error = RuntimeError("forwarding failed after diagnostic cancellation")

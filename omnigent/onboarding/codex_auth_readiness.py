@@ -16,11 +16,10 @@ would authenticate the selected provider.
 from __future__ import annotations
 
 import os
+import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
-
-import tomllib
 
 CODEX_BUILTIN_PROVIDERS = frozenset(
     {"openai", "amazon-bedrock", "amazon-bedrock-runtime", "ollama", "lmstudio"}
@@ -73,6 +72,18 @@ def effective_custom_provider_table(
     if not isinstance(table, dict):
         return None
     return provider_id, table
+
+
+def effective_self_sufficient_builtin_provider(config: dict[str, object]) -> str | None:
+    """Return the selected built-in provider id when Codex needs no login for it.
+
+    Every built-in provider except ``openai`` (Bedrock, Ollama, LM Studio)
+    authenticates itself, mirroring :func:`codex_config_effective_auth`.
+    """
+    provider_id = effective_codex_model_provider(config)
+    if provider_id in CODEX_BUILTIN_PROVIDERS and provider_id != "openai":
+        return provider_id
+    return None
 
 
 def provider_table_has_self_contained_auth(table: dict[str, object]) -> bool:

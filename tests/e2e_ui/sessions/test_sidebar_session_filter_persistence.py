@@ -11,7 +11,7 @@ against a live server: seed an owned session and a shared one over the REST
 API, pick a filter through the live funnel, reload the browser, and assert
 the list is still scoped and the radio item still reads checked.
 
-Also covered is the read-side guard. "Shared sessions" is dropped from the
+Also covered is the read-side guard. "Shared with me" is dropped from the
 menu on a loopback-only server (one user, so the slice is meaningless), so a
 value stored against a multi-user server must not be honored there — it would
 scope the list to a slice with no menu entry to leave it by. That half runs
@@ -29,13 +29,14 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
-from tests._helpers.session import post_session_bundle
+from tests._helpers.browser import user_page
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
+    create_user_session,
     spawn_multi_user_server,
 )
-from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.sessions._sidebar_helpers import choose_session_filter, open_session_filters
 
 # Edit access (2): enough to share a session with a non-owner. Mirrors
 # LEVEL_EDIT in omnigent/server/auth.py.
@@ -48,30 +49,10 @@ _STORAGE_KEY = "omnigent:session-filter"
 
 
 def _create_session(server: MultiUserServer, *, owner_email: str, title: str) -> str:
-    """Create a session owned by *owner_email* and give it a unique *title*.
-
-    A multi-user header-auth server 401s headerless writes, so both the create
-    and the title PATCH carry the owner's ``X-Forwarded-Email``. The title makes
-    the row easy to spot among other tests' sessions on the shared server.
-    """
-    headers = {"X-Forwarded-Email": owner_email}
-    create = post_session_bundle(
-        httpx.post,
-        f"{server.base_url}/v1/sessions",
-        _build_hello_world_bundle(),
-        headers=headers,
-        timeout=30.0,
+    """Seed a titled session owned by the explicit header identity."""
+    return create_user_session(
+        server.base_url, headers={"X-Forwarded-Email": owner_email}, metadata={"title": title}
     )
-    create.raise_for_status()
-    session_id = create.json()["session_id"]
-    resp = httpx.patch(
-        f"{server.base_url}/v1/sessions/{session_id}",
-        json={"title": title},
-        headers=headers,
-        timeout=10.0,
-    )
-    resp.raise_for_status()
-    return session_id
 
 
 def _grant(server: MultiUserServer, session_id: str, user_id: str, level: int) -> None:
@@ -92,13 +73,12 @@ def _row(page: Page, session_id: str) -> Locator:
 
 def _set_filter(page: Page, value: str) -> None:
     """Open the filter funnel and pick *value* (all/mine/shared/archived)."""
-    page.locator(_FILTER).click()
-    page.locator(f'[data-testid="session-filter-{value}"]').click()
+    choose_session_filter(page, value)
 
 
 def _expect_checked_filter(page: Page, value: str) -> None:
     """Open the funnel and assert *value* is the checked radio item."""
-    page.locator(_FILTER).click()
+    open_session_filters(page)
     expect(page.locator(f'[data-testid="session-filter-{value}"]')).to_have_attribute(
         "aria-checked", "true", timeout=15_000
     )
@@ -145,9 +125,7 @@ def test_all_sessions_filter_survives_a_reload(
     shared = _create_session(server, owner_email=ADMIN_EMAIL, title=f"e2e-filter-shared-{uniq}")
     _grant(server, shared, viewer_email, _LEVEL_EDIT)
 
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{owned}")
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
 
@@ -167,8 +145,6 @@ def test_all_sessions_filter_survives_a_reload(
         expect(_row(page, owned)).to_be_visible(timeout=30_000)
         expect(_row(page, shared)).to_be_visible(timeout=30_000)
         _expect_checked_filter(page, "all")
-    finally:
-        ctx.close()
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
@@ -190,9 +166,7 @@ def test_shared_sessions_filter_survives_a_reload(
     shared = _create_session(server, owner_email=ADMIN_EMAIL, title=f"e2e-shared-shared-{uniq}")
     _grant(server, shared, viewer_email, _LEVEL_EDIT)
 
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{owned}")
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
         # Default "My sessions" hides the shared row; picking "Shared" brings it
@@ -206,8 +180,6 @@ def test_shared_sessions_filter_survives_a_reload(
         expect(_row(page, shared)).to_be_visible(timeout=30_000)
         expect(_row(page, owned)).to_have_count(0)
         _expect_checked_filter(page, "shared")
-    finally:
-        ctx.close()
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
@@ -218,7 +190,7 @@ def test_stored_shared_filter_is_dropped_on_a_single_user_server(
 ) -> None:
     """A persisted "shared" doesn't strand the viewer on a single-user server.
 
-    ``live_server`` is loopback-only, so the funnel drops "Shared sessions" —
+    ``live_server`` is loopback-only, so the funnel drops "Shared with me" —
     there's one user and the slice is meaningless. Seeding the stored value
     that a multi-user server would have written (or a hand-edited entry) must
     therefore fall back to the "My sessions" default: honoring it would scope
@@ -238,7 +210,7 @@ def test_stored_shared_filter_is_dropped_on_a_single_user_server(
     # the menu falls back to the "My sessions" default with no Shared option to
     # have selected.
     expect(_row(page, session_id)).to_be_visible(timeout=30_000)
-    page.locator(_FILTER).click()
+    open_session_filters(page)
     expect(page.locator('[data-testid="session-filter-mine"]')).to_have_attribute(
         "aria-checked", "true", timeout=15_000
     )

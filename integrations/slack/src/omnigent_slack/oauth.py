@@ -12,8 +12,10 @@ from the server itself (see :func:`probe_auth_mode`, mirroring the
   scoped, rotating delegated token.
 - **oidc** → the server's CLI-login ticket flow (``/auth/cli-login`` +
   ``/auth/cli-poll``). The user completes the real OIDC flow at the IdP;
-  the bot receives the server's session JWT (no refresh — re-login on
-  expiry), exactly as the ``omnigent`` CLI does.
+  the bot receives the server's session JWT, exactly as the ``omnigent``
+  CLI does. When the server has a grant store (a database), the poll also
+  returns a login grant's refresh token, which the bot renews through
+  ``/oauth/token``; without one, the user re-logs-in on expiry.
 
 Header/proxy mode is unsupported: identity is asserted by a trusted
 upstream proxy, so the server mints no token and mounts no login
@@ -28,8 +30,11 @@ See ``designs/DEVICE_AUTH.md`` for the device-grant design.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import enum
+import hashlib
+import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -60,6 +65,10 @@ class OAuthError(RuntimeError):
     """A login step failed in a way the user must resolve."""
 
 
+class PerUserLoginUnavailableError(OAuthError):
+    """Server configuration provides no delegated login flow for this bot."""
+
+
 class AuthorizationPendingError(OAuthError):
     """The user has not yet finished — keep polling."""
 
@@ -86,8 +95,9 @@ class DeviceGrantUnavailableError(OAuthError):
 class TokenResult:
     """A token obtained from a completed login.
 
-    ``refresh_token`` is empty for OIDC session JWTs (the cli-ticket flow
-    issues no refresh token — the bot re-logs-in on expiry).
+    ``refresh_token`` is empty when an OIDC server's cli-ticket login
+    issues no login grant (no grant store wired) — the session JWT then
+    stands alone and the bot re-logs-in on expiry.
     """
 
     access_token: str
@@ -96,9 +106,12 @@ class TokenResult:
 
 
 def _token_from_response(
-    resp: httpx.Response, *, access_key: str, has_refresh: bool, default_expires: int
+    resp: httpx.Response, *, access_key: str, refresh_required: bool, default_expires: int
 ) -> TokenResult:
     """Parse a 200 token body, mapping a malformed one to ``OAuthError``.
+
+    ``refresh_required`` makes a missing ``refresh_token`` malformed; when
+    false the field is optional and an absent one yields ``""``.
 
     A 200 whose body is non-JSON, missing the token field, or carries a
     non-numeric ``expires_in`` would otherwise raise
@@ -110,7 +123,10 @@ def _token_from_response(
     try:
         data = resp.json()
         access_token = str(data[access_key])
-        refresh_token = str(data["refresh_token"]) if has_refresh else ""
+        if refresh_required:
+            refresh_token = str(data["refresh_token"])
+        else:
+            refresh_token = str(data.get("refresh_token") or "")
         expires_in = int(data.get("expires_in", default_expires))
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise OAuthError(f"Malformed token response: {exc}") from exc
@@ -130,8 +146,7 @@ class PendingLogin:
     """
 
     verification_url: str
-    # Short human-readable code to display, when the flow has one (device
-    # grant). Empty for the OIDC ticket flow (the IdP page needs no code).
+    # Short human-readable code to display when the flow has one.
     user_code: str
     _poll: Callable[[], Awaitable[TokenResult]]
     _close: Callable[[], Awaitable[None]]
@@ -204,10 +219,10 @@ async def start_login(
     if mode is AuthMode.OIDC:
         return await _start_cli_ticket_login(server_url)
     if mode is AuthMode.HEADER:
-        raise OAuthError(
-            "This server uses header/proxy authentication, which this bot "
-            "can't log in to per user. Put the bot behind the same identity "
-            "proxy, or run the server in accounts or OIDC mode."
+        raise PerUserLoginUnavailableError(
+            "This server accepts anonymous requests or uses header/proxy authentication. "
+            "Ask your administrator to enable accounts or OIDC authentication for "
+            "individual Slack logins, or configure Databricks Apps web-auth enrollment."
         )
     return await _start_device_login(server_url, client_id=client_id, client_secret=client_secret)
 
@@ -283,7 +298,7 @@ async def _poll_device(
             continue  # transient — keep polling until the deadline (mirrors the ticket flow)
         if resp.status_code == 200:
             return _token_from_response(
-                resp, access_key="access_token", has_refresh=True, default_expires=3600
+                resp, access_key="access_token", refresh_required=True, default_expires=3600
             )
         error = _error_code(resp)
         if error == "slow_down":
@@ -304,8 +319,17 @@ async def _poll_device(
 async def _start_cli_ticket_login(server_url: str) -> PendingLogin:
     base = server_url.rstrip("/")
     client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(30.0))
+    code_verifier = secrets.token_urlsafe(48)
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
     try:
-        resp = await client.post("/auth/cli-login")
+        resp = await client.post(
+            "/auth/cli-login",
+            json={"code_challenge": code_challenge, "code_challenge_method": "S256"},
+        )
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         await client.aclose()
@@ -315,6 +339,7 @@ async def _start_cli_ticket_login(server_url: str) -> PendingLogin:
         ticket = str(data["ticket"])
         # login_url is a server-relative path (e.g. "/auth/login?ticket=…").
         login_url = str(data["login_url"])
+        user_code = str(data.get("user_code", ""))
     except (ValueError, KeyError, TypeError) as exc:
         # A 200 with a malformed body would otherwise leak the open client.
         await client.aclose()
@@ -322,18 +347,22 @@ async def _start_cli_ticket_login(server_url: str) -> PendingLogin:
     verification_url = login_url if login_url.startswith("http") else f"{base}{login_url}"
 
     async def _poll() -> TokenResult:
-        return await _poll_cli_ticket(client, ticket)
+        return await _poll_cli_ticket(client, ticket, code_verifier)
 
     return PendingLogin(
         verification_url=verification_url,
-        user_code="",
+        user_code=user_code,
         _poll=_poll,
         _close=client.aclose,
     )
 
 
 async def _poll_cli_ticket(
-    client: httpx.AsyncClient, ticket: str, interval: int = 2, timeout_seconds: int = 300
+    client: httpx.AsyncClient,
+    ticket: str,
+    code_verifier: str,
+    interval: int = 2,
+    timeout_seconds: int = 300,
 ) -> TokenResult:
     deadline = asyncio.get_event_loop().time() + timeout_seconds
     while True:
@@ -341,26 +370,34 @@ async def _poll_cli_ticket(
             raise AuthorizationExpiredError("The login link expired.")
         await asyncio.sleep(interval)
         try:
-            resp = await client.get("/auth/cli-poll", params={"ticket": ticket})
+            resp = await client.get(
+                "/auth/cli-poll",
+                params={"ticket": ticket},
+                headers={"X-Omnigent-Code-Verifier": code_verifier},
+            )
         except httpx.HTTPError:
             continue  # transient — keep polling until the deadline
         if resp.status_code == 202:
             continue  # pending: browser flow not finished
         if resp.status_code == 200:
-            # No refresh token in the ticket flow — the session JWT stands
-            # alone until it expires, then the user re-logs-in.
+            # Keep optional login grants; servers without grant storage
+            # return only the session JWT.
             return _token_from_response(
-                resp, access_key="token", has_refresh=False, default_expires=8 * 3600
+                resp, access_key="token", refresh_required=False, default_expires=8 * 3600
             )
-        # 410 (expired/unknown) or any other status → terminal.
+        if resp.status_code in (400, 403, 410):
+            raise AuthorizationExpiredError(
+                _error_code(resp) or "The login link expired or was rejected."
+            )
         raise AuthorizationExpiredError("The login link expired or was rejected.")
 
 
 class DeviceFlowClient:
     """Talks to a single Omnigent server's ``/oauth/*`` endpoints.
 
-    Used for token refresh and revocation of device-grant tokens (the
-    login start/poll now lives in :func:`start_login`). Sends the optional
+    Used for token refresh and revocation of device-grant and OIDC
+    login-grant tokens (the login start/poll now lives in
+    :func:`start_login`). Sends the optional
     device-grant client secret (when configured) on every call, since the
     ``/oauth/token`` and ``/oauth/revoke`` endpoints may be secret-gated.
     """
@@ -386,7 +423,7 @@ class DeviceFlowClient:
         if response.status_code != 200:
             raise OAuthError(f"Refresh failed: {_error_code(response) or response.status_code}")
         return _token_from_response(
-            response, access_key="access_token", has_refresh=True, default_expires=3600
+            response, access_key="access_token", refresh_required=True, default_expires=3600
         )
 
     async def revoke(self, refresh_token: str) -> None:

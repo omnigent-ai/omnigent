@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner import _proc
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -395,11 +396,11 @@ class QwenExecutor(Executor):
             if not sandbox.active:
                 return self._qwen_path
             # qwen is an npm CLI: it must read its own install + node_modules
-            # and write its config dir (~/.qwen) and /tmp, or it can't start
+            # and write its config dir (~/.qwen), or it can't start
             # inside the jail.
             qwen_dir = Path(self._qwen_path).resolve().parent.parent
             sandbox = with_additional_read_roots(sandbox, [qwen_dir])
-            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".qwen", Path("/tmp")])
+            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".qwen"])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(self._qwen_path, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:
@@ -593,7 +594,7 @@ class QwenExecutor(Executor):
         await self._send(request)
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending.pop(req_id, None)
             raise
 
@@ -1296,6 +1297,10 @@ class QwenExecutor(Executor):
             return True
         return False
 
+    def preserves_empty_initiating_message(self) -> bool:
+        """Keep the initiating item identity even when its ACP prompt is empty."""
+        return True
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -1340,6 +1345,9 @@ class QwenExecutor(Executor):
         # a reset) holds no prior context. Captured before we flip the latch
         # below so we know whether to replay history into this turn.
         fresh_session = not self._system_prompt_sent
+
+        candidate_id = messages[-1].get("input_item_id") if messages else None
+        input_item_id = candidate_id if isinstance(candidate_id, str) else None
 
         # Build the prompt payload from the most recent user message.
         user_text = ""
@@ -1421,6 +1429,7 @@ class QwenExecutor(Executor):
             "params": {
                 "sessionId": session_id,
                 "prompt": prompt_blocks,
+                "_meta": {_META_INPUT_ITEM_ID: input_item_id},
             },
         }
         await self._send(prompt_request)
@@ -1480,7 +1489,7 @@ class QwenExecutor(Executor):
                 notification = await asyncio.wait_for(
                     self._queue.get(), timeout=min(remaining, 2.0)
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
             method = notification.get("method", "")

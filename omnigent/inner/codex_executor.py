@@ -26,6 +26,7 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Collection,
     Iterable,
     Mapping,
     MutableMapping,
@@ -40,7 +41,26 @@ from typing import Any, Protocol, TypeAlias, cast
 from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
+from omnigent.databricks_ai_gateway import (
+    CLIENT_SURFACES_HEADER,
+    CODEX_AGENT,
+    CODING_AGENT_HEADER,
+    REQUEST_TAGS_HEADER,
+    is_databricks_ai_gateway_url,
+    with_gateway_attribution,
+)
 from omnigent.errors import HarnessTransportClosedError
+from omnigent.harnesses.codex_egress import (
+    CERTIFICATE_FAILURE_CODE,
+    CERTIFICATE_FAILURE_TITLE,
+    CERTIFICATE_REMEDIATION,
+    CertificateFailure,
+    certificate_failure_message,
+    connection_retry_detail,
+    detect_certificate_failure,
+    is_connection_failure_text,
+    is_connection_retry,
+)
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
@@ -48,15 +68,22 @@ from omnigent.models.codex_model_vocabulary import (
     EXTENDED_CATALOG_MODELS,
     EXTENDED_MODEL_DEFAULT_EFFORT,
     EXTENDED_MODEL_EFFORTS,
+    EXTENDED_MODEL_INPUT_MODALITIES,
 )
-from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
+from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.spec.repo_scope import repo_scope_dirs
 from omnigent.spec.types import RetryPolicy
+from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
 from . import _proc
-from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
+from ._subprocess_lifecycle import (
+    close_subprocess_transport,
+    subprocess_exited,
+    terminate_subprocess,
+)
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
@@ -68,6 +95,9 @@ from .codex_staging import (
     prepare_codex_skills_dir,
 )
 from .codex_worker import (
+    BROKERED_CODEX_ALLOWED_ENV,
+    BROKERED_CODEX_AUTH_COMMAND,
+    BROKERED_CODEX_ENV,
     CodexWorkerLaunch,
     prepare_codex_catalog_probe,
     prepare_codex_worker,
@@ -109,7 +139,7 @@ logger = logging.getLogger(__name__)
 # Default auth-token refresh cadence (ms) for the vendor-neutral gateway
 # transport when ``HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS`` is unset.
 # Not Databricks-specific: the same fallback applies to any gateway producer
-# (Databricks AI gateway or a generic key/gateway provider).
+# (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _GATEWAY_AUTH_TIMEOUT_MS = 15_000
 
@@ -170,6 +200,13 @@ _STREAM_READ_CHUNK_SIZE = 65536
 # home starts with no memories and past-conversation context is lost. The ``_1``
 # suffix is Codex's schema version — update if Codex migrates to a newer schema.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json", ".credentials.json", "memories_1.sqlite")
+# Bridged as hard links instead: Codex rewrites its OAuth store in place through
+# an ``O_NOFOLLOW`` open, which fails on a symlink (ELOOP). A hard link shares the
+# inode, so refreshes still reach the real home.
+_CODEX_HOME_HARDLINK_FILES = frozenset({".credentials.json"})
+# Unlike a symlink, a hard link records no path back to its source home, so the
+# private home records it here for nested launches to resolve.
+_CODEX_HOME_SOURCE_RECORD = ".omnigent-codex-source"
 _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md", "hooks.json")
 # Name of the hooks file inside a CODEX_HOME. Symlinked from the user's home
 # by default; generated as a merged regular file when subagent routing is on.
@@ -200,6 +237,7 @@ _CODEX_HOME_SYMLINK_DIRS = (
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
+_GATEWAY_CODEX_PROVIDER_NAME = "omnigent_databricks"
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -262,6 +300,16 @@ def _parse_codex_gateway_error(line: str) -> _CodexGatewayError | None:
     url_match = _CODEX_STDERR_URL_RE.search(line)
     url = url_match.group("url").rstrip(",") if url_match else None
     return _CodexGatewayError(code, reason, url)
+
+
+def _codex_turn_status(turn: object) -> str | None:
+    """Return a Codex turn object's status, e.g. ``"completed"`` or ``"interrupted"``."""
+    if not isinstance(turn, dict):
+        return None
+    status = turn.get("status")
+    if isinstance(status, dict):
+        status = status.get("type") or status.get("status")
+    return status if isinstance(status, str) else None
 
 
 def _extract_codex_last_turn_usage(params: object, model: str | None) -> dict[str, object] | None:
@@ -565,7 +613,7 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
         stdout, _ = await asyncio.wait_for(
             proc.communicate(), timeout=_CODEX_VERSION_PROBE_TIMEOUT_SECONDS
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         with suppress(ProcessLookupError):
             proc.kill()
         with suppress(Exception):
@@ -604,21 +652,30 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 
-_BROKERED_CODEX_VERSION = Version("0.146.0")
+_BROKERED_CODEX_MIN_VERSION = Version("0.146.0")
 
 
 async def _require_brokered_codex_version(codex_path: str) -> None:
-    """Fail closed unless Codex uses the wire version tested for brokered auth."""
+    """Fail closed unless Codex is a stable release at or above the brokered-auth floor.
+
+    The signer rebuilds every request strictly, so a newer Codex that sends an
+    unexpected request fails its turn rather than reaching the model.
+    """
     raw = await _codex_cli_version_text(codex_path)
     try:
         version = Version(raw) if raw is not None else None
     except InvalidVersion:
         version = None
-    if version != _BROKERED_CODEX_VERSION:
+    if (
+        version is None
+        or version.is_prerelease
+        or version.is_postrelease
+        or version < _BROKERED_CODEX_MIN_VERSION
+    ):
         shown = raw or "unparseable"
         raise RuntimeError(
             "unsupported Codex wire version "
-            f"{shown}; brokered authentication requires exactly 0.146.0"
+            f"{shown}; brokered authentication requires a stable Codex 0.146.0 or newer"
         )
 
 
@@ -713,22 +770,40 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     return env
 
 
+@dataclass(frozen=True)
+class CodexSkillSources:
+    """
+    Existing Codex skill roots, split by who loads them, each in priority order.
+
+    :param linked: The bundle, host Codex, and ``~/.agents`` skills that the
+        launch symlinks into ``$CODEX_HOME/skills``. Codex ranks them as user
+        skills.
+    :param native: The repo-scope ``.agents/skills`` dirs, nearest first, which
+        Codex reads from its own cwd and ranks above user skills.
+    """
+
+    linked: list[Path]
+    native: list[Path]
+
+
 def codex_skill_sources(
     bundle_dir: Path | None,
     home: Path,
     *,
     codex_home: Path | None = None,
-) -> list[Path]:
+    workspace: Path | None = None,
+) -> CodexSkillSources:
     """
-    Build the ordered Codex skill-source list: bundle skills, then host skills.
+    Find every Codex skill root, split into linked and native groups.
 
     The single source of truth for *where* Codex skills come from, shared
-    by :func:`populate_codex_skills_from_bundle` (which symlinks them into
-    ``$CODEX_HOME/skills/``) and the slash-command menu's ``codex_host_skills``
-    provider — so the linked set and the menu cannot drift on which roots
-    are scanned. Priority order: the agent's own ``<bundle>/skills/`` before
-    the host-installed skills dir (a bundled skill shadows a host skill of
-    the same name). Only existing directories are returned.
+    by :func:`populate_codex_skills_from_bundle` (which symlinks only the
+    ``linked`` group into ``$CODEX_HOME/skills/``) and the slash-command
+    menu's ``codex_host_skills`` provider, which lists both groups. The
+    ``linked`` order is the agent's own ``<bundle>/skills/``, then the
+    host-installed Codex skills dir, then ``~/.agents/skills``: an earlier
+    source shadows a later skill of the same name. Only existing directories
+    are returned.
 
     :param bundle_dir: Materialized agent-bundle root, or ``None``.
     :param home: The user home directory (``Path.home()``); injected so
@@ -739,15 +814,31 @@ def codex_skill_sources(
         ``$CODEX_HOME`` for its config, so the native launch passes the
         resolved home here to keep the seeded skills and the menu in step with
         the CLI's own ``$CODEX_HOME``.
-    :returns: Existing skill-dir roots in priority order.
+    :param workspace: Codex's working directory. Codex reads ``.agents/skills``
+        from it up to the repository root, or from it alone outside a
+        repository. ``None`` leaves ``native`` empty.
+    :returns: The linked and native skill roots.
     """
-    sources: list[Path] = []
+    linked: list[Path] = []
     if bundle_dir is not None and (bundle_dir / "skills").is_dir():
-        sources.append(bundle_dir / "skills")
+        linked.append(bundle_dir / "skills")
     host = (codex_home if codex_home is not None else home / ".codex") / "skills"
     if host.is_dir():
-        sources.append(host)
-    return sources
+        linked.append(host)
+    shared = home / ".agents" / "skills"
+    if shared.is_dir():
+        linked.append(shared)
+    native: list[Path] = []
+    if workspace is not None:
+        # A home-directory workspace keeps ~/.agents/skills at its user-tier rank.
+        user_tier = os.path.realpath(shared)
+        native = [
+            skills
+            for directory in repo_scope_dirs(workspace, outside_repo="self")
+            if (skills := directory / ".agents" / "skills").is_dir()
+            and os.path.realpath(skills) != user_tier
+        ]
+    return CodexSkillSources(linked=linked, native=native)
 
 
 def select_codex_skill_dirs(
@@ -923,16 +1014,19 @@ def populate_codex_skills_from_bundle(
     *,
     copy_skills: bool = False,
     source_codex_home: Path | None = None,
+    include_host_skills: bool = True,
 ) -> None:
     """
     Populate a CODEX_HOME's ``skills/`` from a bundle + host skills.
 
     Shared by the wrapped ``codex`` executor and the ``codex-native``
-    launch path so both expose the same skill surface. Builds the source
-    list in priority order — the agent's own ``<bundle>/skills/`` before
-    the host skills dir (so a bundled skill shadows a host skill of the same
-    name) — and delegates to :func:`_populate_codex_skills`, which honours
-    ``skills_filter`` (``"all"`` / ``"none"`` / list of names).
+    launch path so both expose the same skill surface. Links the ``linked``
+    roots of :func:`codex_skill_sources` in priority order — the agent's own
+    ``<bundle>/skills/`` before the host skills dir (so a bundled skill shadows
+    a host skill of the same name) — and delegates to
+    :func:`_populate_codex_skills`, which honours ``skills_filter`` (``"all"`` /
+    ``"none"`` / list of names). Repo-scope skills are not linked: Codex reads
+    them from its cwd, so a link would register each one twice.
 
     :param codex_home: The CODEX_HOME whose ``skills/`` subdir Codex
         scans, e.g. a per-conversation temp dir or the per-bridge native
@@ -952,12 +1046,17 @@ def populate_codex_skills_from_bundle(
         skills from instead of ``~/.codex``. The native launch passes the
         ``$CODEX_HOME``-resolved home so the seeded skills match what the CLI
         loads; the wrapped executor omits it and keeps ``~/.codex``.
+    :param include_host_skills: Include host Codex and shared skills. Brokered
+        gateway sessions use only bundle skills.
     :returns: None.
     """
-    skill_sources = codex_skill_sources(bundle_dir, Path.home(), codex_home=source_codex_home)
-    _populate_codex_skills(
-        codex_home / "skills", skills_filter, skill_sources, copy_skills=copy_skills
-    )
+    if include_host_skills:
+        sources = codex_skill_sources(bundle_dir, Path.home(), codex_home=source_codex_home).linked
+    else:
+        sources = (
+            [bundle_dir / "skills"] if bundle_dir and (bundle_dir / "skills").is_dir() else []
+        )
+    _populate_codex_skills(codex_home / "skills", skills_filter, sources, copy_skills=copy_skills)
 
 
 def _is_omnigent_private_codex_home(path: Path) -> bool:
@@ -992,7 +1091,8 @@ def _private_codex_home_config_source(path: Path) -> Path | None:
     A parent Omnigent launch bridges ``auth.json`` and ``config.toml`` into
     its private home as symlinks. If a nested launch inherits that private
     ``CODEX_HOME``, those symlink targets are the only durable record of a
-    custom parent source.
+    custom parent source, along with the source recorded beside a
+    hard-linked credential store.
 
     :param path: Private ``CODEX_HOME`` path, e.g.
         ``"/home/user/.omnigent/codex-native/<hash>/codex-home"``.
@@ -1006,6 +1106,10 @@ def _private_codex_home_config_source(path: Path) -> Path | None:
             continue
         with suppress(OSError):
             source_dirs.add(config_file.resolve().parent)
+    with suppress(OSError):
+        recorded = (path / _CODEX_HOME_SOURCE_RECORD).read_text().strip()
+        if recorded:
+            source_dirs.add(Path(recorded))
     if len(source_dirs) == 1:
         return next(iter(source_dirs))
     return None
@@ -1070,6 +1174,7 @@ def _populate_codex_home_config(
     supported_efforts: frozenset[str] = CODEX_EFFORTS,
     include_credentials: bool = True,
     required_brokered_probe: tuple[str, Path, OSEnvSpec] | None = None,
+    require_native_tools_disabled: bool = False,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -1134,7 +1239,10 @@ def _populate_codex_home_config(
             write_required_brokered_model_catalog(
                 target_dir,
                 codex_path=probe.launch_path,
+                strip_native_tools=require_native_tools_disabled,
             )
+            if require_native_tools_disabled:
+                verify_brokered_codex_native_tools_disabled(probe.launch_path, target_dir)
         finally:
             probe.close()
     if not source_dir.is_dir():
@@ -1156,22 +1264,30 @@ def _populate_codex_home_config(
         # home would either shadow it or (worse) be written through.
         symlink_files = tuple(name for name in symlink_files if name != _CODEX_HOOKS_FILENAME)
     for filename in symlink_files:
+        link_path = target_dir / filename
+        if filename in _CODEX_HOME_HARDLINK_FILES and link_path.is_symlink():
+            # A home reused from before hard-linking still holds the symlink.
+            link_path.unlink()
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
-        link_path = target_dir / filename
         if link_path.exists() or link_path.is_symlink():
             continue
         try:
-            link_path.symlink_to(source_file)
+            if filename in _CODEX_HOME_HARDLINK_FILES:
+                os.link(source_file, link_path)
+            else:
+                link_path.symlink_to(source_file)
         except OSError as exc:
             logger.warning(
-                "could not symlink %r into %s (%s); copying instead",
+                "could not link %r into %s (%s); copying instead",
                 filename,
                 target_dir,
                 exc,
             )
             shutil.copy2(source_file, link_path)
+        if filename in _CODEX_HOME_HARDLINK_FILES:
+            (target_dir / _CODEX_HOME_SOURCE_RECORD).write_text(f"{source_dir.resolve()}\n")
 
     if not minimal_config:
         for reldir in _CODEX_HOME_SYMLINK_DIRS:
@@ -1238,6 +1354,9 @@ def materialize_codex_provider_config(
     config_overrides: Iterable[str],
     *,
     retry_policy: RetryPolicy | None = None,
+    source_home: Path | None = None,
+    effective_providers: Mapping[str, object] | None = None,
+    client_surface: str | None = None,
 ) -> list[str]:
     """Move generated provider definitions into a private Codex config.
 
@@ -1246,15 +1365,36 @@ def materialize_codex_provider_config(
     commands. Persist them in the session-owned ``config.toml`` instead so
     process arguments contain only non-secret routing and behavior overrides.
 
+    Built-in provider tables (e.g. ``[model_providers.amazon-bedrock]``) stay
+    untouched: Codex rejects unsupported fields there by discarding the whole config.
+    Custom providers on a Databricks Unity Gateway also get the gateway's
+    usage-attribution ``http_headers``.
+
     :param codex_home: Private session ``CODEX_HOME`` directory.
     :param config_overrides: Pending Codex config override strings.
     :param retry_policy: Omnigent retry policy to apply through Codex's native
         provider settings. ``None`` uses :class:`RetryPolicy` defaults.
+    :param source_home: Optional host config source for a selected custom provider
+        missing from a reused private home. Existing private provider tables win.
+    :param effective_providers: Provider tables resolved by Codex's ``config/read``.
+        Only display names and attribution headers are copied from inherited providers.
     :returns: Overrides safe to retain in subprocess arguments.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(codex_home, 0o700)
     config_path = codex_home / "config.toml"
+    from omnigent.onboarding.codex_auth_readiness import (
+        CODEX_BUILTIN_PROVIDERS,
+        effective_codex_model_provider,
+    )
+
+    gateway_providers = {
+        name: provider
+        for name, provider in (effective_providers or {}).items()
+        if isinstance(provider, Mapping)
+        and isinstance(base_url := provider.get("base_url"), str)
+        and is_databricks_ai_gateway_url(base_url)
+    }
 
     provider_overrides: list[str] = []
     argv_overrides: list[str] = []
@@ -1263,7 +1403,12 @@ def materialize_codex_provider_config(
             provider_overrides.append(override)
         else:
             argv_overrides.append(override)
-    if not provider_overrides and not config_path.is_file():
+    if (
+        not provider_overrides
+        and not config_path.is_file()
+        and source_home is None
+        and not gateway_providers
+    ):
         return argv_overrides
     if not provider_overrides and config_path.is_symlink():
         return argv_overrides
@@ -1272,28 +1417,98 @@ def materialize_codex_provider_config(
 
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     document = tomlkit.parse(existing) if existing else tomlkit.document()
-    providers = document.get("model_providers")
-    if providers is None and not provider_overrides:
+    providers: MutableMapping[str, Any] | None = None
+    declared_providers = document.get("model_providers")
+    if declared_providers is not None:
+        if not isinstance(declared_providers, MutableMapping):
+            raise ValueError("Codex model_providers config must be a TOML table")
+        providers = declared_providers
+
+    if provider_overrides:
+        if providers is None:
+            providers = tomlkit.table()
+            document["model_providers"] = providers
+        for override in provider_overrides:
+            fragment = tomlkit.parse(override)
+            generated = fragment.get("model_providers")
+            if not isinstance(generated, MutableMapping) or not generated:
+                raise ValueError("Codex provider override must define model_providers")
+            for provider_name, provider_config in generated.items():
+                providers[provider_name] = provider_config
+
+    if source_home is not None:
+        selected: object = effective_codex_model_provider(document.unwrap())
+        for override in argv_overrides:
+            key, _, value = override.partition("=")
+            if key.strip() != "model_provider":
+                continue
+            # Like Codex's own ``-c`` parsing: a TOML value, else the bare string;
+            # the last override wins.
+            try:
+                selected = tomlkit.parse(override).get("model_provider")
+            except tomlkit.exceptions.TOMLKitError:
+                selected = value.strip()
+        if (
+            isinstance(selected, str)
+            and selected not in CODEX_BUILTIN_PROVIDERS
+            and (providers is None or selected not in providers)
+        ):
+            source_path = source_home / "config.toml"
+            try:
+                source = (
+                    tomlkit.parse(source_path.read_text(encoding="utf-8")).unwrap()
+                    if source_path.is_file()
+                    else {}
+                )
+            except (OSError, UnicodeDecodeError, tomlkit.exceptions.TOMLKitError) as exc:
+                logger.warning(
+                    "skipping unusable Codex source config %s for provider %r: %s",
+                    source_path,
+                    selected,
+                    exc,
+                )
+                source = {}
+            source_providers = source.get("model_providers")
+            source_provider = (
+                source_providers.get(selected) if isinstance(source_providers, dict) else None
+            )
+            if isinstance(source_provider, dict):
+                if providers is None:
+                    providers = tomlkit.table()
+                    document["model_providers"] = providers
+                # A plain dict takes the parent's table style, so an inline
+                # ``model_providers`` parent still serializes as valid TOML.
+                providers[selected] = source_provider
+
+    if providers is None and gateway_providers:
+        providers = tomlkit.table()
+        document["model_providers"] = providers
+
+    if providers is None:
         if config_path.is_file() and not config_path.is_symlink():
             os.chmod(config_path, 0o600)
         return argv_overrides
-    if providers is None:
-        document["model_providers"] = tomlkit.table()
-        providers = document["model_providers"]
-    if not isinstance(providers, MutableMapping):
-        raise ValueError("Codex model_providers config must be a TOML table")
 
-    for override in provider_overrides:
-        fragment = tomlkit.parse(override)
-        generated = fragment.get("model_providers")
-        if not isinstance(generated, MutableMapping) or not generated:
-            raise ValueError("Codex provider override must define model_providers")
-        for provider_name, provider_config in generated.items():
-            providers[provider_name] = provider_config
+    for provider_name, effective_provider in gateway_providers.items():
+        if provider_name in CODEX_BUILTIN_PROVIDERS:
+            continue
+        if provider_name not in providers:
+            providers[provider_name] = tomlkit.inline_table()
+        provider_config = providers[provider_name]
+        name = effective_provider.get("name")
+        # Hook-trust writes validate inactive providers too, without CLI name overlays.
+        if isinstance(provider_config, MutableMapping) and isinstance(name, str) and name.strip():
+            configured_name = provider_config.get("name")
+            if "name" not in provider_config or (
+                isinstance(configured_name, str) and not configured_name.strip()
+            ):
+                provider_config["name"] = name
 
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):
         if not isinstance(provider_config, MutableMapping):
+            continue
+        if provider_name in CODEX_BUILTIN_PROVIDERS:
             continue
         if isinstance(provider_config, tomlkit.items.InlineTable):
             inline_provider = tomlkit.inline_table()
@@ -1305,6 +1520,38 @@ def materialize_codex_provider_config(
         provider_config["stream_max_retries"] = policy.max_retries
         if policy.timeout_per_request_s is not None:
             provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
+        resolved = (effective_providers or {}).get(provider_name)
+        effective = resolved if isinstance(resolved, Mapping) else provider_config
+        base_url = effective.get("base_url")
+        if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
+            headers = provider_config.get("http_headers")
+            effective_headers = effective.get("http_headers")
+            attributed = with_gateway_attribution(
+                effective_headers if isinstance(effective_headers, Mapping) else None,
+                CODEX_AGENT,
+                base_url,
+                client_surface=client_surface,
+            )
+            attribution_headers = {
+                name: value
+                for name, value in attributed.items()
+                if name.lower()
+                in (
+                    CODING_AGENT_HEADER.lower(),
+                    CLIENT_SURFACES_HEADER.lower(),
+                    REQUEST_TAGS_HEADER.lower(),
+                )
+            }
+            replaced_header_names = {name.lower() for name in attribution_headers}
+            # Codex retains inherited routing and credentials; write only attribution.
+            provider_config["http_headers"] = {
+                **{
+                    name: value
+                    for name, value in (headers.items() if isinstance(headers, Mapping) else ())
+                    if name.lower() not in replaced_header_names
+                },
+                **attribution_headers,
+            }
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
     try:
@@ -1656,6 +1903,18 @@ _CODEX_OMNIGENT_LAUNCH_ENV_VARS: tuple[str, ...] = (
 _CODEX_MODEL_CATALOG_FILENAME = "model_catalog.json"
 _BROKERED_MODEL_CATALOG_MAX_BYTES = 4 * 1024 * 1024
 _BROKERED_MODEL_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
+_BROKERED_DISABLED_FEATURES = (
+    "shell_tool",
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "in_app_browser",
+    "view_image",
+    "image_generation",
+    "multi_agent",
+    "code_mode",
+)
 # Entry a gateway-only model is cloned from: the cheapest current arm, so an
 # unset field inherits a sane current-generation value rather than a frozen one.
 _CATALOG_CLONE_SOURCE_SLUG = CODEX_CATALOG_CLONE_SOURCE_SLUG
@@ -1713,6 +1972,8 @@ def extended_model_catalog(
                 "upgrade": None,
             }
         )
+        if modalities := EXTENDED_MODEL_INPUT_MODALITIES.get(bare):
+            entry["input_modalities"] = list(modalities)
         added.append(entry)
     if not added:
         return None
@@ -1956,6 +2217,7 @@ def write_required_brokered_model_catalog(
     target_dir: Path,
     *,
     codex_path: str,
+    strip_native_tools: bool = False,
     timeout: float = 10.0,
 ) -> Path:
     """Write the bundled Codex catalog required by a brokered session."""
@@ -1985,6 +2247,11 @@ def write_required_brokered_model_catalog(
         raise RuntimeError("signer-backed Codex requires a valid bundled model catalog") from exc
     if not _valid_brokered_model_catalog(catalog):
         raise RuntimeError("signer-backed Codex requires a valid bundled model catalog")
+    if strip_native_tools:
+        for entry in catalog["models"]:
+            entry["shell_type"] = "disabled"
+            entry["apply_patch_tool_type"] = None
+            entry["experimental_supported_tools"] = []
 
     target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(target_dir, 0o700)
@@ -2011,6 +2278,49 @@ def write_required_brokered_model_catalog(
             catalog_path.unlink()
         raise RuntimeError("signer-backed Codex requires a valid bundled model catalog")
     return catalog_path
+
+
+def verify_brokered_codex_native_tools_disabled(codex_path: str, codex_home: Path) -> None:
+    """Require the installed CLI to honor locked sessions' native-tool switches."""
+    env = {
+        name: value
+        for name in ("PATH", "LANG", "LC_ALL", "TZ")
+        if (value := os.environ.get(name)) is not None
+    }
+    env.setdefault("PATH", os.defpath)
+    env["HOME"] = str(codex_home)
+    env["CODEX_HOME"] = str(codex_home)
+    try:
+        completed = subprocess.run(
+            [
+                codex_path,
+                *(
+                    arg
+                    for name in _BROKERED_DISABLED_FEATURES
+                    for arg in ("-c", f"features.{name}=false")
+                ),
+                "-c",
+                "web_search=disabled",
+                "features",
+                "list",
+            ],
+            capture_output=True,
+            timeout=10,
+            env=env,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise RuntimeError("brokered Codex requires a CLI that disables native tools") from None
+    if completed.returncode != 0 or any(
+        re.search(
+            rb"^" + name.encode() + rb"\s+.+\s+false\s*$",
+            completed.stdout,
+            re.MULTILINE,
+        )
+        is None
+        for name in _BROKERED_DISABLED_FEATURES
+    ):
+        raise RuntimeError("brokered Codex requires a CLI that disables native tools")
 
 
 # Top-level ``model_reasoning_effort = "<value>"`` assignment, tolerating
@@ -2091,7 +2401,7 @@ def _normalize_copied_codex_effort(
 
 
 def _databricks_codex_base_url(host: str) -> str:
-    """Return the Unity AI Gateway Codex Responses base URL for *host*."""
+    """Return the Unity Gateway Codex Responses base URL for *host*."""
     return f"{host.rstrip('/')}/ai-gateway/codex/v1"
 
 
@@ -2117,6 +2427,7 @@ def _databricks_codex_config_overrides(
     base_url: str,
     auth_command: str,
     auth_refresh_interval_ms: int | None = None,
+    auth_config: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Return TOML-fragment overrides for the Codex per-conversation config.
 
@@ -2128,21 +2439,39 @@ def _databricks_codex_config_overrides(
         a bearer token, e.g. ``"databricks auth token --host ..."``.
     :param auth_refresh_interval_ms: Refresh cadence in milliseconds,
         e.g. ``900000``.
+    :param auth_config: ucode's structured auth command, args and timeout.
+        Invalid or missing values retain the legacy shell helper and defaults.
     :returns: Codex TOML-fragment override strings.
     """
-    provider_name = "omnigent_databricks"
-    auth_command_json = json.dumps(auth_command)
+    provider_name = _GATEWAY_CODEX_PROVIDER_NAME
+    command = "sh"
+    args = ["-c", auth_command]
+    timeout_ms = _GATEWAY_AUTH_TIMEOUT_MS
+    if auth_config is not None:
+        configured_command = auth_config.get("command")
+        configured_args = auth_config.get("args", [])
+        if (
+            isinstance(configured_command, str)
+            and configured_command.strip()
+            and isinstance(configured_args, list)
+            and all(isinstance(arg, str) for arg in configured_args)
+        ):
+            command = configured_command
+            args = configured_args
+        configured_timeout = auth_config.get("timeout_ms")
+        if type(configured_timeout) is int and configured_timeout > 0:
+            timeout_ms = configured_timeout
     return [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
         "model_supports_reasoning_summaries=true",
         (
-            "model_providers.omnigent_databricks="
+            f"model_providers.{provider_name}="
             '{name="Omnigent Databricks",'
             f"base_url={json.dumps(base_url)},"
-            'auth={command="sh",'
-            f'args=["-c",{auth_command_json}],'
-            f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
+            f"auth={{command={json.dumps(command)},"
+            f"args={json.dumps(args)},"
+            f"timeout_ms={timeout_ms},"
             f"refresh_interval_ms={auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS}"
             "},"
             'wire_api="responses"}'
@@ -2695,6 +3024,7 @@ class _CodexAppServerSession:
         env: dict[str, str],
         tool_executor: CodexToolExecutor | None,
         codex_config_overrides: list[str] | None = None,
+        active_harnesses: Collection[str] | None = None,
         retry_policy: RetryPolicy | None = None,
         disable_native_tools: bool = False,
         bundle_dir: Path | None = None,
@@ -2709,7 +3039,9 @@ class _CodexAppServerSession:
         self._cwd = cwd
         self._env = env
         self._tool_executor = tool_executor
-        self._codex_config_overrides = list(codex_config_overrides or [])
+        self._base_codex_config_overrides = tuple(codex_config_overrides or ())
+        self._codex_config_overrides = list(self._base_codex_config_overrides)
+        self._mcp_active_harnesses = active_harnesses
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
@@ -2740,15 +3072,14 @@ class _CodexAppServerSession:
         self._reader_completed_turn: str | None = None
         self._next_id = 1
         self._started = False
+        self._starting = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self.thread_id: str | None = None
         self.active_turn_id: str | None = None
-        # Last reasoning effort applied via ``thread/settings/update`` on the
-        # current thread. Effort is not part of the executor's session
-        # signature, so a change must be re-applied per turn; this is reset on
-        # a fresh thread so it is re-sent. ``turn/start`` carries no ``effort``
-        # field (it is silently dropped), hence the separate settings update.
+        # Last requested override on this thread; None means its original default.
         self._applied_effort: str | None = None
+        self._default_effort: str | None = None
+        self._thread_model: str | None = None
         self._recent_stderr: list[str] = []
         # Auth-class gateway rejection tracking, read off the CLI's stderr so a
         # turn that emits no events fails fast with the real cause instead of
@@ -2760,6 +3091,12 @@ class _CodexAppServerSession:
         self._pending_fatal_gateway_error: _CodexGatewayError | None = None
         self._saw_retries_exhausted = False
         self._fatal_gateway_error: _CodexGatewayError | None = None
+        # A TLS certificate failure the codex launcher printed to stderr. The
+        # launcher prints it once at start, so it stays until a turn reaches
+        # the model and proves the egress works.
+        self._certificate_failure: CertificateFailure | None = None
+        # Whether this turn saw Codex retry a request that got no HTTP response.
+        self._saw_connection_retry = False
         self._recent_events: list[CodexMessage] = []
         self._process_cwd: Path | None = None
         self._worker_launch: CodexWorkerLaunch | None = None
@@ -2789,15 +3126,23 @@ class _CodexAppServerSession:
 
     async def start(self) -> None:
         """Start signer and worker transactionally."""
+        self._starting = True
         try:
             await self._start_unchecked()
         except BaseException:
             await self.close()
             raise
+        finally:
+            self._starting = False
+            # Startup owns the signer across worker replacement. Hand EOF cleanup
+            # back to the reader, including EOF that arrived during initialize.
+            if not self._closing and self._reader_task is not None and self._reader_task.done():
+                await self._close_signer()
 
     async def _start_unchecked(self) -> None:
         if self._started:
             return
+        self._codex_config_overrides = list(self._base_codex_config_overrides)
         cleanup_task = self._cleanup_task
         if cleanup_task is not None and not cleanup_task.done():
             await asyncio.shield(cleanup_task)
@@ -2862,25 +3207,23 @@ class _CodexAppServerSession:
                 self._codex_home_dir / "skills",
                 exc,
             )
+        brokered_gateway = self._env.get(BROKERED_CODEX_ENV) == "1"
         populate_codex_skills_from_bundle(
             self._codex_home_dir,
             self._bundle_dir,
             self._skills_filter,
             copy_skills=True,
+            include_host_skills=not brokered_gateway,
         )
-        # Bridge the user's authentication and provider config into the
-        # temp CODEX_HOME. The codex CLI reads ``auth.json`` (OAuth tokens
-        # for subscription auth) and ``config.toml`` (model provider
-        # definitions) from ``$CODEX_HOME``; without this step a freshly-
-        # created temp dir has neither, causing 401 Unauthorized errors
-        # for subscription-authenticated users.
+        # Subscription sessions bridge host auth and provider config into the
+        # temp home. Brokered sessions use only generated provider config.
         config_source = _codex_home_config_source_from_env()
         # When the runner advertises a subagent-routing endpoint, the user's
         # hooks.json is merged into a generated file registering the routing
         # hooks instead of being symlinked in untouched. Only an auto-harness
         # Smart Routing session gets that endpoint, so a plain or pinned session
         # keeps the symlink — and with it mid-session edits to the user's file.
-        router_bridge_dir = codex_router_bridge_dir(self._env)
+        router_bridge_dir = None if brokered_gateway else codex_router_bridge_dir(self._env)
         if router_bridge_dir is not None:
             # Probed only on the routing path so a plain session never pays the
             # subprocess. A CLI too old for the spawn gate drops the hooks and
@@ -2898,26 +3241,43 @@ class _CodexAppServerSession:
             _populate_codex_home_config,
             self._codex_home_dir,
             config_source,
-            minimal_config=True if self._signer is not None else None,
+            minimal_config=True if self._signer is not None or brokered_gateway else None,
             inject_hooks=router_bridge_dir is not None,
-            extend_model_catalog=codex_extended_catalog_requested(self._env),
-            include_credentials=self._signer is None,
+            extend_model_catalog=(
+                not brokered_gateway and codex_extended_catalog_requested(self._env)
+            ),
+            include_credentials=self._signer is None and not brokered_gateway,
+            require_native_tools_disabled=brokered_gateway,
             required_brokered_probe=(
                 (
                     self._codex_path,
                     Path(self._cwd or os.getcwd()).resolve(strict=False),
                     self._os_env_spec,
                 )
-                if self._signer is not None and self._os_env_spec is not None
+                if (self._signer is not None or brokered_gateway) and self._os_env_spec is not None
                 else None
             ),
         )
-        self._codex_config_overrides = materialize_codex_provider_config(
-            self._codex_home_dir,
-            self._codex_config_overrides,
-            retry_policy=self._retry_policy,
-        )
-        if self._signer is not None:
+        if self._signer is None and not brokered_gateway:
+            from omnigent.harnesses.codex_native.app_server import prepare_codex_provider_config
+
+            self._codex_config_overrides = await prepare_codex_provider_config(
+                self._codex_home_dir,
+                self._codex_config_overrides,
+                codex_path=self._codex_path,
+                cwd=Path(self._cwd or os.getcwd()),
+                env=self._env,
+                retry_policy=self._retry_policy,
+                client_surface=harness_client_surface(),
+            )
+        else:
+            # The signer replaces gateway attribution from its own launch metadata.
+            self._codex_config_overrides = materialize_codex_provider_config(
+                self._codex_home_dir,
+                self._codex_config_overrides,
+                retry_policy=self._retry_policy,
+            )
+        if self._signer is not None or brokered_gateway:
             self._codex_config_overrides.extend(
                 [
                     f"sqlite_home={json.dumps(str(self._codex_home_dir))}",
@@ -2935,13 +3295,16 @@ class _CodexAppServerSession:
         # history) in a private temp directory rather than the user's ~/.codex/.
         # This prevents subagent sessions from polluting the user's Codex history.
         proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
-        if self._signer is not None:
+        if self._signer is not None or brokered_gateway:
             # Newer Codex builds keep some SQLite stores relative to HOME even
             # when CODEX_HOME is set. Keep those stores inside the same private,
             # sandbox-writable session directory and away from host ~/.codex.
             proc_env["HOME"] = str(self._codex_home_dir)
             proc_env["CFFIXED_USER_HOME"] = str(self._codex_home_dir)
             proc_env["CODEX_SQLITE_HOME"] = str(self._codex_home_dir)
+        if brokered_gateway:
+            for name in ("TMPDIR", "TMP", "TEMP"):
+                proc_env[name] = str(self._codex_home_dir)
         try:
             process_cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             # Active egress rules start a parent-side proxy and wait for its
@@ -2968,65 +3331,31 @@ class _CodexAppServerSession:
                 await asyncio.to_thread(worker_launch.close)
                 raise RuntimeError("Codex session closed during worker preparation")
             self._worker_launch = worker_launch
-            argv = [self._worker_launch.launch_path, "app-server"]
-            for override in self._codex_config_overrides:
-                argv.extend(["-c", override])
-            spawn_argv = argv
-            pass_fds: tuple[int, ...] = ()
-            liveness_read_fd: int | None = None
-            await self._require_live_signer()
-            if self._worker_launch.sandboxed and os.name == "posix":
-                liveness_read_fd, self._worker_liveness_fd = os.pipe()
-                os.set_inheritable(liveness_read_fd, True)
-                spawn_argv = [
-                    sys.executable,
-                    str(Path(__file__).with_name("_liveness_exec.py")),
-                    "--liveness-fd",
-                    str(liveness_read_fd),
-                    *argv,
-                ]
-                pass_fds = (liveness_read_fd,)
-            try:
-                spawn_task = asyncio.create_task(
-                    _create_subprocess_exec(
-                        *spawn_argv,
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        env=proc_env,
-                        pass_fds=pass_fds,
-                        **_proc.spawn_kwargs(),
-                        cwd=self._cwd or os.getcwd(),
-                    )
-                )
-                self._worker_spawn_task = spawn_task
-                proc = await asyncio.shield(spawn_task)
-                self._proc = proc
-                if self._worker_spawn_task is spawn_task:
-                    self._worker_spawn_task = None
-                _proc.remember_process_group(self._proc)
-                _proc.refresh_process_tree(self._proc)
-                if self._closing:
-                    raise RuntimeError("Codex session closed during worker spawn")
-                await self._require_live_signer()
-            finally:
-                if liveness_read_fd is not None:
-                    os.close(liveness_read_fd)
-            self._reader_task = asyncio.create_task(self._reader_loop())
-            self._stderr_task = asyncio.create_task(self._stderr_loop())
-            self._worker_census_task = asyncio.create_task(self._refresh_worker_census())
-            initialized = await self._request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "omnigent",
-                        "version": "0.1",
-                    },
-                    "capabilities": {
-                        "experimentalApi": True,
-                    },
-                },
+            from omnigent.mcp_disabled_servers import (
+                RELAUNCH_WITHOUT_OVERRIDES_EVENT,
+                plan_codex_launch,
             )
+
+            mcp_plan = plan_codex_launch(
+                self._codex_config_overrides,
+                executor="codex",
+                active_harnesses=self._mcp_active_harnesses,
+                codex_home=self._codex_home_dir,
+                cwd=process_cwd,
+            )
+            try:
+                initialized = await self._spawn_and_initialize(mcp_plan.config_overrides, proc_env)
+            except Exception:
+                fallback = mcp_plan.overrides_after_early_exit()
+                if (
+                    fallback is None
+                    or self._proc is None
+                    or not await subprocess_exited(self._proc)
+                ):
+                    raise
+                logger.warning(RELAUNCH_WITHOUT_OVERRIDES_EVENT)
+                await self._discard_early_exit_worker()
+                initialized = await self._spawn_and_initialize(fallback, proc_env)
             user_agent = initialized.get("result", {}).get("userAgent")
             version = (
                 re.match(r"^[^/\s]+/(\d+)\.(\d+)\.(\d+)", user_agent)
@@ -3046,7 +3375,7 @@ class _CodexAppServerSession:
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
-                except Exception:  # noqa: BLE001 - never block session startup
+                except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                     logger.warning(
                         "codex subagent-routing hook trust failed; "
                         "routing will not be enforced for this session",
@@ -3055,6 +3384,110 @@ class _CodexAppServerSession:
         except BaseException:
             await self.close()
             raise
+
+    async def _spawn_and_initialize(
+        self, overrides: Sequence[str], proc_env: dict[str, str]
+    ) -> CodexMessage:
+        """Spawn the prepared worker and complete its initialize handshake."""
+        assert self._worker_launch is not None
+        self._recent_stderr.clear()
+        self._certificate_failure = None
+        self._saw_connection_retry = False
+        self._pending_fatal_gateway_error = None
+        self._saw_retries_exhausted = False
+        self._fatal_gateway_error = None
+        argv = [self._worker_launch.launch_path, "app-server"]
+        for override in overrides:
+            argv.extend(["-c", override])
+        spawn_argv = argv
+        pass_fds: tuple[int, ...] = ()
+        liveness_read_fd: int | None = None
+        await self._require_live_signer()
+        if self._worker_launch.sandboxed and os.name == "posix":
+            liveness_read_fd, self._worker_liveness_fd = os.pipe()
+            os.set_inheritable(liveness_read_fd, True)
+            spawn_argv = [
+                sys.executable,
+                str(Path(__file__).with_name("_liveness_exec.py")),
+                "--liveness-fd",
+                str(liveness_read_fd),
+                *argv,
+            ]
+            pass_fds = (liveness_read_fd,)
+        try:
+            spawn_task = asyncio.create_task(
+                _create_subprocess_exec(
+                    *spawn_argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=proc_env,
+                    pass_fds=pass_fds,
+                    **_proc.spawn_kwargs(),
+                    cwd=self._cwd or os.getcwd(),
+                )
+            )
+            self._worker_spawn_task = spawn_task
+            proc = await asyncio.shield(spawn_task)
+            self._proc = proc
+            if self._worker_spawn_task is spawn_task:
+                self._worker_spawn_task = None
+            _proc.remember_process_group(self._proc)
+            _proc.refresh_process_tree(self._proc)
+            if self._closing:
+                raise RuntimeError("Codex session closed during worker spawn")
+            await self._require_live_signer()
+        finally:
+            if liveness_read_fd is not None:
+                os.close(liveness_read_fd)
+        self._reader_task = asyncio.create_task(self._reader_loop())
+        self._stderr_task = asyncio.create_task(self._stderr_loop())
+        self._worker_census_task = asyncio.create_task(self._refresh_worker_census())
+        return await self._request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "omnigent",
+                    "version": "0.1",
+                },
+                "capabilities": {
+                    "experimentalApi": True,
+                },
+            },
+        )
+
+    async def _discard_early_exit_worker(self) -> None:
+        """Reap a pre-initialize worker while retaining its prepared sandbox and signer."""
+        self._close_worker_liveness()
+        proc = self._proc
+        if proc is not None:
+            reaped = await terminate_subprocess(
+                proc,
+                terminate_timeout=_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
+                kill_timeout=1,
+                label="Codex app-server",
+                terminate_tree=_terminate_process_tree,
+                kill_tree=_kill_process_tree,
+            )
+            if not reaped:
+                raise RuntimeError("Codex early-exit worker could not be reaped")
+        tasks = [
+            task
+            for task in (self._reader_task, self._stderr_task, self._worker_census_task)
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for future in self._pending_requests.values():
+            if not future.done():
+                future.cancel()
+        self._pending_requests.clear()
+        if proc is not None:
+            close_subprocess_transport(proc)
+        self._proc = None
+        self._transport_error = None
+        self._events = asyncio.Queue()
 
     async def close(self) -> None:
         self._closing = True
@@ -3149,7 +3582,7 @@ class _CodexAppServerSession:
                         terminate_tree=_terminate_process_tree,
                         kill_tree=_kill_process_tree,
                     )
-                except Exception:  # noqa: BLE001 - cleanup must continue
+                except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                     logger.warning("Codex worker cleanup failed", exc_info=True)
                     reaped = False
                 if not reaped:
@@ -3216,7 +3649,13 @@ class _CodexAppServerSession:
                     self._worker_launch_close_task = None
                     try:
                         launch_close_task.result()
-                    except Exception:  # noqa: BLE001 - cleanup must continue
+                    except (
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        TypeError,
+                        subprocess.SubprocessError,
+                    ):
                         logger.warning("Codex worker launch cleanup failed", exc_info=True)
                         cleanup_complete = False
                     else:
@@ -3324,7 +3763,7 @@ class _CodexAppServerSession:
             await signer.wait()
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - any signer failure invalidates the worker
+        except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
             logger.debug("model signer watcher failed", exc_info=True)
         self._signer_exited = True
         if not self._closing and self._proc is not None:
@@ -3355,7 +3794,7 @@ class _CodexAppServerSession:
                 await signer.close()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - cleanup state records failure
+            except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                 logger.warning("model signer close failed", exc_info=True)
             else:
                 if self._signer is signer:
@@ -3457,7 +3896,7 @@ class _CodexAppServerSession:
                 return final_response
             try:
                 message = await asyncio.wait_for(self._events.get(), timeout=remaining)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return final_response
             if isinstance(message, HarnessTransportClosedError):
                 # A completed turn remains successful when its process exits.
@@ -3498,6 +3937,35 @@ class _CodexAppServerSession:
             if phase == "final_answer":
                 return final_response
 
+    async def _resolve_default_effort(self) -> str:
+        """Resolve the thread's original configured or model-default effort."""
+        if self._default_effort is not None:
+            return self._default_effort
+        # Null is a no-op for both settings/update and legacy turn/start.
+        # Resolve an explicit value without replacing the thread or its history.
+        if self._thread_model is not None:
+            params: CodexParams = {"includeHidden": True}
+            seen_cursors: set[str] = set()
+            while True:
+                response = await self._request("model/list", params.copy())
+                result = response.get("result", {})
+                for entry in result.get("data", []):
+                    if entry.get("model") == self._thread_model:
+                        effort = entry.get("defaultReasoningEffort")
+                        if isinstance(effort, str) and effort:
+                            self._default_effort = effort
+                            return effort
+                cursor = result.get("nextCursor")
+                if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                    break
+                seen_cursors.add(cursor)
+                params["cursor"] = cursor
+        raise RuntimeError(
+            f"Cannot restore Codex default reasoning effort for {self._thread_model!r}: "
+            "the app-server did not provide a default. Select an explicit effort or "
+            "start a new session."
+        )
+
     async def run_turn(
         self,
         *,
@@ -3522,6 +3990,7 @@ class _CodexAppServerSession:
         self._pending_fatal_gateway_error = None
         self._saw_retries_exhausted = False
         self._fatal_gateway_error = None
+        self._saw_connection_retry = False
         native_forwarder_health.note_post_success()
 
         is_new_thread = self.thread_id is None
@@ -3538,6 +4007,7 @@ class _CodexAppServerSession:
                 params["developerInstructions"] = system_prompt
             if tools:
                 params["dynamicTools"] = _dynamic_tool_specs(tools)
+            if tools or self._disable_native_tools:
                 tool_config: CodexParams = {
                     "features.unified_exec": False,
                 }
@@ -3558,6 +4028,14 @@ class _CodexAppServerSession:
             # Fresh thread: forget the prior thread's applied effort so the
             # settings update below re-sends it for this thread.
             self._applied_effort = None
+            raw_default_effort = response.get("result", {}).get("reasoningEffort")
+            self._default_effort = (
+                raw_default_effort
+                if isinstance(raw_default_effort, str) and raw_default_effort
+                else None
+            )
+            raw_model = response.get("result", {}).get("model")
+            self._thread_model = raw_model if isinstance(raw_model, str) and raw_model else model
             # Fresh thread: cumulative usage counters restart at zero.
             self._thread_usage_total_raw = None
             self._thread_usage_baseline_raw = None
@@ -3600,13 +4078,16 @@ class _CodexAppServerSession:
         # Prefer the persistent thread setting and fall back only for that
         # explicit protocol-version mismatch.
         effort_via_turn_start = False
-        if reasoning_effort and reasoning_effort != self._applied_effort:
+        effort = reasoning_effort
+        if reasoning_effort != self._applied_effort:
+            if effort is None:
+                effort = await self._resolve_default_effort()
             try:
                 await self._request(
                     "thread/settings/update",
                     {
                         "threadId": self.thread_id,
-                        "effort": reasoning_effort,
+                        "effort": effort,
                         "summary": "detailed",
                     },
                 )
@@ -3629,7 +4110,7 @@ class _CodexAppServerSession:
             "input": turn_input,
         }
         if effort_via_turn_start:
-            turn_params["effort"] = reasoning_effort
+            turn_params["effort"] = effort
             turn_params["summary"] = "detailed"
         start_response = await self._request(
             "turn/start",
@@ -3773,10 +4254,7 @@ class _CodexAppServerSession:
                     event_task.cancel()
                     with suppress(BaseException):
                         await event_task
-                    try:
-                        await asyncio.wait_for(self.interrupt_turn(), timeout=0.5)
-                    except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
-                        logger.debug("Codex auth-failure turn interrupt failed: %s", exc)
+                    await self._interrupt_failed_turn("auth-failure")
                     if (
                         fatal_gateway_error.code == 401
                         and self._provider_auth_authority is not None
@@ -4004,6 +4482,10 @@ class _CodexAppServerSession:
                             active_turn_id,
                         )
                         continue
+                    if _codex_turn_status(turn) in (None, "completed"):
+                        # The model answered, so a certificate failure printed at
+                        # launch no longer describes this process's egress.
+                        self._certificate_failure = None
                     if not final_response:
                         final_response = _latest_buffered_agent_message(message_buffers)
                     if not final_response:
@@ -4034,6 +4516,13 @@ class _CodexAppServerSession:
                         or turn.get("error")
                         or "Codex App Server turn failed"
                     )
+                    # Only a connection-level failure is the certificate's doing;
+                    # a tool or provider error keeps its own retryable text.
+                    if self._certificate_failure is not None and (
+                        self._saw_connection_retry or is_connection_failure_text(error_text)
+                    ):
+                        yield self._certificate_error(model, codex_error=error_text)
+                        return
                     # turn/failed is a provider/runtime-level turn error
                     # (e.g. tool exit code, transient provider issue) —
                     # mark retryable so the workflow's retry policy
@@ -4043,6 +4532,18 @@ class _CodexAppServerSession:
 
                 if method == "error":
                     if isinstance(params, dict) and params.get("willRetry") is True:
+                        if is_connection_retry(params):
+                            # Codex retries a connection failure indefinitely:
+                            # name it for the idle watchdog, and fail fast once
+                            # the launcher has already reported the certificate.
+                            self._saw_connection_retry = True
+                            native_forwarder_health.record_transport_failure(
+                                connection_retry_detail(params)
+                            )
+                            if self._certificate_failure is not None:
+                                await self._interrupt_failed_turn("certificate-failure")
+                                yield self._certificate_error(model)
+                                return
                         continue
                     # JSON-RPC-shaped error frames from the app server
                     # carry ``code`` / ``message`` / ``data``. Some error
@@ -4107,6 +4608,28 @@ class _CodexAppServerSession:
             },
         )
         return True
+
+    async def _interrupt_failed_turn(self, cause: str) -> None:
+        """Best-effort interrupt of a turn the head is about to fail on *cause*."""
+        try:
+            await asyncio.wait_for(self.interrupt_turn(), timeout=0.5)
+        except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
+            logger.debug("Codex %s turn interrupt failed: %s", cause, exc)
+
+    def _certificate_error(
+        self, model: str | None, *, codex_error: str | None = None
+    ) -> ExecutorError:
+        """The terminal error for a turn blocked by the launcher-reported certificate failure."""
+        assert self._certificate_failure is not None
+        return ExecutorError(
+            message=certificate_failure_message(
+                self._certificate_failure, model=model, codex_error=codex_error
+            ),
+            retryable=False,
+            code=CERTIFICATE_FAILURE_CODE,
+            title=CERTIFICATE_FAILURE_TITLE,
+            remediation=CERTIFICATE_REMEDIATION,
+        )
 
     async def _execute_dynamic_tool(
         self,
@@ -4269,7 +4792,7 @@ class _CodexAppServerSession:
             logger.debug("Codex App Server reader loop ended: %s", exc)
             self._note_transport_closed(f"Codex app-server reader failed: {exc}", clean_eof=False)
         finally:
-            if not self._closing:
+            if not self._closing and not self._starting:
                 await self._close_signer()
 
     async def _stderr_loop(self) -> None:
@@ -4298,7 +4821,17 @@ class _CodexAppServerSession:
         its own retry budget (a final ``Reconnecting N/N``); the two signals can
         arrive in either order, so both are tracked and fast-fail arms when both
         hold — a single blip the CLI recovers from never kills a healthy turn.
+
+        A TLS certificate failure printed by the codex launcher is kept
+        separately; it arms fast-fail once Codex reports a connection retry.
         """
+        if self._certificate_failure is None:
+            failure = detect_certificate_failure(text)
+            if failure is not None:
+                self._certificate_failure = failure
+                logger.warning(
+                    "codex launcher reported a TLS certificate failure: %s", failure.evidence
+                )
         retry = _CODEX_STDERR_RETRY_EXHAUSTED_RE.search(text)
         if retry is not None and retry.group("n") == retry.group("total"):
             self._saw_retries_exhausted = True
@@ -4358,9 +4891,16 @@ def _default_app_session_factory(
     skills_dir: Path | None = None,
     os_env: OSEnvSpec | None,
     signer_launch_config: SignerLaunchConfig | None = None,
+    active_harnesses: Collection[str] | None = None,
 ) -> _CodexAppServerSession:
+    thread_provider = None
+    if signer_launch_config is not None:
+        thread_provider = _BROKERED_CODEX_PROVIDER_NAME
+    elif env.get(BROKERED_CODEX_ENV) == "1":
+        thread_provider = _GATEWAY_CODEX_PROVIDER_NAME
     return _CodexAppServerSession(
         codex_path=codex_path,
+        active_harnesses=active_harnesses,
         cwd=cwd,
         env=env,
         tool_executor=tool_executor,
@@ -4381,9 +4921,7 @@ def _default_app_session_factory(
             if signer_launch_config is not None and signer_launch_config.auth_profile is not None
             else None
         ),
-        thread_model_provider=(
-            _BROKERED_CODEX_PROVIDER_NAME if signer_launch_config is not None else None
-        ),
+        thread_model_provider=thread_provider,
     )
 
 
@@ -4397,6 +4935,7 @@ class CodexExecutor(Executor):
         codex_path: str | None = None,
         app_session_factory: _AppSessionFactory | None = None,
         gateway: bool = False,
+        brokered_gateway: bool = False,
         databricks_profile: str | None = None,
         model_provider_override: str | None = None,
         gateway_host: str | None = None,
@@ -4411,6 +4950,7 @@ class CodexExecutor(Executor):
         skills_filter: str | list[str] = "all",
         skills_dir: Path | None = None,
         signer_launch_config: SignerLaunchConfig | None = None,
+        active_harnesses: Collection[str] | None = None,
     ) -> None:
         """Create a CodexExecutor.
 
@@ -4516,12 +5056,34 @@ class CodexExecutor(Executor):
                 f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
             )
         self._codex_path = resolved_codex
-        self._env = _clean_codex_env(declared_passthrough(self._os_env_spec))
+        if brokered_gateway and (
+            not gateway or gateway_auth_command != BROKERED_CODEX_AUTH_COMMAND
+        ):
+            raise ValueError("brokered Codex requires gateway routing and placeholder auth")
+        self._brokered_gateway = brokered_gateway
+        self._env = _clean_codex_env(
+            () if brokered_gateway else declared_passthrough(self._os_env_spec)
+        )
+        if self._brokered_gateway:
+            if os_env is None or os_env.sandbox is None or os_env.sandbox.type == "none":
+                raise ValueError("brokered Codex gateway requires an active sandbox")
+            if enable_web_search or not disable_native_tools:
+                raise ValueError(
+                    "brokered Codex gateway requires disabled web search and native tools"
+                )
+            self._env = {
+                key: value for key, value in self._env.items() if key in BROKERED_CODEX_ALLOWED_ENV
+            }
+            self._env[BROKERED_CODEX_ENV] = "1"
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
         # SDK internally). Speculative — empirical audit pending.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._env.update(self._retry_policy.codex_cli.env())
         self._codex_config_overrides: list[str] = []
+        if self._brokered_gateway:
+            self._codex_config_overrides.extend(
+                [f"features.{name}=false" for name in _BROKERED_DISABLED_FEATURES]
+            )
         if signer_launch_config is not None:
             if os_env is None or os_env.sandbox is None or os_env.sandbox.type == "none":
                 raise OSError("signer-backed Codex worker requires an active sandbox")
@@ -4640,7 +5202,8 @@ class CodexExecutor(Executor):
             # ``DATABRICKS_HOST`` is read by the Databricks ``databricks auth
             # token`` fallback auth command; harmless for a generic gateway
             # whose auth command is a static ``printf %s <key>``.
-            self._env["DATABRICKS_HOST"] = host
+            if not self._brokered_gateway:
+                self._env["DATABRICKS_HOST"] = host
             self._codex_config_overrides.extend(
                 _databricks_codex_config_overrides(
                     model=effective_model,
@@ -4664,6 +5227,7 @@ class CodexExecutor(Executor):
                 _AppSessionFactory,
                 partial(
                     _default_app_session_factory,
+                    active_harnesses=active_harnesses,
                     signer_launch_config=signer_launch_config,
                 ),
             )
@@ -4835,28 +5399,20 @@ class CodexExecutor(Executor):
         session_key = _session_key(messages)
         state = self._session_states.setdefault(session_key, _CodexSessionState())
         # cfg.model (per-request /model override) wins over the spec default.
-        # An unresolved default comes from the active provider catalog.
-        # On the cli-config path (model_provider_override set) the codex binary
-        # owns its own model list via its config.toml — omnigent does not pass a
-        # model override to thread/create, letting the binary use its configured
-        # default. Passing an unresolvable alias (e.g. gpt-5.6) would cause the
-        # binary to call UC and get a validation error.
+        # On the cli-config path (model_provider_override set) and on codex's
+        # own login (ChatGPT account / API key), codex owns its model list, so
+        # an unset model reaches thread/start as null and codex starts on its
+        # own configured or catalog default.
         model = cfg.model or self._model_override
         if self._model_provider_override is not None:
             model = None
-        elif model is None:
-            if self._gateway_uses_databricks_profile:
-                resolution = await run_sync_on_thread(
-                    model_catalog.resolve_catalog_model,
-                    "databricks",
-                    family="openai",
-                )
-                model = resolution.model_id
-            else:
-                # Codex's own login (ChatGPT account / API key), where codex is
-                # the vocabulary authority: the bundled OpenAI catalog's newest
-                # row is a bare family alias its backend rejects.
-                model = CODEX_DEFAULT_MODEL
+        elif model is None and self._gateway_uses_databricks_profile:
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                "databricks",
+                family="openai",
+            )
+            model = resolution.model_id
         effective_cwd = (
             self._cwd or (self._os_env_spec.cwd if self._os_env_spec else None) or os.getcwd()
         )

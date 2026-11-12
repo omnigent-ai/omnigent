@@ -82,7 +82,7 @@ _COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
-_SUBAGENT_STATUS_DOT = '[data-testid="subagent-status-dot"]'
+_SUBAGENT_STATUS_AVATAR = '[data-testid="subagent-status-avatar"]'
 
 # One relay = dispatch turn + sub-agent turn + auto-wake continuation,
 # three serial LLM calls, so nonce assertions get a generous budget.
@@ -119,17 +119,13 @@ def _expect_dispatch_tool_call_rendered(page: Page) -> None:
     A lone call can render directly; completed multi-step turns fold calls
     into a collapsed summary group labeled by formatToolRunLabel (generic
     "Called N tools" for unrecognized sys_* names). Expand groups when
-    present. The trigger renders toolTitle.ts's raw-name fallback
-    ("sys_session_send(...)"), not the friendly "Start child session:"
-    verb: sessionTitle() reads `tool`/`session` args while the named
-    spawn schema (omnigent/tools/builtins/spawn.py) sends `agent`/`title`,
-    so the formatter never matches. If this starts failing with the
-    friendly verb present instead, that mismatch was fixed and this
-    should assert "Start child session:".
+    present. The trigger shows toolTitle.ts's "Start child session:" title,
+    built from the named spawn schema's `agent`/`title` args
+    (omnigent/tools/builtins/spawn.py).
 
     :param page: The Playwright page, on the parent session.
     """
-    direct_call = page.get_by_role("button", name=re.compile(r"^sys_session_send\("))
+    direct_call = page.get_by_role("button", name=re.compile(r"^Start child session:"))
     if direct_call.count():
         expect(direct_call.first).to_be_visible()
         return
@@ -138,7 +134,7 @@ def _expect_dispatch_tool_call_rendered(page: Page) -> None:
     expect(step_groups.first).to_be_visible()
     for group in step_groups.all():
         group.click()
-    expect(page.get_by_text(re.compile(r"sys_session_send")).first).to_be_visible()
+    expect(page.get_by_text("Start child session:", exact=True).first).to_be_visible()
 
 
 def _expect_single_deep_thought_row(page: Page) -> str:
@@ -165,7 +161,7 @@ def _expect_single_deep_thought_row(page: Page) -> str:
     rows = rail.locator(_SUBAGENT_ROW)
     expect(rows).to_have_count(1, timeout=30_000)
     expect(rows.first).to_contain_text("deep_thought")
-    expect(rows.first.locator(_SUBAGENT_STATUS_DOT)).to_be_visible()
+    expect(rows.first.locator(_SUBAGENT_STATUS_AVATAR)).to_be_visible()
     child_session_id = rows.first.get_attribute("data-child-session-id")
     assert child_session_id, "subagent row is missing data-child-session-id"
     return child_session_id

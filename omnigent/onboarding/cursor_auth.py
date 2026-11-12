@@ -3,7 +3,7 @@
 Cursor is deliberately outside the anthropic/openai provider-family + gateway
 machinery (see :func:`omnigent.runtime.workflow._build_cursor_spawn_env`): the
 Cursor SDK (``cursor-sdk``) talks only to Cursor's own backend via a
-``CURSOR_API_KEY`` — which it requires — never the Databricks AI gateway. It
+``CURSOR_API_KEY`` — which it requires — never the Databricks Unity Gateway. It
 therefore has no ``providers:`` family entry, but a user should still be able to
 register a ``CURSOR_API_KEY`` once through ``omnigent setup`` rather than
 exporting it in every shell.

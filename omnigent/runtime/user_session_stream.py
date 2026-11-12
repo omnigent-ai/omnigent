@@ -57,9 +57,19 @@ def publish(user_key: str, event: dict[str, Any]) -> None:
         ``{"type": "session_added", "session_id": "conv_abc123"}``.
     """
     with _lock:
-        subs = list(_subscribers.get(user_key, ()))
-    for queue, loop in subs:
-        loop.call_soon_threadsafe(queue.put_nowait, event)
+        subs = _subscribers.get(user_key)
+        if subs is None:
+            return
+        for subscriber in tuple(subs):
+            queue, loop = subscriber
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+            except RuntimeError:
+                # A subscriber's loop can close before its generator cleans up.
+                # Remove that slot without interrupting the producer or peers.
+                subs.discard(subscriber)
+        if not subs:
+            _subscribers.pop(user_key, None)
 
 
 async def subscribe(user_key: str) -> AsyncIterator[dict[str, Any]]:

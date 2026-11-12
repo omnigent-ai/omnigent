@@ -667,9 +667,17 @@ async def test_relocation_during_batch_preserves_unread_result_without_reposting
             read_state: forwarder.TranscriptForwardState,
             agent_name: str,
             settled_response_id: str | None,
+            pending_settled_response_id: str | None = None,
+            pending_settled_at: float | None = None,
         ) -> TranscriptReadResult:
             """Relocate after a real read, before its async caller can persist the cursor."""
-            result = read_items(read_state, agent_name, settled_response_id)
+            result = read_items(
+                read_state,
+                agent_name,
+                settled_response_id,
+                pending_settled_response_id,
+                pending_settled_at,
+            )
             _relocate()
             return result
 
@@ -1215,6 +1223,8 @@ async def test_forwarder_migrates_hook_cursor_state_to_byte_offset(tmp_path: Pat
         server.server_close()
         thread.join(timeout=5.0)
 
+    context = request["body"]["data"].pop("failure_context")
+    assert context["native_hook_cursor"] == 2
     assert request["body"] == {
         "type": "external_session_status",
         "data": {"status": "failed"},

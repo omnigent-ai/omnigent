@@ -28,7 +28,7 @@ report cites the pre-relocation path ``omnigent/pi_native_credentials.py``):
 * **C -- latent prefix-stripping.** ``_inline_family_pi_provider`` hardcodes
   ``KEY_KIND`` in its ``normalize_model_for_provider`` call, so an override of
   ``databricks-claude-fable-5-1`` renders as ``claude-fable-5-1`` -- wrong for a
-  gateway fronting Databricks AI Gateway, which expects the prefixed endpoint
+  gateway fronting Databricks Unity Gateway, which expects the prefixed endpoint
   name. The family ``models.default`` path renders it correctly.
 
 The fail -> pass contract
@@ -78,6 +78,7 @@ from omnigent.harnesses.pi_native.credentials import (
     resolve_pi_native_provider,
 )
 from omnigent.harnesses.pi_native.main import pi_bridge_dir_for_session
+from omnigent.process_logging import data_dir
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.helpers import POLL_INTERVAL_S
@@ -481,7 +482,7 @@ def test_facet_a_live_pi_cli_gateway_claude_404_journey(fake_gateway: str, tmp_p
                 lambda: _match_conv(_output()), timeout=160, what="conversation id", tail=_output
             )
         )
-        bridge = home / pi_bridge_dir_for_session(conv).relative_to(Path.home())
+        bridge = config_home / pi_bridge_dir_for_session(conv).relative_to(data_dir())
         models_path = bridge / "pi-agent" / "models.json"
 
         # 2. Wait for the runner to render the managed per-session models.json.

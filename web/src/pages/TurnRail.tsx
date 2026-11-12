@@ -255,7 +255,7 @@ export function TurnRail({
       // of ticks sits mid-page rather than clustering at the top. The row is
       // wide enough for the ticks; the preview box overflows to the right.
       // Hidden on mobile (max-md:hidden): the rail is a hover minimap and
-      // touch has no hover, so mobile keeps the ↑↓ nav buttons instead.
+      // touch has no hover.
       className="pointer-events-none absolute left-0 top-1/2 z-40 flex w-6 -translate-y-1/2 items-center max-md:hidden"
       onMouseLeave={() => {
         interactingRef.current = false;
@@ -334,7 +334,7 @@ export function TurnRail({
           // inside the narrow w-6 rail column, so without a set width it
           // shrink-wraps to a few words per line. w-80 lets it fill out and
           // preview more content; max-w caps it on small viewports.
-          "pointer-events-none absolute left-7 w-80 max-w-[calc(100vw-4rem)] -translate-y-1/2 rounded-xl border border-border/60 bg-background px-3 py-2 shadow-tooltip transition-[opacity,top] duration-150",
+          "menu-surface pointer-events-none absolute left-7 w-80 max-w-[calc(100vw-4rem)] -translate-y-1/2 rounded-xl border border-border/60 bg-background px-3 py-2 shadow-tooltip transition-[opacity,top] duration-150",
           hovered ? "opacity-100" : "opacity-0",
         )}
       >

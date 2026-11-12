@@ -79,6 +79,20 @@ describe("createProject", () => {
 });
 
 describe("getProject", () => {
+  it("preserves the HTTP status so callers can distinguish deleted projects from outages", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        { error: { code: "not_found", message: "Project not found" } },
+        { ok: false, status: 404 },
+      ),
+    );
+    await expect(getProject("deleted")).rejects.toMatchObject({
+      status: 404,
+      code: "not_found",
+      message: "Project not found",
+    });
+  });
+
   it("GETs /v1/projects/{id} and returns the project with config", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({ id: "p_1", name: "A", config: { workspace: "/w" } }),
