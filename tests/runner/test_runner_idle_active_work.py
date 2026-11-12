@@ -29,7 +29,6 @@ from omnigent.runner.app import (
     register_timer,
     unregister_timer,
 )
-from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import NullServerClient
 
 _HUMAN_WAIT_HOLD_ENV = "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S"
@@ -556,7 +555,9 @@ async def test_native_dialog_hold_is_bounded_and_fresh_after_running(
     """
     from tests.runner.conftest import _runner_client
 
-    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr("omnigent.runner.app.time", clock)
     conv_id = "conv_native_dialog_episode"
     app = await _native_app_with_session(conv_id)
     async with _runner_client(app) as client:
@@ -564,14 +565,20 @@ async def test_native_dialog_hold_is_bounded_and_fresh_after_running(
         assert created.status_code == 201, created.text
         _publish_native_status(app, conv_id, "running", "permission prompt")
         assert app.state.has_active_work() is True
-        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
 
         # The answered dialog resumes the turn, which then parks on another dialog;
         # nothing polls the watchdog in between.
         _publish_native_status(app, conv_id, "running", None)
         _publish_native_status(app, conv_id, "running", "permission prompt")
         assert app.state.has_active_work() is True
-        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
 
         _publish_native_status(app, conv_id, "running", None)
         assert app.state.has_active_work() is True
@@ -593,7 +600,9 @@ async def test_permission_hook_wait_is_bounded_per_hook(
     """
     from omnigent.harnesses.claude_native import bridge
 
-    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr("omnigent.runner.app.time", clock)
     conv_id = "conv_parked_permission_hook"
     async with _claude_native_pane_app(tmp_path, monkeypatch, conv_id) as (app, _instance):
         first_hook = bridge.approval_wait_marker_path(conv_id)
@@ -602,22 +611,83 @@ async def test_permission_hook_wait_is_bounded_per_hook(
         _publish_native_status(app, conv_id, "running", None)
         bridge.touch_approval_wait_marker(first_hook)
         assert app.state.has_active_work() is True
-        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
         assert app.state.has_sandbox_work() is False
 
         bridge.touch_approval_wait_marker(second_hook)
         assert app.state.has_active_work() is True
-        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
 
         # Both hooks give up and Claude shows its own permission prompt.
         bridge.clear_approval_wait_marker(first_hook)
         bridge.clear_approval_wait_marker(second_hook)
         _publish_native_status(app, conv_id, "running", "permission prompt")
         assert app.state.has_active_work() is True
-        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
 
         # Answering it resumes the running turn, which is agent work again.
         _publish_native_status(app, conv_id, "running", None)
+        assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_a_check_on_another_thread_cannot_age_the_next_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A check that read a dialog before it was answered cannot shorten the next one.
+
+    The parent-death thread checks for active work off the event loop. If it
+    reads a dialog, pauses while the dialog is answered, and only then records
+    that dialog's start, a later dialog must still get its full hold.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import threading
+
+    from omnigent.runner import app as runner_app
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr(runner_app, "time", clock)
+    read_dialog = threading.Event()
+    resume = threading.Event()
+    real_is_native_harness = runner_app.is_native_harness
+
+    def pause_probe_after_reading_dialog(name: str | None) -> bool:
+        if threading.current_thread().name == "active-work-probe" and not read_dialog.is_set():
+            read_dialog.set()
+            assert resume.wait(5)
+        return real_is_native_harness(name)
+
+    monkeypatch.setattr(runner_app, "is_native_harness", pause_probe_after_reading_dialog)
+    conv_id = "conv_dialog_thread_race"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        probe = threading.Thread(target=app.state.has_active_work, name="active-work-probe")
+        probe.start()
+        assert await asyncio.to_thread(read_dialog.wait, 5)
+        # The dialog is answered while the probe is paused; the turn runs on.
+        _publish_native_status(app, conv_id, "running", None)
+        resume.set()
+        await asyncio.to_thread(probe.join, 5)
+        assert not probe.is_alive()
+
+        clock.advance(120)
+        _publish_native_status(app, conv_id, "running", "permission prompt")
         assert app.state.has_active_work() is True
 
 
@@ -628,7 +698,9 @@ async def test_replaced_prompt_waiter_gets_a_fresh_hold(monkeypatch: pytest.Monk
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.05")
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr("omnigent.runner.app.time", clock)
     app = _scaffold_app()
     sid = "conv_wait_episode_waiter"
     tasks: list[asyncio.Task[None]] = []
@@ -637,7 +709,10 @@ async def test_replaced_prompt_waiter_gets_a_fresh_hold(monkeypatch: pytest.Monk
         tasks.append(first)
         app.state.claude_prompt_waiters[sid] = first
         assert app.state.has_active_work() is True
-        await poll_until_async(lambda: app.state.has_active_work() is False, timeout_s=5)
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
 
         app.state.claude_prompt_waiters.pop(sid)
         first.cancel()
@@ -909,6 +984,14 @@ async def test_only_pane_inferred_status_is_marked_inferred(
         publish(conv_id, "running", "terminal prompt", inferred=True)
         queue = _session_event_queues_ref[conv_id]
         events = [queue.get_nowait() for _ in range(queue.qsize())]
+
+        # An inferred reason neither ends nor restarts the authoritative dialog's hold.
+        assert app.state.has_sandbox_work() is True
+        clock.advance(59)
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        assert app.state.has_sandbox_work() is True
+        clock.advance(2)
+        assert app.state.has_sandbox_work() is False
 
         # The dialog is answered, then the pane hides its input box mid-reply.
         publish(conv_id, "running", None)

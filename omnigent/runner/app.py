@@ -1664,8 +1664,10 @@ def create_runner_app(
     _sessions_with_background_shell: set[str] = set()
 
     _human_wait_hold_s = _resolve_human_wait_hold_s()
-    # Dialog each native turn is parked on: its latest ``running`` edge's ``blocked_on``.
-    _native_dialog_waits: dict[str, str] = {}
+    # Dialog each native turn is parked on: its latest ``running`` edge's
+    # ``blocked_on`` and a serial, so every dialog is its own wait episode.
+    _native_dialog_waits: dict[str, tuple[str, int]] = {}
+    _dialog_serials = itertools.count(1)
     # Start and logged expiry of each human-wait episode (see ``_human_wait_holds``).
     _human_wait_since: dict[tuple[str, object], float] = {}
     _human_wait_expired: set[tuple[str, object]] = set()
@@ -1684,16 +1686,17 @@ def create_runner_app(
         _native_pane_status[session_id] = status
         if inferred is True and status == "running":
             return
-        dialog = (
+        reason = (
             blocked_on
             if status == "running" and isinstance(blocked_on, str) and blocked_on
             else None
         )
-        if _native_dialog_waits.get(session_id) == dialog:
+        current = _native_dialog_waits.get(session_id)
+        if (current[0] if current is not None else None) == reason:
             return
         _forget_dialog_wait(session_id)
-        if dialog is not None:
-            _native_dialog_waits[session_id] = dialog
+        if reason is not None:
+            _native_dialog_waits[session_id] = (reason, next(_dialog_serials))
 
     def _forget_native_pane_status(session_id: str) -> None:
         """Drop a native session's status record and any dialog wait."""
@@ -1701,11 +1704,12 @@ def create_runner_app(
         _forget_dialog_wait(session_id)
 
     def _forget_dialog_wait(session_id: str) -> None:
-        if _native_dialog_waits.pop(session_id, None) is None:
+        dialog = _native_dialog_waits.pop(session_id, None)
+        if dialog is None:
             return
         with _human_wait_lock:
-            _human_wait_since.pop((session_id, "dialog"), None)
-            _human_wait_expired.discard((session_id, "dialog"))
+            _human_wait_since.pop((session_id, dialog), None)
+            _human_wait_expired.discard((session_id, dialog))
 
     def _human_wait_holds(session_ids: set[str], approval_waits: dict[str, list[str]]) -> bool:
         """Whether a session parked on a human still holds the idle watchdog open.
@@ -1716,19 +1720,19 @@ def create_runner_app(
         ``_human_wait_hold_s`` from the first active-work check that sees it;
         ``0`` keeps the old unbounded hold. A wait ends where its state
         changes, not on a later check, since nothing checks while a turn runs:
-        the next status edge ends a dialog, and a waiter task or hook marker
-        identifies its own wait, so a new one starts fresh.
+        the next status edge ends a dialog. A dialog serial, waiter task or hook
+        marker identifies each wait, so a new one starts fresh even if a check
+        running on another thread re-adds a finished wait's timestamp.
 
         :param session_ids: Sessions the runner currently tracks.
         :param approval_waits: Fresh permission-hook marker names per session.
         :returns: ``True`` while any human wait is inside its hold.
         """
         episodes: set[tuple[str, object]] = set(_claude_prompt_waiters.items())
-        episodes.update(
-            (session_id, "dialog")
-            for session_id in session_ids
-            if _native_awaiting_human(session_id)
-        )
+        for session_id in session_ids:
+            dialog = _native_dialog_waits.get(session_id)
+            if dialog is not None and is_native_harness(_session_harness_name(session_id)):
+                episodes.add((session_id, dialog))
         episodes.update(
             (session_id, marker)
             for session_id, markers in approval_waits.items()
@@ -1815,12 +1819,6 @@ def create_runner_app(
         if _native_pane_status.get(session_id) not in _IN_FLIGHT_SESSION_STATUSES:
             return False
         if session_id in _native_dialog_waits:
-            return False
-        return is_native_harness(_session_harness_name(session_id))
-
-    def _native_awaiting_human(session_id: str) -> bool:
-        """Whether a native terminal reports this session's turn parked on a dialog."""
-        if session_id not in _native_dialog_waits:
             return False
         return is_native_harness(_session_harness_name(session_id))
 
