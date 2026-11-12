@@ -1,12 +1,22 @@
 // Hiding the Databricks workspace navigation chrome around a workspace-hosted
 // Omnigent SPA. Kept in its own Electron-free module so the injection logic is
-// unit-testable (test/workspace-chrome.test.js calls applyWorkspaceChromeHideCss
+// unit-testable (test/workspace-chrome.test.ts calls applyWorkspaceChromeHideCss
 // with a fake webContents) without requiring main.js, which boots the app.
 //
 // The mobile shells carry the same logic in
 // web/android/.../WorkspaceChromeScript.kt and
 // web/ios/Omnigent/WorkspaceChromeScript.swift. Keep the CSS identical in all
 // three so a fix in one shell isn't silently missing from the others.
+
+/** The part of a webContents that receives the chrome-hide CSS. */
+export interface CssTarget {
+  insertCSS: (css: string) => Promise<unknown>;
+}
+
+/** A webContents that re-injects the CSS after each document load. */
+export interface ChromeHideWebContents extends CssTarget {
+  on: (event: "did-finish-load", listener: () => void) => unknown;
+}
 
 /**
  * CSS that hides the Databricks workspace navigation chrome.
@@ -22,7 +32,7 @@
  * standalone (non-embed) build there is no ``.omnigent-app``, so the rule is
  * a harmless no-op.
  */
-const WORKSPACE_CHROME_HIDE_CSS = `
+export const WORKSPACE_CHROME_HIDE_CSS = `
   .omnigent-app {
     position: fixed !important;
     inset: 0 !important;
@@ -41,9 +51,8 @@ const WORKSPACE_CHROME_HIDE_CSS = `
  * build — injecting on every load is a harmless no-op on standalone servers.
  * Do not reintroduce a URL/path guard here.
  *
- * @param {{ insertCSS: (css: string) => Promise<unknown> }} webContents
  */
-function applyWorkspaceChromeHideCss(webContents) {
+export function applyWorkspaceChromeHideCss(webContents: CssTarget): void {
   void webContents.insertCSS(WORKSPACE_CHROME_HIDE_CSS);
 }
 
@@ -54,18 +63,9 @@ function applyWorkspaceChromeHideCss(webContents) {
  * such as the initial navigation or a server switch. The SPA's own client-side
  * routing keeps the same document, so the injected stylesheet persists across
  * in-app navigation without re-firing.
- *
- * @param {{ on: (event: string, listener: () => void) => void,
- *           insertCSS: (css: string) => Promise<unknown> }} webContents
  */
-function registerWorkspaceChromeHide(webContents) {
+export function registerWorkspaceChromeHide(webContents: ChromeHideWebContents): void {
   webContents.on("did-finish-load", () => {
     applyWorkspaceChromeHideCss(webContents);
   });
 }
-
-module.exports = {
-  WORKSPACE_CHROME_HIDE_CSS,
-  applyWorkspaceChromeHideCss,
-  registerWorkspaceChromeHide,
-};

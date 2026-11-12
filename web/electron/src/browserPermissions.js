@@ -1,6 +1,6 @@
 "use strict";
 
-const { isLocalhostUrl } = require("./localhost_cors");
+const { isLocalhostUrl } = require("./localhost_cors.ts");
 
 const LOCAL_NETWORK_PERMISSIONS = new Set([
   "local-network-access",

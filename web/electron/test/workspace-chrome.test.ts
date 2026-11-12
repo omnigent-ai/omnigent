@@ -1,4 +1,4 @@
-// Unit test for the workspace-chrome CSS injection (src/workspace-chrome.js),
+// Unit test for the workspace-chrome CSS injection (src/workspace-chrome.ts),
 // run with `node --test` (no extra deps). It calls the REAL function that
 // main.js wires to the webContents `did-finish-load` event, passing a fake
 // webContents whose URL is NOT under the workspace mount path.
@@ -9,22 +9,22 @@
 // Reintroducing any URL/path guard inside applyWorkspaceChromeHideCss stops
 // insertCSS from firing here, failing this test.
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const {
+import {
   applyWorkspaceChromeHideCss,
   registerWorkspaceChromeHide,
   WORKSPACE_CHROME_HIDE_CSS,
-} = require("../src/workspace-chrome");
+} from "../src/workspace-chrome.ts";
 
 describe("applyWorkspaceChromeHideCss", () => {
   it("injects the chrome-hide CSS even when the URL is not under the workspace path", () => {
-    const injected = [];
+    const injected: string[] = [];
     const webContents = {
       // A path variant the old guard would have skipped (not /omnigent).
       getURL: () => "https://dbc-x.cloud.databricks.com/dashboard",
-      insertCSS: (css) => {
+      insertCSS: (css: string) => {
         injected.push(css);
         return Promise.resolve();
       },
@@ -54,18 +54,18 @@ describe("registerWorkspaceChromeHide", () => {
   // that captures the listener registered via `.on(eventName, listener)`, then
   // fire the event ourselves and assert the CSS landed.
   function fakeWebContents() {
-    const listeners = new Map();
-    const injected = [];
+    const listeners = new Map<string, () => void>();
+    const injected: string[] = [];
     return {
       injected,
-      emit(eventName) {
+      emit(eventName: string) {
         const listener = listeners.get(eventName);
         if (listener) listener();
       },
-      on: (eventName, listener) => {
+      on: (eventName: string, listener: () => void) => {
         listeners.set(eventName, listener);
       },
-      insertCSS: (css) => {
+      insertCSS: (css: string) => {
         injected.push(css);
         return Promise.resolve();
       },

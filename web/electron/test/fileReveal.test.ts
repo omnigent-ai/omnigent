@@ -1,20 +1,31 @@
-"use strict";
-const { test } = require("node:test");
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
-const { registerFileReveal } = require("../src/fileReveal");
+import { test, type TestContext } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  registerFileReveal,
+  type ContentTypesReader,
+  type RevealShell,
+} from "../src/fileReveal.ts";
 
-function setup(t, platform = "linux", contentTypes = async () => null) {
+interface RevealEvent {
+  trusted?: boolean;
+}
+
+function setup(
+  t: TestContext,
+  platform: NodeJS.Platform = "linux",
+  contentTypes: ContentTypesReader = async () => null,
+) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "omni-reveal-"));
   const file = path.join(directory, "a file.txt");
   fs.writeFileSync(file, "test");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  let handler;
-  const shown = [];
-  const opened = [];
-  const shell = {
+  let handler: ((event: RevealEvent, ...args: unknown[]) => unknown) | undefined;
+  const shown: string[] = [];
+  const opened: string[] = [];
+  const shell: RevealShell = {
     showItemInFolder: (value) => shown.push(value),
     openPath: async (value) => {
       opened.push(value);
@@ -24,13 +35,16 @@ function setup(t, platform = "linux", contentTypes = async () => null) {
   registerFileReveal({
     ipcMain: { handle: (_channel, callback) => (handler = callback) },
     shell,
-    isPinnedOriginSender: (event) => event.trusted === true,
+    isPinnedOriginSender: (event: RevealEvent) => event.trusted === true,
     localHostId: () => "local",
     platform,
     contentTypes,
   });
-  const reveal = (value, hostId = "local", event = { trusted: true }) =>
-    handler(event, hostId, value);
+  const reveal = (
+    value: string,
+    hostId: unknown = "local",
+    event: RevealEvent = { trusted: true },
+  ) => handler!(event, hostId, value);
   return { directory, file, shown, opened, shell, reveal };
 }
 
@@ -43,7 +57,7 @@ test("selects a file in its folder and opens a folder", async (t) => {
 });
 
 test("selects macOS packages and opens ordinary dotted folders", async (t) => {
-  const packageTypes = async (dir) =>
+  const packageTypes = async (dir: string) =>
     dir.endsWith(".key") ? '("com.apple.package","public.directory")' : '("public.folder")';
   const { reveal, shown, opened, directory } = setup(t, "darwin", packageTypes);
   const app = path.join(directory, "Tool.app");

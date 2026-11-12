@@ -1,18 +1,25 @@
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const { pathToFileURL } = require("node:url");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { pathToFileURL } from "node:url";
+import type { Rectangle } from "electron";
 
-const { createUpdateOverlay, OVERLAY_INSET, OVERLAY_WIDTH } = require("../src/update_overlay");
+import {
+  createUpdateOverlay,
+  OVERLAY_INSET,
+  OVERLAY_WIDTH,
+  type UpdateOverlayIpcEvent,
+  type UpdateOverlayUpdater,
+  type UpdateOverlayWindowOptions,
+} from "../src/update_overlay.ts";
+
+type Handler = (event: UpdateOverlayIpcEvent, ...args: unknown[]) => unknown;
 
 class FakeWebContents extends EventEmitter {
-  constructor() {
-    super();
-    this.sent = [];
-    this.url = "";
-    this.windowOpenHandler = null;
-    this.destroyed = false;
-  }
+  sent: { channel: string; payload: unknown }[] = [];
+  url = "";
+  windowOpenHandler: (() => { action: "deny" }) | null = null;
+  destroyed = false;
 
   getURL() {
     return this.url;
@@ -22,25 +29,28 @@ class FakeWebContents extends EventEmitter {
     return this.destroyed;
   }
 
-  setWindowOpenHandler(handler) {
+  setWindowOpenHandler(handler: () => { action: "deny" }) {
     this.windowOpenHandler = handler;
   }
 
-  send(channel, payload) {
+  send(channel: string, payload: unknown) {
     if (this.destroyed) throw new TypeError("Object has been destroyed");
     this.sent.push({ channel, payload });
   }
 }
 
 class FakeWindow extends EventEmitter {
-  constructor(options = {}) {
+  options: Partial<UpdateOverlayWindowOptions<FakeWindow>>;
+  webContents = new FakeWebContents();
+  destroyed = false;
+  visible = false;
+  bounds: Rectangle | null = null;
+  ignoreMouse: { ignore: boolean; options: { forward?: boolean } | undefined }[] = [];
+  excludedFromShownWindowsMenu?: boolean;
+
+  constructor(options: Partial<UpdateOverlayWindowOptions<FakeWindow>> = {}) {
     super();
     this.options = options;
-    this.webContents = new FakeWebContents();
-    this.destroyed = false;
-    this.visible = false;
-    this.bounds = null;
-    this.ignoreMouse = [];
   }
 
   isDestroyed() {
@@ -51,11 +61,11 @@ class FakeWindow extends EventEmitter {
     return { x: 10, y: 20, width: 1000, height: 700 };
   }
 
-  setBounds(bounds) {
+  setBounds(bounds: Rectangle) {
     this.bounds = bounds;
   }
 
-  setIgnoreMouseEvents(ignore, options) {
+  setIgnoreMouseEvents(ignore: boolean, options?: { forward?: boolean }) {
     this.ignoreMouse.push({ ignore, options });
   }
 
@@ -67,7 +77,7 @@ class FakeWindow extends EventEmitter {
     this.visible = true;
   }
 
-  loadFile(file) {
+  loadFile(file: string) {
     this.webContents.url = pathToFileURL(file).href;
     return Promise.resolve();
   }
@@ -88,27 +98,27 @@ class FakeWindow extends EventEmitter {
   }
 }
 
-function makeOverlay({ platform = process.platform } = {}) {
-  const onHandlers = new Map();
-  const handleHandlers = new Map();
-  const windows = [];
+function makeOverlay({ platform = process.platform }: { platform?: NodeJS.Platform } = {}) {
+  const onHandlers = new Map<string, Handler>();
+  const handleHandlers = new Map<string, Handler>();
+  const windows: FakeWindow[] = [];
   class BrowserWindow extends FakeWindow {
-    constructor(options) {
+    constructor(options: UpdateOverlayWindowOptions<FakeWindow>) {
       super(options);
       windows.push(this);
     }
   }
   const ipcMain = {
-    on: (channel, handler) => onHandlers.set(channel, handler),
-    handle: (channel, handler) => handleHandlers.set(channel, handler),
+    on: (channel: string, handler: Handler) => onHandlers.set(channel, handler),
+    handle: (channel: string, handler: Handler) => handleHandlers.set(channel, handler),
   };
-  const nativeTheme = new EventEmitter();
-  nativeTheme.shouldUseDarkColors = false;
-  const calls = [];
-  const updater = {
-    getConfig: () => ({}),
-    getStatus: () => ({}),
-    setConfig: () => ({}),
+  const nativeTheme = Object.assign(new EventEmitter(), { shouldUseDarkColors: false });
+  const calls: unknown[] = [];
+  const config = { mode: "default", autoInstall: true, skippedVersion: null } as const;
+  const updater: UpdateOverlayUpdater = {
+    getConfig: () => config,
+    getStatus: () => ({ state: "idle" }),
+    setConfig: () => config,
     checkForUpdates: async () => {},
     downloadUpdate: async () => {
       calls.push("download");
@@ -120,7 +130,7 @@ function makeOverlay({ platform = process.platform } = {}) {
     ipcMain,
     nativeTheme,
     updater,
-    openAbout: (parent) => calls.push({ openAbout: parent }),
+    openAbout: (parent: FakeWindow) => calls.push({ openAbout: parent }),
     overlayPage: "/overlay.html",
     preloadPath: "/preload.js",
     platform,
@@ -154,8 +164,8 @@ describe("update overlay", () => {
     const mac = makeOverlay({ platform: "darwin" });
     const macOverlay = mac.controller.ensureOverlay(new FakeWindow());
     assert.equal(macOverlay.excludedFromShownWindowsMenu, true);
-    assert.equal(macOverlay.options.webPreferences.sandbox, true);
-    assert.deepEqual(macOverlay.webContents.windowOpenHandler(), { action: "deny" });
+    assert.equal(macOverlay.options.webPreferences?.sandbox, true);
+    assert.deepEqual(macOverlay.webContents.windowOpenHandler?.(), { action: "deny" });
     let prevented = false;
     macOverlay.webContents.emit(
       "will-navigate",
@@ -179,7 +189,7 @@ describe("update overlay", () => {
     const overlay = controller.ensureOverlay(parent);
     assert.equal(windows[0], overlay);
 
-    onHandlers.get("omnigent:overlay-height")({ sender: overlay.webContents }, 180.4);
+    onHandlers.get("omnigent:overlay-height")!({ sender: overlay.webContents }, 180.4);
 
     assert.deepEqual(parent.webContents.sent.at(-1), {
       channel: "omnigent:update-overlay-height",
@@ -193,13 +203,13 @@ describe("update overlay", () => {
     });
     assert.deepEqual(overlay.ignoreMouse.at(-1), { ignore: false, options: undefined });
     assert.equal(
-      await handleHandlers.get("omnigent:get-update-overlay-height")({
+      await handleHandlers.get("omnigent:get-update-overlay-height")!({
         sender: parent.webContents,
       }),
       180,
     );
     assert.equal(
-      await handleHandlers.get("omnigent:get-update-overlay-height")({
+      await handleHandlers.get("omnigent:get-update-overlay-height")!({
         sender: new FakeWebContents(),
       }),
       0,
@@ -227,13 +237,13 @@ describe("update overlay", () => {
     const parent = new FakeWindow();
     const overlay = controller.ensureOverlay(parent);
 
-    onHandlers.get("omnigent:overlay-height")({ sender: overlay.webContents }, 0);
+    onHandlers.get("omnigent:overlay-height")!({ sender: overlay.webContents }, 0);
 
     assert.deepEqual(parent.webContents.sent.at(-1), {
       channel: "omnigent:update-overlay-height",
       payload: 0,
     });
-    assert.equal(overlay.bounds.height, 1);
+    assert.equal(overlay.bounds?.height, 1);
     assert.deepEqual(overlay.ignoreMouse.at(-1), {
       ignore: true,
       options: { forward: true },
@@ -245,10 +255,10 @@ describe("update overlay", () => {
     const parent = new FakeWindow();
     const overlay = controller.ensureOverlay(parent);
 
-    await handleHandlers.get("omnigent:overlay-update-download")({ sender: overlay.webContents });
+    await handleHandlers.get("omnigent:overlay-update-download")!({ sender: overlay.webContents });
 
     assert.deepEqual(calls, [{ openAbout: parent }, "download"]);
-    assert.equal(overlay.bounds.height, 1);
+    assert.equal(overlay.bounds?.height, 1);
     assert.deepEqual(overlay.ignoreMouse.at(-1), {
       ignore: true,
       options: { forward: true },
@@ -263,14 +273,23 @@ describe("update overlay", () => {
     const { calls, controller, handleHandlers } = makeOverlay();
     const parent = new FakeWindow();
     const overlay = controller.ensureOverlay(parent);
-    const download = handleHandlers.get("omnigent:overlay-update-download");
+    const download = handleHandlers.get("omnigent:overlay-update-download")!;
 
-    await assert.rejects(download({ sender: new FakeWebContents() }), /shell overlay page/);
+    await assert.rejects(
+      Promise.resolve(download({ sender: new FakeWebContents() })),
+      /shell overlay page/,
+    );
     overlay.webContents.url = "https://evil.example/";
-    await assert.rejects(download({ sender: overlay.webContents }), /shell overlay page/);
+    await assert.rejects(
+      Promise.resolve(download({ sender: overlay.webContents })),
+      /shell overlay page/,
+    );
     overlay.webContents.url = pathToFileURL("/overlay.html").href;
     parent.destroyed = true;
-    await assert.rejects(download({ sender: overlay.webContents }), /active parent window/);
+    await assert.rejects(
+      Promise.resolve(download({ sender: overlay.webContents })),
+      /active parent window/,
+    );
     assert.deepEqual(calls, []);
   });
 
@@ -278,13 +297,13 @@ describe("update overlay", () => {
     const { controller, onHandlers } = makeOverlay();
     const parent = new FakeWindow();
     const overlay = controller.ensureOverlay(parent);
-    onHandlers.get("omnigent:overlay-height")({ sender: overlay.webContents }, 180);
+    onHandlers.get("omnigent:overlay-height")!({ sender: overlay.webContents }, 180);
 
     controller.suppress(parent);
-    assert.equal(overlay.bounds.height, 1);
+    assert.equal(overlay.bounds?.height, 1);
 
     controller.unsuppress(parent);
-    assert.equal(overlay.bounds.height, 180);
+    assert.equal(overlay.bounds?.height, 180);
     assert.deepEqual(overlay.ignoreMouse.at(-1), { ignore: false, options: undefined });
     assert.deepEqual(parent.webContents.sent.at(-1), {
       channel: "omnigent:update-overlay-height",

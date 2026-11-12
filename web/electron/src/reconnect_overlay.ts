@@ -7,24 +7,84 @@
 // input to the page underneath. The page is bundled and its preload is narrow;
 // IPC is verified by sender, since the page underneath may be untrusted.
 
-"use strict";
+import type { Rectangle, WebContentsViewConstructorOptions } from "electron";
+import { pathToFileURL } from "node:url";
 
-const { pathToFileURL } = require("node:url");
+/** The parts of the overlay's WebContentsView this module drives. */
+export interface ReconnectOverlayView {
+  webContents: {
+    isDestroyed: () => boolean;
+    close: () => void;
+    focus: () => void;
+    setWindowOpenHandler: (handler: () => { action: "deny" }) => void;
+    on: (
+      event: "will-navigate",
+      listener: (event: { preventDefault: () => void }) => void,
+    ) => unknown;
+    loadFile: (filePath: string, options: { query: Record<string, string> }) => Promise<void>;
+  };
+  setBackgroundColor: (color: string) => void;
+  setBounds: (bounds: Rectangle) => void;
+}
 
-/**
- * @param {object} deps
- * @param {typeof import("electron").WebContentsView} deps.WebContentsView
- * @param {import("electron").IpcMain} deps.ipcMain
- * @param {string} deps.overlayPage Absolute path to the bundled overlay HTML.
- * @param {string} deps.preloadPath Absolute path to reconnect_overlay_preload.js.
- * @param {(parent: import("electron").BrowserWindow) => void} deps.onCancel
- */
-function createReconnectOverlay({ WebContentsView, ipcMain, overlayPage, preloadPath, onCancel }) {
+/** The parts of a shell window the overlay covers. */
+export interface ReconnectOverlayParent {
+  isDestroyed: () => boolean;
+  getContentSize: () => number[];
+  on: (event: "resize", listener: () => void) => unknown;
+  once: (event: "closed", listener: () => void) => unknown;
+  contentView: {
+    addChildView: (view: ReconnectOverlayView) => void;
+    removeChildView: (view: ReconnectOverlayView) => void;
+  };
+  isFocused?: () => boolean;
+  webContents: { focus: () => void };
+}
+
+/** The parts of an IPC event used to recognize the overlay page. */
+export interface ReconnectOverlayIpcEvent {
+  sender: unknown;
+  senderFrame?: { url?: string } | null;
+}
+
+export interface ReconnectOverlayDeps<Parent extends ReconnectOverlayParent> {
+  WebContentsView: new (options: WebContentsViewConstructorOptions) => ReconnectOverlayView;
+  ipcMain: {
+    on: (channel: string, listener: (event: ReconnectOverlayIpcEvent) => void) => unknown;
+  };
+  /** Absolute path to the bundled overlay HTML. */
+  overlayPage: string;
+  /** Absolute path to reconnect_overlay_preload.js. */
+  preloadPath: string;
+  onCancel: (parent: Parent) => void;
+}
+
+export interface ReconnectOverlay<Parent> {
+  show: (parent: Parent | null | undefined, hint: string) => void;
+  hide: (parent: Parent) => void;
+  isShown: (parent: Parent) => boolean;
+  raise: (parent: Parent) => void;
+  registerIpc: () => void;
+}
+
+interface OverlayEntry {
+  view: ReconnectOverlayView;
+  hint: string | null;
+  shown: boolean;
+  fit: () => void;
+}
+
+export function createReconnectOverlay<Parent extends ReconnectOverlayParent>({
+  WebContentsView,
+  ipcMain,
+  overlayPage,
+  preloadPath,
+  onCancel,
+}: ReconnectOverlayDeps<Parent>): ReconnectOverlay<Parent> {
   const pageUrl = pathToFileURL(overlayPage).href;
-  /** @type {Map<Electron.BrowserWindow, {view: Electron.WebContentsView, hint: string | null, shown: boolean, fit: () => void}>} */
-  const overlays = new Map();
+  const overlays = new Map<Parent, OverlayEntry>();
 
-  function parentForSender(event) {
+  function parentForSender(event: ReconnectOverlayIpcEvent): Parent | null {
     for (const [parent, overlay] of overlays) {
       const wc = overlay.view.webContents;
       if (event.sender === wc && event.senderFrame?.url?.split("?")[0] === pageUrl) return parent;
@@ -32,7 +92,7 @@ function createReconnectOverlay({ WebContentsView, ipcMain, overlayPage, preload
     return null;
   }
 
-  function ensureOverlay(parent) {
+  function ensureOverlay(parent: Parent): OverlayEntry {
     const existing = overlays.get(parent);
     if (existing) return existing;
     const view = new WebContentsView({
@@ -47,10 +107,10 @@ function createReconnectOverlay({ WebContentsView, ipcMain, overlayPage, preload
     view.setBackgroundColor("#00000000");
     view.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     view.webContents.on("will-navigate", (event) => event.preventDefault());
-    const overlay = { view, hint: null, shown: false, fit: () => {} };
+    const overlay: OverlayEntry = { view, hint: null, shown: false, fit: () => {} };
     overlay.fit = () => {
       if (parent.isDestroyed()) return;
-      const [width, height] = parent.getContentSize();
+      const [width = 0, height = 0] = parent.getContentSize();
       view.setBounds({ x: 0, y: 0, width, height });
     };
     parent.on("resize", overlay.fit);
@@ -63,7 +123,7 @@ function createReconnectOverlay({ WebContentsView, ipcMain, overlayPage, preload
   }
 
   /** Show (or update) the overlay over a window's current page. */
-  function show(parent, hint) {
+  function show(parent: Parent | null | undefined, hint: string): void {
     if (!parent || parent.isDestroyed()) return;
     const overlay = ensureOverlay(parent);
     if (overlay.hint !== hint) {
@@ -78,7 +138,7 @@ function createReconnectOverlay({ WebContentsView, ipcMain, overlayPage, preload
   }
 
   /** Hide the overlay (idempotent); the view is kept for the next show. */
-  function hide(parent) {
+  function hide(parent: Parent): void {
     const overlay = overlays.get(parent);
     if (!overlay?.shown || parent.isDestroyed()) return;
     overlay.shown = false;
@@ -87,12 +147,12 @@ function createReconnectOverlay({ WebContentsView, ipcMain, overlayPage, preload
     if (parent.isFocused?.()) parent.webContents.focus();
   }
 
-  function isShown(parent) {
+  function isShown(parent: Parent): boolean {
     return Boolean(overlays.get(parent)?.shown);
   }
 
   /** Keep the overlay above a view attached while it is shown. */
-  function raise(parent) {
+  function raise(parent: Parent): void {
     const overlay = overlays.get(parent);
     if (overlay?.shown && !parent.isDestroyed()) parent.contentView.addChildView(overlay.view);
   }
@@ -107,5 +167,3 @@ function createReconnectOverlay({ WebContentsView, ipcMain, overlayPage, preload
 
   return { show, hide, isShown, raise, registerIpc };
 }
-
-module.exports = { createReconnectOverlay };

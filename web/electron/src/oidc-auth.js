@@ -4,7 +4,7 @@
 
 "use strict";
 
-const { diagnostics } = require("./diagnostics");
+const { diagnostics } = require("./diagnostics.ts");
 
 const { serverEndpoint } = require("./oidc-credentials");
 

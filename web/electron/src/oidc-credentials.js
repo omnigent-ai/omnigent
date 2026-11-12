@@ -4,7 +4,7 @@
 
 "use strict";
 
-const { diagnostics } = require("./diagnostics");
+const { diagnostics } = require("./diagnostics.ts");
 
 const { shell } = require("electron");
 const { makePkce, runLoopbackAuthorization } = require("./loopback-oauth");

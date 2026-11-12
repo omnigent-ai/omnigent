@@ -437,7 +437,7 @@ function loadNavigationHarness({
   };
 
   const localRequires = {
-    "./desktop_updater": { createDesktopUpdater },
+    "./desktop_updater.ts": { createDesktopUpdater },
     "./ssh_connect_window": {
       createSshConnectFlow: () => ({
         run: async (_parentWin, sshServerUrl, destination) => {
@@ -446,17 +446,17 @@ function loadNavigationHarness({
         },
       }),
     },
-    "./connection_loading": {
+    "./connection_loading.ts": {
       createConnectionLoading: () => ({
         show: (_win, attempt, label) => calls.loading.push({ action: "show", attempt, label }),
         hide: (_win, attempt) => calls.loading.push({ action: "hide", attempt }),
       }),
     },
-    "./update_overlay": {
+    "./update_overlay.ts": {
       createUpdateOverlay: () => ({ ensureOverlay: () => {}, registerIpc: () => {} }),
     },
-    "./localhost_cors": {
-      isLocalhostUrl: require("../src/localhost_cors").isLocalhostUrl,
+    "./localhost_cors.ts": {
+      isLocalhostUrl: require("../src/localhost_cors.ts").isLocalhostUrl,
       registerLocalhostCors: () => {},
     },
     "./browserPermissionPrompt": {
@@ -489,7 +489,7 @@ function loadNavigationHarness({
       parseOmnigentDeepLink: () => null,
       chooseDeepLinkStrategy: () => null,
     },
-    "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
+    "./workspace-chrome.ts": { registerWorkspaceChromeHide: () => {} },
     // Never probe for or spawn a real arca from tests.
     "./arca": {
       ...require("../src/arca"),
@@ -597,8 +597,8 @@ function loadNavigationHarness({
     // stubbed here because it would call into the stubbed ./url module. The
     // away banner is intentionally NOT stubbed: its wiring through
     // createWindow is what the behavior test below exercises.
-    "./workspace-root-bounce": { registerWorkspaceRootBounce: () => {} },
-    "./return_banner": {
+    "./workspace-root-bounce.ts": { registerWorkspaceRootBounce: () => {} },
+    "./return_banner.ts": {
       createReturnBanner: () => ({
         ensureBanner: () => {},
         show: (bannerWin, returnUrl) => bannerCalls.show.push({ win: bannerWin, returnUrl }),
@@ -606,7 +606,7 @@ function loadNavigationHarness({
         registerIpc: () => {},
       }),
     },
-    "./reconnect_overlay": {
+    "./reconnect_overlay.ts": {
       createReconnectOverlay: ({ onCancel }) => {
         overlay.cancel = () => onCancel(win);
         return {
@@ -649,7 +649,7 @@ function loadNavigationHarness({
         browserIpcDeps = deps;
       },
     },
-    "./session-expiry": require("../src/session-expiry"),
+    "./session-expiry.ts": require("../src/session-expiry.ts"),
     "./popupPolicy.ts": {
       decideWindowOpen: () => ({ kind: "ignore" }),
       stripCrossOriginOpenerHeaders: () => {},
@@ -2318,7 +2318,7 @@ describe("Databricks auth mode wiring", () => {
 
   it("attributes an account-first landing failure to the resolved workspace", async (t) => {
     const events = [];
-    t.mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+    t.mock.method(require("../src/diagnostics.ts").diagnostics, "record", (...args) =>
       events.push(args),
     );
     const account = "https://accounts.cloud.databricks.com/omnigent";
@@ -5186,7 +5186,7 @@ describe("server response deadline (src/main.js)", () => {
 
   it("returns to setup with a timeout when the server accepts but never responds", async (t) => {
     const events = [];
-    t.mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+    t.mock.method(require("../src/diagnostics.ts").diagnostics, "record", (...args) =>
       events.push(args),
     );
     const h = stalledHarness(t, () => new Promise(() => {}));

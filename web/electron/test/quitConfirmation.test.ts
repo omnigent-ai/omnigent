@@ -1,12 +1,22 @@
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const {
+import {
   CONFIRM_BEFORE_QUIT_SETTING,
   confirmBeforeQuitEnabled,
   createQuitConfirmation,
   quitPromptDetail,
-} = require("../src/quitConfirmation");
+  type QuitSettings,
+  type RunningWork,
+} from "../src/quitConfirmation.ts";
+
+interface HarnessOptions {
+  settings?: QuitSettings;
+  running?: RunningWork;
+  pageCanAsk?: boolean;
+  isMac?: boolean;
+  saveFails?: boolean;
+}
 
 function harness({
   settings = {},
@@ -14,9 +24,13 @@ function harness({
   pageCanAsk = true,
   isMac = true,
   saveFails = false,
-} = {}) {
-  const calls = { asked: [], quits: 0, saved: [] };
-  let stored = { ...settings };
+}: HarnessOptions = {}) {
+  const calls = {
+    asked: [] as (string | null)[],
+    quits: 0,
+    saved: [] as QuitSettings[],
+  };
+  let stored: QuitSettings = { ...settings };
   const confirmation = createQuitConfirmation({
     isMac,
     appName: () => "Omnigent",

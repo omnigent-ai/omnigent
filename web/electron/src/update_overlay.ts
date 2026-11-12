@@ -12,26 +12,110 @@
 // server-page IPC keeps those). The window sizes itself to the card via the
 // height the overlay reports, and hides when the card renders nothing.
 
-"use strict";
+import type { BrowserWindowConstructorOptions, Rectangle } from "electron";
+import { pathToFileURL } from "node:url";
 
-const { pathToFileURL } = require("node:url");
+import type { DesktopUpdater } from "./desktop_updater.ts";
 
-const OVERLAY_WIDTH = 344; // 320px card + 12px shadow gutter each side
-const OVERLAY_INSET = 12;
+export const OVERLAY_WIDTH = 344; // 320px card + 12px shadow gutter each side
+export const OVERLAY_INSET = 12;
 
-/**
- * @param {object} deps
- * @param {typeof import("electron").BrowserWindow} deps.BrowserWindow
- * @param {import("electron").IpcMain} deps.ipcMain
- * @param {import("electron").NativeTheme} deps.nativeTheme
- * @param {{ getConfig: Function, getStatus: Function, setConfig: Function,
- *   checkForUpdates: Function, downloadUpdate: Function, installUpdateNow: Function }} deps.updater
- * @param {(parent: Electron.BrowserWindow) => void} deps.openAbout
- * @param {string} deps.overlayPage Absolute path to the built overlay HTML.
- * @param {string} deps.preloadPath Absolute path to update_overlay_preload.js.
- * @param {NodeJS.Platform} [deps.platform] Runtime platform (injectable for tests).
- */
-function createUpdateOverlay({
+type ParentWindowEvent = "resize" | "move" | "closed";
+
+/** The parts of a shell window the overlay is anchored to. */
+export interface UpdateOverlayParent {
+  isDestroyed: () => boolean;
+  getContentBounds: () => Rectangle;
+  webContents: {
+    isDestroyed: () => boolean;
+    send: (channel: string, height: number) => void;
+  } | null;
+  on: (event: ParentWindowEvent, listener: () => void) => unknown;
+  removeListener: (event: ParentWindowEvent, listener: () => void) => unknown;
+}
+
+/** The parts of the overlay's own BrowserWindow this module drives. */
+export interface UpdateOverlayWindow {
+  excludedFromShownWindowsMenu?: boolean;
+  isDestroyed: () => boolean;
+  isVisible: () => boolean;
+  showInactive: () => void;
+  destroy: () => void;
+  setBounds: (bounds: Rectangle) => void;
+  setIgnoreMouseEvents: (ignore: boolean, options?: { forward?: boolean }) => void;
+  loadFile: (filePath: string, options: { search: string }) => Promise<void>;
+  on: (event: "closed", listener: () => void) => unknown;
+  webContents: {
+    setWindowOpenHandler: (handler: () => { action: "deny" }) => void;
+    on: ((
+      event: "will-navigate",
+      listener: (event: { preventDefault: () => void }, url: string) => void,
+    ) => unknown) &
+      ((event: "did-finish-load", listener: () => void) => unknown);
+    send: (channel: string, theme: "dark" | "light") => void;
+  };
+}
+
+export type UpdateOverlayWindowOptions<Parent> = Omit<BrowserWindowConstructorOptions, "parent"> & {
+  parent: Parent;
+};
+
+/** The parts of an IPC event used to recognize the overlay page. */
+export interface UpdateOverlayIpcEvent {
+  sender: { getURL?: () => string } | null | undefined;
+  senderFrame?: { url?: string } | null;
+}
+
+export type UpdateOverlayUpdater = Pick<
+  DesktopUpdater,
+  | "getConfig"
+  | "getStatus"
+  | "setConfig"
+  | "checkForUpdates"
+  | "downloadUpdate"
+  | "installUpdateNow"
+>;
+
+export interface UpdateOverlayDeps<
+  Parent extends UpdateOverlayParent,
+  Overlay extends UpdateOverlayWindow,
+> {
+  BrowserWindow: new (options: UpdateOverlayWindowOptions<Parent>) => Overlay;
+  ipcMain: {
+    on: (
+      channel: string,
+      listener: (event: UpdateOverlayIpcEvent, ...args: unknown[]) => void,
+    ) => unknown;
+    handle: (
+      channel: string,
+      listener: (event: UpdateOverlayIpcEvent, ...args: unknown[]) => unknown,
+    ) => void;
+  };
+  nativeTheme: {
+    shouldUseDarkColors: boolean;
+    on: (event: "updated", listener: () => void) => unknown;
+  };
+  updater: UpdateOverlayUpdater;
+  openAbout: (parent: Parent) => void;
+  /** Absolute path to the built overlay HTML. */
+  overlayPage: string;
+  /** Absolute path to update_overlay_preload.js. */
+  preloadPath: string;
+  /** Runtime platform (injectable for tests). */
+  platform?: NodeJS.Platform;
+}
+
+export interface UpdateOverlay<Parent, Overlay> {
+  ensureOverlay: (parent: Parent) => Overlay;
+  suppress: (parent: Parent) => void;
+  unsuppress: (parent: Parent) => void;
+  registerIpc: () => void;
+}
+
+export function createUpdateOverlay<
+  Parent extends UpdateOverlayParent,
+  Overlay extends UpdateOverlayWindow,
+>({
   BrowserWindow,
   ipcMain,
   nativeTheme,
@@ -40,16 +124,16 @@ function createUpdateOverlay({
   overlayPage,
   preloadPath,
   platform = process.platform,
-}) {
+}: UpdateOverlayDeps<Parent, Overlay>): UpdateOverlay<Parent, Overlay> {
   const overlayPageUrl = pathToFileURL(overlayPage);
-  /** @type {Map<Electron.BrowserWindow, Electron.BrowserWindow>} parent -> overlay */
-  const overlays = new Map();
-  /** @type {WeakMap<Electron.BrowserWindow, number>} overlay -> last reported height */
-  const heights = new WeakMap();
+  /** parent -> overlay */
+  const overlays = new Map<Parent, Overlay>();
+  /** overlay -> last reported height */
+  const heights = new WeakMap<Overlay, number>();
   /** Parents whose update flow has moved into the About modal. */
-  const suppressedParents = new Set();
+  const suppressedParents = new Set<Parent | null>();
 
-  function overlayForSender(event) {
+  function overlayForSender(event: UpdateOverlayIpcEvent): Overlay | null {
     for (const ov of overlays.values()) {
       if (ov.isDestroyed() || ov.webContents !== event.sender) continue;
       const frameUrl = event.senderFrame?.url ?? event.sender?.getURL?.() ?? "";
@@ -63,14 +147,14 @@ function createUpdateOverlay({
     return null;
   }
 
-  function parentOf(overlay) {
+  function parentOf(overlay: Overlay): Parent | null {
     for (const [parent, ov] of overlays) {
       if (ov === overlay) return parent;
     }
     return null;
   }
 
-  function overlayHeightForSender(event) {
+  function overlayHeightForSender(event: UpdateOverlayIpcEvent): number {
     for (const [parent, overlay] of overlays) {
       if (!parent.isDestroyed() && parent.webContents === event.sender) {
         return heights.get(overlay) ?? 0;
@@ -79,7 +163,7 @@ function createUpdateOverlay({
     return 0;
   }
 
-  function notifyParentHeight(parent, height) {
+  function notifyParentHeight(parent: Parent | null, height: number): void {
     if (!parent || parent.isDestroyed()) return;
     const contents = parent.webContents;
     // During BrowserWindow's "closed" event Electron may already have
@@ -90,21 +174,21 @@ function createUpdateOverlay({
     contents.send("omnigent:update-overlay-height", height);
   }
 
-  function collapse(parent, overlay) {
+  function collapse(parent: Parent | null, overlay: Overlay): void {
     notifyParentHeight(parent, 0);
     position(parent, overlay, 1);
     overlay.setIgnoreMouseEvents(true, { forward: true });
     if (!overlay.isVisible()) overlay.showInactive();
   }
 
-  function suppress(parent) {
+  function suppress(parent: Parent): void {
     const overlay = overlays.get(parent);
     if (!overlay || overlay.isDestroyed()) return;
     suppressedParents.add(parent);
     collapse(parent, overlay);
   }
 
-  function unsuppress(parent) {
+  function unsuppress(parent: Parent): void {
     const overlay = overlays.get(parent);
     suppressedParents.delete(parent);
     if (!overlay || overlay.isDestroyed() || parent.isDestroyed()) return;
@@ -115,7 +199,7 @@ function createUpdateOverlay({
     if (!overlay.isVisible()) overlay.showInactive();
   }
 
-  function position(parent, overlay, height) {
+  function position(parent: Parent | null, overlay: Overlay, height: number): void {
     if (!parent || parent.isDestroyed() || overlay.isDestroyed()) return;
     const content = parent.getContentBounds();
     overlay.setBounds({
@@ -127,7 +211,7 @@ function createUpdateOverlay({
   }
 
   /** Create (once) the overlay window for a shell window and load the card. */
-  function ensureOverlay(parent) {
+  function ensureOverlay(parent: Parent): Overlay {
     const existing = overlays.get(parent);
     if (existing && !existing.isDestroyed()) return existing;
 
@@ -136,7 +220,10 @@ function createUpdateOverlay({
     // without letting it take focus from its parent. Do not apply focusable:
     // false on Linux: Electron documents that as making the window unmanaged,
     // always-on-top, and visible across every workspace.
-    const macOverlayOptions =
+    const macOverlayOptions: Pick<
+      BrowserWindowConstructorOptions,
+      "focusable" | "hiddenInMissionControl" | "acceptFirstMouse"
+    > =
       platform === "darwin"
         ? {
             focusable: false,
@@ -260,7 +347,7 @@ function createUpdateOverlay({
     ipcMain.handle("omnigent:get-update-overlay-height", (event) => overlayHeightForSender(event));
 
     // Trusted updater controls for the overlay page only.
-    const guard = (event) => {
+    const guard = (event: UpdateOverlayIpcEvent): Overlay => {
       const overlay = overlayForSender(event);
       if (!overlay) {
         throw new Error("update overlay IPC is only available to the shell overlay page");
@@ -318,5 +405,3 @@ function createUpdateOverlay({
 
   return { ensureOverlay, suppress, unsuppress, registerIpc };
 }
-
-module.exports = { createUpdateOverlay, OVERLAY_WIDTH, OVERLAY_INSET };
