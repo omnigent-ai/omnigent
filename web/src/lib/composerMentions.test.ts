@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   detectMentionAt,
+  recallFileMentions,
   recallSessionMentions,
   composerInlineMentions,
   expandMentionTokens,
@@ -230,6 +231,38 @@ describe("detectMentionAt", () => {
     // A double space or a newline always finishes it.
     expect(detectMentionAt("@casual  ", 9, titles)).toBeNull();
     expect(detectMentionAt("@casual\ng", 9, titles)).toBeNull();
+  });
+});
+
+describe("recallFileMentions", () => {
+  it("turns relative file markers back into tokens and tags", () => {
+    expect(
+      recallFileMentions(
+        "check [Attached: src/app.ts] and [Attached file: docs/] lines [Attached: a.ts:3-9]",
+      ),
+    ).toEqual({
+      text: "check @src/app.ts and @docs/ lines @a.ts:3-9",
+      files: [
+        { path: "src/app.ts", isDir: false },
+        { path: "docs", isDir: true },
+        { path: "a.ts", isDir: false, lineRange: { start: 3, end: 9 } },
+      ],
+    });
+  });
+
+  it("gives a file a token no recalled session uses", () => {
+    expect(recallFileMentions("see [Attached: README.md]", ["@README.md"])).toEqual({
+      text: "see @README.md (file)",
+      files: [{ path: "README.md", isDir: false, token: "@README.md (file)" }],
+    });
+  });
+
+  it("drops upload markers and leaves session markers alone", () => {
+    const session = '[Session: "Fix CI" id=sess_1 subagent=no]';
+    expect(recallFileMentions(`[Attached: /tmp/up.png]see ${session}`)).toEqual({
+      text: `see ${session}`,
+      files: [],
+    });
   });
 });
 

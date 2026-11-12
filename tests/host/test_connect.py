@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import click
+import httpx
 import pytest
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
@@ -28,7 +29,7 @@ from websockets.frames import Close
 from websockets.http11 import Response
 
 from omnigent import debug_logging
-from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host import HOST_FATAL_EXIT_CODE, daemon_launch
 from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
@@ -104,6 +105,8 @@ from omnigent.host.git_worktree import CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.host.session_env import session_env_handoff
+from omnigent.onboarding import harness_install
 from omnigent.onboarding.harness_install import READINESS_CLI_PROBE_TIMEOUT_S
 from omnigent.onboarding.harness_login import CodexDeviceLogin
 from omnigent.runner.identity import (
@@ -1214,6 +1217,101 @@ async def test_handle_launch_refuses_when_workspace_mkdir_denied(
     _cleanup_host(host)
 
 
+_FORWARDS_SESSION_ENV = pytest.mark.skipif(
+    sys.platform == "win32", reason="Session env forwarding is disabled on Windows"
+)
+
+
+def _relayed_launch_frame(body: dict[str, str], request_id: str) -> HostLaunchRunnerFrame:
+    """Return the launch frame a host receives for a CLI's ``POST /v1/hosts/{id}/runners``."""
+    frame = decode_host_frame(
+        encode_host_frame(
+            HostLaunchRunnerFrame(
+                request_id=request_id,
+                binding_token=f"token_{request_id}",
+                workspace=body["workspace"],
+                session_id=body["session_id"],
+                session_env_handoff_id=body.get("session_env_handoff_id"),
+            )
+        )
+    )
+    assert isinstance(frame, HostLaunchRunnerFrame)
+    return frame
+
+
+@_FORWARDS_SESSION_ENV
+async def test_cli_launch_forwards_named_shell_env_to_only_that_sessions_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only the launching CLI's session runner gets its named variables, never the server."""
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    forwarded_names = ("ARCATERM_CAPABILITY", "MACTERM_SOCKET", "ARCATERM_PROJECTS_ROOT")
+    monkeypatch.setenv("OMNIGENT_SESSION_ENV_PASSTHROUGH", " , ".join(forwarded_names))
+    monkeypatch.setenv("ARCATERM_CAPABILITY", "capability-for-pane-1")
+    monkeypatch.setenv("MACTERM_SOCKET", "/tmp/macterm-pane-1.sock")
+    monkeypatch.delenv("ARCATERM_PROJECTS_ROOT", raising=False)
+    launch_requests: list[bytes] = []
+    spawned_envs: dict[str, dict[str, str]] = {}
+    original_popen = subprocess.Popen
+
+    async def _server(request: httpx.Request) -> httpx.Response:
+        launch_requests.append(request.content)
+        body = json.loads(request.content)
+        for name in ("OMNIGENT_SESSION_ENV_PASSTHROUGH", *forwarded_names):
+            monkeypatch.delenv(name, raising=False)
+        session_id = body["session_id"]
+
+        def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+            spawned_envs[session_id] = dict(kwargs["env"])  # type: ignore[call-overload]
+            return original_popen(
+                ["sleep", "10"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+
+        frame = _relayed_launch_frame(body, f"req_{session_id}")
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await host._handle_launch(frame)
+        assert result.status == "launched", result.error
+        return httpx.Response(200, json={"runner_id": result.runner_id})
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server), base_url="https://server.example"
+        ) as client:
+            for session_id in ("conv_arcaterm", "conv_plain"):
+                await daemon_launch.launch_or_reuse_daemon_runner(
+                    client,
+                    host_id="host_test_connect",
+                    session_id=session_id,
+                    workspace=str(workspace),
+                    fresh=True,
+                )
+    finally:
+        _cleanup_host(host)
+
+    assert "did not receive" not in capsys.readouterr().err
+    assert not any(b"capability-for-pane-1" in content for content in launch_requests)
+    arcaterm_body, plain_body = (json.loads(content) for content in launch_requests)
+    assert arcaterm_body.pop("session_env_handoff_id")
+    assert arcaterm_body == {"session_id": "conv_arcaterm", "workspace": str(workspace)}
+    assert plain_body == {"session_id": "conv_plain", "workspace": str(workspace)}
+    arcaterm_env = spawned_envs["conv_arcaterm"]
+    assert arcaterm_env["ARCATERM_CAPABILITY"] == "capability-for-pane-1"
+    assert arcaterm_env["MACTERM_SOCKET"] == "/tmp/macterm-pane-1.sock"
+    assert "ARCATERM_PROJECTS_ROOT" not in arcaterm_env
+    assert (
+        arcaterm_env["OMNIGENT_RUNNER_SESSION_ENV_NAMES"] == "ARCATERM_CAPABILITY,MACTERM_SOCKET"
+    )
+    plain_env = spawned_envs["conv_plain"]
+    assert not {"ARCATERM_CAPABILITY", "MACTERM_SOCKET"} & plain_env.keys()
+    assert "OMNIGENT_RUNNER_SESSION_ENV_NAMES" not in plain_env
+
+
 @pytest.mark.parametrize("binding_token", ["token_xyz", "", "   "])
 async def test_handle_launch_fails_for_bad_workspace(
     tmp_path: Path,
@@ -1472,14 +1570,14 @@ async def test_handle_launch_does_not_ask_to_install_a_resolvable_pi_that_never_
     monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
     monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
-    original_run = subprocess.run
+    original_run = harness_install.run_isolated
 
     def _unanswered_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if argv[1:] != ["--version"]:
             return original_run(argv, **kwargs)
         raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
 
-    monkeypatch.setattr(subprocess, "run", _unanswered_version)
+    monkeypatch.setattr(harness_install, "run_isolated", _unanswered_version)
     host = _make_host_process()
     proc = Mock(spec=subprocess.Popen, pid=1234)
     proc.poll.return_value = None
@@ -1509,7 +1607,7 @@ async def test_handle_launch_bound_preflight_waits_only_the_readiness_probe_budg
     """A bound launch lets an unanswered CLI through within the readiness probe budget."""
     probe_timeouts: list[object] = []
     original_which = shutil.which
-    original_run = subprocess.run
+    original_run = harness_install.run_isolated
 
     def _resolve_claude(name: str, *args: object, **kwargs: object) -> str | None:
         return "/usr/bin/claude" if name == "claude" else original_which(name, *args, **kwargs)
@@ -1524,7 +1622,7 @@ async def test_handle_launch_bound_preflight_waits_only_the_readiness_probe_budg
     proc = Mock(spec=subprocess.Popen, pid=1234)
     proc.poll.return_value = None
     monkeypatch.setattr(shutil, "which", _resolve_claude)
-    monkeypatch.setattr(subprocess, "run", _unanswered_version)
+    monkeypatch.setattr(harness_install, "run_isolated", _unanswered_version)
     monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
     monkeypatch.setattr(
         host, "_spawn_runner_proc", Mock(return_value=(proc, tmp_path / "runner.log"))
@@ -5153,6 +5251,27 @@ def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
     assert env["MY_GATEWAY_URL"] == "https://llm.internal.example.com"
     # Anything unnamed stays behind the allowlist.
     assert "UNLISTED_SECRET" not in env
+
+
+def test_build_runner_env_session_env_bypasses_allowlist_and_overrides_daemon_values() -> None:
+    """Forwarded values bypass the allowlist and replace the daemon's own copies."""
+    env = _build_runner_env(
+        {"PATH": "/usr/bin", "SSH_AUTH_SOCK": "/tmp/daemon-agent.sock"},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+        session_env={
+            "SSH_AUTH_SOCK": "/tmp/pane-agent.sock",
+            "ARCATERM_CAPABILITY": "capability-for-pane-1",
+        },
+    )
+
+    assert env["SSH_AUTH_SOCK"] == "/tmp/pane-agent.sock"
+    assert env["ARCATERM_CAPABILITY"] == "capability-for-pane-1"
+    assert env["RUNNER_SERVER_URL"] == "http://server"
+    assert env["OMNIGENT_RUNNER_SESSION_ENV_NAMES"] == "ARCATERM_CAPABILITY,SSH_AUTH_SOCK"
 
 
 def test_dispatch_trace_context_reaches_runner_but_not_daemon(
@@ -10211,6 +10330,7 @@ async def test_fatal_upgrade_error_bodyless_4xx_falls_back_to_generic() -> None:
     assert "the server rejected the host tunnel request" in str(err)
 
 
+@_FORWARDS_SESSION_ENV
 async def test_handle_launch_supersedes_previous_runner_for_same_session(
     tmp_path: Path,
 ) -> None:
@@ -10218,7 +10338,9 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
 
     The server rotates the binding token on every relaunch, so without
     this the host accumulates one live runner per attempt — each with a
-    transcript forwarder tailing the same session (the #5182 leak).
+    transcript forwarder tailing the same session (the #5182 leak). A
+    server-driven relaunch also starts without the first launch's forwarded
+    variables.
     """
     host = _make_host_process()
     maintenance_reasons: list[str] = []
@@ -10229,21 +10351,29 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
     workspace.mkdir()
 
     original_popen = subprocess.Popen
+    spawned_envs: list[dict[str, str]] = []
 
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        spawned_envs.append(dict(kwargs["env"]))  # type: ignore[call-overload]
         return original_popen(
             ["sleep", "30"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
-    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+    with (
+        patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen),
+        session_env_handoff(
+            "conv_super", {"ARCATERM_CAPABILITY": "capability-for-pane-1"}
+        ) as handoff_id,
+    ):
         first = await host._handle_launch(
             HostLaunchRunnerFrame(
                 request_id="req_a",
                 binding_token="tok_a",
                 workspace=str(workspace),
                 session_id="conv_super",
+                session_env_handoff_id=handoff_id,
             )
         )
         first_handle = host._runners[first.runner_id]
@@ -10273,6 +10403,11 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
         await asyncio.sleep(0.01)
     assert maintenance_reasons == ["runner_superseded"]
     assert second.runner_id in host._runners
+    first_env, replacement_env = spawned_envs
+    assert first_env["ARCATERM_CAPABILITY"] == "capability-for-pane-1"
+    assert (
+        not {"ARCATERM_CAPABILITY", "OMNIGENT_RUNNER_SESSION_ENV_NAMES"} & replacement_env.keys()
+    )
     _cleanup_host(host)
 
 
@@ -11299,6 +11434,10 @@ def test_github_commit_ops_are_served_on_host(
             author = {"name": "Ada", "date": "2026-11-01T10:00:00Z"}
             entries = [{"sha": commit, "commit": {"message": "Fix", "author": author}}]
             return 0, json.dumps([entries]), ""
+        if "/compare/" in argv[-1]:
+            return 0, "compare-patch", ""
+        if "graphql" in argv:
+            return 1, "", "no associated PRs here"
         return 0, "commit-patch", ""
 
     monkeypatch.setattr(github_resource, "_gh", gh)
@@ -11325,13 +11464,82 @@ def test_github_commit_ops_are_served_on_host(
                 params={"pr_url": url, "commit_sha": commit},
             )
         )
+        compared = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="compare-diff",
+                op="github_compare_diff",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "head_sha": head, "from_sha": commit},
+            )
+        )
     finally:
         _cleanup_host(host)
 
     assert listed.status == "ok", listed
     assert [entry["sha"] for entry in listed.payload["data"]] == [commit]
+    assert compared.status == "ok", compared
+    assert compared.payload["patch"] == "compare-patch"
     assert patch.status == "ok", patch
     assert patch.payload == {"object": "session.github.pr_diff", "patch": "commit-patch"}
+
+
+def _host_with_tracked_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gh: Callable[..., tuple[int, str, str]]
+) -> tuple[HostProcess, str]:
+    """A host whose session tracks one PR, with every ``gh`` call going to ``gh``."""
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    return _make_host_process(), url
+
+
+def test_github_merge_on_host_runs_as_the_confirmed_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tunneled merge-as runs with the confirmed account's own token."""
+    from omnigent.host.frames import HostFsWriteFrame
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    calls: list[tuple[list[str], object]] = []
+
+    def gh(argv: list[str], **kwargs: object) -> tuple[int, str, str]:
+        calls.append((argv, kwargs.get("token")))
+        if argv[:2] == ["auth", "token"]:
+            return 0, f"token-{argv[3]}", ""
+        return 0, "", ""
+
+    host, url = _host_with_tracked_pr(tmp_path, monkeypatch, gh)
+    try:
+        merged = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="merge",
+                op="github_merge_as",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={
+                    "pr_url": url,
+                    "merge_method": "rebase",
+                    "expected_head": "a" * 40,
+                    "account": "personal",
+                },
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert merged.status == "ok", merged
+    argv, token = calls[-1]
+    assert argv[:2] == ["pr", "merge"]
+    assert argv[-3:] == ["--rebase", "--match-head-commit", "a" * 40]
+    assert token == "token-personal"
 
 
 def test_github_merge_ops_are_served_on_host(
@@ -11340,9 +11548,7 @@ def test_github_merge_ops_are_served_on_host(
     """The host reads merge options and merges a tracked PR when the runner is offline."""
     from omnigent.host.frames import HostFsRequestFrame, HostFsWriteFrame
     from omnigent.runner import github_resource
-    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 
-    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
     calls: list[list[str]] = []
 
@@ -11356,12 +11562,7 @@ def test_github_merge_ops_are_served_on_host(
             )
         return 0, "", ""
 
-    monkeypatch.setattr(github_resource, "_gh", gh)
-    url = "https://github.com/example/one/pull/42"
-    SessionPrRegistry("session").record(
-        [PullRequestRef.from_url(url)], relationship="created", source="test"
-    )
-    host = _make_host_process()
+    host, url = _host_with_tracked_pr(tmp_path, monkeypatch, gh)
     try:
         options = host._handle_fs_request(
             HostFsRequestFrame(

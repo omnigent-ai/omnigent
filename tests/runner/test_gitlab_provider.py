@@ -599,6 +599,95 @@ def test_gitlab_omitted_patch_keeps_file_without_line_counts(
     assert result == {"object": "session.github.pr_diff", "patch": ""}
 
 
+def test_pinned_reads_echo_the_matching_revisions(root: str, api: Mock) -> None:
+    files = module.PULL_REQUESTS.pinned_changed_files(root, ref(), head_sha=HEAD, base_sha=BASE)
+    assert files["head_sha"] == HEAD and files["base_sha"] == BASE
+    assert files["data"][0]["path"] == "src/new.py"
+    patch = module.PULL_REQUESTS.pinned_diff(root, ref(), head_sha=HEAD, base_sha=BASE)
+    assert patch["head_sha"] == HEAD and patch["base_sha"] == BASE
+    assert "--- a/src/old.py\n+++ b/src/new.py\n" in patch["patch"]
+
+
+@pytest.mark.parametrize("read", ["pinned_changed_files", "pinned_diff"])
+@pytest.mark.parametrize("override", [{"head_sha": "d" * 40}, {"base_sha": "e" * 40}])
+def test_pinned_read_refuses_a_merge_request_that_moved(
+    root: str, api: Mock, read: str, override: dict
+) -> None:
+    pins = {"head_sha": HEAD, "base_sha": BASE, **override}
+    with pytest.raises(ValueError, match="merge request changed"):
+        getattr(module.PULL_REQUESTS, read)(root, ref(), **pins)
+
+
+@pytest.mark.parametrize("read", ["pinned_changed_files", "pinned_diff"])
+def test_pinned_read_refuses_a_merge_request_that_moves_during_the_listing(
+    root: str, api: Mock, mr: dict, change: dict, read: str
+) -> None:
+    def moving_changes(path: str, **query):
+        mr["diff_refs"]["head_sha"] = "d" * 40
+        return [change], False
+
+    api.pages.side_effect = moving_changes
+    with pytest.raises(ValueError, match="merge request changed"):
+        getattr(module.PULL_REQUESTS, read)(root, ref(), head_sha=HEAD, base_sha=BASE)
+
+
+def test_partial_pinned_listing_whose_final_check_times_out_returns_it_without_pins(
+    root: str, api: Mock, change: dict
+) -> None:
+    api.pages.side_effect = lambda path, **query: ([change], True)
+    answer = api.object.side_effect
+    merge_request_reads = []
+
+    def final_check_times_out(path: str, **query):
+        # The reads are the check before the listing, the listing's own read, then the final check.
+        if path == MR_PATH:
+            merge_request_reads.append(path)
+            if len(merge_request_reads) == 3:
+                raise GitLabTimeoutError("GitLab request timed out. Refresh to retry.")
+        return answer(path, **query)
+
+    api.object.side_effect = final_check_times_out
+    result = module.PULL_REQUESTS.pinned_changed_files(root, ref(), head_sha=HEAD, base_sha=BASE)
+
+    assert result["has_more"] is True and result["warning"]
+    assert [file["path"] for file in result["data"]] == ["src/new.py"]
+    assert "head_sha" not in result and "base_sha" not in result
+
+
+@pytest.mark.parametrize("read", ["pinned_changed_files", "pinned_diff"])
+def test_pinned_read_without_prepared_diff_refs_returns_data_without_pins(
+    root: str, api: Mock, mr: dict, read: str
+) -> None:
+    mr["diff_refs"] = None
+    result = getattr(module.PULL_REQUESTS, read)(root, ref(), head_sha=HEAD, base_sha=BASE)
+    assert "src/new.py" in str(result)
+    assert "head_sha" not in result and "base_sha" not in result
+
+
+def test_incomplete_pinned_diff_echoes_the_verified_revisions(
+    root: str, api: Mock, mr: dict
+) -> None:
+    mr["changes_count"] = "1000+"
+    result = module.PULL_REQUESTS.pinned_diff(root, ref(), head_sha=HEAD, base_sha=BASE)
+    assert result["unavailable_reason"] == "incomplete_diff"
+    assert result["head_sha"] == HEAD and result["base_sha"] == BASE
+
+
+def test_panel_pinned_reads_route_to_the_gitlab_revisions(
+    root: str, api: Mock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.runner import pr_resource
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    session = "gitlab-pinned"
+    pr_resource.update_session_pr(root, session, URL, "attach")
+    pinned = {"session_id": session, "pr_url": URL, "head_sha": HEAD, "base_sha": BASE}
+    assert pr_resource.pr_changed_files(root, **pinned)["head_sha"] == HEAD
+    assert pr_resource.pr_diff(root, **pinned)["head_sha"] == HEAD
+    with pytest.raises(ValueError, match="merge request changed"):
+        pr_resource.pr_changed_files(root, **{**pinned, "head_sha": "d" * 40})
+
+
 def file_diff(root: str, **overrides) -> dict:
     return module.PULL_REQUESTS.file_diff(
         root,

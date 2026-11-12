@@ -11,6 +11,7 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
+import type * as UseSessionLiveMcpServersModule from "@/hooks/useSessionLiveMcpServers";
 import type * as UseAgentsModule from "@/hooks/useAgents";
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -84,6 +85,16 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHarnessInventoryModule>()),
   useHostMcpServers: () => ({ data: [], isLoading: false, isError: false }),
+}));
+vi.mock("@/hooks/useSessionLiveMcpServers", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSessionLiveMcpServersModule>()),
+  useSessionLiveMcpServers: () => ({ data: undefined, isError: false }),
+  useReconnectLiveMcpServer: () => ({
+    reconnect: () => {},
+    reconnectingName: null,
+    error: null,
+    clearError: () => {},
+  }),
 }));
 // /mcp reads the session's agent via a TanStack query; stub it (no agent loaded)
 // so these renders don't need a QueryClientProvider either.

@@ -179,7 +179,7 @@ export interface SessionMention {
  * ``omnigent/entities/conversation.py``.
  */
 export const SESSION_MENTION_HINT =
-  "[Tagged sessions: read with sys_session_get_history; to message one, use " +
+  "[Tagged sessions: read with sys_session_get_history; if asked to message one, use " +
   "sys_session_send if it is your own subagent and that tool is available, " +
   "otherwise sys_session_message]";
 
@@ -413,6 +413,39 @@ export function recallSessionMentions(
     others: others.map((segment) => segment.replace(SENT_SESSION_RE, toToken)),
     sessions,
   };
+}
+
+/**
+ * Turn a sent message's relative file markers back into composer tokens and
+ * return the tagged files. Absolute-path upload markers are dropped, as in
+ * ``replaceSentMentions``; session markers are left for ``recallSessionMentions``,
+ * whose tokens go in ``taken`` so a file and a session never share one.
+ */
+export function recallFileMentions(
+  text: string,
+  taken: readonly string[] = [],
+): { text: string; files: MentionItem[] } {
+  const files: MentionItem[] = [];
+  const recalled = text.replace(SENT_ATTACHED_RE, (_m, raw: string, trail: string) => {
+    const path = raw.trim();
+    if (!path || isAbsolutePath(path)) return "";
+    const range = /^(.*):(\d+)-(\d+)$/.exec(path);
+    const item: MentionItem = range
+      ? {
+          path: range[1]!,
+          isDir: false,
+          lineRange: { start: Number(range[2]), end: Number(range[3]) },
+        }
+      : { path: path.replace(/\/$/, ""), isDir: path.endsWith("/") };
+    const known = files.find((it) => mentionItemPath(it) === mentionItemPath(item));
+    if (known) return fileMentionToken(known) + trail;
+    // A session tag recalled from the same message may own the plain token.
+    const token = newFileMentionToken(item, [...taken, ...files.map(fileMentionToken)]);
+    if (token !== fileMentionToken(item)) item.token = token;
+    files.push(item);
+    return token + trail;
+  });
+  return { text: recalled, files };
 }
 
 /** Sent-message text for reading and copying: markers become ``@name``. */
