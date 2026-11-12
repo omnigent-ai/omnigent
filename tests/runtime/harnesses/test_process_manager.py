@@ -31,10 +31,12 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -2148,6 +2150,74 @@ async def _cancel_pending(*tasks: asyncio.Task[object] | None) -> None:
                 # as a dead statement (teardown only cares that the task settles).
                 _settled = await task
                 del _settled
+
+
+@pytest.mark.parametrize("outcome", ["ready", "cancelled", "write_error"])
+async def test_slow_owner_claim_preserves_loop_progress_and_spawn_ownership(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """Slow spawn preparation keeps the loop live and drains before shutdown."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+    from tests._helpers.polling import poll_until_async
+
+    await manager.start()
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_write = pm_mod.write_owner_claim
+
+    def slow_write(directory: Path, *, filename: str) -> None:
+        loop.call_soon_threadsafe(entered.set)
+        release.wait(timeout=5.0)
+        try:
+            if outcome == "write_error":
+                raise OSError("owner claim could not be written")
+            original_write(directory, filename=filename)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(pm_mod, "write_owner_claim", slow_write)
+    spawn_process = AsyncMock(wraps=manager._spawn_harness_process)
+    monkeypatch.setattr(manager, "_spawn_harness_process", spawn_process)
+    spawn = asyncio.create_task(manager.get_client("conv_slow_owner", _TEST_HARNESS_NAME))
+    shutdown: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10.0)
+        assert not finished.is_set(), "owner-file I/O blocked the event loop"
+        if outcome == "cancelled":
+            spawn.cancel()
+            await asyncio.sleep(0)
+            spawn.cancel()
+            await asyncio.sleep(0)
+            assert not spawn.done(), "cancellation abandoned the file writer"
+            shutdown = asyncio.create_task(manager.shutdown())
+            await poll_until_async(lambda: manager._shutting_down, timeout_s=5.0)
+            assert not shutdown.done(), "shutdown raced the pending file writer"
+        release.set()
+        if outcome == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await spawn
+            assert shutdown is not None
+            await shutdown
+        elif outcome == "write_error":
+            with pytest.raises(OSError, match="owner claim could not be written"):
+                await spawn
+        else:
+            await _ping_health(await spawn)
+            claim = read_owner_claim(manager.instance_dir, filename=_AP_PID_FILE)
+            assert claim is not None and claim.pid == os.getpid()
+        assert finished.is_set()
+        assert spawn_process.await_count == (1 if outcome == "ready" else 0)
+    finally:
+        release.set()
+        await _cancel_pending(spawn, shutdown)
+        if spawn.done() and not spawn.cancelled():
+            spawn.exception()
+        await manager.shutdown()
+    assert not manager.instance_dir.exists()
 
 
 async def test_release_during_spawn_leaves_no_live_process(
