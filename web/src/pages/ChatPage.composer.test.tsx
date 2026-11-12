@@ -84,6 +84,10 @@ vi.mock("@/lib/mcpRegistry", () => ({
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: () => ({ data: undefined }),
 }));
+// Run a workflow lists saved workflows from a TanStack query; none here.
+vi.mock("@/hooks/useSavedWorkflows", () => ({
+  useSavedWorkflows: () => ({ workflows: [], refresh: () => {} }),
+}));
 // The workspace bar's git-status hook uses TanStack Query; stub it so the
 // composer renders in isolation (no QueryClient) with a neutral empty status.
 // The hoisted spy records the args so a test can assert the page passes the

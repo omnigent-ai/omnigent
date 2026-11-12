@@ -5,11 +5,20 @@ import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } fr
 import {
   CheckIcon,
   ChevronRightIcon,
+  EllipsisIcon,
   ListChecksIcon,
   Loader2Icon,
   MessageCircleQuestionMarkIcon,
+  WorkflowIcon,
   XIcon,
 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useNow } from "@/hooks/useNow";
 import { useSessionTasks } from "@/hooks/useSessionTasks";
@@ -649,12 +658,15 @@ function TasksHeader({
   paused,
   stuck,
   onSelect,
+  onSaveWorkflow,
 }: {
   plan: JournalEntry | null;
   progress: readonly StepProgress[];
   paused: PausedLabel | null;
   stuck: boolean;
   onSelect: (stepId: string) => void;
+  /** Opens the composer's Save as workflow dialog; absent when the agent can't save. */
+  onSaveWorkflow?: () => void;
 }) {
   const tally = planTally(progress);
   const updatedAt = Math.max(
@@ -669,6 +681,8 @@ function TasksHeader({
   const finished = finishedTaskCount(progress);
   const allDone = tally.done === progress.length;
   const name = planName(plan);
+  // Save opens the composer's dialog once this menu has closed, so the dialog keeps focus.
+  const saveAfterCloseRef = useRef(false);
   return (
     <header
       className={cn(
@@ -689,11 +703,47 @@ function TasksHeader({
                 {name}
               </h3>
             )}
-            {updatedAt > 0 && (
-              <span className="ml-auto shrink-0 text-sm text-muted-foreground">
-                Updated <Ago seconds={updatedAt} />
-              </span>
-            )}
+            <span className="ml-auto flex shrink-0 items-center gap-1">
+              {updatedAt > 0 && (
+                <span className="text-sm text-muted-foreground">
+                  Updated <Ago seconds={updatedAt} />
+                </span>
+              )}
+              {onSaveWorkflow && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="Plan actions"
+                      className="shrink-0 self-center text-muted-foreground"
+                      data-testid="tasks-plan-menu"
+                    >
+                      <EllipsisIcon className="size-3.5" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent
+                    align="end"
+                    onCloseAutoFocus={(event) => {
+                      if (!saveAfterCloseRef.current) return;
+                      saveAfterCloseRef.current = false;
+                      event.preventDefault();
+                      requestAnimationFrame(() => onSaveWorkflow());
+                    }}
+                  >
+                    <DropdownMenuItem
+                      data-testid="tasks-save-workflow"
+                      onSelect={() => {
+                        saveAfterCloseRef.current = true;
+                      }}
+                    >
+                      <WorkflowIcon className="size-3.5" />
+                      Save as workflow…
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+            </span>
           </div>
         )}
         {!name && <h3 className="sr-only">Tasks</h3>}
@@ -780,6 +830,7 @@ export function TasksPanel({
   const tasks = useSessionTasks(conversationId, active);
   const { journal, plan, progress } = tasks;
   const startWorkflow = useSessionTasksActions((state) => state.startWorkflow[conversationId]);
+  const saveWorkflow = useSessionTasksActions((state) => state.saveWorkflow[conversationId]);
   const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
   const empty = progress.length === 0;
@@ -879,6 +930,9 @@ export function TasksPanel({
               paused={tasks.paused}
               stuck={stuck}
               onSelect={jumpToStep}
+              onSaveWorkflow={
+                saveWorkflow && plan ? () => saveWorkflow(planName(plan) ?? "") : undefined
+              }
             />
             <TaskList
               progress={progress}

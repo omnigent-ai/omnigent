@@ -302,6 +302,11 @@ export interface ServerInfo {
    */
   session_journal?: boolean;
   /**
+   * True when the server keeps each user's saved workflows (``/v1/workflows``), which
+   * Run a workflow offers; absent on older servers (off).
+   */
+  workflows?: boolean;
+  /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
    */
@@ -647,6 +652,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_pull_requests: data.session_pull_requests === true,
           session_journal: data.session_journal === true,
+          workflows: data.workflows === true,
           session_title_instructions: data.session_title_instructions === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,

@@ -12,6 +12,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
+import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 
 /** What the user asked for in the "Run a workflow" dialog. */
 export interface WorkflowRequest {
@@ -19,6 +20,8 @@ export interface WorkflowRequest {
   description: string;
   /** Whether the agent's plan starts with the user reviewing it. */
   reviewPlanFirst: boolean;
+  /** The saved workflow to run; the description then holds this run's details. */
+  savedWorkflow?: SavedWorkflow;
 }
 
 export interface WorkflowDialogProps {
@@ -30,15 +33,21 @@ export interface WorkflowDialogProps {
   initialDescription?: string;
   /** Why the workflow can't be sent right now; it disables Run. */
   blockedReason?: string | null;
+  /** A saved workflow to run instead of describing a new one. */
+  savedWorkflow?: SavedWorkflow | null;
 }
 
-/** Ask for a workflow's description, and whether to review the plan before work starts. */
+/**
+ * Ask for a workflow's description, or a saved workflow's details, and whether to
+ * review the plan before work starts.
+ */
 export function WorkflowDialog({
   open,
   onOpenChange,
   onRunWorkflow,
   initialDescription = "",
   blockedReason = null,
+  savedWorkflow = null,
 }: WorkflowDialogProps) {
   const [description, setDescription] = useState(initialDescription);
   const [reviewPlanFirst, setReviewPlanFirst] = useState(true);
@@ -54,13 +63,18 @@ export function WorkflowDialog({
     setReviewPlanFirst(true);
   }, [open]);
 
-  const canRun = description.trim() !== "" && blockedReason === null;
+  // A saved workflow runs without details: the agent asks for any it needs.
+  const canRun = (savedWorkflow !== null || description.trim() !== "") && blockedReason === null;
   const submit = (event: FormEvent) => {
     event.preventDefault();
     // React bubbles a portal's submit to the composer's form, which would send the draft.
     event.stopPropagation();
     if (!canRun) return;
-    onRunWorkflow({ description: description.trim(), reviewPlanFirst });
+    onRunWorkflow({
+      description: description.trim(),
+      reviewPlanFirst,
+      ...(savedWorkflow ? { savedWorkflow } : {}),
+    });
     onOpenChange(false);
   };
 
@@ -74,11 +88,17 @@ export function WorkflowDialog({
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <WorkflowIcon className="size-4" />
-              <span>Run a workflow</span>
+              <span className="min-w-0 truncate">
+                {savedWorkflow ? `Run ${savedWorkflow.name}` : "Run a workflow"}
+              </span>
             </DialogTitle>
-            <DialogDescription>
-              The agent turns your description into a plan and works through it step by step. Follow
-              along in the Tasks tab.
+            <DialogDescription
+              className={savedWorkflow ? "whitespace-pre-line" : undefined}
+              data-testid="workflow-dialog-about"
+            >
+              {savedWorkflow
+                ? savedWorkflow.description
+                : "The agent turns your description into a plan and works through it step by step. Follow along in the Tasks tab."}
             </DialogDescription>
           </DialogHeader>
 
@@ -86,7 +106,7 @@ export function WorkflowDialog({
           <div className="-mx-1 min-h-0 space-y-4 overflow-y-auto px-1">
             <div className="space-y-1.5">
               <label className="text-sm font-medium text-muted-foreground" htmlFor={descriptionId}>
-                Description
+                {savedWorkflow ? "Details" : "Description"}
               </label>
               <Textarea
                 id={descriptionId}
@@ -99,7 +119,11 @@ export function WorkflowDialog({
                 rows={5}
                 // The New automation dialog's prompt field: focus recolors the border, with no ring.
                 className="min-h-32 resize-y rounded-xl p-4 text-ui focus-visible:ring-0"
-                placeholder="Add retries to the uploader, with tests"
+                placeholder={
+                  savedWorkflow
+                    ? "What this run is about"
+                    : "Add retries to the uploader, with tests"
+                }
                 autoFocus
                 data-testid="workflow-dialog-description"
                 componentId="workflow_dialog.description"

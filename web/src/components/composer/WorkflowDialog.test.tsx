@@ -44,6 +44,30 @@ describe("WorkflowDialog", () => {
     });
   });
 
+  it("runs a saved workflow with optional details", () => {
+    const savedWorkflow = {
+      id: "0123456789abcdef0123456789abcdef",
+      name: "Triage flaky tests",
+      description: "Finds and fixes flaky tests.\nGive it: the test suite.",
+    };
+    const { onRunWorkflow } = renderDialog({ savedWorkflow });
+    expect(screen.getByRole("dialog", { name: "Run Triage flaky tests" })).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-dialog-about")).toHaveTextContent(
+      "Give it: the test suite.",
+    );
+    expect(screen.getByLabelText("Details")).toBe(description());
+    expect(run()).toBeEnabled();
+
+    fireEvent.change(description(), { target: { value: " The upload tests " } });
+    fireEvent.click(run());
+
+    expect(onRunWorkflow).toHaveBeenCalledWith({
+      description: "The upload tests",
+      reviewPlanFirst: true,
+      savedWorkflow,
+    });
+  });
+
   it("opens on the caller's description, checked again, each time", () => {
     const { rerender, onOpenChange, onRunWorkflow } = renderDialog({ initialDescription: "Draft" });
     expect(description()).toHaveValue("Draft");

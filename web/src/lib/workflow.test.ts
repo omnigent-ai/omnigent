@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { REVIEW_PLAN_FIRST, offersWorkflow, workflowMessage } from "./workflow";
+import {
+  REVIEW_PLAN_FIRST,
+  offersSaveWorkflow,
+  offersWorkflow,
+  savedWorkflowMessage,
+  saveWorkflowMessage,
+  workflowMessage,
+} from "./workflow";
 
 describe("workflowMessage", () => {
   it("asks for the plan review in its own paragraph", () => {
@@ -18,5 +25,32 @@ describe("offersWorkflow", () => {
   it("needs the workflow skill", () => {
     expect(offersWorkflow([{ name: "deslop" }, { name: "workflow" }])).toBe(true);
     expect(offersWorkflow([{ name: "deslop" }])).toBe(false);
+  });
+});
+
+describe("savedWorkflowMessage", () => {
+  const workflow = { id: "0123456789abcdef0123456789abcdef", name: "Triage flaky tests" };
+
+  it("names the saved workflow by ID, then the details and the review", () => {
+    expect(savedWorkflowMessage("/", workflow, "  The upload tests ", true)).toBe(
+      `/workflow Run the saved workflow "Triage flaky tests" (ID ${workflow.id}).\n\n` +
+        `The upload tests\n\n${REVIEW_PLAN_FIRST}`,
+    );
+  });
+
+  it("leaves out empty details", () => {
+    expect(savedWorkflowMessage("$", workflow, " ", false)).toBe(
+      `$workflow Run the saved workflow "Triage flaky tests" (ID ${workflow.id}).`,
+    );
+  });
+});
+
+describe("saveWorkflowMessage", () => {
+  it("runs the save-workflow skill with the picked name", () => {
+    expect(saveWorkflowMessage("/", " Triage flaky tests ")).toBe(
+      '/save-workflow Save this session\'s plan as a workflow named "Triage flaky tests".',
+    );
+    expect(offersSaveWorkflow([{ name: "save-workflow" }])).toBe(true);
+    expect(offersSaveWorkflow([{ name: "workflow" }])).toBe(false);
   });
 });

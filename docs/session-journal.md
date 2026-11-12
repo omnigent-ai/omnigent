@@ -51,7 +51,7 @@ stored entry is at most 16,383 bytes after compression.
 
 ## Agent tools
 
-The five tools make up the `journal` tool group, which every agent has. An agent
+The seven tools make up the `journal` tool group, which every agent has. An agent
 spec can drop it with `tool_groups.journal: false` (see
 [Tool groups](AGENT_YAML_SPEC.md#tool-groups)).
 
@@ -62,6 +62,8 @@ spec can drop it with `tool_groups.journal: false` (see
 | `sys_journal_write_status(status, step?, text?)`                    | Records a step's status. `step` may be left out when the plan has one step. `started` and `done` need every step it depends on to be done first; otherwise the write fails with `step_not_ready`, naming them.                                                                  |
 | `sys_journal_write_note(body, step?)`                               | Adds a note.                                                                                                                                                                                                                                                                    |
 | `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`.                           |
+| `sys_workflow_save(name, description, steps)` | Saves a reusable workflow for the session's owner through `POST /v1/workflows`, and returns `{id, name}`, or `name_taken`. The `save-workflow` skill says how to make the steps generic. A save from a session shared with edit access is refused. |
+| `sys_workflow_load(workflow)` | Loads one of the owner's saved workflows by ID or name, with its steps. A name with no exact match returns `workflow_not_found` with the closest names. |
 
 Errors come back as `{"error": …}`: `invalid_entry` (a field failed
 validation), `invalid_input` (a question or its task failed validation; a
@@ -96,6 +98,25 @@ one, or keep the current one and leave the new work aside. Otherwise it asks
 first only if the description is ambiguous. You can steer or stop it in chat at
 any time. An agent's own skill named `workflow` takes precedence over
 Omnigent's.
+
+## Saving and reusing a workflow
+
+To keep a workflow that worked, open the **⋯** menu at the right of the plan's
+name in the Tasks tab and choose **Save as workflow…**. Pick a name, which
+starts as the plan's, and choose **Save workflow**. The request goes to the
+agent through the `/save-workflow` skill. The agent keeps the steps worth
+repeating, writes them generically, leaving out the details that change from
+run to run, and saves the workflow with a description that says what a run
+needs ("Give it: the test suite"). You can also ask in chat, "save this as a
+workflow"; with no name given, the agent suggests one first.
+
+Once you have saved workflows, **Run a workflow** lists them, with a search
+field and **Describe a new workflow…** below them. Pick one, add this run's
+details, and choose **Run workflow**: the agent loads the saved workflow with
+`sys_workflow_load` and uses its steps as the plan, filling in the details.
+The saved steps are a starting point, so the agent can still replan. You can
+also ask for a saved workflow by name in chat ("run my flaky-test triage
+workflow").
 
 ## Automations
 
