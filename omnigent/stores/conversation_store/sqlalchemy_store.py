@@ -3638,6 +3638,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if cursor_id:
                     self._require_cursor_grant(cursor_id, cursor_viewer)
 
+        agent_ids_for_name: list[str] | None = None
+        if agent_name is not None:
+            # Agents live in the Omnigent DB — resolve to IDs first, then filter
+            # on the conversations.agent_id column directly. Resolved before the
+            # conversation session opens so a single-DB request never holds two
+            # pooled connections at once.
+            with self._session("list_conversations") as agent_sess:
+                agent_ids_for_name = list(
+                    agent_sess.execute(
+                        select(SqlAgent.id).where(
+                            SqlAgent.workspace_id == current_workspace_id(),
+                            SqlAgent.name == agent_name,
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
             # LOCAL scopes to this transaction and reverts on commit, so it
@@ -3728,20 +3746,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if has_agent_id is True:
                 stmt = stmt.where(SqlConversation.agent_id.is_not(None))
-            if agent_name is not None:
-                # Agents live in the Omnigent DB — resolve to IDs first, then
-                # filter on the conversations.agent_id column directly.
-                with self._session("list_conversations") as agent_sess:
-                    agent_ids_for_name = list(
-                        agent_sess.execute(
-                            select(SqlAgent.id).where(
-                                SqlAgent.workspace_id == current_workspace_id(),
-                                SqlAgent.name == agent_name,
-                            )
-                        )
-                        .scalars()
-                        .all()
-                    )
+            if agent_ids_for_name is not None:
                 stmt = stmt.where(SqlConversation.agent_id.in_(agent_ids_for_name))
             if agent_id is not None:
                 # Conversations without an agent binding (legacy rows) correctly
