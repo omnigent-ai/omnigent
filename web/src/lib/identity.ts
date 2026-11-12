@@ -16,6 +16,7 @@
  */
 
 import { stripBasePath, withBasePath } from "./basePath";
+import { isAdminViewEnabled } from "./adminView";
 import { getCachedServerInfo } from "./capabilities";
 import {
   getOmnigentHostConfig,
@@ -511,11 +512,16 @@ export function getCurrentUserId(): string | null {
 }
 
 /**
- * Whether the current user is an admin, per the `/v1/me` probe.
+ * Whether the current user has admin access enabled in this browser.
  * Mode-agnostic — usable to gate admin chrome under header, accounts,
  * AND OIDC. Returns false before `resolveIdentity` completes.
  */
 export function getCurrentIsAdmin(): boolean {
+  return currentIsAdmin && (getCachedServerInfo()?.admin_view === false || isAdminViewEnabled());
+}
+
+/** The account's role, used to keep the admin-view switch available while off. */
+export function getCurrentAdminEligibility(): boolean {
   return currentIsAdmin;
 }
 

@@ -101,6 +101,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    effective_admin,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -4137,7 +4138,7 @@ def register_events_routes(
         user_id = _require_user(request, auth_provider)
         if permission_store is not None and user_id is not None:
             is_admin = await asyncio.to_thread(permission_store.is_admin, user_id)
-            if not is_admin:
+            if not effective_admin(is_admin):
                 grant = await asyncio.to_thread(permission_store.get, user_id, session_id)
                 if grant is None or grant.level < LEVEL_OWNER:
                     if grant is not None:
