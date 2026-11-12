@@ -15,14 +15,12 @@ import { Input } from "@/components/ui/input";
 import { showToast } from "@/components/ui/toast";
 import { NewWorkflowDialog } from "@/components/workflows/NewWorkflowDialog";
 import { WorkflowRow } from "@/components/workflows/WorkflowRow";
-import { useNow } from "@/hooks/useNow";
 import { useWorkflows } from "@/hooks/useWorkflows";
 
 export function WorkflowsPage() {
   const { data: workflows, isLoading, isError, refetch } = useWorkflows();
   const [search, setSearch] = useState("");
   const [creating, setCreating] = useState(false);
-  const now = useNow();
 
   const hasAnyWorkflows = (workflows?.length ?? 0) > 0;
   const filtered = useMemo(() => {
@@ -95,7 +93,6 @@ export function WorkflowsPage() {
             <WorkflowRow
               key={workflow.id}
               workflow={workflow}
-              now={now}
               onRun={() => showToast("Running workflows isn’t connected yet.")}
               onEdit={() => showToast("Editing workflows isn’t connected yet.")}
               onCreateAutomation={() =>

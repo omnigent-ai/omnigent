@@ -49,7 +49,7 @@ describe("WorkflowsPage", () => {
   beforeEach(() => vi.mocked(showToast).mockClear());
   afterEach(cleanup);
 
-  it("lists workflows with their description and last update", () => {
+  it("lists workflows with their descriptions", () => {
     mockWorkflows({ data: WORKFLOWS });
     render(<WorkflowsPage />);
 
@@ -60,10 +60,6 @@ describe("WorkflowsPage", () => {
     expect(
       first.getByText("Reruns the suite and files an issue for each flaky test."),
     ).toBeInTheDocument();
-    expect(first.getByTestId("workflow-row-updated")).toHaveTextContent("Updated 2h ago");
-    expect(within(rows()[1]!).getByTestId("workflow-row-updated")).toHaveTextContent(
-      "Updated 3d ago",
-    );
   });
 
   it("says the row actions aren't connected yet", () => {

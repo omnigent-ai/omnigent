@@ -16,31 +16,20 @@ import {
 } from "@/components/ui/dropdown-menu";
 import type { WorkflowSummary } from "@/hooks/useWorkflows";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
 
 export interface WorkflowRowProps {
   workflow: WorkflowSummary;
-  /** The shared clock, for "Updated 2h ago". */
-  now: Date;
   onRun: (workflow: WorkflowSummary) => void;
   onEdit: (workflow: WorkflowSummary) => void;
   onCreateAutomation: (workflow: WorkflowSummary) => void;
 }
 
 /**
- * One saved workflow: its name, description and last update, with Run, Edit and
- * Create automation in a ⋯ menu and on right-click, like an automation's row.
+ * One saved workflow: its name and description, with Run, Edit and Create
+ * automation in a ⋯ menu and on right-click, like an automation's row.
  */
-export function WorkflowRow({
-  workflow,
-  now,
-  onRun,
-  onEdit,
-  onCreateAutomation,
-}: WorkflowRowProps) {
-  const updatedMs = workflow.updated_at * 1000;
-  const ago = relativeTime(updatedMs, now.getTime());
+export function WorkflowRow({ workflow, onRun, onEdit, onCreateAutomation }: WorkflowRowProps) {
   const actions = { workflow, onRun, onEdit, onCreateAutomation };
 
   return (
@@ -48,7 +37,7 @@ export function WorkflowRow({
       <ContextMenuTrigger asChild>
         <div
           data-testid="workflow-row"
-          className="group relative flex items-baseline gap-4 rounded-xl border border-border bg-card py-3 pr-12 pl-4"
+          className="group relative flex items-center gap-3 rounded-xl border border-border bg-card py-3 pr-12 pl-4"
         >
           <div className="flex min-w-0 flex-1 flex-col gap-0.5">
             <span className="truncate text-[15px] font-semibold">{workflow.name}</span>
@@ -56,14 +45,6 @@ export function WorkflowRow({
               {workflow.description}
             </span>
           </div>
-          <time
-            dateTime={new Date(updatedMs).toISOString()}
-            title={absoluteTime(updatedMs)}
-            className="shrink-0 text-sm text-muted-foreground"
-            data-testid="workflow-row-updated"
-          >
-            {ago === "now" ? "Updated just now" : `Updated ${ago} ago`}
-          </time>
           {/* Hidden until the row is hovered or focused on desktop, as on automation rows. */}
           <DropdownMenu>
             <DropdownMenuTrigger asChild>

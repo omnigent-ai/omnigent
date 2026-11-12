@@ -5,20 +5,20 @@ import type { WorkflowSummary } from "@/hooks/useWorkflows";
 
 import { WorkflowRow } from "./WorkflowRow";
 
-const NOW = new Date("2026-11-12T12:00:00Z");
-const NOW_S = NOW.getTime() / 1000;
+// Nov 12, 2026, in Unix epoch seconds.
+const SAVED_S = 1_794_484_800;
 
 const WORKFLOW: WorkflowSummary = {
   id: "6f1c2b9a4d8e4f30a1b2c3d4e5f60718",
   name: "Fix flaky tests",
   description: "Reruns the suite and files an issue for each flaky test.",
-  created_at: NOW_S - 3 * 24 * 3600,
-  updated_at: NOW_S - 2 * 3600,
+  created_at: SAVED_S,
+  updated_at: SAVED_S,
 };
 
 function renderRow(workflow: WorkflowSummary = WORKFLOW) {
   const handlers = { onRun: vi.fn(), onEdit: vi.fn(), onCreateAutomation: vi.fn() };
-  render(<WorkflowRow workflow={workflow} now={NOW} {...handlers} />);
+  render(<WorkflowRow workflow={workflow} {...handlers} />);
   return handlers;
 }
 
@@ -29,20 +29,14 @@ const itemNames = () => screen.getAllByRole("menuitem").map((item) => item.textC
 describe("WorkflowRow", () => {
   afterEach(cleanup);
 
-  it("shows the name, description and last update", () => {
+  it("shows the name and description, without a time", () => {
     renderRow();
 
     expect(screen.getByText("Fix flaky tests")).toBeInTheDocument();
     expect(
       screen.getByText("Reruns the suite and files an issue for each flaky test."),
     ).toBeInTheDocument();
-    expect(screen.getByTestId("workflow-row-updated")).toHaveTextContent("Updated 2h ago");
-  });
-
-  it("says just now for a change in the last minute", () => {
-    renderRow({ ...WORKFLOW, updated_at: NOW_S - 20 });
-
-    expect(screen.getByTestId("workflow-row-updated")).toHaveTextContent("Updated just now");
+    expect(screen.queryByText(/Updated/)).toBeNull();
   });
 
   it("offers Run, Edit and Create automation in the ⋯ menu", () => {
