@@ -747,6 +747,9 @@ launch.
 
 ### Named TCP egress from a sandbox
 
+For runnable CLI checks on macOS and Linux, see the
+[local Python HTTP listener and public SSH examples](../examples/tcp-egress/README.md).
+
 `sandbox.tcp_egress` permits a sandbox to open an opaque TCP stream to one
 named, exact host and port without giving it general network access. The
 parent resolves DNS on each connection, checks **every** returned address
