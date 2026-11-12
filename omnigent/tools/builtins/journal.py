@@ -4,8 +4,10 @@
 * ``sys_journal_write_plan`` sets the session's plan, the whole graph each time.
 * ``sys_journal_write_status`` records where one plan step stands.
 * ``sys_journal_write_note`` adds a Markdown note.
+* ``sys_workflow_request_input`` asks the user about a task and waits for the
+  answer, marking the task ``needs_input`` meanwhile.
 
-All four are schema-only: the runner sends them to the server's
+All five are schema-only: the runner sends them to the server's
 ``/v1/sessions/{id}/journal`` routes. They make up the ``journal`` tool group,
 which every agent has unless its spec sets ``tool_groups.journal: false``.
 """
@@ -24,6 +26,15 @@ from omnigent.entities.session_journal import (
     STEP_ID_MAX_CHARS,
     STEP_NAME_MAX_CHARS,
     STEP_STATUSES,
+)
+from omnigent.entities.workflow_questions import (
+    HEADER_MAX_CHARS,
+    OPTION_DESCRIPTION_MAX_CHARS,
+    OPTION_LABEL_MAX_CHARS,
+    OPTIONS_MAX,
+    OPTIONS_MIN,
+    QUESTION_MAX_CHARS,
+    QUESTIONS_MAX,
 )
 from omnigent.tools.base import Tool
 
@@ -206,8 +217,8 @@ class SysJournalWriteStatusTool(Tool):
             "'started' when you begin a step yourself, or resume it; 'done' when it achieved "
             "its goal (only done lets later steps start); 'needs_input' when it waits for "
             "the user: an approval, a decision, a go-ahead they asked for, or how to get "
-            "past something you can't clear yourself, such as CI being down. Write it, then "
-            "ask them with your question tool so it reaches their Inbox; 'failed' when its "
+            "past something you can't clear yourself, such as CI being down. To ask them, "
+            "call sys_workflow_request_input instead, which writes it for you; 'failed' when its "
             "own work failed. text says why in a few words, and is required except for "
             "started. Writing started on a done step reopens it. started and done need "
             "every step this one depends on to be done first; otherwise the write fails "
@@ -278,9 +289,91 @@ class SysJournalWriteNoteTool(Tool):
         )
 
 
+class SysWorkflowRequestInputTool(Tool):
+    """Ask the user about a task and wait. Runner-dispatched to the journal's input requests."""
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_workflow_request_input"``."""
+        return "sys_workflow_request_input"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "Ask the user about a task in your plan and wait for their answer: an approval, "
+            "a decision, or a way past something you can't clear yourself. First finish the "
+            "ready tasks that don't depend on the answer. It marks the task needs_input "
+            "with your first question, puts the questions in the user's Inbox with your "
+            "options as buttons (they can also write their own answer), and returns the "
+            "answers. Then write the task's next status: started to resume it, done for an "
+            "approval given, failed for one refused. Ask everything you need in one call. "
+            "In a run no one is watching, such as an automation's, don't call it: write "
+            "needs_input with the options and your recommendation instead."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """:returns: The OpenAI-format tool schema."""
+        option = {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "maxLength": OPTION_LABEL_MAX_CHARS},
+                "description": {
+                    "type": "string",
+                    "maxLength": OPTION_DESCRIPTION_MAX_CHARS,
+                    "description": "What choosing it means, in a sentence.",
+                },
+            },
+            "required": ["label"],
+            "additionalProperties": False,
+        }
+        question = {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "maxLength": QUESTION_MAX_CHARS},
+                "header": {
+                    "type": "string",
+                    "maxLength": HEADER_MAX_CHARS,
+                    "description": "A short label for the question, e.g. 'Profiles'.",
+                },
+                "options": {
+                    "type": "array",
+                    "items": option,
+                    "minItems": OPTIONS_MIN,
+                    "maxItems": OPTIONS_MAX,
+                },
+                "recommended": {
+                    "type": "string",
+                    "description": "The label of the option you recommend, if any.",
+                },
+            },
+            "required": ["question", "header", "options"],
+            "additionalProperties": False,
+        }
+        return _schema(
+            self.name(),
+            self.description(),
+            {
+                "step": {
+                    "type": "string",
+                    "pattern": _STEP_ID_PATTERN,
+                    "description": "The task in the current plan that waits for the answer.",
+                },
+                "questions": {
+                    "type": "array",
+                    "items": question,
+                    "minItems": 1,
+                    "maxItems": QUESTIONS_MAX,
+                },
+            },
+            ["step", "questions"],
+        )
+
+
 JOURNAL_TOOLS: tuple[type[Tool], ...] = (
     SysJournalReadTool,
     SysJournalWritePlanTool,
     SysJournalWriteStatusTool,
     SysJournalWriteNoteTool,
+    SysWorkflowRequestInputTool,
 )
