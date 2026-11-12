@@ -127,7 +127,7 @@ afterEach(() => cleanup());
 describe("HostBadge", () => {
   it.each([
     ["managed snapshot", null],
-    ["Arclet host", "arclet"],
+    ["Example host", "example"],
     ["Databricks Sandbox host", "lakebox"],
   ])(
     "explains disabled host switching for %s, including keyboard selection",
@@ -179,7 +179,7 @@ describe("HostBadge", () => {
     expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
   });
 
-  it.each(["arclet", "lakebox"])(
+  it.each(["example", "modal"])(
     "explains disabled switching on the default %s badge with a keyboard-focusable target",
     async (provider) => {
       useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: provider })] });
@@ -260,7 +260,7 @@ describe("HostBadge", () => {
         fireEvent.click(screen.getByTestId("host-badge"));
       }
       expect(screen.getByTestId("switch-host-dialog")).toBeInTheDocument();
-      useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "arclet" })] });
+      useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "example" })] });
       rerender(<HostBadge sessionId="conv_1" appearance={appearance} />);
       expect(screen.queryByTestId("switch-host-dialog")).not.toBeInTheDocument();
       useHostsMock.mockReturnValue({ data: [host()] });
@@ -269,7 +269,7 @@ describe("HostBadge", () => {
     },
   );
 
-  it.each(["ordinary", "arclet", "lakebox", "loading", "failed"])(
+  it.each(["ordinary", "example", "modal", "loading", "failed"])(
     "hides switch host in read-only %s sessions",
     (state) => {
       useHostsMock.mockReturnValue(
@@ -341,18 +341,6 @@ describe("HostBadge", () => {
       }
     },
   );
-
-  it("names an Arclet in the composer tooltip by its own host name", async () => {
-    useHostsMock.mockReturnValue({
-      data: [host({ name: "omnigent-arclet-1234567890", sandbox_provider: "arclet" })],
-    });
-    render(<HostBadge sessionId="conv_1" appearance="composer" />);
-    fireEvent.focus(screen.getByTestId("composer-host-select"));
-    const tooltip = await screen.findByTestId("composer-host-tooltip");
-    expect(tooltip).toHaveTextContent("Host: Arclet Sandbox");
-    expect(tooltip).toHaveTextContent("Name: omnigent-arclet-1234567890");
-    expect(tooltip).toHaveTextContent("Status: Connected");
-  });
 
   it("keeps another sandbox's managed-* name out of the composer tooltip", async () => {
     useHostsMock.mockReturnValue({
@@ -568,7 +556,7 @@ describe("HostBadge", () => {
 
   it("spins the chip and menu dot while waking an asleep sandbox, then shows it online", async () => {
     useHostsMock.mockReturnValue({
-      data: [host({ name: "omnigent-arclet-1234", sandbox_provider: "arclet" })],
+      data: [host({ name: "omnigent-example-1234", sandbox_provider: "example" })],
     });
     useSessionMock.mockReturnValue({
       session: { hostId: "host_a1b2", hostResumable: true },
@@ -580,7 +568,7 @@ describe("HostBadge", () => {
       <HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} starting />,
     );
     const trigger = screen.getByTestId("composer-host-select");
-    expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, Starting");
+    expect(trigger).toHaveAccessibleName("Host Example Sandbox, Starting");
     expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "starting");
     expect(screen.getByTestId("composer-host-status")).toHaveClass("animate-spin");
     fireEvent.focus(trigger);
@@ -597,7 +585,7 @@ describe("HostBadge", () => {
     // Online wins while the wake request is still in flight.
     useSessionHostOnlineMock.mockReturnValue(true);
     rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} starting />);
-    expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, online");
+    expect(trigger).toHaveAccessibleName("Host Example Sandbox, online");
     expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "online");
     expect(screen.getByTestId("composer-host-menu-status")).toHaveAttribute(
       "data-status",
@@ -802,15 +790,15 @@ describe("HostBadge during a sandbox launch", () => {
   });
 
   it("spins a bound sandbox's dot through the server's wake stages, still reconnectable, until online", () => {
-    launch("provisioning", "host_a1b2", "arclet");
-    useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "arclet" })] });
+    launch("provisioning", "host_a1b2", "example");
+    useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "example" })] });
     useSessionMock.mockReturnValue({ session: { hostId: "host_a1b2", hostResumable: true } });
     useSessionHostOnlineMock.mockReturnValue(false);
     const { rerender } = render(
       <HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />,
     );
     const trigger = screen.getByTestId("composer-host-select");
-    expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, Provisioning sandbox");
+    expect(trigger).toHaveAccessibleName("Host Example Sandbox, Provisioning sandbox");
     expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "starting");
     // A server-reported stage can go stale, so Reconnect host stays available.
     fireEvent.pointerDown(trigger, { button: 0 });
@@ -818,26 +806,26 @@ describe("HostBadge during a sandbox launch", () => {
 
     useChatStore.setState({ sandboxStatus: { stage: "connecting", error: null } });
     rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);
-    expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, Starting agent");
+    expect(trigger).toHaveAccessibleName("Host Example Sandbox, Starting agent");
     expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "starting");
 
     // Online wins while the wake request is still in flight.
     useSessionHostOnlineMock.mockReturnValue(true);
     rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} starting />);
-    expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, online");
+    expect(trigger).toHaveAccessibleName("Host Example Sandbox, online");
     expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "online");
   });
 
   it.each(["action_required", "failed"] as const)(
     "keeps an offline sandbox reconnectable while its launch is %s",
     (stage) => {
-      launch(stage, "host_a1b2", "arclet");
-      useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "arclet" })] });
+      launch(stage, "host_a1b2", "example");
+      useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "example" })] });
       useSessionMock.mockReturnValue({ session: { hostId: "host_a1b2", hostResumable: true } });
       useSessionHostOnlineMock.mockReturnValue(false);
       render(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);
       const trigger = screen.getByTestId("composer-host-select");
-      expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, offline");
+      expect(trigger).toHaveAccessibleName("Host Example Sandbox, offline");
       expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "offline");
       fireEvent.pointerDown(trigger, { button: 0 });
       expect(screen.getByRole("menuitem", { name: "Reconnect host" })).toBeInTheDocument();
@@ -852,14 +840,14 @@ describe("HostBadge during a sandbox launch", () => {
   });
 
   const timedOut = { stage: "failed", error: "Sandbox launch timed out" } as const;
-  const approve = { stage: "action_required", details: "Approve the sandbox in Arclet" } as const;
+  const approve = { stage: "action_required", details: "Approve the sandbox in Example" } as const;
 
   it.each([
     ["failure", timedOut],
     ["user action", approve],
   ] as const)("spins this tab's wake over an earlier %s", (_stop, before) => {
     useChatStore.setState({ conversationId: "conv_1", sandboxStatus: before });
-    useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "arclet" })] });
+    useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "example" })] });
     useSessionMock.mockReturnValue({ session: { hostId: "host_a1b2", hostResumable: true } });
     useSessionHostOnlineMock.mockReturnValue(false);
     const { rerender } = render(
@@ -867,13 +855,13 @@ describe("HostBadge during a sandbox launch", () => {
     );
     const trigger = screen.getByTestId("composer-host-select");
     const dot = screen.getByTestId("composer-host-status");
-    expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, Starting");
+    expect(trigger).toHaveAccessibleName("Host Example Sandbox, Starting");
     expect(dot).toHaveAttribute("data-status", "starting");
     fireEvent.pointerDown(trigger, { button: 0 });
     expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).not.toBeInTheDocument();
 
     rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);
-    expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, offline");
+    expect(trigger).toHaveAccessibleName("Host Example Sandbox, offline");
     expect(dot).toHaveAttribute("data-status", "offline");
     expect(screen.getByRole("menuitem", { name: "Reconnect host" })).toBeInTheDocument();
   });

@@ -67,8 +67,6 @@ be able to write resources without a separate Omnigent account.
   (refused, no browser), a window connected to a server on this computer
   (`localhost`; refused in the dialog before connecting), and failures, shown
   only in the app's own window.
-  Hidden where **Run on Arca** is offered (the managed-features flag on a
-  managed server).
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.

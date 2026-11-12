@@ -1,4 +1,4 @@
-"""Arclet skill completion and launch payloads use mocked browser contracts."""
+"""Sandbox skill isolation and first prompts use mocked browser contracts."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from tests.browser_ui.chat.session_contract import ChatSessionContract
 
 
 @pytest.mark.parametrize("harness,prefix", [("claude-native", "/"), ("codex-native", "$")])
-def test_arclet_first_prompt_uses_connected_arca_skills(
+def test_sandbox_first_prompt_does_not_use_connected_host_skills(
     page: Page, chat_session_contract: ChatSessionContract, harness: str, prefix: str
 ) -> None:
     page.set_viewport_size({"width": 1440, "height": 960})
@@ -26,7 +26,7 @@ def test_arclet_first_prompt_uses_connected_arca_skills(
             "single_user": True,
             "needs_setup": False,
             "managed_sandboxes_enabled": True,
-            "sandbox_provider": "arclet",
+            "sandbox_provider": "example",
             "durable_initial_input": True,
         },
     )
@@ -51,7 +51,7 @@ def test_arclet_first_prompt_uses_connected_arca_skills(
             "hosts": [
                 {
                     "host_id": chat.host_id,
-                    "name": "browser's arca",
+                    "name": "connected workstation",
                     "owner": "local",
                     "status": "online",
                     "configured_harnesses": {harness: True},
@@ -79,26 +79,18 @@ def test_arclet_first_prompt_uses_connected_arca_skills(
     page.goto(chat.base_url)
     composer = page.get_by_test_id("new-chat-landing-input")
     composer.fill(f"{prefix}review")
-    row = page.get_by_test_id("slash-menu-item-dev:review")
-    expect(row).to_be_visible()
-    assert discoveries == [
-        {
-            "host_id": [chat.host_id],
-            "harness": [harness],
-            "path": ["~"],
-            "agent_id": [chat.agent_id],
-        }
-    ]
+    expect(
+        page.get_by_text("Host skills will be available after the sandbox starts.")
+    ).to_be_visible()
+    assert discoveries == []
     assert creates == []
-    row.click()
-    expect(composer).to_have_value(f"{prefix}dev:review ")
     prompt = f"{prefix}dev:review check these changes"
     composer.fill(prompt)
     page.get_by_test_id("new-chat-landing-submit").click()
     expect(page).to_have_url(chat.url)
     assert len(creates) == 1
     assert creates[0]["host_type"] == "managed"
-    assert creates[0]["sandbox_provider"] == "arclet"
+    assert creates[0]["sandbox_provider"] == "example"
     assert "host_id" not in creates[0]
     assert creates[0]["initial_input"] == {
         "type": "message",
