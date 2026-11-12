@@ -160,4 +160,29 @@ describe("listReconcileTargets", () => {
     const pinned = conv("s9", { labels: { "omnigent.pinned": "1" }, project_id: "proj_b" });
     expect(targets([main, alpha, beta], [[pinned, ["pinned"]]])).toEqual(new Set());
   });
+
+  it("treats rows as the viewer's own on a server without sign-in", () => {
+    // No viewer id: ownership falls back to the access level, as the sidebar's scopes do.
+    const changes = new Map<string, MembershipChange>();
+    const row = conv("new", { owner: "local", permission_level: null, project_id: "proj_a" });
+    const shared = mainList([], ["conversations", "", false, null, "shared"]);
+    expect(
+      listReconcileTargets({
+        lists: [mainList([]), shared, alpha],
+        changes,
+        newRows: new Map([[row.id, row]]),
+        projectNamesOf: projects,
+        viewerId: null,
+      }),
+    ).toEqual(new Set([mainList([]).queryHash, alpha.queryHash]));
+  });
+
+  it("matches project-filtered lists by project_id alone", () => {
+    const picker = mainList([], ["conversations", "", true, "Alpha"]);
+    const other = mainList([], ["conversations", "", true, "Beta"]);
+    const archived = conv("s7", { archived: true, project_id: "proj_a" });
+    expect(targets([picker, other], [[archived, ["archived"]]])).toEqual(
+      new Set([picker.queryHash]),
+    );
+  });
 });

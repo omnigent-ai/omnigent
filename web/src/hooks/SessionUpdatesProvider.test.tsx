@@ -1285,6 +1285,38 @@ describe("SessionUpdatesProvider list invalidation", () => {
     }
   });
 
+  it.each([
+    ["an unpin the pinned list still shows", { "omnigent.pinned": "1" }, {}, true],
+    ["a pin the pinned list lacks", {}, { "omnigent.pinned": "1" }, false],
+  ])("refetches the pinned list for %s elsewhere", (_case, before, after, listed) => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], (old) =>
+        old
+          ? { ...old, pages: [{ ...old.pages[0], data: [{ ...conv("conv_a"), labels: before }] }] }
+          : old,
+      );
+      client.setQueryData(["pinned-conversations"], {
+        conversations: listed ? [{ ...conv("conv_a"), labels: before }] : [],
+        filterHonored: true,
+      });
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), labels: after }] }));
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(invalidatedKeys(client, invalidate)).toEqual([
+        JSON.stringify(["pinned-conversations"]),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reconciles every list when the open session's access level changes", () => {
     vi.useFakeTimers();
     try {

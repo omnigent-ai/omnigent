@@ -10,6 +10,7 @@ import {
   PROJECT_LABEL_KEY,
   SIDE_CHAT_LABEL_KEY,
 } from "@/lib/sessionListCache";
+import { sessionVisibility } from "@/lib/sessionVisibility";
 import type { Conversation } from "@/hooks/useConversations";
 
 /** One cached list, as the target picker sees it after the frame was patched in. */
@@ -73,7 +74,8 @@ function couldBelong(
   } else if (row.archived === true && (!filters.includeArchived || filters.visibility)) {
     return false;
   }
-  const owned = row.owner == null || row.owner === viewerId;
+  // Same inference the sidebar scopes use, so a signed-out solo server still owns its rows.
+  const owned = sessionVisibility(row, viewerId) === "mine";
   // Folders list only the viewer's own sessions, whatever their scope.
   if ((filters.visibility === "mine" || list.folder !== undefined) && !owned) return false;
   if (filters.visibility === "shared" && owned) return false;
@@ -90,6 +92,7 @@ function couldBelong(
 function fieldsReadBy(list: CachedList): Set<MembershipField> {
   const fields = new Set<MembershipField>(["archived", "hidden"]);
   if (list.folder !== undefined || list.filters.project) fields.add("project");
+  // No sidebar list is keyed by a search today; this keeps one correct if added.
   if (list.filters.searchQuery) fields.add("title");
   return fields;
 }

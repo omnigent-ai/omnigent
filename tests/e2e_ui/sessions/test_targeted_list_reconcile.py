@@ -103,8 +103,8 @@ def test_session_changes_refetch_only_the_folders_they_touch(
         expect(_folder_link(page, b, moved)).to_be_visible(timeout=15_000)
         expect(_folder_link(page, a, moved)).to_have_count(0)
         page.wait_for_timeout(SETTLE_MS)
-        assert set(folder_fetches) <= {a, b}
-        assert c not in folder_fetches
+        # Retries may repeat a fetch; both folders must be re-read, and only them.
+        assert set(folder_fetches) == {a, b}
 
         # An archive drops the row and refetches only its own folder.
         archived = members[c][0]
@@ -112,7 +112,7 @@ def test_session_changes_refetch_only_the_folders_they_touch(
         patch_session(base_url, archived, archived=True)
         expect(_folder_link(page, c, archived)).to_have_count(0, timeout=15_000)
         page.wait_for_timeout(SETTLE_MS)
-        assert set(folder_fetches) <= {c}
+        assert set(folder_fetches) == {c}  # backfills the emptied slot
 
         # Every folder still lists exactly what the server holds for it.
         expect(_folder_link(page, a, renamed)).to_be_visible()

@@ -265,12 +265,12 @@ function applyItemsToCache(
     if (fields.has("archived") || (fields.has("project") && row.archived === true)) {
       targets.add(ARCHIVED_PROJECT_NAMES_HASH);
     }
-    // A session pinned elsewhere that the pinned list doesn't hold yet.
+    // A pin made elsewhere that the pinned list lacks, or an unpin it still
+    // shows (its patch keeps the cached pin so local pins aren't dropped).
+    const pinned = row.labels?.[PINNED_LABEL_KEY] != null;
     if (
       fields.has("pinned") &&
-      row.labels?.[PINNED_LABEL_KEY] != null &&
-      row.archived !== true &&
-      !pinnedIds.has(row.id)
+      (pinned ? row.archived !== true && !pinnedIds.has(row.id) : pinnedIds.has(row.id))
     ) {
       targets.add(PINNED_CONVERSATIONS_HASH);
     }
