@@ -11,6 +11,8 @@ from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.scheduled.harness_settings import (
     automation_session_launch_options,
+    forget_unrecorded_legacy_run_session,
+    note_unrecorded_legacy_run_session,
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
 )
@@ -104,7 +106,7 @@ _KEPT_SESSION = "conv_kept"
 
 
 class _TaskStore:
-    """One task, ``task_1``, whose run is running in ``conv_run``."""
+    """One task, ``task_1``, whose run is starting or running in ``conv_run``."""
 
     def __init__(
         self,
@@ -129,9 +131,8 @@ class _TaskStore:
     def get(self, scheduled_task_id: str) -> SimpleNamespace | None:
         return self._task if scheduled_task_id == self._task.id else None
 
-    def get_running_run_by_conversation(self, conversation_id: str) -> SimpleNamespace | None:
-        task_id = self._running.get(conversation_id)
-        return None if task_id is None else SimpleNamespace(scheduled_task_id=task_id)
+    def has_active_run(self, scheduled_task_id: str, conversation_id: str) -> bool:
+        return self._running.get(conversation_id) == scheduled_task_id
 
 
 @pytest.mark.asyncio
@@ -170,6 +171,35 @@ async def test_continue_automation_kept_session_uses_its_mode() -> None:
         store, "task_1", source_session_id=_KEPT_SESSION, user_id="alice", harness="claude-native"
     )
     assert options == (["--permission-mode", "auto"], {})
+
+
+@pytest.mark.asyncio
+async def test_legacy_fire_session_counts_before_its_run_row_exists() -> None:
+    """A legacy fire sends its prompt before writing the run row, so its session is
+    noted in between."""
+    store = _TaskStore("auto", running={})
+    note_unrecorded_legacy_run_session("conv_legacy", "task_1")
+    try:
+        options = await automation_session_launch_options(
+            store,
+            "task_1",
+            source_session_id="conv_legacy",
+            user_id="alice",
+            harness="claude-native",
+        )
+    finally:
+        forget_unrecorded_legacy_run_session("conv_legacy")
+    assert options == (["--permission-mode", "auto"], {})
+    assert (
+        await automation_session_launch_options(
+            store,
+            "task_1",
+            source_session_id="conv_legacy",
+            user_id="alice",
+            harness="claude-native",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

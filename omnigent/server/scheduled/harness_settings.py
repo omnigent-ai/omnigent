@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import Any
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.native.permission_modes import (
@@ -94,20 +95,39 @@ def permission_mode_launch_options(
     return list(args) or None, labels
 
 
+# Sessions a legacy timer fire has created but not yet recorded a run for, mapped to
+# their task. Its prompt is sent before the run row is written, so a worker the
+# turn starts in between would otherwise not count as the run's. Legacy timers
+# fire in this process (see ``_IN_FLIGHT_TASKS`` in ``fire.py``).
+_UNRECORDED_LEGACY_RUN_SESSIONS: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+
+def note_unrecorded_legacy_run_session(conversation_id: str, scheduled_task_id: str) -> None:
+    """Count *conversation_id* as *scheduled_task_id*'s run until its run row exists."""
+    _UNRECORDED_LEGACY_RUN_SESSIONS[conversation_id] = scheduled_task_id
+
+
+def forget_unrecorded_legacy_run_session(conversation_id: str) -> None:
+    """Stop counting a legacy run session once its run row is written."""
+    _UNRECORDED_LEGACY_RUN_SESSIONS.pop(conversation_id, None)
+
+
 def _is_automation_run_session(
     scheduled_task_store: Any, task: Any, source_session_id: str | None
 ) -> bool:
     """Whether *source_session_id* is where *task* runs now, not a fork or a finished run.
 
-    A continue task runs in its kept session. A new-session run's session counts only
-    while that run is running, which it is for the whole turn that starts workers.
+    A continue task runs in its kept session. A new-session run's session counts
+    from before its prompt is sent until its run ends: a claimed run is already
+    ``starting`` then, and a legacy fire is noted until its run row exists.
     """
     if not source_session_id:
         return False
     if task.continues_session and task.session_id == source_session_id:
         return True
-    run = scheduled_task_store.get_running_run_by_conversation(source_session_id)
-    return run is not None and run.scheduled_task_id == task.id
+    if _UNRECORDED_LEGACY_RUN_SESSIONS.get(source_session_id) == task.id:
+        return True
+    return bool(scheduled_task_store.has_active_run(task.id, source_session_id))
 
 
 async def automation_session_launch_options(
