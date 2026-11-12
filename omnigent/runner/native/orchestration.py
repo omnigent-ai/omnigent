@@ -9223,6 +9223,7 @@ async def _auto_create_claude_terminal(
 
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
+        apply_claude_launch_mcp_policy,
         augment_claude_args,
         claude_terminal_relay_env,
         ensure_claude_workspace_trusted,
@@ -9894,6 +9895,8 @@ async def _auto_create_claude_terminal(
     claude_args = augment_claude_args(
         base_claude_args,
         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+        # Strict MCP discovery runs once the wrapper's cwd and environment are known.
+        defer_inherited_mcp_discovery=True,
         bridge_dir=bridge_dir,
         workspace=Path(workspace),
         ap_server_url=server_url,
@@ -9986,10 +9989,15 @@ async def _auto_create_claude_terminal(
     )
     # Seed trust and onboarding in the config selected by the terminal's launch environment.
     try:
-        ensure_claude_workspace_trusted(
-            _claude_terminal_launch_cwd(env_spec, agent_os_env),
-            env=_claude_terminal_launch_env(env_spec),
+        launch_cwd = _claude_terminal_launch_cwd(env_spec, agent_os_env)
+        launch_env = _claude_terminal_launch_env(env_spec)
+        apply_claude_launch_mcp_policy(
+            bridge_dir,
+            cwd=launch_cwd,
+            env=launch_env,
+            active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
         )
+        ensure_claude_workspace_trusted(launch_cwd, env=launch_env)
     except BaseException as seed_error:
         # No forwarder owns the routers yet, so release the ones this launch started.
         # A ``None`` handle would shut down whichever router is registered now.

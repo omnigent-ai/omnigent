@@ -31,6 +31,7 @@ import socket
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -570,16 +571,23 @@ def read_claude_managed_settings(
     return None
 
 
-def claude_user_settings_path(cwd: str | Path | None = None) -> Path:
+def claude_user_settings_path(
+    cwd: str | Path | None = None, env: Mapping[str, str] | None = None
+) -> Path:
     """Return the user ``settings.json`` path Claude Code reads from *cwd*.
 
     :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
         ``None`` means this process's working directory.
+    :param env: The CLI's launch environment; ``None`` means this process's.
     :returns: ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
         ``~/.claude/settings.json``.
     """
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    config_dir = Path(configured) if configured else Path.home() / ".claude"
+    env = os.environ if env is None else env
+    configured = env.get("CLAUDE_CONFIG_DIR")
+    home = env.get("HOME")
+    config_dir = (
+        Path(configured) if configured else (Path(home) if home else Path.home()) / ".claude"
+    )
     return Path(cwd or "") / config_dir / "settings.json"
 
 

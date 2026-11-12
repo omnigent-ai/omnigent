@@ -260,7 +260,6 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
     from omnigent.onboarding import ambient
 
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
-    command = {"serverCommand": ["npx", "server"]}
     url = {"serverUrl": "https://mcp.example.com/*"}
     _write_json(
         tmp_path / "claude/claude-config/settings.json",
@@ -269,7 +268,6 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
                 {"serverName": "user_only"},
                 {"serverName": "kept"},
                 {"serverName": "omnigent"},
-                command,
                 url,
                 "not-an-entry",
                 {"serverName": 3, "serverCommand": "not-a-list"},
@@ -286,6 +284,11 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
     )
     managed = ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS[0]
     _write_json(managed, {"allowedMcpServers": [{"serverName": "managed_only"}]})
+    # Servers in managed-mcp.json skip the allowlist, so only a deny stops them.
+    _write_json(
+        managed.with_name("managed-mcp.json"),
+        {"mcpServers": {"omnigent": {}, "kept": {}, "pinned": {"command": "pinned"}}},
+    )
     _write_json(
         managed.with_name("managed-settings.d") / "10-team.json",
         {"allowedMcpServers": [{"serverName": "drop_in_only"}]},
@@ -305,13 +308,13 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
         "deniedMcpServers": [
             {"serverName": "caller"},
             {"serverName": "user_only"},
-            command,
             url,
             {"serverName": "subdirectory_only"},
             {"serverName": "project_only"},
             {"serverName": "local_only"},
             {"serverName": "managed_only"},
             {"serverName": "drop_in_only"},
+            {"serverName": "pinned"},
         ],
         "allowedMcpServers": [{"serverName": "omnigent"}, {"serverName": "kept"}],
     }
@@ -350,62 +353,94 @@ def test_claude_strict_reads_linked_worktree_and_main_checkout_settings(
     ]
 
 
-@pytest.mark.parametrize("via_symlink", [False, True])
-def test_claude_strict_keeps_exact_transport_entries_of_allowlisted_servers(
-    claude_project, via_symlink
-):
-    """A deny matching an allowlisted server's transport would block that server too."""
-    write_mcp_inheritance({"inherit": False, "allow": ["kept", "kept_project", "kept_http"]})
+@pytest.mark.parametrize("executor", ["claude-native", "claude-sdk"])
+def test_claude_strict_refuses_inherited_command_entries(claude_project, executor):
+    """Claude then admits stdio servers by command alone, ignoring the name allowlist."""
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    # Both servers satisfy the command entry, so neither keeping nor denying it works.
     _write_json(
         claude_project.parent / "claude-config/.claude.json",
         {
             "mcpServers": {
-                "kept": {"command": "npx", "args": ["kept-server"]},
-                "other": {"command": "npx", "args": ["other-server"]},
-            },
-            "projects": {
-                str(claude_project.resolve()): {"mcpServers": {"kept_project": {"command": "uvx"}}}
-            },
+                "kept": {"command": "npx", "args": ["server"], "env": {"ROLE": "kept"}},
+                "other": {"command": "npx", "args": ["server"], "env": {"ROLE": "other"}},
+            }
         },
     )
-    _write_json(
-        claude_project / ".mcp.json",
-        {"mcpServers": {"kept_http": {"type": "http", "url": "https://mcp.example.com/kept"}}},
-    )
-    other = {"serverCommand": ["npx", "other-server"]}
-    _write_json(
-        claude_project / ".claude/settings.json",
-        {
-            "allowedMcpServers": [
-                {"serverCommand": ["npx", "kept-server"]},
-                {"serverCommand": ["uvx"]},
-                {"serverUrl": "https://mcp.example.com/kept"},
-                other,
-            ]
-        },
-    )
-    launch = claude_project
-    if via_symlink:
-        launch = claude_project.parent / "linked-project"
-        launch.symlink_to(claude_project, target_is_directory=True)
+    settings = claude_project / ".claude/settings.json"
+    _write_json(settings, {"allowedMcpServers": [{"serverCommand": ["npx", "server"]}]})
+    with pytest.raises(McpStrictModeError, match="including for the omnigent relay") as raised:
+        apply_claude_settings(
+            {} if executor == "claude-native" else None, executor=executor, active_harnesses=None
+        )
+    assert raised.value.path == settings
+
+
+@pytest.mark.parametrize(
+    ("pattern", "source"),
+    [
+        ("https://mcp.example.com/kept", "user"),
+        ("https://mcp.example.com/kept", "project_key"),
+        ("https://mcp.example.com/*", "mcp_json"),
+    ],
+)
+def test_claude_strict_refuses_url_entries_matching_allowlisted_servers(
+    claude_project, pattern, source
+):
+    """Denying such an entry blocks the server; keeping it admits others at that URL."""
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
+    servers = {"mcpServers": {"kept": {"type": "http", "url": "https://mcp.example.com/kept"}}}
+    if source == "mcp_json":
+        _write_json(claude_project / ".mcp.json", servers)
+    else:
+        # Claude keys projects by the physical path of its working directory.
+        user = {"projects": {str(claude_project.resolve()): servers}}
+        _write_json(
+            claude_project.parent / "claude-config/.claude.json",
+            servers if source == "user" else user,
+        )
+    other = {"serverUrl": "https://other.example.com/mcp"}
+    settings = claude_project / ".claude/settings.json"
+    _write_json(settings, {"allowedMcpServers": [other, {"serverUrl": pattern}]})
+    launch = claude_project.parent / "linked-project"
+    launch.symlink_to(claude_project, target_is_directory=True)
+    with pytest.raises(
+        McpStrictModeError,
+        match=re.escape(f"serverUrl {pattern}, which matches allowlisted server kept"),
+    ) as raised:
+        apply_claude_settings({}, executor="claude-native", active_harnesses=None, cwd=launch)
+    assert raised.value.path == launch / ".claude/settings.json"
+    _write_json(settings, {"allowedMcpServers": [other]})
     result = apply_claude_settings({}, executor="claude-native", active_harnesses=None, cwd=launch)
     assert result["deniedMcpServers"] == [other]
 
 
-def test_claude_strict_refuses_wildcard_url_matching_an_allowlisted_server(claude_project):
-    write_mcp_inheritance({"inherit": False, "allow": ["local"]})
+def test_claude_strict_reads_settings_for_the_launch_environment(tmp_path, claude_project):
+    """A relative config directory resolves against the launch cwd, not this process's."""
+    write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
     _write_json(
-        claude_project / ".mcp.json",
-        {"mcpServers": {"local": {"type": "http", "url": "http://localhost:8123/mcp"}}},
+        tmp_path / "claude/claude-config/settings.json",
+        {"allowedMcpServers": [{"serverName": "process_user"}]},
     )
-    settings = claude_project / ".claude/settings.json"
-    _write_json(settings, {"allowedMcpServers": [{"serverUrl": "http://localhost:*"}]})
-    with pytest.raises(
-        McpStrictModeError,
-        match=re.escape("pattern http://localhost:*, which also matches allowlisted server local"),
-    ) as raised:
-        apply_claude_settings({}, executor="claude-native", active_harnesses=None)
-    assert raised.value.path == settings
+    launch = tmp_path / "launch"
+    launch_settings = launch / "launch-config/settings.json"
+    _write_json(launch_settings, {"allowedMcpServers": [{"serverName": "launch_user"}]})
+    env = {"CLAUDE_CONFIG_DIR": "launch-config"}
+    result = apply_claude_settings(
+        {}, executor="claude-native", active_harnesses=None, cwd=launch, env=env
+    )
+    assert result["deniedMcpServers"] == [{"serverName": "launch_user"}]
+    # The launch's own global config supplies the allowlisted server's transport.
+    url = "https://mcp.example.com/kept"
+    _write_json(
+        launch / "launch-config/.claude.json",
+        {"mcpServers": {"kept": {"type": "http", "url": url}}},
+    )
+    _write_json(launch_settings, {"allowedMcpServers": [{"serverUrl": url}]})
+    with pytest.raises(McpStrictModeError, match="matches allowlisted server kept"):
+        apply_claude_settings(
+            {}, executor="claude-native", active_harnesses=None, cwd=launch, env=env
+        )
 
 
 @pytest.mark.parametrize("content", ["{", "[]", None])

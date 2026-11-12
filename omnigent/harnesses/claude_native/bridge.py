@@ -3124,6 +3124,7 @@ def augment_claude_args(
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
     active_harnesses: Collection[str] | None = None,
+    defer_inherited_mcp_discovery: bool = False,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -3177,6 +3178,11 @@ def augment_claude_args(
         Routing on, threaded to :func:`build_hook_settings` so the
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
+    :param active_harnesses: Harnesses whose saved MCP disables apply to this launch.
+    :param defer_inherited_mcp_discovery: ``True`` when the caller resolves the
+        launch cwd and environment later and then calls
+        :func:`apply_claude_launch_mcp_policy`; otherwise strict MCP mode reads
+        inherited settings for *workspace* and this process's environment.
     :returns: Augmented argument list for the terminal resource.
     """
     hook_settings = build_hook_settings(
@@ -3200,6 +3206,7 @@ def augment_claude_args(
         executor="claude-native",
         active_harnesses=active_harnesses,
         cwd=workspace,
+        discover_inherited=not defer_inherited_mcp_discovery,
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
@@ -3233,6 +3240,41 @@ def augment_claude_args(
     from omnigent.harnesses.claude_native.diagnostics import augment_claude_debug_args
 
     return augment_claude_debug_args(args, bridge_dir)
+
+
+def apply_claude_launch_mcp_policy(
+    bridge_dir: Path,
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    active_harnesses: Collection[str] | None,
+) -> None:
+    """
+    Apply strict MCP discovery to the invocation settings for Claude's launch context.
+
+    Completes :func:`augment_claude_args` called with
+    ``defer_inherited_mcp_discovery=True``, reading the settings files the launched
+    CLI reads from *cwd* and *env*.
+
+    :param bridge_dir: Bridge directory holding the invocation settings.
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+    :param env: Claude's launch environment, e.g. ``{"HOME": "/home/user"}``.
+    :param active_harnesses: Harnesses whose saved MCP disables apply to this launch.
+    :raises McpStrictModeError: When strict mode cannot narrow the inherited settings.
+    """
+    from omnigent.mcp_disabled_servers import apply_claude_settings
+
+    settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    updated = apply_claude_settings(
+        settings,
+        executor="claude-native",
+        active_harnesses=active_harnesses,
+        cwd=cwd,
+        env=env,
+    )
+    if updated is not settings:
+        _write_json_file(settings_path, updated)
 
 
 def _arg_value(args: tuple[str, ...], flag: str) -> str | None:

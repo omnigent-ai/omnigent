@@ -49,6 +49,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _is_box_rule,
     _JsonlRecord,
     _occupying_surface,
+    apply_claude_launch_mcp_policy,
     augment_claude_args,
     claude_global_config_path,
     count_hook_events,
@@ -18028,7 +18029,13 @@ _HOOK_CASES = [
 
 
 @pytest.mark.parametrize(("active", "saved", "strict"), _HOOK_CASES)
-def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved, strict):
+@pytest.mark.parametrize("deferred", [False, True])
+def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved, strict, deferred):
+    """Saved disables and strict policy reach the invocation settings.
+
+    A deferred launch reads inherited settings for the launch cwd and environment
+    passed later, not for the workspace and this process's environment.
+    """
     from tests._helpers.mcp_disabled_servers import (
         isolate_claude_settings,
         launch_activation,
@@ -18043,10 +18050,13 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved,
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     workspace = isolate_claude_settings(monkeypatch, tmp_path / "claude")
-    (workspace / ".claude").mkdir()
-    (workspace / ".claude/settings.json").write_text(
-        json.dumps({"allowedMcpServers": [{"serverName": "inherited"}]})
-    )
+    launch_cwd = tmp_path / "launch"
+    for path, name in (
+        (workspace / ".claude/settings.json", "inherited"),
+        (launch_cwd / "launch-config/settings.json", "launch_inherited"),
+    ):
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"allowedMcpServers": [{"serverName": name}]}))
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     original_args = augment_claude_args(
@@ -18066,18 +18076,32 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved,
             bridge_dir=bridge_dir,
             active_harnesses=active,
             workspace=workspace,
+            defer_inherited_mcp_discovery=deferred,
         )
-    hook.assert_called_once()
-    assert hook.call_args.kwargs == {
+        if deferred:
+            launch_env = {"CLAUDE_CONFIG_DIR": "launch-config"}
+            apply_claude_launch_mcp_policy(
+                bridge_dir, cwd=launch_cwd, env=launch_env, active_harnesses=active
+            )
+    assert hook.call_args_list[0].kwargs == {
         "executor": "claude-native",
         "active_harnesses": active,
         "cwd": workspace,
+        "discover_inherited": not deferred,
     }
+    if deferred:
+        assert hook.call_args_list[1].kwargs == {
+            "executor": "claude-native",
+            "active_harnesses": active,
+            "cwd": launch_cwd,
+            "env": launch_env,
+        }
+    assert hook.call_count == 1 + deferred
     assert args == original_args
     expected = json.loads(original)
     denied = [{"serverName": "fixture"}] if active and saved else []
     if strict:
-        denied.append({"serverName": "inherited"})
+        denied.append({"serverName": "launch_inherited" if deferred else "inherited"})
     if denied:
         expected["deniedMcpServers"] = denied
     if strict:

@@ -378,9 +378,10 @@ def test_strict_disables_every_layer_except_allowlist_without_retry(launch, exec
     home, repo = launch
     write_mcp_inheritance({"inherit": False, "allow": ["kept"]})
     _write(mcp_disabled_servers.CODEX_SYSTEM_CONFIG_PATH, '[mcp_servers.system]\ncommand="true"\n')
-    _write(
-        mcp_disabled_servers.CODEX_MANAGED_CONFIG_PATH, '[mcp_servers.managed]\ncommand="true"\n'
-    )
+    managed = mcp_disabled_servers.CODEX_MANAGED_CONFIG_PATH
+    # The managed layer outranks ``-c``; enabling an allowlisted server there is fine.
+    managed_servers = '[mcp_servers.managed]\ncommand="true"\n[mcp_servers.kept]\nenabled=true\n'
+    _write(managed, managed_servers)
     _write(
         home / "config.toml",
         '[mcp_servers.user]\ncommand="true"\n[mcp_servers.kept]\ncommand="true"\n'
@@ -406,6 +407,13 @@ def test_strict_disables_every_layer_except_allowlist_without_retry(launch, exec
         f"mcp_strict_mode_applied executor={executor} "
         f"disabled={tuple(names)} allowed=('omnigent', 'kept')"
     ) in caplog.text
+    if os.name != "posix":
+        return
+    # Enabling any other server there would defeat its ``enabled=false`` override.
+    _write(managed, f"{managed_servers}[mcp_servers.user]\nenabled=true\n")
+    with pytest.raises(McpStrictModeError, match="enabled = true for MCP server user") as refused:
+        _plan(home, repo, ['mcp_servers.cli.command="true"'], active=None, executor=executor)
+    assert refused.value.path == managed
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Codex reads /etc layers only on POSIX")

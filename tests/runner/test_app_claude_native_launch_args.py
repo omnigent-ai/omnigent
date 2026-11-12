@@ -1652,7 +1652,8 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
     ``env -C`` and a relative or empty ``CLAUDE_CONFIG_DIR`` compose in auto-create.
 
     The wrapper moves Claude's cwd first; the config dir then resolves against
-    that cwd, and the trust key names it. The real seeder writes the file.
+    that cwd, and the trust key names it. The real seeder writes the file, and
+    strict MCP mode reads the settings that cwd and config dir select.
 
     :param config_dir: ``CLAUDE_CONFIG_DIR`` assigned by the wrapper.
     :param legacy_in_cwd: Whether a legacy ``.config.json`` exists in the cwd.
@@ -1662,13 +1663,28 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
     from unittest.mock import Mock
 
     from omnigent.runner.resource_registry import SessionResourceRegistry
+    from tests._helpers.mcp_disabled_servers import (
+        isolate_claude_settings,
+        write_mcp_inheritance,
+    )
 
-    workspace = tmp_path / "workspace"
+    workspace = isolate_claude_settings(monkeypatch, tmp_path / "workspace")
     (workspace / "sub").mkdir(parents=True)
     if legacy_in_cwd:
         (workspace / "sub" / ".config.json").write_text("{}")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "omnigent-config"))
+    write_mcp_inheritance({"inherit": False})
+    inherited = {
+        workspace / "sub/.claude/settings.json": "launch_project",
+        workspace / f"sub/{config_dir}/settings.json": "launch_user",
+        workspace / ".claude/settings.json": "workspace_project",
+    }
+    for path, name in inherited.items():
+        if config_dir or name != "launch_user":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"allowedMcpServers": [{"serverName": name}]}))
     monkeypatch.delenv("CLAUDE_CODE_CUSTOM_OAUTH_URL", raising=False)
     monkeypatch.setattr(
         "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
@@ -1695,6 +1711,11 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
     data = json.loads((workspace / expected).read_text())
     assert data["projects"][str((workspace / "sub").resolve())]["hasTrustDialogAccepted"] is True
     assert not (tmp_path / "home" / ".claude.json").exists()
+    launch_args = registry.launch_required_terminal.call_args.kwargs["spec"].args
+    settings = json.loads(Path(launch_args[launch_args.index("--settings") + 1]).read_text())
+    # ``workspace`` is the launch cwd's Git root, which Claude also reads.
+    denied = [*(["launch_user"] if config_dir else []), "launch_project", "workspace_project"]
+    assert settings["deniedMcpServers"] == [{"serverName": name} for name in denied]
 
 
 @pytest.mark.parametrize(

@@ -7726,10 +7726,12 @@ async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, 
             _default_executor(active_harnesses=active, cwd=str(workspace))
         )
     hook.assert_called_once()
+    # Strict discovery reads the environment the SDK starts the CLI with.
     assert hook.call_args.kwargs == {
         "executor": "claude-sdk",
         "active_harnesses": active,
         "cwd": str(workspace),
+        "env": {**os.environ, **options.env},
     }
     expected = {"other": True}
     denied = [{"serverName": "fixture"}] if active and saved else []

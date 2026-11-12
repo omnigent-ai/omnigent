@@ -337,16 +337,25 @@ unchanged. Saved preferences remain available when the flags are re-enabled.
 
 **MCP inheritance:** `mcp: {inherit: false, allow: [names]}` in the user's
 `~/.omnigent/config.yaml`, optionally overridden under `harness.<id>.mcp`, makes
-Claude and Codex launches load only the `omnigent` server plus the allowlist.
+Claude and Codex launches load only the `omnigent` server plus the allowlist,
+apart from the plugin and unreadable-config limits below.
 It needs no server flag and has no UI. Project config cannot change it. Claude
 gets `allowedMcpServers` through `--settings`, and because Claude unions
 allowlists across settings sources, every other inherited user, project, local
 or managed `allowedMcpServers` entry (project and local files from the cwd, Git
-root and linked-worktree main checkout) is mirrored into `deniedMcpServers`, except
-a `serverCommand`/`serverUrl` entry exactly matching an allowlisted server's
-readable transport; a wildcard URL matching one raises `McpStrictModeError`. Codex
+root and linked-worktree main checkout) is mirrored into `deniedMcpServers`, as
+are non-allowlisted `managed-mcp.json` names, which bypass Claude's allowlist.
+Managed-host native launches read these for the wrapper-resolved cwd and
+environment (`apply_claude_launch_mcp_policy`); SDK launches use the executor cwd
+and CLI env, and `omnigent claude` its own cwd and env (a `CLAUDE_LAUNCHER`
+plugin's wrapper is not modeled).
+Any inherited `serverCommand` entry, or a `serverUrl` entry matching an
+allowlisted server's URL, raises `McpStrictModeError`: Claude 2.1.283 admits stdio
+(or remote) servers only by command (or URL) once such an entry exists, so a name
+allowlist cannot narrow it and the stdio relay would be rejected. Codex
 gets an `enabled=false` override for every other discovered server (TOML 1.1
-layers and `-c` values are read with `tomlkit`) and no relaunch without them. A
+layers and `-c` values are read with `tomlkit`) and no relaunch without them; a
+managed-layer `enabled = true` for any other server raises `McpStrictModeError`. A
 strict launch whose Claude settings or Codex config layer exists but is
 unreadable, or whose `-c mcp_servers` override is not a table, raises
 `McpStrictModeError` naming it. Malformed Omnigent fields warn once and are
@@ -1189,7 +1198,8 @@ Cross-harness journeys:
   `tests/server/routes/test_mcp_servers.py`. The non-browser journey
   `tests/e2e/test_mcp_disabled_servers.py` checks both native CLIs, a disabled
   fixture, an enabled control, and the Omnigent relay without building the SPA;
-  its `strict` cases do the same with `mcp: {inherit: false}` and no host flag.
+  its `strict` cases do the same with `mcp: {inherit: false}` against a server
+  without the MCP flags.
   Strict planning and config parsing are in `tests/test_mcp_disabled_servers*.py`
   and `tests/test_mcp_inheritance.py`.
   Disabled plugin MCP rows stay visible without expansion or probes. Check

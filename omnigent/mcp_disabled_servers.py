@@ -234,11 +234,13 @@ def _claude_name(key: ServerKey) -> str:
     return f"plugin:{key.plugin}:{key.server}" if key.plugin else key.server
 
 
-def _claude_inherited_settings_paths(cwd: Path, executor: str) -> list[Path]:
+def _claude_inherited_settings_paths(
+    cwd: Path, executor: str, env: Mapping[str, str] | None
+) -> list[Path]:
     """List the user, project, local and managed settings files Claude merges from *cwd*."""
     from omnigent.onboarding import ambient
 
-    paths = [ambient.claude_user_settings_path(cwd)]
+    paths = [ambient.claude_user_settings_path(cwd, env)]
     for directory in _claude_project_directories(cwd):
         paths.append(directory / ".claude" / "settings.json")
         paths.append(directory / ".claude" / "settings.local.json")
@@ -268,9 +270,10 @@ def _claude_project_directories(cwd: Path) -> list[Path]:
 
 
 def _claude_allowlisted_servers(
-    cwd: Path, inheritance: McpInheritance
+    cwd: Path, inheritance: McpInheritance, env: Mapping[str, str] | None
 ) -> list[tuple[str, Mapping[str, object]]]:
     """Return the readable configs of strict-allowlisted servers Claude may load from *cwd*."""
+    from omnigent.harnesses.claude_native.bridge import claude_global_config_path
     from omnigent.host.mcp_inventory import managed_claude_mcp_config
 
     def servers_in(data: object) -> Mapping[str, object]:
@@ -287,10 +290,7 @@ def _claude_allowlisted_servers(
     present, managed = managed_claude_mcp_config()
     tables = [managed]
     if not present:
-        configured = os.environ.get("CLAUDE_CONFIG_DIR")
-        user = read(
-            cwd / Path(configured) / ".claude.json" if configured else Path.home() / ".claude.json"
-        )
+        user = read(claude_global_config_path(cwd, env))
         projects = user.get("projects")
         tables.append(servers_in(user))
         for directory in _claude_project_directories(cwd):
@@ -307,36 +307,31 @@ def _claude_allowlisted_servers(
     ]
 
 
-def _claude_transport_matches(field: str, value: object, config: Mapping[str, object]) -> bool:
-    """Whether a ``serverCommand`` or ``serverUrl`` entry matches a server, as Claude does."""
-    if field == "serverCommand":
-        args = config.get("args", [])
-        return isinstance(config.get("command"), str) and value == [
-            config["command"],
-            *(args if isinstance(args, list) else []),
-        ]
+def _claude_url_matches(value: str, config: Mapping[str, object]) -> bool:
+    """Whether a ``serverUrl`` allow entry matches a server's URL, as Claude does."""
     url = config.get("url")
-    if not isinstance(value, str) or not isinstance(url, str):
+    if not isinstance(url, str):
         return False
     return re.fullmatch(".*".join(re.escape(part) for part in value.split("*")), url) is not None
 
 
 def _claude_inherited_denials(
-    cwd: Path, inheritance: McpInheritance, executor: str
+    cwd: Path, inheritance: McpInheritance, executor: str, env: Mapping[str, str] | None
 ) -> list[dict[str, object]]:
-    """Deny every inherited ``allowedMcpServers`` entry outside the strict allowlist.
+    """Deny inherited MCP admissions outside the strict allowlist.
 
     Claude unions allowlists across its settings sources, but a deny from any source
     wins, so mirroring them is the only way an injected allowlist can narrow them.
-    A command or URL entry matching an allowlisted server is kept when exact, since
-    it admits only that server's own transport.
+    Servers in ``managed-mcp.json`` skip the allowlist, so their names are denied too.
 
-    :raises McpStrictModeError: When a wildcard URL entry matches an allowlisted
-        server, since denying it would block that server.
+    :raises McpStrictModeError: When an inherited transport entry cannot be denied
+        without also blocking an allowlisted server or the ``omnigent`` relay.
     """
+    from omnigent.host.mcp_inventory import managed_claude_mcp_config
+
     allowlisted: list[tuple[str, Mapping[str, object]]] | None = None
     denials: list[dict[str, object]] = []
-    for path in _claude_inherited_settings_paths(cwd, executor):
+    for path in _claude_inherited_settings_paths(cwd, executor, env):
         try:
             text = path.read_text(encoding="utf-8")
         except (FileNotFoundError, NotADirectoryError):
@@ -354,38 +349,55 @@ def _claude_inherited_denials(
             for field, value in entry.items() if isinstance(entry, dict) else ():
                 if field == "serverName":
                     mirrored = isinstance(value, str) and not inheritance.allows(value)
-                elif (field == "serverUrl" and isinstance(value, str)) or (
+                elif (
                     field == "serverCommand"
                     and isinstance(value, list)
                     and all(isinstance(part, str) for part in value)
                 ):
+                    # With any command entry, Claude admits stdio servers by command only.
+                    raise McpStrictModeError(
+                        executor,
+                        path,
+                        "inherited serverCommand allow entry",
+                        problem=(
+                            f"{path} allows MCP servers by command, so Claude admits stdio "
+                            "servers only by command and ignores the name allowlist, "
+                            "including for the omnigent relay. Replace it with serverName "
+                            "entries"
+                        ),
+                    )
+                elif field == "serverUrl" and isinstance(value, str):
                     if allowlisted is None:
-                        allowlisted = _claude_allowlisted_servers(cwd, inheritance)
+                        allowlisted = _claude_allowlisted_servers(cwd, inheritance, env)
                     matched = next(
                         (
                             name
                             for name, config in allowlisted
-                            if _claude_transport_matches(field, value, config)
+                            if _claude_url_matches(value, config)
                         ),
                         None,
                     )
-                    if matched is not None and field == "serverUrl" and "*" in value:
+                    if matched is not None:
                         raise McpStrictModeError(
                             executor,
                             path,
-                            "wildcard serverUrl matches an allowlisted server",
+                            "serverUrl matches an allowlisted server",
                             problem=(
-                                f"{path} allows the serverUrl pattern {value}, which also "
-                                f"matches allowlisted server {matched}, so it can be neither "
-                                "denied nor kept. Replace it with that server's exact URL or "
-                                "a serverName entry"
+                                f"{path} allows the serverUrl {value}, which matches allowlisted "
+                                f"server {matched}: denying it blocks that server and keeping "
+                                "it admits any other server at that URL. Replace it with "
+                                "serverName entries"
                             ),
                         )
-                    mirrored = matched is None
+                    mirrored = True
                 else:
                     mirrored = False
                 if mirrored and {field: value} not in denials:
                     denials.append({field: value})
+    _, managed = managed_claude_mcp_config()
+    for name in managed:
+        if not inheritance.allows(name) and {"serverName": name} not in denials:
+            denials.append({"serverName": name})
     return denials
 
 
@@ -396,6 +408,8 @@ def apply_claude_settings(
     executor: Literal["claude-native"],
     active_harnesses: Collection[str] | None,
     cwd: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+    discover_inherited: bool = True,
 ) -> dict[str, object]: ...
 
 
@@ -406,6 +420,8 @@ def apply_claude_settings(
     executor: Literal["claude-sdk"],
     active_harnesses: Collection[str] | None,
     cwd: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+    discover_inherited: bool = True,
 ) -> str | None: ...
 
 
@@ -415,13 +431,17 @@ def apply_claude_settings(
     executor: Literal["claude-native", "claude-sdk"],
     active_harnesses: Collection[str] | None,
     cwd: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+    discover_inherited: bool = True,
 ) -> dict[str, object] | str | None:
     """Add Claude deny and strict-mode allow entries without modifying the caller's settings.
 
     The executor selects native dict settings versus the SDK's JSON-string form.
     With ``inherit: false``, ``allowedMcpServers`` replaces any caller allowlist and
     inherited allow entries outside it, read from Claude's settings files for the
-    launch *cwd* (default: this process's), are added to ``deniedMcpServers``.
+    launch *cwd* and *env* (default: this process's), are added to ``deniedMcpServers``.
+    ``discover_inherited=False`` skips that reading, for a caller that applies these
+    settings again once the launch context is known.
 
     :raises McpStrictModeError: In strict mode, when the caller's settings or an
         inherited settings file cannot be read as a JSON object.
@@ -448,9 +468,11 @@ def apply_claude_settings(
         denied = None
     if denied is not None:
         wanted: list[dict[str, object]] = [{"serverName": _claude_name(key)} for key in entries]
-        if not inheritance.inherit:
+        if not inheritance.inherit and discover_inherited:
             launch_cwd = Path(cwd) if cwd is not None else Path.cwd()
-            wanted.extend(_claude_inherited_denials(launch_cwd.absolute(), inheritance, executor))
+            wanted.extend(
+                _claude_inherited_denials(launch_cwd.absolute(), inheritance, executor, env)
+            )
         additions: list[dict[str, object]] = []
         for entry in wanted:
             if entry not in denied and entry not in additions:
@@ -589,10 +611,15 @@ def _codex_layer_trusted(projects: Any, *candidates: Path | None) -> bool:
 
 
 def _codex_server_names(
-    codex_home: Path, cwd: Path, config_overrides: Sequence[str], unreadable: list[Path]
+    codex_home: Path,
+    cwd: Path,
+    config_overrides: Sequence[str],
+    unreadable: list[Path],
+    managed_enabled: list[str] | None = None,
 ) -> set[str]:
     """Read system and already-materialized profile MCPs, then trusted project, CLI and
-    managed layers. Paths of layers that exist but cannot be read go to *unreadable*."""
+    managed layers. Paths of layers that exist but cannot be read go to *unreadable*,
+    and servers the managed layer sets ``enabled = true`` go to *managed_enabled*."""
     config_path = codex_home / "config.toml"
     config: dict[str, Any] = {}
     if os.name == "posix":
@@ -633,7 +660,15 @@ def _codex_server_names(
             _merge_tables(config, _read_codex_config(project_home / "config.toml", unreadable))
     _merge_tables(config, cli)
     if os.name == "posix":
-        _merge_tables(config, _read_codex_config(CODEX_MANAGED_CONFIG_PATH, unreadable))
+        managed = _read_codex_config(CODEX_MANAGED_CONFIG_PATH, unreadable)
+        managed_servers = managed.get("mcp_servers")
+        if managed_enabled is not None and isinstance(managed_servers, dict):
+            managed_enabled.extend(
+                name
+                for name, server in managed_servers.items()
+                if isinstance(server, dict) and server.get("enabled") is True
+            )
+        _merge_tables(config, managed)
     servers = config.get("mcp_servers", {})
     return (
         {name for name, server in servers.items() if isinstance(server, dict)}
@@ -691,7 +726,8 @@ def plan_codex_launch(
     disabled, and the early-exit retry keeps those overrides.
 
     :raises McpStrictModeError: With ``inherit: false``, when a config layer
-        exists but cannot be read or parsed.
+        exists but cannot be read or parsed, or the managed layer enables a server
+        outside the allowlist, since it outranks the ``-c`` disables.
     """
     original = tuple(config_overrides)
     entries = _active_entries("codex", active_harnesses)
@@ -700,8 +736,11 @@ def plan_codex_launch(
         return CodexLaunchPlan(original, original, "none", ())
     config_path = codex_home / "config.toml"
     unreadable: list[Path] = []
+    managed_enabled: list[str] = []
     try:
-        servers = _codex_server_names(codex_home.resolve(), cwd.absolute(), original, unreadable)
+        servers = _codex_server_names(
+            codex_home.resolve(), cwd.absolute(), original, unreadable, managed_enabled
+        )
     except (OSError, ValueError, RuntimeError, RecursionError) as error:
         _log_read_failure(
             config_path,
@@ -713,6 +752,18 @@ def plan_codex_launch(
     if unreadable and not inheritance.inherit:
         # Servers in an unreadable layer cannot be named, so they could still load.
         raise McpStrictModeError(executor, unreadable[0], "unreadable or invalid TOML")
+    forced = next((name for name in managed_enabled if not inheritance.allows(name)), None)
+    if forced is not None and not inheritance.inherit:
+        raise McpStrictModeError(
+            executor,
+            CODEX_MANAGED_CONFIG_PATH,
+            "managed layer enables a server outside the allowlist",
+            problem=(
+                f"{CODEX_MANAGED_CONFIG_PATH} sets enabled = true for MCP server {forced}, "
+                "which outranks the launch's disable, so it would still load. Remove that "
+                f"setting or add {forced} to the allowlist"
+            ),
+        )
     strict = _codex_strict_names(servers, inheritance, executor)
     applied = [key.server for key in entries if key.server in servers and key.server not in strict]
     dropped = [key.server for key in entries if key.server not in servers]

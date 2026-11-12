@@ -9,6 +9,7 @@ import json
 import shutil
 import sys
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -32,23 +33,36 @@ from tests.e2e.conftest import configure_mock_llm, get_mock_requests
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.fixture(scope="module")
-def mcp_enabled_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
-    """Keep MCP release flags local to this journey, preserving old-server compatibility."""
-    env = {
-        "PYTHONPATH": server_pythonpath(_REPO_ROOT),
-    }
-    if compat_server_python() is None:
+@contextmanager
+def _journey_server(
+    tmp_path_factory: pytest.TempPathFactory, name: str, *, mcp_flags: bool
+) -> Iterator[str]:
+    env = {"PYTHONPATH": server_pythonpath(_REPO_ROOT)}
+    if mcp_flags and compat_server_python() is None:
         env["OMNIGENT_FEATURES"] = (
             "mcp_disabled_servers,mcp_disabled_servers_claude,mcp_disabled_servers_codex"
         )
     with isolated_local_server(
-        tmp_path_factory.mktemp("mcp_enabled_server"),
+        tmp_path_factory.mktemp(name),
         env=env,
         executable=server_executable(),
         cwd=compat_server_cwd(),
         health_timeout=180.0,
     ) as base_url:
+        yield base_url
+
+
+@pytest.fixture(scope="module")
+def mcp_enabled_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    """Keep MCP release flags local to this journey, preserving old-server compatibility."""
+    with _journey_server(tmp_path_factory, "mcp_enabled_server", mcp_flags=True) as base_url:
+        yield base_url
+
+
+@pytest.fixture(scope="module")
+def mcp_flagless_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    """A server without the MCP release flags, which strict mode does not need."""
+    with _journey_server(tmp_path_factory, "mcp_flagless_server", mcp_flags=False) as base_url:
         yield base_url
 
 
@@ -64,10 +78,17 @@ def server_version(mcp_enabled_server: str) -> str:
 @pytest.mark.parametrize("control", ["switch", "strict"])
 @pytest.mark.parametrize("harness", ["claude", "codex"])
 def test_disabled_server_absent_from_real_native_session(
-    mcp_enabled_server: str, mock_llm_server_url: str, tmp_path: Path, harness: str, control: str
+    request: pytest.FixtureRequest,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+    harness: str,
+    control: str,
 ) -> None:
     if shutil.which(harness) is None:
         pytest.skip(f"needs the {harness} CLI")
+    server = request.getfixturevalue(
+        "mcp_enabled_server" if control == "switch" else "mcp_flagless_server"
+    )
     home = tmp_path / "host" / "home"
     home.mkdir(parents=True)
     workspace = tmp_path / "workspace"
@@ -124,13 +145,14 @@ def test_disabled_server_absent_from_real_native_session(
         "providers": {"test": {"kind": "key", "default": [family], family: provider}}
     }
     if control == "strict":
-        # The user-config allowlist needs no host disable state or server feature flag.
+        # The user-config allowlist needs no host disable state or server feature flag;
+        # this server runs without the flags.
         host_config["mcp"] = {"inherit": False, "allow": ["on_fixture"]}
     with (
-        httpx.Client(base_url=mcp_enabled_server, timeout=120) as client,
+        httpx.Client(base_url=server, timeout=120) as client,
         isolated_host(
             tmp_path / "host",
-            mcp_enabled_server,
+            server,
             config=host_config,
             env={
                 "CLAUDE_CONFIG_DIR": None,
@@ -153,7 +175,7 @@ def test_disabled_server_absent_from_real_native_session(
             response.raise_for_status()
         session = create_native_session(
             client,
-            mcp_enabled_server,
+            server,
             harness=harness,
             metadata={
                 "host_id": host.host_id,
