@@ -60,6 +60,8 @@ _STATE_LOCK_FILE = "state.lock"
 _STARTUP_ERROR_FILE = "startup_error.json"
 _STARTUP_TIMEOUT_FILE = "startup_timeout.json"
 _EGRESS_CERTIFICATE_FILE = "egress_certificate_failure.json"
+# Input ownership and terminal evidence can arrive on separate connections.
+_TURN_INPUT_FILE = "turn_inputs.json"
 # Applied model/effort that config.toml failed to record, for every reader of it.
 _UNMIRRORED_SETTINGS_FILE = "unmirrored_settings.json"
 _UNMIRRORED_SETTINGS_LOCK_FILE = "unmirrored_settings.lock"
@@ -1196,6 +1198,7 @@ def clear_bridge_state(bridge_dir: Path) -> None:
             _STARTUP_TIMEOUT_FILE,
             _MCP_STARTUP_FILE,
             _EGRESS_CERTIFICATE_FILE,
+            _TURN_INPUT_FILE,
         ):
             try:
                 (bridge_dir / name).unlink()
@@ -1452,6 +1455,120 @@ def read_certificate_failure(bridge_dir: Path) -> CertificateFailure | None:
     if not isinstance(evidence, str) or not evidence:
         return None
     return CertificateFailure(evidence=evidence, expired=raw.get("expired") is True)
+
+
+@dataclass(frozen=True)
+class CodexTurnInputOutcome:
+    """An accepted web input joined to its exact native terminal outcome."""
+
+    claim_id: str
+    session_id: str
+    input_stable_id: str
+    empty: bool
+
+
+def _read_turn_input_records(bridge_dir: Path) -> dict[str, dict[str, dict[str, str]]]:
+    """Read validated identity records; malformed records cannot settle input."""
+    try:
+        raw = json.loads((bridge_dir / _TURN_INPUT_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"claims": {}, "outcomes": {}}
+    records: dict[str, dict[str, dict[str, str]]] = {"claims": {}, "outcomes": {}}
+    if not isinstance(raw, dict):
+        return records
+    for kind in records:
+        values = raw.get(kind)
+        if isinstance(values, dict):
+            records[kind] = {
+                key: value
+                for key, value in values.items()
+                if isinstance(key, str)
+                and isinstance(value, dict)
+                and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items())
+            }
+    return records
+
+
+@contextlib.contextmanager
+def _turn_input_records(bridge_dir: Path) -> Iterator[dict[str, dict[str, dict[str, str]]]]:
+    """Serialize executor acknowledgements with forwarder terminal observations."""
+    with _bridge_state_lock(bridge_dir, "turn_inputs.lock"):
+        records = _read_turn_input_records(bridge_dir)
+        yield records
+        records["outcomes"] = {
+            turn_id: outcome
+            for turn_id, outcome in records["outcomes"].items()
+            if any(
+                claim.get("thread_id") == outcome.get("thread_id")
+                and claim.get("turn_id") in (None, turn_id)
+                for claim in records["claims"].values()
+            )
+        }
+        _replace_bridge_record(bridge_dir, _TURN_INPUT_FILE, records)
+
+
+def prepare_turn_input(bridge_dir: Path, state: CodexNativeBridgeState, stable_id: str) -> str:
+    """Persist a web input's ownership before sending its native delivery request."""
+    claim_id = secrets.token_hex(16)
+    with _turn_input_records(bridge_dir) as records:
+        records["claims"][claim_id] = {
+            "session_id": state.session_id,
+            "thread_id": state.thread_id or "",
+            "input_stable_id": stable_id,
+        }
+    return claim_id
+
+
+def acknowledge_turn_input(bridge_dir: Path, claim_id: str, turn_id: str) -> None:
+    """Associate a claim only with the turn ID in its own RPC acknowledgement."""
+    with _turn_input_records(bridge_dir) as records:
+        claim = records["claims"].get(claim_id)
+        if claim is not None:
+            claim["turn_id"] = turn_id
+
+
+def discard_turn_input(bridge_dir: Path, claim_id: str) -> None:
+    """Forget an input after its outcome was delivered or its RPC was refused."""
+    with _turn_input_records(bridge_dir) as records:
+        records["claims"].pop(claim_id, None)
+        if not records["claims"]:
+            records["outcomes"].clear()
+
+
+def record_turn_input_outcome(
+    bridge_dir: Path, thread_id: str, turn_id: str, *, empty: bool
+) -> None:
+    """Retain terminal evidence even when it arrives before the RPC reply."""
+    with _turn_input_records(bridge_dir) as records:
+        if any(
+            claim.get("thread_id") == thread_id and claim.get("turn_id") in (None, turn_id)
+            for claim in records["claims"].values()
+        ):
+            records["outcomes"][turn_id] = {"thread_id": thread_id, "empty": str(empty)}
+
+
+def pending_turn_input_outcomes(bridge_dir: Path) -> list[CodexTurnInputOutcome]:
+    """Join only accepted claims and terminal evidence from the same native thread."""
+    records = _read_turn_input_records(bridge_dir)
+    result: list[CodexTurnInputOutcome] = []
+    for claim_id, claim in records["claims"].items():
+        outcome = records["outcomes"].get(claim.get("turn_id", ""))
+        if (
+            outcome is not None
+            and outcome.get("thread_id") == claim.get("thread_id")
+            and outcome.get("empty") in {"True", "False"}
+            and claim.get("session_id")
+            and claim.get("input_stable_id")
+        ):
+            result.append(
+                CodexTurnInputOutcome(
+                    claim_id,
+                    claim["session_id"],
+                    claim["input_stable_id"],
+                    outcome["empty"] == "True",
+                )
+            )
+    return result
 
 
 def clear_certificate_failure(bridge_dir: Path) -> None:

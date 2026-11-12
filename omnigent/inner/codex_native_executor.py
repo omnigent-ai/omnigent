@@ -42,12 +42,15 @@ from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
     CodexNativeBridgeState,
     CodexStartupFailure,
+    acknowledge_turn_input,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
     clear_pending_shell_command,
+    discard_turn_input,
     mark_shell_command_pending,
     mcp_startup_waiting_detail,
     mirror_applied_codex_settings,
+    prepare_turn_input,
     read_bridge_startup_error,
     read_bridge_startup_failure,
     read_bridge_startup_timeout,
@@ -472,12 +475,34 @@ async def _native_delivery_request_once(
         native_turn_id=requested_turn_id,
         requested_native_turn_id=requested_turn_id,
     )
+    input_stable_id = current_input_attributes().get("input_stable_id")
+    input_claim: str | None = None
+    if (
+        method in {"turn/start", "turn/steer"}
+        and isinstance(input_stable_id, str)
+        and input_stable_id
+    ):
+        preparing_claim = asyncio.create_task(
+            asyncio.to_thread(prepare_turn_input, bridge_dir, state, input_stable_id)
+        )
+        try:
+            input_claim = await asyncio.shield(preparing_claim)
+        except asyncio.CancelledError:
+            # A thread keeps writing after cancellation; remove only after it finishes.
+            with contextlib.suppress(OSError):
+                abandoned_claim = await preparing_claim
+                await asyncio.to_thread(discard_turn_input, bridge_dir, abandoned_claim)
+            raise
     try:
         # Turn input is acknowledged before execution; shell RPCs may await completion.
         timeout = _DELIVERY_RPC_TIMEOUT_SECONDS if method in {"turn/start", "turn/steer"} else None
         async with asyncio.timeout(timeout):
             response = await client.request(method, params)
     except BaseException as exc:
+        if input_claim is not None:
+            # No acknowledgement can arrive after this call exits; uncertainty never settles input.
+            with contextlib.suppress(OSError):
+                await asyncio.to_thread(discard_turn_input, bridge_dir, input_claim)
         outcome = "rpc_error"
         if isinstance(exc, asyncio.CancelledError):
             outcome = "cancelled"
@@ -534,6 +559,22 @@ async def _native_delivery_request_once(
     else:
         turn_id = result.get("turnId") if result is not None else None
     native_turn_id = turn_id if isinstance(turn_id, str) and turn_id else None
+    if input_claim is not None:
+        if native_turn_id is None or (
+            requested_turn_id is not None and native_turn_id != requested_turn_id
+        ):
+            await asyncio.to_thread(discard_turn_input, bridge_dir, input_claim)
+        else:
+            try:
+                await asyncio.to_thread(
+                    acknowledge_turn_input, bridge_dir, input_claim, native_turn_id
+                )
+            except OSError as exc:
+                with contextlib.suppress(OSError):
+                    await asyncio.to_thread(discard_turn_input, bridge_dir, input_claim)
+                raise InjectionDeliveryAmbiguous(
+                    "Could not record the accepted native input"
+                ) from exc
     # A shell command's ack is empty; its turn arrives later via turn/started.
     accepted = native_turn_id is not None or method == "thread/shellCommand"
     log_input_event(

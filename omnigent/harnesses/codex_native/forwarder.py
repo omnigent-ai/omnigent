@@ -49,7 +49,9 @@ from omnigent.harnesses.codex_native.bridge import (
     clear_certificate_failure,
     codex_config_revision,
     codex_home_for_bridge_dir,
+    discard_turn_input,
     pending_mcp_servers,
+    pending_turn_input_outcomes,
     read_bridge_state,
     read_certificate_failure,
     read_child_usage_baselines,
@@ -58,6 +60,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_mcp_startup,
     record_child_usage_baseline,
+    record_turn_input_outcome,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -2866,6 +2869,10 @@ async def supervise_forwarder(
             ),
             name="codex-native-forwarder-side-chat",
         )
+        input_outcomes_task = asyncio.create_task(
+            _drive_turn_input_outcomes(ap_client, bridge_dir),
+            name="codex-native-input-outcomes",
+        )
         await _sleep(0)
         stream_error: BaseException | None = None
         try:
@@ -2950,7 +2957,7 @@ async def supervise_forwarder(
             raise
         finally:
             # Stop producers before draining their output while the HTTP client is open.
-            background_tasks = [subscribe_task, side_chat_task]
+            background_tasks = [subscribe_task, side_chat_task, input_outcomes_task]
             if mcp_settle_timer is not None:
                 background_tasks.append(mcp_settle_timer)
             if forwarder_state.background_terminal_poll is not None:
@@ -2983,6 +2990,69 @@ async def supervise_forwarder(
                 )
             if stream_error is None and cleanup_errors:
                 raise cleanup_errors[0]
+
+
+async def _drain_turn_input_outcomes(client: httpx.AsyncClient, bridge_dir: Path) -> bool:
+    """Settle accepted empty turns; return whether every required post succeeded."""
+    delivered_all = True
+    for outcome in await asyncio.to_thread(pending_turn_input_outcomes, bridge_dir):
+        if outcome.empty:
+            response = await _post_session_event(
+                client,
+                outcome.session_id,
+                event_type="external_session_status",
+                data={"undelivered_input_stable_id": outcome.input_stable_id},
+            )
+            if response is None or response.status_code >= 400:
+                delivered_all = False
+                continue
+        await asyncio.to_thread(discard_turn_input, bridge_dir, outcome.claim_id)
+    return delivered_all
+
+
+async def _drive_turn_input_outcomes(client: httpx.AsyncClient, bridge_dir: Path) -> None:
+    """Reconcile durable receipts even when completion preceded the RPC reply."""
+    retry_delay = 1.0
+    while True:
+        try:
+            delivered_all = await _drain_turn_input_outcomes(client, bridge_dir)
+        except Exception:
+            _logger.warning("Codex empty-turn settlement failed", exc_info=True)
+            delivered_all = False
+        retry_delay = 1.0 if delivered_all else min(60.0, retry_delay * 2)
+        await _sleep(retry_delay)
+
+
+def _record_terminal_input_outcome(
+    bridge_dir: Path, params: _JsonObject, *, method: str | None = None
+) -> None:
+    """Remember exact terminal evidence without changing the active turn."""
+    state = read_bridge_state(bridge_dir)
+    turn_id = _terminal_turn_id_from_params(params)
+    thread_id = _thread_id_from_params(params)
+    if state is None or not state.thread_id or turn_id is None:
+        return
+    if thread_id is not None and thread_id != state.thread_id:
+        return
+    status = _turn_status_from_params(params)
+    if status is None and method == "turn/completed":
+        status = "completed"
+    turn = params.get("turn")
+    items = turn.get("items") if isinstance(turn, dict) else None
+    if _terminal_error_from_turn(params) is not None or status in {
+        "failed",
+        "errored",
+        "interrupted",
+        "cancelled",
+        "canceled",
+    }:
+        empty = False
+    elif status == "completed" and isinstance(items, list):
+        empty = not items
+    else:
+        # A partial notification cannot prove delivery or an empty completion.
+        return
+    record_turn_input_outcome(bridge_dir, state.thread_id, turn_id, empty=empty)
 
 
 async def _drive_side_chat_requests(
@@ -3790,6 +3860,12 @@ def _resume_turn_status_edge_for_latest_turn(
     state = read_bridge_state(bridge_dir)
     if state is None or state.thread_id != thread_id:
         return None
+    for turn in turns:
+        if isinstance(turn, dict) and _omnigent_status_from_resume_turn(turn) in {
+            "idle",
+            "failed",
+        }:
+            _record_terminal_input_outcome(bridge_dir, {"threadId": thread_id, "turn": turn})
     for turn in reversed(turns):
         if not isinstance(turn, dict):
             continue
@@ -6834,6 +6910,11 @@ def _prepare_terminal_turn_event(
         and terminal_turn_id in forwarder_state.surfaced_terminal_error_turns
     ):
         if bridge_dir is not None:
+            state = read_bridge_state(bridge_dir)
+            if state is not None and state.thread_id:
+                record_turn_input_outcome(
+                    bridge_dir, state.thread_id, terminal_turn_id, empty=False
+                )
             clear_active_turn_id_if_matches(bridge_dir, terminal_turn_id)
         _logger.info(
             "Codex forwarder suppressed terminal boundary after standalone error: "
@@ -6871,6 +6952,8 @@ def _terminal_turn_status_edge(
     :returns: Terminal status edge, or ``None`` when the event is stale.
     """
     terminal_turn_id = _terminal_turn_id_from_params(params)
+    if bridge_dir is not None:
+        _record_terminal_input_outcome(bridge_dir, params, method=method)
     # Child threads share the app-server but have no on-disk bridge of their own.
     if bridge_dir is not None and not clear_active_turn_id_if_matches(
         bridge_dir, terminal_turn_id

@@ -362,6 +362,91 @@ async def test_subagent_idle_validates_optional_response_id(
     assert route.forwarded == []
 
 
+@pytest.mark.parametrize("failure_mode", ["none", "once", "concurrent"])
+async def test_empty_turn_settlement_preserves_newer_running_turn(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    """A durable input notice retries persistence without changing a newer lifecycle."""
+    from omnigent.runtime import pending_inputs
+
+    route = status_route
+    sid = route.parent_id
+    stable_id = "a" * 32
+    pending_inputs.reset_for_tests()
+    pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "first message"}],
+        stable_id=stable_id,
+    )
+    newer = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "newer message"}],
+        stable_id="b" * 32,
+    )
+    append = route.store.append
+    failed = False
+    append_entered = threading.Event()
+    release_append = threading.Event()
+    second_entered = asyncio.Event()
+    settle = routes_events._settle_empty_native_turn_input
+    settle_calls = 0
+
+    async def observe_settle(*args: Any) -> None:
+        nonlocal settle_calls
+        settle_calls += 1
+        if settle_calls == 2:
+            second_entered.set()
+        await settle(*args)
+
+    monkeypatch.setattr(routes_events, "_settle_empty_native_turn_input", observe_settle)
+
+    def append_with_failure(*args: Any, **kwargs: Any) -> Any:
+        nonlocal failed
+        if failure_mode != "none" and not failed:
+            failed = True
+            if failure_mode == "concurrent":
+                append_entered.set()
+                assert release_append.wait(10), "test did not release the first append"
+            raise RuntimeError("temporary append failure")
+        return append(*args, **kwargs)
+
+    monkeypatch.setattr(route.store, "append", append_with_failure)
+    body = {"type": "external_session_status", "data": {"undelivered_input_stable_id": stable_id}}
+    try:
+        if failure_mode == "concurrent":
+            first = asyncio.create_task(route.client.post(f"/v1/sessions/{sid}/events", json=body))
+            assert await asyncio.to_thread(append_entered.wait, 5)
+            second = asyncio.create_task(
+                route.client.post(f"/v1/sessions/{sid}/events", json=body)
+            )
+            await asyncio.wait_for(second_entered.wait(), 5)
+            assert not second.done(), "a duplicate must not acknowledge before persistence"
+            release_append.set()
+            assert (await first).status_code == 500
+            assert (await second).status_code == 202
+        elif failure_mode == "once":
+            response = await route.client.post(f"/v1/sessions/{sid}/events", json=body)
+            assert response.status_code == 500, response.text
+            assert pending_inputs.pending_id_for_stable_id(sid, stable_id) == pending
+        for _ in range(2):
+            response = await route.client.post(f"/v1/sessions/{sid}/events", json=body)
+            assert response.status_code == 202, response.text
+        items = route.store.list_items(sid).data
+        assert [item.type for item in items] == ["message", "error"]
+        assert items[1].data.code == "native_prompt_not_recorded"
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [newer]
+        assert common._session_status_cache[sid] == "running"
+        assert common._session_active_response_cache[sid] == "resp_active"
+        assert route.store.get_conversation(sid).live_status == "running"
+        route.telemetry.assert_not_called()
+        assert route.forwarded == []
+    finally:
+        release_append.set()
+        pending_inputs.reset_for_tests()
+
+
 @pytest.mark.parametrize(
     ("status", "turn_outcome"),
     [("idle", None), ("running", None), ("failed", None), ("idle", "cancelled")],

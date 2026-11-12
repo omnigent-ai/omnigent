@@ -291,6 +291,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
     _session_is_moving,
+    _settle_empty_native_turn_input,
     _side_chat_source_id,
     _stop_host_runner_intentionally,
     _wait_for_host_bound_runner_client,
@@ -2551,6 +2552,17 @@ def register_events_routes(
             return {"queued": False}
         if body.type in (_EXTERNAL_SESSION_STATUS_TYPE, _SUBAGENT_STATUS_TYPE):
             status = body.data.get("status")
+            undelivered_input_stable_id = body.data.get("undelivered_input_stable_id")
+            if (
+                body.type == _EXTERNAL_SESSION_STATUS_TYPE
+                and "status" not in body.data
+                and isinstance(undelivered_input_stable_id, str)
+                and undelivered_input_stable_id
+            ):
+                await _settle_empty_native_turn_input(
+                    conversation_store, conv, session_id, undelivered_input_stable_id
+                )
+                return {"queued": False}
             if body.type == _SUBAGENT_STATUS_TYPE:
                 if body.data.get("idle") is not True:
                     raise OmnigentError(
