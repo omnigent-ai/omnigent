@@ -8008,6 +8008,8 @@ async def _forward_event_to_runner(
                     extra={"session_id": session_id},
                 )
 
+    from omnigent.tools.browser_agent_tools import browser_agent_tools_turn_flag
+
     # Flatten SessionEventInput {type, data} into the runner's
     # discriminated-union shape {type, ...data_fields}. The runner's
     # POST handler expects the harness event shape, not the
@@ -8035,6 +8037,7 @@ async def _forward_event_to_runner(
         # registration), so a non-renderer viewer keeps tools advertised
         # — no worse than the pre-hint behavior.
         "browser_renderer_available": session_stream.has_subscribers(session_id),
+        **browser_agent_tools_turn_flag(conv.labels),
     }
     if agent_revision is not None:
         runner_body["agent_revision"] = agent_revision
@@ -12522,7 +12525,10 @@ async def _create_session_from_existing_agent(
     assert body.agent_id is not None
 
     _reject_reserved_cost_control_label_seed(body.labels)
-    _reject_server_reserved_label_seed(body.labels)
+    _reject_server_reserved_label_seed(body.labels, at_creation=True)
+    from omnigent.tools.browser_agent_tools import apply_browser_agent_tools_creation_labels
+
+    apply_browser_agent_tools_creation_labels(body.labels, request.headers)
 
     agent = await validate_session_agent(
         user_id=user_id,
