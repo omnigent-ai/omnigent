@@ -458,9 +458,14 @@ function DirtyFileViewerProbe() {
     [registerNavigationGuard],
   );
   return allowLeaving ? (
-    <button type="button" onClick={allowLeaving}>
-      allow leaving
-    </button>
+    <>
+      <button type="button" onClick={allowLeaving}>
+        allow leaving
+      </button>
+      <button type="button" onClick={() => setAllowLeaving(null)}>
+        Keep editing
+      </button>
+    </>
   ) : null;
 }
 
@@ -4528,9 +4533,22 @@ describe("AppShell fullscreen file links", () => {
   it("follows a fullscreen link within the current session and restores the sidebar on exit", () => {
     renderShell("/c/conv_abc?file=README.md", undefined, {
       sessionNavTo: "/c/conv_abc?file=AGENTS.md&fullscreen=1",
+      dirtyFileViewer: true,
     });
+    expect(screen.queryByRole("button", { name: "allow leaving" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
     fireEvent.click(screen.getByTestId("nav-session"));
+
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+    expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.getByTestId("url-params")).toHaveTextContent(/^file=README.md$/);
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+    expect(screen.getByTestId("url-params")).toHaveTextContent(/^file=README.md$/);
+
+    fireEvent.click(screen.getByTestId("nav-session"));
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
 
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "AGENTS.md");
     expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveClass("md:absolute");
@@ -4543,6 +4561,30 @@ describe("AppShell fullscreen file links", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(screen.getByTestId("url-params")).toHaveTextContent("file=AGENTS.md");
     expect(screen.getByTestId("url-params").textContent).not.toContain("fullscreen");
+  });
+
+  it("ignores a pending file link's acceptance after navigation to another session", () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        client,
+        "/c/conv_abc?file=README.md",
+        <>
+          <DirtyFileViewerProbe />
+          <Link to="/c/conv_abc?file=AGENTS.md&fullscreen=1">Open shared file</Link>
+          <Link to="/c/conv_other">Open other session</Link>
+          <LocationDisplay />
+        </>,
+      ),
+    );
+    fireEvent.click(screen.getByRole("link", { name: "Open shared file" }));
+    expect(screen.getByRole("button", { name: "allow leaving" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("link", { name: "Open other session" }));
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+    expect(screen.getByTestId("url-params")).toHaveTextContent(/^$/);
+    expect(screen.getByRole("complementary", { name: "Workspace" })).not.toHaveClass("md:absolute");
   });
 
   it("clears fullscreen and viewer parameters when the linked file is closed", () => {

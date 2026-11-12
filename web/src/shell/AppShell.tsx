@@ -1447,9 +1447,44 @@ function AppShellImpl() {
     if (restoredWorkspace?.exitedMaximized) restoreSidebarAfterMaximize();
   }, [restoredWorkspace]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
+  const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
+    fileNavigationGuardsRef.current.add(guard);
+    return () => {
+      fileNavigationGuardsRef.current.delete(guard);
+    };
+  }, []);
+  const guardFileNavigation = useCallback(
+    (path: string | null, options: OpenFileOptions | undefined, commit: () => void) => {
+      const guards = [...fileNavigationGuardsRef.current];
+      const navigate = (index: number) => {
+        const guard = guards[index];
+        if (guard) guard(path, options, () => navigate(index + 1));
+        else commit();
+      };
+      navigate(0);
+    },
+    [],
+  );
   const urlFilePath = searchParams.get("file") || null;
   const urlFileFullscreen = searchParams.get("fullscreen") === "1";
   const fullscreenRestoreRef = useRef<typeof restoredWorkspace>(null);
+  const visibleFileUrlRef = useRef(searchParams);
+  const fileLinkLocationRef = useRef(location);
+  fileLinkLocationRef.current = location;
+  const guardedFileLinkRef = useRef<{
+    locationKey: string;
+    restoredParams: URLSearchParams | null;
+  } | null>(null);
+  useEffect(
+    () => () => {
+      guardedFileLinkRef.current = null;
+    },
+    [],
+  );
+  if (urlFilePath === selectedFilePath && urlFileFullscreen === rightPanelMaximized) {
+    visibleFileUrlRef.current = searchParams;
+  }
   // Honor incoming links even when the current session is already open.
   useEffect(() => {
     const sessionJustRestored = fullscreenRestoreRef.current !== restoredWorkspace;
@@ -1463,32 +1498,71 @@ function AppShellImpl() {
       (localFileUrl.get("file") || null) === urlFilePath &&
       (localFileUrl.get("fullscreen") === "1") === urlFileFullscreen
     ) {
+      if (guardedFileLinkRef.current?.restoredParams === localFileUrl) {
+        guardedFileLinkRef.current.locationKey = location.key;
+      } else {
+        guardedFileLinkRef.current = null;
+      }
       return;
     }
-    if (conversationId && urlFilePath) {
-      setSelectedFilePath(urlFilePath);
-      setSelectedTerminalKey(null);
-      setOpenFiles((prev) => (prev.includes(urlFilePath) ? prev : [...prev, urlFilePath]));
-      setRightRailTab((prev) => (prev === "files" || prev === "changes" ? prev : "files"));
-      setRightPanelOpenImmediately(true);
-      setFilesPanelOpen(false);
-      setSubagentsPanelOpen(false);
-      setShellsPanelOpen(false);
-      setSideChatsPanelOpen(false);
-      setContentSearchPanelOpen(false);
-      setExecutionLogsKey(null);
-      if (!terminalFirst) setPanelInitialKeyState(null);
-    }
-    const maximized = !!conversationId && !!urlFilePath && urlFileFullscreen;
-    if (maximized && !rightPanelMaximized) {
-      if (!sessionJustRestored || !restoredWorkspace?.exitedMaximized) {
-        sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
+    guardedFileLinkRef.current = null;
+    const applyIncomingLink = () => {
+      if (conversationId && urlFilePath) {
+        setSelectedFilePath(urlFilePath);
+        setSelectedTerminalKey(null);
+        setOpenFiles((prev) => (prev.includes(urlFilePath) ? prev : [...prev, urlFilePath]));
+        setRightRailTab((prev) => (prev === "files" || prev === "changes" ? prev : "files"));
+        setRightPanelOpenImmediately(true);
+        setFilesPanelOpen(false);
+        setSubagentsPanelOpen(false);
+        setShellsPanelOpen(false);
+        setSideChatsPanelOpen(false);
+        setContentSearchPanelOpen(false);
+        setExecutionLogsKey(null);
+        if (!terminalFirst) setPanelInitialKeyState(null);
       }
-      setSidebarOpen(false);
-    } else if (!maximized && rightPanelMaximized) {
-      restoreSidebarAfterMaximize();
+      const maximized = !!conversationId && !!urlFilePath && urlFileFullscreen;
+      if (maximized && !rightPanelMaximized) {
+        if (!sessionJustRestored || !restoredWorkspace?.exitedMaximized) {
+          sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
+        }
+        setSidebarOpen(false);
+      } else if (!maximized && rightPanelMaximized) {
+        restoreSidebarAfterMaximize();
+      }
+      setRightPanelMaximized(maximized);
+    };
+    if (!sessionJustRestored && conversationId && urlFilePath && urlFilePath !== selectedFilePath) {
+      const request = { locationKey: location.key, restoredParams: null as URLSearchParams | null };
+      guardedFileLinkRef.current = request;
+      let committed = false;
+      guardFileNavigation(urlFilePath, undefined, () => {
+        if (
+          guardedFileLinkRef.current !== request ||
+          fileLinkLocationRef.current.key !== request.locationKey
+        )
+          return;
+        committed = true;
+        guardedFileLinkRef.current = null;
+        if (request.restoredParams) {
+          localFileUrlRef.current = searchParams;
+          setSearchParams(searchParams, { replace: true });
+        }
+        applyIncomingLink();
+      });
+      if (!committed) {
+        const currentParams = new URLSearchParams(visibleFileUrlRef.current);
+        if (selectedFilePath) currentParams.set("file", selectedFilePath);
+        else currentParams.delete("file");
+        if (selectedFilePath && rightPanelMaximized) currentParams.set("fullscreen", "1");
+        else currentParams.delete("fullscreen");
+        request.restoredParams = currentParams;
+        localFileUrlRef.current = currentParams;
+        setSearchParams(currentParams, { replace: true });
+      }
+    } else {
+      applyIncomingLink();
     }
-    setRightPanelMaximized(maximized);
     // Sidebar and maximize state are captured only when the URL request changes.
   }, [conversationId, urlFilePath, urlFileFullscreen, restoredWorkspace]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1663,25 +1737,6 @@ function AppShellImpl() {
     ],
   );
 
-  const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
-  const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
-    fileNavigationGuardsRef.current.add(guard);
-    return () => {
-      fileNavigationGuardsRef.current.delete(guard);
-    };
-  }, []);
-  const guardFileNavigation = useCallback(
-    (path: string | null, options: OpenFileOptions | undefined, commit: () => void) => {
-      const guards = [...fileNavigationGuardsRef.current];
-      const navigate = (index: number) => {
-        const guard = guards[index];
-        if (guard) guard(path, options, () => navigate(index + 1));
-        else commit();
-      };
-      navigate(0);
-    },
-    [],
-  );
   // Mobile Back returns to Content search only for the conversation and file
   // its result committed; any other file navigation clears it.
   const contentSearchFileRef = useRef<string | null>(null);

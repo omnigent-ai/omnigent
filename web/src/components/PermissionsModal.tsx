@@ -86,8 +86,10 @@ export function PermissionsModal({
   const sharingMode = info === "loading" ? "on" : info.sharing_mode;
   const sharingOff = sharingMode === "off";
   const sharingReadOnly = sharingMode === "read_only" || sharingMode === "restricted_read_only";
+  const { session } = useSession(open && !sharingOff ? sessionId : null);
+  const sharingWorkspace = workspace ?? (filePath ? session?.workspace : undefined);
   const workspaceBlocked =
-    sharingMode === "restricted_read_only" && workspaceSharingBlocked(workspace);
+    sharingMode === "restricted_read_only" && workspaceSharingBlocked(sharingWorkspace);
   // Disabling public sharing prevents new grants but still permits revocation.
   const publicSharingEnabled = info === "loading" ? true : info.public_sharing_enabled;
   const { data: livePublicMaxLevel } = usePublicSharingMaxLevel(open && !sharingOff);
@@ -111,7 +113,6 @@ export function PermissionsModal({
   // Whether the owner shared the workspace files with view-level collaborators.
   // Read from the (shared-cache) session snapshot; the toggle PATCHes it and
   // invalidates the snapshot so the rail's file surfaces appear/disappear.
-  const { session } = useSession(open && !sharingOff ? sessionId : null);
   const queryClient = useQueryClient();
   const shareWorkspace = useMutation({
     mutationFn: (next: boolean) => updateSession(sessionId, { shareWorkspaceFiles: next }),
@@ -197,10 +198,10 @@ export function PermissionsModal({
     });
   }
 
-  function handleChangeLevel(userId: string, level: number) {
+  async function handleChangeLevel(userId: string, level: number) {
     if (workspaceBlocked) return;
     setError(null);
-    grant.mutate({ userId, level }, { onError: (err) => setError(err.message) });
+    await grantAccess(userId, level);
   }
 
   async function handlePublicLevel(value: string) {
@@ -709,21 +710,33 @@ function CopyLinkButton({
     const url = getShareableSessionLink(sessionId, rebasePath, filePath);
     setCopied(false);
     onError(null);
-    const prepared = beforeCopy?.().then(
-      () => true,
-      (err) => {
-        console.warn("Failed to prepare file share", err);
-        return false;
-      },
-    );
-    try {
-      await copyText(url);
-    } catch (err) {
-      console.warn("Failed to copy link to clipboard", err);
-      onError("Could not copy the link. Please try again or use the mobile QR code.");
+    const [clipboard, prepared] = await Promise.allSettled([copyText(url), beforeCopy?.()]);
+    if (clipboard.status === "rejected") {
+      console.warn("Failed to copy link to clipboard", clipboard.reason);
+    }
+    if (prepared.status === "rejected") {
+      console.warn("Failed to prepare file share", prepared.reason);
+      const message = (prepared.reason as Error).message;
+      if (clipboard.status === "fulfilled") {
+        onError(
+          `Link copied, but file sharing failed: ${message}. Please try again before sharing this link.`,
+        );
+      } else {
+        onError(`Could not copy the link, and file sharing failed: ${message}. Please try again.`);
+      }
       return;
     }
-    if ((await prepared) ?? true) setCopied(true);
+    if (clipboard.status === "rejected") {
+      if (filePath) {
+        onError(
+          "Could not copy the link. Workspace files are shared with everyone who has Read access. Please try copying again.",
+        );
+      } else {
+        onError("Could not copy the link. Please try again or use the mobile QR code.");
+      }
+      return;
+    }
+    setCopied(true);
   }, [sessionId, rebasePath, filePath, beforeCopy, onError]);
 
   return (
