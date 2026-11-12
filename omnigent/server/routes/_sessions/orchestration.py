@@ -9735,10 +9735,12 @@ async def _relay_runner_stream_once(
     heartbeat_seen = False
     try:
         # Every connection reopens this stream, so the runner relearns that inferred
-        # status edges are handled below; an older runner ignores the parameter.
+        # status edges and input-only failures are handled below; an older runner
+        # ignores the parameters.
         async with runner_client.stream(
             "GET",
-            f"/v1/sessions/{session_id}/stream?accepts_inferred_status=true",
+            f"/v1/sessions/{session_id}/stream"
+            "?accepts_inferred_status=true&accepts_input_only_failures=true",
             timeout=_relay_timeout,
         ) as resp:
             resp.raise_for_status()

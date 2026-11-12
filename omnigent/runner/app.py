@@ -476,6 +476,11 @@ _server_version: str | None = None
 # session stream request, that it accepts pane-inferred status edges. A
 # reconnect clears it.
 _server_accepts_inferred_status = False
+# Whether that server records an ``input_only`` failure for one queued message
+# without ending the session's tracked turn. Until it says so, the runner keeps
+# a prompt waiter (and its queued messages) past the human-wait hold. A
+# reconnect clears it.
+_server_accepts_input_only_failures = False
 
 
 def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
@@ -1794,7 +1799,8 @@ def create_runner_app(
         hook marker identifies each wait, so a new one starts fresh. Checks from
         another thread (the parent-death killer) only read this bookkeeping. An
         expired prompt waiter holds until the loop has reported its queued
-        messages as not delivered.
+        messages as not delivered, and indefinitely if the server cannot take
+        those reports (no ``accepts_input_only_failures``).
 
         :param session_ids: Sessions the runner currently tracks.
         :param approval_waits: Fresh permission-hook marker names per session.
@@ -1831,6 +1837,10 @@ def create_runner_app(
             session_id, identity = episode
             if isinstance(identity, asyncio.Task):
                 held = True
+                if not _server_accepts_input_only_failures:
+                    # An older server would end the parked turn on these reports and
+                    # could not recover their content: keep the messages queued.
+                    continue
                 with contextlib.suppress(RuntimeError):
                     identity.get_loop().call_soon_threadsafe(
                         _expire_prompt_wait, session_id, identity, waited_s
@@ -2713,8 +2723,10 @@ def create_runner_app(
         validate_runner_inference_config(envelope.snapshot.inference_config)
 
         global _server_version, _server_accepts_inferred_status
+        global _server_accepts_input_only_failures
         _server_version = envelope.server_version
         _server_accepts_inferred_status = envelope.accepts_inferred_status
+        _server_accepts_input_only_failures = envelope.accepts_input_only_failures
         snapshot = envelope.snapshot
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,
@@ -3847,12 +3859,16 @@ def create_runner_app(
 
     @app.get("/v1/sessions/{session_id}/stream")
     async def stream_session(
-        session_id: str, accepts_inferred_status: bool = False
+        session_id: str,
+        accepts_inferred_status: bool = False,
+        accepts_input_only_failures: bool = False,
     ) -> StreamingResponse:
-        global _server_accepts_inferred_status
+        global _server_accepts_inferred_status, _server_accepts_input_only_failures
         # A reconnecting server reopens every bound session's stream, idle ones included.
         if accepts_inferred_status:
             _server_accepts_inferred_status = True
+        if accepts_input_only_failures:
+            _server_accepts_input_only_failures = True
 
         async def _event_generator() -> AsyncIterator[bytes]:
             queue = _session_event_queues.get(session_id)
@@ -9020,9 +9036,11 @@ def create_runner_app(
     )
 
     async def _catch_up_scan() -> None:
-        global _server_accepts_inferred_status
-        # The new connection may reach an older server; it must accept inferred status anew.
+        global _server_accepts_inferred_status, _server_accepts_input_only_failures
+        # The new connection may reach an older server; it must accept inferred status
+        # and input-only failures anew.
         _server_accepts_inferred_status = False
+        _server_accepts_input_only_failures = False
         recreated_prompts = pending_approvals.notify_server_reconnect()
         if recreated_prompts:
             _logger.info(

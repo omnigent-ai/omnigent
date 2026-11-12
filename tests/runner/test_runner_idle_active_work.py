@@ -705,6 +705,7 @@ async def test_replaced_prompt_waiter_gets_a_fresh_hold(monkeypatch: pytest.Monk
     monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
     clock = _AdvanceableClock()
     monkeypatch.setattr("omnigent.runner.app.time", clock)
+    monkeypatch.setattr("omnigent.runner.app._server_accepts_input_only_failures", True)
     app = _scaffold_app()
     sid = "conv_wait_episode_waiter"
     tasks: list[asyncio.Task[None]] = []
@@ -1105,6 +1106,58 @@ async def test_pane_inference_is_scoped_to_the_server_connection(
         created = await client.post("/v1/sessions", json=envelope_init("conv_native_new_server"))
         assert created.status_code == 201, created.text
         assert accepts_inferred_status() is True
+
+
+@pytest.mark.asyncio
+async def test_input_only_failure_support_is_scoped_to_the_server_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a server whose init envelope advertises it gets input-only failures.
+
+    An older server's envelope lacks the field, and a reconnect forgets it until
+    the new server says so again.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.entities import Conversation
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PAYLOAD_KEY,
+        build_runner_session_init_payload,
+    )
+    from tests.runner.conftest import _runner_client
+
+    def envelope_init(session_id: str, *, advertise: bool) -> dict[str, object]:
+        conversation = Conversation(
+            id=session_id,
+            created_at=1,
+            updated_at=1,
+            agent_id="ag",
+            root_conversation_id=session_id,
+        )
+        payload = build_runner_session_init_payload(conversation, server_version="0.22.0")
+        if not advertise:
+            envelope = payload[SESSION_INIT_PAYLOAD_KEY]
+            assert isinstance(envelope, dict)
+            envelope.pop("accepts_input_only_failures")
+        return payload
+
+    monkeypatch.setattr(runner_app, "_server_accepts_input_only_failures", False)
+    app = await _native_app_with_session("conv_input_only_new_server")
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json=envelope_init("conv_input_only_older_server", advertise=False)
+        )
+        assert created.status_code == 201, created.text
+        assert runner_app._server_accepts_input_only_failures is False
+        created = await client.post(
+            "/v1/sessions", json=envelope_init("conv_input_only_new_server", advertise=True)
+        )
+        assert created.status_code == 201, created.text
+        assert runner_app._server_accepts_input_only_failures is True
+        await app.state.catch_up_scan()
+        assert runner_app._server_accepts_input_only_failures is False
 
 
 @pytest.mark.asyncio

@@ -466,6 +466,7 @@ async def test_unanswered_prompt_reports_queued_messages_then_releases_runner(
     must not vanish silently when an unanswered prompt lets it idle out.
     """
     monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", "0.05")
+    monkeypatch.setattr(runner_app, "_server_accepts_input_only_failures", True)
     app, _harness = _build_app()
     sid = uuid.uuid4().hex
     queued = [
@@ -532,6 +533,86 @@ async def test_unanswered_prompt_reports_queued_messages_then_releases_runner(
             response_ids = [failure["response"]["id"] for failure in failures]
             assert all(re.fullmatch(r"resp_[0-9a-f]{32}", rid) for rid in response_ids)
             assert len(set(response_ids)) == len(queued)
+        finally:
+            monitor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor
+            waiter = app.state.claude_prompt_waiters.get(sid)
+            if waiter is not None:
+                waiter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await waiter
+
+
+@pytest.mark.asyncio
+async def test_prompt_waiter_outlives_the_hold_until_the_server_takes_input_only_failures(
+    monkeypatch: pytest.MonkeyPatch, pending_prompt: dict[str, bool]
+) -> None:
+    """A server without ``accepts_input_only_failures`` keeps queued messages queued.
+
+    An older server would end the parked turn on per-message failures and could
+    not recover their content, so the runner keeps the prompt waiter and its
+    messages past the hold and sends nothing. Once the server reopens the session
+    stream advertising the capability, the expiry goes ahead.
+    """
+    monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", "0.05")
+    monkeypatch.setattr(runner_app, "_server_accepts_input_only_failures", False)
+    app, _harness = _build_app()
+    sid = uuid.uuid4().hex
+    queued = [
+        {
+            **_message(text),
+            "pending_id": f"pending_{uuid.uuid4().hex}",
+            "input_stable_id": uuid.uuid4().hex,
+        }
+        for text in ("first follow-up", "second follow-up")
+    ]
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
+        for body in queued:
+            buffered = await client.post(f"/v1/sessions/{sid}/events", json=body)
+            assert buffered.json()["status"] == "buffered"
+        events = runner_app._session_event_queues_ref[sid]
+
+        def failures_sent() -> list[dict[str, Any]]:
+            drained = [events.get_nowait() for _ in range(events.qsize())]
+            return [
+                event
+                for event in drained
+                if isinstance(event, dict) and event.get("type") == "response.failed"
+            ]
+
+        loop = asyncio.get_running_loop()
+        shutdowns: list[str] = []
+        monitor = asyncio.create_task(
+            _run_inactivity_monitor(
+                idle_timeout_s=0.02,
+                get_last_activity=lambda: loop.time() - 1.0,
+                has_active_work=app.state.has_active_work,
+                request_shutdown=lambda: shutdowns.append("shutdown"),
+                poll_interval_s=0.005,
+            )
+        )
+        try:
+            # Well past the hold: the older server gets nothing and the runner stays up.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(monitor), timeout=0.3)
+            assert shutdowns == []
+            assert sid in app.state.claude_prompt_waiters
+            assert len(app.state.session_message_buffers[sid]) == 2
+            assert failures_sent() == []
+
+            # The server reopens the session stream and advertises the capability.
+            events.put_nowait(None)
+            reopened = await client.get(
+                f"/v1/sessions/{sid}/stream", params={"accepts_input_only_failures": "true"}
+            )
+            assert reopened.status_code == 200
+            await asyncio.wait_for(monitor, timeout=5)
+            assert shutdowns == ["shutdown"]
+            assert [failure["pending_id"] for failure in failures_sent()] == [
+                body["pending_id"] for body in queued
+            ]
         finally:
             monitor.cancel()
             with contextlib.suppress(asyncio.CancelledError):

@@ -260,7 +260,8 @@ does not count as work. Waiting on a human (an unanswered dialog or permission
 request) counts as work for at most `OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S` seconds per
 wait (one day by default; `0` removes the limit), measured from the runner's first
 active-work check that observes the wait. Messages queued behind a wait that runs
-out are reported as not sent. After renewal stops, the provider's own idle or expiry
+out are reported as not sent; a server too old to record that keeps the wait open
+instead. After renewal stops, the provider's own idle or expiry
 behavior applies. For `agent_sandbox`, `sandbox.keep_warm_s` sets that runner
 idle timeout, and expiry suspends compute while retaining storage. Other
 providers have different lifetime behavior, so enabling managed sandboxes alone
