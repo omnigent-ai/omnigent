@@ -302,10 +302,13 @@ function renderDialog(onOpenChange: (open: boolean) => void = vi.fn()) {
 }
 
 /** Render inside a CapabilitiesProvider that advertises managed sandboxes. */
-function renderWithSandboxes(onOpenChange: (open: boolean) => void = vi.fn()) {
+function renderWithSandboxes(
+  onOpenChange: (open: boolean) => void = vi.fn(),
+  info: Partial<ServerInfo> = {},
+) {
   return render(
     <CapabilitiesProvider
-      info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true }}
+      info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true, ...info }}
     >
       <CreateScheduledTaskDialog open onOpenChange={onOpenChange} />
     </CapabilitiesProvider>,
@@ -1130,14 +1133,26 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
   });
 
   it("starts a new task in sandbox mode when sandboxes are offered, and a host pick sticks", () => {
-    renderWithSandboxes();
+    renderWithSandboxes(vi.fn(), {
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_automation_notices: {
+        agent_sandbox: "Keep your laptop's credentials fresh.",
+      },
+    });
     // The sandbox default wins over the online host and shows the fresh-sandbox
-    // copy; the connected-host workspace picker never appears.
+    // copy and the provider's notice; the connected-host workspace picker never appears.
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Sandbox");
+    expect(screen.getByTestId("task-sandbox-automation-notice")).toHaveTextContent(
+      "Keep your laptop's credentials fresh.",
+    );
     expect(screen.queryByText("pick-workspace")).not.toBeInTheDocument();
     openHostSelect();
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("laptop");
+    expect(screen.queryByTestId("task-sandbox-automation-notice")).not.toBeInTheDocument();
+    openHostSelect();
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+    expect(screen.getByTestId("task-sandbox-automation-notice")).toBeInTheDocument();
   });
 
   it.each([
@@ -1344,38 +1359,6 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
       expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("workspace");
     },
   );
-
-  it("shows the sandbox provider's automation notice only while a new sandbox is the target", async () => {
-    render(
-      <CapabilitiesProvider
-        info={{
-          ...SERVER_INFO_OFFLINE_FALLBACK,
-          managed_sandboxes_enabled: true,
-          sandbox_provider: "agent_sandbox",
-          sandbox_provider_capabilities: {
-            agent_sandbox: { automation_notice: "Keep your laptop's credentials fresh." },
-          },
-        }}
-      >
-        <CreateScheduledTaskDialog
-          open
-          onOpenChange={vi.fn()}
-          initialName="Nightly"
-          initialPrompt="Do it"
-        />
-      </CapabilitiesProvider>,
-    );
-    // A new sandbox is the default target where sandboxes are enabled.
-    expect(screen.getByTestId("task-sandbox-automation-notice")).toHaveTextContent(
-      "Keep your laptop's credentials fresh.",
-    );
-    openHostSelect();
-    fireEvent.click(await screen.findByRole("option", { name: "laptop" }));
-    expect(screen.queryByTestId("task-sandbox-automation-notice")).not.toBeInTheDocument();
-    openHostSelect();
-    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
-    expect(screen.getByTestId("task-sandbox-automation-notice")).toBeInTheDocument();
-  });
 
   it("submits execution_target=managed_sandbox with no host/workspace when the sandbox option is chosen", async () => {
     vi.mocked(hostsHook.useHosts).mockReturnValue({

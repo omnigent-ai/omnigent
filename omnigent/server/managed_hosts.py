@@ -1008,9 +1008,9 @@ class ManagedSandboxDeployment:
             if config.managed_launch_supported and config.provider is not None
         )
 
-    def provider_ui_capabilities(self) -> dict[str, dict[str, object]]:
+    def provider_ui_capabilities(self) -> dict[str, dict[str, bool]]:
         """
-        UI-relevant capabilities per launchable provider, for ``/v1/info``.
+        UI-relevant capability flags per launchable provider, for ``/v1/info``.
 
         Only the flags the web branches on are exposed (not the full internal
         :class:`SandboxCapabilities`), so the wire contract stays small — add an
@@ -1020,10 +1020,9 @@ class ManagedSandboxDeployment:
         ponytail: builds launchers on each call; memoize on the deployment only
         if /v1/info shows up hot (provider count is tiny, __init__ does no I/O).
 
-        :returns: Capabilities for each launchable provider, in configured order:
-            flags, plus the provider's ``automation_notice`` text when it sets one.
+        :returns: Capability flags for each launchable provider, in configured order.
         """
-        caps: dict[str, dict[str, object]] = {}
+        caps: dict[str, dict[str, bool]] = {}
         for config in self.configs:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
@@ -1047,9 +1046,23 @@ class ManagedSandboxDeployment:
                     config.host_config, config.model_discovery
                 ):
                     caps[config.provider]["default_models"] = True
-                if launcher.automation_notice:
-                    caps[config.provider]["automation_notice"] = launcher.automation_notice
         return caps
+
+    def provider_automation_notices(self) -> dict[str, str]:
+        """
+        Each launchable provider's ``automation_notice``, for ``/v1/info``.
+
+        Kept apart from :meth:`provider_ui_capabilities`, whose values are flags.
+
+        :returns: Notice text keyed by provider name; a provider without one is absent.
+        """
+        notices: dict[str, str] = {}
+        for config in self.configs:
+            if config.managed_launch_supported and config.provider is not None:
+                notice = config.launcher_factory().automation_notice
+                if notice:
+                    notices[config.provider] = notice
+        return notices
 
 
 @dataclass

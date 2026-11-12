@@ -6619,9 +6619,19 @@
             ],
             "title": "Sandbox Provider"
           },
+          "sandbox_provider_automation_notices": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "title": "Sandbox Provider Automation Notices",
+            "type": "object"
+          },
           "sandbox_provider_capabilities": {
             "additionalProperties": {
-              "additionalProperties": true,
+              "additionalProperties": {
+                "type": "boolean"
+              },
               "type": "object"
             },
             "default": {},

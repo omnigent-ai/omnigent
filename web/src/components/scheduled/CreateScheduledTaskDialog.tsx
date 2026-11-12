@@ -270,7 +270,7 @@ export function CreateScheduledTaskDialog({
       : [];
   const sandboxAutomationNotice =
     info !== "loading" && info.sandbox_provider
-      ? (info.sandbox_provider_capabilities?.[info.sandbox_provider]?.automation_notice ?? null)
+      ? (info.sandbox_provider_automation_notices?.[info.sandbox_provider] ?? null)
       : null;
 
   const {

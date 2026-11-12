@@ -974,9 +974,9 @@ class SandboxHostLauncher(SandboxLifecycle):
     automation_notice: ClassVar[str | None] = None
     """User-safe note on what this provider's unattended runs need from their owner.
 
-    The automation form shows it while the owner picks a new sandbox for each run,
-    e.g. a credential that must stay fresh on the owner's machine. ``None`` shows
-    nothing.
+    ``/v1/info`` reports it in ``sandbox_provider_automation_notices``, and the
+    automation form shows it while a new sandbox is the run target, e.g. for a
+    credential that must stay fresh on the owner's machine. ``None`` shows nothing.
     """
 
     def list_profiles(self, context: SandboxProfileContext) -> list[ProviderSandboxProfile] | None:

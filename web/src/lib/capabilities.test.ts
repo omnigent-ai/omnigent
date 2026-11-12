@@ -145,31 +145,39 @@ describe("resolveServerInfo sandbox_providers", () => {
     });
   });
 
-  it("keeps a provider's automation notice", async () => {
+  it("keeps each provider's automation notice", async () => {
     const result = await probe({
-      sandbox_provider_capabilities: {
-        agent_sandbox: { multi_repo: false, automation_notice: "Keep your laptop signed in." },
-      },
+      sandbox_provider_automation_notices: { agent_sandbox: "Keep your laptop signed in." },
     });
-    expect(result.sandbox_provider_capabilities?.agent_sandbox).toEqual({
-      multi_repo: false,
-      automation_notice: "Keep your laptop signed in.",
-      repo_catalog: [],
+    expect(result.sandbox_provider_automation_notices).toEqual({
+      agent_sandbox: "Keep your laptop signed in.",
     });
   });
 
-  it.each([null, 42, "", "   ", ["note"]])(
-    "drops a malformed automation notice (%j)",
-    async (automation_notice) => {
-      const result = await probe({
-        sandbox_provider_capabilities: { agent_sandbox: { multi_repo: false, automation_notice } },
-      });
-      expect(result.sandbox_provider_capabilities?.agent_sandbox).toEqual({
-        multi_repo: false,
-        repo_catalog: [],
-      });
+  it.each([undefined, null, "invalid", ["note"]])(
+    "reads a missing or malformed notice map as no notices (%j)",
+    async (value) => {
+      expect(
+        (await probe({ sandbox_provider_automation_notices: value }))
+          .sandbox_provider_automation_notices,
+      ).toEqual({});
     },
   );
+
+  it("drops notices that aren't non-blank text", async () => {
+    const result = await probe({
+      sandbox_provider_automation_notices: {
+        kept: "Keep your laptop signed in.",
+        empty: "",
+        blank: "   ",
+        number: 42,
+        missing: null,
+      },
+    });
+    expect(result.sandbox_provider_automation_notices).toEqual({
+      kept: "Keep your laptop signed in.",
+    });
+  });
 
   it.each([undefined, false, "true", true])(
     "requires an explicit durable-input capability (%s)",

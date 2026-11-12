@@ -21,7 +21,7 @@ import click
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
 from omnigent.entities.agent import Agent
@@ -2371,9 +2371,9 @@ class _NoticeLauncher(FakeSandboxLauncher):
     automation_notice = "Keep your laptop's credentials fresh."
 
 
-def test_provider_ui_capabilities_carry_a_providers_automation_notice() -> None:
+def test_provider_automation_notices_list_only_providers_that_set_one() -> None:
     """A provider's automation notice reaches /v1/info for the automation form; a
-    provider without one adds no key."""
+    provider without one is absent."""
     deployment = ManagedSandboxDeployment(
         configs=tuple(
             ManagedSandboxConfig(
@@ -2386,10 +2386,9 @@ def test_provider_ui_capabilities_carry_a_providers_automation_notice() -> None:
         )
     )
 
-    capabilities = deployment.provider_ui_capabilities()
-
-    assert capabilities["noted"]["automation_notice"] == "Keep your laptop's credentials fresh."
-    assert "automation_notice" not in capabilities["plain"]
+    assert deployment.provider_automation_notices() == {
+        "noted": "Keep your laptop's credentials fresh."
+    }
 
 
 def test_provider_ui_capabilities_report_which_providers_take_a_moved_session() -> None:
@@ -2649,11 +2648,12 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
     assert body["sandbox_provider"] is None
 
 
-async def test_info_reports_a_providers_automation_notice_beside_its_flags(
+async def test_info_reports_a_providers_automation_notice_apart_from_its_flags(
     db_uri: str,
     tmp_path: Path,
 ) -> None:
-    """``GET /v1/info`` keeps a provider's text notice next to its boolean flags."""
+    """``GET /v1/info`` reports a provider's text notice in its own map, so the
+    capability map keeps its boolean-valued contract."""
     config = ManagedSandboxDeployment.single(
         ManagedSandboxConfig(
             server_url="https://s.example.com",
@@ -2666,13 +2666,13 @@ async def test_info_reports_a_providers_automation_notice_beside_its_flags(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get("/v1/info")
     assert resp.status_code == 200, resp.text
-    assert resp.json()["sandbox_provider_capabilities"] == {
-        "noted": {
-            "multi_repo": False,
-            "accepts_session_move": True,
-            "automation_notice": "Keep your laptop's credentials fresh.",
-        }
+    body = resp.json()
+    assert body["sandbox_provider_automation_notices"] == {
+        "noted": "Keep your laptop's credentials fresh."
     }
+    capabilities = body["sandbox_provider_capabilities"]
+    assert capabilities == {"noted": {"multi_repo": False, "accepts_session_move": True}}
+    TypeAdapter(dict[str, dict[str, bool]]).validate_python(capabilities, strict=True)
 
 
 # ── launch_managed_host ─────────────────────────────────────
