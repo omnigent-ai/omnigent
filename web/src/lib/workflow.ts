@@ -62,13 +62,17 @@ export function savedWorkflowMessage(
   return `${skillPrefix}${WORKFLOW_SKILL} ${paragraphs.join("\n\n")}`;
 }
 
+/** What a task's ⋯ menu in the Tasks tab asks of the agent: run a ready task, or continue a stopped one. */
+export type TaskAction = "run" | "continue";
+
 /**
- * The message that asks the agent to pick a stopped task back up.
+ * The message that asks the agent to run a ready task or continue a stopped one.
  *
  * @param taskName The task's name, e.g. `"Review #6109"`.
+ * @returns e.g. `Run the task "Share the review files".`
  */
-export function continueTaskMessage(taskName: string): string {
-  return `Continue the task "${taskName}".`;
+export function taskActionMessage(action: TaskAction, taskName: string): string {
+  return `${action === "run" ? "Run" : "Continue"} the task "${taskName}".`;
 }
 
 /**

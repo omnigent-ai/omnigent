@@ -120,9 +120,9 @@ import {
   useChatStore,
 } from "@/store/chatStore";
 import {
-  registerContinueTask,
   registerSaveWorkflow,
   registerStartWorkflow,
+  registerTaskAction,
 } from "@/store/sessionTasksActions";
 import { isRetryableRequestError } from "@/lib/queryRetry";
 import { useTrueForAtMost } from "@/hooks/useTrueForAtMost";
@@ -358,11 +358,12 @@ import { SaveWorkflowDialog } from "@/components/composer/SaveWorkflowDialog";
 import { WorkflowDialog, type WorkflowRequest } from "@/components/composer/WorkflowDialog";
 import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import {
-  continueTaskMessage,
   offersSaveWorkflow,
   offersWorkflow,
   savedWorkflowMessage,
   saveWorkflowMessage,
+  type TaskAction,
+  taskActionMessage,
   workflowMessage,
 } from "@/lib/workflow";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
@@ -3170,11 +3171,13 @@ function ComposerImpl(
     if (!canSaveWorkflow || composerSessionId === null) return;
     return registerSaveWorkflow(composerSessionId, setSaveWorkflowName);
   }, [canSaveWorkflow, composerSessionId]);
-  // The Tasks tab's Continue asks the agent to pick a stopped task back up.
-  const continueTaskRef = useRef<(taskName: string) => void>(() => undefined);
+  // A task's ⋯ menu in the Tasks tab asks the agent to run a ready task or continue a stopped one.
+  const taskActionRef = useRef<(action: TaskAction, taskName: string) => void>(() => undefined);
   useEffect(() => {
     if (isReadOnly || composerSessionId === null) return;
-    return registerContinueTask(composerSessionId, (taskName) => continueTaskRef.current(taskName));
+    return registerTaskAction(composerSessionId, (action, taskName) =>
+      taskActionRef.current(action, taskName),
+    );
   }, [isReadOnly, composerSessionId]);
   const slashCommands = useMemo(
     () =>
@@ -4258,10 +4261,10 @@ function ComposerImpl(
           : (sendDisabledReason ??
             (disabled ? "This session can't take messages right now." : null));
   const workflowBlockedReason = blockedReasonFor("run a workflow");
-  continueTaskRef.current = (taskName) => {
-    const reason = blockedReasonFor("continue");
+  taskActionRef.current = (action, taskName) => {
+    const reason = blockedReasonFor(`${action} the task`);
     if (reason) toast.error(reason);
-    else sendWorkflowMessage(continueTaskMessage(taskName));
+    else sendWorkflowMessage(taskActionMessage(action, taskName));
   };
 
   const handleSubmit = (e: FormEvent) => {

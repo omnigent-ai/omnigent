@@ -16,9 +16,9 @@ import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import {
   openTasksTab,
-  registerContinueTask,
   registerSaveWorkflow,
   registerStartWorkflow,
+  registerTaskAction,
   useSessionTasksActions,
 } from "@/store/sessionTasksActions";
 import { journalEntry, journalPlan } from "@/test/journalFixtures";
@@ -385,26 +385,33 @@ describe("TasksPanel", () => {
     }
   });
 
-  it("offers Continue on a stopped task once the composer can send", () => {
-    showJournal([journalPlan(0, ["baseline"], ["ship"]), status(1, "baseline", "started")]);
+  it("offers Run on a ready task and Continue on a stopped one once the composer can send", () => {
+    showJournal([
+      journalPlan(0, ["baseline"], ["ship"], ["docs", ["ship"]]),
+      status(1, "baseline", "started"),
+    ]);
     renderPanel();
     expect(screen.queryByTestId("tasks-row-menu")).toBeNull();
     cleanup();
 
-    const continueTask = vi.fn();
-    const withdraw = registerContinueTask("conv", continueTask);
+    const taskAction = vi.fn();
+    const withdraw = registerTaskAction("conv", taskAction);
     try {
       renderPanel();
-      // Only the stopped task has the menu; one that isn't started has nothing to continue.
-      const [stopped, notStarted] = screen.getAllByTestId("tasks-row");
-      expect(within(notStarted!).queryByTestId("tasks-row-menu")).toBeNull();
+      const [stopped, ready, waiting] = screen.getAllByTestId("tasks-row");
       fireEvent.pointerDown(within(stopped!).getByTestId("tasks-row-menu"), { button: 0 });
       fireEvent.click(screen.getByTestId("tasks-row-continue"));
-      expect(continueTask).toHaveBeenCalledWith("baseline");
+      expect(taskAction).toHaveBeenLastCalledWith("continue", "baseline");
+      fireEvent.pointerDown(within(ready!).getByTestId("tasks-row-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-row-run"));
+      expect(taskAction).toHaveBeenLastCalledWith("run", "ship");
+      // A task still waiting on another has nothing to offer.
+      expect(within(waiting!).queryByTestId("tasks-row-menu")).toBeNull();
 
-      // Once the agent is working on it again, there's nothing to continue.
+      // Once the agent works on the started task again, it has nothing to continue.
       setSession({ sessionStatus: "running" });
-      expect(screen.queryByTestId("tasks-row-menu")).toBeNull();
+      const [running] = screen.getAllByTestId("tasks-row");
+      expect(within(running!).queryByTestId("tasks-row-menu")).toBeNull();
     } finally {
       act(withdraw);
     }
