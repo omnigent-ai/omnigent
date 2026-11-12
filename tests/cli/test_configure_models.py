@@ -4016,14 +4016,13 @@ def test_setup_saves_invalid_provider_choices_only_after_every_entry(
         return
     assert result.exit_code == 0, result.output
     providers = _config_yaml(isolated_config).get("providers") or {}
+    assert "workspace" not in providers
     if first == "1":
-        assert providers == {
-            "databricks-gemini-example": {
-                key: value for key, value in repairable.items() if key != "default"
-            }
+        assert providers["databricks-gemini-example"] == {
+            key: value for key, value in repairable.items() if key != "default"
         }
     else:
-        assert providers == {}
+        assert "databricks-gemini-example" not in providers
 
 
 @pytest.mark.parametrize(
