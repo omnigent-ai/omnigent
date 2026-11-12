@@ -108,7 +108,10 @@ function friendlyCloneError(error: unknown): string {
   if (message.includes("lost contact")) {
     return "The host stopped responding during the clone. The clone may have finished, so check the destination before retrying.";
   }
-  if (message.includes("took too long") || message.includes("did not finish")) {
+  if (message.includes("did not finish")) {
+    return "The host didn’t finish the clone in time. It may still finish, so check the destination before retrying.";
+  }
+  if (message.includes("took too long")) {
     return "The clone took too long and was stopped. Delete the partial folder, then try again.";
   }
   if (message.includes("doesn't exist or isn't writable")) {

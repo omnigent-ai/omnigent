@@ -418,6 +418,27 @@ describe("NewProjectButton project repositories", () => {
     expect(mocks.createProject).not.toHaveBeenCalled();
   });
 
+  it("does not tell the user to delete a checkout the host may still be writing", async () => {
+    mocks.serverInfo = projectServerInfo;
+    mocks.cloneRepository.mockRejectedValueOnce(
+      new Error(
+        "host 'laptop' did not finish cloning within 420s; the clone may still finish, so check the destination before retrying",
+      ),
+    );
+    renderButton([laptop]);
+
+    nameProject("Garden");
+    chooseRepositorySource();
+    typeRepository(repoUrl);
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "It may still finish, so check the destination before retrying.",
+    );
+    expect(alert).not.toHaveTextContent("Delete the partial folder");
+  });
+
   it("reuses a successful checkout when only the name changes after a failed save", async () => {
     mocks.serverInfo = projectServerInfo;
     mocks.createProject.mockImplementationOnce(
