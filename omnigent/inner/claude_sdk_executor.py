@@ -3535,7 +3535,7 @@ class ClaudeSDKExecutor(Executor):
             active_harnesses=self._mcp_active_harnesses,
         )
         if hermetic:
-            # The SDK's bundled CLI predates that setting but honors this knob.
+            # Claude Code builds older than that setting honor only this knob.
             env[_CLAUDE_CODE_ENABLE_CLAUDEAI_MCP_ENV] = "false"
 
         # Capture stderr from the CLI subprocess for diagnostics

@@ -2812,11 +2812,22 @@ class TestHermeticLaunchConnectorOptOut(unittest.TestCase):
         self.assertEqual(self._launch_env(options).get("ENABLE_CLAUDEAI_MCP_SERVERS"), "false")
 
     def test_skills_none_bundled_cli_fallback_keeps_env_opt_out(self):
-        # Without a system claude the SDK runs its bundled CLI, which predates
-        # the settings flag and only honors the environment knob.
+        # Without a system claude the SDK runs its bundled CLI; the
+        # environment knob must still reach it.
         options = self._capture_launch_options("none", system_cli=False)
 
         self.assertIsNone(getattr(options, "cli_path", None))
+        self.assertEqual(self._launch_env(options).get("ENABLE_CLAUDEAI_MCP_SERVERS"), "false")
+
+    def test_skills_none_user_settings_env_cannot_reenable_connectors(self):
+        # A hermetic launch merges the user settings ``env`` block; the
+        # executor's opt-out must win over a value set there.
+        with patch(
+            "omnigent.inner.claude_sdk_executor._claude_user_settings_env",
+            return_value={"ENABLE_CLAUDEAI_MCP_SERVERS": "true"},
+        ):
+            options = self._capture_launch_options("none")
+
         self.assertEqual(self._launch_env(options).get("ENABLE_CLAUDEAI_MCP_SERVERS"), "false")
 
     def test_other_filters_leave_connectors_to_host_settings(self):

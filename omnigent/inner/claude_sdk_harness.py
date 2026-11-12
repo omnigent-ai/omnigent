@@ -76,7 +76,7 @@ Env vars read at startup:
   sources also hide a project's ``disableClaudeAiConnectors``
   opt-out, ``"none"`` carries that opt-out in the launch
   settings and sets ``ENABLE_CLAUDEAI_MCP_SERVERS=false`` for
-  the CLI (the SDK's bundled CLI predates the setting), so
+  the CLI (older Claude Code builds predate the setting), so
   claude.ai connectors stay off.
 - ``HARNESS_CLAUDE_SDK_BUNDLE_DIR``: Absolute path to the
   agent bundle's extracted root. When set, the inner executor
