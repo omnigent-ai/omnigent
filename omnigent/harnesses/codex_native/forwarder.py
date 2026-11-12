@@ -6638,16 +6638,25 @@ def _async_question_reply_keys(text: str, question_keys: Collection[str]) -> lis
     """
     Return the keys of the async questions a Codex user message answers.
 
+    Only a message that is wholly one tagged reply answers questions, as the
+    TUI picker and the cards send it; a reply quoted inside other text is an
+    ordinary message.
+
     :param text: Codex ``userMessage`` text.
     :param question_keys: Keys of the async questions Codex asked.
-    :returns: Answered question keys, e.g. ``["call_abc:0"]``.
+    :returns: Answered question keys, e.g. ``["call_abc:0"]``, or ``[]``.
     """
+    replies = list(_async_question_replies(text, question_keys))
+    if len(replies) != 1:
+        return []
+    start, end, entries = replies[0]
+    if text[:start].strip() or text[end:].strip():
+        return []
     keys: list[str] = []
-    for _start, _end, entries in _async_question_replies(text, question_keys):
-        for entry in entries:
-            key = _async_question_reply_entry_key(entry)
-            if key is not None and key not in keys:
-                keys.append(key)
+    for entry in entries:
+        key = _async_question_reply_entry_key(entry)
+        if key is not None and key not in keys:
+            keys.append(key)
     return keys
 
 

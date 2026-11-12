@@ -46,7 +46,9 @@ export function codexAsyncQuestionReplyText(text: string): string {
     if (typeof entry !== "object" || entry === null) return text;
     const { answer, question, questionItemId } = entry as Record<string, unknown>;
     if (!isAsyncQuestionItemId(questionItemId)) return text;
-    if (typeof answer !== "string" || !answer) continue;
+    if (typeof answer !== "string") return text;
+    if (question !== undefined && typeof question !== "string") return text;
+    if (!answer) continue;
     replies.push(
       typeof question === "string" && question ? `↪ Re: ${question}\n${answer}` : answer,
     );

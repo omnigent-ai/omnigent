@@ -1080,9 +1080,35 @@ def test_forwarder_posts_notice_when_codex_async_question_answer_cannot_be_sent(
             [0],
         ),
         ([_user_message_event("What is 2 plus 2?")], [0, 1]),
+        (
+            [
+                _user_message_event(
+                    "Is this the format? "
+                    + _async_question_reply(0, "Which option do you choose?", "Alpha")
+                )
+            ],
+            [0, 1],
+        ),
+        (
+            [
+                _user_message_event(
+                    "```\n"
+                    + _async_question_reply(0, "Which option do you choose?", "Alpha")
+                    + "\n```"
+                )
+            ],
+            [0, 1],
+        ),
         ([_completed_event("turn_123", thread_id="thread_123")], [0, 1]),
     ],
-    ids=["tagged_reply", "reply_contains_closing_tag", "any_other_message", "turn_end"],
+    ids=[
+        "tagged_reply",
+        "reply_contains_closing_tag",
+        "any_other_message",
+        "reply_quoted_in_prose",
+        "reply_in_code_fence",
+        "turn_end",
+    ],
 )
 def test_forwarder_closes_codex_async_questions_the_tui_queue_clears(
     tmp_path: Path,
