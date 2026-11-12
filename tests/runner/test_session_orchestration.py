@@ -1248,19 +1248,24 @@ async def test_invalid_host_options_do_not_create(arguments):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "action,supported,explicit_target",
+    "action,supported,explicit_target,legacy_host",
     [
-        ("attach", True, False),
-        ("remove", True, False),
-        ("attach", True, True),
-        ("attach", False, False),
-        ("attach", None, False),
+        ("attach", True, False, False),
+        ("remove", True, False, False),
+        ("attach", True, True, False),
+        ("attach", True, True, True),
+        ("attach", False, False, False),
+        ("attach", None, False, False),
     ],
 )
 async def test_pr_link_routes_to_target_and_requires_capability(
-    action, supported, explicit_target
+    action, supported, explicit_target, legacy_host
 ):
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+    from omnigent.runner.session_requests import REQUEST_HOST_EXTENSION
+
     requests = []
+    delivered = []
     source = uuid4().hex
     target = uuid4().hex if explicit_target else source
     host = uuid4().hex
@@ -1274,10 +1279,15 @@ async def test_pr_link_routes_to_target_and_requires_capability(
         if request.method == "GET":
             assert request.url.path == f"/v1/sessions/{target}"
             return httpx.Response(200, json={"host_id": host})
+        if legacy_host and request.extensions[REQUEST_HOST_EXTENSION]:
+            return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
+        delivered.append(request)
         return httpx.Response(200, json={"prs": []})
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(respond), base_url="http://server"
+        transport=httpx.MockTransport(respond),
+        base_url="http://server",
+        headers={"Authorization": "Bearer test-token", OMNIGENT_SLICE_KEY_HEADER: "source-host"},
     ) as client:
         result = json.loads(
             await execute_tool(
@@ -1293,13 +1303,20 @@ async def test_pr_link_routes_to_target_and_requires_capability(
                 conversation_id=source,
             )
         )
+        assert client.headers[OMNIGENT_SLICE_KEY_HEADER] == "source-host"
     posts = [r for r in requests if r.method == "POST"]
     if supported is not True:
         assert "unavailable" in result["error"]
         assert not posts
         return
     assert result == {"prs": []}
-    assert len(posts) == 1
+    assert len(posts) == (2 if legacy_host else 1)
+    assert len(delivered) == 1
+    assert [r.extensions[REQUEST_HOST_EXTENSION] for r in posts] == (
+        [host, ""] if legacy_host else [host]
+    )
+    assert all(r.headers[ORCHESTRATION_SOURCE_HEADER] == source for r in posts)
+    assert all(r.headers["Authorization"] == "Bearer test-token" for r in posts)
     assert posts[0].url.path == f"/v1/sessions/{target}/resources/github/prs/orchestrated"
     assert posts[0].extensions["omnigent_host_id"] == host
     assert posts[0].headers[ORCHESTRATION_SOURCE_HEADER] == source

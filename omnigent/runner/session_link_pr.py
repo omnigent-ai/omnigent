@@ -6,7 +6,12 @@ from typing import Any
 import httpx
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.runner.session_requests import normalize_session_id, post_on_host, session_host_id
+from omnigent.runner.session_requests import (
+    is_wrong_replica,
+    normalize_session_id,
+    post_on_host,
+    session_host_id,
+)
 
 
 async def execute_link_pr_tool(
@@ -31,15 +36,24 @@ async def execute_link_pr_tool(
                 {"error": "Scripted session PR linking is unavailable on this server"}
             )
         host_id = await session_host_id(client, target)
+        path = f"/v1/sessions/{target}/resources/github/prs/orchestrated"
+        headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
+        payload = {"url": url, "action": action}
         requested = True
         response = await post_on_host(
             client,
-            f"/v1/sessions/{target}/resources/github/prs/orchestrated",
+            path,
             host_id=host_id,
-            headers={ORCHESTRATION_SOURCE_HEADER: source_id},
-            json={"url": url, "action": action},
+            headers=headers,
+            json=payload,
             timeout=60,
         )
+        if host_id and is_wrong_replica(response):
+            # Older hosts can be registered on the unkeyed replica. This explicit
+            # routing refusal precedes mutation; ambiguous outcomes are never replayed.
+            response = await post_on_host(
+                client, path, host_id=None, headers=headers, json=payload, timeout=60
+            )
         if response.is_error:
             if response.status_code >= 500 or response.status_code in (408, 429):
                 raise httpx.HTTPError("Missing acknowledgement")
