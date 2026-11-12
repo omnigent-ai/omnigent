@@ -117,6 +117,7 @@ const SESSION_SEARCH_RESULT_LIMIT = 50;
 const SEARCH_GROUP_PAGE_SIZE = 8;
 /** Keys that move cmdk's selection; see `userMovedSelection`. */
 const SELECTION_KEYS = new Set(["ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
+const EMPTY_PROJECTS: readonly ProjectSummary[] = [];
 
 interface PaletteSession {
   id: string;
@@ -137,12 +138,14 @@ function paletteSessions(
     includeArchived = false,
     excludeIds = new Set(),
     newestFirst = false,
-    projects = [],
+    projects = EMPTY_PROJECTS,
+    parentTitles,
   }: {
     includeArchived?: boolean;
     excludeIds?: ReadonlySet<string>;
     newestFirst?: boolean;
     projects?: readonly ProjectSummary[];
+    parentTitles?: ReadonlyMap<string, string | null>;
   } = {},
 ): PaletteSession[] {
   const seen = new Set(excludeIds);
@@ -164,7 +167,7 @@ function paletteSessions(
       parent:
         c.family?.representative_id && c.family.representative_id !== c.id
           ? (c.family.representative_title ??
-            rows.find((row) => row.id === c.family?.representative_id)?.title ??
+            parentTitles?.get(c.family.representative_id) ??
             "Session group")
           : null,
       project:
@@ -186,7 +189,7 @@ export function CommandPalette({
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
-  const { data: projects = [] } = useProjects({ enabled: open });
+  const { data: projects = EMPTY_PROJECTS } = useProjects({ enabled: open });
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [pageLimit, setPageLimit] = useState(SESSION_SEARCH_PAGE_BATCH);
@@ -323,11 +326,25 @@ export function CommandPalette({
     fetchNextPage,
   ]);
 
+  const parentTitles = useMemo(
+    () =>
+      new Map(
+        [data, titleSearch.data, contentSearch.data]
+          .flatMap((result) => result?.pages ?? [])
+          .flatMap((page) => page.data)
+          .map((row) => [row.id, row.title]),
+      ),
+    [data, titleSearch.data, contentSearch.data],
+  );
   const sessions = useMemo(() => {
     if (searching)
-      return paletteSessions(titleSearch.data?.pages ?? [], { includeArchived: true, projects });
+      return paletteSessions(titleSearch.data?.pages ?? [], {
+        includeArchived: true,
+        projects,
+        parentTitles,
+      });
     // Rows archived after they loaded are still cached here, so drop them.
-    const out = paletteSessions(data?.pages ?? [], { newestFirst: true, projects });
+    const out = paletteSessions(data?.pages ?? [], { newestFirst: true, projects, parentTitles });
     if (sessionsOnly) {
       if (!query.trim()) return out;
       return out
@@ -337,7 +354,7 @@ export function CommandPalette({
     }
     // The full first page would push Actions below the fold.
     return out.slice(0, IDLE_SESSION_LIMIT);
-  }, [data, titleSearch.data, query, searching, sessionsOnly, projects]);
+  }, [data, titleSearch.data, query, searching, sessionsOnly, projects, parentTitles]);
   // Excludes title matches again in case a rename moved a session between the
   // two groups' requests: cmdk needs each item value to be unique.
   const contentSessions = useMemo(
@@ -346,10 +363,11 @@ export function CommandPalette({
         ? paletteSessions(contentSearch.data?.pages ?? [], {
             includeArchived: true,
             projects,
+            parentTitles,
             excludeIds: new Set(sessions.map((s) => s.id)),
           })
         : [],
-    [contentSearch.data, searching, sessions, projects],
+    [contentSearch.data, searching, sessions, projects, parentTitles],
   );
   const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
   const searchGroups = [titleSearch, contentSearch];
@@ -428,19 +446,12 @@ export function CommandPalette({
           <HighlightedText text={s.label} query={sessionsOnly ? query : debouncedQuery} />
         </span>
         {(s.project || s.parent) && (
-          <span
-            className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground"
-            aria-label={[
-              s.project && `Project: ${s.project}`,
-              s.parent && `Nested under: ${s.parent}`,
-            ]
-              .filter(Boolean)
-              .join("; ")}
-          >
+          <span className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
             {s.project && (
               <>
                 <FolderIcon aria-hidden="true" className="size-3 shrink-0" />
                 <span className="truncate" title={s.project}>
+                  <span className="sr-only">Project: </span>
                   {s.project}
                 </span>
               </>
@@ -452,6 +463,7 @@ export function CommandPalette({
               <>
                 <CornerDownRightIcon aria-hidden="true" className="size-3 shrink-0" />
                 <span className="truncate" title={s.parent}>
+                  <span className="sr-only">Nested under: </span>
                   {s.parent}
                 </span>
               </>
