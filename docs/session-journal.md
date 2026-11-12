@@ -87,9 +87,12 @@ description in the composer, for example:
 `/workflow` is a skill Omnigent ships to every agent with the journal tools. The
 agent turns the description into a plan, works through it, and records each
 step's status as it goes; the Tasks tab shows the plan's steps the moment it's
-written. The agent asks first only if the description is ambiguous, and you can
-steer or stop it in chat at any time. An agent's own skill named `workflow`
-takes precedence over Omnigent's.
+written. If the session's plan still has tasks left, the agent first asks what
+to do with the new workflow: add it to the current one, replace the current
+one, or keep the current one and leave the new work aside. Otherwise it asks
+first only if the description is ambiguous. You can steer or stop it in chat at
+any time. An agent's own skill named `workflow` takes precedence over
+Omnigent's.
 
 ## Automations
 

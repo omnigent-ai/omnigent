@@ -15,15 +15,31 @@ don't have them, tell the user this agent can't run workflows and stop.
 
 ## Plan
 
-1. Read your journal first with `sys_journal_read`. If the session already has a
-   plan, continue it instead of starting over: steps that are done stay done.
+1. Read your journal first with `sys_journal_read`. If the session's plan has
+   steps that aren't done or failed, ask the user what to do with the new
+   workflow before you plan it. Ask with `sys_workflow_request_input` on the
+   step you'd work on next, saying what's left ("The current workflow has 2
+   tasks left. What should I do with the new one?"), with these options and
+   your recommendation:
+   - "Add to the current workflow": replan with the current steps, which keep
+     their status, plus steps for the new work.
+   - "Replace the current workflow": plan the new work alone, dropping the
+     steps left in the current plan.
+   - "Keep the current workflow": go on with the current plan, and leave the
+     new work aside.
+
+   If the plan still has the step you asked on, write `started` on it when you
+   get to it. A plan whose steps are all done or failed is finished: plan the
+   new work without asking.
 2. Write the plan with `sys_journal_write_plan` before you start working. Name
    the plan for its goal in a few words ("Cut GET /orders p95 by 20%"). Give
    each step a short, stable ID (`profile`, `opt-pool`), a name, and its
-   dependencies. A single goal is a one-step plan.
-3. Ask first only if the description is ambiguous: write the plan with what you
-   know, and ask with `sys_workflow_request_input` on its first step. Otherwise
-   start.
+   dependencies. A new step needs an ID the journal hasn't used yet, since a
+   step's status is the newest one written under its ID. A single goal is a
+   one-step plan.
+3. Ask about the description first only if it's ambiguous: write the plan with
+   what you know, and ask with `sys_workflow_request_input` on its first step.
+   Otherwise start.
 
 ## Work through it
 
