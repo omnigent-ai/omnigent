@@ -4458,6 +4458,13 @@ class HostProcess:
                 cast("str | None", params.get("pr_url")),
                 commit_sha=cast("str | None", params.get("commit_sha")),
             )
+        if op == "github_compare_diff":
+            return r.github_compare_diff(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                from_sha=cast("str | None", params.get("from_sha")),
+            )
         if op == "github_labels":
             return r.github_labels(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_merge_options":
@@ -4569,6 +4576,15 @@ class HostProcess:
                 pr_url=cast("str | None", params.get("pr_url")),
                 merge_method=params.get("merge_method"),
                 expected_head=params.get("expected_head"),
+            )
+        if op == "github_merge_as":
+            return pr_resource.merge_pr_as(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                merge_method=params.get("merge_method"),
+                expected_head=params.get("expected_head"),
+                account=params.get("account"),
             )
         if op == "github_disable_auto_merge":
             return pr_resource.disable_pr_auto_merge(

@@ -206,6 +206,7 @@ def test_colocated_child_on_another_replica_is_not_reported_offline(surface, anc
             else:
                 router.client_for_conversation(conversation_id=child.id, harness="pi-native")
         assert caught.value.code == ErrorCode.WRONG_REPLICA
+        assert getattr(caught.value, "host_id", None) == "host_parent"
     assert child.host_id is None
 
 

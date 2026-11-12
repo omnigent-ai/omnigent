@@ -25,6 +25,7 @@ import asyncio
 import uuid
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -162,6 +163,85 @@ async def test_quiescence_idle_for_legacy_native_harness_still_completes() -> No
             assert resp.status_code == 204, resp.text
         delivered = rig.drained()
         assert [(item["status"], item["output"]) for item in delivered] == [("completed", "done")]
+    finally:
+        rig.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovered", [False, True], ids=["fresh", "recovered"])
+@pytest.mark.parametrize(
+    ("resume_status", "resume_error", "expected_status"),
+    [
+        ("completed", None, "completed"),
+        ("interrupted", None, "completed"),
+        ("cancelled", None, "completed"),
+        ("failed", None, "failed"),
+        ("completed", {"message": "request refused"}, "failed"),
+    ],
+)
+async def test_codex_resume_idle_wakes_only_recovered_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recovered: bool,
+    resume_status: str,
+    resume_error: dict[str, str] | None,
+    expected_status: str,
+) -> None:
+    from omnigent.harnesses.codex_native import forwarder
+    from omnigent.harnesses.codex_native.bridge import read_bridge_state
+    from omnigent.runner.native import orchestration
+    from tests.harnesses.codex_native.session._support import (
+        _forwarder_context,
+        _write_forwarder_bridge,
+    )
+
+    rig = _Rig("codex-native")
+    launch_terminal = AsyncMock(return_value=None)
+    monkeypatch.setattr(orchestration, "_auto_create_codex_terminal", launch_terminal)
+    turn_id = "turn_live"
+    _write_forwarder_bridge(tmp_path, active_turn_id=turn_id, session_id=rig.child_id)
+    try:
+        async with _runner_client(rig.app) as client:
+            await rig.create_child_session(client)
+            launch_terminal.assert_awaited_once()
+            assert rig.drained() == []
+            await forwarder._replay_resume_response(
+                client,
+                **_forwarder_context(client, tmp_path, session_id=rig.child_id),
+                response={
+                    "result": {
+                        "thread": {
+                            "id": "thread_123",
+                            "turns": [
+                                {
+                                    "id": turn_id,
+                                    "status": resume_status,
+                                    "items": [],
+                                    **(
+                                        {"error": resume_error} if resume_error is not None else {}
+                                    ),
+                                }
+                            ],
+                        }
+                    }
+                },
+                replay_from_turn_id=turn_id if recovered else None,
+            )
+            delivered = rig.drained()
+            should_deliver = recovered or expected_status == "failed"
+            assert bool(delivered) is should_deliver
+            bridge_state = read_bridge_state(tmp_path)
+            assert bridge_state is not None
+            assert bridge_state.active_turn_id == (None if should_deliver else turn_id)
+            if should_deliver:
+                assert [item["status"] for item in delivered] == [expected_status]
+                return
+            entry = subagent_work.get_subagent_work(rig.child_id)
+            assert entry is not None and entry.status not in ("completed", "failed", "cancelled")
+            for status in ("running", "idle"):
+                response = await rig.post_status(client, {"status": status})
+                assert response.status_code == 204, response.text
+            assert [item["status"] for item in rig.drained()] == ["completed"]
     finally:
         rig.close()
 

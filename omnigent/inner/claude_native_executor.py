@@ -50,6 +50,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorWait,
     Message,
     TextChunk,
     ToolSpec,
@@ -382,7 +383,7 @@ class ClaudeNativeExecutor(Executor):
             Claude-native output/tool activity is terminal-originated
             and mirrored from Claude's transcript.
         :param system_prompt: Per-turn composed system prompt. Ignored here:
-            claude-native delivers raw author instructions once, at terminal
+            claude-native delivers session startup instructions once, at terminal
             launch, via ``--append-system-prompt`` (see
             ``omnigent.runner.native.orchestration`` and
             ``omnigent.harnesses.claude_native.main``) — not per-turn through this
@@ -431,6 +432,7 @@ class ClaudeNativeExecutor(Executor):
             )
             yield TextChunk(text=_HOST_DISK_WAIT_MESSAGE)
             while await asyncio.to_thread(_transcript_disk_full, self._bridge_dir):
+                yield ExecutorWait()
                 await asyncio.sleep(_HOST_DISK_POLL_S)
         from omnigent.runtime import telemetry
 

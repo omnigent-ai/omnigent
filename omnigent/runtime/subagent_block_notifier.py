@@ -149,7 +149,8 @@ class SubagentBlockNotifier:
         resolution notice; a ``request`` event arms the debounce and schedules
         :meth:`handle_request` onto the captured loop for the off-hot-path
         grace + parent lookup. Arm and clear both happen here, so they order
-        deterministically. Other event types are ignored.
+        deterministically. Other event types, and requests marked
+        ``is_blocking: false`` that the child keeps working past, are ignored.
 
         :param conversation_id: Session the event was published on,
             e.g. ``"conv_child123"``.
@@ -178,7 +179,10 @@ class SubagentBlockNotifier:
                 with contextlib.suppress(RuntimeError):
                     self._loop.call_soon_threadsafe(signal.set)
             return
-        if event_type != _REQUEST_TYPE:
+        params = event.get("params")
+        if event_type != _REQUEST_TYPE or (
+            isinstance(params, dict) and params.get("is_blocking") is False
+        ):
             return
         with self._lock:
             if key in self._notified:

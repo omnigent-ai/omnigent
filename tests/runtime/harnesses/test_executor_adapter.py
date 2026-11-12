@@ -567,6 +567,103 @@ async def test_turn_cancelled_terminates_with_response_cancelled(
 # ── Error-code classification ──────────────────────────────────
 
 
+@pytest.mark.parametrize("watchdog_enabled", [False, True])
+def test_executor_wait_does_not_report_progress_or_delivery(watchdog_enabled: bool) -> None:
+    import asyncio
+    from unittest.mock import Mock
+
+    from omnigent.inner.executor import ExecutorWait
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = TurnContext(
+        response_id="resp_wait", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    hold_idle = Mock()
+    progress = Mock()
+    ctx._hold_idle_watchdog = hold_idle if watchdog_enabled else None
+    ctx._reset_idle_watchdog = progress
+
+    adapter._translate_event(ExecutorWait(), ctx)
+
+    assert hold_idle.call_count == int(watchdog_enabled)
+    progress.assert_not_called()
+    assert ctx._has_progress is False
+    assert ctx._event_queue.empty()
+
+
+@pytest.mark.parametrize("outcome", ["recovered", "absolute", "cancelled", "stalled_probe"])
+async def test_claude_disk_hold_keeps_only_the_idle_watchdog_alive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
+) -> None:
+    """A checked capacity wait survives idle expiry without disabling other limits."""
+    import asyncio
+    from unittest.mock import Mock
+
+    from omnigent.inner import claude_native_executor
+    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(claude_native_executor, "_HOST_DISK_POLL_S", 0.05)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    checked: list[float] = []
+    ctx = TurnContext(
+        response_id="resp_disk_wait", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    def disk_full(bridge_dir: Path) -> bool:
+        del bridge_dir
+        elapsed = loop.time() - started
+        checked.append(elapsed)
+        if outcome == "cancelled" and elapsed >= 0.8:
+            loop.call_soon_threadsafe(ctx.cancelled.set)
+        return outcome != "recovered" or elapsed < 0.8
+
+    monkeypatch.setattr(claude_native_executor, "_transcript_disk_full", disk_full)
+    injected = Mock()
+    reaped = Mock()
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
+    monkeypatch.setattr(claude_native_executor, "kill_session", reaped)
+    executor = claude_native_executor.ClaudeNativeExecutor(tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    if outcome == "stalled_probe":
+        # No further capacity check completes within the idle window.
+        monkeypatch.setattr(claude_native_executor, "_HOST_DISK_POLL_S", 10.0)
+    request = CreateResponseRequest(model="test-agent", input="held original")
+    try:
+        if outcome in {"absolute", "stalled_probe"}:
+            expected = "absolute watchdog" if outcome == "absolute" else "idle watchdog"
+            with pytest.raises(RuntimeError, match=expected):
+                await adapter._guarded_run_turn(request, ctx)
+        else:
+            await adapter._guarded_run_turn(request, ctx)
+            assert checked[-1] >= 0.8
+        if outcome == "recovered":
+            injected.assert_called_once()
+            assert injected.call_args.kwargs["content"] == "held original"
+            reaped.assert_not_called()
+            assert adapter._executor is executor
+        else:
+            injected.assert_not_called()
+        if outcome == "cancelled":
+            assert ctx.cancelled.is_set()
+        deltas = []
+        while not ctx._event_queue.empty():
+            event = ctx._event_queue.get_nowait()
+            if event is not None:
+                deltas.append(event)
+        assert len(deltas) == 1
+        assert deltas[0].delta == claude_native_executor._HOST_DISK_WAIT_MESSAGE
+    finally:
+        await adapter.on_shutdown()
+
+
 def test_build_error_detail_keeps_inner_executor_error_fields() -> None:
     """
     An executor that names its failure (``ExecutorError.code``) is raised as

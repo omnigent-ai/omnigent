@@ -651,8 +651,8 @@ def _materialize_codex_agent_spec(
     return yaml_path
 
 
-def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
-    """Resolve raw author instructions from the wrapper's agent spec.
+def _wrapper_spec_startup_instructions(spec_path: Path) -> str:
+    """Compose author instructions and stable guidance for the wrapper's session.
 
     Reuses :func:`omnigent.spec.load` (the same loader
     :func:`~omnigent.cli._bundle` and the server use for both an agent-image
@@ -663,23 +663,21 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     :param spec_path: The generated/current wrapper agent spec (a
         standalone YAML file or an agent-image directory).
-    :returns: The verbatim instructions text, or ``None`` if unresolvable
-        or absent/whitespace-only. Best-effort: a malformed spec must not
-        block the terminal launch, so load failures degrade to ``None``.
+    :returns: Startup instructions, with framework guidance if the spec fails.
     """
-    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.runtime.prompt import build_native_startup_instructions
     from omnigent.spec import load as load_agent_spec
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
     except Exception:
         _logger.warning(
-            "Could not resolve raw instructions from wrapper spec %s",
+            "Could not resolve instructions from wrapper spec %s",
             spec_path,
             exc_info=True,
         )
-        return None
-    return raw_author_instructions(spec)
+        return build_native_startup_instructions(None)
+    return build_native_startup_instructions(spec)
 
 
 def _run_with_local_server(
@@ -749,7 +747,7 @@ def _run_with_local_server(
                     command=command,
                     model=model,
                     startup_progress=progress,
-                    developer_instructions=_wrapper_spec_raw_instructions(spec_path),
+                    developer_instructions=_wrapper_spec_startup_instructions(spec_path),
                 )
             if resolved_session_id is None:
                 _record_launch_for_fresh_session(prepared.session_id)
@@ -1137,7 +1135,7 @@ async def _prepare_codex_terminal(
     :param model: Optional model id.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
-    :param developer_instructions: Raw author instructions persisted into
+    :param developer_instructions: Session startup instructions persisted into
         Codex's private per-session config, applied on fresh launch and
         cold resume only — the reattach branch below returns before this
         is used, so it never relaunches or duplicates the value.

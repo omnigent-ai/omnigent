@@ -26,11 +26,19 @@ implements them separately, so a fix for one harness does not reach the others.
   reported unavailable until the user picks an offered one. Display only;
   [automations](automation-templates.md) share this curation while preserving
   saved selections on edit. Project-settings pickers are unchanged.
-- `agent-instructions`: Pi native delivers authored instructions at launch/resume;
-  authors can keep or replace Pi's base prompt and disable automatic context files.
+- `agent-instructions`: supported native startup paths preserve authored instructions
+  and add shared guidance for showing workspace screenshots; Pi authors can keep
+  or replace its base prompt and disable automatic context files.
 - `pi-host-mcp`: managed Pi sessions (pi-native with an Omnigent provider, and the
   Pi gateway executor) also get the MCP servers configured for Claude Code, Codex
   and Cursor; the user's own `~/.pi/agent/mcp.json` entries win and it is not written.
+- `claude-managed-mcp-relay`: on a machine with Claude Code's enterprise
+  `managed-mcp.json`, Claude Code refuses `--mcp-config`, so Claude native
+  sessions (web-launched and `omnigent claude`) reach Omnigent's tools through
+  the file's `omnigent` relay entry (`docs/CLAUDE_MANAGED_MCP.md`). Without a
+  usable entry the session still launches, without Omnigent's tools, and the
+  launch logs a warning naming the missing entry. claude-sdk applies the same
+  check (see [Composer](./composer.md)).
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
   an Omnigent session behind it. With `OMNIGENT_SESSION_ENV_PASSTHROUGH=NAME,...`
   the named shell variables reach only the new runner that command launches; a
@@ -146,6 +154,13 @@ implements them separately, so a fix for one harness does not reach the others.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
   including those sent while it works, stay in that thread, and closing it
   leaves the parent usable.
+- `codex-async-questions`: each Codex `request_user_input_async` question shows
+  a card in Chat and Inbox that leaves the composer usable, like the Codex TUI's
+  queued-question picker. A card closes when the question is answered from the
+  card or the TUI picker, when the user sends any other message, when Cancel is
+  pressed (Codex keeps working), or when the turn ends. A server whose
+  `/v1/info` lacks `codex_nonblocking_decline` shows no card, so answer in the
+  terminal.
 - `codex-plan-mode`: Codex starts in, or switches to, its own Plan mode from the
   composer's Plan row; see `plan-mode` in [composer.md](./composer.md).
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
@@ -198,13 +213,25 @@ interface creating the fork. Gateway requests carry `Databricks-Custom-Coding-Ag
 creating interface use `omnigent` as a fallback.
 Routes configured by ug retain the additional `ug` surface.
 
-**Agent instructions (Pi native):** launch an agent whose spec contains inline
+**Agent instructions:** supported native startup paths add Omnigent's guidance
+to embed existing workspace screenshots in replies using their real file paths.
+After upgrading, start a new session or restart/cold-resume an existing one to
+load this guidance. Reopening the Terminal view alone does not update a running
+process.
+
+For Pi native, launch an agent whose spec contains inline
 instructions or references a bundled instruction file. Reopen its terminal and
 check the same authored role is present once. For a custom Pi-native agent,
 `executor.context_files: false` excludes automatic workspace/global notes, and
 `executor.system_prompt_mode: replace` replaces Pi's base prompt. Explicit agent
 instructions remain; these options do not restrict file access or extensions.
 The `omnigent pi` wrapper also appends its own startup instructions.
+
+**Managed MCP config (Claude):** on a disposable machine whose Claude Code
+reads an enterprise `managed-mcp.json` containing the documented `omnigent`
+entry, start a Claude Code session from New Chat and another with
+`omnigent claude`, then ask each to use an Omnigent tool. Remove the entry and
+start another session from each surface.
 
 **Working status:** watch the session's Chat indicator after sending from the
 new-session composer, an existing-session composer, or the agent terminal.
@@ -362,6 +389,20 @@ turn, and Stop separately. For an offline host use the reconnect paths in
 follow-up in the side pane, then close its tab. The parent conversation stays
 separate. See [sessions](./sessions.md) for all side-chat entry points.
 
+**Codex async question:** in Default mode, ask Codex to call
+`request_user_input_async` and keep working. The cards follow the Codex TUI's
+queued questions (shift+← in the terminal): one card per question, its options
+plus a free-text "Other" row, and the composer stays usable. Answer a card in
+Chat or Inbox: the answer is sent as an ordinary message in the TUI picker's
+reply format, which steers Codex's current turn, and the transcript shows it as
+the TUI does (`↪ Re: <question>` above the answer). So does an answer picked
+in the TUI. A card closes when its question is answered there or in the card,
+when any other user message is sent from either side, on Cancel (Codex keeps
+working, like the TUI's skip), or when the turn ends. Cancel does not clear the
+question in the terminal. If the answer can't be sent, a notice asks the user
+to answer in the terminal. An open question is not restored after the
+forwarder reconnects.
+
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
 columns name one journey test per harness; "—" means none exists yet.
@@ -483,6 +524,24 @@ guide](../docs/native-agy-gateways.md) for live smoke steps.
 The reader/server replay regression is
 `tests/server/integration/test_sessions_external_item_idempotency.py::test_agy_reader_restart_preserves_messages_and_tool_pairs`.
 
+**`claude-managed-mcp-relay`, both Claude native launch paths:** the launch
+environment and the entry check are covered by
+`tests/harnesses/claude_native/test_claude_native.py::test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config`
+(`omnigent claude`),
+`tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_claude_terminal_points_a_managed_relay_entry_at_its_bridge`
+(web launch) and
+`tests/harnesses/claude_native/test_claude_native.py::test_managed_relay_entry_must_launch_serve_mcp_for_the_session_bridge`.
+No browser test drives a native session under a managed file. Manually, in a
+disposable container or VM where Claude Code's managed directory
+(`/etc/claude-code` on Linux, `/Library/Application Support/ClaudeCode` on
+macOS) is writable, deploy the documented entry, start a session from each
+surface, and expect `claude mcp list` in its terminal to report `omnigent`
+connected and an Omnigent tool call such as `sys_session_get_info` to
+succeed. With the entry removed, expect each launch to succeed without
+`mcp__omnigent__*` tools, and the launching process (the runner for web, the
+`omnigent claude` process locally) to log that the relay entry is missing.
+Remove the file afterwards.
+
 Cross-harness journeys:
 
 - **`working-status`, Claude (component and real-process checks):** run with
@@ -553,6 +612,14 @@ Cross-harness journeys:
   and cleanup checks, including Codex-role and auxiliary-shell controls, are
   in [Terminals](./terminals.md); they do not establish full harness acceptance.
 
+- **`steer`, Claude questions in a narrow terminal:**
+  `tests/harnesses/claude_native/test_claude_native_copy_mode.py::test_question_with_a_footer_word_split_by_tmux_keeps_waiting`
+  uses real tmux and a stand-in question picker. Chat input and settings leave
+  the question open when wrapping splits a footer word; an explicit terminal
+  answer releases the composer for one message. Manually, narrow Claude's
+  terminal while a question is pending, send an unrelated Chat message, then
+  answer the question and verify that the held message arrives once.
+
 - **Antigravity permission choices (Chat and Inbox):**
   `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`
   uses a recorded permission prompt and the real server to check both choices
@@ -603,6 +670,21 @@ Cross-harness journeys:
   model context, distinct native threads on one runner, transcript isolation,
   follow-ups that switch model and effort on the same thread, and a working
   parent after side-chat closure.
+- **`codex-async-questions`:**
+  `tests/harnesses/codex_native/session/test_elicitation.py` (the
+  `*codex_async_question*` tests) drives the forwarder with a fake app-server
+  client: one card per question, each answer sent as its own user message, a
+  skipped or closed card, an older server, the notice when the answer can't be
+  sent, and the cards closing on a tagged reply, any other user message, and
+  the turn's end.
+  `tests/server/integration/test_sessions_permission_request_hook.py::test_codex_request_user_input_decline_interrupts_only_blocking_questions`
+  covers Cancel on the server. `web/src/lib/codexAsyncQuestionReply.test.ts`
+  covers the `↪ Re:` transcript, `web/src/lib/blockStream.test.ts` and
+  `web/src/lib/blocks.test.ts` the non-blocking card,
+  `web/src/pages/ChatPage.composer.test.tsx` the composer,
+  `web/src/pages/ChatPage.indicators.test.tsx` the working indicator's terminal
+  guidance, and `web/src/components/chat/chatBubbleParts.test.tsx` Retry. No
+  test drives a real Codex CLI, the browser, Inbox, or a child thread.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus
@@ -713,6 +795,12 @@ Cross-harness journeys:
   unchanged. Databricks codex launch discovery skips models whose
   `supported_api_types` list omits `codex/v1/responses`.
 - **`model-and-effort`, Codex runtime settings:**
+  A model/effort update before message delivery has a 30-second RPC budget.
+  If its reply is rejected or lost, the message remains unsent even if the
+  settings already changed; no request is replayed automatically. The real
+  loopback cases in
+  `tests/inner/test_codex_native_executor.py::test_transport_failure_keeps_native_work_running`
+  cover failed settings, concurrent native work and replacement ownership.
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_preserves_supported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_switch_clamps_inherited_effort`,
@@ -1135,6 +1223,10 @@ Cross-harness journeys:
   the session stays idle and the released reply never appears, then completes
   a follow-up. The harness bench does not register opencode-native, so its
   interrupt probe does not apply.
+- **opencode-native usage (component checks):**
+  `tests/test_opencode_native_forwarder.py::test_usage_dedupes_identical_posts`
+  checks that a rejected report can be retried at turn completion while
+  accepted totals remain deduplicated. It controls HTTP responses locally.
 - **opencode-native journeys (own environment, scripted model):** needs
   `@opencode/cli` 2.0.18–2.0.x and tmux on `PATH`, in e2e mock mode:
   `uv run --no-sync pytest tests/e2e/test_host_opencode_native_mock_e2e.py --reruns 0 -v`.
@@ -1339,6 +1431,13 @@ With the default client deadline, cancellation must clear the approval without
 creating the automation. Record the client configuration with the evidence.
 
 ## Gotchas
+
+- An enterprise `managed-mcp.json` applies to every Claude Code process on the
+  machine, whatever its `HOME` or `CLAUDE_CONFIG_DIR`, including other test
+  runs and the developer's own sessions. Drive `claude-managed-mcp-relay` only on
+  a disposable machine, and never overwrite a file an administrator deployed.
+  Outside Omnigent the relay entry's variables are unset, so a hand-started
+  `claude mcp list` reports `omnigent` as failed; that is expected.
 
 - Relay approval waits retain one pending request slot. Vendor clients that do not
   honor MCP progress notifications can still impose their own shorter deadline;
