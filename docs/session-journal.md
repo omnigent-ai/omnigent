@@ -132,6 +132,11 @@ The saved steps are a starting point, so the agent can still replan. You can
 also ask for a saved workflow by name in chat ("run my flaky-test triage
 workflow").
 
+To run a saved workflow on a schedule or a trigger, pick it in New
+automation's **Workflow (optional)** field. Each run follows the workflow
+without a plan review, and the automation's **Additional instructions**
+customize it.
+
 ## Automations
 
 An automation's prompt asks the agent to read its journal first, write a plan if
