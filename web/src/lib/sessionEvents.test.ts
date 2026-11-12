@@ -1453,7 +1453,7 @@ describe("session.sandbox_status (FLAT envelope)", () => {
       conversation_id: "conv_abc",
       stage: "cloning",
       error: null,
-      provider: "arclet",
+      provider: "example",
     });
     expect(out).toHaveLength(1);
     const ev = out[0] as SessionSandboxStatusEvent;
@@ -1461,7 +1461,7 @@ describe("session.sandbox_status (FLAT envelope)", () => {
     expect(ev.conversationId).toBe("conv_abc");
     expect(ev.stage).toBe("cloning");
     expect(ev.error).toBeNull();
-    expect(ev.provider).toBe("arclet");
+    expect(ev.provider).toBe("example");
   });
 
   it("carries the failure reason on stage=failed", () => {
@@ -1483,13 +1483,13 @@ describe("session.sandbox_status (FLAT envelope)", () => {
       conversation_id: "conv_abc",
       stage: "action_required",
       error: null,
-      provider: "arclet",
-      details: "Refresh your dbcert on your laptop.",
+      provider: "example",
+      details: "Refresh your provider credentials.",
     });
     expect(out).toHaveLength(1);
     const ev = out[0] as SessionSandboxStatusEvent;
     expect(ev.stage).toBe("action_required");
-    expect(ev.details).toBe("Refresh your dbcert on your laptop.");
+    expect(ev.details).toBe("Refresh your provider credentials.");
   });
 
   it("drops frames with an unknown stage", () => {

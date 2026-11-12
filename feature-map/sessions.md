@@ -911,7 +911,7 @@ plain `uv run pytest`, which starts a private server for the test.
   that the composer host menu's Switch host stays disabled, at desktop and phone
   widths. It checks hover, keyboard focus, and ignored activation for Switch host.
   The Arclet session forks to connected hosts and a new Arclet:
-  `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_arclet_session_forks_onto_connected_hosts_and_a_new_arclet`.
+  `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_sandbox_session_forks_onto_connected_hosts_and_a_new_sandbox`.
   The server and transcript are real; Databricks Sandbox and Arclet metadata is
   patched at the browser boundary, and no live sandbox is provisioned. Direct form
   and reconnect guards have component coverage in `web/src/shell/ForkSessionDialog.test.tsx`,

@@ -95,7 +95,7 @@ describe("sandboxProviderOptions", () => {
 });
 
 describe("resolveServerInfo sandbox_providers", () => {
-  it.each([null, [], "invalid", { arclet: null }, { arclet: [] }, { arclet: "invalid" }])(
+  it.each([null, [], "invalid", { example: null }, { example: [] }, { example: "invalid" }])(
     "ignores malformed provider capabilities (%j)",
     async (value) => {
       expect(
@@ -108,9 +108,9 @@ describe("resolveServerInfo sandbox_providers", () => {
     "ignores a non-array repository catalog (%j)",
     async (repo_catalog) => {
       const result = await probe({
-        sandbox_provider_capabilities: { arclet: { multi_repo: true, repo_catalog } },
+        sandbox_provider_capabilities: { example: { multi_repo: true, repo_catalog } },
       });
-      expect(result.sandbox_provider_capabilities?.arclet).toEqual({
+      expect(result.sandbox_provider_capabilities?.example).toEqual({
         multi_repo: true,
         repo_catalog: [],
       });
@@ -121,7 +121,7 @@ describe("resolveServerInfo sandbox_providers", () => {
     const valid = { name: "runtime", url: "https://github.com/example/runtime" };
     const result = await probe({
       sandbox_provider_capabilities: {
-        arclet: {
+        example: {
           inference_models: true,
           default_models: true,
           repo_catalog: [
@@ -138,7 +138,7 @@ describe("resolveServerInfo sandbox_providers", () => {
         },
       },
     });
-    expect(result.sandbox_provider_capabilities?.arclet).toEqual({
+    expect(result.sandbox_provider_capabilities?.example).toEqual({
       inference_models: true,
       default_models: true,
       repo_catalog: [valid],

@@ -8688,12 +8688,12 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         conversationId: "conv_abc",
         stage: "cloning",
         error: null,
-        provider: "arclet",
+        provider: "example",
       });
       expect(useChatStore.getState().sandboxStatus).toEqual({
         stage: "cloning",
         error: null,
-        provider: "arclet",
+        provider: "example",
       });
       expect(useChatStore.getState().runnerLaunchedAt).toBeNull();
     });
@@ -18324,7 +18324,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
               pending_elicitations: [],
               pending_inputs: [],
               host_id: "host_b",
-              sandbox_status: { stage: "provisioning", error: null, provider: "arclet" },
+              sandbox_status: { stage: "provisioning", error: null, provider: "example" },
             }),
           );
         }

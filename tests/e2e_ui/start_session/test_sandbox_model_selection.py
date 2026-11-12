@@ -48,8 +48,8 @@ async def _drive_gateway(
             )
             info = json.loads(_managed_info_body())
             info.update(
-                sandbox_provider="arclet",
-                sandbox_provider_capabilities={"arclet": {"default_models": True}},
+                sandbox_provider="example",
+                sandbox_provider_capabilities={"example": {"default_models": True}},
             )
             await page.route("**/v1/info", lambda route: route.fulfill(json=info))
             await page.route("**/v1/hosts", lambda route: route.fulfill(json={"hosts": []}))
@@ -91,7 +91,7 @@ async def _drive_gateway(
             await page.goto(base_url)
             await _open_entry_models(page, "ag_codex_e2e")
             await expect(page.get_by_test_id("sandbox-model-provider")).to_have_text("AI Gateway")
-            assert requests and "/arclet/harnesses/codex-native/" in requests[-1]
+            assert requests and "/example/harnesses/codex-native/" in requests[-1]
             assert creates == []
             if unavailable:
                 await expect(
@@ -114,7 +114,7 @@ async def _drive_gateway(
             await expect(page).to_have_url(re.compile(rf"/c/{session_id}$"))
             assert len(creates) == 1
             assert creates[0]["host_type"] == "managed"
-            assert creates[0]["sandbox_provider"] == "arclet"
+            assert creates[0]["sandbox_provider"] == "example"
             assert "host_id" not in creates[0]
             assert "inference_configuration_revision" not in creates[0]
             if unavailable:
@@ -291,8 +291,8 @@ async def _drive_unsupported_harness(base_url: str, session_id: str, *, evidence
             )
             info = json.loads(_managed_info_body())
             info.update(
-                sandbox_provider="arclet",
-                sandbox_provider_capabilities={"arclet": {"default_models": True}},
+                sandbox_provider="example",
+                sandbox_provider_capabilities={"example": {"default_models": True}},
             )
             await page.route("**/v1/info", lambda route: route.fulfill(json=info))
             await page.route("**/v1/hosts", lambda route: route.fulfill(json={"hosts": []}))

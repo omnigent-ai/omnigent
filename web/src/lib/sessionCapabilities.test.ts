@@ -14,7 +14,7 @@ describe("session action restrictions", () => {
     });
   });
 
-  it.each(["arclet", "lakebox"])(
+  it.each(["example", "kubernetes"])(
     "keeps host switching restricted for the %s provider when the session has no synthetic label",
     (provider) => {
       expect(sessionActionRestrictions({ labels: {} }, { sandbox_provider: provider })).toEqual({

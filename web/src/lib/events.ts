@@ -753,7 +753,7 @@ export interface SessionSandboxStatusEvent {
   stage: SandboxLaunchStage;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error: string | null;
-  /** Sandbox provider being launched, e.g. `"arclet"`, when the server reports it. */
+  /** Sandbox provider being launched, e.g. `"kubernetes"`, when the server reports it. */
   provider?: string;
   /** What the user needs to do when `stage === "action_required"`; `null` otherwise. */
   details?: string | null;
