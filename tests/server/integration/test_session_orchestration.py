@@ -1511,12 +1511,18 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     assert "omnigent.session_family_id" not in sibling.labels
     assert [grant.user_id for grant in permissions.list_for_session(sibling_id)[0]] == ["alice"]
     assert store.list_child_conversation_ids_by_parent([source["id"]])[source["id"]] == []
+    renamed = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"title": "Parent planning"}
+    )
+    assert renamed.status_code == 200, renamed.text
     snapshot = await auth_client.get(f"/v1/sessions/{sibling_id}")
     assert snapshot.json()["family"]["id"] == source["id"]
+    assert snapshot.json()["family"]["representative_title"] == "Parent planning"
     listing = await auth_client.get(
         "/v1/sessions", params={"limit": 1, "search_query": "Private sibling"}
     )
     assert [row["id"] for row in listing.json()["data"]] == [sibling_id]
+    assert listing.json()["data"][0]["family"]["representative_title"] == "Parent planning"
     expanded = await auth_client.get(
         "/v1/sessions",
         params={"limit": 1, "search_query": "Private sibling", "expand_families": True},

@@ -7730,6 +7730,17 @@
               }
             ],
             "title": "Representative Id"
+          },
+          "representative_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Representative Title"
           }
         },
         "required": [

@@ -49,7 +49,9 @@ the header menu), and each place is a separate entry point.
   Sessions whose title matches list under **Sessions**, then sessions matching
   only in chat content under **In messages** with a snippet; each group has its
   own Show more. Archived sessions match too, marked **Archived**; the recent
-  sessions shown before typing leave them out.
+  sessions shown before typing leave them out. Results show project and parent
+  session breadcrumbs when available, including when the parent did not match
+  the search. Desktop and mobile search use the same context.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
