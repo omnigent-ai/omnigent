@@ -6445,23 +6445,27 @@ describe("Composer workflow entry point", () => {
     expect(onSendSlashCommand).not.toHaveBeenCalled();
   });
 
-  it("continues a stopped task for the Tasks tab, or says why it can't", () => {
+  it("runs or continues a task for the Tasks tab, or says why it can't", () => {
     setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
     const onSend = vi.fn();
     const error = vi.spyOn(toast, "error");
     const { rerender } = renderWithTooltips(<Composer {...composerProps({ onSend })} />);
 
-    act(() => useSessionTasksActions.getState().continueTask.conv_test?.("Run the tests"));
-    expect(onSend).toHaveBeenCalledWith('Continue the task "Run the tests".');
+    const taskAction = (action: "run" | "continue", name: string) =>
+      act(() => useSessionTasksActions.getState().taskAction.conv_test?.(action, name));
+    taskAction("continue", "Run the tests");
+    expect(onSend).toHaveBeenLastCalledWith('Continue the task "Run the tests".');
+    taskAction("run", "Ship it");
+    expect(onSend).toHaveBeenLastCalledWith('Run the task "Ship it".');
 
     rerender(
       <TooltipProvider>
         <Composer {...composerProps({ onSend, unreachable: true })} />
       </TooltipProvider>,
     );
-    act(() => useSessionTasksActions.getState().continueTask.conv_test?.("Run the tests"));
-    expect(error).toHaveBeenCalledWith("The session is offline. Reconnect it to continue.");
-    expect(onSend).toHaveBeenCalledTimes(1);
+    taskAction("run", "Ship it");
+    expect(error).toHaveBeenCalledWith("The session is offline. Reconnect it to run the task.");
+    expect(onSend).toHaveBeenCalledTimes(2);
     error.mockRestore();
   });
 

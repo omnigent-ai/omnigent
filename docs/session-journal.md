@@ -170,8 +170,8 @@ result, and how long it has run while it runs. A done or failed task shows when
 it finished, stamped the way chat messages are ("8:56 PM" today, "Nov 11,
 8:56 PM" earlier). A started task is running while the session's turn, a
 background task it left running or a sub-agent is still going, and stopped once
-nothing is. A stopped task's **⋯** menu has **Continue**, which asks the agent
-to pick it back up. It waits for you while a question or permission prompt in the chat
+nothing is. A ready task's **⋯** menu has **Run**, and a stopped task's has
+**Continue**: each sends the agent a message asking it to do that. It waits for you while a question or permission prompt in the chat
 waits for your answer. A task's history marks a restart after the task was done
 or failed. Tasks waiting for you are pink, and an idle list
 with tasks the agent could still run says "Stopped" ("Run ended" after an
