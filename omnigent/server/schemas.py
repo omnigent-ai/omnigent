@@ -2916,6 +2916,33 @@ class ClearCodexGoalResponse(BaseModel):
     cleared: bool
 
 
+def _check_managed_sandbox_target(host_id: str | None, workspaces: list[str]) -> None:
+    """
+    Validate the new sandbox a managed fork or host move asks for.
+
+    :param host_id: Requested id for the new sandbox host, or ``None``.
+    :param workspaces: Repository URLs (each optionally ``#<branch>``) to
+        clone into the sandbox; empty for an empty one.
+    :raises ValueError: On a malformed ``host_id``, or a workspace that
+        isn't a valid repository URL.
+    """
+    # Lazy import: schemas is imported by nearly every module, so
+    # pulling the (FastAPI/click-importing) managed-hosts module in
+    # at module scope would risk import cycles.
+    from omnigent.server.managed_hosts import parse_repo_workspace
+
+    if host_id is not None and not _MANAGED_HOST_ID_RE.fullmatch(host_id):
+        raise ValueError("host_type 'managed' takes a host_id of 32 lowercase hex characters")
+    for workspace in workspaces:
+        try:
+            parse_repo_workspace(workspace)
+        except ValueError as exc:
+            raise ValueError(
+                "host_type 'managed' takes a git repository URL "
+                f"(optionally '#<branch>') for each workspace: {exc}"
+            ) from exc
+
+
 class SessionForkRequest(_SandboxProfileSelection):
     """
     Request body for ``POST /v1/sessions/{source_id}/fork``.
@@ -3034,16 +3061,7 @@ class SessionForkRequest(_SandboxProfileSelection):
             conflicting or oversized workspace selections, or ``host_id`` /
             ``sandbox_provider`` / workspace(s) without ``host_type: "managed"``.
         """
-        # Lazy import: schemas is imported by nearly every module, so
-        # pulling the (FastAPI/click-importing) managed-hosts module in
-        # at module scope would risk import cycles.
-        from omnigent.server.managed_hosts import parse_repo_workspace
-
         if self.host_type == "managed":
-            if self.host_id is not None and not _MANAGED_HOST_ID_RE.fullmatch(self.host_id):
-                raise ValueError(
-                    "host_type 'managed' takes a host_id of 32 lowercase hex characters"
-                )
             if {"workspace", "workspaces"} <= self.model_fields_set:
                 raise ValueError(
                     "set either 'workspace' (one repository) or 'workspaces' "
@@ -3054,17 +3072,10 @@ class SessionForkRequest(_SandboxProfileSelection):
                     f"host_type 'managed' takes at most {_MAX_MANAGED_WORKSPACES} "
                     f"repositories in 'workspaces' (got {len(self.workspaces)})"
                 )
-            workspaces = self.workspaces or (
-                [self.workspace] if self.workspace is not None else []
+            _check_managed_sandbox_target(
+                self.host_id,
+                self.workspaces or ([self.workspace] if self.workspace is not None else []),
             )
-            for workspace in workspaces:
-                try:
-                    parse_repo_workspace(workspace)
-                except ValueError as exc:
-                    raise ValueError(
-                        "host_type 'managed' takes a git repository URL "
-                        f"(optionally '#<branch>') for each workspace: {exc}"
-                    ) from exc
             return self
         if self.host_id is not None:
             raise ValueError(
@@ -3086,6 +3097,47 @@ class SessionForkRequest(_SandboxProfileSelection):
                 "workspaces only applies to host_type 'managed' — an external "
                 "fork picks its directory when it binds a host"
             )
+        return self
+
+
+class SessionManagedHostRequest(BaseModel):
+    """
+    Request body for ``POST /v1/sessions/{session_id}/managed-host``.
+
+    Moves an existing session onto a new server-provisioned sandbox — the
+    sandbox counterpart of ``POST /v1/hosts/{host_id}/runners``, which
+    binds a connected host. The fields mean what they do on a managed fork.
+
+    :param sandbox_provider: Which configured sandbox provider to
+        provision (one of the server's ``sandbox_providers``); ``None``
+        takes the server's first.
+    :param host_id: Id for the new sandbox host, 32 lowercase hex
+        characters, sent only when ``GET /v1/info`` reports
+        ``request_managed_sandbox_host_id``; ``None`` lets the server
+        mint one.
+    :param workspace: Git repository URL (optionally ``#<branch>``) cloned
+        into the sandbox as the session's working directory, e.g.
+        ``"https://github.com/org/repo#main"``; ``None`` gives the session
+        an empty sandbox.
+    """
+
+    sandbox_provider: str | None = None
+    host_id: str | None = None
+    workspace: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def _check_sandbox_target(self) -> Self:
+        """
+        Reject a malformed host id or a non-repository workspace with a 422.
+
+        :returns: The validated instance.
+        :raises ValueError: See :func:`_check_managed_sandbox_target`.
+        """
+        _check_managed_sandbox_target(
+            self.host_id, [self.workspace] if self.workspace is not None else []
+        )
         return self
 
 

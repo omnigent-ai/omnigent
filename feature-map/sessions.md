@@ -138,6 +138,15 @@ the header menu), and each place is a separate entry point.
 - `unsupported-sandbox-actions`: Databricks Sandbox and Arclet host-switch
   controls stay visible but disabled, with hover and keyboard explanations.
   Their forms cannot submit. Fork is not restricted for these sessions.
+- `switch-host-sandbox`: on a server that offers managed sandboxes, Switch host
+  on a session running on a connected machine also lists a new sandbox per
+  provider. Picking one asks for an optional repository and branch, then moves
+  the session there with the same launch progress a new sandbox session shows.
+  A refused launch keeps the dialog open, with the old host offered again. The
+  reconnect dialog's Switch host opens the same picker, so a session whose
+  machine is offline can recover onto a new sandbox too. Only providers whose
+  `/v1/info` capabilities report `accepts_session_move` are offered (not those
+  that manage sandbox profiles), and none once the session has no host.
 
 - `clone`: copy a session into a new workspace, including a typed `~` path.
   Participating sandbox providers require a [profile selection](sandbox-profiles.md)
@@ -327,7 +336,10 @@ that deleting stops them, then asks again with Delete anyway.
 then click Show more under its rows. Opening one of its older sessions from
 the ⌘K / Ctrl+K palette or a link also lists down to that session, once the
 sidebar has loaded it. To change the count or list every session instead,
-use Settings → Appearance → Sidebar.
+use Settings → Appearance → Sidebar. Opening a session never opens its folder:
+a collapsed folder holding the open, unpinned session lists just that row under
+its header until you open another session. Moving a session into a project
+still opens that folder.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -572,6 +584,14 @@ If the reconnect dialog is already on Clone when an unsupported result arrives,
 it selects Reconnect and explains the restriction.
 An open switch dialog closes when switching becomes unavailable and stays closed
 if support returns; choose Switch host again to reopen it.
+
+**Move to a new sandbox:** on a session running on one of your machines, open the
+composer's host menu and choose **Switch host…**. With managed sandboxes
+configured, the host picker lists a new sandbox per provider above your
+machines, and preselects one when no other machine is online. Enter an optional
+repository URL and branch and choose **Switch host**; the session shows the
+sandbox's launch progress and continues there. A message sent while it
+provisions waits for the sandbox.
 
 **Stop session:** open the parent's sidebar row menu or right-click the row and
 choose Stop session while a side chat or sub-agent is working. On mobile, open
@@ -919,6 +939,25 @@ plain `uv run pytest`, which starts a private server for the test.
   Supported host-switch UI coverage:
   `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_switches_the_session_to_another_host`
   checks the release/launch requests with stubbed host APIs.
+- **`switch-host-sandbox` (server integration, plain `uv run pytest`):**
+  `tests/server/integration/test_host_session_binding.py::test_session_moves_from_its_host_onto_a_new_managed_sandbox`
+  moves a session from a connected host onto a fake-launched sandbox host that
+  registers over the real tunnel;
+  `test_message_sent_while_a_moved_session_provisions_waits_for_the_sandbox`,
+  `test_concurrent_sandbox_moves_launch_one_sandbox`,
+  `test_runner_bound_during_a_sandbox_move_keeps_the_session`,
+  `test_refused_sandbox_move_restores_the_session_binding`,
+  `test_sandbox_move_failing_partway_restores_the_session_binding`, and
+  `test_sandbox_move_refuses_without_touching_the_session` in the same file cover
+  the held message, racing moves and runner binds, refused or interrupted moves,
+  and the guards;
+  `tests/server/integration/test_sessions_permissions.py::test_move_to_managed_sandbox_requires_owner_access`
+  covers the owner-only gate. The dialog's sandbox rows (hidden on servers without
+  `move_to_managed_sandbox`), repository validation, and refused-launch
+  recovery have component coverage in `web/src/shell/SwitchHostDialog.test.tsx`;
+  routing the move by the new sandbox's host id is covered in
+  `web/src/lib/identity.test.ts`. No browser test drives the dialog into a live
+  sandbox launch.
 - **`reconnect`, spinner (own environment):**
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
   seeds an error item directly into the spawned server's database.
@@ -1279,8 +1318,8 @@ its discoverability.
   cannot create siblings. Shared viewers see flat rows.
 - Families are bounded to 100 retained members, including archived members.
   Use the row chevron to **Collapse session family** or **Expand session family**.
-- Nested creation and same-sandbox fork selection require the default-off
-  `OMNIGENT_FEATURES=sibling_sessions` flag. Reload the UI after enabling it.
+- Nested creation and same-sandbox fork selection are enabled by default.
+  Set `OMNIGENT_FEATURES=-sibling_sessions` to disable them and reload the UI.
   Opening a saved **Add nested agent** link while disabled or on an older server
   shows an unavailable message instead of a composer that cannot submit.
 - If the source disappears after a rejected create, **Continue in a new session**
