@@ -35,3 +35,26 @@ def is_required_mcp_startup_timeout(error: CodexAppServerResponseError) -> bool:
         )
         is not None
     )
+
+
+def input_too_large_limits(error: CodexAppServerResponseError) -> tuple[int, int] | None:
+    """Read the sizes when Codex refused turn input as too large to accept.
+
+    Codex validates ``turn/start`` and ``turn/steer`` input before submitting
+    it, answering ``-32602`` with ``data.input_error_code == "input_too_large"``,
+    so nothing reached the thread.
+
+    :param error: Structured JSON-RPC response error.
+    :returns: ``(actual_chars, max_chars)`` for that refusal, ``(0, 0)`` when it
+        omits the sizes, or ``None`` for any other error.
+    """
+    if error.code != -32602:
+        return None
+    data = error.error.get("data") if isinstance(error.error, dict) else None
+    if not isinstance(data, dict) or data.get("input_error_code") != "input_too_large":
+        return None
+    actual = data.get("actual_chars")
+    limit = data.get("max_chars")
+    if isinstance(actual, int) and isinstance(limit, int):
+        return actual, limit
+    return 0, 0

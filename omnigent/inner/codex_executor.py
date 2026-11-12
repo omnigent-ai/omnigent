@@ -87,7 +87,11 @@ from ._subprocess_lifecycle import (
 from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .codex_goal_command import goal_objective_length_error as _goal_objective_length_error
-from .codex_rpc_errors import CodexAppServerResponseError, is_required_mcp_startup_timeout
+from .codex_rpc_errors import (
+    CodexAppServerResponseError,
+    input_too_large_limits,
+    is_required_mcp_startup_timeout,
+)
 from .codex_staging import (
     CODEX_HOME_PREFIX,
     CODEX_SKILLS_PREFIX,
@@ -2635,6 +2639,8 @@ def _extract_latest_user_content(
 
 def _build_initial_prompt(
     messages: list[Message],
+    *,
+    omitted_messages: int = 0,
 ) -> str | list[CodexParams]:
     """
     Build the initial prompt for a fresh Codex thread.
@@ -2643,11 +2649,19 @@ def _build_initial_prompt(
     content blocks. Text-only history retains its plain-string format.
 
     :param messages: Conversation history.
+    :param omitted_messages: Earlier messages excluded by the replay limit.
     :returns: A string prompt or a list of content block dicts.
     """
     user_messages = [msg for msg in messages if msg.get("role") == "user"]
-    if len(messages) <= 1 or len(user_messages) <= 1:
+    if not omitted_messages and (len(messages) <= 1 or len(user_messages) <= 1):
         return _extract_latest_user_content(messages)
+
+    opening = "Conversation so far:"
+    if omitted_messages:
+        opening = (
+            f"[Earlier conversation omitted to fit Codex input limit: {omitted_messages} "
+            "messages. Do not assume the missing context.]\n" + opening
+        )
 
     has_attachments = any(
         isinstance(msg.get("content"), list)
@@ -2658,7 +2672,7 @@ def _build_initial_prompt(
         for msg in messages
     )
     if has_attachments:
-        blocks: list[CodexParams] = [{"type": "input_text", "text": "Conversation so far:"}]
+        blocks: list[CodexParams] = [{"type": "input_text", "text": opening}]
         for msg in messages:
             role = str(msg.get("role", "user")).replace("_", " ")
             blocks.append({"type": "input_text", "text": f"{role}:"})
@@ -2695,7 +2709,7 @@ def _build_initial_prompt(
         )
         return blocks
 
-    lines = ["Conversation so far:"]
+    lines = [opening]
     for msg in messages:
         role = str(msg.get("role", "user")).replace("_", " ")
         raw_content = msg.get("content")
@@ -2728,6 +2742,35 @@ def _prompt_for_turn(messages: list[Message], *, is_new_thread: bool) -> str | l
     if is_new_thread:
         return _build_initial_prompt(messages)
     return _extract_latest_user_content(messages)
+
+
+def _bounded_replay_input(messages: list[Message], max_chars: int) -> list[CodexParams] | None:
+    """Fit recent whole exchanges without changing the current input or stored history."""
+    exchange_starts = [
+        index
+        for index, message in enumerate(messages)
+        if index > 0 and message.get("role") == "user"
+    ]
+    if not exchange_starts:
+        return None
+
+    def candidate(start: int) -> list[CodexParams]:
+        prompt = _build_initial_prompt(messages[start:], omitted_messages=start)
+        if isinstance(prompt, list):
+            return _to_codex_input_items(prompt)
+        return [{"type": "text", "text": prompt}]
+
+    left, right = 0, len(exchange_starts)
+    fitting_input = None
+    while left < right:
+        middle = (left + right) // 2
+        items = candidate(exchange_starts[middle])
+        if sum(len(item.get("text", "")) for item in items) <= max_chars:
+            fitting_input = items
+            right = middle
+        else:
+            left = middle + 1
+    return fitting_input
 
 
 def _to_codex_input_items(
@@ -4134,10 +4177,31 @@ class _CodexAppServerSession:
         if effort_via_turn_start:
             turn_params["effort"] = effort
             turn_params["summary"] = "detailed"
-        start_response = await self._request(
-            "turn/start",
-            turn_params,
-        )
+        try:
+            start_response = await self._request("turn/start", turn_params)
+        except CodexAppServerResponseError as error:
+            limits = input_too_large_limits(error)
+            if (
+                not is_new_thread
+                or self._native_progress_observed
+                or self._retry_policy.max_retries == 0
+                or limits is None
+            ):
+                raise
+            actual_chars, limit = limits
+            if (
+                type(limit) is not int
+                or type(actual_chars) is not int
+                or not 0 < limit < actual_chars
+            ):
+                raise
+            bounded_input = _bounded_replay_input(prompt_messages, limit)
+            if bounded_input is None:
+                raise
+            logger.info("Retrying rejected Codex cold replay within its %d-character limit", limit)
+            start_response = await self._request(
+                "turn/start", {**turn_params, "input": bounded_input}
+            )
         if effort_via_turn_start:
             self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
