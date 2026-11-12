@@ -23,6 +23,7 @@ from omnigent.server.routes._auth_helpers import (
     require_access,
 )
 from omnigent.server.routes._errors import session_not_found
+from omnigent.server.scheduled import session_triggers
 from omnigent.stores import ConversationStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.permission_store import PermissionStore
@@ -238,6 +239,9 @@ def create_comments_router(
             # author-only server gate (``_require_comment_author``) and the
             # client's Edit/Delete affordances key off ``created_by is None``.
             created_by=attribution_user(user_id),
+        )
+        session_triggers.notify(
+            "comment.created", session_id, occurrence=comment.id, comment_id=comment.id
         )
         return asdict(comment)
 

@@ -144,7 +144,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     const nextRunByTaskId = new Map(
       matches
         .filter((t) => t.state === "active")
-        .map((t) => [t.id, nextRunAtMs(t.rrule, t.timezone)]),
+        .map((t) => [t.id, t.rrule !== null ? nextRunAtMs(t.rrule, t.timezone) : null]),
     );
     // Sort: ACTIVE first (soonest next-run at the top), PAUSED last. The
     // least-actionable (paused) rows sink to the bottom rather than leading the

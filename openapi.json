@@ -2060,8 +2060,15 @@
             "title": "Reasoning Effort"
           },
           "rrule": {
-            "title": "Rrule",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rrule"
           },
           "session_id": {
             "anyOf": [
@@ -2101,6 +2108,18 @@
             "title": "Timezone",
             "type": "string"
           },
+          "trigger_config": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Config"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -2117,7 +2136,6 @@
         "required": [
           "name",
           "prompt",
-          "rrule",
           "agent_id"
         ],
         "title": "CreateScheduledTaskRequest",
@@ -6660,6 +6678,11 @@
           "scheduled_task_session_modes": {
             "default": true,
             "title": "Scheduled Task Session Modes",
+            "type": "boolean"
+          },
+          "scheduled_task_session_triggers": {
+            "default": false,
+            "title": "Scheduled Task Session Triggers",
             "type": "boolean"
           },
           "scheduled_task_source_sessions": {
@@ -12905,6 +12928,18 @@
             ],
             "title": "Timezone"
           },
+          "trigger_config": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Config"
+          },
           "workspace": {
             "anyOf": [
               {
@@ -16758,6 +16793,20 @@
       "get": {
         "description": "List the caller's scheduled tasks.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
         "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
+        "parameters": [
+          {
+            "description": "Include event-triggered automations, which have no rrule.",
+            "in": "query",
+            "name": "event_triggers",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Include event-triggered automations, which have no rrule.",
+              "title": "Event Triggers",
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -16776,6 +16825,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Scheduled Tasks",
@@ -16858,6 +16917,18 @@
                 }
               ],
               "title": "After"
+            }
+          },
+          {
+            "description": "Include event-triggered automations, which have no rrule.",
+            "in": "query",
+            "name": "event_triggers",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Include event-triggered automations, which have no rrule.",
+              "title": "Event Triggers",
+              "type": "boolean"
             }
           }
         ],
@@ -16944,6 +17015,18 @@
             "schema": {
               "title": "Scheduled Task Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "Include event-triggered automations, which have no rrule.",
+            "in": "query",
+            "name": "event_triggers",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Include event-triggered automations, which have no rrule.",
+              "title": "Event Triggers",
+              "type": "boolean"
             }
           }
         ],

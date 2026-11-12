@@ -50,6 +50,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.harness_aliases import is_native_harness
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_CLI_UNRESPONSIVE,
@@ -380,6 +381,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
+from omnigent.server.scheduled import session_triggers
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ChildSessionSummary,
@@ -7181,6 +7183,41 @@ def _opens_codex_side_chat(harness: str | None, body: SessionEventInput) -> bool
     )
 
 
+async def _report_runner_turn_completed(
+    session_id: str, response: object, conversation_store: ConversationStore
+) -> None:
+    """Report a finished turn of a harness the runner drives to session triggers.
+
+    A native harness's ``response.completed`` only acknowledges that the prompt
+    reached its terminal; its forwarder's ``external_session_status`` reports the
+    turn's end instead.
+
+    :param session_id: Session whose turn completed, e.g. ``"conv_abc"``.
+    :param response: The event's ``response`` object, whose ``id`` keys the occurrence.
+    :param conversation_store: Store read for the session's harness.
+    """
+    if not session_triggers.enabled():
+        return
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or is_native_harness(await asyncio.to_thread(_native_pane_harness, conv)):
+            return
+    except Exception:  # noqa: BLE001 — a read error must not kill the relay
+        # An automation hearing of the turn is optional; the relay must keep streaming.
+        _logger.warning(
+            "Could not report a finished turn of session=%s to session triggers",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    raw_id = response.get("id") if isinstance(response, dict) else None
+    response_id = raw_id if isinstance(raw_id, str) and raw_id else None
+    session_triggers.notify(
+        "turn.completed", session_id, occurrence=response_id, response_id=response_id
+    )
+
+
 def _native_pane_harness(
     conv: Conversation,
     *,
@@ -10037,6 +10074,9 @@ async def _relay_runner_stream_once(
                                 conversation_store,
                             )
                     if evt_type == "response.completed":
+                        await _report_runner_turn_completed(
+                            session_id, event.get("response"), conversation_store
+                        )
                         # Persist the turn's usage (cost + token buckets) so
                         # policy callables can read
                         # event["context"]["usage"]["total_cost_usd"] and the
@@ -10985,7 +11025,12 @@ def configure_subagent_block_notifier(
         wake_dispatch=_wake_dispatch,
         loop=loop,
     )
-    _pending_elicitations.set_elicitation_observer(notifier.observe)
+
+    def _observe(conversation_id: str, event: dict[str, Any]) -> None:
+        notifier.observe(conversation_id, event)
+        session_triggers.observe_elicitation(conversation_id, event)
+
+    _pending_elicitations.set_elicitation_observer(_observe)
 
     def _uninstall() -> None:
         """Remove the observer and cancel any outstanding wake futures."""

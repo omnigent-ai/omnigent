@@ -40,8 +40,11 @@ export interface ScheduledTask {
   id: string;
   name: string;
   prompt: string;
-  /** RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`. */
-  rrule: string;
+  /**
+   * RFC-5545 recurrence rule, e.g. `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0`,
+   * or `null` for an automation that runs on events instead of a schedule.
+   */
+  rrule: string | null;
   /** Owning user, or `null` in single-user / auth-disabled deployments. */
   ownerUserId: string | null;
   agentId: string;
@@ -152,7 +155,8 @@ export interface CreateScheduledTaskInput {
   templateId?: AutomationTemplateId;
   name: string;
   prompt: string;
-  rrule: string;
+  /** The schedule; required unless the server accepts an event trigger instead. */
+  rrule?: string;
   agentId: string;
   timezone?: string;
   modelOverride?: string | null;
@@ -226,7 +230,7 @@ interface ScheduledTaskWire {
   id: string;
   name: string;
   prompt: string;
-  rrule: string;
+  rrule: string | null;
   owner_user_id: string | null;
   agent_id: string;
   timezone: string;
@@ -360,14 +364,17 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
 
 /** List the caller's scheduled tasks (owner-scoped server-side). */
 export async function listScheduledTasks(): Promise<ScheduledTask[]> {
-  const res = await authenticatedFetch("/v1/scheduled-tasks");
+  // Ask for event-triggered tasks too; older clients don't see them.
+  const res = await authenticatedFetch("/v1/scheduled-tasks?event_triggers=1");
   const body = await readJsonOrThrow<{ scheduled_tasks: ScheduledTaskWire[] }>(res);
   return (body.scheduled_tasks ?? []).map(taskFromWire);
 }
 
 /** Fetch one of the caller's scheduled tasks (404 if not owned). */
 export async function getScheduledTask(id: string): Promise<ScheduledTask> {
-  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`);
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(id)}?event_triggers=1`,
+  );
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
 }
 
@@ -522,6 +529,8 @@ const AUTOMATION_INBOX_PAGE_SIZE = 50;
 export async function listAutomationFailures(after: string | null): Promise<AutomationFailurePage> {
   const params = new URLSearchParams({ limit: String(AUTOMATION_INBOX_PAGE_SIZE) });
   if (after !== null) params.set("after", after);
+  // Include event-triggered automations; older clients don't see them.
+  params.set("event_triggers", "1");
   const response = await authenticatedFetch(`/v1/scheduled-tasks/inbox?${params}`);
   const page = await readJsonOrThrow<{
     data: AutomationFailureWire[];

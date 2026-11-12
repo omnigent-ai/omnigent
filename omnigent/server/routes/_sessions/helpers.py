@@ -267,6 +267,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     set_server_runner_router,
     user_session_stream,
 )
+from omnigent.server.scheduled import session_triggers
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ChildSessionSummary,
@@ -2619,6 +2620,7 @@ async def _persist_external_session_title(
         session_id,
         title=title,
     )
+    session_triggers.notify("session.renamed", session_id)
     event = SessionTitleEvent(
         type="session.title",
         conversation_id=session_id,
@@ -5126,6 +5128,7 @@ def _publish_status(
     disconnect_evidence: Mapping[str, str] | None = None,
     turn_completed: bool = False,
     background_agents: list[BackgroundTaskInfo] | None = None,
+    reports_turn_end: bool = False,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -5169,6 +5172,10 @@ def _publish_status(
     :param background_agents: Background agents a finished claude-native turn
         left running, on its ``"waiting"`` edge. Kept for snapshots until the
         next non-``waiting`` edge; ignored on every other status.
+    :param reports_turn_end: Whether an ``"idle"`` edge is the caller's proof that
+        a turn finished, which session triggers report as ``turn.completed``. Idle
+        also marks transcript lulls, PTY quiet, stops and undelivered input, so
+        only a caller holding a terminal signal sets it.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -5210,6 +5217,35 @@ def _publish_status(
         # A turn can open or merge a PR while nobody watches; refresh what the server
         # stores. Stops and archives publish idle without persisting it, and skip this.
         session_pull_requests.notify_turn_end(session_id)
+    if (
+        status == "idle"
+        and reports_turn_end
+        and persist_live_status
+        and (
+            previous_status in ("running", "waiting")
+            # A reported end counts when its running edge was never seen (a short
+            # turn, or a forwarder's end after the relay's PTY idle): its response
+            # ID keys it, so a replay records nothing new.
+            or response_id is not None
+            # A confirmed completion also clears a previous turn's late failure.
+            or (turn_completed and previous_status == "failed")
+        )
+    ):
+        # Native harnesses settle turns only through these edges, never response events.
+        turn_id = response_id or _session_active_response_cache.get(session_id)
+        session_triggers.notify(
+            "turn.completed", session_id, occurrence=turn_id, response_id=turn_id
+        )
+    elif status == "failed" and previous_status != "failed" and persist_live_status:
+        # A failure without a response may belong to an earlier turn, so it gets an
+        # identity of its own rather than the active response's.
+        session_triggers.notify(
+            "turn.failed",
+            session_id,
+            occurrence=response_id,
+            response_id=response_id,
+            error_code=error.code if error is not None else None,
+        )
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.

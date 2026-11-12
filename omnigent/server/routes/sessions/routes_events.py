@@ -296,6 +296,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _wait_for_host_reconnect,
     ensure_runner_connected,
 )
+from omnigent.server.scheduled import session_triggers
 from omnigent.server.scheduled.telemetry import start_fire_stage
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
@@ -2697,6 +2698,25 @@ def register_events_routes(
             # A confirmed turn completion after a failure means a later turn
             # succeeded, so the earlier failure must not outlive it.
             turn_completed = status == "idle" and data.get("turn_completed") is True
+            harness: str | None = None
+            harness_resolved = False
+            reports_turn_end = False
+            if status == "idle" and session_triggers.enabled():
+                harness = await asyncio.to_thread(
+                    _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+                )
+                harness_resolved = True
+                # The same rule as a sub-agent's return: a Claude idle without its
+                # Stop hook is an activity observation, not the end of the turn.
+                reports_turn_end = (
+                    native_subagent_terminal_status(
+                        status,
+                        harness=harness,
+                        turn_outcome=data.get("turn_outcome"),
+                        turn_completed=data.get("turn_completed"),
+                    )
+                    == "completed"
+                )
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
             )
@@ -2718,6 +2738,7 @@ def register_events_routes(
                 status,
                 status_error,
                 turn_completed=turn_completed,
+                reports_turn_end=reports_turn_end,
                 failure_origin="external_session_status",
                 failure_intake=failure_intake,
                 failure_context=data.get("failure_context"),
@@ -2731,12 +2752,13 @@ def register_events_routes(
                 and status in {"idle", "failed"}
                 and conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
             ):
-                harness = await asyncio.to_thread(
-                    _native_pane_harness,
-                    conv,
-                    agent_store=agent_store,
-                    agent_cache=agent_cache,
-                )
+                if not harness_resolved:
+                    harness = await asyncio.to_thread(
+                        _native_pane_harness,
+                        conv,
+                        agent_store=agent_store,
+                        agent_cache=agent_cache,
+                    )
                 outcome = native_subagent_terminal_status(
                     status,
                     harness=harness,
@@ -4244,9 +4266,33 @@ def register_events_routes(
                 )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
+        # Grants go with the session, so read who could see it first. A failed
+        # read must not stop the deletion; it only means no automation hears of it.
+        readers: frozenset[str] | None = None
+        reported = session_triggers.enabled()
+        if reported:
+            try:
+                readers = await asyncio.to_thread(
+                    session_triggers.readers_of, conv, "session.deleted"
+                )
+            except Exception:
+                _logger.warning(
+                    "Could not read who may hear that session %s was deleted",
+                    session_id,
+                    exc_info=True,
+                )
+                reported = False
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()
+        if reported:
+            session_triggers.notify(
+                "session.deleted",
+                session_id,
+                occurrence="deleted",
+                conversation=conv,
+                readers=readers,
+            )
         # A relay still inside an offline runner's reconnect grace must not
         # fail the deleted turns when that grace expires.
         _cancel_runner_relays([session_id, *descendant_ids])

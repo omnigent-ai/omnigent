@@ -21,6 +21,7 @@ from omnigent.runner.background_titles.service import (
     FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION,
     LEGACY_BACKGROUND_TITLE_INSTRUCTIONS_MAX_CHARS,
 )
+from omnigent.server.scheduled import session_triggers
 from omnigent.stores.conversation_store import ConversationStore
 
 if TYPE_CHECKING:
@@ -410,6 +411,10 @@ class BackgroundSessionTitleCoordinator:
                 expected_seed_title,
                 title,
             )
+            if updated is not None:
+                session_triggers.notify(
+                    "session.renamed", request.session_id, conversation=updated
+                )
             _logger.info(
                 "background session title completed session=%s renamed=%s elapsed_ms=%.1f",
                 request.session_id,

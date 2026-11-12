@@ -19,6 +19,7 @@ comments, and schema on "scheduled task"; only presentation strings say
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -42,15 +43,16 @@ class ScheduledTask:
     """
     A scheduled task persisted in the ``scheduled_tasks`` table.
 
-    A task's trigger is a required recurring ``rrule``.
+    A task runs on a recurring ``rrule``, or on events when it has a
+    ``trigger_config``.
 
     :param id: UUID primary key (bare 32-char hex string, no dashes).
     :param workspace_id: Tenant partition key that owns this row.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
-    :param rrule: The required RFC 5545 recurrence rule for the recurring
-        trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``. Evaluated in
-        ``timezone``.
+    :param rrule: The RFC 5545 recurrence rule for the recurring trigger,
+        e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``, evaluated in ``timezone``.
+        ``None`` for an event-triggered task.
     :param user_id: User the spawned session's ``LEVEL_OWNER`` grant is
         written for, e.g. ``"alice@example.com"``. ``None`` in single-user mode.
     :param agent_id: The agent bound to this task, e.g. ``"ag_..."``.
@@ -94,12 +96,15 @@ class ScheduledTask:
         firing, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
+    :param trigger_config: The event trigger, e.g. ``{"provider": "omnigent",
+        "events": ["turn.completed"]}``, or ``None`` for a scheduled task. Each
+        provider validates its own shape.
     """
 
     id: str
     name: str
     prompt: str
-    rrule: str
+    rrule: str | None
     user_id: str | None
     agent_id: str
     timezone: str
@@ -124,6 +129,7 @@ class ScheduledTask:
     next_run_at: int | None = None
     project_id: str | None = None
     delegation_ref: str | None = None
+    trigger_config: dict[str, Any] | None = None
 
     @property
     def continues_session(self) -> bool:
@@ -154,6 +160,9 @@ class ScheduledTaskRun:
     :param error_code: Short failure classification (e.g. ``"timeout"``,
         ``"rate_limited"``) for future retry logic; ``None`` unless
         ``status == "failed"``.
+    :param event: What an event-triggered run was recorded for, e.g.
+        ``{"events": [{"type": "turn.completed", "session_id": "..."}]}``, or
+        ``None`` for scheduled and Run now runs.
     """
 
     id: str
@@ -169,3 +178,4 @@ class ScheduledTaskRun:
     trigger_key: str | None = None
     host_id: str | None = None
     lease_expires_at: int | None = None
+    event: dict[str, Any] | None = None

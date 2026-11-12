@@ -1589,8 +1589,22 @@ class SqlScheduledTask(OmnigentBase):
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     # Opaque free text, never SQL-queried — stored compressed (CompressedText).
     prompt: Mapped[str] = mapped_column(CompressedText, nullable=False)
-    # RFC 5545 recurrence rule, e.g. "FREQ=DAILY;BYHOUR=9;BYMINUTE=0".
-    rrule: Mapped[str] = mapped_column(String(512), nullable=False)
+    # RFC 5545 recurrence rule, e.g. "FREQ=DAILY;BYHOUR=9;BYMINUTE=0". NULL marks a
+    # task that runs on events (``trigger_config``) instead of a schedule.
+    rrule: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # JSON naming an event trigger's provider and its condition, shared by every
+    # provider, e.g. {"provider": "omnigent", "events": ["turn.completed"]}.
+    # NULL for a scheduled task. Read and written whole, never filtered in SQL.
+    trigger_config: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=16_383, mysql_varbinary=True), nullable=True
+    )
+    # The provider named in trigger_config, e.g. "omnigent", or NULL for a scheduled
+    # task: the scalar SQL filters event-triggered tasks on.
+    trigger_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # The event run a task that continues one session adds new events to while it
+    # waits for a claim (relates to scheduled_task_runs.id; no DB foreign key, Rule
+    # R032). Stale once that run is claimed; NULL until the task's first event run.
+    pending_event_run_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     # Session-owner identity: the spawned run's LEVEL_OWNER grant is written
     # for this user. Nullable — None in single-user/OSS mode (the fire path
     # resolves null to the reserved "local" user). String(128) to match
@@ -1655,6 +1669,21 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         CheckConstraint("session_mode IN (1, 2)", name="ck_scheduled_tasks_session_mode"),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
+        # A workspace's active tasks for one trigger provider, and scheduled tasks
+        # (no provider) that still need a next run time, by equality seeks.
+        Index(
+            "ix_scheduled_tasks_trigger",
+            "state",
+            "trigger_provider",
+            "next_run_at",
+            "workspace_id",
+            "id",
+        ),
+        # SQLite ignores VARCHAR lengths: 32 characters at up to four bytes each.
+        CheckConstraint(
+            "trigger_provider IS NULL OR length(CAST(trigger_provider AS BLOB)) <= 128",
+            name="ck_scheduled_tasks_trigger_provider_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
         # Covers a user's task listing ordered by creation time.
         Index(
             "ix_scheduled_tasks_user_scope",
@@ -1735,6 +1764,12 @@ class SqlScheduledTaskRun(OmnigentBase):
     # "rate_limited") for future retry logic. Bounded plain string, not a blob;
     # no CHECK constraint (no code taxonomy defined yet).
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # JSON describing the event(s) an event-triggered run was recorded for,
+    # e.g. {"events": [{"type": "turn.completed", "session_id": "..."}]}. NULL for
+    # scheduled and Run now runs. Read and written whole, never filtered in SQL.
+    event: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=16_383, mysql_varbinary=True), nullable=True
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -1778,6 +1813,68 @@ class SqlScheduledTaskRun(OmnigentBase):
             "workspace_id",
             "conversation_id",
             "status",
+            "id",
+        ),
+    )
+
+
+class SqlScheduledTaskEventReceipt(OmnigentBase):
+    """
+    SQLAlchemy model for the ``scheduled_task_event_receipts`` table.
+
+    One row per provider event occurrence an event-triggered task accepted, so a
+    repeated delivery records nothing, including an occurrence that joined another
+    occurrence's pending run rather than getting a run of its own.
+
+    :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`).
+    :param scheduled_task_id: The task that accepted the occurrence (relates to
+        ``scheduled_tasks.id``; no DB foreign key, Rule R032).
+    :param trigger_key: The occurrence key, e.g.
+        ``"event:omnigent:<session>:turn.completed:<response>"``. Unique per task.
+    :param run_id: The run the occurrence was recorded in or joined (relates to
+        ``scheduled_task_runs.id``).
+    :param created_at: Unix epoch seconds the occurrence was accepted; old
+        receipts are removed in bounded batches.
+    """
+
+    __tablename__ = "scheduled_task_event_receipts"
+
+    # Tenant partition key: Databricks workspace id owning this row. Part of the PK.
+    # A new table, so writers always supply it and the database has no default.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    scheduled_task_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    trigger_key: Mapped[str] = mapped_column(
+        String(256).with_variant(
+            MySQLVarchar(256, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
+        ),
+        nullable=False,
+    )
+    run_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "scheduled_task_id",
+            "trigger_key",
+            name="uq_scheduled_task_event_receipts_occurrence",
+        ),
+        # SQLite ignores VARCHAR lengths: 256 characters at up to four bytes each.
+        CheckConstraint(
+            "length(CAST(trigger_key AS BLOB)) <= 1024",
+            name="ck_scheduled_task_event_receipts_key_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        Index(
+            "ix_scheduled_task_event_receipts_age",
+            "workspace_id",
+            "scheduled_task_id",
+            "created_at",
             "id",
         ),
     )

@@ -62,6 +62,7 @@ import { formatSessionCostUsd } from "@/lib/formatCost";
 import {
   describeRunFailure,
   describeSchedule,
+  EVENT_TRIGGER_SUMMARY,
   formatNextRunAt,
   formatRunDuration,
   formatRunTimestamp,
@@ -296,7 +297,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
     !task.permissionMode || (permissionOption?.value === "default" && harness !== "claude-native")
       ? "Agent default"
       : (permissionOption?.label ?? task.permissionMode);
-  const scheduleSummary = describeSchedule(task.rrule);
+  const scheduleSummary =
+    task.rrule !== null ? describeSchedule(task.rrule) : EVENT_TRIGGER_SUMMARY;
   const nextRun = formatNextRunAt(task.nextRunAt, now);
   // A single per-task busy flag: the header actions disable while any of this
   // task's mutations are in flight.

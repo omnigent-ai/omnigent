@@ -152,7 +152,7 @@ from omnigent.server.runner_session_init import (
     is_session_agent_removed,
     runner_response_error_body,
 )
-from omnigent.server.scheduled import ScheduledTaskScheduler
+from omnigent.server.scheduled import ScheduledTaskScheduler, session_triggers
 from omnigent.server.scheduled.config import ScheduledTaskSchedulerConfig
 from omnigent.server.scheduled.dispatch_scheduler import (
     PersistentTaskScheduler,
@@ -347,6 +347,9 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_projects: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
+    # Scheduled tasks accept an ``omnigent`` ``trigger_config`` that runs them on
+    # session events (the ``session_triggers`` feature); older servers reject it.
+    scheduled_task_session_triggers: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
@@ -1855,6 +1858,11 @@ def create_app(
         else mcp_disabled_servers
     )
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
+    # Only the database scheduler claims event runs, and an older server would pause
+    # an event-triggered task, so operators turn this on once every server has it.
+    session_triggers_enabled = automations_v2_enabled and resolved_feature_flags.enabled(
+        Feature.SESSION_TRIGGERS
+    )
     if automations_v2_enabled:
         if scheduled_task_store is None:
             raise ValueError(
@@ -2139,11 +2147,17 @@ def create_app(
         # The release flag selects one scheduler for the lifetime of this server.
         scheduler_start_retry: asyncio.Task[None] | None = None
         scheduled_task_scheduler: ScheduledTaskScheduler | PersistentTaskScheduler | None = None
+        session_triggers.configure(
+            scheduled_task_store if session_triggers_enabled else None,
+            conversation_store,
+            permission_store,
+        )
         if scheduled_task_store is not None:
             from omnigent.server.scheduled.fire import (
                 ClaimedRunExecutor,
                 FireDeps,
                 build_busy_until,
+                build_event_session_busy,
                 build_on_fire,
                 build_run_now,
             )
@@ -2195,6 +2209,11 @@ def create_app(
                     # Skipping assumes the built-in executor's continued-session delivery.
                     busy_until=(
                         build_busy_until(fire_deps) if dispatch_hooks.on_fire is None else None
+                    ),
+                    event_session_busy=(
+                        build_event_session_busy(fire_deps)
+                        if dispatch_hooks.on_fire is None
+                        else None
                     ),
                     poll_seconds=dispatch_config.poll_seconds,
                     renewal_seconds=dispatch_config.renewal_seconds,
@@ -2279,6 +2298,8 @@ def create_app(
                 yield
         finally:
             session_pull_requests.install_refresher(None)
+            # Another app in this process must not record into this one's stores.
+            session_triggers.configure(None)
             await pull_request_refresher.aclose()
             if scheduler_start_retry is not None:
                 scheduler_start_retry.cancel()
@@ -2409,6 +2430,7 @@ def create_app(
 
     app.state.automations_available = automations_available
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
+    app.state.scheduled_task_session_triggers_enabled = session_triggers_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
@@ -3752,6 +3774,8 @@ def create_app(
                 },
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
+                "scheduled_task_session_triggers": automations_enabled
+                and session_triggers_enabled,
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,
