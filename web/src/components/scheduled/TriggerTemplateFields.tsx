@@ -122,6 +122,9 @@ export function TriggerTemplateFields({
   const conditionFields = triggerConditionFields(source, fields.event);
   const scopeEntries = triggerScopeEntries(source, fields);
   const instructionsTooLong = fields.instructions.trim().length > MAX_INSTRUCTIONS_CHARS;
+  const instructionsTooLongMessage = `Keep instructions to ${MAX_INSTRUCTIONS_CHARS.toLocaleString("en-US")} characters or fewer so each ${
+    taskSessionMode === "continue" ? "message to the task session" : "session's first message"
+  } has room for the item.`;
   const [activeSection, setActiveSection] = useState<"trigger" | "instructions">("trigger");
   const fullTriggerDescription = triggerEventDescription(source, fields.event);
   const firstSentenceEnd = fullTriggerDescription.indexOf(". ");
@@ -176,8 +179,34 @@ export function TriggerTemplateFields({
                 *
               </span>
             )}
+            {instructionsTooLong && (
+              <TriangleAlertIcon
+                aria-hidden="true"
+                className="size-3.5 text-destructive"
+                data-testid="task-trigger-instructions-invalid"
+              />
+            )}
           </TabsTrigger>
         </TabsList>
+        {/* The length error lives in the hidden Instructions panel, so surface it here too. */}
+        {instructionsTooLong && activeSection !== "instructions" && (
+          <div
+            className="flex items-center justify-between gap-3 text-sm text-destructive"
+            role="alert"
+            data-testid="task-trigger-instructions-too-long-notice"
+          >
+            <p>{instructionsTooLongMessage}</p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              onClick={() => setActiveSection("instructions")}
+            >
+              Edit instructions
+            </Button>
+          </div>
+        )}
         <TabsContent value="trigger" forceMount hidden={activeSection !== "trigger"}>
           <div
             className="flex min-h-[240px] flex-col gap-2 rounded-lg border border-border p-3"
@@ -585,12 +614,7 @@ export function TriggerTemplateFields({
                   role="alert"
                   data-testid="task-trigger-too-long"
                 >
-                  Keep instructions to {MAX_INSTRUCTIONS_CHARS.toLocaleString("en-US")} characters
-                  or fewer so each{" "}
-                  {taskSessionMode === "continue"
-                    ? "message to the task session"
-                    : "session's first message"}{" "}
-                  has room for the item.
+                  {instructionsTooLongMessage}
                 </p>
               )}
             </div>

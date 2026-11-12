@@ -4229,6 +4229,21 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("task-trigger-too-long")).toHaveTextContent(
       "Keep instructions to 2,000 characters or fewer",
     );
+    // The Instructions panel is hidden behind the Trigger tab, so the reason stays visible here.
+    expect(screen.getByRole("tab", { name: "Trigger" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("task-trigger-too-long")).not.toBeVisible();
+    expect(screen.getByTestId("task-trigger-instructions-invalid")).toBeInTheDocument();
+    expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toBeVisible();
+    expect(screen.getByTestId("task-trigger-instructions-too-long-notice")).toHaveTextContent(
+      "Keep instructions to 2,000 characters or fewer",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Edit instructions" }));
+    expect(screen.getByRole("tab", { name: "Instructions" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByTestId("task-trigger-too-long")).toBeVisible();
+    expect(screen.queryByTestId("task-trigger-instructions-too-long-notice")).toBeNull();
   });
 
   it("compiles the builder rows into the saved hourly continue-mode task", async () => {
