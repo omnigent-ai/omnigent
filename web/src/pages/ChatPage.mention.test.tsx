@@ -579,6 +579,69 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     );
   });
 
+  it("repaints the layer when a tag is swapped for one of the same length, or for text", () => {
+    sessions.loaded = [sessionRow("s_alpha", "Alpha"), sessionRow("s_bravo", "Bravo")];
+    renderWithTooltips(<Composer {...composerProps()} />);
+    const overlayText = () => screen.getByTestId("composer-highlight-overlay").textContent;
+    type("look @Alp");
+    fireEvent.click(screen.getByTitle("Tag session Alpha"));
+    expect(overlayText()).toBe("look @Alpha ");
+    type("look @Bra");
+    fireEvent.click(screen.getByTitle("Tag session Bravo"));
+    expect(textarea().value).toBe("look @Bravo ");
+    expect(tokens()).toEqual(["@Bravo"]);
+    expect(overlayText()).toBe("look @Bravo ");
+    // The masked shape of "@Bravo", typed as plain text with Markdown to paint.
+    type("look aaaaaa **now**");
+    expect(tokens()).toEqual([]);
+    expect(overlayText()).toBe("look aaaaaa **now**");
+  });
+
+  it("shows tagged tokens that read as Markdown verbatim, focused and blurred", async () => {
+    const title = "Fix `useAuth` **now** _later_ my_var";
+    ws.rootEntries = [
+      ...ROOT_ENTRIES,
+      { path: "__init__.py", name: "__init__.py", type: "file", bytes: 1, modified_at: null },
+    ];
+    sessions.loaded = [sessionRow("s_md", title)];
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("open @__init");
+    fireEvent.click(screen.getByTitle("Attach __init__.py"));
+    append("and @Fix");
+    fireEvent.click(screen.getByTitle(`Tag session ${title}`));
+    append("then **go**");
+    const expected = ["@__init__.py", `@${title}`];
+    expect(textarea().value).toBe(`open @__init__.py and @${title} then **go**`);
+    // Focused: the highlight layer paints each token whole, with no Markdown inside.
+    expect(tokens()).toEqual(expected);
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.textContent).toBe(textarea().value);
+    expect(
+      Array.from(overlay.querySelectorAll("[data-md]"), (span) => span.textContent).filter(
+        (text) => !expected.includes(text ?? ""),
+      ),
+    ).toEqual(["**", "go", "**"]);
+    // Blurred (focus moved elsewhere): the compact preview drops only real markers.
+    // Let the menu's deferred caret placement (which refocuses) run first.
+    await act(async () => {});
+    const elsewhere = document.body.appendChild(document.createElement("button"));
+    onTestFinished(() => elsewhere.remove());
+    act(() => elsewhere.focus());
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+    const view = screen.getByTestId("composer-compact-view");
+    expect(view.textContent).toBe(`open @__init__.py and @${title} then go`);
+    expect(
+      Array.from(
+        view.querySelectorAll('[data-testid="composer-mention-token"]'),
+        (pill) => pill.textContent,
+      ),
+    ).toEqual(expected);
+  });
+
   it("keeps the highlighted file when session results land above it", async () => {
     sessions.searchHits = [sessionRow("s_readme", "readme cleanup")];
     renderWithTooltips(<Composer {...composerProps()} />);

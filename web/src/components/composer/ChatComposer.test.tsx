@@ -25,6 +25,22 @@ vi.mock("@/lib/composerMarkdown", async (importOriginal) => {
   return { ...actual, tokenizeComposerMarkdown: vi.fn(actual.tokenizeComposerMarkdown) };
 });
 
+/** Draft ranges of each of ``tokens`` in ``draft``, as tagged mention tokens. */
+function rangesOf(draft: string, tokens: readonly string[]) {
+  return tokens.map((token) => {
+    const start = draft.indexOf(token);
+    return { start, end: start + token.length };
+  });
+}
+
+/** A file name and a session title that read as Markdown, tagged as mentions. */
+const MD_LOOKING_TITLE = "@Fix `useAuth` **now** _later_ my_var";
+const MD_LOOKING_DRAFT = `open @__init__.py and ${MD_LOOKING_TITLE} then **go**`;
+const MD_LOOKING_TOKENS = ["@__init__.py", MD_LOOKING_TITLE];
+
+/** Enough lines to make one paragraph that is parsed line by line. */
+const CODE_SPAN_FILLER = Array.from({ length: 110 }, (_, i) => `filler ${i}\n`).join("");
+
 describe("ChatComposer", () => {
   function renderEditor(initial: string, submitWithModEnter = false) {
     const onKeyDown = vi.fn();
@@ -800,6 +816,96 @@ describe("ComposerTextarea Markdown highlight layer", () => {
     render(<ControlledTextarea initial="/review the _diff_" accentRange={{ start: 0, end: 7 }} />);
     expect(layer()?.querySelector(".text-brand-accent")?.textContent).toBe("/review");
     expect(styledText(MD_ITALIC)).toEqual(["diff"]);
+  });
+
+  it("draws tagged mention tokens as pills alongside Markdown and the command tint", () => {
+    const draft = "/review @Alpha planning and **this**\r\nthen ask @Beta";
+    const mentions = [
+      { start: 8, end: 23 },
+      { start: 47, end: 52 },
+    ];
+    render(
+      <ControlledTextarea
+        initial={draft}
+        accentRange={{ start: 0, end: 7 }}
+        mentionRanges={mentions}
+      />,
+    );
+    const pills = screen.getAllByTestId("composer-mention-token");
+    expect(pills.map((pill) => pill.textContent)).toEqual(["@Alpha planning", "@Beta"]);
+    expect(pills[0]).toHaveClass("text-brand-accent", "bg-brand-accent/10");
+    expect(layer()?.querySelector(".text-brand-accent")?.textContent).toBe("/review");
+    expect(styledText(MD_BOLD)).toEqual(["this"]);
+    expect(screen.getByRole("textbox")).toHaveClass("text-transparent");
+  });
+
+  it("highlights a plain draft that only has a mention token", () => {
+    render(<ControlledTextarea initial="ask @Alpha" mentionRanges={[{ start: 4, end: 10 }]} />);
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@Alpha");
+    expect(layer()?.textContent).toBe("ask @Alpha");
+  });
+
+  it("repaints a mention swapped for another of the same shape, or for plain text", () => {
+    const shownAs = (draft: string, tokens: readonly string[]) => {
+      const element = (
+        <ComposerTextarea
+          aria-label="Draft"
+          value={draft}
+          onChange={() => {}}
+          mentionRanges={rangesOf(draft, tokens)}
+        />
+      );
+      return element;
+    };
+    const { rerender } = render(shownAs("look @Alpha", ["@Alpha"]));
+    expect(layer()?.textContent).toBe("look @Alpha");
+    rerender(shownAs("look @Bravo", ["@Bravo"]));
+    expect(layer()?.textContent).toBe("look @Bravo");
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@Bravo");
+    rerender(shownAs("use @iiii **now**", ["@iiii"]));
+    rerender(shownAs("use @WWWW **now**", ["@WWWW"]));
+    expect(layer()?.textContent).toBe("use @WWWW **now**");
+    // The same masked shape with no mention at all.
+    rerender(shownAs("use aaaaa **now**", []));
+    expect(layer()?.textContent).toBe("use aaaaa **now**");
+    expect(screen.queryByTestId("composer-mention-token")).toBeNull();
+    expect(styledText(MD_BOLD)).toEqual(["now"]);
+  });
+
+  it("styles an unchanged mention line by its context, prose or a long paragraph's code span", () => {
+    const line = "see @Alpha **now**";
+    const prose = `${line}\n`;
+    const draft = `${CODE_SPAN_FILLER}open \`code\n${line}\nclose\` end\n`;
+    const shownAs = (value: string) => (
+      <ComposerTextarea
+        aria-label="Draft"
+        value={value}
+        onChange={() => {}}
+        mentionRanges={rangesOf(value, ["@Alpha"])}
+      />
+    );
+    const { rerender } = render(shownAs(prose));
+    expect(styledText(MD_BOLD)).toEqual(["now"]);
+    rerender(shownAs(draft));
+    expect(layer()?.textContent).toBe(draft);
+    expect(styledText(MD_BOLD)).toEqual([]);
+    rerender(shownAs(prose));
+    expect(styledText(MD_BOLD)).toEqual(["now"]);
+  });
+
+  it("keeps tagged mention tokens literal, however they read as Markdown", () => {
+    render(
+      <ControlledTextarea
+        initial={MD_LOOKING_DRAFT}
+        mentionRanges={rangesOf(MD_LOOKING_DRAFT, MD_LOOKING_TOKENS)}
+      />,
+    );
+    const pills = screen.getAllByTestId("composer-mention-token");
+    expect(pills.map((pill) => pill.textContent)).toEqual(MD_LOOKING_TOKENS);
+    expect(styledText(MD_BOLD)).toEqual(["go"]);
+    expect(styledText(MD_ITALIC)).toEqual([]);
+    expect(styledText(MD_CODE)).toEqual([]);
+    expect(layer()?.textContent).toBe(MD_LOOKING_DRAFT);
   });
 
   it("steps aside during IME composition so the native composition text shows", () => {
@@ -1695,6 +1801,35 @@ describe("ComposerTextarea compact preview", () => {
     vi.restoreAllMocks();
     Reflect.deleteProperty(document, "caretPositionFromPoint");
     Reflect.deleteProperty(document, "caretRangeFromPoint");
+  });
+
+  it("keeps a code span's markers in a long paragraph's mention line after prose", async () => {
+    const line = "see @Alpha **now**";
+    const warm = render(
+      <ComposerTextarea
+        aria-label="Warm"
+        value={`${line}\n`}
+        onChange={() => {}}
+        mentionRanges={rangesOf(`${line}\n`, ["@Alpha"])}
+      />,
+    );
+    warm.unmount();
+    const draft = `${CODE_SPAN_FILLER}open \`code\n${line}\nclose\` end`;
+    await blurred(draft, { mentionRanges: rangesOf(draft, ["@Alpha"]) });
+    // Only the code span's backticks collapse; its content, `**` included, stays.
+    expect(view()?.textContent).toContain(`open code\n${line}\nclose end`);
+  });
+
+  it("shows tagged mention tokens verbatim, collapsing only real markers", async () => {
+    await blurred(MD_LOOKING_DRAFT, {
+      mentionRanges: rangesOf(MD_LOOKING_DRAFT, MD_LOOKING_TOKENS),
+    });
+    expect(view()?.textContent).toBe(`open @__init__.py and ${MD_LOOKING_TITLE} then go`);
+    const pills = Array.from(
+      view()!.querySelectorAll('[data-testid="composer-mention-token"]'),
+      (pill) => pill.textContent,
+    );
+    expect(pills).toEqual(MD_LOOKING_TOKENS);
   });
 
   it("uses the real bold and italic faces, which needn't line up with the textarea", async () => {

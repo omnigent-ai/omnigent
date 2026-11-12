@@ -17,6 +17,7 @@ import {
   normalizeLineBreaks,
   plainComposerMarkdown,
   tokenizeComposerMarkdown,
+  tokenizeComposerMarkdownWithLiterals,
 } from "./composerMarkdown";
 
 const FLAG_NAMES: [number, string][] = [
@@ -851,5 +852,95 @@ describe("markerRevealRanges", () => {
     for (let i = 0; i < 1000; i++) markerRevealRanges(markdown, caret, caret);
     expect(performance.now() - started).toBeLessThan(200);
     expect(markerRevealRanges(markdown, caret, caret)).toHaveLength(2);
+  });
+});
+
+describe("tokenizeComposerMarkdownWithLiterals", () => {
+  /** Styled runs as `[text, "flag+flag"]` with `literal` kept as plain text. */
+  function literalRuns(text: string, literal: string): [string, string][] {
+    const start = text.indexOf(literal);
+    const { blocks } = tokenizeComposerMarkdownWithLiterals(text, [
+      { start, end: start + literal.length },
+    ]);
+    return blocks.flatMap((block) =>
+      block.segments
+        .filter((segment) => segment.flags !== 0)
+        .map((segment): [string, string] => [
+          block.text.slice(segment.start, segment.end),
+          FLAG_NAMES.filter(([flag]) => segment.flags & flag)
+            .map(([, name]) => name)
+            .join("+"),
+        ]),
+    );
+  }
+
+  it("keeps a tagged file name's underscores as text", () => {
+    expect(styledRuns("see @__init__.py now")).not.toEqual([]);
+    expect(literalRuns("see @__init__.py now", "@__init__.py")).toEqual([]);
+  });
+
+  it("keeps a session title's Markdown characters as text, and styles around it", () => {
+    const title = "@Fix `useAuth` **now** _later_ my_var";
+    const draft = `ask ${title} then **this**`;
+    expect(literalRuns(draft, title)).toEqual(styledRuns("**this**"));
+    expect(styledRuns("**this**")).not.toEqual([]);
+  });
+
+  it("returns the draft's own text, tiled by its blocks", () => {
+    const draft = "> quoted @a_b_c\n\n```\n@x*y*\n```\nend @`z`";
+    const literals = ["@a_b_c", "@x*y*", "@`z`"].map((token) => {
+      const start = draft.indexOf(token);
+      return { start, end: start + token.length };
+    });
+    const { blocks } = tokenizeComposerMarkdownWithLiterals(draft, literals);
+    expect(blocks.map((block) => block.text).join("")).toBe(draft);
+    expect(blocks.every((block, i) => i === 0 || block.start > blocks[i - 1].start)).toBe(true);
+  });
+
+  it("ties each block's segments to its own text, not the masked shape", () => {
+    const at = (draft: string, token: string) => {
+      const start = draft.indexOf(token);
+      return [{ start, end: start + token.length }];
+    };
+    const alpha = tokenizeComposerMarkdownWithLiterals("look @Alpha", at("look @Alpha", "@Alpha"));
+    const bravo = tokenizeComposerMarkdownWithLiterals("look @Bravo", at("look @Bravo", "@Bravo"));
+    const plain = tokenizeComposerMarkdown("look aaaaaa");
+    // Same masked text, different drafts: never the same (render-cached) array.
+    expect(bravo.blocks[0].segments).not.toBe(alpha.blocks[0].segments);
+    expect(plain.blocks[0].segments).not.toBe(alpha.blocks[0].segments);
+    // An unchanged draft keeps its arrays, so an edit elsewhere re-renders nothing.
+    const again = tokenizeComposerMarkdownWithLiterals("look @Alpha", at("look @Alpha", "@Alpha"));
+    expect(again.blocks[0].segments).toBe(alpha.blocks[0].segments);
+  });
+
+  it("never shares a restored list between prose and a code span's context", () => {
+    const line = "see @Alpha **now**\n";
+    const at = (draft: string) => {
+      const start = draft.indexOf("@Alpha");
+      return [{ start, end: start + "@Alpha".length }];
+    };
+    const prose = tokenizeComposerMarkdownWithLiterals(line, at(line));
+    const flagsOf = (segments: readonly { flags: number }[]) =>
+      segments.reduce((all, segment) => all | segment.flags, 0);
+    expect(flagsOf(prose.blocks[0].segments) & MD_BOLD).toBeTruthy();
+    // The same line inside a code span crossing lines of a paragraph long enough
+    // to be parsed line by line.
+    const filler = Array.from({ length: MAX_PARAGRAPH_LINES + 5 }, (_, i) => `filler ${i}\n`);
+    const draft = `${filler.join("")}open \`code\n${line}close\` end\n`;
+    const code = tokenizeComposerMarkdownWithLiterals(draft, at(draft));
+    const inCode = code.blocks.find((block) => block.text === line)!;
+    expect(inCode).toBeDefined();
+    expect(inCode.segments).not.toBe(prose.blocks[0].segments);
+    expect(flagsOf(inCode.segments) & MD_BOLD).toBe(0);
+    expect(inCode.segments.every((segment) => segment.flags & MD_CODE)).toBe(true);
+    // Back in prose, the prose styling (and its list) returns.
+    const again = tokenizeComposerMarkdownWithLiterals(line, at(line));
+    expect(again.blocks[0].segments).toBe(prose.blocks[0].segments);
+  });
+
+  it("parses as usual with no literals", () => {
+    expect(tokenizeComposerMarkdownWithLiterals("_a_", [])).toEqual(
+      tokenizeComposerMarkdown("_a_"),
+    );
   });
 });

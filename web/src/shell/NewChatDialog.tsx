@@ -62,12 +62,7 @@ import {
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
-import {
-  ComposerMirror,
-  MIRRORED_TEXTAREA_CLASS,
-  renderMentionTokens,
-  useComposerMirrorAlignment,
-} from "@/components/composer/MentionTokenOverlay";
+import { useMentionTokenRanges } from "@/components/composer/MentionTokenOverlay";
 import {
   SandboxProfilePicker,
   useSandboxProfileCatalog,
@@ -394,7 +389,6 @@ import {
 import {
   composerInlineMentions,
   expandMentionTokens,
-  findMentionTokens,
   presentMentions,
   type TaggedMentions,
   withSessionMentionHint,
@@ -5321,7 +5315,6 @@ function NewChatLandingContent({
     debouncedQuery: useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS),
     currentSessionId: null,
   });
-  const mirrorRef = useRef<HTMLDivElement>(null);
   // Closed-but-loading window: don't let Enter send the half-typed "@dir/".
   // ``isPlaceholderData`` covers the drill-down window where react-query is
   // still serving the previous directory's rows (``isLoading`` stays false).
@@ -5363,8 +5356,8 @@ function NewChatLandingContent({
   };
   // The draft snapshot is built above the hook; add the tags it owns.
   draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
-  const mentionTokensShown = findMentionTokens(message, mentionTokens).length > 0;
-  useComposerMirrorAlignment(mirrorRef, textareaRef, mentionTokensShown);
+  // The composer's highlight layer paints the inline mention pills.
+  const mentionRanges = useMentionTokenRanges(message, mentionTokens);
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
   const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
@@ -7247,10 +7240,7 @@ function NewChatLandingContent({
               input={{
                 ref: textareaRef,
                 value: message,
-                className: mentionTokensShown ? MIRRORED_TEXTAREA_CLASS : undefined,
-                onScroll: (e) => {
-                  if (mirrorRef.current) mirrorRef.current.scrollTop = e.currentTarget.scrollTop;
-                },
+                mentionRanges,
                 onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
                   slashCompletion.onSelectionChange(e.target);
@@ -7308,11 +7298,6 @@ function NewChatLandingContent({
                 "data-testid": "new-chat-landing-input",
               }}
               slots={{
-                inputBackdrop: mentionTokensShown && (
-                  <ComposerMirror ref={mirrorRef}>
-                    {renderMentionTokens(message, mentionTokens)}
-                  </ComposerMirror>
-                ),
                 beforeInput: (
                   <>
                     {/* Skill suggestions — floats above the composer box. */}

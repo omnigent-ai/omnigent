@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { tokenizeComposerMarkdown } from "./composerMarkdown";
+import { tokenizeComposerMarkdown, tokenizeComposerMarkdownWithLiterals } from "./composerMarkdown";
 import {
   compactLayout,
   compactToSource,
@@ -149,5 +149,17 @@ describe("compact offsets", () => {
     const fence = layoutOf("```\n```");
     expect(shown(fence)).toBe("");
     expect(compactToSource(fence, 0)).toBe(fence.sourceLength);
+  });
+});
+
+describe("compactLayout with literal mention tokens", () => {
+  it("keeps a tagged token's characters, collapsing only real markers", () => {
+    const draft = "open @__init__.py and @Fix `useAuth` **now** _later_ then **go**";
+    const tokens = ["@__init__.py", "@Fix `useAuth` **now** _later_"].map((token) => {
+      const start = draft.indexOf(token);
+      return { start, end: start + token.length };
+    });
+    const layout = compactLayout(tokenizeComposerMarkdownWithLiterals(draft, tokens));
+    expect(shown(layout)).toBe("open @__init__.py and @Fix `useAuth` **now** _later_ then go");
   });
 });

@@ -38,11 +38,15 @@ import {
   type CompactPiece,
 } from "@/lib/composerCompact";
 import { useItalicSlant } from "./ComposerItalicSlant";
+import { MENTION_TOKEN_CLASS } from "./MentionTokenOverlay";
 
 /** Tints a slash command or `$skill` token at the start of the draft. */
 const ACCENT = 32;
 /** Shows a marker the caret or selection is editing; other markers are hidden. */
 const REVEAL = 64;
+/** Pills an inline `@` mention token, as the composer mirror used to. */
+const MENTION = 8192;
+const NO_MENTIONS: readonly ComposerAccentRange[] = [];
 
 /** A draft range to tint as a command token, as offsets into the draft. */
 export interface ComposerAccentRange {
@@ -71,7 +75,7 @@ function segmentClass(flags: number): string {
       ? flags & REVEAL
         ? "text-muted-foreground"
         : "text-transparent"
-      : flags & ACCENT
+      : flags & (ACCENT | MENTION)
         ? "text-brand-accent"
         : flags & (MD_INFO | MD_OPEN_FENCE | MD_LINK_URL)
           ? "text-muted-foreground"
@@ -86,6 +90,8 @@ function segmentClass(flags: number): string {
   // compose (see `.md-deco` in index.css), never text-decoration.
   const decorated = flags & (MD_ITALIC | MD_STRIKE | MD_LINK);
   return cn(
+    // The pill's own text color yields to a hidden or revealed marker's.
+    flags & MENTION && MENTION_TOKEN_CLASS,
     color,
     flags & MD_BOLD && "md-strong",
     decorated && "md-deco",
@@ -105,11 +111,12 @@ function classFor(flags: number): string {
   return className;
 }
 
-/** Split a line's segments around the accent range and flag the overlap. */
+/** Split a line's segments around an accent range and flag the overlap. */
 function withAccent(
   segments: readonly MarkdownSegment[],
   lineStart: number,
   accent: ComposerAccentRange,
+  flag = ACCENT,
 ): MarkdownSegment[] {
   const start = accent.start - lineStart;
   const end = accent.end - lineStart;
@@ -119,7 +126,7 @@ function withAccent(
     cuts.push(Math.max(cuts[1], Math.min(end, segment.end)), segment.end);
     for (let i = 0; i < 3; i++) {
       if (cuts[i + 1] <= cuts[i]) continue;
-      const flags = i === 1 ? segment.flags | ACCENT : segment.flags;
+      const flags = i === 1 ? segment.flags | flag : segment.flags;
       out.push({ start: cuts[i], end: cuts[i + 1], flags });
     }
   }
@@ -287,6 +294,7 @@ function renderSegment(line: HighlightLine, segment: MarkdownSegment): ReactNode
       className={classFor(segment.flags)}
       data-md={segment.flags & ~REVEAL}
       data-revealed={segment.flags & REVEAL ? "" : undefined}
+      data-testid={segment.flags & MENTION ? "composer-mention-token" : undefined}
     >
       {slice}
     </span>
@@ -526,6 +534,8 @@ export const ComposerHighlightLayer = forwardRef<
   {
     markdown: ComposerMarkdown;
     accentRange?: ComposerAccentRange | null;
+    /** Draft ranges of tagged `@` mention tokens, each drawn as a pill. */
+    mentionRanges?: readonly ComposerAccentRange[];
     /** Sorted draft ranges of the markers to show, from `markerRevealRanges`. */
     revealRanges?: readonly RevealRange[];
     disabled?: boolean;
@@ -535,7 +545,15 @@ export const ComposerHighlightLayer = forwardRef<
     anchorRef?: MutableRefObject<((top: number) => ScrollAnchor | null) | null>;
   }
 >(function ComposerHighlightLayer(
-  { markdown, accentRange, revealRanges = NO_REVEAL, disabled, hidden, anchorRef },
+  {
+    markdown,
+    accentRange,
+    mentionRanges = NO_MENTIONS,
+    revealRanges = NO_REVEAL,
+    disabled,
+    hidden,
+    anchorRef,
+  },
   ref,
 ) {
   const layerRef = useRef<HTMLDivElement | null>(null);
@@ -568,10 +586,13 @@ export const ComposerHighlightLayer = forwardRef<
       let lineStart = block.start;
       for (const cached of blockLines(block.text, block.segments)) {
         const lineEnd = lineStart + cached.text.length;
-        const accented = accentRange && accentRange.start < lineEnd && accentRange.end > lineStart;
-        const line = accented
-          ? { text: cached.text, segments: withAccent(cached.segments, lineStart, accentRange) }
-          : cached;
+        let segments = cached.segments;
+        if (accentRange && accentRange.start < lineEnd && accentRange.end > lineStart)
+          segments = withAccent(segments, lineStart, accentRange);
+        for (const mention of mentionRanges)
+          if (mention.start < lineEnd && mention.end > lineStart)
+            segments = withAccent(segments, lineStart, mention, MENTION);
+        const line = segments === cached.segments ? cached : { text: cached.text, segments };
         const row = toRow(line, cached, lineStart, copies);
         blockRows.push(row);
         ordered.push(row);
@@ -590,7 +611,7 @@ export const ComposerHighlightLayer = forwardRef<
     flushRows();
     placeQuotes(ordered, quoted);
     return built;
-  }, [markdown, accentRange]);
+  }, [markdown, accentRange, mentionRanges]);
   useLayoutEffect(() => {
     if (!anchorRef) return;
     anchorRef.current = (top) => (layerRef.current ? anchorAt(layerRef.current, items, top) : null);
@@ -657,16 +678,32 @@ function compactClassFor(flags: number): string {
 }
 
 /** A piece: plain text as a bare text node, styled text in a span per accent cut. */
-function renderPiece(piece: CompactPiece, accent: ComposerAccentRange | null): ReactNode[] {
+function renderPiece(
+  piece: CompactPiece,
+  accent: ComposerAccentRange | null,
+  mentions: readonly ComposerAccentRange[],
+): ReactNode[] {
   const end = piece.source + piece.text.length;
-  const cuts = [piece.source, end];
-  if (accent && accent.start < end && accent.end > piece.source)
-    cuts.splice(1, 0, Math.max(piece.source, accent.start), Math.min(end, accent.end));
+  const accents: [ComposerAccentRange, number][] = [];
+  if (accent) accents.push([accent, ACCENT]);
+  for (const mention of mentions) accents.push([mention, MENTION]);
+  const overlapping = accents.filter(([range]) => range.start < end && range.end > piece.source);
+  const cuts = [
+    ...new Set([
+      piece.source,
+      end,
+      ...overlapping.flatMap(([range]) => [
+        Math.max(piece.source, range.start),
+        Math.min(end, range.end),
+      ]),
+    ]),
+  ].sort((a, b) => a - b);
   const nodes: ReactNode[] = [];
   for (let i = 0; i + 1 < cuts.length; i++) {
     if (cuts[i + 1] <= cuts[i]) continue;
-    const accented = accent !== null && cuts[i] >= accent.start && cuts[i + 1] <= accent.end;
-    const flags = accented ? piece.flags | ACCENT : piece.flags;
+    let flags = piece.flags;
+    for (const [range, flag] of overlapping)
+      if (cuts[i] >= range.start && cuts[i + 1] <= range.end) flags |= flag;
     const at = cuts[i] - piece.source;
     const text = piece.text.slice(at, cuts[i + 1] - piece.source);
     // Keyed by draft offset: unique in the row, so an edit elsewhere can't
@@ -679,6 +716,7 @@ function renderPiece(piece: CompactPiece, accent: ComposerAccentRange | null): R
       <span
         key={cuts[i]}
         data-md={flags}
+        data-testid={flags & MENTION ? "composer-mention-token" : undefined}
         className={cn(
           compactClassFor(flags),
           // A link's destination follows its text with no brackets between.
@@ -698,16 +736,18 @@ const CompactRow = memo(function CompactRow({
   line,
   quote,
   accent,
+  mentions,
 }: {
   line: CompactLine;
   quote?: QuotePlace;
   accent: ComposerAccentRange | null;
+  mentions: readonly ComposerAccentRange[];
 }) {
   const children: ReactNode[] = [];
   const { pieces } = line;
   for (let i = 0; i < pieces.length; i++) {
     if (!isInlineCodePiece(pieces[i])) {
-      children.push(...renderPiece(pieces[i], accent));
+      children.push(...renderPiece(pieces[i], accent, mentions));
       continue;
     }
     // Inline code keeps its pill; with no backticks to pad it, it pads itself.
@@ -719,7 +759,7 @@ const CompactRow = memo(function CompactRow({
         data-code-pill=""
         className="rounded-[0.3em] px-[0.2em] [background-color:var(--code-bg)]"
       >
-        {pieces.slice(start, i + 1).flatMap((piece) => renderPiece(piece, accent))}
+        {pieces.slice(start, i + 1).flatMap((piece) => renderPiece(piece, accent, mentions))}
       </span>,
     );
   }
@@ -872,6 +912,7 @@ function chunksAround(view: HTMLElement): ChunkRange | null {
 export const ComposerCompactView = memo(function ComposerCompactView({
   layout,
   accentRange = null,
+  mentionRanges = NO_MENTIONS,
   disabled,
   textareaRef,
   readAnchor,
@@ -879,6 +920,8 @@ export const ComposerCompactView = memo(function ComposerCompactView({
 }: {
   layout: CompactLayout;
   accentRange?: ComposerAccentRange | null;
+  /** Draft ranges of tagged `@` mention tokens, each drawn as a pill. */
+  mentionRanges?: readonly ComposerAccentRange[];
   disabled?: boolean;
   /** The textarea it stands in for: its height caps the preview. */
   textareaRef: RefObject<HTMLTextAreaElement | null>;
@@ -1008,7 +1051,13 @@ export const ComposerCompactView = memo(function ComposerCompactView({
     return (
       <div key={chunk.key} data-chunk={chunk.key} data-chunk-index={at}>
         {chunk.rows.map(({ line, quote }) => (
-          <CompactRow key={line.start} line={line} quote={quote} accent={accentRange} />
+          <CompactRow
+            key={line.start}
+            line={line}
+            quote={quote}
+            accent={accentRange}
+            mentions={mentionRanges}
+          />
         ))}
       </div>
     );

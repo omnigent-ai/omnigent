@@ -25,6 +25,7 @@ import {
   normalizeLineBreaks,
   plainComposerMarkdown,
   tokenizeComposerMarkdown,
+  tokenizeComposerMarkdownWithLiterals,
   type ComposerMarkdown,
   type RevealRange,
 } from "@/lib/composerMarkdown";
@@ -115,6 +116,7 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
     "data-slash-command"?: string;
     "data-has-draft"?: string;
     accentRange?: ComposerAccentRange | null;
+    mentionRanges?: readonly ComposerAccentRange[];
     onCompactChange?: () => void;
   };
   slots?: {
@@ -583,6 +585,8 @@ type ComposerTextareaProps = ComponentPropsWithoutRef<"textarea"> & {
   typingRef?: MutableRefObject<ComposerTyping | null>;
   /** Draft range to tint as a slash command or skill token. */
   accentRange?: ComposerAccentRange | null;
+  /** Draft ranges of tagged `@` mention tokens, drawn as pills. */
+  mentionRanges?: readonly ComposerAccentRange[];
   /**
    * Called in the same task as the switch to or from the compact preview,
    * whose height differs, so a transcript can re-pin before the next paint.
@@ -623,6 +627,7 @@ export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComposerTextarea
       onKeyUp,
       onMouseUp,
       accentRange,
+      mentionRanges,
       parsedRef,
       typingRef,
       onCompactChange,
@@ -655,14 +660,26 @@ export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComposerTextarea
       if (!shown || !accentRange || accentRange.end <= accentRange.start) return null;
       return { start: shown.offset(accentRange.start), end: shown.offset(accentRange.end) };
     }, [shown, accentRange]);
+    const mentions = useMemo(() => {
+      if (!shown || !mentionRanges?.length) return NO_ACCENTS;
+      return mentionRanges.map(({ start, end }) => ({
+        start: shown.offset(start),
+        end: shown.offset(end),
+      }));
+    }, [shown, mentionRanges]);
     const parsed = shown !== null && shown.text.length <= MAX_HIGHLIGHTED_DRAFT_LENGTH;
-    const needsPlain = !parsed && accent !== null;
+    const accented = accent !== null || mentions.length > 0;
+    const needsPlain = !parsed && accented;
     const markdown = useMemo(() => {
       if (!shown) return null;
-      if (parsed) return tokenizeComposerMarkdown(shown.text);
+      // Tagged mention tokens are names, not Markdown (`@__init__.py`).
+      if (parsed)
+        return mentions.length > 0
+          ? tokenizeComposerMarkdownWithLiterals(shown.text, mentions)
+          : tokenizeComposerMarkdown(shown.text);
       return needsPlain ? plainComposerMarkdown(shown.text) : null;
-    }, [shown, parsed, needsPlain]);
-    const highlighted = !composing && markdown !== null && (markdown.styled || accent !== null);
+    }, [shown, parsed, needsPlain, mentions]);
+    const highlighted = !composing && markdown !== null && (markdown.styled || accented);
     const revealRanges = useStableRanges(
       useMemo(
         () =>
@@ -741,6 +758,7 @@ export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComposerTextarea
             ref={layerRef}
             markdown={markdown}
             accentRange={accent}
+            mentionRanges={mentions}
             revealRanges={revealRanges}
             disabled={props.disabled}
             hidden={compacted}
@@ -751,6 +769,7 @@ export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComposerTextarea
           <ComposerCompactView
             layout={compact}
             accentRange={accent}
+            mentionRanges={mentions}
             disabled={props.disabled}
             textareaRef={textareaRef}
             readAnchor={readAnchor}
@@ -827,6 +846,7 @@ export const ComposerTextarea = forwardRef<HTMLTextAreaElement, ComposerTextarea
 );
 
 const NO_RANGES: readonly RevealRange[] = [];
+const NO_ACCENTS: readonly ComposerAccentRange[] = [];
 
 /**
  * While `active`, the textarea takes no height in the flow: a negative bottom

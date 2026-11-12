@@ -300,6 +300,63 @@ export function tokenizeComposerMarkdown(text: string): ComposerMarkdown {
   return { blocks, styled };
 }
 
+/**
+ * Parse ``text`` with each of ``literals`` (draft ranges, e.g. tagged ``@``
+ * mention tokens) kept as plain text: no marker starts, ends or hides inside
+ * one, so the live layer and the compact preview show it as typed. Markdown
+ * around a range still applies to it as a whole.
+ */
+export function tokenizeComposerMarkdownWithLiterals(
+  text: string,
+  literals: readonly { start: number; end: number }[],
+): ComposerMarkdown {
+  if (literals.length === 0) return tokenizeComposerMarkdown(text);
+  // Parse a copy with every literal character (but line breaks) a plain letter;
+  // offsets are unchanged, so only the blocks' text needs the draft's back.
+  const masked = text.split("");
+  for (const { start, end } of literals)
+    for (let i = Math.max(0, start); i < Math.min(text.length, end); i++)
+      if (masked[i] !== "\n" && masked[i] !== "\r") masked[i] = "a";
+  const markdown = tokenizeComposerMarkdown(masked.join(""));
+  return {
+    styled: markdown.styled,
+    blocks: markdown.blocks.map((block) => {
+      const original = text.slice(block.start, block.start + block.text.length);
+      if (original === block.text) return block;
+      return { ...block, text: original, segments: restoredSegments(block.segments, original) };
+    }),
+  };
+}
+
+// Segment arrays stand for one block text in one parse context (renderers cache
+// lines by them). A restored block's array is the masked text's, so it gets its
+// own per source array and real text: the same text in another context (a code
+// span crossing lines) has another source array, and an unchanged block keeps its.
+const restoredSegmentsBySource = new WeakMap<
+  readonly MarkdownSegment[],
+  Map<string, readonly MarkdownSegment[]>
+>();
+const RESTORED_TEXTS_PER_SOURCE = 16;
+
+function restoredSegments(
+  source: readonly MarkdownSegment[],
+  text: string,
+): readonly MarkdownSegment[] {
+  let byText = restoredSegmentsBySource.get(source);
+  if (!byText) {
+    byText = new Map();
+    restoredSegmentsBySource.set(source, byText);
+  }
+  let segments = byText.get(text);
+  if (segments === undefined) {
+    // Bounded per source; the oldest real text for this masked shape goes first.
+    if (byText.size >= RESTORED_TEXTS_PER_SOURCE) byText.delete(byText.keys().next().value!);
+    segments = source.slice();
+    byText.set(text, segments);
+  }
+  return segments;
+}
+
 /** The draft as unstyled blocks, one per line, for drafts too long to parse. */
 export function plainComposerMarkdown(text: string): ComposerMarkdown {
   const blocks: MarkdownBlock[] = [];
