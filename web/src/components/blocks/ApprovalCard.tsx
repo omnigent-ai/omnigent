@@ -101,7 +101,12 @@ const QUESTION_TITLES = [
   ["devin_", "Devin needs your input"],
 ] as const;
 
-function questionPromptTitle(policyName: string, phase: string): string {
+// A workflow question comes from whichever harness runs the workflow; its
+// message names the task waiting on it.
+const WORKFLOW_QUESTION_PHASE = "workflow_request_input";
+
+function questionPromptTitle(policyName: string, phase: string, message: string): string {
+  if (phase === WORKFLOW_QUESTION_PHASE && message) return message;
   const match = QUESTION_TITLES.find(
     ([prefix]) => policyName.startsWith(prefix) || phase.startsWith(prefix),
   );
@@ -464,7 +469,7 @@ export function ApprovalCard({
   // ("pre_tool_use", "codex_command_approval", ...). It carries no
   // information the card doesn't already show, so hide it for them.
   const showPhase = phase !== "" && !isNativePolicy;
-  const askUserQuestionTitle = questionPromptTitle(policyName, phase);
+  const askUserQuestionTitle = questionPromptTitle(policyName, phase, message);
 
   const fileEditDiff = useMemo(
     () => (fileEdit ? getFileEditDiff(fileEdit.toolName, fileEdit.toolInput) : null),

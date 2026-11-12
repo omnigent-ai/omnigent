@@ -3270,6 +3270,37 @@ class SessionJournalAppendRequest(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=128)
 
 
+class SessionJournalInputRequest(BaseModel):
+    """
+    Body of ``POST /v1/sessions/{id}/journal/input-requests``, sent by the session's runner.
+
+    :param step: The task in the current plan that waits for the answer, e.g. ``"deploy"``.
+    :param questions: 1 to 3 questions, each with a ``question``, a short
+        ``header``, 2 to 4 ``options`` (``label``, optional ``description``) and
+        an optional ``recommended`` option label.
+    :param idempotency_key: Names the request, e.g. ``"tool:<tool call ID>"``; a
+        retry with the same key reuses the first attempt's status and question.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    step: str
+    questions: list[dict[str, Any]]
+    idempotency_key: str = Field(min_length=1, max_length=128)
+
+
+class SessionJournalInputRequested(BaseModel):
+    """
+    Response of ``POST /v1/sessions/{id}/journal/input-requests``.
+
+    :param entry: The task's ``needs_input`` status.
+    :param elicitation_id: The question's elicitation; the runner waits for its answer.
+    """
+
+    entry: SessionJournalEntry
+    elicitation_id: str
+
+
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.

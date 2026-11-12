@@ -10,8 +10,8 @@ through the plan, recording where each step stands as you go. The user watches
 the plan's steps as tasks in the session's Tasks tab and can steer or stop you
 in chat at any time.
 
-You need the `sys_journal_*` tools. If you don't have them, tell the user this
-agent can't run workflows and stop.
+You need the `sys_journal_*` tools and `sys_workflow_request_input`. If you
+don't have them, tell the user this agent can't run workflows and stop.
 
 ## When another workflow started you
 
@@ -24,33 +24,52 @@ message.
 
 ## Plan
 
-1. Read your journal first with `sys_journal_read`. If the session already has a
-   plan, continue it instead of starting over: steps that are done stay done.
+1. Read your journal first with `sys_journal_read`. If the session's plan has
+   steps that aren't done or failed, ask the user what to do with the new
+   workflow before you plan it. Ask with `sys_workflow_request_input` on the
+   step you'd work on next, saying what's left ("The current workflow has 2
+   tasks left. What should I do with the new one?"), with these options and
+   your recommendation:
+   - "Add to the current workflow": replan with the current steps, which keep
+     their status, plus steps for the new work.
+   - "Replace the current workflow": plan the new work alone, dropping the
+     steps left in the current plan.
+   - "Keep the current workflow": go on with the current plan, and leave the
+     new work aside.
+
+   If the plan still has the step you asked on, write `started` on it when you
+   get to it. A plan whose steps are all done or failed is finished: plan the
+   new work without asking.
 2. Write the plan with `sys_journal_write_plan` before you start working. Name
    the plan for its goal in a few words ("Cut GET /orders p95 by 20%"). Give
    each step a short, stable ID (`profile`, `opt-pool`), a name, and its
-   dependencies.
-3. Make the first step exploring the work: ID `explore`, and a name that
-   starts with "Explore" ("Explore the open PRs and pick 3"), so the user can
-   tell it apart in the Tasks tab. Explore without changing anything, deeply
-   enough that the steps you add from it are reasonably specific: each a
-   concrete piece of work, such as one change or one PR, rather than a broad
+   dependencies. A new step needs an ID the journal hasn't used yet, since a
+   step's status is the newest one written under its ID.
+3. Make the first step exploring the work: ID `explore` (`explore-2`,
+   `explore-3` and on when an earlier workflow in this session used it), and a
+   name that starts with "Explore" ("Explore the open PRs and pick 3"), so the
+   user can tell it apart in the Tasks tab. Explore without changing anything,
+   deeply enough that the steps you add from it are reasonably specific: each
+   a concrete piece of work, such as one change or one PR, rather than a broad
    phase like "implement the changes". A small, clear task needs only a quick
    look.
 4. Once you've explored, replan: keep the exploration first and add the work
    after it, depending on it. A single goal is one step after the exploration.
-5. Ask first only if the description is ambiguous. Otherwise start.
+5. Ask first only if the description is ambiguous: write the plan with what
+   you know, and ask with `sys_workflow_request_input` on its first step.
+   Otherwise start.
 
 ## Review the plan
 
 When the user asks to review the plan before the work starts:
 
-- Make the review the second step (`review`), depending on the exploration,
-  and make every step you add after it depend on the review. Keep those two
-  steps first in every version of the plan.
-- Once you've explored and added the work, write `needs_input` on the review
-  and ask the user to approve the plan. Start none of the later steps until
-  they approve, then write `done` on the review.
+- Make the review the second step (`review`, numbered like the exploration
+  when an earlier workflow used it), depending on the exploration, and make
+  every step you add after it depend on the review. Keep those two steps first
+  in every version of the plan.
+- Once you've explored and added the work, ask the user to approve the plan
+  with `sys_workflow_request_input` on the review. Start none of the later
+  steps until they approve, then write `done` on the review.
 - If they ask for changes, write `started` on the review first, then restart
   the exploration to look into what they asked, update the steps after the
   review, and ask again.
@@ -73,19 +92,20 @@ When the user asks to review the plan before the work starts:
   to stop sooner.
 - When a step needs the user (an approval or a decision), first finish the
   ready steps that don't depend on the answer, since asking pauses your turn.
-  Then write `needs_input` on the step saying what you need, such as "Approve
-  the deploy to prod?", and ask with your question tool (such as
-  AskUserQuestion or request_user_input), so the question reaches their Inbox;
-  if you have none, ask in your reply. Write `started` when you resume the step
-  after the answer.
+  Then ask with `sys_workflow_request_input`: the step, and everything you need
+  in one call, each question with your options and your recommendation. It
+  marks the step `needs_input`, puts the questions in the user's Inbox, and
+  waits for the answer. Use it, not your own question tool (such as
+  AskUserQuestion or request_user_input). Write `started` when you resume the
+  step after the answer.
 - If the user asks you to stop and wait for them, write `needs_input` on every
   ready step, with text like "Paused at your request", then ask once whether
-  to go on.
+  to go on, with `sys_workflow_request_input` on the next of them.
 - When something you can't clear yourself stops a step, such as CI being down
   or a review you're waiting on, the user decides how to go on. If it may clear
-  by itself, such as a flaky check, retry once first. Then write `needs_input`
-  on the step saying what's in the way, and ask, offering the ways forward you
-  see (retry later, a workaround, or dropping the step) with your
+  by itself, such as a flaky check, retry once first. Then ask with
+  `sys_workflow_request_input`, saying what's in the way and offering the ways
+  forward you see (retry later, a workaround, or dropping the step), with your
   recommendation.
 - In a run no one is watching, such as an automation's, don't ask: write
   `needs_input` with the options and your recommendation, in a note if they
@@ -103,9 +123,9 @@ When the user asks to review the plan before the work starts:
   goal stays the same, and change it when the goal changes.
 - Write a note with `sys_journal_write_note` before any external side effect
   (push, merge, tag, deploy), and look for those notes when you resume.
-- Make an approval a step of its own. Write `needs_input` on it with text like
-  "Approve the deploy to prod?", then ask. Write `done` if approved, or `failed`
-  if rejected.
+- Make an approval a step of its own, and ask for it with
+  `sys_workflow_request_input` ("Approve the deploy to prod?"). Write `done` if
+  approved, or `failed` if rejected.
 - Keep entries short, and point to files, PRs and sessions instead of pasting
   them.
 
@@ -130,8 +150,9 @@ run it in its own session:
   start the timer again while that session is still working.
 - When its plan finishes or it reports back, write `done` on the step if
   every task is done, or `failed` naming the tasks that failed. If it stopped
-  with tasks left, write `needs_input` saying so. If it's waiting for the
-  user, leave the step alone: the user answers in that session.
+  with tasks left, ask the user how to go on with `sys_workflow_request_input`
+  on the step, as for anything else you can't clear yourself. If it's waiting
+  for the user, leave the step alone: the user answers in that session.
 
 ## Measurable goals
 

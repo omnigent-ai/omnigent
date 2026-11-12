@@ -1,4 +1,4 @@
-"""Runner-side ``sys_journal_*`` tools: registration, retries and older servers.
+"""Runner-side journal tools: registration, retries, older servers, and questions.
 
 The tools' behavior against real routes is covered end to end in
 ``tests/server/integration/test_session_journal_routes.py``.
@@ -6,12 +6,14 @@ The tools' behavior against real routes is covered end to end in
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
 import jsonschema
 import pytest
 
+from omnigent.runner import pending_approvals
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.journal_tools import JOURNAL_TOOL_NAMES, execute_journal_tool
 from omnigent.runner.tool_dispatch import _ALL_LOCAL_TOOLS, _NATIVE_RELAY_BUILTIN_TOOLS
@@ -39,6 +41,7 @@ def test_every_agent_gets_the_journal_tools_unless_its_spec_opts_out() -> None:
         "sys_journal_write_note",
         "sys_journal_write_plan",
         "sys_journal_write_status",
+        "sys_workflow_request_input",
     }
     assert names == JOURNAL_TOOL_NAMES
     assert names <= _ALL_LOCAL_TOOLS and names <= _NATIVE_RELAY_BUILTIN_TOOLS
@@ -153,7 +156,114 @@ async def test_invalid_arguments_never_reach_the_server() -> None:
         assert (await _run(client, "sys_journal_read", {"cursor": "!!"}))["error"].startswith(
             "invalid_entry"
         )
+        no_options = {"step": "a", "questions": [{"question": "Go?", "header": "Go"}]}
+        assert (await _run(client, "sys_workflow_request_input", no_options))["error"].startswith(
+            "invalid_input: questions[0].options must list 2 to 4"
+        )
 
 
 async def _no_sleep(_seconds: float) -> None:
     return None
+
+
+_QUESTION = {
+    "question": "Deploy to prod now?",
+    "header": "Deploy",
+    "options": [{"label": "Deploy"}, {"label": "Wait"}],
+    "recommended": "Wait",
+}
+_STATUS = {**_ENTRY, "kind": "status", "step": "deploy", "payload": {"status": "needs_input"}}
+
+
+async def _answer_when_asked(elicitation_id: str, *answers: tuple[bool, dict | None]) -> None:
+    """Deliver each verdict once the runner waits on the question, as the server would."""
+    for approved, content in answers:
+        while not pending_approvals.resolve(elicitation_id, approved, content):
+            await asyncio.sleep(0.01)
+
+
+async def test_a_question_waits_for_the_answer_and_returns_it() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": "elicit_journal_1"})
+
+    published: list[dict[str, object]] = []
+    async with _client(handler) as client:
+        answer = asyncio.create_task(
+            _answer_when_asked(
+                "elicit_journal_1", (True, {"Deploy to prod now?": "Wait (recommended)"})
+            )
+        )
+        result = await _run(
+            client,
+            "sys_workflow_request_input",
+            {"step": "deploy", "questions": [_QUESTION]},
+            call_id="toolu_9",
+            publish_event=lambda _session, event: published.append(event),
+        )
+        await answer
+    assert result == {
+        "answered": True,
+        "answers": [{"question": "Deploy to prod now?", "answer": "Wait"}],
+    }
+    assert requests == [
+        {
+            "step": "deploy",
+            "questions": [{**_QUESTION, "options": [{"label": "Deploy"}, {"label": "Wait"}]}],
+            "idempotency_key": "tool:toolu_9",
+        }
+    ]
+    # The task's status reaches the Tasks tab while the question waits.
+    assert published[0] == {
+        "type": "session.journal.appended",
+        "conversation_id": SESSION,
+        "entry": _STATUS,
+    }
+
+
+async def test_a_question_is_raised_again_after_the_server_reconnects() -> None:
+    keys: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        keys.append(json.loads(request.content)["idempotency_key"])
+        return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": "elicit_journal_2"})
+
+    async def reconnect_then_answer() -> None:
+        while not pending_approvals.has_pending(SESSION):
+            await asyncio.sleep(0.01)
+        pending_approvals.notify_server_reconnect()
+        while len(keys) < 2:
+            await asyncio.sleep(0.01)
+        await _answer_when_asked("elicit_journal_2", (True, {"Deploy to prod now?": "Deploy"}))
+
+    async with _client(handler) as client:
+        helper = asyncio.create_task(reconnect_then_answer())
+        result = await _run(
+            client,
+            "sys_workflow_request_input",
+            {"step": "deploy", "questions": [_QUESTION]},
+            call_id="toolu_10",
+            publish_event=lambda *_: None,
+        )
+        await helper
+    assert keys == ["tool:toolu_10", "tool:toolu_10"]
+    assert result["answers"] == [{"question": "Deploy to prod now?", "answer": "Deploy"}]
+
+
+async def test_a_dismissed_question_tells_the_agent_not_to_ask_again() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"entry": _STATUS, "elicitation_id": "elicit_journal_3"})
+
+    async with _client(handler) as client:
+        answer = asyncio.create_task(_answer_when_asked("elicit_journal_3", (False, None)))
+        result = await _run(
+            client,
+            "sys_workflow_request_input",
+            {"step": "deploy", "questions": [_QUESTION]},
+            publish_event=lambda *_: None,
+        )
+        await answer
+    assert result["answered"] is False
+    assert "don't ask again this turn" in result["detail"]

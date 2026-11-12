@@ -106,6 +106,22 @@ def test_codex_mcp_config_overrides_isolate_the_bridge_relay(tmp_path: Path) -> 
     assert json.loads(raw_data_dir) == str(data_dir())
 
 
+def test_codex_gives_omnigent_tools_longer_than_the_runner_waits_for_a_person(
+    tmp_path: Path,
+) -> None:
+    """A tool waiting on a person, such as a workflow question, outlives Codex's 60 s default.
+
+    :param tmp_path: Stands in for the per-session bridge dir.
+    """
+    from omnigent.runner import pending_approvals
+
+    overrides = codex_mcp_config_overrides(tmp_path)
+
+    prefix = "mcp_servers.omnigent.tool_timeout_sec="
+    timeout = next(int(o[len(prefix) :]) for o in overrides if o.startswith(prefix))
+    assert timeout > pending_approvals._DEFAULT_WAIT_SECONDS
+
+
 def test_codex_mcp_config_overrides_pin_a_relative_data_dir_as_absolute(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

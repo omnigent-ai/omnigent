@@ -386,3 +386,100 @@ async def test_the_agents_tools_write_and_read_through_the_runner(
     unnamed = await run("sys_journal_write_status", {"status": "started"})
     assert unnamed["error"].startswith("invalid_entry: step is required")
     assert len(published) == count
+
+
+_DEPLOY_QUESTION = {
+    "question": "Approve the deploy to prod?",
+    "header": "Deploy",
+    "options": [{"label": "Approve"}, {"label": "Hold", "description": "Wait for the freeze"}],
+    "recommended": "Hold",
+}
+_ONE_TASK_PLAN = {
+    "name": "Ship it",
+    "steps": [{"id": "deploy", "name": "Deploy to prod", "depends_on": []}],
+}
+
+
+async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """``sys_workflow_request_input`` through the real route, up to the user's answer."""
+    import asyncio
+    import json
+
+    from omnigent.runner import pending_approvals
+    from omnigent.runner.journal_tools import execute_journal_tool
+    from omnigent.runtime import pending_elicitations
+
+    session_id = _session(db_uri)
+    client.headers.update(_headers())
+    published: list[dict[str, object]] = []
+
+    async def run(tool: str, args: dict[str, object], call_id: str | None = None) -> dict:
+        output = await execute_journal_tool(
+            tool,
+            json.dumps(args),
+            server_client=client,
+            conversation_id=session_id,
+            call_id=call_id,
+            publish_event=lambda _session, event: published.append(event),
+        )
+        return json.loads(output)
+
+    ask = {"step": "deploy", "questions": [_DEPLOY_QUESTION]}
+    no_plan = await run("sys_workflow_request_input", ask)
+    assert no_plan["error"] == "invalid_input: the session has no plan; write one first"
+    await run("sys_journal_write_plan", _ONE_TASK_PLAN)
+    elsewhere = await run("sys_workflow_request_input", {**ask, "step": "verify"})
+    assert elsewhere["error"] == "invalid_input: step 'verify' isn't in the current plan"
+
+    asking = asyncio.create_task(run("sys_workflow_request_input", ask, call_id="call_ask"))
+    # The server raises the question before it answers the runner, which then
+    # publishes the task's status; wait for both.
+    while (
+        not (pending := pending_elicitations.snapshot_for(session_id))
+        or published[-1]["entry"]["kind"] != "status"  # type: ignore[index]
+    ):
+        await asyncio.sleep(0.01)
+    # The question is in the Inbox's pending index, with the shared question form.
+    [event] = pending
+    params = event["params"]
+    assert params["message"] == "Waiting for you on Deploy to prod"
+    assert (params["phase"], params["journal_step"]) == ("workflow_request_input", "deploy")
+    assert params.get("policy_name") is None
+    [form] = params["ask_user_question"]["questions"]
+    assert [option["label"] for option in form["options"]] == ["Hold (recommended)", "Approve"]
+    # The task waits for the user, its status the question.
+    entry = published[-1]["entry"]
+    assert entry["step"] == "deploy"
+    assert entry["payload"] == {"status": "needs_input", "text": "Approve the deploy to prod?"}
+
+    while not pending_approvals.resolve(
+        event["elicitation_id"], True, {"Approve the deploy to prod?": "Approve"}
+    ):
+        await asyncio.sleep(0.01)
+    assert await asking == {
+        "answered": True,
+        "answers": [{"question": "Approve the deploy to prod?", "answer": "Approve"}],
+    }
+
+
+async def test_a_retried_workflow_question_reuses_its_status_and_question(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _session(db_uri)
+    journal = f"/v1/sessions/{session_id}/journal"
+    plan = await client.post(
+        journal, json=_write("plan", _ONE_TASK_PLAN, "tool:plan"), headers=_runner(session_id)
+    )
+    assert plan.status_code == 200, plan.text
+    body = {"step": "deploy", "questions": [_DEPLOY_QUESTION], "idempotency_key": "tool:ask"}
+    url = f"{journal}/input-requests"
+    first = await client.post(url, json=body, headers=_runner(session_id))
+    again = await client.post(url, json=body, headers=_runner(session_id))
+    assert first.status_code == 200, first.text
+    assert again.json() == first.json()
+    assert first.json()["elicitation_id"].startswith("elicit_journal_")
+    # Only the session's own runner asks.
+    refused = await client.post(url, json=body, headers=_headers())
+    assert refused.status_code == 403, refused.text
