@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 from fastapi import HTTPException
 
 from omnigent.entities import Conversation
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
@@ -184,8 +184,8 @@ def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentErr
     dispatch. Tell the two apart from the host record the caller already loaded:
 
     - **sharded** deployment and still **live** (online + fresh heartbeat) → up
-      on some replica, just not here → :data:`~ErrorCode.WRONG_REPLICA` (400) so
-      the client re-addresses WITHOUT the key.
+      on some replica, just not here → :class:`WrongReplicaError` (400) so the
+      client re-addresses with the slice key the response names.
     - otherwise → genuinely unreachable here → ``CONFLICT`` (409).
 
     On a single-replica deployment the local registry is authoritative: an
@@ -206,7 +206,7 @@ def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentErr
     if sharded is None:
         sharded = _deployment_is_sharded()
     if sharded and host_is_live(host):
-        return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
+        return WrongReplicaError("host is on another replica", host_id=host.host_id)
     return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
 
 

@@ -29,6 +29,8 @@ import {
 } from "@/lib/projectFolderPaginationPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
+import * as adminView from "@/lib/adminView";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   readTerminalClipboardPreference,
@@ -53,6 +55,8 @@ const mocks = vi.hoisted(() => ({
   // single_user: explicit single-user marker; false for accounts/OIDC/
   // multi-user-header. Gates the settings-route single-user redirect.
   singleUser: false,
+  adminViewSupported: true as boolean | undefined,
+  bootFallback: false,
   sessionTitleInstructions: false,
   nestedAgents: false,
   advisorAvailable: false,
@@ -60,6 +64,7 @@ const mocks = vi.hoisted(() => ({
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
+  effectiveAdmin: undefined as boolean | undefined,
   conversations: [] as Conversation[],
   conversationQuery: vi.fn(),
   // Optional multi-page dataset (array of per-page row arrays) for pagination
@@ -81,15 +86,19 @@ vi.mock("next-themes", () => ({
   }),
 }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({
-    accounts_enabled: mocks.accountsEnabled,
-    login_url: mocks.loginUrl,
-    single_user: mocks.singleUser,
-    sibling_sessions: mocks.nestedAgents,
-    enabled_connections: mocks.enabledConnections,
-    session_title_instructions: mocks.sessionTitleInstructions,
-    proactive_agent_available: mocks.advisorAvailable,
-  }),
+  useServerInfo: () =>
+    mocks.bootFallback
+      ? SERVER_INFO_OFFLINE_FALLBACK
+      : {
+          accounts_enabled: mocks.accountsEnabled,
+          login_url: mocks.loginUrl,
+          single_user: mocks.singleUser,
+          admin_view: mocks.adminViewSupported,
+          sibling_sessions: mocks.nestedAgents,
+          enabled_connections: mocks.enabledConnections,
+          session_title_instructions: mocks.sessionTitleInstructions,
+          proactive_agent_available: mocks.advisorAvailable,
+        },
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
   SessionTitleInstructionsControl: () => <div data-testid="mock-session-title-instructions" />,
@@ -104,7 +113,8 @@ vi.mock("@/lib/accountsApi", () => ({
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: (...args: unknown[]) => mocks.authenticatedFetch(...args),
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
-  getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
+  getCurrentIsAdmin: () => mocks.effectiveAdmin ?? mocks.me?.is_admin ?? false,
+  getCurrentAdminEligibility: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
   subscribeIdentity: () => () => {},
 }));
@@ -284,6 +294,8 @@ beforeEach(() => {
   mocks.theme = "system";
   mocks.isEmbedded = false;
   mocks.accountsEnabled = true;
+  mocks.adminViewSupported = true;
+  mocks.bootFallback = false;
   mocks.sessionTitleInstructions = false;
   mocks.nestedAgents = false;
   mocks.advisorAvailable = false;
@@ -292,6 +304,7 @@ beforeEach(() => {
   mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
+  mocks.effectiveAdmin = undefined;
   mocks.conversations = [];
   mocks.pages = undefined;
   mocks.projectNames = [];
@@ -408,6 +421,61 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+  it.each([
+    { supported: false, enabled: true, bootFallback: false },
+    { supported: false, enabled: false, bootFallback: false },
+    { supported: undefined, enabled: true, bootFallback: false },
+    { supported: undefined, enabled: false, bootFallback: true },
+  ])(
+    "hides admin view with support=$supported, preference=$enabled, boot=$bootFallback",
+    ({ supported, enabled, bootFallback }) => {
+      mocks.me = { id: "admin", is_admin: true };
+      mocks.adminViewSupported = supported;
+      mocks.bootFallback = bootFallback;
+      if (!enabled) document.cookie = "omnigent_admin_view=off; Path=/";
+      try {
+        renderPage("/settings/general");
+        expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
+      } finally {
+        document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
+      }
+    },
+  );
+
+  it("hides admin view in a workspace while on", () => {
+    mocks.me = { id: "admin", is_admin: true };
+    vi.spyOn(host, "isDatabricksWorkspace").mockReturnValue(true);
+    renderPage("/settings/general");
+    expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
+  });
+
+  it.each([
+    { workspace: false, supported: true, enabled: true },
+    { workspace: false, supported: true, enabled: false },
+    { workspace: true, supported: true, enabled: false },
+    { workspace: false, supported: undefined, enabled: false },
+  ])(
+    "changes admin view from $enabled (workspace=$workspace, support=$supported)",
+    ({ workspace, supported, enabled }) => {
+      mocks.me = { id: "admin", is_admin: true };
+      mocks.effectiveAdmin = enabled;
+      mocks.adminViewSupported = supported;
+      mocks.singleUser = false;
+      vi.spyOn(host, "isDatabricksWorkspace").mockReturnValue(workspace);
+      if (!enabled) document.cookie = "omnigent_admin_view=off; Path=/";
+      const update = vi.spyOn(adminView, "setAdminViewEnabled").mockImplementation(() => {});
+      try {
+        renderPage("/settings/general");
+        const control = screen.getByRole("switch", { name: "Admin view" });
+        expect(control).toHaveAttribute("aria-checked", String(enabled));
+        fireEvent.click(control);
+        expect(update).toHaveBeenCalledWith(!enabled);
+      } finally {
+        document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
+      }
+    },
+  );
+
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
     localStorage.removeItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY);
@@ -417,6 +485,7 @@ describe("SettingsPage", () => {
     renderPage("/settings/general");
 
     expect(screen.getByText("Configure general Omnigent behavior.")).toHaveClass("max-md:hidden");
+    expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
 
     for (const testId of [
       "settings-group-composer",

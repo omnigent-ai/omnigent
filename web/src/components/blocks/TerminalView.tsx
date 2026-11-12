@@ -622,13 +622,14 @@ export function TerminalView({
         await Promise.resolve();
         if (superseded()) return;
         // Browser WebSockets carry the host ID in the query string so they
-        // reach the replica holding the runner tunnel. Hostless sessions
-        // and direct connections need no routing key.
-        const computedHostId = (() => {
-          if (!isHostRoutingEnabled()) return undefined;
-          if (isDatabricksWorkspace() && keylessRef.current) return undefined;
+        // reach the replica holding the runner tunnel. A host proven keyless
+        // dials unkeyed; a hostless session carries the client's own key.
+        const routing = ((): { hostId?: string; unkeyed?: boolean } => {
+          if (!isHostRoutingEnabled()) return {};
+          if (isDatabricksWorkspace() && keylessRef.current) return { unkeyed: true };
           const h = getSessionHost(sessionId);
-          return h && (!isDatabricksWorkspace() || !isHostKeyless(h)) ? h : undefined;
+          if (!h) return {};
+          return !isDatabricksWorkspace() || !isHostKeyless(h) ? { hostId: h } : { unkeyed: true };
         })();
         const awaitLaunch = isTerminalLaunching(terminalId);
         dialedDuringLaunchRef.current = awaitLaunch;
@@ -636,8 +637,9 @@ export function TerminalView({
           sessionId,
           terminalId,
           readOnly,
-          computedHostId,
+          routing.hostId,
           awaitLaunch,
+          routing.unkeyed,
         );
         const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
         // Never keep the user waiting on the direct path: this resolves
@@ -1013,6 +1015,7 @@ export function buildAttachPath(
  * :param hostId: The session's host_id, forwarded as the routing key
  *     ``?omnigent_slice_key=``.
  * :param awaitLaunch: Wait for a terminal whose create is still in flight.
+ * :param unkeyed: Dial without a routing key (a host whose tunnels connected without one).
  * :returns: The fully-qualified ``ws(s)://`` URL.
  */
 function buildAttachUrl(
@@ -1021,8 +1024,14 @@ function buildAttachUrl(
   readOnly: boolean,
   hostId?: string,
   awaitLaunch = false,
+  unkeyed = false,
 ): string {
   // Delegates origin/prefix resolution to the embed host when present
   // (standalone falls back to the current page's origin).
-  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId, awaitLaunch));
+  return resolveWebSocketUrl(
+    buildAttachPath(sessionId, terminalId, readOnly, hostId, awaitLaunch),
+    {
+      unkeyed,
+    },
+  );
 }

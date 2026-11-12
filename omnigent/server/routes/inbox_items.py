@@ -177,8 +177,8 @@ def create_inbox_items_router(
 
     router = APIRouter(dependencies=[Depends(require_enabled)])
 
-    def _posting_agent(source_session_id: str) -> tuple[str, str | None]:
-        """Return the source session's agent id and bundle hash, if it may post."""
+    def _posting_agent(source_session_id: str) -> str:
+        """Return the source session's agent id, if it may post."""
         conversation = conversation_store.get_conversation(source_session_id)
         agent = (
             agent_store.get(conversation.agent_id)
@@ -206,7 +206,7 @@ def create_inbox_items_router(
                 "Inbox posts require an agent with the user_inbox tool group",
                 code=ErrorCode.FORBIDDEN,
             )
-        return agent.id, agent.bundle_location.rsplit("/", 1)[-1] or None
+        return agent.id
 
     @router.post("/inbox/items")
     async def create_inbox_item(request: Request, body: CreateInboxItemRequest) -> dict[str, Any]:
@@ -224,7 +224,7 @@ def create_inbox_items_router(
             )
         )
         assert source_session_id is not None
-        agent_id, prompt_version = await asyncio.to_thread(_posting_agent, source_session_id)
+        agent_id = await asyncio.to_thread(_posting_agent, source_session_id)
 
         links = [link.model_dump(exclude_none=True) for link in body.links]
         try:
@@ -256,7 +256,6 @@ def create_inbox_items_router(
             user_id=owner,
             source_session_id=source_session_id,
             agent_id=agent_id,
-            prompt_version=prompt_version,
             kind=body.kind,
             title=body.title,
             body_md=body.body_md,

@@ -33,6 +33,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
 from omnigent.db.envelope import EnvelopedJSON
+from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
 from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
@@ -1190,7 +1191,7 @@ class SqlComment(OmnigentBase):
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     anchor_metadata: Mapped[str | None] = mapped_column(
-        CompressedText(max_stored_bytes=1_024), nullable=True
+        CompressedText(max_stored_bytes=COMMENT_ANCHOR_MAX_STORED_BYTES), nullable=True
     )
 
     __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
@@ -1813,9 +1814,6 @@ class SqlInboxItem(OmnigentBase):
     # The session whose agent posted the item, and that agent.
     source_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
     agent_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
-    # Content hash of the agent bundle that posted the item, so acceptance can be
-    # compared across prompt revisions.
-    prompt_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Versioned duplicate key: a hash of the kind, primary link, and topic.
     dedupe_key: Mapped[str] = mapped_column(String(128), nullable=False)
     # INBOX_ITEM_STATUS code: unread, read, done, or dismissed.
@@ -1842,10 +1840,6 @@ class SqlInboxItem(OmnigentBase):
         CheckConstraint(
             "user_id IS NULL OR length(CAST(user_id AS BLOB)) <= 512",
             name="ck_inbox_items_user_id_bytes",
-        ).ddl_if(callable_=_on_sqlite_family),
-        CheckConstraint(
-            "prompt_version IS NULL OR length(CAST(prompt_version AS BLOB)) <= 256",
-            name="ck_inbox_items_prompt_version_bytes",
         ).ddl_if(callable_=_on_sqlite_family),
         CheckConstraint(
             "dedupe_key IS NULL OR length(CAST(dedupe_key AS BLOB)) <= 512",

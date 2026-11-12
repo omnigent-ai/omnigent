@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import telemetry
@@ -257,9 +257,10 @@ class RunnerRouter:
         if conv.runner_id:
             session = self._registry.get(conv.runner_id)
             if session is None:
-                raise OmnigentError(
+                raise self._runner_absent_error(
+                    conv,
+                    conv.runner_id,
                     f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
-                    code=self._runner_absent_code(routing_host_id(conv, self._conversation_store)),
                 )
             return RoutedRunner(
                 runner_id=conv.runner_id,
@@ -293,9 +294,10 @@ class RunnerRouter:
             return None
         session = self._registry.get(conv.runner_id)
         if session is None:
-            raise OmnigentError(
+            raise self._runner_absent_error(
+                conv,
+                conv.runner_id,
                 f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
-                code=self._runner_absent_code(routing_host_id(conv, self._conversation_store)),
             )
         return RoutedRunner(
             runner_id=conv.runner_id,
@@ -400,9 +402,10 @@ class RunnerRouter:
         """
         session = self._registry.get(runner_id)
         if session is None:
-            raise OmnigentError(
+            raise self._runner_absent_error(
+                conv,
+                runner_id,
                 f"runner {runner_id!r} is offline; resume the session to bind a registered runner",
-                code=self._runner_absent_code(routing_host_id(conv, self._conversation_store)),
             )
         if not _runner_supports_harness(session, harness):
             raise OmnigentError(
@@ -410,6 +413,27 @@ class RunnerRouter:
                 code=ErrorCode.RUNNER_CAPABILITY_MISMATCH,
             )
         return RoutedRunner(runner_id=runner_id, client=self._client_for_runner(runner_id))
+
+    def _runner_absent_error(
+        self, conv: Conversation, runner_id: str, offline_message: str
+    ) -> OmnigentError:
+        """
+        Return the error for a bound runner whose tunnel is not on this replica.
+
+        :param conv: The conversation bound to *runner_id*; its routing host
+            classifies the miss (see :meth:`_runner_absent_code`).
+        :param runner_id: The bound runner, e.g. ``"runner_0123456789abcdef"``.
+        :param offline_message: The message when the runner is genuinely offline.
+        :returns: A :class:`WrongReplicaError` naming the routing host, or a
+            ``RUNNER_UNAVAILABLE`` error with *offline_message*.
+        """
+        host_id = routing_host_id(conv, self._conversation_store)
+        code = self._runner_absent_code(host_id)
+        if host_id and code == ErrorCode.WRONG_REPLICA:
+            return WrongReplicaError(
+                f"runner {runner_id!r} is on another replica", host_id=host_id
+            )
+        return OmnigentError(offline_message, code=code)
 
     def _runner_absent_code(self, host_id: str | None) -> str:
         """
@@ -421,8 +445,8 @@ class RunnerRouter:
 
         - host set, absent from this replica's ``HostRegistry``, and still
           live elsewhere (``host_store.is_online``) → wrong replica. Return
-          :data:`~ErrorCode.WRONG_REPLICA` so the client re-addresses without
-          the key and reaches the host via the default route.
+          :data:`~ErrorCode.WRONG_REPLICA` so the client re-addresses with the
+          slice key the response names.
         - otherwise (no host, no registry/store wired, host is on this
           replica, or host not live anywhere) → genuinely offline. Return
           :data:`~ErrorCode.RUNNER_UNAVAILABLE`.

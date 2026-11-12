@@ -108,6 +108,7 @@ import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
+import { isFileComment } from "@/lib/localReviewComments";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
@@ -560,7 +561,7 @@ function FileViewerBody({
   // marked seen too.
   useEffect(() => {
     if (!open || !commentsOpen || commentsQuery.data === undefined) return;
-    markCommentsSeen(commentsQuery.data.map((c) => c.id));
+    markCommentsSeen(commentsQuery.data.filter(isFileComment).map((c) => c.id));
   }, [open, commentsOpen, commentsQuery.data]);
   // Notify parent when comments panel opens or closes (e.g. so the parent
   // can widen the inline panel to fit both the code viewer and comments).
@@ -648,7 +649,10 @@ function FileViewerBody({
 
   const sender = useOptionalCommentSender();
 
-  const allComments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data]);
+  const allComments = useMemo(
+    () => (commentsQuery.data ?? []).filter(isFileComment),
+    [commentsQuery.data],
+  );
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
   const [remapFormatted, setRemapFormatted] = useState<
     ((comment: Comment, content: string) => Comment) | null
@@ -677,14 +681,14 @@ function FileViewerBody({
     () => classifyAndRemapComments(allComments, fileContent, remapFormatted),
     [allComments, fileContent, remapFormatted],
   );
-  // Address All sends drafts from every file; this file's own query supplies its drafts.
+  // Address All sends Files drafts across paths; this file's own query supplies its drafts.
   // Until both lists load, a send would silently skip the unloaded list's drafts.
   const { ids: addressableCommentIds, fileCount: addressableFileCount } = useMemo(() => {
     if (!commentsQuery.data || !sessionCommentsQuery.data) return { ids: [], fileCount: 0 };
     const ids = new Set(openComments.map((c) => c.id));
     const paths = new Set(openComments.length > 0 ? [path] : []);
     for (const c of sessionCommentsQuery.data) {
-      if (c.status === "draft" && c.path !== path) {
+      if (isFileComment(c) && c.status === "draft" && c.path !== path) {
         ids.add(c.id);
         paths.add(c.path);
       }

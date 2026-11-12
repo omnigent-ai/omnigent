@@ -40,7 +40,6 @@ def test_upgrade_creates_table_and_downgrade_drops_it(tmp_path: Path) -> None:
         "user_id",
         "source_session_id",
         "agent_id",
-        "prompt_version",
         "dedupe_key",
         "status",
         "content",

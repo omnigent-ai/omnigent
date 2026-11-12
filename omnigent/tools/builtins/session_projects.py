@@ -109,8 +109,10 @@ class SysSessionUpdateTool(Tool):
             "unpins it for the user. archived: true archives it, which stops its runner "
             "and unpins it, so a running session's turn ends; archived: false restores "
             "it. Filing, renaming and pinning only change how the session is listed: a "
-            "running session, including this one, keeps working. This session cannot "
-            "archive itself. Sub-agent sessions follow their parent, and a family shares "
+            "running session, including this one, keeps working. This session can archive "
+            "itself, for example when its task is done: its runner stops once the current "
+            "turn ends. It cannot archive a session it runs under. Sub-agent sessions "
+            "follow their parent, and a family shares "
             "the project of the session its members list as moves_with. Call once per "
             "session."
         )
@@ -202,6 +204,48 @@ class SysProjectUpdateTool(Tool):
                         },
                     },
                     "required": ["project"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+
+class SysSessionLinkPrTool(Tool):
+    @classmethod
+    def name(cls) -> str:
+        return "sys_session_link_pr"
+
+    @classmethod
+    def description(cls) -> str:
+        return (
+            "Link or unlink a GitHub pull request in a session's PR panel. "
+            "Defaults to the current session; another session requires edit access. "
+            "Its host or runner must be online and able to read the PR. "
+            "Requires scripted sessions enabled on the server and a private or "
+            "read-only-shared calling session. This updates the association only."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name(),
+                "description": self.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Target session; omit for this session.",
+                        },
+                        "url": {"type": "string", "description": "GitHub pull request URL."},
+                        "action": {
+                            "type": "string",
+                            "enum": ["attach", "remove"],
+                            "description": "Defaults to attach.",
+                        },
+                    },
+                    "required": ["url"],
                     "additionalProperties": False,
                 },
             },

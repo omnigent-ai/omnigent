@@ -26,7 +26,6 @@ def _new(dedupe_key: str = "v1:aaa", user_id: str = "alice", **overrides: object
         "user_id": user_id,
         "source_session_id": _SESSION,
         "agent_id": "a" * 32,
-        "prompt_version": "b" * 64,
         "kind": "followup",
         "title": "Ramp up the flag",
         "body_md": "The PR merged yesterday.",
