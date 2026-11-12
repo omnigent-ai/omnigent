@@ -8891,6 +8891,153 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("server_copy_expired", [True, False])
+@pytest.mark.parametrize("parked_response_id", [None, "resp_" + "c" * 32])
+async def test_relay_records_queued_native_messages_reported_after_a_long_prompt_wait(
+    monkeypatch: pytest.MonkeyPatch,
+    parked_response_id: str | None,
+    server_copy_expired: bool,
+) -> None:
+    """Messages the runner reports as not sent after a long prompt wait stay visible.
+
+    Two web messages are queued behind an unanswered native prompt. When the
+    runner's human-wait hold runs out, it reports each message as an
+    input-only failure under its own response id, carrying its content, while
+    the turn is still parked. Each must become the user message plus its
+    not-sent error under that id and be published live. That holds both when
+    the server's queued copies outlived their TTL and when they are still
+    there. The parked turn, with or without a tracked response, keeps its
+    status and response id.
+    """
+    from omnigent.runner.app import _prompt_wait_expired_failure
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    texts = ["first follow-up", "second follow-up"]
+    bodies = []
+    for text, stable_id in zip(
+        texts,
+        ["7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d", "8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e"],
+        strict=True,
+    ):
+        content = [{"type": "input_text", "text": text}]
+        pending_id = pending_inputs.record(
+            session_id, content, created_by="alice@example.com", stable_id=stable_id
+        )
+        identity = pending_inputs.delivery_attributes_for(session_id, pending_id)
+        bodies.append({"type": "message", "content": content, **identity})
+    if server_copy_expired:
+        clock["t"] += pending_inputs._TTL_S + 1
+        assert pending_inputs.snapshot_for(session_id) == []
+    failures = [_prompt_wait_expired_failure(body) for body in bodies]
+    failure_ids = [failure["response"]["id"] for failure in failures]  # type: ignore[index]
+
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _session_id, event: published.append(event)
+    )
+    store = _ConversationStore()
+    # No saved startup inputs: the server's only copies were the expired ones.
+    store.list_pending_inputs = lambda _conversation_id: []  # type: ignore[attr-defined]
+    parked_turn = (
+        [
+            _sse_frame(
+                {
+                    "type": "response.in_progress",
+                    "response": {"id": parked_response_id, "model": "claude"},
+                }
+            )
+        ]
+        if parked_response_id is not None
+        else []
+    )
+    parked_turn_ends = (
+        [
+            _sse_frame({"type": "response.output_text.delta", "delta": "all done"}),
+            _sse_frame(
+                {
+                    "type": "response.completed",
+                    "response": {"id": parked_response_id, "status": "completed"},
+                }
+            ),
+        ]
+        if parked_response_id is not None
+        else []
+    )
+    client = _ScriptedStreamingRunnerClient(
+        [
+            *parked_turn,
+            _sse_frame(
+                {"type": "session.status", "status": "running", "blocked_on": "permission prompt"}
+            ),
+            *[_sse_frame(failure) for failure in failures],
+            *parked_turn_ends,
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    try:
+        await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
+
+        recorded = [
+            (item.type, item.response_id)
+            for item in store.appended_items
+            if item.response_id in failure_ids
+        ]
+        assert recorded == [
+            ("message", failure_ids[0]),
+            ("error", failure_ids[0]),
+            ("message", failure_ids[1]),
+            ("error", failure_ids[1]),
+        ]
+        messages = [
+            item
+            for item in store.appended_items
+            if item.type == "message" and item.response_id in failure_ids
+        ]
+        assert ["".join(b["text"] for b in m.data.content) for m in messages] == texts
+        assert all(m.data.role == "user" and m.data.user_authored for m in messages)
+        assert [m.created_by for m in messages] == [
+            None if server_copy_expired else "alice@example.com"
+        ] * 2
+        assert pending_inputs.snapshot_for(session_id) == []
+        errors = [
+            item
+            for item in store.appended_items
+            if item.type == "error" and item.response_id in failure_ids
+        ]
+        assert [e.data.code for e in errors] == ["native_prompt_wait_expired"] * 2
+        live = [event for event in published if event.get("type") == "response.failed"]
+        assert [event["response"]["id"] for event in live] == failure_ids
+        consumed = [event for event in published if event.get("type") == "session.input.consumed"]
+        assert [event["data"]["cleared_pending_id"] for event in consumed] == [
+            body["pending_id"] for body in bodies
+        ]
+        # The parked turn is untouched: still running, never failed.
+        assert not [
+            event
+            for event in published
+            if event.get("type") == "session.status" and event.get("status") == "failed"
+        ]
+        if parked_response_id is None:
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+        else:
+            # Its own reply still persists under its own response id.
+            assert [
+                item.response_id
+                for item in store.appended_items
+                if item.type == "message" and item.data.role == "assistant"
+            ] == [parked_response_id]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

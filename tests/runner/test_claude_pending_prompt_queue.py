@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import copy
 import logging
+import re
 import threading
 import uuid
 from collections.abc import Callable
@@ -512,12 +513,25 @@ async def test_unanswered_prompt_reports_queued_messages_then_releases_runner(
                     failure["input_stable_id"],
                     failure["error"]["code"],
                     failure["error"]["undelivered"],
+                    failure["input_only"],
+                    failure["input_content"],
                 )
                 for failure in failures
             ] == [
-                (body["pending_id"], body["input_stable_id"], "native_prompt_wait_expired", True)
+                (
+                    body["pending_id"],
+                    body["input_stable_id"],
+                    "native_prompt_wait_expired",
+                    True,
+                    True,
+                    body["content"],
+                )
                 for body in queued
             ]
+            # Each failure names its own response, not the parked turn's.
+            response_ids = [failure["response"]["id"] for failure in failures]
+            assert all(re.fullmatch(r"resp_[0-9a-f]{32}", rid) for rid in response_ids)
+            assert len(set(response_ids)) == len(queued)
         finally:
             monitor.cancel()
             with contextlib.suppress(asyncio.CancelledError):

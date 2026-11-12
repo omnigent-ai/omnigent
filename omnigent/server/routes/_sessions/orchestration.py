@@ -411,6 +411,7 @@ from omnigent.server.subagent_activity import (
     record_claude_subagent_return,
     record_subagent_activity,
 )
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -3548,6 +3549,93 @@ def _failed_event_undelivered(event: Mapping[str, Any]) -> bool:
     return isinstance(raw_error, dict) and raw_error.get("undelivered") is True
 
 
+_INPUT_ONLY_FAILURE_RESPONSE_ID_RE = re.compile(r"resp_[0-9a-f]{32}")
+
+
+def _input_only_failure_response_id(event: Mapping[str, Any]) -> str | None:
+    """
+    Return the response id of a runner failure that reports one queued input alone.
+
+    The runner sends one such ``response.failed`` per message it held for a
+    native prompt nobody answered, each under its own response id and marked
+    ``input_only``. It is not the end of the session's tracked turn, which may
+    still be parked on that prompt.
+
+    :param event: Runner SSE event.
+    :returns: The failure's own response id, e.g. ``"resp_<32 hex>"``, or
+        ``None`` when the event is not an input-only undelivered failure.
+    """
+    if event.get("type") != "response.failed" or event.get("input_only") is not True:
+        return None
+    if not _failed_event_undelivered(event):
+        return None
+    raw_response = event.get("response")
+    response_id = raw_response.get("id") if isinstance(raw_response, dict) else None
+    if isinstance(response_id, str) and _INPUT_ONLY_FAILURE_RESPONSE_ID_RE.fullmatch(response_id):
+        return response_id
+    return None
+
+
+def _undelivered_input_content(event: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    """
+    Return the message content a runner sent with an undelivered input, within limits.
+
+    Used only when the server's own queued copy is gone (its TTL ran out), so
+    the message can still be recorded. Content larger than a session event
+    request could carry is ignored.
+
+    :param event: Runner ``response.failed`` event.
+    :returns: Content blocks, e.g. ``[{"type": "input_text", "text": "hi"}]``,
+        or ``None`` when absent, malformed or too large.
+    """
+    raw = event.get("input_content")
+    if not isinstance(raw, list) or not raw or not all(isinstance(b, dict) for b in raw):
+        return None
+    try:
+        encoded = json.dumps(raw, separators=(",", ":")).encode()
+    except (TypeError, ValueError):
+        return None
+    if len(encoded) > MAX_SESSION_EVENT_REQUEST_BYTES:
+        return None
+    return raw
+
+
+async def _settle_input_only_failure(
+    conversation_store: ConversationStore | None,
+    session_id: str,
+    event: dict[str, Any],
+    response_id: str,
+) -> None:
+    """
+    Record a queued input the runner reports as not delivered, under its own response.
+
+    Commits the message (from the server's queued copy, else the content the
+    runner sent) and its error item, both under the failure's own response id,
+    so neither borrows the session's tracked turn.
+
+    :param conversation_store: Store to append to; ``None`` skips persistence.
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param event: The runner's input-only ``response.failed`` event.
+    :param response_id: The failure's own response id.
+    """
+    input_stable_id = event.get("input_stable_id")
+    pending_id = event.get("pending_id")
+    delivery_attempt_id = event.get("delivery_attempt_id")
+    await _settle_undelivered_native_input(
+        conversation_store,
+        session_id,
+        response_id,
+        input_stable_id if isinstance(input_stable_id, str) else None,
+        reason_code=_native_input_reason_code(event),
+        pending_id=pending_id if isinstance(pending_id, str) else None,
+        delivery_attempt_id=delivery_attempt_id if isinstance(delivery_attempt_id, str) else None,
+        fallback_content=_undelivered_input_content(event),
+    )
+    error_item = _error_item_from_sse(event, response_id=response_id)
+    if error_item is not None:
+        await _relay_persist_error_once(conversation_store, session_id, error_item)
+
+
 _NATIVE_INPUT_LIFECYCLE_STAGES: dict[str, pending_inputs.NativeInputDeliveryStage] = {
     "response.in_progress": "native_turn_started",
     "response.completed": "native_turn_completed",
@@ -3623,6 +3711,7 @@ async def _settle_undelivered_native_input(
     *,
     pending_id: str | None = None,
     delivery_attempt_id: str | None = None,
+    fallback_content: list[dict[str, Any]] | None = None,
 ) -> None:
     """
     Commit a failed native turn's own queued web message as a user item.
@@ -3646,9 +3735,13 @@ async def _settle_undelivered_native_input(
     :param input_stable_id: The web stable id the runner stamped on the failed
         turn, passed only when the harness reported the failure as undelivered;
         callers without one must supply both server identity fields.
+    :param fallback_content: The message content the runner sent, committed
+        only when no queued entry matches (its TTL ran out); ``None`` settles
+        nothing in that case.
     """
     if input_stable_id is None and (pending_id is None or delivery_attempt_id is None):
         return
+    reported_pending_id = pending_id
     if input_stable_id is not None:
         # Restoring durable inputs regenerates their transient server identities.
         pending_id = None
@@ -3686,6 +3779,15 @@ async def _settle_undelivered_native_input(
         await restore_pending_inputs(conversation_store, session_id)
         matched_pending_id = mark_rejected_input()
     if matched_pending_id is None:
+        if fallback_content is not None:
+            await _commit_undelivered_input_content(
+                conversation_store,
+                session_id,
+                response_id,
+                fallback_content,
+                input_stable_id=input_stable_id,
+                pending_id=reported_pending_id,
+            )
         return
     drained = pending_inputs.resolve(session_id, matched_pending_id)
     if drained is None:
@@ -3728,6 +3830,79 @@ async def _settle_undelivered_native_input(
             ),
         )
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
+
+
+async def _commit_undelivered_input_content(
+    conversation_store: ConversationStore,
+    session_id: str,
+    response_id: str | None,
+    content: list[dict[str, Any]],
+    *,
+    input_stable_id: str | None,
+    pending_id: str | None,
+) -> None:
+    """
+    Commit an undelivered input from the content the runner sent, as a user item.
+
+    The server's queued copy expired, so this is the message's last copy. The
+    stable id is derived from the input's identity, so a relay retry appends
+    nothing twice.
+
+    :param conversation_store: Store to append to.
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param response_id: The failure's response id; ``None`` mints one.
+    :param content: Bounded content blocks from the runner.
+    :param input_stable_id: The web client's stable id, when it sent one.
+    :param pending_id: The server pending id, used when there is no stable id.
+    """
+    stable_id = (
+        input_stable_id
+        or uuid.uuid5(
+            uuid.NAMESPACE_URL, f"omnigent-undelivered-native-user:{session_id}:{pending_id}"
+        ).hex
+    )
+    try:
+        item = NewConversationItem(
+            type="message",
+            response_id=response_id or generate_task_id(),
+            data=MessageData(role="user", content=content, user_authored=True),
+            stable_id=stable_id,
+            replaces_pending_id=input_stable_id,
+        )
+    except ValidationError:
+        _logger.warning(
+            "Relay: undelivered native message content for session=%s is not a message",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return
+    try:
+        persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
+    except Exception:  # noqa: BLE001 — the error item that follows still records the failure
+        _logger.exception(
+            "Relay: could not persist the undelivered native message for session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return
+    if not persisted[0].deduplicated:
+        log_input_event(
+            _logger,
+            "native_input_settled",
+            session_id=session_id,
+            attributes={
+                key: value
+                for key, value in {
+                    "input_stable_id": input_stable_id,
+                    "pending_id": pending_id,
+                }.items()
+                if value is not None
+            },
+            outcome="reported_undelivered_from_runner_copy",
+            item_id=persisted[0].id,
+            response_id=persisted[0].response_id,
+        )
+    _publish_input_consumed(session_id, persisted[0], cleared_pending_id=pending_id)
 
 
 def _restore_drained_inputs(
@@ -9625,6 +9800,17 @@ async def _relay_runner_stream_once(
                         continue
 
                     _record_native_input_lifecycle(session_id, event)
+
+                    # A failure for one queued input under its own response id leaves the
+                    # tracked turn (still parked on its prompt) untouched.
+                    if (
+                        input_only_response_id := _input_only_failure_response_id(event)
+                    ) is not None:
+                        await _settle_input_only_failure(
+                            conversation_store, session_id, event, input_only_response_id
+                        )
+                        session_stream.publish(session_id, event)
+                        continue
 
                     # A pane-inferred reason only annotates a running turn. Publishing it
                     # without yielding keeps a hook's concurrent completion authoritative.

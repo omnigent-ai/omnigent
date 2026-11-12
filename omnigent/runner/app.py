@@ -219,6 +219,7 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.util.dedicated_executor import DedicatedExecutor
@@ -423,6 +424,39 @@ _PROMPT_WAIT_EXPIRED_MESSAGE = (
     "Omnigent stopped waiting and the message was not sent. Answer the prompt in "
     "the terminal, then send the message again."
 )
+
+
+def _prompt_wait_expired_failure(body: Mapping[str, Any]) -> _JsonObject:
+    """
+    Build the failure for one message queued behind a prompt that went unanswered.
+
+    It names the message, not the session's turn: ``input_only`` with its own
+    response id, so the server records it without ending a turn still parked
+    on the prompt. It carries the message content, within the session event
+    request limit, because the server's queued copy may have expired by then.
+
+    :param body: The queued message body, e.g. ``{"type": "message", "content": [...]}``.
+    :returns: A ``response.failed`` event.
+    """
+    payload = _response_failed_payload(
+        {
+            "code": "native_prompt_wait_expired",
+            "message": _PROMPT_WAIT_EXPIRED_MESSAGE,
+            "undelivered": True,
+        },
+        input_identity=_input_identity(body),
+    )
+    payload["input_only"] = True
+    cast(_JsonObject, payload["response"])["id"] = f"resp_{uuid.uuid4().hex}"
+    content = body.get("content")
+    if isinstance(content, list) and content:
+        try:
+            encoded = json.dumps(content, separators=(",", ":")).encode()
+        except (TypeError, ValueError):
+            encoded = None
+        if encoded is not None and len(encoded) <= MAX_SESSION_EVENT_REQUEST_BYTES:
+            payload["input_content"] = content
+    return payload
 
 
 def _on_event_loop() -> bool:
@@ -1728,8 +1762,9 @@ def create_runner_app(
 
         The runner accepted these messages (``202 buffered``) but holds them only in
         memory, so letting it idle out would lose them silently. Each one becomes an
-        undelivered ``response.failed``, which the server records with the message,
-        so the person sees it was not sent and can send it again.
+        input-only undelivered ``response.failed`` (see
+        :func:`_prompt_wait_expired_failure`), which the server records with the
+        message, so the person sees it was not sent and can send it again.
         """
         if _claude_prompt_waiters.get(session_id) is not waiter or session_id in _active_turns:
             return
@@ -1744,17 +1779,7 @@ def create_runner_app(
             extra={"session_id": session_id},
         )
         for body in queued:
-            _publish_event(
-                session_id,
-                _response_failed_payload(
-                    {
-                        "code": "native_prompt_wait_expired",
-                        "message": _PROMPT_WAIT_EXPIRED_MESSAGE,
-                        "undelivered": True,
-                    },
-                    input_identity=_input_identity(body),
-                ),
-            )
+            _publish_event(session_id, _prompt_wait_expired_failure(body))
 
     def _human_wait_holds(session_ids: set[str], approval_waits: dict[str, list[str]]) -> bool:
         """Whether a session parked on a human still holds the idle watchdog open.
