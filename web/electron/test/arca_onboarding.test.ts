@@ -1,21 +1,40 @@
-"use strict";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const { buildSetupArgs, startArcaSetup, SETUP_TIMEOUT_MS } = require("../src/arca_onboarding");
-const { buildConnectArgs, CONNECT_TIMEOUT_MS } = require("../src/arca");
+import { buildConnectArgs, CONNECT_TIMEOUT_MS } from "../src/arca.ts";
+import {
+  buildSetupArgs,
+  startArcaSetup,
+  SETUP_TIMEOUT_MS,
+  type ArcaSetupResult,
+  type StartArcaSetupDeps,
+} from "../src/arca_onboarding.ts";
 
-function fakeChild() {
-  const child = new EventEmitter();
-  child.stdout = new EventEmitter();
-  child.stderr = new EventEmitter();
-  child.signals = [];
-  child.kill = (signal) => child.signals.push(signal);
-  return child;
+class FakeChild extends EventEmitter {
+  stdout = new EventEmitter();
+  stderr = new EventEmitter();
+  signals: (NodeJS.Signals | undefined)[] = [];
+
+  kill(signal?: NodeJS.Signals) {
+    this.signals.push(signal);
+  }
 }
 
-function setup(child, options = {}) {
+function fakeChild() {
+  return new FakeChild();
+}
+
+/** The result's failure fields, or undefined after a success. */
+function failureOf(result: ArcaSetupResult) {
+  return result.ok ? undefined : result;
+}
+
+/** `onOutput` is not a setup option; passing one checks that nothing reaches it. */
+function setup(
+  child: FakeChild,
+  options: StartArcaSetupDeps & { onOutput?: (text: string) => void } = {},
+) {
   return startArcaSetup("https://account.databricks.com/omnigent?o=123", {
     resolveArcaPath: () => "/fixture/arca",
     spawn: () => child,
@@ -60,7 +79,7 @@ describe("Arca onboarding setup", () => {
 
   it("keeps both sign-ins private and waits for process completion", async () => {
     const child = fakeChild();
-    const output = [];
+    const output: string[] = [];
     const run = setup(child, {
       spawn: (_file, _args, options) => {
         assert.equal(options.detached, true);
@@ -71,7 +90,7 @@ describe("Arca onboarding setup", () => {
     });
     child.stdout.emit("data", "Isaac login: https://example.com/oauth?state=SECRET");
     child.stderr.emit("data", "Omnigent login: https://example.com/auth/login?ticket=SECRET");
-    let result;
+    let result: ArcaSetupResult | undefined;
     void run.promise.then((value) => {
       result = value;
     });
@@ -91,7 +110,7 @@ describe("Arca onboarding setup", () => {
     ["OMNIGENT_AUTH_REQUIRED", 1, "omni-auth"],
     ["https://example.com/auth/login?ticket=SECRET", 1, "unknown"],
     ["private SSH details", 255, "unreachable"],
-  ]) {
+  ] as const) {
     it(`reports ${errorKind} without exposing private output (exit ${code})`, async () => {
       const child = fakeChild();
       const run = setup(child);
@@ -100,7 +119,7 @@ describe("Arca onboarding setup", () => {
       child.emit("exit", code);
       child.emit("close", code);
       const result = await run.promise;
-      assert.equal(result.ok, false);
+      assert.ok(!result.ok);
       assert.equal(result.errorKind, errorKind);
       assert.doesNotMatch(JSON.stringify(result), /SECRET|ticket=|private SSH/);
     });
@@ -114,6 +133,7 @@ describe("Arca onboarding setup", () => {
     child.emit("close", 1);
 
     const result = await run.promise;
+    assert.ok(!result.ok);
     assert.equal(
       result.error,
       "Arca setup didn't complete. Check Arca Companion, finish browser sign-in, and try again.",
@@ -131,7 +151,7 @@ describe("Arca onboarding setup", () => {
     run.cancel();
     child.emit("exit", null);
     child.emit("close", null);
-    assert.equal((await run.promise).canceled, true);
+    assert.equal(failureOf(await run.promise)?.canceled, true);
     assert.deepEqual(child.signals, ["SIGTERM"]);
     await new Promise((resolve) => {
       setTimeout(resolve, 15);
@@ -144,7 +164,7 @@ describe("Arca onboarding setup", () => {
     const run = setup(child);
     child.emit("exit", 0);
     run.cancel();
-    assert.equal((await run.promise).canceled, true);
+    assert.equal(failureOf(await run.promise)?.canceled, true);
     await new Promise((resolve) => {
       setTimeout(resolve, 15);
     });
@@ -157,6 +177,7 @@ describe("Arca onboarding setup", () => {
     const child = fakeChild();
     const run = setup(child, { timeoutMs: 5 });
     const result = await run.promise;
+    assert.ok(!result.ok);
     assert.equal(result.errorKind, "timeout");
     assert.equal(result.errorMessage, "Arca sign-in timed out.");
     assert.equal(

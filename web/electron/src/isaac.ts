@@ -1,18 +1,15 @@
-"use strict";
-
 /**
  * Locate the `isaac` launcher for desktop host enrollment.
  * GUI-launched Electron inherits a minimal PATH, so mirror the Omnigent/Arca
  * resolver pattern: PATH first, then well-known macOS install locations.
  */
 
-const { execFileSync } = require("node:child_process");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-/** @returns {string[]} */
-function candidatePaths() {
+export function candidatePaths(): string[] {
   const home = os.homedir();
   return [
     "/usr/local/bin/isaac",
@@ -21,8 +18,7 @@ function candidatePaths() {
   ];
 }
 
-/** @param {string} value @returns {boolean} */
-function isExecutableFile(value) {
+function isExecutableFile(value: string): boolean {
   try {
     if (!fs.statSync(value).isFile()) return false;
     fs.accessSync(value, fs.constants.X_OK);
@@ -32,8 +28,7 @@ function isExecutableFile(value) {
   }
 }
 
-/** @returns {string | null} */
-function whichIsaac() {
+function whichIsaac(): string | null {
   try {
     const out = execFileSync("/bin/sh", ["-c", "command -v isaac"], { encoding: "utf8" });
     return out.trim() || null;
@@ -42,15 +37,14 @@ function whichIsaac() {
   }
 }
 
-/**
- * @param {{
- *   isExecutableFile?: (value: string) => boolean,
- *   whichIsaac?: () => string | null,
- *   candidatePaths?: () => string[],
- * }} [deps]
- * @returns {string | null}
- */
-function resolveIsaacPath(deps = {}) {
+/** Probes {@link resolveIsaacPath} uses; each defaults to the real one. */
+export interface ResolveIsaacPathDeps {
+  isExecutableFile?: ((value: string) => boolean) | undefined;
+  whichIsaac?: (() => string | null) | undefined;
+  candidatePaths?: (() => string[]) | undefined;
+}
+
+export function resolveIsaacPath(deps: ResolveIsaacPathDeps = {}): string | null {
   const isExec = deps.isExecutableFile || isExecutableFile;
   const onPath = (deps.whichIsaac || whichIsaac)();
   if (onPath && isExec(onPath)) return onPath;
@@ -59,5 +53,3 @@ function resolveIsaacPath(deps = {}) {
   }
   return null;
 }
-
-module.exports = { candidatePaths, resolveIsaacPath };

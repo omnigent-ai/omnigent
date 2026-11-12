@@ -1,5 +1,3 @@
-"use strict";
-
 /**
  * Arca host connection.
  *
@@ -18,25 +16,35 @@
  * injected so everything is unit-testable without Electron or a real arca.
  */
 
-const { execFile, execFileSync, spawn } = require("node:child_process");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
-const { StringDecoder } = require("node:string_decoder");
-const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity.ts");
+import { execFile, execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
+
+import {
+  readArcaIdentity,
+  IDENTITY_START,
+  IDENTITY_END,
+  type ArcaIdentity,
+} from "./arcaIdentity.ts";
+import type { ArcaExtendMode, DbcertRefreshResult, DbcertStatusResult } from "./ipc/bridge.ts";
 
 /**
  * Connecting may cold-start the EC2 instance, which takes minutes — give the
  * whole ssh + remote daemon startup a generous ceiling.
  */
-const CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
-const STATUS_TIMEOUT_MS = 60_000;
-const EXTEND_TIMEOUT_MS = 120_000;
+export const CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
+export const STATUS_TIMEOUT_MS = 60_000;
+export const EXTEND_TIMEOUT_MS = 120_000;
 /** A dbcert refresh waits for the user to finish its browser sign-in. */
-const DBCERT_REFRESH_TIMEOUT_MS = 5 * 60 * 1000;
+export const DBCERT_REFRESH_TIMEOUT_MS = 5 * 60 * 1000;
 const DBCERT_STATUS_TIMEOUT_MS = 10_000;
 const DBCERT_ARCA_SYNC_TIMEOUT_MS = 60_000;
-const ARCA_EXTEND_MODES = Object.freeze(["overnight", "workweek"]);
+export const ARCA_EXTEND_MODES: readonly ArcaExtendMode[] = Object.freeze([
+  "overnight",
+  "workweek",
+]);
 const ARCA_AUTH_RE = /arca (auth )?login|certificate.*expired|permission denied \(publickey/i;
 const MAX_CLI_OUTPUT_BYTES = 256 * 1024;
 
@@ -48,20 +56,41 @@ const MAX_CLI_OUTPUT_BYTES = 256 * 1024;
  * query — URL-legal but shell-hostile. Allowlist, not escape: a URL outside
  * this set is refused outright.
  */
-const SAFE_URL_RE = /^[A-Za-z0-9\-._~:/?=&%]+$/;
+export const SAFE_URL_RE = /^[A-Za-z0-9\-._~:/?=&%]+$/;
 
-/**
- * @typedef {"timeout" | "omni-auth" | "arca-auth" | "missing-remote-cli" | "unreachable" | "not-installed" | "no-instance" | "runtime-limit" | "unknown"} ArcaErrorKind
- */
+export type ArcaErrorKind =
+  | "timeout"
+  | "omni-auth"
+  | "arca-auth"
+  | "missing-remote-cli"
+  | "unreachable"
+  | "not-installed"
+  | "no-instance"
+  | "runtime-limit"
+  | "unknown";
+
+/** A property of an untrusted value, read the way `value?.[key]` would. */
+function propertyOf(value: unknown, key: string): unknown {
+  return value == null ? undefined : (value as Record<string, unknown>)[key];
+}
+
+/** `error.message` as plain property access reads it: a thrown null or undefined throws here. */
+function messageOf(error: unknown): unknown {
+  return (error as { message?: unknown }).message;
+}
+
+/** A child's exit code as Node reports it on `exit` and `close`. */
+function exitCodeOf(value: unknown): number | null {
+  // Node passes a number, or null after a signal; the cast keeps the value as is.
+  return value as number | null;
+}
 
 /**
  * Well-known install locations for the arca binary. Probed because a
  * GUI-launched Electron app inherits a minimal PATH (mirrors the omnigent CLI
  * resolution in omnigent_cli.ts).
- *
- * @returns {string[]}
  */
-function candidatePaths() {
+function candidatePaths(): string[] {
   const home = os.homedir();
   return [
     "/usr/local/bin/arca",
@@ -70,13 +99,8 @@ function candidatePaths() {
   ];
 }
 
-/**
- * True when `p` exists, is a regular file, and is executable by this process.
- *
- * @param {string} p
- * @returns {boolean}
- */
-function isExecutableFile(p) {
+/** True when `p` exists, is a regular file, and is executable by this process. */
+export function isExecutableFile(p: string): boolean {
   try {
     if (!fs.statSync(p).isFile()) return false;
     fs.accessSync(p, fs.constants.X_OK);
@@ -89,10 +113,8 @@ function isExecutableFile(p) {
 /**
  * Resolve `arca` on PATH via the shell (so login-shell PATHs resolve), else
  * null. Arca is macOS-only, so no Windows branch.
- *
- * @returns {string | null}
  */
-function whichArca() {
+function whichArca(): string | null {
   try {
     const out = execFileSync("/bin/sh", ["-c", "command -v arca"], { encoding: "utf8" });
     return out.trim() || null;
@@ -101,18 +123,24 @@ function whichArca() {
   }
 }
 
+/** Probes {@link resolveArcaPath} uses; each defaults to the real one. */
+export interface ResolveArcaPathDeps {
+  isExecutableFile?: ((p: string) => boolean) | undefined;
+  whichArca?: (() => string | null) | undefined;
+  candidatePaths?: (() => string[]) | undefined;
+}
+
+/** Probes {@link resolveArcaPathAsync} uses; PATH is always probed through the shell. */
+export interface ResolveArcaPathAsyncDeps {
+  isExecutableFile?: ((p: string) => boolean) | undefined;
+  candidatePaths?: (() => string[]) | undefined;
+}
+
 /**
  * Locate the arca binary: PATH first, then well-known locations. Null when
  * arca isn't installed on this machine.
- *
- * @param {{
- *   isExecutableFile?: (p: string) => boolean,
- *   whichArca?: () => string | null,
- *   candidatePaths?: () => string[],
- * }} [deps]
- * @returns {string | null}
  */
-function resolveArcaPath(deps = {}) {
+export function resolveArcaPath(deps: ResolveArcaPathDeps = {}): string | null {
   const isExec = deps.isExecutableFile || isExecutableFile;
   const onPath = (deps.whichArca || whichArca)();
   if (onPath && isExec(onPath)) return onPath;
@@ -125,14 +153,8 @@ function resolveArcaPath(deps = {}) {
 /**
  * {@link resolveArcaPath} without blocking the caller: the PATH probe runs the
  * shell asynchronously, so the Electron main process never stalls on it.
- *
- * @param {{
- *   isExecutableFile?: (p: string) => boolean,
- *   candidatePaths?: () => string[],
- * }} [deps]
- * @returns {Promise<string | null>}
  */
-function resolveArcaPathAsync(deps = {}) {
+export function resolveArcaPathAsync(deps: ResolveArcaPathAsyncDeps = {}): Promise<string | null> {
   return new Promise((resolve) => {
     execFile("/bin/sh", ["-c", "command -v arca"], { encoding: "utf8" }, (error, stdout) => {
       const onPath = error ? null : String(stdout).trim() || null;
@@ -145,11 +167,9 @@ function resolveArcaPathAsync(deps = {}) {
  * Build the arca argv that connects the instance to `serverUrl`. Everything
  * after "ssh" is passed through to ssh and runs as the remote command.
  *
- * @param {string} serverUrl
- * @param {boolean} [login] Prepare the remote grant instead of starting a host.
- * @returns {string[]}
+ * @param login Prepare the remote grant instead of starting a host.
  */
-function buildArcaArgs(serverUrl, login = false) {
+function buildArcaArgs(serverUrl: string, login = false): string[] {
   const url = new URL(serverUrl);
   if (url.protocol !== "https:" && url.protocol !== "http:") {
     throw new Error(`unsupported server URL scheme: ${url.protocol}`);
@@ -197,12 +217,30 @@ function buildArcaArgs(serverUrl, login = false) {
   ];
 }
 
-function buildConnectArgs(serverUrl) {
+export function buildConnectArgs(serverUrl: string): string[] {
   return buildArcaArgs(serverUrl);
 }
 
-function buildLoginArgs(serverUrl) {
+export function buildLoginArgs(serverUrl: string): string[] {
   return buildArcaArgs(serverUrl, true);
+}
+
+/** A finished arca run's exit code and captured output. */
+export interface ArcaRunOutput {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut?: boolean | undefined;
+}
+
+/** A failed connect, worded for the user. */
+export interface ArcaConnectFailure {
+  ok: false;
+  error: string;
+  errorMessage?: string;
+  errorAction?: string;
+  errorKind: ArcaErrorKind;
+  authError?: boolean;
 }
 
 /**
@@ -212,18 +250,8 @@ function buildLoginArgs(serverUrl) {
  *
  * `errorKind` lets callers offer the one fix that applies (retry, sign in on
  * Arca, or `arca login` on this machine).
- *
- * @param {{ code: number | null, stdout: string, stderr: string, timedOut?: boolean }} run
- * @returns {{
- *   ok: false,
- *   error: string,
- *   errorMessage?: string,
- *   errorAction?: string,
- *   errorKind: ArcaErrorKind,
- *   authError?: boolean,
- * }}
  */
-function describeConnectFailure(run) {
+export function describeConnectFailure(run: ArcaRunOutput): ArcaConnectFailure {
   const output = `${run.stderr}\n${run.stdout}`;
   if (run.timedOut) {
     return {
@@ -301,11 +329,8 @@ function describeConnectFailure(run) {
 /**
  * The last non-empty line of captured output — arca and ssh are chatty, and
  * the final line is where both put the actual error.
- *
- * @param {string} text
- * @returns {string}
  */
-function lastLine(text) {
+export function lastLine(text: string): string {
   const lines = text
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -313,13 +338,17 @@ function lastLine(text) {
   return lines[lines.length - 1] ?? text;
 }
 
-/**
- * Parse the status object even when the CLI surrounds it with notices.
- * @param {string} stdout
- * @returns {{ state: string | null, hasInstance: boolean, shutdownAt: number | null, rawShutdownTime: string | null } | null}
- */
-function parseArcaStatus(stdout) {
-  const isStatus = (value) => {
+/** This machine's Arca instance state, as `arca status --json` reports it. */
+export interface ArcaStatus {
+  state: string | null;
+  hasInstance: boolean;
+  shutdownAt: number | null;
+  rawShutdownTime: string | null;
+}
+
+/** Parse the status object even when the CLI surrounds it with notices. */
+export function parseArcaStatus(stdout: string): ArcaStatus | null {
+  const isStatus = (value: Record<string, unknown>) => {
     const hasInstance =
       Object.hasOwn(value, "instance") &&
       (value.instance === null ||
@@ -328,10 +357,12 @@ function parseArcaStatus(stdout) {
       typeof value.status === "string" && (hasInstance || Object.hasOwn(value, "shutdown_time"))
     );
   };
-  const parseObject = (text) => {
+  const parseObject = (text: string): Record<string, unknown> | null => {
     try {
-      const value = JSON.parse(text);
-      return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+      const value: unknown = JSON.parse(text);
+      return value && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : null;
     } catch {
       return null;
     }
@@ -376,7 +407,7 @@ function parseArcaStatus(stdout) {
   const raw =
     status.instance === null || status.instance === undefined
       ? status.shutdown_time
-      : status.instance.shutdown_time;
+      : propertyOf(status.instance, "shutdown_time");
   const rawShutdownTime = typeof raw === "string" ? raw : null;
   const shutdownAt =
     rawShutdownTime && /(?:Z|[+-]\d{2}:?\d{2})$/i.test(rawShutdownTime)
@@ -393,16 +424,53 @@ function parseArcaStatus(stdout) {
   };
 }
 
-/**
- * Run a headless Arca command and capture both output streams.
- * @param {string} arcaPath
- * @param {string[]} args
- * @param {{ spawn?: typeof spawn, timeoutMs: number, killGraceMs?: number, maxOutputBytes?: number, env?: NodeJS.ProcessEnv }} options
- * @returns {Promise<{ code: number | null, stdout: string, stderr: string, timedOut?: boolean, spawnError?: Error }>}
- */
-function runArca(arcaPath, args, options) {
+/** An arca or dbcert child's output stream. */
+export interface ArcaChildOutput {
+  on: (event: "data", listener: (chunk: unknown) => void) => unknown;
+  off: (event: "data", listener: (chunk: unknown) => void) => unknown;
+  destroy?: (() => unknown) | undefined;
+}
+
+/** The part of a spawned arca or dbcert `ChildProcess` this module uses. */
+export interface ArcaChild {
+  pid?: number | undefined;
+  stdout?: ArcaChildOutput | null | undefined;
+  stderr?: ArcaChildOutput | null | undefined;
+  kill: (signal?: NodeJS.Signals) => unknown;
+  // Node passes an `Error` for "error", and the exit code for "exit" and "close".
+  on: (event: "error" | "exit" | "close", listener: (value: unknown) => void) => unknown;
+}
+
+export interface ArcaSpawnOptions {
+  stdio: ["ignore", "pipe", "pipe"];
+  detached?: boolean;
+  env?: NodeJS.ProcessEnv;
+}
+
+/** `child_process.spawn`, injectable so tests need no real arca or dbcert. */
+export type SpawnArca = (command: string, args: string[], options: ArcaSpawnOptions) => ArcaChild;
+
+interface RunArcaOptions {
+  spawn?: SpawnArca | undefined;
+  timeoutMs: number;
+  killGraceMs?: number | undefined;
+  maxOutputBytes?: number | undefined;
+  env?: NodeJS.ProcessEnv | undefined;
+}
+
+interface RunArcaResult extends ArcaRunOutput {
+  /** What spawn threw, or what the child's "error" event carried. */
+  spawnError?: unknown;
+}
+
+/** Run a headless Arca command and capture both output streams. */
+function runArca(
+  arcaPath: string,
+  args: string[],
+  options: RunArcaOptions,
+): Promise<RunArcaResult> {
   return new Promise((resolve) => {
-    let child;
+    let child: ArcaChild;
     try {
       child = (options.spawn || spawn)(arcaPath, args, {
         stdio: ["ignore", "pipe", "pipe"],
@@ -421,11 +489,11 @@ function runArca(arcaPath, args, options) {
     const stderrDecoder = new StringDecoder("utf8");
     let settled = false;
     let exited = false;
-    let exitCode = null;
-    let exitGraceTimer;
-    let killTimer;
+    let exitCode: number | null = null;
+    let exitGraceTimer: ReturnType<typeof setTimeout> | undefined;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
-    const killTree = (signal) => {
+    const killTree = (signal: NodeJS.Signals) => {
       try {
         if (typeof child.pid === "number") process.kill(-child.pid, signal);
         else child.kill(signal);
@@ -437,21 +505,24 @@ function runArca(arcaPath, args, options) {
         }
       }
     };
-    const onStdout = (chunk) => {
+    const onStdout = (chunk: unknown) => {
       if (stdoutBytes >= (options.maxOutputBytes ?? Infinity)) return;
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
       const retained = bytes.subarray(0, (options.maxOutputBytes ?? Infinity) - stdoutBytes);
       stdout += stdoutDecoder.write(retained);
       stdoutBytes += retained.length;
     };
-    const onStderr = (chunk) => {
+    const onStderr = (chunk: unknown) => {
       if (stderrBytes >= (options.maxOutputBytes ?? Infinity)) return;
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
       const retained = bytes.subarray(0, (options.maxOutputBytes ?? Infinity) - stderrBytes);
       stderr += stderrDecoder.write(retained);
       stderrBytes += retained.length;
     };
-    const settle = (result, fromClose = false) => {
+    const settle = (
+      result: { code: number | null; timedOut?: boolean; spawnError?: unknown },
+      fromClose = false,
+    ) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -460,10 +531,11 @@ function runArca(arcaPath, args, options) {
       stdout += stdoutDecoder.end();
       stderr += stderrDecoder.end();
       if (!fromClose) {
-        for (const [stream, listener] of [
+        const streams: [ArcaChildOutput | null | undefined, (chunk: unknown) => void][] = [
           [child.stdout, onStdout],
           [child.stderr, onStderr],
-        ]) {
+        ];
+        for (const [stream, listener] of streams) {
           try {
             stream?.off("data", listener);
             stream?.destroy?.();
@@ -472,7 +544,8 @@ function runArca(arcaPath, args, options) {
           }
         }
       }
-      resolve({ code: result.code, stdout, stderr, timedOut, ...result });
+      const captured = { code: result.code, stdout, stderr, timedOut };
+      resolve({ ...captured, ...result });
     };
     const timer = setTimeout(() => {
       if (exited) {
@@ -492,20 +565,22 @@ function runArca(arcaPath, args, options) {
     child.on("exit", (code) => {
       if (settled) return;
       exited = true;
-      exitCode = code;
-      exitGraceTimer = setTimeout(() => settle({ code }), 500);
+      exitCode = exitCodeOf(code);
+      exitGraceTimer = setTimeout(() => settle({ code: exitCodeOf(code) }), 500);
     });
-    child.on("close", (code) => settle({ code: exited ? exitCode : code }, true));
+    child.on("close", (code) => settle({ code: exited ? exitCode : exitCodeOf(code) }, true));
   });
 }
 
-/**
- * Turn a failed status or extend run into an actionable result.
- * @param {{ code: number | null, stdout: string, stderr: string, timedOut?: boolean }} run
- * @param {"status" | "extend"} action
- * @returns {{ ok: false, errorKind: ArcaErrorKind, error: string }}
- */
-function describeArcaCliFailure(run, action) {
+/** A failed status or extend run, worded for the user. */
+export interface ArcaCliFailure {
+  ok: false;
+  errorKind: ArcaErrorKind;
+  error: string;
+}
+
+/** Turn a failed status or extend run into an actionable result. */
+function describeArcaCliFailure(run: ArcaRunOutput, action: "status" | "extend"): ArcaCliFailure {
   const output = `${run.stdout}\n${run.stderr}`;
   if (run.timedOut) {
     return {
@@ -563,12 +638,24 @@ function describeArcaCliFailure(run, action) {
   };
 }
 
-/**
- * Read this machine's Arca instance state and shutdown time.
- * @param {{ resolveArcaPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number }} [deps]
- * @returns {Promise<{ ok: true, state: string | null, hasInstance: boolean, shutdownAt: number | null, rawShutdownTime: string | null } | { ok: false, errorKind: ArcaErrorKind, error: string }>}
- */
-async function readArcaStatus(deps = {}) {
+/** What the status and extend commands use; each defaults to the real one. */
+export interface ArcaCliDeps {
+  resolveArcaPath?: (() => string | null | Promise<string | null>) | undefined;
+  spawn?: SpawnArca | undefined;
+  timeoutMs?: number | undefined;
+  killGraceMs?: number | undefined;
+}
+
+export interface ArcaStatusSuccess extends ArcaStatus {
+  ok: true;
+}
+
+export type ArcaStatusResult = ArcaStatusSuccess | ArcaCliFailure;
+
+export type ArcaExtendOutcome = { ok: true; shutdownAt: number | null } | ArcaCliFailure;
+
+/** Read this machine's Arca instance state and shutdown time. */
+export async function readArcaStatus(deps: ArcaCliDeps = {}): Promise<ArcaStatusResult> {
   try {
     const arcaPath = await (deps.resolveArcaPath || resolveArcaPathAsync)();
     if (!arcaPath)
@@ -587,7 +674,7 @@ async function readArcaStatus(deps = {}) {
       return {
         ok: false,
         errorKind: "unknown",
-        error: `Couldn't run arca: ${run.spawnError.message}`,
+        error: `Couldn't run arca: ${messageOf(run.spawnError)}`,
       };
     if (run.code !== 0 || run.timedOut) return describeArcaCliFailure(run, "status");
     const parsed = parseArcaStatus(run.stdout);
@@ -600,18 +687,21 @@ async function readArcaStatus(deps = {}) {
       };
     return { ok: true, ...parsed };
   } catch (error) {
-    return { ok: false, errorKind: "unknown", error: `Couldn't run arca: ${error.message}` };
+    return { ok: false, errorKind: "unknown", error: `Couldn't run arca: ${messageOf(error)}` };
   }
 }
 
-/**
- * Extend this machine's Arca instance using an approved mode.
- * @param {string} mode
- * @param {{ resolveArcaPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number }} [deps]
- * @returns {Promise<{ ok: true, shutdownAt: number | null } | { ok: false, errorKind: ArcaErrorKind, error: string }>}
- */
-async function runArcaExtend(mode, deps = {}) {
-  if (!ARCA_EXTEND_MODES.includes(mode))
+/** Whether `mode` is an approved extend mode; any value may arrive from the renderer. */
+function isArcaExtendMode(mode: unknown): mode is ArcaExtendMode {
+  return (ARCA_EXTEND_MODES as readonly unknown[]).includes(mode);
+}
+
+/** Extend this machine's Arca instance using an approved mode. */
+export async function runArcaExtend(
+  mode: unknown,
+  deps: ArcaCliDeps = {},
+): Promise<ArcaExtendOutcome> {
+  if (!isArcaExtendMode(mode))
     return { ok: false, errorKind: "unknown", error: "Unsupported arca extend mode." };
   try {
     const arcaPath = await (deps.resolveArcaPath || resolveArcaPathAsync)();
@@ -640,15 +730,49 @@ async function runArcaExtend(mode, deps = {}) {
       return {
         ok: false,
         errorKind: "unknown",
-        error: `Couldn't run arca: ${run.spawnError.message}`,
+        error: `Couldn't run arca: ${messageOf(run.spawnError)}`,
       };
     if (run.code !== 0 || run.timedOut) return describeArcaCliFailure(run, "extend");
     const updated = await readArcaStatus({ ...deps, resolveArcaPath: () => arcaPath });
     if (!updated.ok) console.warn("[arca] status verification after extend failed:", updated.error);
     return { ok: true, shutdownAt: updated.ok ? updated.shutdownAt : null };
   } catch (error) {
-    return { ok: false, errorKind: "unknown", error: `Couldn't run arca: ${error.message}` };
+    return { ok: false, errorKind: "unknown", error: `Couldn't run arca: ${messageOf(error)}` };
   }
+}
+
+/** What a streamed connect or login uses; each defaults to the real one. */
+export interface StartArcaCommandDeps {
+  timeoutMs?: number | undefined;
+  resolveArcaPath?: (() => string | null) | undefined;
+  spawn?: SpawnArca | undefined;
+  onOutput?: ((text: string) => void) | undefined;
+  onIdentityUnavailable?: ((reason: string) => void) | undefined;
+}
+
+export interface ArcaCommandSuccess {
+  ok: true;
+  alreadyRunning: boolean;
+  identity?: ArcaIdentity;
+}
+
+export interface ArcaCommandFailure {
+  ok: false;
+  error: string;
+  errorKind?: ArcaErrorKind;
+  errorMessage?: string;
+  errorAction?: string;
+  authError?: boolean;
+  canceled?: boolean;
+}
+
+export type ArcaCommandResult = ArcaCommandSuccess | ArcaCommandFailure;
+
+/** A started connect or login; `command` is null when nothing was started. */
+export interface ArcaCommand {
+  command: string | null;
+  promise: Promise<ArcaCommandResult>;
+  cancel: () => void;
 }
 
 /**
@@ -658,28 +782,13 @@ async function runArcaExtend(mode, deps = {}) {
  * terminal pane, and may `cancel()` (window closed). The promise never
  * rejects — every failure resolves as `{ ok: false, error }`.
  *
- * @param {string} serverUrl The window's connected server URL.
- * @param {{
- *   timeoutMs?: number,
- *   resolveArcaPath?: () => string | null,
- *   spawn?: typeof spawn,
- *   onOutput?: (text: string) => void,
- *   onIdentityUnavailable?: (reason: string) => void,
- * }} [deps]
- * @returns {{
- *   command: string | null,
- *   promise: Promise<{
- *     ok: boolean,
- *     alreadyRunning?: boolean,
- *     identity?: { serverUrl: string, hostId: string },
- *     error?: string,
- *     authError?: boolean,
- *     canceled?: boolean,
- *   }>,
- *   cancel: () => void,
- * }}
+ * @param serverUrl The window's connected server URL.
  */
-function startArcaCommand(serverUrl, deps = {}, login = false) {
+function startArcaCommand(
+  serverUrl: string,
+  deps: StartArcaCommandDeps = {},
+  login = false,
+): ArcaCommand {
   const timeoutMs = deps.timeoutMs ?? CONNECT_TIMEOUT_MS;
   const onOutput = deps.onOutput || (() => {});
   const arcaPath = (deps.resolveArcaPath || resolveArcaPath)();
@@ -693,18 +802,18 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
       cancel: () => {},
     };
   }
-  let args;
+  let args: string[];
   try {
     args = buildArcaArgs(serverUrl, login);
   } catch (error) {
     return {
       command: null,
-      promise: Promise.resolve({ ok: false, error: `Invalid server URL: ${error.message}` }),
+      promise: Promise.resolve({ ok: false, error: `Invalid server URL: ${messageOf(error)}` }),
       cancel: () => {},
     };
   }
-  const spawnFn = deps.spawn || spawn;
-  let child;
+  const spawnFn: SpawnArca = deps.spawn || spawn;
+  let child: ArcaChild;
   try {
     child = spawnFn(arcaPath, args, { stdio: ["ignore", "pipe", "pipe"] });
   } catch {
@@ -716,8 +825,9 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
   }
   let stdout = "";
   let stderr = "";
-  let settle;
-  const promise = new Promise((resolve) => {
+  // Assigned by the executor below, which runs synchronously.
+  let settle!: (result: ArcaCommandResult) => void;
+  const promise = new Promise<ArcaCommandResult>((resolve) => {
     const timer = setTimeout(() => {
       settle(
         login
@@ -759,7 +869,7 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
       resolve(result);
     };
     child.on("error", (error) => {
-      settle({ ok: false, error: `Couldn't run arca: ${error.message}` });
+      settle({ ok: false, error: `Couldn't run arca: ${messageOf(error)}` });
     });
     child.on("exit", (code) => {
       if (code === 0) {
@@ -798,7 +908,7 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
         });
         return;
       }
-      settle(describeConnectFailure({ code, stdout, stderr }));
+      settle(describeConnectFailure({ code: exitCodeOf(code), stdout, stderr }));
     });
   });
   return {
@@ -819,11 +929,11 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
   };
 }
 
-function startArcaConnect(serverUrl, deps = {}) {
+export function startArcaConnect(serverUrl: string, deps: StartArcaCommandDeps = {}): ArcaCommand {
   return startArcaCommand(serverUrl, deps);
 }
 
-function startArcaLogin(serverUrl, deps = {}) {
+export function startArcaLogin(serverUrl: string, deps: StartArcaCommandDeps = {}): ArcaCommand {
   return startArcaCommand(serverUrl, deps, true);
 }
 
@@ -831,20 +941,17 @@ function startArcaLogin(serverUrl, deps = {}) {
  * Connect the user's Arca instance to `serverUrl` as an Omnigent host. Thin
  * non-streaming wrapper over {@link startArcaConnect}; never rejects.
  *
- * @param {string} serverUrl The window's connected server URL.
- * @param {Parameters<typeof startArcaConnect>[1]} [deps]
- * @returns {Promise<{ ok: boolean, error?: string, authError?: boolean }>}
+ * @param serverUrl The window's connected server URL.
  */
-function connectArcaHost(serverUrl, deps = {}) {
+export function connectArcaHost(
+  serverUrl: string,
+  deps: StartArcaCommandDeps = {},
+): Promise<ArcaCommandResult> {
   return startArcaConnect(serverUrl, deps).promise;
 }
 
-/**
- * Well-known install locations for dbcert.
- *
- * @returns {string[]}
- */
-function dbcertCandidatePaths() {
+/** Well-known install locations for dbcert. */
+function dbcertCandidatePaths(): string[] {
   return [
     "/usr/local/bin/dbcert",
     "/opt/homebrew/bin/dbcert",
@@ -852,13 +959,10 @@ function dbcertCandidatePaths() {
   ];
 }
 
-/**
- * Locate dbcert the way {@link resolveArcaPathAsync} locates arca.
- *
- * @param {{ isExecutableFile?: (p: string) => boolean }} [deps]
- * @returns {Promise<string | null>}
- */
-function resolveDbcertPathAsync(deps = {}) {
+/** Locate dbcert the way {@link resolveArcaPathAsync} locates arca. */
+function resolveDbcertPathAsync(
+  deps: Pick<ResolveArcaPathDeps, "isExecutableFile"> = {},
+): Promise<string | null> {
   return new Promise((resolve) => {
     execFile("/bin/sh", ["-c", "command -v dbcert"], { encoding: "utf8" }, (error, stdout) => {
       const onPath = error ? null : String(stdout).trim() || null;
@@ -869,15 +973,21 @@ function resolveDbcertPathAsync(deps = {}) {
   });
 }
 
+/** What the dbcert commands use; each defaults to the real one. */
+export interface DbcertDeps {
+  resolveDbcertPath?: (() => string | null | Promise<string | null>) | undefined;
+  spawn?: SpawnArca | undefined;
+  timeoutMs?: number | undefined;
+  killGraceMs?: number | undefined;
+  skipArcaSync?: boolean | undefined;
+}
+
 /**
  * Renew this machine's dbcert with `dbcert --force`, which signs in through
  * the browser. Unless skipped, dbcert also syncs the primary Arca instance.
  * `--force` mints a new certificate even while the current one is valid.
- *
- * @param {{ resolveDbcertPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number, skipArcaSync?: boolean }} [deps]
- * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
  */
-async function runDbcertRefresh(deps = {}) {
+export async function runDbcertRefresh(deps: DbcertDeps = {}): Promise<DbcertRefreshResult> {
   return runDbcertCommand(
     ["--force", "--caller-name", "omnigent", "--update-kubeconfig=false"],
     "sign-in",
@@ -885,14 +995,18 @@ async function runDbcertRefresh(deps = {}) {
   );
 }
 
-async function runDbcertArcaSync(deps = {}) {
+export async function runDbcertArcaSync(deps: DbcertDeps = {}): Promise<DbcertRefreshResult> {
   return runDbcertCommand(["sync-arca"], "Arca sync", {
     ...deps,
     timeoutMs: deps.timeoutMs ?? DBCERT_ARCA_SYNC_TIMEOUT_MS,
   });
 }
 
-async function runDbcertCommand(args, action, deps) {
+async function runDbcertCommand(
+  args: string[],
+  action: string,
+  deps: DbcertDeps,
+): Promise<DbcertRefreshResult> {
   try {
     const dbcertPath = await (deps.resolveDbcertPath || resolveDbcertPathAsync)();
     if (!dbcertPath) return { ok: false, error: "dbcert was not found on this machine." };
@@ -904,7 +1018,7 @@ async function runDbcertCommand(args, action, deps) {
       ...(deps.skipArcaSync ? { env: { ...process.env, DBCERT_SKIP_ARCA_SYNC: "1" } } : {}),
     });
     if (run.spawnError)
-      return { ok: false, error: `Couldn't run dbcert: ${run.spawnError.message}` };
+      return { ok: false, error: `Couldn't run dbcert: ${messageOf(run.spawnError)}` };
     if (run.timedOut) return { ok: false, error: `The dbcert ${action} timed out.` };
     if (run.code !== 0) {
       const output = run.stderr.trim() || run.stdout.trim();
@@ -915,12 +1029,12 @@ async function runDbcertCommand(args, action, deps) {
     }
     return { ok: true };
   } catch (error) {
-    return { ok: false, error: `Couldn't run dbcert: ${error.message}` };
+    return { ok: false, error: `Couldn't run dbcert: ${messageOf(error)}` };
   }
 }
 
 /** Check both SSH and X.509 credentials without starting an interactive login. */
-async function readDbcertStatus(dbcertPath, deps) {
+async function readDbcertStatus(dbcertPath: string, deps: DbcertDeps): Promise<DbcertStatusResult> {
   const run = await runArca(dbcertPath, ["status"], {
     spawn: deps.spawn,
     timeoutMs: deps.timeoutMs ?? DBCERT_STATUS_TIMEOUT_MS,
@@ -939,12 +1053,8 @@ async function readDbcertStatus(dbcertPath, deps) {
   return { ok: true, valid: run.code === 0 };
 }
 
-/**
- * Check local credentials before provisioning an Arclet without starting sign-in.
- * @param {Parameters<typeof runDbcertRefresh>[0]} [deps]
- * @returns {Promise<{ ok: true, valid: boolean } | { ok: false, error: string }>}
- */
-async function checkDbcert(deps = {}) {
+/** Check local credentials before provisioning an Arclet without starting sign-in. */
+export async function checkDbcert(deps: DbcertDeps = {}): Promise<DbcertStatusResult> {
   try {
     const dbcertPath = await (deps.resolveDbcertPath || resolveDbcertPathAsync)();
     if (!dbcertPath) {
@@ -958,28 +1068,3 @@ async function checkDbcert(deps = {}) {
     return { ok: false, error: "Couldn't check your laptop's dbcert. Try again." };
   }
 }
-
-module.exports = {
-  ARCA_EXTEND_MODES,
-  STATUS_TIMEOUT_MS,
-  EXTEND_TIMEOUT_MS,
-  DBCERT_REFRESH_TIMEOUT_MS,
-  runDbcertRefresh,
-  runDbcertArcaSync,
-  checkDbcert,
-  parseArcaStatus,
-  readArcaStatus,
-  runArcaExtend,
-  CONNECT_TIMEOUT_MS,
-  buildConnectArgs,
-  buildLoginArgs,
-  connectArcaHost,
-  describeConnectFailure,
-  isExecutableFile,
-  lastLine,
-  resolveArcaPath,
-  resolveArcaPathAsync,
-  SAFE_URL_RE,
-  startArcaConnect,
-  startArcaLogin,
-};

@@ -1,20 +1,31 @@
-"use strict";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { createArcaAutoConnect } = require("../src/arca_autoconnect");
+import {
+  createArcaAutoConnect,
+  type ArcaAutoConnectDeps,
+  type ArcaAutoConnectResult,
+  type ArcaAutoConnectStatus,
+} from "../src/arca_autoconnect.ts";
 
 const SERVER = "https://workspace.cloud.databricks.com/ml/omnigents";
 
+interface FakeRun {
+  serverUrl: string;
+  onOutput: (text: string) => void;
+  finish: (result: ArcaAutoConnectResult) => void;
+}
+
 /** A controllable startConnect: each call records itself and waits for finish(). */
 function fakeConnects() {
-  const runs = [];
-  const startConnect = (serverUrl, onOutput) => {
-    let resolve;
-    const promise = new Promise((r) => {
+  const runs: FakeRun[] = [];
+  const startConnect: ArcaAutoConnectDeps["startConnect"] = (serverUrl, onOutput) => {
+    // Assigned by the executor, which runs synchronously.
+    let resolve!: (result: ArcaAutoConnectResult) => void;
+    const promise = new Promise<ArcaAutoConnectResult>((r) => {
       resolve = r;
     });
-    const run = { serverUrl, onOutput, finish: (result) => resolve(result) };
+    const run = { serverUrl, onOutput, finish: (result: ArcaAutoConnectResult) => resolve(result) };
     runs.push(run);
     return { command: "arca ssh …", promise, cancel: () => {} };
   };
@@ -23,7 +34,7 @@ function fakeConnects() {
 
 function harness({ eligible = true } = {}) {
   const connects = fakeConnects();
-  const events = [];
+  const events: { target: string; status: ArcaAutoConnectStatus }[] = [];
   const auto = createArcaAutoConnect({
     isEligible: () => eligible,
     startConnect: connects.startConnect,
@@ -48,10 +59,10 @@ describe("arca auto-connect", () => {
     const second = auto.ensure(`${SERVER}/`);
     assert.equal(runs.length, 1);
     assert.equal(auto.getStatus(SERVER).state, "starting");
-    assert.equal(events[0].target, SERVER);
-    assert.equal(events[0].status.command, "arca ssh isaac omni host");
+    assert.equal(events[0]?.target, SERVER);
+    assert.equal(events[0]?.status.command, "arca ssh isaac omni host");
 
-    runs[0].finish({ ok: true, alreadyRunning: false });
+    runs[0]!.finish({ ok: true, alreadyRunning: false });
     const [a, b] = await Promise.all([first, second]);
     assert.equal(a.state, "online");
     assert.equal(b.state, "online");
@@ -70,14 +81,14 @@ describe("arca auto-connect", () => {
     assert.equal(auto.inFlight(secondTarget), null);
     const second = auto.ensure(secondTarget);
     assert.equal(runs.length, 2);
-    runs[0].finish({ ok: true });
-    runs[1].finish({ ok: false, errorKind: "omni-auth" });
+    runs[0]!.finish({ ok: true });
+    runs[1]!.finish({ ok: false, errorKind: "omni-auth" });
     await Promise.all([first, second]);
     assert.equal(auto.getStatus(firstTarget).state, "online");
     assert.equal(auto.getStatus(secondTarget).state, "failed");
     const retry = auto.retry(secondTarget);
-    assert.equal(runs[2].serverUrl, secondTarget);
-    runs[2].finish({ ok: true });
+    assert.equal(runs[2]!.serverUrl, secondTarget);
+    runs[2]!.finish({ ok: true });
     await retry;
     assert.equal(runs.length, 3);
   });
@@ -86,7 +97,7 @@ describe("arca auto-connect", () => {
     const { auto, runs } = harness();
     const pending = auto.ensure(SERVER);
     const identity = { serverUrl: SERVER, hostId: "a".repeat(32) };
-    runs[0].finish({ ok: true, alreadyRunning: true, identity });
+    runs[0]!.finish({ ok: true, alreadyRunning: true, identity });
     const status = await pending;
     assert.equal(status.state, "online");
     assert.equal(status.alreadyRunning, true);
@@ -96,9 +107,9 @@ describe("arca auto-connect", () => {
   it("keeps the failure kind and output tail, and retries only after a failure", async () => {
     const { auto, runs } = harness();
     const pending = auto.ensure(SERVER);
-    runs[0].onOutput("ssh: connecting…\n");
+    runs[0]!.onOutput("ssh: connecting…\n");
     assert.equal(auto.getStatus(SERVER).output, "ssh: connecting…\n");
-    runs[0].finish({ ok: false, errorKind: "omni-auth", error: "not signed in" });
+    runs[0]!.finish({ ok: false, errorKind: "omni-auth", error: "not signed in" });
     const failed = await pending;
     assert.equal(failed.state, "failed");
     assert.equal(failed.errorKind, "omni-auth");
@@ -110,7 +121,7 @@ describe("arca auto-connect", () => {
 
     const retry = auto.retry(SERVER);
     assert.equal(runs.length, 2);
-    runs[1].finish({ ok: true });
+    runs[1]!.finish({ ok: true });
     assert.equal((await retry).state, "online");
 
     // Retrying a healthy connection is refused.
@@ -122,33 +133,33 @@ describe("arca auto-connect", () => {
   it("shares an in-flight retry instead of starting another run", async () => {
     const { auto, runs } = harness();
     const pending = auto.ensure(SERVER);
-    runs[0].finish({ ok: false, errorKind: "timeout", error: "timed out" });
+    runs[0]!.finish({ ok: false, errorKind: "timeout", error: "timed out" });
     await pending;
     const first = auto.retry(SERVER);
     const second = auto.retry(SERVER);
     assert.equal(runs.length, 2);
-    runs[1].finish({ ok: true });
+    runs[1]!.finish({ ok: true });
     assert.equal((await first).state, "online");
     assert.equal((await second).state, "online");
   });
 
   it("streams a new run's output to the caller that started it", async () => {
     const { auto, runs } = harness();
-    const seen = [];
+    const seen: string[] = [];
     const first = auto.ensure(SERVER, (text) => seen.push(text));
     // Joining the in-flight run gets its outcome, not its output.
-    const joined = [];
+    const joined: string[] = [];
     const second = auto.ensure(SERVER, (text) => joined.push(text));
-    runs[0].onOutput("Starting…\n");
-    runs[0].finish({ ok: false, errorKind: "timeout", error: "timed out" });
+    runs[0]!.onOutput("Starting…\n");
+    runs[0]!.finish({ ok: false, errorKind: "timeout", error: "timed out" });
     await Promise.all([first, second]);
     assert.deepEqual(seen, ["Starting…\n"]);
     assert.deepEqual(joined, []);
 
-    const retried = [];
+    const retried: string[] = [];
     const again = auto.retry(SERVER, (text) => retried.push(text));
-    runs[1].onOutput("Retrying…\n");
-    runs[1].finish({ ok: true });
+    runs[1]!.onOutput("Retrying…\n");
+    runs[1]!.finish({ ok: true });
     assert.equal((await again).state, "online");
     assert.deepEqual(retried, ["Retrying…\n"]);
   });
@@ -159,7 +170,7 @@ describe("arca auto-connect", () => {
     void auto.ensure(SERVER);
     const shared = auto.inFlight(SERVER);
     assert.ok(shared);
-    runs[0].finish({ ok: true });
+    runs[0]!.finish({ ok: true });
     assert.equal((await shared).state, "online");
     assert.equal(auto.inFlight(SERVER), null);
   });

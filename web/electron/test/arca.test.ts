@@ -1,9 +1,8 @@
-"use strict";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
-const {
+import {
   buildConnectArgs,
   buildLoginArgs,
   connectArcaHost,
@@ -16,40 +15,55 @@ const {
   runDbcertArcaSync,
   startArcaConnect,
   startArcaLogin,
-} = require("../src/arca");
-const { IDENTITY_START, IDENTITY_END } = require("../src/arcaIdentity.ts");
+  type ArcaCommandResult,
+  type ArcaRunOutput,
+  type DbcertDeps,
+  type SpawnArca,
+} from "../src/arca.ts";
+import { IDENTITY_START, IDENTITY_END } from "../src/arcaIdentity.ts";
 
 /** A fake connect child: an EventEmitter with stdout/stderr stream stubs. */
-function fakeConnectChild() {
-  const child = new EventEmitter();
-  child.stdout = new EventEmitter();
-  child.stderr = new EventEmitter();
-  child.killed = false;
-  child.signals = [];
-  child.kill = (signal) => {
-    child.killed = true;
-    child.signals.push(signal);
-  };
-  return child;
+class FakeChild extends EventEmitter {
+  stdout = new EventEmitter();
+  stderr = new EventEmitter();
+  killed = false;
+  signals: (NodeJS.Signals | undefined)[] = [];
+
+  kill(signal?: NodeJS.Signals) {
+    this.killed = true;
+    this.signals.push(signal);
+  }
 }
 
-function commandDeps(outputs) {
-  const calls = [];
-  return {
-    calls,
-    resolveArcaPath: () => "/bin/arca",
-    spawn: (_path, args) => {
-      calls.push(args);
-      const child = fakeConnectChild();
-      const output = outputs.shift();
-      queueMicrotask(() => {
-        child.stdout.emit("data", output?.stdout ?? "");
-        child.stderr.emit("data", output?.stderr ?? "");
-        child.emit("close", output?.code ?? 0);
-      });
-      return child;
-    },
+function fakeConnectChild() {
+  return new FakeChild();
+}
+
+interface CommandOutput {
+  stdout?: string;
+  stderr?: string;
+  code?: number;
+}
+
+/** The result's failure fields, or undefined after a success. */
+function failureOf(result: ArcaCommandResult) {
+  return result.ok ? undefined : result;
+}
+
+function commandDeps(outputs: CommandOutput[]) {
+  const calls: string[][] = [];
+  const spawn: SpawnArca = (_path, args) => {
+    calls.push(args);
+    const child = fakeConnectChild();
+    const output = outputs.shift();
+    queueMicrotask(() => {
+      child.stdout.emit("data", output?.stdout ?? "");
+      child.stderr.emit("data", output?.stderr ?? "");
+      child.emit("close", output?.code ?? 0);
+    });
+    return child;
   };
+  return { calls, resolveArcaPath: () => "/bin/arca", spawn };
 }
 
 describe("arca extend command", () => {
@@ -57,11 +71,13 @@ describe("arca extend command", () => {
   it("finds status after many brace-containing CLI notices", async () => {
     const notices = Array.from({ length: 24 }, (_, index) => `notice {${index}}`).join("\n");
     const deps = commandDeps([{ stdout: `${notices}\n${running}` }]);
-    assert.equal((await readArcaStatus(deps)).state, "running");
+    const status = await readArcaStatus(deps);
+    assert.ok(status.ok);
+    assert.equal(status.state, "running");
   });
   it("rejects a JSON error object even when status exits zero", async () => {
     const result = await readArcaStatus(commandDeps([{ stdout: '{"error":"failed"}' }]));
-    assert.equal(result.ok, false);
+    assert.ok(!result.ok);
     assert.match(result.error, /Unexpected arca status output/);
   });
   it("checks a running instance first and reports the updated shutdown time", async () => {
@@ -105,6 +121,7 @@ describe("arca extend command", () => {
         timeoutMs: 5,
         killGraceMs: 5,
       });
+      assert.ok(!result.ok);
       assert.equal(result.errorKind, "timeout");
       assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
     } finally {
@@ -116,10 +133,12 @@ describe("arca extend command", () => {
     const child = fakeConnectChild();
     const deps = commandDeps([{ stdout: running }]);
     const firstSpawn = deps.spawn;
-    deps.spawn = (path, args) => (args[0] === "extend" ? child : firstSpawn(path, args));
+    deps.spawn = (path, args, options) =>
+      args[0] === "extend" ? child : firstSpawn(path, args, options);
     const keepAlive = setTimeout(() => {}, 1000);
     try {
       const result = await runArcaExtend("overnight", { ...deps, timeoutMs: 5, killGraceMs: 5 });
+      assert.ok(!result.ok);
       assert.equal(result.errorKind, "timeout");
       assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
     } finally {
@@ -129,14 +148,17 @@ describe("arca extend command", () => {
 
   it("classifies failed extend commands", async () => {
     await Promise.all(
-      [
-        ["No running Arca instance", "no-instance"],
-        ["Runtime limit reached", "runtime-limit"],
-        ["certificate expired; run arca login", "arca-auth"],
-        ["unexpected failure", "unknown"],
-      ].map(async ([stderr, errorKind]) => {
+      (
+        [
+          ["No running Arca instance", "no-instance"],
+          ["Runtime limit reached", "runtime-limit"],
+          ["certificate expired; run arca login", "arca-auth"],
+          ["unexpected failure", "unknown"],
+        ] as const
+      ).map(async ([stderr, errorKind]) => {
         const deps = commandDeps([{ stdout: running }, { code: 1, stderr }]);
         const result = await runArcaExtend("overnight", deps);
+        assert.ok(!result.ok);
         assert.equal(result.errorKind, errorKind);
         assert.deepEqual(deps.calls, [
           ["status", "--json"],
@@ -148,7 +170,7 @@ describe("arca extend command", () => {
 });
 
 describe("dbcert refresh", () => {
-  const dbcertDeps = (outputs) => ({
+  const dbcertDeps = (outputs: CommandOutput[]) => ({
     ...commandDeps(outputs),
     resolveDbcertPath: () => "/bin/dbcert",
   });
@@ -162,12 +184,16 @@ describe("dbcert refresh", () => {
   });
 
   it("syncs existing credentials with a shorter non-interactive timeout", async (context) => {
-    const timeouts = [];
-    const schedule = global.setTimeout;
-    context.mock.method(global, "setTimeout", (callback, delay, ...args) => {
+    const timeouts: (number | undefined)[] = [];
+    const schedule = globalThis.setTimeout;
+    context.mock.method(globalThis, "setTimeout", ((
+      callback: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
       timeouts.push(delay);
       return schedule(callback, delay, ...args);
-    });
+    }) as typeof setTimeout);
     const deps = dbcertDeps([{ code: 0 }]);
     assert.deepEqual(await runDbcertArcaSync(deps), { ok: true });
     assert.deepEqual(deps.calls, [["sync-arca"]]);
@@ -178,13 +204,13 @@ describe("dbcert refresh", () => {
     it(`sets local-only renewal environment only when requested (${skipArcaSync})`, async () => {
       const deps = dbcertDeps([{ code: 0 }]);
       const inheritedSkip = process.env.DBCERT_SKIP_ARCA_SYNC;
-      let environment;
+      let environment: NodeJS.ProcessEnv | undefined;
       const result = await runDbcertRefresh({
         ...deps,
         skipArcaSync,
         spawn: (binary, args, options) => {
           environment = options.env;
-          return deps.spawn(binary, args);
+          return deps.spawn(binary, args, options);
         },
       });
       assert.deepEqual(result, { ok: true });
@@ -203,14 +229,16 @@ describe("dbcert refresh", () => {
 
   it("reports a missing dbcert without spawning", async () => {
     const deps = { ...dbcertDeps([]), resolveDbcertPath: () => null };
-    assert.match((await runDbcertRefresh(deps)).error, /not found/);
+    const result = await runDbcertRefresh(deps);
+    assert.ok(!result.ok);
+    assert.match(result.error, /not found/);
     assert.deepEqual(deps.calls, []);
   });
 
   for (const [action, runCommand] of [
     ["sign-in", runDbcertRefresh],
     ["Arca sync", runDbcertArcaSync],
-  ]) {
+  ] as const) {
     it(`ends an abandoned ${action}`, async () => {
       const child = fakeConnectChild();
       const keepAlive = setTimeout(() => {}, 1000);
@@ -231,7 +259,7 @@ describe("dbcert refresh", () => {
 });
 
 describe("Arclet dbcert preflight", () => {
-  const depsFor = (outputs) => ({
+  const depsFor = (outputs: CommandOutput[]): DbcertDeps & { calls: string[][] } => ({
     ...commandDeps(outputs),
     resolveDbcertPath: () => "/bin/dbcert",
   });
@@ -262,7 +290,7 @@ describe("Arclet dbcert preflight", () => {
   it("reports a missing CLI without attempting sign-in", async () => {
     const deps = { ...depsFor([]), resolveDbcertPath: () => null };
     const result = await checkDbcert(deps);
-    assert.equal(result.ok, false);
+    assert.ok(!result.ok);
     assert.match(result.error, /Install dbcert/);
     assert.deepEqual(deps.calls, []);
   });
@@ -276,7 +304,7 @@ describe("Arclet dbcert preflight", () => {
       timeoutMs: 5,
       killGraceMs: 5,
     });
-    assert.equal(result.ok, false);
+    assert.ok(!result.ok);
     assert.match(result.error, /Couldn't check/);
     assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
   });
@@ -288,7 +316,7 @@ describe("Arclet dbcert preflight", () => {
         throw new Error("spawn EACCES");
       },
     });
-    assert.equal(result.ok, false);
+    assert.ok(!result.ok);
     assert.match(result.error, /Couldn't check/);
   });
 });
@@ -298,7 +326,7 @@ describe("arca binary resolution", () => {
     assert.equal(
       resolveArcaPath({
         whichArca: () => "/from/path/arca",
-        isExecutableFile: (p) => p === "/from/path/arca",
+        isExecutableFile: (p: string) => p === "/from/path/arca",
         candidatePaths: () => ["/usr/local/bin/arca"],
       }),
       "/from/path/arca",
@@ -306,7 +334,7 @@ describe("arca binary resolution", () => {
     assert.equal(
       resolveArcaPath({
         whichArca: () => null,
-        isExecutableFile: (p) => p === "/usr/local/bin/arca",
+        isExecutableFile: (p: string) => p === "/usr/local/bin/arca",
         candidatePaths: () => ["/opt/homebrew/bin/arca", "/usr/local/bin/arca"],
       }),
       "/usr/local/bin/arca",
@@ -440,7 +468,7 @@ describe("arca connect failures", () => {
   });
 
   it("tags each failure with the kind of fix it needs", () => {
-    const kind = (run) =>
+    const kind = (run: Partial<ArcaRunOutput>) =>
       describeConnectFailure({ code: 1, stdout: "", stderr: "", ...run }).errorKind;
     assert.equal(kind({ code: null, timedOut: true }), "timeout");
     assert.equal(kind({ stderr: "Not signed in to https://srv." }), "omni-auth");
@@ -468,7 +496,7 @@ describe("arca connect failures", () => {
 describe("startArcaConnect / connectArcaHost", () => {
   it("reports unavailable identity without changing a successful older connect result", async () => {
     const child = fakeConnectChild();
-    const reasons = [];
+    const reasons: string[] = [];
     const run = startArcaConnect("https://srv.example.com", {
       resolveArcaPath: () => "/bin/arca",
       spawn: () => child,
@@ -487,7 +515,7 @@ describe("startArcaConnect / connectArcaHost", () => {
       spawn: () => child,
     });
     run.cancel();
-    assert.equal((await run.promise).canceled, true);
+    assert.equal(failureOf(await run.promise)?.canceled, true);
     assert.equal(child.killed, true);
     child.emit("exit", 0);
     assert.equal((await run.promise).ok, false);
@@ -498,9 +526,9 @@ describe("startArcaConnect / connectArcaHost", () => {
       [1, "omni-auth"],
       [127, "missing-remote-cli"],
       [255, "unreachable"],
-    ]) {
+    ] as const) {
       const child = fakeConnectChild();
-      const chunks = [];
+      const chunks: string[] = [];
       const run = startArcaLogin("https://account.databricks.com/omnigent?o=123", {
         resolveArcaPath: () => "/bin/arca",
         spawn: (_file, args, opts) => {
@@ -516,8 +544,8 @@ describe("startArcaConnect / connectArcaHost", () => {
       // oxlint-disable-next-line no-await-in-loop -- Exercise both process outcomes.
       const result = await run.promise;
       assert.equal(result.ok, code === 0);
-      assert.equal(result.errorKind, errorKind);
-      assert.equal(result.authError === true, code === 1);
+      assert.equal(failureOf(result)?.errorKind, errorKind);
+      assert.equal(failureOf(result)?.authError === true, code === 1);
       assert.deepEqual(chunks, []);
       assert.doesNotMatch(JSON.stringify(result), /SECRET|ticket=/);
     }
@@ -533,6 +561,7 @@ describe("startArcaConnect / connectArcaHost", () => {
     const keepAlive = setTimeout(() => {}, 1000);
     try {
       const result = await run.promise;
+      assert.ok(!result.ok);
       assert.equal(result.errorKind, "timeout");
       assert.match(result.error, /sign-in timed out.*Arca Companion/);
       assert.equal(child.killed, true);
@@ -543,8 +572,8 @@ describe("startArcaConnect / connectArcaHost", () => {
     }
   });
   it("streams live output, exposes the command, and resolves ok on exit 0", async () => {
-    const chunks = [];
-    let child;
+    const chunks: string[] = [];
+    let child = undefined as FakeChild | undefined;
     const run = startArcaConnect("https://srv.example.com", {
       resolveArcaPath: () => "/usr/local/bin/arca",
       spawn: (file, args) => {
@@ -555,6 +584,7 @@ describe("startArcaConnect / connectArcaHost", () => {
       },
       onOutput: (text) => chunks.push(text),
     });
+    assert.ok(child, "startArcaConnect spawns the command");
     assert.equal(run.command, `arca ${buildConnectArgs("https://srv.example.com").join(" ")}`);
     child.stdout.emit("data", "Attempting to start your Arca instance\n");
     child.stderr.emit("data", "synced dbcert\n");
@@ -564,7 +594,7 @@ describe("startArcaConnect / connectArcaHost", () => {
   });
 
   it("reports a reused daemon so callers don't wait for a new host", async () => {
-    let child;
+    let child = undefined as FakeChild | undefined;
     const run = startArcaConnect("https://srv.example.com", {
       resolveArcaPath: () => "/usr/local/bin/arca",
       spawn: () => {
@@ -572,6 +602,7 @@ describe("startArcaConnect / connectArcaHost", () => {
         return child;
       },
     });
+    assert.ok(child, "startArcaConnect spawns the command");
     child.stdout.emit("data", "Host daemon already running (pid 4242).\n");
     child.emit("exit", 0);
     assert.deepEqual(await run.promise, { ok: true, alreadyRunning: true });
@@ -609,7 +640,7 @@ describe("startArcaConnect / connectArcaHost", () => {
   });
 
   it("maps a failing exit through the captured output and never rejects", async () => {
-    let child;
+    let child = undefined as FakeChild | undefined;
     const failRun = startArcaConnect("https://srv.example.com", {
       resolveArcaPath: () => "/usr/local/bin/arca",
       spawn: () => {
@@ -617,15 +648,16 @@ describe("startArcaConnect / connectArcaHost", () => {
         return child;
       },
     });
+    assert.ok(child, "startArcaConnect spawns the command");
     child.stderr.emit("data", "bash: isaac: command not found");
     child.emit("exit", 1);
     const result = await failRun.promise;
-    assert.equal(result.ok, false);
+    assert.ok(!result.ok);
     assert.match(result.error, /Arca instance/);
   });
 
   it("cancel kills the child and resolves as canceled", async () => {
-    let child;
+    let child = undefined as FakeChild | undefined;
     const run = startArcaConnect("https://srv.example.com", {
       resolveArcaPath: () => "/usr/local/bin/arca",
       spawn: () => {
@@ -633,11 +665,12 @@ describe("startArcaConnect / connectArcaHost", () => {
         return child;
       },
     });
+    assert.ok(child, "startArcaConnect spawns the command");
     run.cancel();
     assert.equal(child.killed, true);
     child.emit("exit", null); // the kill lands
     const result = await run.promise;
-    assert.equal(result.ok, false);
+    assert.ok(!result.ok);
     assert.equal(result.canceled, true);
   });
 

@@ -36,9 +36,9 @@ const FORWARDERS = [
     callee: "send",
   },
   {
-    file: "arca_connect_window.js",
-    site: "win.webContents.send(channel, payload)",
-    callerFile: "arca_connect_window.js",
+    file: "arca_connect_window.ts",
+    site: "push(win.webContents, channel, ...args)",
+    callerFile: "arca_connect_window.ts",
     callee: "send",
   },
   {

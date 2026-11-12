@@ -1,5 +1,5 @@
 // Renderer logic for the Arca connect console (see index.html for the page
-// and src/arca_connect_window.js for the flow + trust model). Talks only to
+// and src/arca_connect_window.ts for the flow + trust model). Talks only to
 // the narrow `window.arcaConnect` bridge exposed by arca_connect_preload.js.
 "use strict";
 
