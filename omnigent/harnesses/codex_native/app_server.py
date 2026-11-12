@@ -4103,6 +4103,30 @@ def databricks_profile_codex_models(profile: str) -> DatabricksCodexModelListing
 
 
 def _databricks_servable_codex_models(host: str, profile: str) -> DatabricksCodexModelListing:
+    """List codex-servable ids in Codex's preference order; empty when no listing reads."""
+    from omnigent.models.databricks_model_discovery import order_by_codex_catalog
+
+    listing = _databricks_listed_codex_models(host, profile)
+    if not listing.ids:
+        return listing
+    return DatabricksCodexModelListing(
+        order_by_codex_catalog(listing.ids, _codex_catalog_models()), cached=listing.cached
+    )
+
+
+def _codex_catalog_models() -> list[object]:
+    """Return the installed Codex's catalog rows, or ``[]`` when they cannot be read."""
+    codex_path = _find_codex_cli()
+    if codex_path is None:
+        return []
+    catalog = read_codex_model_catalog(
+        codex_path, _codex_home_config_source_from_env(), timeout=5.0
+    )
+    models = catalog.get("models") if catalog else None
+    return models if isinstance(models, list) else []
+
+
+def _databricks_listed_codex_models(host: str, profile: str) -> DatabricksCodexModelListing:
     """List codex-servable ids live, then from ucode's cached copy; empty when neither reads."""
     from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
 

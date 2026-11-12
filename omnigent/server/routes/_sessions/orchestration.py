@@ -174,6 +174,7 @@ from omnigent.server.managed_hosts import (
     host_sandbox_is_running,
     parse_repo_workspace,
     read_managed_repo_workspaces,
+    stop_archived_session_sandbox,
 )
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -970,6 +971,7 @@ async def _archive_stop(
     *,
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
+    sandbox_config: ManagedSandboxDeployment | None = None,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -1000,6 +1002,11 @@ async def _archive_stop(
         tunnels, or ``None`` when host support is not wired.
     :param delete_worktree: After the stop, also remove the session's
         server-created worktree directory (the branch is kept).
+    :param host_store: Persistent host registrations, or ``None`` when host
+        support is not wired.
+    :param sandbox_config: The deployment's managed-sandbox config; when the
+        host's provider opts in (``stop_on_archive``), the session's sandbox is
+        stopped last.
     """
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
@@ -1079,6 +1086,9 @@ async def _archive_stop(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+    # Last: the worktree cleanup above needs the sandbox's host online.
+    if host_store is not None:
+        await stop_archived_session_sandbox(conv, host_store, conversation_store, sandbox_config)
 
 
 async def _await_archived_turn_end(session_id: str, conversation_store: ConversationStore) -> bool:
@@ -1137,6 +1147,7 @@ def _spawn_archive_stop(
     *,
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
+    sandbox_config: ManagedSandboxDeployment | None = None,
     after_turn: bool = False,
 ) -> None:
     """
@@ -1166,6 +1177,7 @@ def _spawn_archive_stop(
     :param host_registry: The ``HostRegistry`` tracking live host
         tunnels, or ``None`` when host support is not wired.
     :param delete_worktree: Forwarded to :func:`_archive_stop`.
+    :param sandbox_config: Forwarded to :func:`_archive_stop`.
     :param after_turn: Also wait for the session's current turn to end before
         tearing it down; set when the session archived itself. That wait, like
         the grace, lives only in this replica's memory: if the replica restarts
@@ -1193,6 +1205,7 @@ def _spawn_archive_stop(
             host_registry,
             delete_worktree=delete_worktree,
             host_store=host_store,
+            sandbox_config=sandbox_config,
         )
 
     task = asyncio.create_task(_stop_after_grace())
