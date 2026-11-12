@@ -235,7 +235,12 @@ def test_relative_policy_cwd_preserves_non_claude_workspace(
 
 @pytest.mark.parametrize(
     "harness,feature",
-    [(harness, feature) for harness in _HARNESSES for feature in ("fork", "cwd_conflict")],
+    [
+        (harness, feature)
+        for harness in _HARNESSES
+        for feature in ("fork", "cwd_conflict", "egress_rules")
+        if feature != "egress_rules" or harness != "codex"
+    ],
 )
 def test_harness_rejects_policy_features_it_cannot_honor(
     harness: str, feature: str, tmp_path: Path
@@ -245,26 +250,21 @@ def test_harness_rejects_policy_features_it_cannot_honor(
     executable.touch()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    spec = OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+    spec = OSEnvSpec(
+        cwd=str(workspace),
+        sandbox=OSEnvSandboxSpec(
+            type="linux_bwrap",
+            egress_rules=["GET api.example.com/**"] if feature == "egress_rules" else None,
+        ),
+    )
     if feature == "cwd_conflict":
         spec.cwd = str(tmp_path / "another-workspace")
-    else:
-        setattr(spec, feature, True)
-    with pytest.raises(ValueError, match=r"does not support|conflicts"):
+    elif feature == "fork":
+        spec.fork = True
+    message = "egress_rules" if feature == "egress_rules" else r"does not support|conflicts"
+    with pytest.raises(ValueError, match=message):
         with _prepared_launch(harness, executable, workspace, spec):
             pytest.fail(f"{harness} silently ignored {feature}")
-
-
-@pytest.mark.parametrize("harness", [name for name in _HARNESSES if name != "codex"])
-def test_harness_without_egress_broker_rejects_egress_rules(harness: str, tmp_path: Path) -> None:
-    executable = tmp_path / "agent"
-    executable.touch()
-    spec = OSEnvSpec(
-        sandbox=OSEnvSandboxSpec(type="linux_bwrap", egress_rules=["GET api.example.com/**"])
-    )
-    with pytest.raises(ValueError, match="egress_rules"):
-        with _prepared_launch(harness, executable, tmp_path, spec):
-            pytest.fail(f"{harness} ignored the egress allowlist")
 
 
 @pytest.mark.parametrize("harness", ["copilot", "cursor", "hermes"])
