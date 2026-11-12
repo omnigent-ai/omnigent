@@ -15,8 +15,10 @@ the header menu), and each place is a separate entry point.
   managed hosts, preselected. Siblings have one
   indentation level with curved connectors and are absent from the Agents panel.
   Archive/delete promotes the oldest active member; compute survives while any
-  session remains bound. The representative pins/moves the family; individual
-  pins appear only in Pinned and return to their nest when unpinned. Existing
+  session remains bound. The representative pins/moves the entire family; nested members have no pin
+  action, and legacy individual pins keep their place inside the nest.
+  Opening Add nested agent shows a draft row in the family until creation
+  replaces it; leaving the composer without submitting removes the draft. Existing
   sessions cannot join a family; ordinary forks remain standalone and may reuse the source host.
 
 - `session-grid`: behind `grid_sessions_display_ui`, drag sidebar sessions into a
@@ -1305,7 +1307,7 @@ model. It covers desktop kebab/right-click/header and mobile long-press/header
 composer navigation, shared/fresh compute, pin/project/fork actions, archive/undo,
 and survivor messaging after representative deletion. It also checks that expanded
 family rows hide actions when not hovered, deletion keeps peers nested before the
-server responds, and personal pins appear only once. Set `OMNIGENT_DEMO_DIR`
+server responds, and only the representative offers family-wide pin actions. Set `OMNIGENT_DEMO_DIR`
 outside the checkout to retain recordings.
 The component tests in `web/src/shell/HeaderConversationMenu.test.tsx` and
 `web/src/components/KeyboardShortcutsDialog.test.tsx` cover Cmd/Ctrl+Alt+A and

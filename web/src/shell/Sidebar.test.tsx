@@ -1,3 +1,9 @@
+import {
+  addNestedSessionDraft,
+  updateNestedSessionDraft,
+  removeNestedSessionDraft,
+} from "@/lib/nestedSessionDrafts";
+import type { Session } from "@/lib/types";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -289,7 +295,7 @@ function renderSidebar(
   );
   const result = render(tree());
   // Re-render the same tree, as a query does when the hook mocks return new data.
-  return { ...result, refresh: () => result.rerender(tree()) };
+  return { ...result, queryClient: qc, refresh: () => result.rerender(tree()) };
 }
 
 // Session scope lives in the Sessions heading's filter menu; pick an option to
@@ -1743,7 +1749,7 @@ describe("Sidebar failed session indicator", () => {
       );
     };
     const result = render(tree());
-    return { ...result, refresh: () => result.rerender(tree()) };
+    return { ...result, queryClient: qc, refresh: () => result.rerender(tree()) };
   }
 
   it("keeps rows memoized across grid renames and updates changed members", async () => {
@@ -2069,78 +2075,95 @@ describe("Sidebar sections", () => {
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
 
+  it.each(["sessions", "project", "pinned"])(
+    "expands a collapsed family for its draft in %s, replaces it in place, and removes cancelled drafts",
+    async (scope) => {
+      const family = { id: "family", representative_id: "conv_parent", pinned: scope === "pinned" };
+      const labels: Record<string, string> =
+        scope === "project" ? { omni_project: "Example project" } : {};
+      if (scope === "project") projectsMock.push("Example project");
+      if (scope === "pinned") seedPins(["conv_parent"]);
+      const members = [
+        conv("conv_parent", "Claude Code", { family, labels }),
+        conv("conv_peer", "Codex", { family, labels }),
+      ];
+      mockConversations(members);
+      const { queryClient, refresh } = renderSidebar();
+      if (scope === "project")
+        fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+      if (scope === "project")
+        fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
+      const source = {
+        id: "conv_parent",
+        title: "conv_parent",
+        createdAt: 1,
+        labels,
+        permissionLevel: null,
+        family,
+      } as Session;
+      act(() => addNestedSessionDraft(queryClient, "temp:nested", source));
+      const placeholder = await screen.findByText("New nested agent");
+      expect(placeholder.closest("li")).toHaveAttribute("data-sibling-session", "true");
+      expect(placeholder.closest("a")).toHaveAttribute("href", "/?sibling=conv_parent");
+      expect(screen.getByText("conv_peer")).toBeInTheDocument();
+      const rowNode = placeholder.closest("li");
+      expect(rowNode).toHaveClass("ml-9");
+      act(() => updateNestedSessionDraft(queryClient, "temp:nested", "created"));
+      mockConversations([
+        ...members,
+        conv("created", "Codex", { family, labels, title: "New task" }),
+      ]);
+      refresh();
+      await waitFor(() => expect(screen.queryByText("New nested agent")).toBeNull());
+      expect(screen.getByText("New task").closest("li")).toBe(rowNode);
+      act(() => addNestedSessionDraft(queryClient, "temp:cancelled", source));
+      expect(await screen.findByText("New nested agent")).toBeInTheDocument();
+      act(() => removeNestedSessionDraft(queryClient, "temp:cancelled"));
+      await waitFor(() => expect(screen.queryByText("New nested agent")).toBeNull());
+    },
+  );
+
   it.each([false, true])(
-    "moves personal pins out of their family until unpinned (project: %s)",
+    "keeps legacy individual pins nested and pins the family as a unit (project: %s)",
     (inProject) => {
       const family = { id: "family", representative_id: "conv_parent", pinned: false };
-      if (inProject) projectsMock.push("Customer X");
-      const projectLabels: Record<string, string> = inProject ? { omni_project: "Customer X" } : {};
-      mockConversations([
-        conv("conv_parent", "Claude Code", { family, labels: projectLabels }),
-        conv("conv_peer", "Codex", { family, labels: projectLabels }),
-        conv("conv_sibling", "Codex", {
+      if (inProject) projectsMock.push("Example project");
+      const labels: Record<string, string> = inProject ? { omni_project: "Example project" } : {};
+      const members = ["conv_parent", "conv_peer", "conv_nested"].map((id, index) =>
+        conv(id, "Claude Code", {
           family,
-          labels: { ...projectLabels, "omnigent.pinned": "1" },
+          created_at: index + 1,
+          labels: { ...labels, ...(id === "conv_nested" ? { "omnigent.pinned": "1" } : {}) },
         }),
-      ]);
-      seedPins(["conv_sibling"]);
+      );
+      mockConversations(members);
+      seedPins(["conv_nested"]);
       const { refresh } = renderSidebar();
-      if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
-
-      const link = screen.getByText("conv_parent").closest("a")!;
-      const surface = link.parentElement!;
-      const chevron = screen.getByRole("button", { name: "Collapse session family" });
-      expect(surface).toHaveClass("relative");
-      expect(surface).toContainElement(chevron);
-      expect(link).not.toContainElement(chevron);
-      const pinnedSection = screen.getByText("Pinned").closest("section")!;
-      expect(screen.getAllByText("conv_sibling")).toHaveLength(1);
-      expect(within(pinnedSection).getByText("conv_sibling").closest("li")).not.toHaveAttribute(
-        "data-sibling-session",
-      );
-      expect(
-        within(pinnedSection).queryByRole("button", { name: "Collapse session family" }),
-      ).toBeNull();
-
-      const setFamilyPinned = (pinned: boolean) => {
-        mockConversations([
-          conv("conv_parent", "Claude Code", {
-            family: { ...family, pinned },
-            labels: projectLabels,
-          }),
-          conv("conv_peer", "Codex", { family: { ...family, pinned }, labels: projectLabels }),
-          conv("conv_sibling", "Codex", {
-            family: { ...family, pinned },
-            labels: { ...projectLabels, "omnigent.pinned": "1" },
-          }),
-        ]);
-        seedPins(pinned ? ["conv_parent", "conv_sibling"] : ["conv_sibling"]);
-        refresh();
-      };
-      setFamilyPinned(true);
-      fireEvent.click(
-        within(pinnedSection).getByRole("button", { name: "Collapse session family" }),
-      );
-      expect(within(pinnedSection).getByText("conv_sibling")).toBeInTheDocument();
-      expect(within(pinnedSection).queryByText("conv_peer")).toBeNull();
-      setFamilyPinned(false);
-      expect(within(pinnedSection).getByText("conv_sibling").closest("li")).not.toHaveAttribute(
-        "data-sibling-session",
-      );
-      mockConversations([
-        conv("conv_parent", "Claude Code", { family, labels: projectLabels }),
-        conv("conv_peer", "Codex", { family, labels: projectLabels }),
-        conv("conv_sibling", "Codex", { family, labels: projectLabels }),
-      ]);
-      seedPins([]);
-      refresh();
-      expect(screen.queryByText("conv_sibling")).toBeNull();
-      fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
-      expect(screen.getAllByText("conv_sibling")).toHaveLength(1);
-      expect(screen.getByText("conv_sibling").closest("li")).toHaveAttribute(
+      if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
+      expect(screen.getAllByText("conv_nested")).toHaveLength(1);
+      expect(screen.getByText("conv_nested").closest("li")).toHaveAttribute(
         "data-sibling-session",
         "true",
       );
+      expect(
+        within(screen.getByText("conv_nested").closest("li")!).queryByTestId(
+          "quick-pin-conversation",
+        ),
+      ).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+      expect(screen.queryByText("conv_nested")).toBeNull();
+      mockConversations(members.map((row) => ({ ...row, family: { ...family, pinned: true } })));
+      seedPins(["conv_parent", "conv_nested"]);
+      refresh();
+      const pinnedSection = screen.getByText("Pinned").closest("section")!;
+      expect(within(pinnedSection).getByText("conv_parent")).toBeInTheDocument();
+      expect(within(pinnedSection).queryByText("conv_nested")).toBeNull();
+      fireEvent.click(within(pinnedSection).getByRole("button", { name: "Expand session family" }));
+      for (const id of ["conv_parent", "conv_peer", "conv_nested"]) {
+        expect(screen.getAllByText(id)).toHaveLength(1);
+        expect(within(pinnedSection).getByText(id)).toBeInTheDocument();
+      }
     },
   );
 

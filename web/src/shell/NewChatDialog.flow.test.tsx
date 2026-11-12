@@ -272,7 +272,7 @@ function setAgents(agents: AvailableAgent[]): void {
 function renderLanding(
   cachedSessionIds: string[] = [],
   infoOverrides: Partial<ServerInfo> = {},
-): void {
+): QueryClient {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -322,6 +322,7 @@ function renderLanding(
     );
   }
   render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return client;
 }
 
 /**
@@ -515,7 +516,15 @@ describe("NewChatLandingScreen create flow", () => {
             ),
           ),
       );
-      renderLanding([], { sibling_sessions: true });
+      const client = renderLanding([], { sibling_sessions: true });
+      await waitFor(() =>
+        expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+          expect.objectContaining({
+            source: expect.objectContaining({ id: "source" }),
+            creating: false,
+          }),
+        ]),
+      );
       await screen.findByTestId("new-chat-landing-input");
       expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
         `Working directory: ${sourceDirectory}`,
@@ -598,6 +607,11 @@ describe("NewChatLandingScreen create flow", () => {
               }
             : undefined;
       expect(body.git).toEqual(expectedGit);
+      await waitFor(() =>
+        expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+          expect.objectContaining({ id: "conv_new", creating: true, created: true }),
+        ]),
+      );
     },
   );
 

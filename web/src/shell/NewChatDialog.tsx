@@ -1,3 +1,8 @@
+import {
+  addNestedSessionDraft,
+  updateNestedSessionDraft,
+  removeNestedSessionDraft,
+} from "@/lib/nestedSessionDrafts";
 import { useSiblingSessionDestinations } from "@/hooks/useSharing";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useComposerContext } from "@/hooks/useComposerContext";
@@ -2911,6 +2916,14 @@ function NewChatLandingContent({
   // `submittedRef` is flipped once the draft is sent to a create, so the
   // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
+  const [nestedProvisional] = useState(newTempConversation);
+  useEffect(() => {
+    if (!siblingSource) return;
+    addNestedSessionDraft(queryClient, nestedProvisional.id, siblingSource);
+    return () => {
+      if (!submittedRef.current) removeNestedSessionDraft(queryClient, nestedProvisional.id);
+    };
+  }, [queryClient, nestedProvisional, siblingSource]);
   const submittedDraftRevisionRef = useRef<number | null>(null);
   // Whether this composer is still on screen. The create POST can outlive
   // it — the user opens another session while the session bootstraps — and
@@ -5867,6 +5880,11 @@ function NewChatLandingContent({
   function returnDraftToUser(temporaryConversationId?: string) {
     submittedRef.current = false;
     submittedDraftRevisionRef.current = null;
+    if (siblingSource && onScreenRef.current) {
+      addNestedSessionDraft(queryClient, nestedProvisional.id, siblingSource);
+    } else {
+      removeNestedSessionDraft(queryClient, nestedProvisional.id);
+    }
     const originalDraft =
       temporaryConversationId && !hasPendingLocalMessage(temporaryConversationId)
         ? { ...draftRef.current, message: "", files: [] }
@@ -5980,6 +5998,7 @@ function NewChatLandingContent({
       // Spend the draft only once provisioning starts, after the laptop credential check.
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
+      if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
         writeLastSandboxRepos(sandboxRepoSelections);
@@ -6132,7 +6151,7 @@ function NewChatLandingContent({
       // "Sessions" section while the search-indexed session list catches up to
       // the move. A `project_id` create needs no label: the row is born with
       // first-class membership (and a label would go stale on project rename).
-      const createLabels =
+      const createLabels: Record<string, string> =
         selectedProject && createProjectId === null
           ? {
               ...(baseLabels ?? {}),
@@ -6141,6 +6160,7 @@ function NewChatLandingContent({
             }
           : { ...(baseLabels ?? {}), ...composerContextLabels };
 
+      if (siblingSource) createLabels[CLIENT_CREATE_TOKEN_LABEL] = nestedProvisional.token;
       const skill = isNativeTerminalAgent
         ? null
         : matchSkillInvocation(initialPrompt, availableSkills);
@@ -6237,7 +6257,7 @@ function NewChatLandingContent({
         setPendingAgent(null);
       } else {
         // Normal path: bind to an existing registered agent.
-        const provisional = newTempConversation();
+        const provisional = siblingSource ? nestedProvisional : newTempConversation();
         try {
           localConv = beginLocalConversation(initialPrompt, files, provisional, localProject, {
             // Seed the temp session with the NORMALIZED create identity so the
@@ -6566,6 +6586,7 @@ function NewChatLandingContent({
         writeLandingDraft(draftState, null);
       }
 
+      if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id, data.id);
       // `localConv` is set only when a real agent id was resolved up front.
       if (localConv !== null && effectiveAgentId !== null) {
         const tempConvId = localConv.tempConvId;

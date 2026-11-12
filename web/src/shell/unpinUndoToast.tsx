@@ -44,9 +44,11 @@ export function unpinWithUndo(
   queryClient: QueryClient,
   writePin: WritePin,
   id: string,
-  before: Pick<Conversation, "title" | "labels"> | undefined,
+  before: Pick<Conversation, "title" | "labels" | "family"> | undefined,
 ): void {
-  const previous = Number(before?.labels?.[PINNED_LABEL_KEY]);
+  const previous = Number(
+    before?.family ? before.family.pinned_at : before?.labels?.[PINNED_LABEL_KEY],
+  );
   const pinnedAt = Number.isFinite(previous) && previous > 0 ? previous : undefined;
   writePin({ id, pinned: false })
     .then(() => {

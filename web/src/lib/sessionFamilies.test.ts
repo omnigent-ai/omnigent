@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
-import { isIndentedSibling, orderSessionFamilies } from "./sessionFamilies";
+import { isIndentedSibling, isSessionPinned, orderSessionFamilies } from "./sessionFamilies";
 
 const member = (id: string, created_at: number, representative_id = "a") =>
   ({ id, created_at, family: { id: "family", representative_id, pinned: false } }) as Conversation;
@@ -33,9 +33,8 @@ describe("session families", () => {
       "x",
     ]);
     const pinned = { ...c, labels: { "omnigent.pinned": "1" } };
-    expect(orderSessionFamilies([b, pinned, a], collapsed).map((row) => row.id)).toEqual([
-      "a",
-      "c",
-    ]);
+    expect(orderSessionFamilies([b, pinned, a], collapsed).map((row) => row.id)).toEqual(["a"]);
+    expect(isSessionPinned(pinned, new Set(["c"]))).toBe(false);
+    expect(isSessionPinned({ ...pinned, family: { ...pinned.family!, pinned: true } })).toBe(true);
   });
 });

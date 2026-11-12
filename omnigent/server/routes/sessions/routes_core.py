@@ -3619,8 +3619,6 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
         if PINNED_LABEL_KEY in labels_to_set:
-            from omnigent.stores.conversation_store import family_pinned_label_key
-
             pin_source = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             owner_grant = (
                 await asyncio.to_thread(permission_store.get, user_id, session_id)
@@ -3644,15 +3642,7 @@ def register_core_routes(
                 )
                 active = [member for member in members if not member.archived]
                 retained = active or members
-                family_pin_key = family_pinned_label_key(user_id)
-                if (
-                    retained
-                    and retained[0].id == session_id
-                    and (
-                        family_pin_key in pin_source.labels
-                        or pinned_label_key(user_id) not in pin_source.labels
-                    )
-                ):
+                if retained and retained[0].id == session_id:
                     family_pin_value = labels_to_set.pop(PINNED_LABEL_KEY)
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't

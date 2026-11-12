@@ -60,6 +60,18 @@ describe("unpinWithUndo", () => {
     await waitFor(() => expect(screen.queryByText("Unpinned session")).not.toBeInTheDocument());
   });
 
+  it("restores the family pin position instead of a legacy personal pin", async () => {
+    act(() =>
+      unpinWithUndo(queryClient, writePin, "conv_a", {
+        ...row("Group", "1"),
+        family: { id: "family", representative_id: "conv_a", pinned: true, pinned_at: "2000" },
+      }),
+    );
+    await screen.findByText("Unpinned session");
+    act(() => fireEvent.click(screen.getByRole("button", { name: "Undo" })));
+    expect(writePin).toHaveBeenLastCalledWith({ id: "conv_a", pinned: true, pinnedAt: 2000 });
+  });
+
   it("offers nothing when the unpin is refused or fails", async () => {
     writePin.mockRejectedValueOnce(new Error("Still saving your pins."));
     act(() =>
