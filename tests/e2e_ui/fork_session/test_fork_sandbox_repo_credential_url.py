@@ -46,7 +46,6 @@ def _managed_info_body() -> str:
             "accounts_enabled": False,
             "login_url": None,
             "needs_setup": False,
-            "databricks_features": False,
             "managed_sandboxes_enabled": True,
             "session_fork_workspaces": True,
             "sandbox_provider": "modal",

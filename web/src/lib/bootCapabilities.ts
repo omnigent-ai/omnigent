@@ -5,7 +5,6 @@ export const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   single_user: false,
   login_url: null,
   needs_setup: false,
-  databricks_features: false,
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
   sandbox_providers: [],

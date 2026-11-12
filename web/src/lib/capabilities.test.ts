@@ -22,7 +22,6 @@ function info(overrides: Partial<ServerInfo>): ServerInfo {
     single_user: true,
     login_url: null,
     needs_setup: false,
-    databricks_features: false,
     managed_sandboxes_enabled: true,
     sandbox_provider: null,
     sandbox_providers: [],

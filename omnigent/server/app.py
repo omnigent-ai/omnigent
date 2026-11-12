@@ -259,7 +259,6 @@ class ServerInfoResponse(BaseModel):
     single_user: bool
     login_url: str | None
     needs_setup: bool
-    databricks_features: bool
     managed_sandboxes_enabled: bool
     durable_initial_input: bool = False
     sandbox_provider: str | None
@@ -3575,11 +3574,10 @@ def create_app(
         It exposes no sensitive state — only the active auth
         source, the login URL, whether first-run admin setup is
         still pending (``needs_setup``), coarse capability
-        booleans (``databricks_features``,
-        ``managed_sandboxes_enabled``, ``dictation_available``,
-        ``single_user``), the short sandbox provider name
-        (``sandbox_provider``) the web UI labels the new-session
-        sandbox option with, and the installed
+        booleans (``managed_sandboxes_enabled``,
+        ``dictation_available``, ``single_user``), the short sandbox
+        provider name (``sandbox_provider``) the web UI labels the
+        new-session sandbox option with, and the installed
         ``server_version`` (already public via ``/api/version``).
         """
         from omnigent.server.auth import local_single_user_enabled
@@ -3604,15 +3602,6 @@ def create_app(
         needs_setup = False
         if accounts_enabled and account_store is not None:
             needs_setup = not any(u.has_password for u in account_store.list_users())
-        # databricks_features gates the Databricks-only UI hints (the
-        # "Databricks Lakebox" connect tab). True only when the lakebox launcher
-        # module is present; otherwise the SPA shows the provider-agnostic hints.
-        # find_spec is side-effect-free (no import).
-        import importlib.util
-
-        databricks_features = (
-            importlib.util.find_spec("omnigent.onboarding.sandboxes.lakebox") is not None
-        )
         # managed_sandboxes_enabled gates the web UI's sandbox
         # option on the new-session screen: true only when a `sandbox:`
         # config is wired AND its provider can actually serve a managed
@@ -3710,7 +3699,6 @@ def create_app(
                 "single_user": single_user,
                 "login_url": login_url,
                 "needs_setup": needs_setup,
-                "databricks_features": databricks_features,
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
                 "durable_initial_input": startup_inputs is not None,
                 "sandbox_provider": sandbox_provider,

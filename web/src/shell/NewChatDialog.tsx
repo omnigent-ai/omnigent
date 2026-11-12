@@ -118,7 +118,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { MenuItem } from "@/components/ui/menu-item";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
@@ -590,50 +589,15 @@ export function ConnectHostInstructions({
   /** After the desktop shell connects a machine over SSH, with its host id. */
   onSshConnected?: (hostId: string) => void;
 }) {
-  // Managed servers add the Lakebox connect path. Other builds show only the
-  // plain `omni host` command. Driven by /v1/info.
-  const info = useServerInfo();
-  // "loading" counts as no managed hints until the probe resolves, so the
-  // Lakebox option never flashes in.
-  const databricksFeatures = info !== "loading" && info.databricks_features;
   const quotedServerUrl = quoteShellArgument(serverUrl);
   const sshConnectAvailable = useSshConnectAvailable();
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
-      {databricksFeatures ? (
-        <Tabs defaultValue="local" componentId="new_chat.host_tabs">
-          <TabsList className="w-full">
-            <TabsTrigger value="local" className="text-sm">
-              Local machine
-            </TabsTrigger>
-            <TabsTrigger value="lakebox" className="text-sm">
-              Databricks Lakebox
-            </TabsTrigger>
-          </TabsList>
-          <TabsContent value="local">
-            <CliCommandBlock
-              command={`omni host --server ${quotedServerUrl}`}
-              testIdPrefix="connect-host"
-            />
-          </TabsContent>
-          <TabsContent value="lakebox" className="flex flex-col gap-1.5">
-            <CliCommandBlock
-              command="omni sandbox create --provider lakebox"
-              testIdPrefix="connect-lakebox-create"
-            />
-            <CliCommandBlock
-              command={`omni sandbox connect --provider lakebox --sandbox-id <id> --server ${quotedServerUrl}`}
-              testIdPrefix="connect-lakebox-connect"
-            />
-          </TabsContent>
-        </Tabs>
-      ) : (
-        <CliCommandBlock
-          command={`omni host --server ${quotedServerUrl}`}
-          testIdPrefix="connect-host"
-        />
-      )}
+      <CliCommandBlock
+        command={`omni host --server ${quotedServerUrl}`}
+        testIdPrefix="connect-host"
+      />
       {sshConnectAvailable && <SshConnectForm onConnected={onSshConnected} />}
     </div>
   );
