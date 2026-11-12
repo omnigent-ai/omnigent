@@ -1849,7 +1849,7 @@ def test_codex_cli_config_default_pins_model_provider(config_home: Path) -> None
     the user's ~/.codex/config.toml, which the executor bridges into the
     session CODEX_HOME — so the spawn env must carry exactly the pin and
     none of the gateway transport vars. Failure on the pin means an adopted
-    isaac-style provider launches codex on its built-in (unauthenticated)
+    custom provider launches codex on its built-in (unauthenticated)
     path; a leaked gateway var means the executor would expect a base
     URL/auth command that was never resolved.
     """
@@ -2063,7 +2063,7 @@ def test_codex_undismissed_config_provider_routes_via_detection(
 ) -> None:
     """The same config WITHOUT a dismissal routes via the detected provider.
 
-    Counterpart to the test above: an isaac-configured machine that never
+    Counterpart to the test above: a gateway-configured machine that never
     Removed anything keeps its gateway routing (the ambient cli-config
     detection auto-defaults and pins its own provider). Failure means the
     no-provider neutralization fires too broadly and breaks the golden path.

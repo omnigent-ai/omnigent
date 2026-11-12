@@ -11821,7 +11821,7 @@ def test_wait_for_claude_prompt_ready_outlasts_base_budget_while_pane_alive(
 
 
 _SIGN_IN_PANE = (
-    "dbexec: launcher 1.2.3\n"
+    "synthetic-launcher: launcher 1.2.3\n"
     "Logging in via SSO...\n"
     "If the browser does not open automatically, please open the following URL:\n"
     "\thttps://signin.example.com/oauth2/v1/authorize?client_id=abc&state=xyz\n"
@@ -14580,7 +14580,7 @@ def test_inject_user_message_retries_a_swallowed_occupied_input_escape(
 
 
 # What the pane shows behind a launch wrapper before Claude Code draws its
-# input box (captured from ``isaac -- --resume <id>``).
+# input box (captured from ``example-wrapper -- --resume <id>``).
 _LAUNCHER_OUTPUT_PANE = """\
 Generating claude-code MCP client config...
 No changes made to /home/user/.claude.json.

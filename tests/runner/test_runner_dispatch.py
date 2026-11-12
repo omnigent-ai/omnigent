@@ -13814,13 +13814,14 @@ _SSE_RESPONSE_FAILED_SIGN_IN = (
     '"code":"databricks_sign_in_pending"}}\n\n'
 )
 _SIGN_IN_PROMPT_SCREEN = (
-    "dbcert: If the browser does not open automatically, please open the following URL:\n"
-    "\n\thttps://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
+    "credential-helper: If the browser does not open automatically, "
+    "please open the following URL:\n"
+    "\n\thttps://login.example.test/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
 )
 _SIGNED_IN_SCREENS = {
     # Codex draws inline: the launcher's lines stay above its banner.
     "codex-native": (
-        _SIGN_IN_PROMPT_SCREEN + "dbcert: All credentials successfully written\n"
+        _SIGN_IN_PROMPT_SCREEN + "credential-helper: All credentials successfully written\n"
         "╭── OpenAI Codex (v0.156.1) ──╮\n"
         "› Ask Codex to do anything\n"
     ),

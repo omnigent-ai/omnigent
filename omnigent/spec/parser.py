@@ -985,7 +985,7 @@ def _parse_terminals(
 
     :param raw: The raw ``terminals:`` value from config.yaml — a mapping of
         terminal name → config, or absent (``None``). Example:
-        ``{"claude_code": {"command": "isaac", "allow_cwd_override": True,
+        ``{"claude_code": {"command": "example-wrapper", "allow_cwd_override": True,
         "os_env": {"type": "caller_process", "sandbox": {"type": "none"}}}}``.
     :returns: Map of terminal name → :class:`TerminalEnvSpec` when present and
         non-empty, else ``None`` (so ``sys_terminal_*`` stays unregistered).

@@ -1161,7 +1161,7 @@ async def test_session_app_server_launches_through_the_configured_wrapper(
     workspace = tmp_path / "work"
     workspace.mkdir()
     server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
-    server.app_server_command = ("env", "MODE=omni", "isaac", "codex", "--")
+    server.app_server_command = ("env", "MODE=omni", "example-wrapper", "codex", "--")
     server.config_overrides = ['model_provider="p"', 'model="m"']
 
     await server._spawn_app_server_process("unix:///tmp/codex.sock")
@@ -1172,7 +1172,7 @@ async def test_session_app_server_launches_through_the_configured_wrapper(
     # Wrapper args, then Omnigent's -c (joining the wrapper's top-level group), then app-server.
     assert spawned["argv"][1:] == (
         "MODE=omni",
-        "isaac",
+        "example-wrapper",
         "codex",
         "--",
         "-c",

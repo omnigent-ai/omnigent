@@ -11,7 +11,7 @@
 │               /private/tmp/btw-repro               │                                                                                                         │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 
- ▎ Try Codex in Isaac for improved token efficiency and speed — run `isaac codex` to start a Codex session.
+ ▎ Try Codex for coding tasks — run `codex` to start a Codex session.
 
 
 

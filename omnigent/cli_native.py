@@ -295,7 +295,7 @@ def register_native_commands(cli: click.Group) -> None:
         # the native claude/codex terminal (_auto_create_*_terminal resolves
         # them), and every CLI launch here reaches that daemon path. Persist the
         # RAW pass-through so the runner merge is not stacked on top of a
-        # CLI-merged prefix — that doubled the wrapper (e.g. `isaac -- -- …`).
+        # CLI-merged prefix — that doubled the wrapper (e.g. `example-wrapper -- -- …`).
         extra_args = claude_args
         if smart_routing:
             # Arming creates the session (that is where Smart Routing is turned
