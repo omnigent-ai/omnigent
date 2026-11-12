@@ -2532,9 +2532,7 @@ function LocalCliSection() {
             )}
 
             {status.customizationDisabled ? (
-              <p className="text-sm text-muted-foreground">
-                Managed by your organization. Host enrollment uses <code>isaac omni</code>.
-              </p>
+              <p className="text-sm text-muted-foreground">Managed by your organization.</p>
             ) : (
               <>
                 <p className="text-sm text-muted-foreground">

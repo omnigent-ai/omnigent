@@ -193,6 +193,7 @@ function loadNavigationHarness({
     arcaSetups: [],
     arcaSetupCancels: 0,
     sshConnects: [],
+    hostConnects: [],
   };
   const pickers = [];
   const findBars = [];
@@ -647,7 +648,10 @@ function loadNavigationHarness({
       shutdown: async () => {},
       onChange: () => {},
       ensureServerAuth: async () => serverAuthResult,
-      ensureHostConnected: async () => hostConnectResult,
+      ensureHostConnected: async (...args) => {
+        calls.hostConnects.push(args);
+        return hostConnectResult;
+      },
       restartHost: async () => ({ ok: true }),
       disconnectHost: async () => ({ ok: true }),
       startLocalServer: async () => ({ ok: false }),
@@ -2476,7 +2480,7 @@ describe("managed server preference wiring", () => {
     const handler = liveCode.slice(start, end);
     assert.match(
       handler,
-      /hostCliCommand\(target\)[\s\S]*serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]*serverManager\.ensureHostConnected\(cliCommand, target\)/,
+      /resolvedCliPath\(\)[\s\S]*serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]*serverManager\.ensureHostConnected\(cliCommand, target\)/,
     );
   });
 
@@ -2556,44 +2560,13 @@ describe("managed server preference wiring", () => {
   });
 });
 
-describe("managed local-host CLI wiring", () => {
-  it("selects isaac omni only behind the managed features flag and managed server gate", () => {
-    assert.match(
-      liveCode,
-      /function hostCliCommand\(serverUrl\)[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,120}isDatabricksManagedServerUrl\(serverUrl\)[\s\S]{0,300}prefixArgs:\s*\["omni"\]/,
-    );
-  });
-
+describe("local-host CLI wiring", () => {
   it("uses the selected command for identity availability and every host action", () => {
+    assert.match(liveCode, /host-get-identity[\s\S]{0,350}Boolean\(resolvedCliPath\(\)\)/);
     assert.match(
       liveCode,
-      /host-get-identity[\s\S]{0,350}Boolean\(hostCliCommand\(senderServerUrl\(event\)\)\)/,
+      /host-control[\s\S]{0,450}const cliCommand = resolvedCliPath\(\)[\s\S]{0,1400}ensureServerAuth\(cliCommand, serverUrl\)[\s\S]{0,400}ensureHostConnected\(cliCommand, serverUrl\)[\s\S]{0,300}disconnectHost\(cliCommand, serverUrl\)/,
     );
-    assert.match(
-      liveCode,
-      /host-control[\s\S]{0,450}const cliCommand = hostCliCommand\(serverUrl\)[\s\S]{0,1400}ensureServerAuth\(cliCommand, serverUrl\)[\s\S]{0,400}ensureHostConnected\(cliCommand, serverUrl\)[\s\S]{0,300}disconnectHost\(cliCommand, serverUrl\)/,
-    );
-  });
-
-  it("disables CLI customization in main and explains managed policy in the setup dialog", () => {
-    assert.match(
-      liveCode,
-      /omnigent:set-cli-path[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,250}customizationDisabled:\s*true[\s\S]{0,80}accepted:\s*false/,
-    );
-    assert.match(
-      liveCode,
-      /omnigent:browse-cli-path[\s\S]{0,250}databricksInternalFeaturesEnabled\(\)\) return null/,
-    );
-    assert.match(
-      liveCode,
-      /omnigent:cli-reset-path[\s\S]{0,250}databricksInternalFeaturesEnabled\(\)[\s\S]{0,250}customizationDisabled:\s*true/,
-    );
-    assert.match(setupSource, /cliGear\.hidden = false/);
-    assert.match(setupSource, /cliManaged\.hidden = !cliCustomizationDisabled/);
-    assert.match(setupSource, /cliPathInput\.disabled = cliCustomizationDisabled/);
-    assert.match(setupSource, /cliBrowse\.disabled = cliCustomizationDisabled/);
-    assert.match(setupSource, /cliRedetect\.disabled = cliCustomizationDisabled/);
-    assert.match(setupSource, /Managed by your organization/);
   });
 });
 
@@ -4260,6 +4233,27 @@ describe("onboarding runner IPC", () => {
     const result = await h.ipc.get("omnigent:connect-runner")(event, server, "remote");
     assert.equal(result.ok, false);
     assert.match(result.error, /isn't available/);
+  });
+
+  it("uses the configured CLI for local enrollment and leaves customization available", async (t) => {
+    const serverUrl = "https://accounts.cloud.databricks.com";
+    const cliPath = "/configured/omnigent";
+    const h = loadNavigationHarness({ serverUrl, internalFeatures: true, cliPath });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ omnigent_path: cliPath }));
+    const page = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    assert.equal(h.ipc.get("omnigent:host-get-identity")(page).cliInstalled, true);
+    assert.equal((await h.ipc.get("omnigent:cli-get-status")(page)).customizationDisabled, false);
+    const result = await h.ipc.get("omnigent:connect-runner")(
+      { sender: setupSender(), senderFrame: setupFrame(h) },
+      serverUrl,
+      "local",
+    );
+    assert.equal(result.ok, true);
+    assert.deepEqual(h.calls.hostConnects, [[cliPath, serverUrl]]);
+    await h.ipc.get("omnigent:cli-reset-path")(page);
+    assert.equal(JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).omnigent_path, undefined);
   });
 
   it("names the missing launcher when this laptop has no host CLI", async (t) => {
