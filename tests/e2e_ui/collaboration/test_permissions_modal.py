@@ -185,7 +185,7 @@ def _open_share_modal(page: Page) -> None:
     expect(share).to_be_enabled(timeout=60_000)
     share.click()
     expect(page.get_by_role("dialog")).to_be_visible()
-    expect(page.get_by_text("Share this session")).to_be_visible()
+    expect(page.get_by_role("heading", name=re.compile(r"^Share "))).to_be_visible()
 
 
 def _read_clipboard(page: Page, secure_url: str) -> str:
@@ -245,13 +245,14 @@ def test_permissions_modal_controls_drive_server_state(
     _open_share_modal(page)
     dialog = page.get_by_role("dialog")
 
-    # General access: No access -> Read creates a __public__ grant.
-    public_level = dialog.get_by_role("combobox", name="General access")
-    expect(public_level).to_have_text("No access")
+    # General access: Restricted -> Anyone with the link creates a __public__ Read grant.
+    public_level = dialog.get_by_role("button", name="General access")
+    expect(public_level).to_have_text("Restricted")
     assert _PUBLIC_USER not in _permissions(base_url, session_id)
     public_level.click()
-    page.get_by_role("option", name="Read", exact=True).click()
-    expect(public_level).to_have_text("Read")
+    page.get_by_role("menuitemradio", name=re.compile(r"^Anyone with the link")).click()
+    expect(public_level).to_have_text("Anyone with the link")
+    expect(dialog.get_by_text("Everyone with this link can read")).to_be_visible()
     # Wait for the mutation before cross-checking the grant through the API.
     _wait_for(lambda: _permissions(base_url, session_id).get(_PUBLIC_USER) == _LEVEL_READ)
 
@@ -268,19 +269,20 @@ def test_permissions_modal_controls_drive_server_state(
 
     # ── Grant a user at Read via the add-user form ───────────────────
     dialog.get_by_placeholder("alice@example.com").fill(grantee)
-    dialog.get_by_role("button", name="Grant").click()
+    dialog.get_by_role("button", name="Add").click()
     # The new row renders the grantee and the REST state agrees at Read.
     expect(dialog.get_by_title(grantee)).to_be_visible()
     _wait_for(lambda: _permissions(base_url, session_id).get(grantee) == _LEVEL_READ)
 
-    # ── Change that user's level Read → Edit via the row select ──────
-    level_select = dialog.get_by_role("combobox", name=f"Permission level for {grantee}")
-    level_select.click()
-    page.get_by_role("option", name="Edit").click()
+    # ── Change that user's level Read → Edit via the row menu ────────
+    level_menu = dialog.get_by_role("button", name=f"Permission level for {grantee}")
+    level_menu.click()
+    page.get_by_role("menuitemradio", name=re.compile(r"^Edit")).click()
     _wait_for(lambda: _permissions(base_url, session_id).get(grantee) == _LEVEL_EDIT)
 
     # ── Revoke the user: row disappears, grant is gone server-side ───
-    dialog.get_by_role("button", name="Revoke").click()
+    level_menu.click()
+    page.get_by_role("menuitem", name="Remove access").click()
     expect(dialog.get_by_title(grantee)).to_have_count(0)
     _wait_for(lambda: grantee not in _permissions(base_url, session_id))
 
@@ -323,7 +325,7 @@ def test_share_modal_qr_code_opens_mobile_deep_link(
     # entirely). Scope the Close button to the QR dialog to avoid matching
     # the Radix Dialog's built-in close (X) on the share dialog underneath.
     qr_dialog.get_by_role("button", name="Close").first.click()
-    expect(page.get_by_text("Share this session")).to_be_visible()
+    expect(page.get_by_role("heading", name=re.compile(r"^Share "))).to_be_visible()
 
 
 def test_public_edit_ceiling_grant_downgrade_revoke(
@@ -378,11 +380,15 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         page.goto(f"{multi_user_server.public_url}/c/{session_id}")
         _open_share_modal(page)
         dialog = page.get_by_role("dialog")
-        general = dialog.get_by_role("combobox", name="General access")
-        expect(general).to_have_text("No access")
+        general = dialog.get_by_role("button", name="General access")
+        expect(general).to_have_text("Restricted")
         general.click()
-        page.get_by_role("option", name="Edit", exact=True).click()
-        expect(general).to_have_text("Edit")
+        page.get_by_role("menuitemradio", name=re.compile(r"^Anyone with the link")).click()
+        link_role = dialog.get_by_role("button", name="Link access permission")
+        expect(link_role).to_have_text("Read")
+        link_role.click()
+        page.get_by_role("menuitemradio", name=re.compile(r"^Edit")).click()
+        expect(link_role).to_have_text("Edit")
         _wait_for(
             lambda: (
                 _permissions(base_url, session_id, headers=admin_headers).get(_PUBLIC_USER) == 2
@@ -394,7 +400,7 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         composer = member.get_by_placeholder("Send a message…")
         expect(composer).to_be_enabled(timeout=30_000)
         page.screenshot(path=str(tmp_path / "public-sharing-owner.png"))
-        page.get_by_role("button", name="Done", exact=True).click()
+        dialog.get_by_role("button", name="Close", exact=True).click()
         marker = f"public-edit-{secrets.token_hex(4)}"
         composer.fill(f"Reply with exactly this token and nothing else: {marker}")
         member.get_by_role("button", name="Send", exact=True).click()
@@ -436,12 +442,13 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         _open_share_modal(page)
         page.set_viewport_size({"width": 390, "height": 844})
         dialog = page.get_by_role("dialog")
-        general = dialog.get_by_role("combobox", name="General access")
-        expect(general).to_have_text("Read")
+        general = dialog.get_by_role("button", name="General access")
+        expect(general).to_have_text("Anyone with the link")
+        expect(dialog.get_by_text("Everyone with this link can read")).to_be_visible()
         page.screenshot(path=str(tmp_path / "public-sharing-mobile.png"))
         assert dialog.evaluate("(el) => el.scrollWidth <= el.clientWidth")
         general.click()
-        page.get_by_role("option", name="No access", exact=True).click()
+        page.get_by_role("menuitemradio", name=re.compile(r"^Restricted")).click()
         _wait_for(
             lambda: _PUBLIC_USER not in _permissions(base_url, session_id, headers=admin_headers)
         )

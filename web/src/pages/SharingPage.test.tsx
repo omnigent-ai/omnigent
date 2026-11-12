@@ -176,7 +176,7 @@ describe("SharingPage", () => {
       ["Read only", description],
       [
         "Read only (restricted)",
-        "Read-only. Sessions in a home directory or the filesystem root cannot be shared.",
+        "Read-only. Sessions in a home directory or the filesystem root never share workspace files.",
       ],
       ["Off", "Block new shares and hide the Share control."],
     ]) {
@@ -209,7 +209,7 @@ describe("SharingPage", () => {
     );
     expect(trigger).toHaveTextContent(/^Read only \(restricted\)$/);
     expect(trigger).toHaveAccessibleDescription(
-      "Read-only. Sessions in a home directory or the filesystem root cannot be shared.",
+      "Read-only. Sessions in a home directory or the filesystem root never share workspace files.",
     );
   });
 

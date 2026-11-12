@@ -225,12 +225,12 @@ describe("palette-aware surface composition", () => {
     expect(darkTokens).toContain(
       "--composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white)",
     );
-    expect(darkTokens).toContain("--menu-surface-bg: var(--composer-surface-bg)");
+    expect(darkTokens).toContain("--overlay-surface-bg: var(--composer-surface-bg)");
     expect(darkTokens).toContain("color-mix(in srgb, var(--card) 95%, white)");
     expect(darkTokens).not.toContain("#5c306c");
     expect(sidebarRule).toContain("background-color: var(--sidebar)");
     expect(composerRule).toContain("background-color: var(--composer-surface-bg)");
-    expect(menuRule).toContain("background-color: var(--menu-surface-bg)");
+    expect(menuRule).toContain("background-color: var(--overlay-surface-bg)");
     expect(cardRule).toContain("background-color: var(--card-surface-bg)");
   });
 
@@ -255,8 +255,8 @@ describe("palette-aware surface composition", () => {
     expect(generatedPaletteCssSource).not.toContain("--primary-cta");
   });
 
-  it("keeps menu surfaces white in light mode", () => {
-    expect(lightMenuRule).toContain("background-color: #fff");
+  it("uses the palette popover for menu surfaces in light mode", () => {
+    expect(lightMenuRule).toContain("background-color: var(--popover)");
     expect(lightMenuRule).toContain("border: 1px solid rgb(0 0 0 / 8%)");
   });
 
@@ -874,7 +874,7 @@ describe("index.css composer and menu surfaces", () => {
     expect(darkTokens).toContain(
       "--composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white)",
     );
-    expect(darkTokens).toContain("--menu-surface-bg: var(--composer-surface-bg)");
+    expect(darkTokens).toContain("--overlay-surface-bg: var(--composer-surface-bg)");
     expect(darkTokens).not.toContain("--composer-surface-bg: rgb(255 255 255 /");
   });
 

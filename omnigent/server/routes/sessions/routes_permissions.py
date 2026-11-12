@@ -36,7 +36,8 @@ from omnigent.server.auth import (
     RESERVED_USER_PUBLIC,
     AuthProvider,
     SharingMode,
-    workspace_sharing_blocked,
+    level_rank,
+    workspace_files_withheld,
 )
 from omnigent.server.routes._auth_helpers import (
     get_session_owner_id as _get_session_owner_id,
@@ -126,15 +127,14 @@ def register_permissions_routes(
                 "Sharing has been disabled for this Omnigent server.",
                 code=ErrorCode.FORBIDDEN,
             )
-        # RESTRICTED_READ_ONLY blocks sharing entirely (even read) for a session
-        # whose cwd is a home dir or the filesystem root — that workspace is too
-        # broad to expose. Other sessions fall through to the read-only cap.
-        if _sharing_mode == SharingMode.RESTRICTED_READ_ONLY:
+        # A home or root cwd on a restricted server is shareable at read only,
+        # and never with its workspace files (see workspace_files_withheld).
+        if _sharing_mode == SharingMode.RESTRICTED_READ_ONLY and body.level != LEVEL_READ:
             _conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if _conv is not None and workspace_sharing_blocked(_conv.workspace):
+            if _conv is not None and workspace_files_withheld(_sharing_mode, _conv.workspace):
                 raise OmnigentError(
-                    "This session's working directory (a home or root directory) "
-                    "cannot be shared on this Omnigent server.",
+                    "Sessions in a home or root directory can only be shared with "
+                    "read access on this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
                 )
         if (
@@ -170,7 +170,7 @@ def register_permissions_routes(
             ceiling = getattr(
                 request.app.state, "public_sharing_max_level", lambda: PublicSharingMaxLevel.READ
             )()
-            if body.level > ceiling.level:
+            if level_rank(body.level) > level_rank(ceiling.level):
                 raise OmnigentError(
                     f"Public access is limited to {ceiling.value} (level {ceiling.level})",
                     code=ErrorCode.INVALID_INPUT,

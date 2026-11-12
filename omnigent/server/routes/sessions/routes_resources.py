@@ -58,6 +58,9 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    SharingMode,
+    level_satisfies,
+    workspace_files_withheld,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
@@ -920,7 +923,21 @@ def register_resources_routes(
         # child session, access inherited from the parent chain with no direct
         # grant. Edit collaborators keep the workspace unconditionally; a
         # view-only grant reaches it only once the owner shares its files.
-        if access.level is None or access.level >= LEVEL_EDIT or conv.share_workspace_files:
+        sharing_mode = getattr(request.app.state, "sharing_mode", lambda: SharingMode.ON)()
+        if workspace_files_withheld(sharing_mode, conv.workspace):
+            # A home or root cwd on a restricted server: only the owner sees files.
+            if access.level is None or await _owns_session(user_id, conv, access.level):
+                return conv, True
+            raise OmnigentError(
+                f"Session {session_id!r} runs in a home or root directory, so this "
+                "Omnigent server only shows its workspace files to the owner",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if (
+            access.level is None
+            or level_satisfies(access.level, LEVEL_EDIT)
+            or conv.share_workspace_files
+        ):
             return conv, await _owns_session(user_id, conv, access.level)
         raise OmnigentError(
             f"{user_id!r} needs edit access to browse the workspace of session "

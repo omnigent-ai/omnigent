@@ -1753,8 +1753,8 @@ def create_app(
         permission grants (see :class:`SharingMode`): ``ON`` allows
         grants at any level plus public/workspace read, ``READ_ONLY``
         caps grants at read (edit/manage rejected with 403),
-        ``RESTRICTED_READ_ONLY`` additionally blocks sharing a session
-        whose working directory is a home or root directory, and ``OFF``
+        ``RESTRICTED_READ_ONLY`` additionally never shares workspace files
+        of a session whose working directory is a home or root directory, and ``OFF``
         rejects all new grants (403). Only *new* grants are gated —
         revoke/list, self-ownership grants, and existing grants are
         unaffected in every mode. Accepts a static :class:`SharingMode`,

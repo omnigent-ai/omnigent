@@ -40,6 +40,8 @@ from omnigent.server.auth import (
     AuthProvider,
     SharingMode,
     UnifiedAuthProvider,
+    level_rank,
+    level_satisfies,
     workspace_sharing_blocked,
 )
 from omnigent.server.feature_flags import resolve_feature_flags
@@ -579,15 +581,23 @@ def test_workspace_sharing_blocked_false(workspace: str | None) -> None:
     assert workspace_sharing_blocked(workspace) is False
 
 
-# ── RESTRICTED_READ_ONLY gate — home/root cwd blocked entirely ───────
+def test_level_rank_orders_levels_and_rejects_unknown() -> None:
+    """Levels compare by privilege rank; an unknown required level never passes."""
+    assert [level_rank(level) for level in (None, 99, LEVEL_READ, LEVEL_OWNER)] == [0, 0, 1, 4]
+    assert level_satisfies(LEVEL_OWNER, LEVEL_EDIT)
+    assert not level_satisfies(LEVEL_READ, LEVEL_EDIT)
+    assert not level_satisfies(LEVEL_OWNER, 99)
+
+
+# ── RESTRICTED_READ_ONLY gate — home/root cwd shares read only ───────
 
 
 @pytest.mark.parametrize("blocked_workspace", ["/", "/home/alice", "/root"])
-async def test_restricted_blocks_home_or_root_session_even_read(
+async def test_restricted_allows_read_but_not_edit_for_home_or_root_session(
     db_uri: str, tmp_path: Path, blocked_workspace: str
 ) -> None:
-    """RESTRICTED_READ_ONLY rejects *all* grants (even read) on a session
-    whose cwd is a home dir or the filesystem root."""
+    """RESTRICTED_READ_ONLY still shares a home or root session at read (its files
+    are withheld elsewhere) but rejects anything above read."""
     app, sid = _seed_owned_session(
         db_uri,
         tmp_path,
@@ -595,12 +605,17 @@ async def test_restricted_blocks_home_or_root_session_even_read(
         workspace=blocked_workspace,
     )
     async with _client(app, _OWNER) as c:
-        resp = await c.put(
+        read = await c.put(
             f"/v1/sessions/{sid}/permissions",
             json={"user_id": _GRANTEE, "level": LEVEL_READ},
         )
-        assert resp.status_code == 403, resp.text
-        assert "cannot be shared" in resp.text.lower()
+        assert read.status_code == 200, read.text
+        edit = await c.put(
+            f"/v1/sessions/{sid}/permissions",
+            json={"user_id": _GRANTEE, "level": LEVEL_EDIT},
+        )
+        assert edit.status_code == 403, edit.text
+        assert "home or root directory" in edit.text.lower()
 
 
 async def test_restricted_allows_read_on_normal_session(db_uri: str, tmp_path: Path) -> None:
@@ -640,6 +655,41 @@ async def test_restricted_allows_read_when_no_workspace(db_uri: str, tmp_path: P
             json={"user_id": _GRANTEE, "level": LEVEL_READ},
         )
         assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.parametrize(
+    ("sharing_mode", "workspace", "enable_status"),
+    [
+        (SharingMode.RESTRICTED_READ_ONLY, "/home/alice", 403),
+        (SharingMode.RESTRICTED_READ_ONLY, "/home/alice/project", 200),
+        (SharingMode.READ_ONLY, "/home/alice", 200),
+    ],
+)
+async def test_restricted_blocks_enabling_workspace_files_for_home_or_root(
+    db_uri: str,
+    tmp_path: Path,
+    runtime_init: None,
+    sharing_mode: SharingMode,
+    workspace: str,
+    enable_status: int,
+) -> None:
+    """Enabling workspace-file sharing follows the same home/root gate as
+    grants; turning it off is always allowed so owners can revoke it."""
+    from tests.server.helpers import create_test_agent
+
+    app, _ = _seed_owned_session(db_uri, tmp_path, sharing_mode=sharing_mode)
+    async with _client(app, _OWNER) as c:
+        agent = await create_test_agent(c, user=_OWNER)
+        conv = SqlAlchemyConversationStore(db_uri).create_conversation(
+            agent_id=agent["id"], workspace=workspace
+        )
+        SqlAlchemyPermissionStore(db_uri).grant(_OWNER, conv.id, LEVEL_OWNER)
+        sid = conv.id
+        enable = await c.patch(f"/v1/sessions/{sid}", json={"share_workspace_files": True})
+        assert enable.status_code == enable_status, enable.text
+        disable = await c.patch(f"/v1/sessions/{sid}", json={"share_workspace_files": False})
+        assert disable.status_code == 200, disable.text
+        assert disable.json()["share_workspace_files"] is False
 
 
 # ── File-backed override: persistence + create_app precedence ────────
