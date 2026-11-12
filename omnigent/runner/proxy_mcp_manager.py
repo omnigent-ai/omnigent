@@ -505,22 +505,23 @@ class ProxyMcpManager:
                         None, request_generation=request_generation, started=started
                     )
             try:
+                post_request = self._omnigent_client.post(
+                    url,
+                    json=payload,
+                    headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
+                    # Short connect timeout still fails fast on an unreachable
+                    # server; the read timeout covers ordinary proxy request
+                    # hangs. Sub-agent dispatch returns an async handle
+                    # immediately and no longer holds this call for a child turn.
+                    timeout=httpx.Timeout(
+                        connect=10.0,
+                        read=read_timeout,
+                        write=10.0,
+                        pool=10.0,
+                    ),
+                )
                 async with asyncio.timeout(total_timeout):
-                    resp = await self._omnigent_client.post(
-                        url,
-                        json=payload,
-                        headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
-                        # Short connect timeout still fails fast on an unreachable
-                        # server; the read timeout covers ordinary proxy request
-                        # hangs. Sub-agent dispatch returns an async handle
-                        # immediately and no longer holds this call for a child turn.
-                        timeout=httpx.Timeout(
-                            connect=10.0,
-                            read=read_timeout,
-                            write=10.0,
-                            pool=10.0,
-                        ),
-                    )
+                    resp = await post_request
                 failure_phase = "http_status"
                 resp.raise_for_status()
                 failure_phase = "response_decode"
