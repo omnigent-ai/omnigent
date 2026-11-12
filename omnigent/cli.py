@@ -2249,7 +2249,6 @@ def _enforce_wrapper_guard() -> None:
         raise SystemExit(2)
 
 
-@capture_cli_entry
 def _client_identity_headers() -> dict[str, str]:
     """Return the User-Agent naming this CLI, for ad-hoc requests to the server."""
     from omnigent.telemetry.request_headers import client_identity_headers
@@ -2257,6 +2256,7 @@ def _client_identity_headers() -> dict[str, str]:
     return client_identity_headers()
 
 
+@capture_cli_entry
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.

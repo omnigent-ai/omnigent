@@ -118,6 +118,39 @@ async def test_native_clear_replacement_keeps_creating_surface(
     assert scripted.labels[CLIENT_SURFACE_LABEL_KEY] == "script"
 
 
+async def test_internal_fork_keeps_source_surface(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A TUI ``/fork`` from the runner keeps the desktop source's surface."""
+    from omnigent.telemetry.request_headers import client_user_agent
+
+    store = SqlAlchemyConversationStore(db_uri)
+    client.headers["X-Omnigent-Client"] = "desktop"
+    agent = await create_test_agent(client, name="fork-surface")
+    source_id = agent["_session_id"]
+    source = store.get_conversation(source_id)
+    assert source is not None
+    assert source.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+    del client.headers["X-Omnigent-Client"]
+
+    runner_ua = {"User-Agent": client_user_agent().replace("omnigent-cli/", "omnigent-runner/")}
+    fork = await client.post(f"/v1/sessions/{source_id}/fork", json={}, headers=runner_ua)
+    assert fork.status_code == 201, fork.text
+    fork_row = store.get_conversation(fork.json()["id"])
+    assert fork_row is not None
+    assert fork_row.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+
+    # A script's fork is labeled by its own User-Agent, not the source's surface.
+    scripted = await client.post(
+        f"/v1/sessions/{source_id}/fork", json={}, headers={"User-Agent": "curl/8"}
+    )
+    assert scripted.status_code == 201, scripted.text
+    scripted_row = store.get_conversation(scripted.json()["id"])
+    assert scripted_row is not None
+    assert scripted_row.labels[CLIENT_SURFACE_LABEL_KEY] == "script"
+
+
 async def test_list_sessions_empty(client: httpx.AsyncClient) -> None:
     """Empty database returns an empty list."""
     resp = await client.get("/v1/sessions")

@@ -59,6 +59,8 @@ def resolve_client_surface(
         inherited = parent_labels.get(CLIENT_SURFACE_LABEL_KEY)
         if inherited is not None and inherited in CLIENT_SURFACES:
             return inherited
+    # Attribution is self-reported (User-Agent and labels), not authenticated:
+    # an internal UA may carry its re-created session's original surface forward.
     classified = classify_surface(headers.get("user-agent"))
     if classified in _INTERNAL_SURFACES and requested_labels is not None:
         requested = requested_labels.get(CLIENT_SURFACE_LABEL_KEY)

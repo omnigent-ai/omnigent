@@ -5148,8 +5148,11 @@ def register_core_routes(
         # bound target is actually codex-native (the label is inert elsewhere,
         # so refuse to stamp it on a non-Codex fork). Stamped via extra_labels,
         # which the store applies AFTER the drop so the opt-in wins.
+        # Internal forks (TUI /fork, codex bypass) keep the source's surface.
         extra_labels: dict[str, str] = {
-            CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(request.headers)
+            CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(
+                request.headers, requested_labels=source.labels
+            )
         }
         if body.codex_bypass_sandbox:
             target_native = await asyncio.to_thread(_native_coding_agent_for_agent, base_agent)
