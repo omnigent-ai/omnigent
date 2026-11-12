@@ -271,23 +271,14 @@ export function PermissionsModal({
           </DialogDescription>
         </DialogHeader>
         {filePath && (
-          <>
-            <p className="break-all font-mono text-sm">{filePath}</p>
-            <Alert role="note" className="bg-muted/50">
-              <InfoIcon />
-              <AlertTitle>Shares the entire session and all workspace files</AlertTitle>
-              <AlertDescription>
-                <p>
-                  New recipients get read-only access to all session messages by default. Existing
-                  permissions are preserved.
-                </p>
-                <p>
-                  Granting access, copying a file link, or opening the mobile link makes all
-                  workspace files available to everyone with Read access to this session.
-                </p>
-              </AlertDescription>
-            </Alert>
-          </>
+          <Alert role="note" className="bg-muted/50">
+            <InfoIcon />
+            <AlertTitle>Shares the entire session and all workspace files</AlertTitle>
+            <AlertDescription>
+              Includes all messages. Sharing enables files for every session reader. New invites
+              default to read-only; existing permissions stay.
+            </AlertDescription>
+          </Alert>
         )}
 
         {(publicSharingEnabled || publicGrant) && (
@@ -343,29 +334,29 @@ export function PermissionsModal({
             file surfaces open up; edit collaborators already have them. Shown
             only for sessions that actually have a workspace on disk. */}
         {hasWorkspace && (
-          <div
-            className="flex items-center justify-between rounded-lg border px-3 py-2"
-            data-testid="share-workspace-files"
-          >
-            <div>
-              <p className="text-ui font-medium">
-                {filePath ? "All workspace files" : "Workspace files"}
-              </p>
-              <p className="text-sm text-muted-foreground">
-                {filePath
-                  ? "Let everyone with Read access browse all workspace files"
-                  : "Let people with view access browse this session's files"}
-              </p>
+          <div className="rounded-lg border px-3 py-2" data-testid="share-workspace-files">
+            {filePath && <p className="mb-2 break-all font-mono text-sm">{filePath}</p>}
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-ui font-medium">
+                  {filePath ? "All workspace files" : "Workspace files"}
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  {filePath
+                    ? "Let everyone with Read access browse all workspace files"
+                    : "Let people with view access browse this session's files"}
+                </p>
+              </div>
+              <Switch
+                checked={workspaceShared}
+                onCheckedChange={(checked) => {
+                  setError(null);
+                  shareWorkspace.mutate(checked);
+                }}
+                disabled={shareBusy}
+                componentId="diagnostics.permissions.share_workspace_toggle"
+              />
             </div>
-            <Switch
-              checked={workspaceShared}
-              onCheckedChange={(checked) => {
-                setError(null);
-                shareWorkspace.mutate(checked);
-              }}
-              disabled={shareBusy}
-              componentId="diagnostics.permissions.share_workspace_toggle"
-            />
           </div>
         )}
 

@@ -1109,7 +1109,7 @@ describe("PermissionsModal", () => {
       );
 
       expect(
-        screen.getByText(/workspace files available to everyone with Read access/),
+        screen.getByText(/Sharing enables files for every session reader/),
       ).toBeInTheDocument();
       await screen.findByText("No grants yet.");
       expect(updateSessionMock).not.toHaveBeenCalled();
@@ -1540,10 +1540,12 @@ describe("PermissionsModal", () => {
         ),
       ).toBeInTheDocument();
       expect(screen.getByRole("note")).toHaveTextContent(
-        "New recipients get read-only access to all session messages by default. Existing permissions are preserved.",
+        "Includes all messages. Sharing enables files for every session reader. New invites default to read-only; existing permissions stay.",
       );
       expect(screen.getByRole("button", { name: "Copy file link" })).toBeEnabled();
-      expect(screen.getByText("artifacts/report.html")).toBeInTheDocument();
+      expect(
+        within(screen.getByTestId("share-workspace-files")).getByText("artifacts/report.html"),
+      ).toBeInTheDocument();
       await waitFor(() => expect(screen.getByText("No grants yet.")).toBeInTheDocument());
       fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
         target: { value: "carol" },
