@@ -240,8 +240,6 @@ interface ElectronDesktopApi extends NativeShellApi {
     opts?: BrowserHostOptions & {
       force?: boolean;
       agent?: boolean;
-      rememberedArcaHostId?: string;
-      sourceIsArcaHost?: boolean;
     },
   ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
   /**
@@ -446,8 +444,6 @@ export interface DesktopFeatures {
    * window's server is a managed server.
    */
   databricksInternalFeatures?: boolean;
-  /** Shell can restore Arca preview identity after a desktop restart. */
-  arcaPreviewRecovery?: boolean;
   /** This shell can import the current site's cookies from local Google Chrome. */
   chromeCookieImport?: boolean;
 }

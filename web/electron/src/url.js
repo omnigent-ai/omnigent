@@ -252,6 +252,21 @@
     return url.toString();
   }
 
+  /** Canonical selected target, preserving mount and workspace selector. */
+  function normalizeServerTarget(raw) {
+    try {
+      const saved = normalizeSavedServerUrl(raw);
+      const url = new URL(databricksWorkspaceUiUrl(saved) ?? saved);
+      if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) return null;
+      url.hash = "";
+      url.pathname = url.pathname.replace(/\/+$/, "") || "/";
+      url.searchParams.sort();
+      return url.href;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * True when a server URL is hosted by Databricks: a workspace domain
    * (workspace-mounted Omnigent) or a Databricks App. Https-only: a local or
@@ -537,6 +552,7 @@
     isPlainHttpRemote,
     isLoopbackServerUrl,
     normalizeSavedServerUrl,
+    normalizeServerTarget,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,
     databricksWorkspaceUiUrl,

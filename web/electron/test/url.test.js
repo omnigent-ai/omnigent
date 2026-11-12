@@ -13,6 +13,7 @@ const {
   serverDisplayLabel,
   isPlainHttpRemote,
   normalizeSavedServerUrl,
+  normalizeServerTarget,
   isDatabricksManagedServerUrl,
   databricksWorkspaceUiUrl,
   expandDatabricksWorkspaceUrl,
@@ -706,5 +707,27 @@ describe("sanitizeServerName", () => {
     assert.equal(sanitizeServerName("\u202e"), null);
     assert.equal(sanitizeServerName(42), null);
     assert.equal(sanitizeServerName(undefined), null);
+  });
+});
+
+describe("normalizeServerTarget", () => {
+  it("preserves mount and selectors while ignoring fragments and query order", () => {
+    assert.equal(
+      normalizeServerTarget("https://server.example.test/app///?o=42&a=1#chat"),
+      "https://server.example.test/app?a=1&o=42",
+    );
+    assert.equal(normalizeServerTarget("http://localhost:6767"), "http://localhost:6767/");
+  });
+
+  it("rejects invalid targets and embedded credentials", () => {
+    for (const target of [
+      null,
+      "",
+      "not a URL",
+      "file:///tmp/app",
+      "https://user:pass@example.test",
+    ]) {
+      assert.equal(normalizeServerTarget(target), null);
+    }
   });
 });

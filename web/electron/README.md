@@ -536,49 +536,6 @@ Hide/reopen the Workspace or switch tabs to retain a page without reloading.
 Closing the tab destroys it. User-created Browser tabs are separate from the
 session's agent browser view and are not targeted by the agent relay.
 
-### Agent previews on Arca
-
-The verified Arca exception also applies to the address bar and chat/file links.
-The remote app's port must be forwarded to the desktop first.
-
-On a managed server with the managed features enabled, an Arca session's agent
-can open and inspect an app through a forwarded port using the existing browser
-tools and tool approval or autoapproval policy.
-Provide the actual forwarded URL to the agent; its local port may differ from
-the app's remote port. Omnigent does not establish or verify forwarding or
-prove that the local endpoint belongs to the Arca host.
-
-The desktop captures the remote daemon's exact host ID during its existing
-Arca connect flow, including when the daemon is already running. Only a
-source session on that host, or a subagent inheriting that host, is eligible.
-An older CLI or an unrecognized, failed, or missing identity leaves localhost
-navigation denied; the remembered host-picker label alone does not grant it.
-Eligibility is scoped to the selected server/workspace, not all sessions on
-the server.
-
-After restarting the desktop, launch-time auto-connect restores this identity
-for users who opted into it. Otherwise, the first loopback preview request with
-a remembered Arca host offers the shell-owned reconnect console and returns the
-denial immediately; nothing runs until the user confirms, and the agent retries
-after recovery finishes. Concurrent retries share the same prompt or run.
-Opted-in recovery stays silent only when the remembered and source hosts match;
-a mismatch requires consent and is offered only when the host list identifies
-the source as Arca, so an incorrect remembered host can be recaptured and
-corrected without prompting from sandbox sessions. Both paths verify that the
-captured host ID matches the source session. Consent or auto-connect opt-in, the
-captured identity check, and the agent-context gate remain the trust boundaries.
-A decline briefly suppresses repeat prompts, while failed runs remain retryable.
-**Run on Arca** is hidden for an online remembered host only when the desktop
-advertises preview recovery; older shells keep the action visible.
-
-The exception covers HTTP(S) `localhost`, `127.0.0.1`, `[::1]`, and
-`*.localhost` subdomains, including redirects and links that would open a new
-window (which stay in the same pane).
-Other loopback addresses, private-network and metadata destinations, hostnames
-that resolve to any of them, and non-web schemes remain restricted. Existing
-tool approvals are unchanged; whether a tool call asks for approval depends on
-the harness and its policy.
-
 ### Local network permission
 
 Sites in the embedded pane can ask for **local network access**, including
@@ -654,7 +611,7 @@ including the address bar, chat links, and agent actions, enforces this policy.
   through its partition before sending, including GET/HEAD subresources and
   WebSockets. IP literals use the URL check without DNS. Loopback names
   (`localhost`, `127.0.0.1`, `[::1]`, and `*.localhost`) remain available to
-  eligible Arca and this-machine sessions without DNS. A `*.localhost` request
+  eligible sessions on this machine without DNS. A `*.localhost` request
   is cancelled before sending unless the partition's proxy lookup returns
   `DIRECT` alone, and its response must come from a loopback address on a
   route that is still direct, since a local proxy also answers from loopback.
@@ -773,7 +730,7 @@ the native view); no server flag.
 
 All renderer IPC navigation uses the same URL policy, including the URL bar.
 A renderer's `agent: false` flag does not exempt a tab from address checks.
-Main-owned eligibility for sessions on this machine and verified Arca sessions
+Main-owned eligibility for sessions on this machine
 applies to loopback names, including `*.localhost`. Other internal sites must
 be opened in a separate browser; this also keeps later redirects in these tabs
 under the same policy.
