@@ -3376,6 +3376,13 @@ def _clear_detection_dismissal(name: str) -> None:
     _save_global_config({DISMISSED_DETECTIONS_KEY: sorted(dismissed - {name})})
 
 
+def _dismissable_detection_names() -> set[str]:
+    """Return live ambient detections that a removal must dismiss to stick."""
+    from omnigent.onboarding.ambient import detect_providers
+
+    return {d.name for d in detect_providers() if d.kind != "subscription"}
+
+
 def _remove_credential(provider: str) -> str | None:
     """Remove the *provider* credential and persist wholesale.
 
@@ -3390,7 +3397,6 @@ def _remove_credential(provider: str) -> str | None:
         records its name under ``dismissed_detections`` so the next
         configure open does not silently re-adopt it).
     """
-    from omnigent.onboarding.ambient import detect_providers
     from omnigent.onboarding.detected import (
         DISMISSED_DETECTIONS_KEY,
         dismissed_detection_names,
@@ -3412,14 +3418,11 @@ def _remove_credential(provider: str) -> str | None:
     # re-adopt. Everything else (env API key, codex config.toml provider,
     # local Ollama) gets a persisted dismissal that the add menu's detected
     # option clears on re-add.
-    backing = next(
-        (d for d in detect_providers() if d.name == provider and d.kind != "subscription"),
-        None,
-    )
-    if backing is not None:
+    backed = provider in _dismissable_detection_names()
+    if backed:
         settings[DISMISSED_DETECTIONS_KEY] = sorted(dismissed_detection_names(config) | {provider})
     _save_global_config(settings)  # wholesale replace per key
-    if backing is not None:
+    if backed:
         return f"✓ Removed {label} — it stays on your machine but won't be auto-configured again"
     return f"✓ Removed {label}"
 
@@ -3668,19 +3671,24 @@ def _manage_opencode_harness() -> None:
 def _repair_invalid_provider_entries() -> bool:
     """Offer to repair or remove provider entries that fail to load; allow cancellation.
 
+    Like :func:`_remove_credential`, removing an entry dismisses its live ambient detection.
+
     :returns: ``False`` when the user leaves an invalid entry unchanged; the
         config is then not written. ``True`` otherwise.
     """
     from rich.markup import escape
 
     from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.onboarding.detected import DISMISSED_DETECTIONS_KEY, dismissed_detection_names
     from omnigent.onboarding.interactive import select
     from omnigent.onboarding.provider_config import drop_unserved_default_scopes, load_providers
 
-    block = _load_global_config().get("providers")
+    config = _load_global_config()
+    block = config.get("providers")
     if not isinstance(block, dict):
         return True
     repaired: dict[str, object] = {}
+    removed: set[str] = set()
     for name, entry in block.items():
         try:
             load_providers({"providers": {name: entry}})
@@ -3710,8 +3718,16 @@ def _repair_invalid_provider_entries() -> bool:
             return False
         if fixed is not None and choice == 0:
             repaired[name] = fixed
+        else:
+            removed.add(str(name))
     if repaired != block:
-        _save_global_config({"providers": repaired})
+        settings: dict[str, object] = {"providers": repaired}
+        dismissed = removed & _dismissable_detection_names() if removed else set()
+        if dismissed:
+            settings[DISMISSED_DETECTIONS_KEY] = sorted(
+                dismissed_detection_names(config) | dismissed
+            )
+        _save_global_config(settings)
     return True
 
 

@@ -4025,6 +4025,29 @@ def test_setup_saves_invalid_provider_choices_only_after_every_entry(
         assert "databricks-gemini-example" not in providers
 
 
+def test_setup_removing_invalid_provider_keeps_stored_key_and_dismisses_detection(
+    isolated_config, monkeypatch
+):
+    entry = {
+        "kind": "key",
+        "default": "openai",
+        "anthropic": {"base_url": "https://api.example.com", "api_key_ref": "keychain:anthropic"},
+    }
+    (isolated_config / "config.yaml").write_text(
+        yaml.safe_dump({"providers": {"anthropic": entry}})
+    )
+    secrets.store_secret("anthropic", "stored-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    result = CliRunner().invoke(cli, ["setup"], input="2\nq\n")
+    assert result.exit_code == 0, result.output
+    assert "Remove this provider" in result.output
+    config = _config_yaml(isolated_config)
+    assert "anthropic" not in (config.get("providers") or {})
+    assert config["dismissed_detections"] == ["anthropic"]
+    assert secrets.load_secret("anthropic") == "stored-key"
+
+
 @pytest.mark.parametrize(
     "profile_text",
     [
