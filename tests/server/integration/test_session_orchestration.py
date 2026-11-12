@@ -42,7 +42,7 @@ pytestmark = pytest.mark.asyncio
 def orchestration_environment(monkeypatch, request, tmp_path):
     monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
     features = getattr(request, "param", None)
-    monkeypatch.setenv("OMNIGENT_FEATURES", f"sibling_sessions,{features or ''}")
+    monkeypatch.setenv("OMNIGENT_FEATURES", features or "")
     return features
 
 
@@ -1378,7 +1378,7 @@ async def test_nested_agent_gate_tracks_request_context_before_creation(
 
     auth_app.state.feature_flags = resolve_feature_flags({})
     info = (await auth_client.get("/v1/info")).json()
-    assert info["sibling_sessions"] is info["features"]["sibling_sessions"] is False
+    assert info["sibling_sessions"] is info["features"]["sibling_sessions"] is True
     auth_app.state.feature_flags = RequestFeatureFlags(resolve_feature_flags({}).enabled_features)
     sibling_id = None
     for active in (False, True, False):
@@ -1511,12 +1511,18 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     assert "omnigent.session_family_id" not in sibling.labels
     assert [grant.user_id for grant in permissions.list_for_session(sibling_id)[0]] == ["alice"]
     assert store.list_child_conversation_ids_by_parent([source["id"]])[source["id"]] == []
+    renamed = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"title": "Parent planning"}
+    )
+    assert renamed.status_code == 200, renamed.text
     snapshot = await auth_client.get(f"/v1/sessions/{sibling_id}")
     assert snapshot.json()["family"]["id"] == source["id"]
+    assert snapshot.json()["family"]["representative_title"] == "Parent planning"
     listing = await auth_client.get(
         "/v1/sessions", params={"limit": 1, "search_query": "Private sibling"}
     )
     assert [row["id"] for row in listing.json()["data"]] == [sibling_id]
+    assert listing.json()["data"][0]["family"]["representative_title"] == "Parent planning"
     expanded = await auth_client.get(
         "/v1/sessions",
         params={"limit": 1, "search_query": "Private sibling", "expand_families": True},
@@ -1854,6 +1860,32 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
     for session_id in (source["id"], sibling_id):
         snapshot = (await auth_client.get(f"/v1/sessions/{session_id}")).json()
         assert snapshot["family"]["pinned_at"] == "1" * 256
+    # A legacy personal pin must not divert the representative's family action.
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    cleared = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": ""}}
+    )
+    assert cleared.status_code == 200, cleared.text
+    store.set_labels(source["id"], {pinned_label_key("alice"): "old-pin"})
+    repinned = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": "42"}}
+    )
+    assert repinned.status_code == 200, repinned.text
+    assert repinned.json()["family"]["pinned_at"] == "42"
+    unpinned = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": ""}}
+    )
+    assert unpinned.status_code == 200, unpinned.text
+    assert not unpinned.json()["family"]["pinned"]
+    assert "omnigent.pinned" not in unpinned.json()["labels"]
+    assert pinned_label_key("alice") not in store.get_conversation(source["id"]).labels
+    pins = (await auth_client.get("/v1/sessions", params={"pinned": True})).json()["data"]
+    assert source["id"] not in {row["id"] for row in pins}
+    repinned = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": "42"}}
+    )
+    assert repinned.status_code == 200, repinned.text
     store.set_conversation_project(source["id"], "a" * 32)
     refused = await auth_client.patch(
         f"/v1/sessions/{source['id']}",

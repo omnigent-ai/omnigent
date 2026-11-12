@@ -185,7 +185,8 @@ def _in_sandbox() -> bool:
 def _gh(
     argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
 ) -> tuple[int | None, str, str]:
-    # ``timeout`` raises the per-call limit for a slow call, such as a video upload.
+    # ``timeout`` replaces the per-call limit: higher for a slow call such as a video
+    # upload, lower for a best-effort one.
     timeout = timeout or _gh_timeout_seconds()
     if (deadline := _gh_deadline.get()) is not None:
         timeout = min(timeout, deadline - time.monotonic())
@@ -1628,13 +1629,80 @@ def _pr_commits(root: str, reference: PullRequestRef, *, head_sha: str) -> dict[
         pr = _check_pr_revision(root, reference, head_sha=head_sha)
         commits = _pr_commit_entries(root, reference)
         _check_pr_revision(root, reference, head_sha=head_sha)
-    shown = commits[:_MAX_PR_COMMITS]
+        shown = commits[:_MAX_PR_COMMITS]
+        heads = _other_pr_heads(root, reference, pr, [commit["sha"] for commit in shown])
+    for commit in shown:
+        if commit["sha"] in heads:
+            commit["head_of"] = heads[commit["sha"]]
     total = pr.get("commits")
     return {
         "object": "list",
         "data": shown,
         "has_more": isinstance(total, int) and total > len(shown),
     }
+
+
+# How many of the author's recently updated PRs one lookup reads for stack parents.
+_AUTHOR_PR_LOOKUPS = 100
+# The lookup only adds hints, so a slow search must not cost the commit list its deadline.
+_AUTHOR_PR_LOOKUP_SECONDS = 4.0
+_AUTHOR_PRS_QUERY = """query($search: String!, $first: Int!) {
+  search(query: $search, type: ISSUE, first: $first) {
+    nodes { ... on PullRequest { number url state headRefOid } }
+  }
+}"""
+
+
+def _other_pr_heads(
+    root: str, reference: PullRequestRef, pr: dict[str, Any], shas: list[str]
+) -> dict[str, list[dict[str, Any]]]:
+    """Map each commit that is the head of another PR by the same author, best effort.
+
+    Marks a stacked PR's parents in its commit list with one search over the author's
+    recently updated PRs in the repository; a per-commit lookup is too slow on large
+    repositories. Any failure leaves the commits unmarked.
+    """
+    user = pr.get("user") if isinstance(pr.get("user"), dict) else {}
+    author = user.get("login")
+    if not isinstance(author, str) or not author or not shas:
+        return {}
+    search = f"repo:{reference.repository} is:pr author:{author} sort:updated-desc"
+    try:
+        rc, out, _ = _gh(
+            [
+                "api",
+                *_host_args(root, reference),
+                "graphql",
+                "-f",
+                f"query={_AUTHOR_PRS_QUERY}",
+                "-f",
+                f"search={search}",
+                "-F",
+                f"first={_AUTHOR_PR_LOOKUPS}",
+            ],
+            cwd=root,
+            token=_pr_token(root, reference),
+            timeout=_AUTHOR_PR_LOOKUP_SECONDS,
+        )
+    except ValueError:
+        return {}
+    if rc != 0:
+        return {}
+    try:
+        nodes = json.loads(out)["data"]["search"]["nodes"]
+    except (ValueError, KeyError, TypeError):
+        return {}
+    wanted = set(shas)
+    heads: dict[str, list[dict[str, Any]]] = {}
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict) or node.get("number") == reference.number:
+            continue
+        sha = node.get("headRefOid")
+        if isinstance(sha, str) and sha in wanted:
+            heads.setdefault(sha, []).append(
+                {"number": node.get("number"), "url": node.get("url"), "state": node.get("state")}
+            )
+    return heads
 
 
 def _pr_commit_patch(root: str, reference: PullRequestRef, *, commit_sha: str) -> dict[str, Any]:
@@ -1660,6 +1728,41 @@ def _pr_commit_patch(root: str, reference: PullRequestRef, *, commit_sha: str) -
         )
     if rc != 0:
         raise ValueError("GitHub could not load the commit's diff. Refresh or open it on GitHub.")
+    return {"object": PR_DIFF_OBJECT, "patch": out}
+
+
+_COMPARE_FAILED = "GitHub could not load the changes since that commit. Refresh to retry."
+
+
+def _pr_compare(
+    root: str, reference: PullRequestRef, *, head_sha: str, from_sha: str
+) -> dict[str, Any]:
+    """Return the PR's changes after ``from_sha``, up to its head.
+
+    ``from_sha`` must be one of the PR's own commits, so only the PR's history is
+    served, and the head is checked before and after the reads so the patch describes
+    the revision the panel shows.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        host = _host_args(root, reference)
+        token = _pr_token(root, reference)
+        _check_pr_revision(root, reference, head_sha=head_sha)
+        if from_sha not in {entry["sha"] for entry in _pr_commit_entries(root, reference)}:
+            raise ValueError("That commit is not part of the selected pull request.")
+        rc, out, _ = _gh(
+            [
+                "api",
+                *host,
+                "-H",
+                "Accept: application/vnd.github.diff",
+                f"repos/{reference.repository}/compare/{from_sha}...{head_sha}",
+            ],
+            cwd=root,
+            token=token,
+        )
+        if rc != 0:
+            raise ValueError(_COMPARE_FAILED)
+        _check_pr_revision(root, reference, head_sha=head_sha)
     return {"object": PR_DIFF_OBJECT, "patch": out}
 
 

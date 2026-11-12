@@ -328,7 +328,7 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
    * Opt-in: only callers that supply that override may set it.
    */
   markFileLinks?: boolean;
-  /** Show images hosted as GitHub attachments, e.g. in a PR description; others stay blocked. */
+  /** Show GitHub attachment images and videos, e.g. in a PR description; others stay blocked. */
   allowGitHubAttachmentImages?: boolean;
   /** Preserve workspace images for a session-aware, authenticated component override. */
   allowWorkspaceImages?: boolean;
