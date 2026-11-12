@@ -3226,7 +3226,7 @@ class SessionJournalEntry(BaseModel):
     :param kind: The entry kind; ``payload`` holds its fields.
     :param payload: e.g. ``{"status": "done", "text": "PR merged"}`` for a
         status, ``{"body": "…"}`` for a note, or ``{"version": 2, "source":
-        "agent", "workflow": null, "steps": [...]}`` for a plan.
+        "agent", "steps": [...]}`` for a plan.
     """
 
     id: str
