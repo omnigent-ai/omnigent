@@ -710,6 +710,11 @@ async def test_a_workflows_runs_list_the_sessions_that_ran_it(
         "failed": 0,
     }
     assert by_session[second]["progress"]["needs_input"] == 1
+    # The steps and their newest statuses, for the run's timeline and graph.
+    assert [step["id"] for step in by_session[first]["steps"]] == ["explore", "fix"]
+    assert [(s["step"], s["payload"]["status"]) for s in by_session[first]["statuses"]] == [
+        ("explore", "done")
+    ]
     # One run a page: three pages, one of them empty where bob's run was left out.
     pages, cursor = [], ""
     while cursor is not None:

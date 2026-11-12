@@ -3407,6 +3407,9 @@ class WorkflowRun(BaseModel):
         ``"failed"``.
     :param archived: Whether the session is archived.
     :param progress: Where the run's steps stand.
+    :param steps: The steps of the plan that started the run.
+    :param statuses: Each of those steps' newest status entry; a step with
+        none yet is left out.
     """
 
     id: str
@@ -3416,6 +3419,8 @@ class WorkflowRun(BaseModel):
     session_status: Literal["idle", "running", "failed"]
     archived: bool = False
     progress: WorkflowRunProgress
+    steps: list[WorkflowStep] = Field(default_factory=list)
+    statuses: list[SessionJournalEntry] = Field(default_factory=list)
 
 
 class WorkflowRunList(BaseModel):

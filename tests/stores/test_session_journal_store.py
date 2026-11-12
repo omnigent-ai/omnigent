@@ -424,4 +424,9 @@ def test_plan_step_statuses_reads_each_steps_newest_status(journal: SessionJourn
         )
     other = journal.append(OTHER, "plan", _plan("a"), idempotency_key="k4").entry
 
-    assert journal.plan_step_statuses([plan, other]) == [{"a": "done", "b": "failed"}, {}]
+    statuses = journal.plan_step_statuses([plan, other])
+    assert [{step: e.payload["status"] for step, e in s.items()} for s in statuses] == [
+        {"a": "done", "b": "failed"},
+        {},
+    ]
+    assert statuses[0]["a"].kind == "status" and statuses[0]["a"].step == "a"
