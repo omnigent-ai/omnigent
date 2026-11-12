@@ -1524,9 +1524,7 @@ export function CreateScheduledTaskDialog({
                         role="status"
                       >
                         <TriangleAlertIcon className="size-3.5 shrink-0" />
-                        {hostOptions.length === 0 ? "No host is connected." : "No host is online."}
-                        {/* A new automation picks the first host that comes online. */}
-                        {isEdit ? "" : " Connect one and it’s picked here automatically."}
+                        No host is connected.
                       </p>
                     )}
                   </div>

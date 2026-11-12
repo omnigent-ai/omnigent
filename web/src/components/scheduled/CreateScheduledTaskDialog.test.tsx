@@ -1453,16 +1453,14 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.queryByTestId("workspace-picker-dialog")).not.toBeInTheDocument();
   });
 
-  it("says no host is online, without a command, until one comes online and is picked", () => {
+  it("says no host is connected, without a command, until one comes online and is picked", () => {
     const offline = [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }];
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: offline,
     } as unknown as ReturnType<typeof hostsHook.useHosts>);
     const view = renderDialog();
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Pick a host");
-    expect(screen.getByTestId("task-no-host-online")).toHaveTextContent(
-      "No host is online. Connect one and it’s picked here automatically.",
-    );
+    expect(screen.getByTestId("task-no-host-online")).toHaveTextContent(/^No host is connected\.$/);
     expect(screen.queryByText(/omni host/)).not.toBeInTheDocument();
 
     vi.mocked(hostsHook.useHosts).mockReturnValue({
@@ -1481,15 +1479,6 @@ describe("CreateScheduledTaskDialog submit", () => {
     renderDialog();
 
     expect(screen.getByTestId("task-no-host-online")).toHaveTextContent("No host is connected.");
-  });
-
-  it("leaves out the auto-pick promise when editing", () => {
-    vi.mocked(hostsHook.useHosts).mockReturnValue({
-      data: [],
-    } as unknown as ReturnType<typeof hostsHook.useHosts>);
-    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />);
-
-    expect(screen.getByTestId("task-no-host-online")).toHaveTextContent(/^No host is connected\.$/);
   });
 
   it("says nothing about hosts when the host lookup fails", () => {
