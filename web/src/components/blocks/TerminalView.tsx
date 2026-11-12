@@ -9,6 +9,7 @@
 import { Loader2Icon } from "lucide-react";
 import {
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -37,6 +38,7 @@ import {
 } from "@/lib/terminalClipboardPreferences";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
+import { ShellCommandDraftContext } from "@/shell/ShellCommandContext";
 import {
   isTerminalLaunching,
   resolveInitialAttachUrl,
@@ -208,6 +210,11 @@ export function TerminalView({
     return true;
   }, []);
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
+  const commandDrafts = useContext(ShellCommandDraftContext);
+  const draftKey = `${sessionId}:${terminalId}`;
+  const draft = commandDrafts?.drafts[draftKey];
+  const pastedCommandRef = useRef<string | null>(null);
+  const setDraft = commandDrafts?.setDraft;
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const clipboardServerIdentity = getOmnigentServerIdentity();
@@ -312,6 +319,21 @@ export function TerminalView({
   activeRef.current = active;
   const focusOnConnectRef = useRef(focusOnConnect);
   focusOnConnectRef.current = focusOnConnect;
+  useEffect(() => {
+    if (draft === undefined || !setDraft || !active || readOnly) return;
+    if (state.kind === "closed" || state.kind === "error") {
+      setDraft(draftKey, null);
+      return;
+    }
+    const session = sessionRef.current;
+    if (state.kind !== "connected" || !session || pastedCommandRef.current === draftKey) return;
+    return session.pasteCommand(draft, (error) => {
+      pastedCommandRef.current = draftKey;
+      setDraft(draftKey, null);
+      if (error) toast.error(error);
+      else session.focus();
+    });
+  }, [draft, draftKey, setDraft, active, readOnly, state.kind]);
   // Track whether this terminal has already tried a keyless re-dial after a
   // 4400 wrong-replica close. If keyless still fails with 4400, the host is
   // genuinely unreachable — stop retrying.
@@ -600,13 +622,14 @@ export function TerminalView({
         await Promise.resolve();
         if (superseded()) return;
         // Browser WebSockets carry the host ID in the query string so they
-        // reach the replica holding the runner tunnel. Hostless sessions
-        // and direct connections need no routing key.
-        const computedHostId = (() => {
-          if (!isHostRoutingEnabled()) return undefined;
-          if (isDatabricksWorkspace() && keylessRef.current) return undefined;
+        // reach the replica holding the runner tunnel. A host proven keyless
+        // dials unkeyed; a hostless session carries the client's own key.
+        const routing = ((): { hostId?: string; unkeyed?: boolean } => {
+          if (!isHostRoutingEnabled()) return {};
+          if (isDatabricksWorkspace() && keylessRef.current) return { unkeyed: true };
           const h = getSessionHost(sessionId);
-          return h && (!isDatabricksWorkspace() || !isHostKeyless(h)) ? h : undefined;
+          if (!h) return {};
+          return !isDatabricksWorkspace() || !isHostKeyless(h) ? { hostId: h } : { unkeyed: true };
         })();
         const awaitLaunch = isTerminalLaunching(terminalId);
         dialedDuringLaunchRef.current = awaitLaunch;
@@ -614,8 +637,9 @@ export function TerminalView({
           sessionId,
           terminalId,
           readOnly,
-          computedHostId,
+          routing.hostId,
           awaitLaunch,
+          routing.unkeyed,
         );
         const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
         // Never keep the user waiting on the direct path: this resolves
@@ -991,6 +1015,7 @@ export function buildAttachPath(
  * :param hostId: The session's host_id, forwarded as the routing key
  *     ``?omnigent_slice_key=``.
  * :param awaitLaunch: Wait for a terminal whose create is still in flight.
+ * :param unkeyed: Dial without a routing key (a host whose tunnels connected without one).
  * :returns: The fully-qualified ``ws(s)://`` URL.
  */
 function buildAttachUrl(
@@ -999,8 +1024,14 @@ function buildAttachUrl(
   readOnly: boolean,
   hostId?: string,
   awaitLaunch = false,
+  unkeyed = false,
 ): string {
   // Delegates origin/prefix resolution to the embed host when present
   // (standalone falls back to the current page's origin).
-  return resolveWebSocketUrl(buildAttachPath(sessionId, terminalId, readOnly, hostId, awaitLaunch));
+  return resolveWebSocketUrl(
+    buildAttachPath(sessionId, terminalId, readOnly, hostId, awaitLaunch),
+    {
+      unkeyed,
+    },
+  );
 }
