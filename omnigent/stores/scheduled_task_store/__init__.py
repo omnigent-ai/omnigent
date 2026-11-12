@@ -424,6 +424,22 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def has_starting_run_for_conversation(self, conversation_id: str) -> bool:
+        """
+        Whether a run that recorded this conversation is still ``starting``.
+
+        A run keeps that status until it settles its launch, including the
+        teardown of a sandbox that never registered, so a fire on any replica
+        can tell the session's launch is still owned. Workspace-scoped like
+        every other store read; backed by
+        ``ix_scheduled_task_runs_conversation_status``.
+
+        :param conversation_id: The session to look up.
+        :returns: ``True`` if any ``starting`` run records the session.
+        """
+        ...
+
+    @abstractmethod
     def list_running_runs_for_tasks(
         self,
         scheduled_task_ids: builtins.list[str],
