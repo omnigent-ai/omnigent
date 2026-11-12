@@ -69,7 +69,8 @@ export type FeatureKey =
   | "automations_v2"
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
-  | "session_orchestration";
+  | "session_orchestration"
+  | "workflows_page";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;

@@ -89,6 +89,7 @@ import {
   UserRoundIcon,
   UsersIcon,
   WalletIcon,
+  WorkflowIcon,
   XIcon,
   type LucideIcon,
 } from "lucide-react";
@@ -587,6 +588,7 @@ function useActiveNavItem(): {
   isInboxPage: boolean;
   isCanvasPage: boolean;
   isTasksPage: boolean;
+  isWorkflowsPage: boolean;
   isUsagePage: boolean;
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
@@ -608,6 +610,7 @@ function useActiveNavItem(): {
   // True for both /tasks (list) and /tasks/:taskId (detail). Basename-agnostic:
   // match the "tasks" segment by position from the end, not an absolute path.
   const isTasksPage = !isExtensionRoute && (leaf === "tasks" || segments.at(-2) === "tasks");
+  const isWorkflowsPage = !isExtensionRoute && leaf === "workflows";
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
@@ -617,6 +620,7 @@ function useActiveNavItem(): {
     !isInboxPage &&
     !isCanvasPage &&
     !isTasksPage &&
+    !isWorkflowsPage &&
     !isUsagePage &&
     !isExtensionRoute;
   const requestedProject = isNewSessionRoute
@@ -632,6 +636,7 @@ function useActiveNavItem(): {
     isInboxPage,
     isCanvasPage,
     isTasksPage,
+    isWorkflowsPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -788,6 +793,7 @@ function SidebarImpl({
   const branding = useBranding();
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
+  const workflowsPageEnabled = isFeatureEnabled(serverInfo, "workflows_page");
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
   const [searchParams] = useSearchParams();
   const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
@@ -917,6 +923,7 @@ function SidebarImpl({
     isInboxPage,
     isCanvasPage,
     isTasksPage,
+    isWorkflowsPage,
     isUsagePage,
     activeExtensionPageId,
     newSessionProjectName,
@@ -1435,6 +1442,31 @@ function SidebarImpl({
                       )}
                     />
                     Automations
+                  </Link>
+                </Button>
+              )}
+              {workflowsPageEnabled && (
+                <Button
+                  asChild
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal mobile-touch-target",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isWorkflowsPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                  variant="ghost"
+                  data-testid="workflows-nav"
+                >
+                  <Link to="/workflows" onClick={onNavClick} componentId="sidebar.workflows">
+                    <WorkflowIcon
+                      className={cn(
+                        "ui-icon",
+                        isWorkflowsPage
+                          ? "text-[var(--sidebar-active-foreground)]"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                    Workflows
                   </Link>
                 </Button>
               )}
