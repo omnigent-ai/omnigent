@@ -1507,7 +1507,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         unique_ids = list(set(conversation_ids))
         with self._conv_session("get_session_activity") as session:
             updated = session.execute(
-                select(SqlConversation.id, SqlConversation.updated_at).where(
+                select(
+                    SqlConversation.id, SqlConversation.updated_at, SqlConversation.archived
+                ).where(
                     SqlConversation.workspace_id == current_workspace_id(),
                     SqlConversation.id.in_(unique_ids),
                 )
@@ -1549,6 +1551,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 total_cost_usd=costs.get(row.id),
                 pending_elicitation_count=pending_counts.get(row.id),
                 runner_id=runner_ids.get(row.id),
+                archived=bool(row.archived),
             )
         return activity
 
@@ -3638,12 +3641,28 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if cursor_id:
                     self._require_cursor_grant(cursor_id, cursor_viewer)
 
+        agent_ids_for_name: list[str] | None = None
+        if agent_name is not None:
+            # Agents live in the Omnigent DB — resolve to IDs first, then filter
+            # on the conversations.agent_id column directly. Resolved before the
+            # conversation session opens so a single-DB request never holds two
+            # pooled connections at once.
+            with self._session("list_conversations") as agent_sess:
+                agent_ids_for_name = list(
+                    agent_sess.execute(
+                        select(SqlAgent.id).where(
+                            SqlAgent.workspace_id == current_workspace_id(),
+                            SqlAgent.name == agent_name,
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+
         with self._conv_session("list_conversations") as session:
-            # Bound the content-search scan server-side (Postgres only). SET
-            # LOCAL scopes to this transaction and reverts on commit, so it
-            # can't leak to the connection's next pooled use. See
-            # _SEARCH_STATEMENT_TIMEOUT_MS. A worker-thread query is not stopped
-            # by a client disconnect, so this is the only server-side bound.
+            # Bound the content-search scan server-side (Postgres only), the only
+            # bound a client disconnect can't skip; see _SEARCH_STATEMENT_TIMEOUT_MS.
+            # SET LOCAL ends with the transaction (a shared_read_scope commit), not later.
             is_postgres = session.bind is not None and is_postgresql_family(
                 session.bind.dialect.name
             )
@@ -3728,20 +3747,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if has_agent_id is True:
                 stmt = stmt.where(SqlConversation.agent_id.is_not(None))
-            if agent_name is not None:
-                # Agents live in the Omnigent DB — resolve to IDs first, then
-                # filter on the conversations.agent_id column directly.
-                with self._session("list_conversations") as agent_sess:
-                    agent_ids_for_name = list(
-                        agent_sess.execute(
-                            select(SqlAgent.id).where(
-                                SqlAgent.workspace_id == current_workspace_id(),
-                                SqlAgent.name == agent_name,
-                            )
-                        )
-                        .scalars()
-                        .all()
-                    )
+            if agent_ids_for_name is not None:
                 stmt = stmt.where(SqlConversation.agent_id.in_(agent_ids_for_name))
             if agent_id is not None:
                 # Conversations without an agent binding (legacy rows) correctly

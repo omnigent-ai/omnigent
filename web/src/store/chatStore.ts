@@ -100,6 +100,7 @@ import { describeSendFailure } from "@/lib/sendFailure";
 import { isRetryableRequestError, queryRetryDelay } from "@/lib/queryRetry";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+import { fetchConversationSnapshot } from "./conversationSnapshot";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
   SSE_STALL_TIMEOUT_MS,
@@ -5198,15 +5199,15 @@ async function bindStream(
 
   // Opening a conversation URL with no session list loaded yet leaves the
   // session→host map empty, so the SSE stream
-  // (and every host-scoped request) would open UNKEYED and route to the default
-  // replica — NOT the one holding this session's runner tunnel. The live tail
+  // (and every host-scoped request) would open on the client's own key and route
+  // to an arbitrary replica — NOT the one holding this session's runner tunnel. The live tail
   // then subscribes to the wrong replica's event bus and silently delivers
   // nothing (the server swallows the miss; there's no 503 to trigger the keyless
   // retry). The snapshot's launch stage also lives only on that replica. When
   // requests route by host, resolve the session's host_id FIRST (one fast
   // metadata GET that populates the map via sessionFromWire) so the stream and
   // snapshot key correctly. Best-effort: a failed resolve falls through to the
-  // unkeyed open (no worse than pre-fix). Re-apply after every resync, see
+  // client-keyed open (no worse than pre-fix). Re-apply after every resync, see
   // agentbricks/mas/.claude/skills/sync-omnigents/SKILL.md.
   if (isHostRoutingEnabled() && getSessionHost(id) === null) {
     try {
@@ -5216,7 +5217,7 @@ async function bindStream(
       await (resolveSessionHost(id) ?? getSessionSlim(id));
     } catch {
       // Best-effort: a failed resolve (bad id, transient) falls through to the
-      // unkeyed open; the snapshot fetch surfaces the real error.
+      // client-keyed open; the snapshot fetch surfaces the real error.
     }
     // Liveness, not the visible id: a background bind must survive a switch away
     // (that is the whole feature). Only a dispose (evicted) bails — and then the
@@ -5269,54 +5270,10 @@ async function bindStream(
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
     // the reader sees as the transcript shifting seconds after it settled.
-    const client = queryClient;
-    // Each request retries on its own, so a failed one doesn't repeat the other.
-    // Set once a session read times out, and kept set through later failures: the shared
-    // read it may have joined is still the one that never answers.
-    let sessionReadTimedOut = false;
-    const [session, page] = await Promise.all([
-      withSnapshotRetries(id, (attempt) =>
-        withReadTimeout((signal) => {
-          const queryKey = ["session", id];
-          const joinsSharedRead = client.isFetching({ queryKey, exact: true }) > 0;
-          // A retry after a timeout reads directly rather than rejoin a shared read that
-          // may never answer, and its result seeds the shared cache.
-          if (sessionReadTimedOut && joinsSharedRead) {
-            return getSessionSlim(id, { refreshState: true, signal }).then((fresh) => {
-              client.setQueryData(queryKey, fresh);
-              return fresh;
-            });
-          }
-          // An attempt that starts the request drops it on timeout, so the retry reads
-          // afresh. One that joins another caller's read leaves that read to its caller.
-          if (!joinsSharedRead) {
-            signal.addEventListener(
-              "abort",
-              () => void client.cancelQueries({ queryKey, exact: true }),
-              { once: true },
-            );
-          }
-          return client.fetchQuery({
-            queryKey,
-            queryFn: ({ signal: querySignal }) =>
-              getSessionSlim(id, { refreshState: true, signal: querySignal }),
-            staleTime: 0,
-            retry: false,
-          });
-        }, snapshotLoadDeadlineMs(attempt)).catch((error: unknown) => {
-          if (error instanceof DOMException && error.name === "TimeoutError") {
-            sessionReadTimedOut = true;
-          }
-          throw error;
-        }),
-      ),
-      withSnapshotRetries(id, (attempt) =>
-        withReadTimeout(
-          (signal) => fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
-          snapshotLoadDeadlineMs(attempt),
-        ),
-      ),
-    ]);
+    const { session, page } = await fetchConversationSnapshot(queryClient, id, {
+      withRetries: (read) => withSnapshotRetries(id, read),
+      withDeadline: (read, attempt) => withReadTimeout(read, snapshotLoadDeadlineMs(attempt)),
+    });
     if (isConversationDisposed(id)) return;
     const items = page.items;
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);

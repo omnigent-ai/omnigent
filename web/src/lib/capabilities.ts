@@ -84,6 +84,8 @@ export function parseSiblingSessionDestinations(value: unknown): SiblingSessionD
 
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  /** The server enforces the browser's Admin view cookie; absent on older servers. */
+  admin_view?: boolean;
   sibling_sessions?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
@@ -154,6 +156,12 @@ export interface ServerInfo {
       repo_catalog?: { name: string; url: string }[];
     }
   >;
+  /**
+   * What each launchable provider's unattended runs need from their owner, e.g.
+   * ``{ agent_sandbox: "Keep your laptop signed in." }``. The automation form
+   * shows the run target's notice; a provider absent from the map has none.
+   */
+  sandbox_provider_automation_notices?: Record<string, string>;
   /**
    * Connection providers this deploy has wired (config + store present),
    * e.g. ``["github"]`` or ``["github", "databricks"]``. Non-empty shows the
@@ -257,6 +265,12 @@ export interface ServerInfo {
    */
   scheduled_task_session_modes?: boolean;
   /**
+   * True when a session create (and so ``sys_session_create``) accepts
+   * ``permission_mode``. Older servers ignore the field, so trigger templates
+   * write a worker mode only here. Fails to ``false``.
+   */
+  session_create_permission_modes?: boolean;
+  /**
    * True when a scheduled task can start every run from a copy of an existing
    * session (``source_session_id``). Gates the session menu's "Create
    * automation…" item. Fails to ``false``.
@@ -305,6 +319,8 @@ export interface ServerInfo {
    * and ``Conversation.pull_request``); absent on older servers (off).
    */
   session_pull_requests?: boolean;
+  /** Session comments preserve PR revision and line anchors; absent on older servers. */
+  comment_anchor_metadata?: boolean;
   /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
@@ -444,6 +460,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   sandbox_provider: null,
   sandbox_providers: [],
   sandbox_provider_capabilities: {},
+  sandbox_provider_automation_notices: {},
   enabled_connections: [],
   // Sharing fails OPEN (opposite of the other caps): a failed probe must
   // not silently disable sharing, so the sentinel is the permissive "on".
@@ -462,12 +479,14 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   automations_enabled: true,
   session_search_scope: false,
   scheduled_task_session_modes: false,
+  session_create_permission_modes: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
   move_to_managed_sandbox: false,
+  comment_anchor_metadata: false,
   branding: null,
   picker: UNRESTRICTED_PICKER,
 };
@@ -563,6 +582,15 @@ function parseSandboxProviderCapabilities(
   );
 }
 
+function parseProviderAutomationNotices(value: unknown): Record<string, string> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim() !== "",
+    ),
+  );
+}
+
 /**
  * Fetch ``/v1/info`` once and cache the result.
  *
@@ -605,6 +633,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           sandbox_provider_capabilities: parseSandboxProviderCapabilities(
             data.sandbox_provider_capabilities,
           ),
+          sandbox_provider_automation_notices: parseProviderAutomationNotices(
+            data.sandbox_provider_automation_notices,
+          ),
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],
@@ -631,6 +662,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+          session_create_permission_modes: data.session_create_permission_modes === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           automation_trigger_poll_minutes:
@@ -653,6 +685,8 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_pull_requests: data.session_pull_requests === true,
           session_title_instructions: data.session_title_instructions === true,
+          admin_view: data.admin_view === true,
+          comment_anchor_metadata: data.comment_anchor_metadata === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,

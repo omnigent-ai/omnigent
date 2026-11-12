@@ -11430,6 +11430,118 @@ async def test_on_proxy_stream_end_spares_superseded_response() -> None:
         app.state.active_turns.pop(conv, None)
 
 
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "read_error",
+        "failed",
+        "completed",
+        "empty",
+        "rejected",
+        "precreated_read_error",
+        "precreated_empty",
+        "late_created",
+    ],
+)
+@pytest.mark.parametrize("successor", ["starting", "running", "finished", "unchanged"])
+@pytest.mark.parametrize("delivery", ["stream", "background"])
+@pytest.mark.asyncio
+async def test_superseded_harness_stream_cannot_settle_newer_turn(
+    outcome: str, successor: str, delivery: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Late stream outcomes cannot consume a successor's status or exit evidence."""
+    conv = "conv_late_stream"
+    harness = _RecoveryScriptedHarnessClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    newer = asyncio.create_task(asyncio.Event().wait())
+    exit_error = {"code": "required_terminal_exited", "message": "successor terminal exited"}
+    clears_at_boundary: list[str] = []
+
+    def replace_turn() -> None:
+        if successor != "unchanged":
+            app.state.begin_turn_slot(conv)
+            app.state.active_turns[conv] = newer
+            app.state.live_response_id.pop(conv, None)
+            if successor in {"running", "finished"}:
+                app.state.live_response_id[conv] = "resp_new"
+                pm.mark_in_flight(conv, "resp_new")
+            if successor == "finished":
+                app.state.on_proxy_stream_end(conv, owner_response_id="resp_new")
+        app.state.required_terminal_exit_errors[conv] = exit_error
+        clears_at_boundary[:] = pm.cleared_in_flight
+        queue = app.state.session_event_queues[conv]
+        while not queue.empty():
+            queue.get_nowait()
+
+    async def frames() -> AsyncIterator[str]:
+        if outcome not in {"precreated_read_error", "precreated_empty", "late_created"}:
+            yield _SSE_RESPONSE_CREATED
+        replace_turn()
+        if outcome in {"read_error", "precreated_read_error"}:
+            raise httpx.ReadError("retired stream closed")
+        if outcome == "failed":
+            yield _SSE_RESPONSE_FAILED
+        elif outcome in {"completed", "late_created"}:
+            if outcome == "late_created":
+                yield _SSE_RESPONSE_CREATED
+            yield _SSE_RESPONSE_COMPLETED
+
+    @asynccontextmanager
+    async def stream(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        if outcome == "rejected":
+            replace_turn()
+        yield SimpleNamespace(status_code=503 if outcome == "rejected" else 200, aiter_text=frames)
+
+    monkeypatch.setattr(harness, "stream", stream)
+    try:
+        async with _recovery_runner_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{conv}/events?stream={'true' if delivery == 'stream' else 'false'}",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "harness": "openai-agents",
+                    "content": [{"type": "input_text", "text": "original work"}],
+                },
+            )
+            assert response.status_code == (200 if delivery == "stream" else 202)
+            await _await_bg_turn_task(conv)
+
+            if successor == "unchanged":
+                assert conv not in app.state.active_turns
+                assert conv in pm.cleared_in_flight
+                events = app.state.session_event_queues[conv]
+                assert any(
+                    events.get_nowait().get("type") == "response.failed"
+                    for _ in range(events.qsize())
+                )
+                return
+
+            queue = app.state.session_event_queues[conv]
+            assert queue.empty()
+            assert pm.cleared_in_flight == clears_at_boundary
+            assert app.state.required_terminal_exit_errors[conv] is exit_error
+            assert "response.failed" not in response.text
+            assert "response.completed" not in response.text
+            if successor == "finished":
+                assert conv not in app.state.active_turns
+                assert conv not in app.state.live_response_id
+            else:
+                assert app.state.active_turns[conv] is newer
+                assert app.state.live_response_id.get(conv) == (
+                    "resp_new" if successor == "running" else None
+                )
+    finally:
+        newer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await newer
+        app.state.active_turns.pop(conv, None)
+
+
 @pytest.mark.parametrize("replacement", ["none", "task", "stream", "finished"])
 @pytest.mark.asyncio
 async def test_interrupt_cleanup_is_scoped_to_turn_generation(replacement: str) -> None:
