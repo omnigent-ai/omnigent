@@ -254,6 +254,8 @@ export interface Conversation {
    * `/v1/sessions/temp:*`. Never set on a server row.
    */
   provisional?: boolean;
+  /** Client-only composer destination before a nested draft is submitted. */
+  nested_draft_source_id?: string;
   /**
    * Total review comments (any status) on this session. Together with
    * `comments_updated_at` it forms a change fingerprint: an add or edit
