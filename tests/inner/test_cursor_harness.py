@@ -114,18 +114,9 @@ def test_executor_factory_decodes_os_env_and_skills(monkeypatch: pytest.MonkeyPa
     assert captured["bundle_dir"] == Path("/tmp/bundle")
 
 
-def test_malformed_os_env_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_executor_factory_rejects_malformed_os_env_json(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HARNESS_CURSOR_OS_ENV", "{not-json")
-    captured: dict[str, Any] = {}
-
-    def _fake_init(self: Any, **kwargs: Any) -> None:
-        captured["os_env"] = kwargs["os_env"]
-
-    with patch(
-        "omnigent.inner.cursor_harness.CursorExecutor.__init__",
-        _fake_init,
-    ):
-        cursor_harness._build_cursor_executor()
-
-    assert captured["os_env"].type == "caller_process"
-    assert captured["os_env"].sandbox.type == "none"
+    with patch("omnigent.inner.cursor_harness.CursorExecutor.__init__") as constructor:
+        with pytest.raises(ValueError, match="HARNESS_CURSOR_OS_ENV"):
+            cursor_harness._build_cursor_executor()
+    constructor.assert_not_called()

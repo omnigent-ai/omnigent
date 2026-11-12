@@ -1,0 +1,503 @@
+"""Check harness launch boundaries independently of vendor APIs and model behavior."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import shlex
+import socket
+import subprocess
+import sys
+from collections.abc import Iterator
+from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
+
+from omnigent.inner import claude_sdk_executor, codex_worker, sandbox
+from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+from omnigent.inner.codex_worker import prepare_codex_worker
+from omnigent.inner.datamodel import GitSshBinding, OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.goose_executor import GooseExecutor
+from omnigent.inner.kimi_executor import KimiExecutor
+from omnigent.inner.pi_executor import _try_sandbox_pi
+from omnigent.inner.qwen_executor import QwenExecutor
+
+_HARNESSES = ["acp", "claude-sdk", "codex", "goose", "kimi", "pi", "qwen"]
+
+
+@contextlib.contextmanager
+def _prepared_launch(
+    harness: str, executable: Path, workspace: Path, spec: OSEnvSpec | None
+) -> Iterator[str]:
+    runtime_home = executable.parent / "runtime-home"
+    runtime_home.mkdir(exist_ok=True)
+    worker = None
+    names = ["PATH", "HOME", "CODEX_HOME"]
+    if harness == "codex":
+        worker = prepare_codex_worker(
+            codex_path=str(executable),
+            cwd=workspace,
+            codex_home=runtime_home,
+            os_env=spec,
+            spawn_env_names=names,
+            worker_env={},
+        )
+        launch_path = worker.launch_path
+    elif harness == "claude-sdk":
+        launch_path = claude_sdk_executor.prepare_claude_cli_path(
+            str(executable), spec, cwd=str(workspace)
+        ).cli_path
+        assert launch_path is not None
+    elif harness == "pi":
+        launch_path = _try_sandbox_pi(str(executable), spec, str(workspace), names).launch_path
+    elif harness == "acp":
+        executor = AcpExecutor(
+            AcpAgentConfig(command=shlex.quote(str(executable))), cwd=str(workspace), os_env=spec
+        )
+        launch_path, _ = executor._sandbox_launch(tuple(names))
+    elif harness == "goose":
+        launch_path = GooseExecutor(
+            goose_path=str(executable), cwd=str(workspace), os_env=spec
+        )._sandbox_launch_path(names)
+    elif harness == "kimi":
+        launch_path = KimiExecutor(
+            binary_path=str(executable), cwd=str(workspace), os_env=spec
+        )._sandbox_launch_path(names)
+    else:
+        assert harness == "qwen"
+        launch_path = QwenExecutor(
+            qwen_path=str(executable), cwd=str(workspace), os_env=spec
+        )._sandbox_launch_path(names)
+    try:
+        yield launch_path
+    finally:
+        if worker is not None:
+            worker.close()
+        elif launch_path != str(executable):
+            Path(launch_path).unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("harness", _HARNESSES)
+@pytest.mark.parametrize("fault", ["resolve", "backend", "launcher", "inactive"])
+def test_requested_sandbox_never_falls_back_to_bare_worker(
+    harness: str, fault: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "bin" / "agent"
+    executable.parent.mkdir()
+    executable.touch()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    policy = sandbox.SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=fault != "inactive",
+        read_roots=[workspace],
+        write_roots=[],
+        write_files=[],
+        allow_network=True,
+    )
+    resolve = Mock(return_value=policy)
+    launcher = Mock(side_effect=OSError("launcher unavailable"))
+    implementation = Mock()
+    implementation.prepare_launcher_policy.side_effect = lambda policy: policy
+    implementation.wrap_launcher_argv.side_effect = lambda argv, *args, **kwargs: [
+        "sandbox",
+        *argv,
+    ]
+    backend = Mock(return_value=implementation)
+    if fault == "backend":
+        backend.side_effect = NotImplementedError("backend unavailable")
+    if fault == "resolve":
+        resolve.side_effect = OSError("sandbox unavailable")
+    monkeypatch.setattr(sandbox, "resolve_sandbox", resolve)
+    monkeypatch.setattr(claude_sdk_executor, "resolve_sandbox", resolve)
+    monkeypatch.setattr(codex_worker, "resolve_sandbox", resolve)
+    if fault == "launcher":
+        monkeypatch.setattr(sandbox, "create_exec_launcher", launcher)
+        monkeypatch.setattr(claude_sdk_executor, "create_exec_launcher", launcher)
+        monkeypatch.setattr(codex_worker, "create_exec_launcher", launcher)
+    monkeypatch.setattr(sandbox, "get_backend", backend)
+    monkeypatch.setattr(claude_sdk_executor, "get_backend", backend)
+    monkeypatch.setattr(codex_worker, "get_backend", backend)
+    spec = OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+    with pytest.raises((OSError, NotImplementedError)):
+        with _prepared_launch(harness, executable, workspace, spec):
+            pytest.fail(f"{harness} accepted an unavailable requested sandbox")
+    if fault == "launcher":
+        launcher.assert_called_once()
+    elif fault == "backend":
+        backend.assert_called_once()
+    else:
+        resolve.assert_called_once()
+
+
+@pytest.mark.parametrize("harness", _HARNESSES)
+@pytest.mark.parametrize("declared", [False, True])
+def test_unsandboxed_worker_requires_no_policy_or_explicit_none(
+    harness: str, declared: bool, tmp_path: Path
+) -> None:
+    spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")) if declared else None
+    executable = tmp_path / "bin" / "agent"
+    executable.parent.mkdir()
+    executable.touch()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with _prepared_launch(harness, executable, workspace, spec) as path:
+        assert path == str(executable)
+
+
+@pytest.mark.parametrize(
+    "harness,feature",
+    [
+        (harness, feature)
+        for harness in _HARNESSES
+        for feature in ("fork", "start_in_scratch", "git_ssh", "cwd_conflict", "relative_cwd")
+    ],
+)
+def test_harness_rejects_policy_features_it_cannot_honor(
+    harness: str, feature: str, tmp_path: Path
+) -> None:
+    executable = tmp_path / "bin" / "agent"
+    executable.parent.mkdir()
+    executable.touch()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+    if feature == "git_ssh":
+        assert spec.sandbox is not None
+        spec.sandbox.git_ssh = [
+            GitSshBinding(
+                host="git.example.test",
+                port=22,
+                username="git",
+                repository="org/repo.git",
+                operations=frozenset({"fetch"}),
+                identity_file="/keys/id",
+                known_hosts_file="/keys/known_hosts",
+            )
+        ]
+    elif feature == "cwd_conflict":
+        spec.cwd = str(tmp_path / "another-workspace")
+    elif feature == "relative_cwd":
+        spec.cwd = "restricted"
+    else:
+        setattr(spec, feature, True)
+    with pytest.raises(ValueError, match=r"does not support|conflicts"):
+        with _prepared_launch(harness, executable, workspace, spec):
+            pytest.fail(f"{harness} silently ignored {feature}")
+
+
+@pytest.mark.parametrize("harness", [name for name in _HARNESSES if name != "codex"])
+def test_harness_without_egress_broker_rejects_egress_rules(harness: str, tmp_path: Path) -> None:
+    executable = tmp_path / "agent"
+    executable.touch()
+    spec = OSEnvSpec(
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap", egress_rules=["GET api.example.com/**"])
+    )
+    with pytest.raises(ValueError, match="egress_rules"):
+        with _prepared_launch(harness, executable, tmp_path, spec):
+            pytest.fail(f"{harness} ignored the egress allowlist")
+
+
+@pytest.mark.parametrize("harness", ["copilot", "cursor", "hermes"])
+def test_harness_without_process_sandbox_rejects_requested_confinement(
+    harness: str, tmp_path: Path
+) -> None:
+    from omnigent.inner.copilot_executor import CopilotExecutor
+    from omnigent.inner.cursor_executor import CursorExecutor
+    from omnigent.inner.hermes_executor import HermesExecutor
+
+    constructors = {"copilot": CopilotExecutor, "cursor": CursorExecutor, "hermes": HermesExecutor}
+    spec = OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+    with pytest.raises(ValueError, match="cannot enforce"):
+        constructors[harness](os_env=spec)
+
+
+@pytest.mark.parametrize("harness", _HARNESSES)
+@pytest.mark.parametrize("launch_state", ["expected", "different_cwd", "forged_marker"])
+@pytest.mark.parametrize("writable_grant", [False, True])
+def test_real_worker_keeps_declared_filesystem_and_network_boundary(
+    harness: str,
+    launch_state: str,
+    writable_grant: bool,
+    tmp_path: Path,
+    active_sandbox_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    writable = tmp_path / "writable"
+    home = tmp_path / "home"
+    install = tmp_path / "install" / "node_modules" / "vendor" / "bin"
+    for directory in (workspace, outside, writable, home, install):
+        directory.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    allowed = workspace / "allowed.txt"
+    allowed.write_text("allowed")
+    secret = outside / "canary.txt"
+    secret.write_text("private canary")
+    protected_home_file = home / "protected.txt"
+    protected_home_file.write_text("unchanged host content")
+    home_output = home / "written.txt"
+    transcript = home / ".claude" / "projects" / "transcript.json"
+    ssh_key = home / ".ssh" / "id_ed25519"
+    for private_file in (transcript, ssh_key):
+        private_file.parent.mkdir(parents=True)
+        private_file.write_text("private canary")
+    escape = workspace / "escape"
+    escape.symlink_to(secret)
+    target = outside / "written.txt"
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    probe = f"""
+import json, pathlib, socket, subprocess, sys
+assert pathlib.Path({str(allowed)!r}).read_text() == 'allowed'
+for path in (
+    {str(secret)!r}, {str(escape)!r}, {str(transcript)!r}, {str(ssh_key)!r},
+    {str(protected_home_file)!r}
+):
+    try:
+        pathlib.Path(path).read_bytes()
+    except OSError:
+        pass
+    else:
+        raise AssertionError('unexpected read grant: ' + path)
+for path in ({str(target)!r}, {str(workspace / "written.txt")!r}):
+    try:
+        pathlib.Path(path).write_text('unexpected')
+    except OSError:
+        pass
+    else:
+        raise AssertionError('unexpected write grant: ' + path)
+# Bubblewrap can synthesize writable HOME parents in private tmpfs.
+# The parent checks that these operations never create or modify host files.
+for path in ({str(home_output)!r}, {str(protected_home_file)!r}):
+    try:
+        pathlib.Path(path).write_text('shadow write')
+    except OSError:
+        pass
+if {writable_grant!r}:
+    pathlib.Path({str(writable / "allowed.txt")!r}).write_text('allowed write')
+else:
+    try:
+        pathlib.Path({str(writable / "denied.txt")!r}).write_text('unexpected')
+    except OSError:
+        pass
+    else:
+        raise AssertionError('unexpected write grant to unlisted root')
+child = subprocess.run(
+    ['/bin/sh', '-c', {("cat " + shlex.quote(str(secret)))!r}], capture_output=True
+)
+assert child.returncode != 0, 'child process escaped read restriction'
+try:
+    connection = socket.create_connection(('127.0.0.1', {listener.getsockname()[1]}), timeout=1)
+except OSError:
+    pass
+else:
+    connection.close()
+    raise AssertionError('direct network access was permitted')
+print(json.dumps({{'contained': True}}))
+"""
+    executable = install / "agent"
+    executable.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(probe)}\n"
+    )
+    executable.chmod(0o755)
+    spec = OSEnvSpec(
+        cwd=str(workspace),
+        sandbox=OSEnvSandboxSpec(
+            type=active_sandbox_type,
+            read_paths=[str(workspace)],
+            write_paths=[str(writable)] if writable_grant else [],
+            allow_network=False,
+            cwd_hidden_scan_overflow="error",
+        ),
+    )
+    launch_env = {"PATH": os.environ["PATH"], "HOME": str(home)}
+    if launch_state == "forged_marker":
+        launch_env["OMNIGENT_LAUNCHER_SPAWN_WRAPPED"] = "1"
+        launch_env["OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"] = str(outside)
+    try:
+        with _prepared_launch(harness, executable, workspace, spec) as path:
+            completed = subprocess.run(
+                [path],
+                cwd=outside if launch_state == "different_cwd" else workspace,
+                env=launch_env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+    finally:
+        listener.close()
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"contained": True}
+    assert not target.exists()
+    assert not home_output.exists()
+    assert protected_home_file.read_text() == "unchanged host content"
+    if writable_grant:
+        assert (writable / "allowed.txt").read_text() == "allowed write"
+    assert not (writable / "denied.txt").exists()
+
+
+@pytest.mark.parametrize("harness", _HARNESSES)
+@pytest.mark.parametrize(
+    "feature", ["credential_proxy", "none_network", "none_copy_on_write", "windows_jobobject"]
+)
+def test_worker_rejects_unenforceable_network_or_backend(
+    harness: str, feature: str, tmp_path: Path
+) -> None:
+    from omnigent.inner.datamodel import CredentialProxySpec, WritePathSpec
+
+    executable = tmp_path / "agent"
+    executable.touch()
+    policy = OSEnvSandboxSpec(type="linux_bwrap")
+    if feature == "credential_proxy":
+        policy.credential_proxy = CredentialProxySpec(entries=[])
+    elif feature == "none_network":
+        policy.type = "none"
+        policy.allow_network = False
+    elif feature == "none_copy_on_write":
+        policy.type = "none"
+        policy.write_paths = [WritePathSpec(path="/workspace", copy_on_write=True)]
+    else:
+        policy.type = feature
+    with pytest.raises(ValueError, match=r"does not support|cannot enforce"):
+        with _prepared_launch(harness, executable, tmp_path, OSEnvSpec(sandbox=policy)):
+            pytest.fail(f"{harness} accepted unenforceable {feature}")
+
+
+def test_claude_sdk_missing_system_cli_rejects_requested_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(claude_sdk_executor, "_find_system_claude", lambda: None)
+    with pytest.raises(OSError, match="requires a CLI path"):
+        claude_sdk_executor.ClaudeSDKExecutor(os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec()))
+
+
+def test_installed_codex_native_commands_remain_inside_outer_sandbox(
+    tmp_path: Path, active_sandbox_type: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise Codex's real command RPC with its nested sandbox disabled."""
+    import shutil
+    import time
+
+    from tests._helpers.live_server import terminate_process
+    from tests._helpers.stdio_jsonrpc import read_json_line, write_json_line
+
+    codex = shutil.which("codex")
+    if codex is None:
+        pytest.skip("requires an installed Codex CLI with command/exec support")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    secret = tmp_path / "private.txt"
+    secret.write_text("private canary")
+    allowed = workspace / "allowed.txt"
+    allowed.write_text("allowed")
+    output = workspace / "forbidden-write.txt"
+    monkeypatch.setenv("HOME", str(home))
+    spec = OSEnvSpec(
+        cwd=str(workspace),
+        sandbox=OSEnvSandboxSpec(
+            type=active_sandbox_type,
+            read_paths=[str(workspace)],
+            write_paths=[],
+            allow_network=False,
+        ),
+    )
+    env = {"PATH": os.environ["PATH"], "HOME": str(home), "CODEX_HOME": str(home)}
+    with contextlib.closing(
+        prepare_codex_worker(
+            codex_path=codex,
+            cwd=workspace,
+            codex_home=home,
+            os_env=spec,
+            spawn_env_names=list(env),
+            worker_env=env,
+        )
+    ) as worker:
+        with (
+            (tmp_path / "codex-stderr.txt").open("w+") as stderr,
+            subprocess.Popen(
+                [worker.launch_path, "app-server"],
+                cwd=tmp_path,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                text=True,
+            ) as process,
+        ):
+            assert process.stdin is not None and process.stdout is not None
+
+            def exchange(
+                request_id: int, method: str, params: dict[str, object]
+            ) -> dict[str, object]:
+                write_json_line(
+                    process.stdin, {"id": request_id, "method": method, "params": params}
+                )
+                deadline = time.monotonic() + 30
+                while True:
+                    response = read_json_line(
+                        process.stdout, timeout_s=max(0.01, deadline - time.monotonic())
+                    )
+                    if response.get("id") == request_id:
+                        assert "error" not in response, response
+                        result = response["result"]
+                        assert isinstance(result, dict)
+                        return result
+
+            try:
+                exchange(1, "initialize", {"clientInfo": {"name": "sandbox-test", "version": "1"}})
+                write_json_line(process.stdin, {"method": "initialized", "params": {}})
+                command = (
+                    f"cat {shlex.quote(str(allowed))} && "
+                    f"! cat {shlex.quote(str(secret))} && "
+                    f"! sh -c {shlex.quote('echo denied > ' + shlex.quote(str(output)))}"
+                )
+                result = exchange(
+                    2,
+                    "command/exec",
+                    {
+                        "command": ["/bin/sh", "-c", command],
+                        "cwd": str(workspace),
+                        "sandboxPolicy": {"type": "dangerFullAccess"},
+                        "timeoutMs": 10000,
+                    },
+                )
+                assert result["exitCode"] == 0, result
+                assert result["stdout"] == "allowed", result
+                assert not output.exists()
+            finally:
+                terminate_process(process)
+
+
+@pytest.mark.parametrize("spec_cwd", [None, "."])
+def test_claude_sdk_uses_executor_workspace_for_implicit_policy_cwd(
+    spec_cwd: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    policy = sandbox.SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=[],
+        write_roots=[],
+        write_files=[],
+        allow_network=True,
+    )
+    resolve = Mock(return_value=policy)
+    backend = Mock()
+    backend.wrap_launcher_argv.return_value = ["bwrap", "python"]
+    monkeypatch.setattr(claude_sdk_executor, "resolve_sandbox", resolve)
+    monkeypatch.setattr(claude_sdk_executor, "get_backend", lambda name: backend)
+    monkeypatch.setattr(
+        claude_sdk_executor, "create_exec_launcher", Mock(return_value="/tmp/launcher")
+    )
+    monkeypatch.setattr(claude_sdk_executor, "_claude_internal_write_roots", list)
+    spec = OSEnvSpec(cwd=spec_cwd, sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+    prepared = claude_sdk_executor.prepare_claude_cli_path("/bin/agent", spec, cwd=str(tmp_path))
+    resolve.assert_called_once_with(spec, tmp_path.resolve())
+    assert prepared.cwd == str(tmp_path.resolve())

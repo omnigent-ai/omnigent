@@ -11,6 +11,7 @@ tests pass without the package installed.
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -49,6 +50,7 @@ _ALL_ANTIGRAVITY_ENV = (
     "HARNESS_ANTIGRAVITY_VERTEX",
     "HARNESS_ANTIGRAVITY_PROJECT",
     "HARNESS_ANTIGRAVITY_LOCATION",
+    "HARNESS_ANTIGRAVITY_OS_ENV",
 )
 
 
@@ -92,10 +94,15 @@ def test_executor_factory_threads_env_vars(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["location"] == "us-central1"
 
 
-def test_executor_factory_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("os_env_payload", [None, '{"sandbox": {"type": "none"}}'])
+def test_executor_factory_defaults_when_unset(
+    monkeypatch: pytest.MonkeyPatch, os_env_payload: str | None
+) -> None:
     """Unset env vars resolve to ``None`` / ``False`` (SDK uses ambient creds)."""
     for var in _ALL_ANTIGRAVITY_ENV:
         monkeypatch.delenv(var, raising=False)
+    if os_env_payload is not None:
+        monkeypatch.setenv("HARNESS_ANTIGRAVITY_OS_ENV", os_env_payload)
 
     captured = _capture_factory_kwargs(monkeypatch)
 
@@ -105,6 +112,31 @@ def test_executor_factory_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -
     assert captured["vertex"] is False
     assert captured["project"] is None
     assert captured["location"] is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{}",
+        '{"sandbox": {"type": "linux_bwrap"}}',
+        '{"sandbox": {"type": "darwin_seatbelt"}}',
+        '{"sandbox": {"type": "windows_jobobject"}}',
+        '{"sandbox": {"type": "none", "allow_network": false}}',
+        '{"sandbox": {"type": "none", "egress_rules": ["GET api.example.com/**"]}}',
+        '{"sandbox": {"type": "none"}, "fork": true}',
+        '{"sandbox": {"type": "none"}, "start_in_scratch": true}',
+        "{not-json",
+        "null",
+    ],
+)
+def test_executor_factory_rejects_unsupported_os_policy_before_construction(
+    monkeypatch: pytest.MonkeyPatch, payload: str
+) -> None:
+    monkeypatch.setenv("HARNESS_ANTIGRAVITY_OS_ENV", payload)
+    with patch.object(antigravity_harness, "AntigravityExecutor") as constructor:
+        with pytest.raises(ValueError):
+            antigravity_harness._build_antigravity_executor()
+    constructor.assert_not_called()
 
 
 @pytest.mark.parametrize(

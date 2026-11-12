@@ -5048,6 +5048,7 @@ async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_o
     def record_launcher(
         target: str, policy: SandboxPolicy, *, cwd=None, env_overrides=None
     ) -> str:
+        assert cwd == str(workspace.resolve())
         path = tmp_path / f"launcher-{len(launchers)}.sh"
         path.write_text("")
         launchers[str(path)] = policy
@@ -5324,16 +5325,15 @@ def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> 
 
 
 @pytest.mark.parametrize("env_value", ["1", "true", "yes"])
-def test_prepare_claude_cli_path_rejects_bypass_when_sandbox_required(
+def test_prepare_claude_cli_path_rejects_bypass_for_requested_sandbox(
     monkeypatch, env_value: str
 ) -> None:
-    """Diagnostic flags cannot authorize uncontained skill execution."""
     from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_SDK_NO_SANDBOX", env_value)
     launcher = Mock()
     monkeypatch.setattr("omnigent.inner.claude_sdk_executor.create_exec_launcher", launcher)
-    with pytest.raises(OSError, match="conflicts with the required Claude sandbox"):
+    with pytest.raises(OSError, match="conflicts with the requested sandbox"):
         prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
     launcher.assert_not_called()
 
@@ -5384,34 +5384,32 @@ def _active_policy(*, allow_network: bool = True):
     )
 
 
-def test_prepare_claude_cli_path_resolution_failure_prevents_launch(monkeypatch) -> None:
-    """A missing backend must stop startup before any skill can be loaded."""
+def test_prepare_claude_cli_path_rejects_sandbox_resolution_failure(monkeypatch) -> None:
     from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
 
-    monkeypatch.setattr(
-        "omnigent.inner.claude_sdk_executor.resolve_sandbox",
-        Mock(side_effect=OSError("sandbox-exec unavailable")),
-    )
-    launcher = Mock()
-    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.create_exec_launcher", launcher)
-    with pytest.raises(OSError, match="sandbox-exec unavailable"):
+    with (
+        patch(
+            "omnigent.inner.claude_sdk_executor.resolve_sandbox",
+            side_effect=OSError("sandbox unavailable"),
+        ),
+        patch("omnigent.inner.claude_sdk_executor.create_exec_launcher") as launcher,
+        pytest.raises(OSError, match="sandbox unavailable"),
+    ):
         prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
     launcher.assert_not_called()
 
 
-def test_prepare_claude_cli_path_wrap_failure_prevents_launch(monkeypatch) -> None:
-    """An unbuildable sandbox cannot fall back to the original CLI."""
+def test_prepare_claude_cli_path_rejects_failed_wrap_probe(monkeypatch) -> None:
     from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
 
-    monkeypatch.setattr(
-        "omnigent.inner.claude_sdk_executor.resolve_sandbox", lambda *a, **k: _active_policy()
-    )
     backend = Mock()
-    backend.wrap_launcher_argv.side_effect = OSError("cannot wrap")
-    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.get_backend", lambda _: backend)
-    launcher = Mock()
-    monkeypatch.setattr("omnigent.inner.claude_sdk_executor.create_exec_launcher", launcher)
-    with pytest.raises(OSError, match="cannot wrap"):
+    backend.wrap_launcher_argv.side_effect = OSError("cannot wrap CLI")
+    with (
+        patch("omnigent.inner.claude_sdk_executor.resolve_sandbox", return_value=_active_policy()),
+        patch("omnigent.inner.claude_sdk_executor.get_backend", return_value=backend),
+        patch("omnigent.inner.claude_sdk_executor.create_exec_launcher") as launcher,
+        pytest.raises(OSError, match="cannot wrap CLI"),
+    ):
         prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
     launcher.assert_not_called()
 

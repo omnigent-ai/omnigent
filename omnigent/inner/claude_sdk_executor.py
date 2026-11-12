@@ -129,6 +129,7 @@ from .sandbox import (
     create_private_tmpdir,
     get_backend,
     resolve_sandbox,
+    validate_harness_sandbox,
     with_additional_read_roots,
     with_additional_write_files,
     with_additional_write_roots,
@@ -1276,6 +1277,7 @@ class PreparedClaudeCli:
     enable_native_tools: bool
     # Policy the wrapper applies; a CLI needing extra grants gets its own launcher from it.
     sandbox: SandboxPolicy | None = None
+    cwd: str | None = None
     sandboxed: bool = False
     _owned_launcher: pathlib.Path | None = None
     _egress_handle: EgressProxyHandle | None = None
@@ -2072,6 +2074,7 @@ def prepare_claude_cli_path(
     real_cli_path: str | None,
     spec: OSEnvSpec | None,
     *,
+    cwd: str | None = None,
     worker_env: MutableMapping[str, str] | None = None,
     bundle_dir: pathlib.Path | None = None,
     agent_name: str | None = None,
@@ -2099,20 +2102,24 @@ def prepare_claude_cli_path(
 
     if spec is None:
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
+    resolved_cwd = _resolve_sandbox_cwd(cwd if cwd is not None else spec.cwd)
+    validate_harness_sandbox(
+        spec, "Claude SDK", cwd=resolved_cwd,
+        supports_egress_rules=worker_env is not None,
+        supports_credential_proxy=worker_env is not None,
+    )
     sandbox_spec = spec.sandbox or OSEnvSandboxSpec()
     if sandbox_spec.type == "none":
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
-
-    if spec.type != "caller_process":
-        raise OSError("Sandboxed Claude requires a caller_process OS environment")
     if real_cli_path is None:
-        raise OSError("Sandboxed Claude requires a resolved CLI executable")
+        raise OSError("Claude SDK requires a CLI path to apply the requested sandbox")
     if _sandbox_disabled_by_env():
-        raise OSError(f"{_NO_SANDBOX_ENV} conflicts with the required Claude sandbox")
+        raise OSError("OMNIGENT_CLAUDE_SDK_NO_SANDBOX conflicts with the requested sandbox")
+
     if model_access is not None and worker_env is None:
         raise ValueError("Brokered Claude model access requires an owned worker environment")
 
-    cwd = _resolve_sandbox_cwd(spec.cwd)
+    cwd = resolved_cwd
     sandbox = resolve_sandbox(spec, cwd)
     if not sandbox.active:
         raise OSError("The configured Claude sandbox resolved to an inactive policy")
@@ -2270,6 +2277,7 @@ def prepare_claude_cli_path(
             worker_env.update(staged_env)
         return PreparedClaudeCli(
             cli_path=str(launcher),
+            cwd=str(cwd),
             enable_native_tools=True,
             sandbox=sandbox,
             sandboxed=True,
@@ -2330,11 +2338,12 @@ def prepare_tight_cli_process(
     sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
     sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
     try:
-        launcher = create_exec_launcher(real_cli_path, sandbox)
+        launcher = create_exec_launcher(real_cli_path, sandbox, cwd=str(resolved_cwd))
         return PreparedClaudeCli(
             cli_path=launcher,
             enable_native_tools=False,
             sandbox=sandbox,
+            cwd=str(resolved_cwd),
         )
     except OSError as exc:
         if "mutable hard-link alias" in str(exc):

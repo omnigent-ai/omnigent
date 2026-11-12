@@ -47,10 +47,7 @@ logger = logging.getLogger(__name__)
 # through the executor's tee.
 _SANDBOX_STRACE_ENV = "OMNIGENT_SANDBOX_STRACE"
 
-# Re-exec marker for ``run_launcher``: when set, the script is
-# already running INSIDE a ``bwrap`` / ``sandbox-exec`` wrap and
-# must NOT re-exec itself again. Set right before the re-exec call
-# and inherited by the wrapped process.
+# Discard this legacy marker; inherited environment is not proof of containment.
 _LAUNCHER_WRAPPED_ENV = "OMNIGENT_LAUNCHER_SPAWN_WRAPPED"
 
 # Hand-off marker for the spawn-time re-exec: the host pass mints the
@@ -843,6 +840,65 @@ def _contained_relative_grant(cwd: Path, root: str, expanded: str) -> str:
     return resolved
 
 
+def validate_harness_sandbox(
+    spec: OSEnvSpec,
+    harness: str,
+    *,
+    cwd: Path | None = None,
+    supports_egress_rules: bool = False,
+    supports_credential_proxy: bool = False,
+) -> None:
+    """Reject policy features a harness cannot enforce before starting its worker."""
+    if spec.type != "caller_process":
+        raise ValueError(f"{harness} does not support os_env.type={spec.type!r}")
+    for feature in ("fork", "start_in_scratch"):
+        if getattr(spec, feature):
+            raise ValueError(f"{harness} does not support os_env.{feature}")
+    sandbox = spec.sandbox or _default_sandbox_for_platform()
+    from .os_env_serialization import validate_sandbox_scan_options
+
+    validate_sandbox_scan_options(sandbox)
+    if (
+        cwd is not None
+        and spec.cwd
+        and sandbox.type != "none"
+        and _resolve_grant_root(cwd, spec.cwd) != cwd.resolve(strict=False)
+    ):
+        raise ValueError(f"{harness}: working directory conflicts with os_env.cwd")
+    if sandbox.type == "windows_jobobject":
+        raise ValueError(
+            f"{harness} cannot enforce filesystem or network policy with windows_jobobject"
+        )
+    if sandbox.type == "none" and (
+        not sandbox.allow_network
+        or sandbox.requires_network_enforcement
+        or sandbox.credential_proxy
+    ):
+        raise ValueError(f"{harness}: sandbox type 'none' cannot enforce network restrictions")
+    if sandbox.type != "linux_bwrap" and any(
+        grant.copy_on_write for grant in sandbox.write_path_specs
+    ):
+        raise ValueError(f"{harness} does not support copy_on_write with {sandbox.type!r}")
+    for feature, supported in (
+        ("egress_rules", supports_egress_rules),
+        ("credential_proxy", supports_credential_proxy),
+        ("git_ssh", False),
+    ):
+        if getattr(sandbox, feature) and not supported:
+            raise ValueError(f"{harness} does not support os_env.sandbox.{feature}")
+
+
+def reject_unsupported_harness_sandbox(spec: OSEnvSpec | None, harness: str) -> None:
+    """Prevent native tools from ignoring a sandbox the adapter cannot install."""
+    if spec is None:
+        return
+    validate_harness_sandbox(spec, harness)
+    if spec.sandbox is None or spec.sandbox.type != "none":
+        raise ValueError(
+            f"{harness} cannot enforce os_env.sandbox; choose a sandbox-capable harness"
+        )
+
+
 def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
     sandbox_spec = spec.sandbox or _default_sandbox_for_platform()
     if sandbox_spec.git_ssh:
@@ -1476,6 +1532,7 @@ def run_launcher(
     *,
     cwd: str | None = None,
     env_overrides: Mapping[str, str] | None = None,
+    _spawn_wrapped: bool = False,
 ) -> int:
     """
     Activate the sandbox and exec the wrapped target inside it.
@@ -1504,6 +1561,10 @@ def run_launcher(
     """
     from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR
 
+    # Only the trusted re-exec program may adopt a previously installed wrap.
+    if not _spawn_wrapped:
+        os.environ.pop(_LAUNCHER_WRAPPED_ENV, None)
+        os.environ.pop(_LAUNCHER_PRIVATE_TMPDIR_ENV, None)
     os.environ.pop(SHARED_ENVIRONMENT_VAR, None)
     for secret_name in RUNNER_AUTH_SECRET_ENV_VARS:
         os.environ.pop(secret_name, None)
@@ -1516,11 +1577,7 @@ def run_launcher(
 
     # Older launcher payloads may not have frozen host-local choices. Resolve
     # them only on the host-side pass; the re-encoded policy carries the result.
-    if (
-        sandbox.active
-        and sandbox.backend_type in _SPAWN_WRAP_BACKENDS
-        and os.environ.get(_LAUNCHER_WRAPPED_ENV) != "1"
-    ):
+    if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS and not _spawn_wrapped:
         sandbox = get_backend(sandbox.backend_type).prepare_launcher_policy(sandbox)
 
     # Before any wrap / exec so neither the re-exec'd launcher nor the target
@@ -1555,16 +1612,12 @@ def run_launcher(
     #
     # We re-exec self under ``backend.wrap_launcher_argv``. The
     # wrapped invocation re-enters this function (via the launcher
-    # script's ``__main__``) but ``_LAUNCHER_WRAPPED_ENV`` breaks the loop
+    # script's ``__main__``) with a private argument to prevent wrapping twice
     # and we proceed to the in-process ``activate_sandbox`` +
     # ``subprocess.run`` path. The wrap inherits HTTP_PROXY / CA
     # env vars set by the parent (terminal path) so the relay
     # daemon spun up by ``activate_sandbox`` is reachable.
-    if (
-        sandbox.active
-        and sandbox.backend_type in _SPAWN_WRAP_BACKENDS
-        and os.environ.get(_LAUNCHER_WRAPPED_ENV) != "1"
-    ):
+    if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS and not _spawn_wrapped:
         backend = get_backend(sandbox.backend_type)
         # Mint the private scratch tmpdir HERE, on the host, before the
         # wrap is built — the reference pattern from
@@ -1602,7 +1655,7 @@ def run_launcher(
             # The inline carries the RE-ENCODED policy so the in-wrap
             # pass decodes the same granted scratch root the profile
             # was built from.
-            inline = _launcher_inline_source(target_path, sandbox, cwd=cwd)
+            inline = _launcher_inline_source(target_path, sandbox, cwd=cwd, _spawn_wrapped=True)
             launcher_argv = [sys.executable, "-I", "-c", inline, *argv]
             wrapped = list(
                 backend.wrap_launcher_argv(
@@ -1612,7 +1665,10 @@ def run_launcher(
                     target=target_path,
                 )
             )
-            os.environ[_LAUNCHER_WRAPPED_ENV] = "1"
+            if wrapped == launcher_argv:
+                raise OSError(
+                    f"Sandbox backend {sandbox.backend_type!r} did not wrap the launcher"
+                )
             logger.info(
                 "[omnigent-sandbox] spawn-time wrap re-exec backend=%s wrap_head=%s",
                 sandbox.backend_type,
@@ -1679,7 +1735,7 @@ def run_launcher(
     try:
         activate_sandbox(sandbox)
         logger.info("[omnigent-sandbox] activated; spawning target=%s", target_path)
-        completed = subprocess.run(target_argv)
+        completed = subprocess.run(target_argv, cwd=cwd)
         logger.info("[omnigent-sandbox] target exited rc=%s", completed.returncode)
         return int(completed.returncode)
     finally:
@@ -1716,6 +1772,7 @@ def _launcher_inline_source(
     *,
     cwd: str | None = None,
     env_overrides_path: str | None = None,
+    _spawn_wrapped: bool = False,
 ) -> str:
     """Build the ``python -c`` program the exec launcher runs.
 
@@ -1734,7 +1791,7 @@ def _launcher_inline_source(
         "logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stderr); "
         "from omnigent.inner.sandbox import run_launcher, _read_launcher_env_overrides; "
         f"raise SystemExit(run_launcher({encoded!r}, {target_path!r}, sys.argv[1:], "
-        f"cwd={cwd!r}, env_overrides={overrides}))"
+        f"cwd={cwd!r}, env_overrides={overrides}, _spawn_wrapped={_spawn_wrapped!r}))"
     )
 
 
@@ -2176,6 +2233,7 @@ def create_exec_launcher(
                     "Grant a dedicated scratch directory instead of the host temporary root."
                 )
         if sandbox.backend_type in _SPAWN_WRAP_BACKENDS:
+            sandbox = with_additional_read_roots(sandbox, [_project_root() / "omnigent"])
             # Path-based spawners may filter the launcher environment. Freeze
             # host-local choices here, immediately before encoding the policy.
             sandbox = get_backend(sandbox.backend_type).prepare_launcher_policy(sandbox)
