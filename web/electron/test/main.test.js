@@ -5482,18 +5482,13 @@ describe("SSH connect IPC", () => {
     assert.deepEqual(h.calls.sshConnects, []);
   });
 
-  // Run on Arca replaces SSH connect where it is offered: the managed features flag on a managed server.
   const managed = "https://workspace.cloud.databricks.com/omnigent";
-  const arcaCases = {
-    "a laptop with managed features on a managed server, which offers Run on Arca": [
-      managed,
-      true,
-      false,
-    ],
+  const sshCases = {
+    "a laptop with managed features on a managed server": [managed, true, true],
     "any other laptop on a Databricks server": [managed, false, true],
     "a laptop with managed features on a self-hosted server": [server, true, true],
   };
-  for (const [label, [serverUrl, internalFeatures, connects]] of Object.entries(arcaCases)) {
+  for (const [label, [serverUrl, internalFeatures, connects]] of Object.entries(sshCases)) {
     it(`${connects ? "connects" : "refuses"} for ${label}`, async (t) => {
       const h = sshHarness(t, { serverUrl, internalFeatures });
       const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
@@ -5502,7 +5497,6 @@ describe("SSH connect IPC", () => {
 
       assert.equal(result.ok, connects);
       assert.equal(h.calls.sshConnects.length, connects ? 1 : 0);
-      if (!connects) assert.match(result.error, /Use Run on Arca instead/);
     });
   }
 

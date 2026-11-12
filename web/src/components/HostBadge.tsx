@@ -186,9 +186,6 @@ export function HostBadge({
     let tooltipRows = badge
       ? [
           { label: "Host", value: badge.label },
-          // An Arclet's host takes the Arclet's own name, e.g. "omnigent-arclet-1234",
-          // which the provider label hides. Other providers' managed-<hex> names don't help.
-          ...(host?.sandbox_provider === "arclet" ? [{ label: "Name", value: host.name }] : []),
           { label: "Status", value: connectionWord },
         ]
       : [{ label: "Host", value: "None" }];

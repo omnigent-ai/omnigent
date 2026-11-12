@@ -1,27 +1,12 @@
-import { type FormEvent, useEffect, useId, useState } from "react";
+import { type FormEvent, useId, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { connectSshHost, getDesktopFeatures, supportsSshConnect } from "@/lib/nativeBridge";
+import { connectSshHost, supportsSshConnect } from "@/lib/nativeBridge";
 
-/**
- * Whether to offer the SSH connect form: the desktop shell can connect over SSH,
- * and this window isn't one where Run on Arca replaces it.
- * False until the shell answers, so the form never flashes in and out.
- */
+/** Offer SSH when the desktop bridge supports it. */
 export function useSshConnectAvailable(): boolean {
-  const [available, setAvailable] = useState(false);
-  useEffect(() => {
-    if (!supportsSshConnect()) return;
-    let active = true;
-    void getDesktopFeatures().then((features) => {
-      if (active) setAvailable(features?.databricksInternalFeatures !== true);
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
-  return available;
+  return supportsSshConnect();
 }
 
 /**

@@ -122,7 +122,6 @@ import { sandboxSessionCatalogKey, writeModelCatalogCache } from "@/lib/modelCat
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import {
   useHostModelOptions,
-  fetchHosts,
   useHosts,
   useInstallHarness,
   useInstallingHarnesses,
@@ -143,9 +142,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import {
-  connectArcaHost,
   controlHost,
-  getDesktopFeatures,
   getHostIdentity,
   isElectronShell,
   onHostStatusChanged,
@@ -282,13 +279,10 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   getHostIdentity: vi.fn(async () => null),
   onHostStatusChanged: vi.fn(() => () => {}),
   controlHost: vi.fn(async () => ({ ok: false })),
-  getDesktopFeatures: vi.fn(async () => null),
-  connectArcaHost: vi.fn(async () => ({ ok: false })),
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(),
-  fetchHosts: vi.fn(async () => []),
   // The setup dialog mounts these; default to inert so tests that don't
   // exercise install / credential-write don't need to wire them up.
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
@@ -3414,255 +3408,6 @@ describe("Run on this machine (desktop host enrollment)", () => {
   });
 });
 
-describe("Run on Arca (flag-gated)", () => {
-  beforeEach(() => {
-    setupLandingMocks();
-    mockHosts([]);
-    vi.mocked(isElectronShell).mockReturnValue(true);
-    vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: false, hostId: null });
-    vi.mocked(onHostStatusChanged).mockReturnValue(() => {});
-    vi.mocked(getDesktopFeatures).mockResolvedValue({
-      databricksInternalFeatures: true,
-      arcaPreviewRecovery: true,
-    });
-    vi.mocked(connectArcaHost).mockClear();
-    vi.mocked(fetchHosts).mockClear();
-  });
-  afterEach(() => {
-    cleanup();
-    localStorage.clear();
-    // Restore the browser defaults so these overrides don't leak into the
-    // other describe blocks (which assume no desktop shell / no desktop flags).
-    vi.mocked(isElectronShell).mockReturnValue(false);
-    vi.mocked(getDesktopFeatures).mockResolvedValue(null);
-  });
-
-  async function openHostMenu() {
-    const chip = await screen.findByTestId("new-chat-landing-host-chip");
-    fireEvent.pointerDown(chip, { button: 0 });
-    fireEvent.click(chip);
-  }
-
-  it("offers the Arca option only when the desktop shell reports the flag", async () => {
-    renderLanding();
-    await openHostMenu();
-    expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toBeTruthy();
-  });
-
-  it("hides the Arca option when the flag is off or unknown (old shell)", async () => {
-    vi.mocked(getDesktopFeatures).mockResolvedValue(null);
-    renderLanding();
-    await openHostMenu();
-    // The menu is open (the escape hatch renders), but no Arca entry.
-    await screen.findByTestId("new-chat-landing-connect-host");
-    expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
-  });
-
-  it("lists the remembered online host under My machines and hides Run on Arca", async () => {
-    // The row is recognized by the host id remembered at connect time — a
-    // host's name (machine hostname) is deliberately not matched against
-    // anything from `arca status`.
-    localStorage.setItem("omnigent:arca-host-id", "arca-1");
-    mockHosts([{ host_id: "arca-1", name: "ip-10-0-0-7", owner: "me", status: "online" }]);
-    renderLanding();
-    await openHostMenu();
-
-    const row = await screen.findByTestId("new-chat-landing-host-arca-1");
-    expect(row.textContent).toContain("Arca instance");
-    // As in the browser picker: a My machines row with a status dot, not a
-    // Cloud row with the cloud icon.
-    expect(
-      screen.getByText("My machines").compareDocumentPosition(row) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-    expect(screen.queryByText("Cloud")).toBeNull();
-    expect(row.querySelector(".bg-success")).not.toBeNull();
-    expect(row.querySelector("svg")).toBeNull();
-    expect(screen.queryByTestId("new-chat-landing-run-on-arca")).toBeNull();
-    fireEvent.click(row);
-    await waitFor(() => expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1"));
-  });
-
-  it("keeps Run on Arca visible in an older shell without preview recovery", async () => {
-    vi.mocked(getDesktopFeatures).mockResolvedValue({ databricksInternalFeatures: true });
-    localStorage.setItem("omnigent:arca-host-id", "arca-1");
-    mockHosts([{ host_id: "arca-1", name: "remote-box", owner: "me", status: "online" }]);
-    renderLanding();
-    await openHostMenu();
-
-    expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
-      /^Run on Arca$/,
-    );
-    // The host row itself still lists under My machines.
-    const row = await screen.findByTestId("new-chat-landing-host-arca-1");
-    expect(
-      screen.getByText("My machines").compareDocumentPosition(row) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-  });
-
-  it("recaptures an already-running host through the same reconnect action", async () => {
-    localStorage.setItem("omnigent:arca-host-id", "actual-arca");
-    mockHosts([{ host_id: "actual-arca", name: "remote-box", owner: "me", status: "offline" }]);
-    vi.mocked(connectArcaHost).mockResolvedValue({
-      ok: true,
-      alreadyRunning: true,
-      identity: { serverUrl: "https://server.databricks.com/omnigent", hostId: "actual-arca" },
-    });
-    renderLanding();
-    await openHostMenu();
-    fireEvent.click(await screen.findByText("Run on Arca"));
-    await waitFor(() =>
-      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("actual-arca"),
-    );
-    expect(connectArcaHost).toHaveBeenCalledTimes(1);
-    expect(fetchHosts).not.toHaveBeenCalled();
-  });
-
-  it("keeps reconnect usable after a console failure without changing host selection", async () => {
-    localStorage.setItem("omnigent:arca-host-id", "arca-1");
-    localStorage.setItem("omnigent:last-host-choice", "arca-1");
-    mockHosts([{ host_id: "arca-1", name: "remote-box", owner: "me", status: "offline" }]);
-    vi.mocked(connectArcaHost).mockResolvedValue({
-      ok: false,
-      shownInConsole: true,
-      error: "Couldn't reach the Arca instance.",
-    });
-    renderLanding();
-    await openHostMenu();
-    fireEvent.click(await screen.findByText("Run on Arca"));
-    await waitFor(() => expect(connectArcaHost).toHaveBeenCalledTimes(1));
-    await openHostMenu();
-    fireEvent.click(await screen.findByText("Run on Arca"));
-    await waitFor(() => expect(connectArcaHost).toHaveBeenCalledTimes(2));
-    expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1");
-  });
-
-  it.each(["missing", "offline"] as const)(
-    "shows Run on Arca when the remembered host is %s",
-    async (status) => {
-      localStorage.setItem("omnigent:arca-host-id", "arca-1");
-      mockHosts(
-        status === "missing"
-          ? []
-          : [{ host_id: "arca-1", name: "remote-box", owner: "me", status }],
-      );
-      renderLanding();
-      await openHostMenu();
-
-      expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
-        /^Run on Arca$/,
-      );
-      // A stopped instance is reached through Run on Arca, not a dead Cloud row.
-      expect(screen.queryByTestId("new-chat-landing-host-arca-1")).toBeNull();
-    },
-  );
-
-  it("shows a plain Run on Arca item (no status line) while not connected", async () => {
-    renderLanding();
-    await openHostMenu();
-
-    const item = await screen.findByTestId("new-chat-landing-run-on-arca");
-    expect(item).toHaveTextContent(/^Run on Arca$/);
-    expect(screen.queryByTestId("new-chat-landing-arca-subtitle")).toBeNull();
-  });
-
-  // Silent-outcome cases: a deliberate dismissal, and a failure the connect
-  // console already displayed — neither may echo into the composer strip.
-  async function expectNoArcaError(result: Awaited<ReturnType<typeof connectArcaHost>>) {
-    vi.mocked(connectArcaHost).mockResolvedValue(result);
-    renderLanding();
-    await openHostMenu();
-    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
-    await waitFor(() => expect(vi.mocked(connectArcaHost)).toHaveBeenCalled());
-    expect(screen.queryByTestId("new-chat-landing-arca-error")).toBeNull();
-  }
-
-  it("stays silent when the user dismissed the console", async () => {
-    await expectNoArcaError({
-      ok: false,
-      canceled: true,
-      error: "Connecting Arca wasn't approved.",
-    });
-  });
-
-  it("stays silent for a failure the console already displayed", async () => {
-    await expectNoArcaError({
-      ok: false,
-      shownInConsole: true,
-      error: "Couldn't reach the Arca instance.",
-    });
-  });
-
-  it("surfaces a gate failure (no console shown) with a retry", async () => {
-    vi.mocked(connectArcaHost).mockResolvedValue({
-      ok: false,
-      error: "Couldn't reach the Arca instance.",
-    });
-    renderLanding();
-    await openHostMenu();
-    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
-
-    const err = await screen.findByTestId("new-chat-landing-arca-error");
-    expect(err.textContent).toContain("Couldn't reach the Arca instance.");
-    expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1);
-
-    // Retry re-invokes the connect.
-    vi.mocked(connectArcaHost).mockClear();
-    fireEvent.click(screen.getByTestId("new-chat-landing-arca-error-retry"));
-    await waitFor(() => expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1));
-  });
-
-  it("skips the new-host wait when the daemon was already connected", async () => {
-    vi.mocked(connectArcaHost).mockResolvedValue({ ok: true, alreadyRunning: true });
-    renderLanding();
-    await openHostMenu();
-    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
-
-    // No 30s poll, no error — an explanatory toast instead.
-    await waitFor(() =>
-      expect(showToastMock).toHaveBeenCalledWith(
-        "Arca is already connected to this server — pick its host from the list.",
-      ),
-    );
-    expect(vi.mocked(fetchHosts)).not.toHaveBeenCalled();
-    expect(screen.queryByTestId("new-chat-landing-arca-error")).toBeNull();
-  });
-
-  it("selects the exact captured Arca host rather than racing newly online hosts", async () => {
-    vi.mocked(connectArcaHost).mockResolvedValue({
-      ok: true,
-      alreadyRunning: true,
-      identity: { serverUrl: "https://server.databricks.com/omnigent", hostId: "actual-arca" },
-    });
-    vi.mocked(fetchHosts).mockResolvedValue([
-      { host_id: "unrelated", name: "new-host", owner: "me", status: "online" },
-    ]);
-    renderLanding();
-    await openHostMenu();
-    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
-    await waitFor(() =>
-      expect(localStorage.getItem("omnigent:last-host-choice")).toBe("actual-arca"),
-    );
-    expect(localStorage.getItem("omnigent:arca-host-id")).toBe("actual-arca");
-  });
-
-  it("selects the host that newly came online after a successful connect", async () => {
-    vi.mocked(connectArcaHost).mockResolvedValue({ ok: true });
-    // First post-connect poll already sees the freshly-registered Arca host.
-    vi.mocked(fetchHosts).mockResolvedValue([
-      { host_id: "arca-1", name: "arca-box", owner: "me", status: "online" },
-    ]);
-    renderLanding();
-    await openHostMenu();
-    fireEvent.click(await screen.findByTestId("new-chat-landing-run-on-arca"));
-
-    // selectHost persists the pick — the observable effect of auto-selection.
-    await waitFor(() => expect(localStorage.getItem("omnigent:last-host-choice")).toBe("arca-1"));
-    expect(vi.mocked(connectArcaHost)).toHaveBeenCalledTimes(1);
-  });
-});
-
 describe("NewChatLandingScreen", () => {
   beforeEach(setupLandingMocks);
   afterEach(() => {
@@ -6421,23 +6166,19 @@ describe("NewChatLandingScreen", () => {
 
   const sshDesktop = { kind: "electron", connectSshHost: vi.fn() };
   it.each([
-    ["the browser", undefined, null, false],
-    ["a desktop app without SSH connect", { kind: "electron" }, null, false],
-    ["a window that offers Run on Arca", sshDesktop, { databricksInternalFeatures: true }, false],
-    ["a desktop app with SSH connect", sshDesktop, null, true],
-  ])("offers SSH connect in %s only when it can", async (_name, desktop, features, shown) => {
+    ["the browser", undefined, false],
+    ["a desktop app without SSH connect", { kind: "electron" }, false],
+    ["a desktop app with SSH connect", sshDesktop, true],
+  ])("offers SSH connect in %s only when it can", async (_name, desktop, shown) => {
     (window as { omnigentDesktop?: unknown }).omnigentDesktop = desktop;
-    vi.mocked(getDesktopFeatures).mockResolvedValue(features);
     try {
       renderLanding();
       fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
       fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
-      // Let the shell's feature answer land before judging.
       await act(async () => {});
 
       expect(screen.queryByTestId("ssh-connect-form") !== null).toBe(shown);
     } finally {
-      vi.mocked(getDesktopFeatures).mockResolvedValue(null);
       delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
     }
   });
@@ -9197,40 +8938,34 @@ describe("NewChatLandingScreen skills menu", () => {
     { agentId: "a1", harness: "claude-native", prefix: "/" },
     { agentId: "a2", harness: "codex-native", prefix: "$" },
   ])(
-    "discovers Arca skills before provisioning and delivers the first $harness prompt",
-    async ({ agentId, harness, prefix }) => {
+    "defers sandbox skill discovery and delivers the first $harness prompt",
+    async ({ agentId, prefix }) => {
       const { useSkills: realHook } =
         await vi.importActual<typeof UseSkillsModule>("@/hooks/useSkills");
       vi.mocked(useSkills).mockImplementation(realHook);
-      mockHosts([host("online"), { ...host("online"), host_id: "arca", name: "corey's arca" }]);
+      mockHosts([host("online")]);
       localStorage.setItem(LAST_AGENT_KEY, agentId);
       authenticatedFetchMock.mockImplementation(async (url) =>
         String(url).startsWith("/v1/skills?")
           ? ({
               ok: true,
               json: async () => ({
-                skills: [{ name: "arca-review", description: "Review on Arca" }],
+                skills: [{ name: "host-review", description: "Review on the connected host" }],
               }),
             } as Response)
           : ({ ok: true, json: async () => ({ id: "conv_new" }) } as Response),
       );
       renderLanding({
         managed_sandboxes_enabled: true,
-        sandbox_provider: "arclet",
+        sandbox_provider: "example",
         durable_initial_input: true,
       });
-      typeMessage(`${prefix}arca`);
-      fireEvent.click(await screen.findByTestId("slash-menu-item-arca-review"));
-      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(`${prefix}arca-review `);
-      expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
-      const discoveryUrl = new URL(String(authenticatedFetchMock.mock.calls[0]![0]), "http://test");
-      expect(Object.fromEntries(discoveryUrl.searchParams)).toEqual({
-        host_id: "arca",
-        harness,
-        path: "~",
-        agent_id: agentId,
-      });
-      typeMessage(`${prefix}arca-review check these changes`);
+      typeMessage(`${prefix}review`);
+      expect(
+        screen.getByText("Host skills will be available after the sandbox starts."),
+      ).toBeInTheDocument();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      typeMessage(`${prefix}host-review check these changes`);
       fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
       await waitFor(() =>
         expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(
@@ -9241,58 +8976,40 @@ describe("NewChatLandingScreen skills menu", () => {
       const body = JSON.parse(init!.body as string);
       expect(body).toMatchObject({
         host_type: "managed",
-        sandbox_provider: "arclet",
+        sandbox_provider: "example",
         initial_input: {
           type: "message",
           data: {
             role: "user",
-            content: [{ type: "input_text", text: `${prefix}arca-review check these changes` }],
+            content: [{ type: "input_text", text: `${prefix}host-review check these changes` }],
           },
         },
       });
       expect(body.host_id).toBeUndefined();
     },
   );
-
-  it("loads Arclet skills when hosts arrive and hides them when the Arca disconnects", () => {
-    const arca: Host = { ...host("online"), host_id: "arca", name: "corey's arca" };
-    mockHosts(undefined);
-    mockSkills({ skills: [{ name: "arca-review", description: "Review on Arca" }] });
-    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "arclet" });
-    typeMessage("/");
-    expect(screen.getByText("Loading skills…")).toBeInTheDocument();
-    mockHosts([arca]);
-    typeMessage("/arca");
-    expect(screen.getByTestId("slash-menu-item-arca-review")).toBeInTheDocument();
-    mockHosts([host("online"), { ...arca, status: "offline" }]);
-    typeMessage("/arc");
-    expect(screen.queryByTestId("slash-menu-item-arca-review")).not.toBeInTheDocument();
-    expect(
-      screen.getByText("Connect your Arca to discover skills before the sandbox starts."),
-    ).toBeInTheDocument();
-    expect(useSkills).toHaveBeenLastCalledWith({ target: null, enabled: false, starting: false });
-  });
-
   it.each([
-    { prompt: "/arca-review check these changes", bundled: false },
+    { prompt: "/host-review check these changes", bundled: false },
     { prompt: "/review-pr check these changes", bundled: true },
   ])(
-    "keeps SDK Arclet skill invocation scoped to its bundle: $prompt",
+    "keeps SDK Example skill invocation scoped to its bundle: $prompt",
     async ({ prompt, bundled }) => {
       mockAgents([skilledAgent()]);
-      mockHosts([{ ...host("online"), name: "corey's arca" }]);
-      mockSkills({ skills: [{ name: "arca-review", description: "Only available on Arca" }] });
+      mockHosts([{ ...host("online"), name: "connected workstation" }]);
+      mockSkills({
+        skills: [{ name: "host-review", description: "Only available on the connected host" }],
+      });
       authenticatedFetchMock.mockResolvedValue({
         ok: true,
         json: async () => ({ id: "conv_new" }),
       } as Response);
       renderLanding({
         managed_sandboxes_enabled: true,
-        sandbox_provider: "arclet",
+        sandbox_provider: "example",
         durable_initial_input: true,
       });
       typeMessage("/");
-      expect(screen.queryByTestId("slash-menu-item-arca-review")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("slash-menu-item-host-review")).not.toBeInTheDocument();
       expect(screen.getByTestId("slash-menu-item-review-pr")).toBeInTheDocument();
       expect(useSkills).toHaveBeenLastCalledWith({ target: null, enabled: false, starting: false });
       typeMessage(prompt);
@@ -9319,12 +9036,12 @@ describe("NewChatLandingScreen skills menu", () => {
     },
   );
 
-  it("keeps other sandbox providers from previewing connected Arca skills", () => {
-    mockHosts([{ ...host("online"), name: "corey's arca" }]);
-    mockSkills({ skills: [{ name: "arca-review", description: "Review on Arca" }] });
+  it("keeps sandbox providers from previewing connected host skills", () => {
+    mockHosts([{ ...host("online"), name: "connected workstation" }]);
+    mockSkills({ skills: [{ name: "host-review", description: "Review on the connected host" }] });
     renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "modal" });
     typeMessage("/");
-    expect(screen.queryByTestId("slash-menu-item-arca-review")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("slash-menu-item-host-review")).not.toBeInTheDocument();
     expect(
       screen.getByText("Host skills will be available after the sandbox starts."),
     ).toBeInTheDocument();
@@ -13010,8 +12727,8 @@ describe("managed sandbox gateway preview", () => {
   function renderGatewaySandbox() {
     return renderLanding({
       managed_sandboxes_enabled: true,
-      sandbox_provider: "arclet",
-      sandbox_provider_capabilities: { arclet: { default_models: true } },
+      sandbox_provider: "example",
+      sandbox_provider_capabilities: { example: { default_models: true } },
     });
   }
 
@@ -13037,8 +12754,8 @@ describe("managed sandbox gateway preview", () => {
       renderLanding(
         {
           managed_sandboxes_enabled: true,
-          sandbox_provider: "arclet",
-          sandbox_provider_capabilities: { arclet: { default_models: true } },
+          sandbox_provider: "example",
+          sandbox_provider_capabilities: { example: { default_models: true } },
         },
         "/?project=Alpha",
       );
@@ -13065,14 +12782,14 @@ describe("managed sandbox gateway preview", () => {
     expect(body).toMatchObject({
       agent_id: "a2",
       host_type: "managed",
-      sandbox_provider: "arclet",
+      sandbox_provider: "example",
       model_override: astra.id,
       reasoning_effort: "max",
     });
     expect(body.host_id).toBeUndefined();
     expect(body.inference_configuration_revision).toBeUndefined();
     expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
-      "arclet",
+      "example",
       "codex-native",
       "a2",
       null,
@@ -13330,7 +13047,7 @@ describe("managed sandbox gateway preview", () => {
       reasoning_effort: "high",
     });
     expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
-      "arclet",
+      "example",
       "claude-sdk",
       "a_polly",
       null,
@@ -13345,9 +13062,13 @@ describe("managed sandbox gateway preview", () => {
       displayName: "GPT 6 Luna",
       supportedReasoningEfforts: [{ reasoningEffort: "ultra" }],
     };
-    writeModelCatalogCache(sandboxSessionCatalogKey("arclet", "codex-native", "a2"), [luna], false);
     writeModelCatalogCache(
-      sandboxSessionCatalogKey("arclet", "claude-native", "a1"),
+      sandboxSessionCatalogKey("example", "codex-native", "a2"),
+      [luna],
+      false,
+    );
+    writeModelCatalogCache(
+      sandboxSessionCatalogKey("example", "claude-native", "a1"),
       [{ id: "opus", displayName: "Opus" }],
       false,
     );
@@ -13374,7 +13095,7 @@ describe("managed sandbox gateway preview", () => {
     const { body } = await submitAndReadBody();
     expect(body).toMatchObject({
       agent_id: "a2",
-      sandbox_provider: "arclet",
+      sandbox_provider: "example",
       model_override: luna.id,
       reasoning_effort: "ultra",
     });
@@ -13383,7 +13104,11 @@ describe("managed sandbox gateway preview", () => {
   it("does not offer another agent's saved catalog", async () => {
     getCurrentUserIdMock.mockReturnValue("alice");
     const luna = { id: "gpt-6-luna", displayName: "GPT 6 Luna" };
-    writeModelCatalogCache(sandboxSessionCatalogKey("arclet", "codex-native", "a3"), [luna], false);
+    writeModelCatalogCache(
+      sandboxSessionCatalogKey("example", "codex-native", "a3"),
+      [luna],
+      false,
+    );
     preview();
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
@@ -13449,7 +13174,7 @@ describe("managed sandbox gateway preview", () => {
     renderGatewaySandbox();
     openAgentModels("a1");
     expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
-      "arclet",
+      "example",
       "claude-native",
       "a1",
       null,
@@ -13478,8 +13203,8 @@ describe("managed sandbox gateway preview", () => {
     mockHosts([]);
     renderLanding({
       managed_sandboxes_enabled: true,
-      sandbox_provider: "arclet",
-      sandbox_provider_capabilities: { arclet: { default_models: true } },
+      sandbox_provider: "example",
+      sandbox_provider_capabilities: { example: { default_models: true } },
       smart_routing_enabled: true,
       smart_routing_sources: { external: true, oss: true },
     });
@@ -13492,7 +13217,7 @@ describe("managed sandbox gateway preview", () => {
     );
   });
 
-  it("keeps a connected host's authoritative discovery when Arclet preview is offered", () => {
+  it("keeps a connected host's authoritative discovery when Example preview is offered", () => {
     localStorage.setItem("omnigent:last-host-choice", "host_1");
     preview();
     renderGatewaySandbox();
@@ -13505,7 +13230,7 @@ describe("managed sandbox gateway preview", () => {
       expect.any(Object),
     );
     expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
-      "arclet",
+      "example",
       "codex-native",
       "a2",
       null,
