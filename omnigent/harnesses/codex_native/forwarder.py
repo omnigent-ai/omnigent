@@ -3358,6 +3358,9 @@ async def _subscribe_until_ready(
     reconnects keep it so no live turn replaces the bridge's recovery cursor
     before the replay lands.
 
+    If Codex cannot list turns, retry without history so live notifications
+    can still be mirrored. Items preceding that subscription remain unreplayed.
+
     :param client: Codex app-server client.
     :param ap_client: Omnigent HTTP client used for replayed items.
     :param session_id: Omnigent conversation id.
@@ -3387,6 +3390,7 @@ async def _subscribe_until_ready(
         and bridge_state.pending_shell_command_id is not None
     )
     saw_not_ready = False
+    history_unavailable = False
     resume_timeout = _SUBSCRIBE_RESUME_TIMEOUT_SECONDS
     replay_owed = replay_from_turn_id is not None or shell_pending
     async with (
@@ -3396,7 +3400,9 @@ async def _subscribe_until_ready(
             async with _conversation_item_delivery_scope(session_id):
                 received_live_items = client.is_subscribed_to_thread(thread_id)
                 params: _JsonObject = {"threadId": thread_id}
-                if not saw_not_ready and replay_from_turn_id is None and not shell_pending:
+                if history_unavailable or (
+                    not saw_not_ready and replay_from_turn_id is None and not shell_pending
+                ):
                     params["excludeTurns"] = True
                 timed_out = False
                 try:
@@ -3411,6 +3417,19 @@ async def _subscribe_until_ready(
                     raise
                 # App-server error envelopes are surfaced as RuntimeError.
                 except Exception as exc:
+                    if (
+                        not params.get("excludeTurns")
+                        and isinstance(exc, CodexAppServerResponseError)
+                        and exc.code == -32601
+                        and exc.message == "list_turns is not supported yet"
+                    ):
+                        history_unavailable = True
+                        _logger.warning(
+                            "Codex cannot list turns for thread %s; subscribing without history. "
+                            "Items before this subscription cannot be replayed.",
+                            thread_id,
+                        )
+                        continue
                     if not _is_thread_not_ready_error(exc):
                         _logger.warning(
                             "failed to subscribe to Codex thread %s", thread_id, exc_info=True
@@ -3431,6 +3450,7 @@ async def _subscribe_until_ready(
                         forwarder_state=forwarder_state,
                         received_live_items=received_live_items,
                         replay_from_turn_id=replay_from_turn_id,
+                        replay_history=not history_unavailable,
                     )
                     return
             if timed_out:
@@ -3473,6 +3493,7 @@ async def _finish_subscription(
     forwarder_state: _CodexForwarderState | None,
     received_live_items: bool,
     replay_from_turn_id: str | None,
+    replay_history: bool,
 ) -> None:
     """
     Sync thread metadata from a successful resume and replay its snapshot.
@@ -3493,6 +3514,7 @@ async def _finish_subscription(
     :param received_live_items: Whether this connection was already
         subscribed (and so received live items) before the resume.
     :param replay_from_turn_id: Interrupted turn to replay from, if any.
+    :param replay_history: Whether Codex returned history for reconciliation.
     :returns: None.
     """
     if forwarder_state is not None:
@@ -3529,6 +3551,10 @@ async def _finish_subscription(
             thread_id=thread_id,
             forwarder_state=forwarder_state,
         )
+    # An excluded history is not evidence that a saved turn or shell finished.
+    # Keep its recovery cursor until an authoritative lifecycle event arrives.
+    if not replay_history:
+        return
     if forwarder_state is not None and received_live_items:
         forwarder_state.resume_echo_thread_ids.add(thread_id)
     try:

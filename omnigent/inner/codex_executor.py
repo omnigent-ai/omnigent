@@ -1489,20 +1489,11 @@ def materialize_codex_provider_config(
             os.chmod(config_path, 0o600)
         return argv_overrides
 
-    for provider_name, effective_provider in gateway_providers.items():
+    for provider_name in gateway_providers:
         if provider_name in CODEX_BUILTIN_PROVIDERS:
             continue
         if provider_name not in providers:
             providers[provider_name] = tomlkit.inline_table()
-        provider_config = providers[provider_name]
-        name = effective_provider.get("name")
-        # Hook-trust writes validate inactive providers too, without CLI name overlays.
-        if isinstance(provider_config, MutableMapping) and isinstance(name, str) and name.strip():
-            configured_name = provider_config.get("name")
-            if "name" not in provider_config or (
-                isinstance(configured_name, str) and not configured_name.strip()
-            ):
-                provider_config["name"] = name
 
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):
@@ -1524,6 +1515,17 @@ def materialize_codex_provider_config(
         effective = resolved if isinstance(resolved, Mapping) else provider_config
         base_url = effective.get("base_url")
         if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
+            configured_name = provider_config.get("name")
+            # Config writes validate inactive gateways even when discovery failed.
+            if "name" not in provider_config or (
+                isinstance(configured_name, str) and not configured_name.strip()
+            ):
+                resolved_name = effective.get("name")
+                provider_config["name"] = (
+                    resolved_name
+                    if isinstance(resolved_name, str) and resolved_name.strip()
+                    else provider_name
+                )
             headers = provider_config.get("http_headers")
             effective_headers = effective.get("http_headers")
             attributed = with_gateway_attribution(

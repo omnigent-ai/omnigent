@@ -1,3 +1,5 @@
+import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
+import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -282,6 +284,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
+import { ComposerLocalReviewChips } from "@/components/composer/ComposerLocalReviewChips";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
 import {
   SMART_ROUTING_ARMS,
@@ -2697,6 +2700,7 @@ function ComposerImpl(
   // tabs and coming back restores the draft. The shared draft store also lets
   // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
+  const localReviewComments = usePendingLocalReviewContexts(conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
@@ -3293,7 +3297,8 @@ function ComposerImpl(
     draft.quotes.length === 0 && findMentionTokens(draft.text, mentionTokens).length > 0;
   const mirrorActive = composerIsCommand || mentionTokensShown;
   useComposerMirrorAlignment(backdropRef, tailTextareaRef, mirrorActive);
-  const hasDraft = fullText.trim().length > 0 || files.length > 0 || hasMentions;
+  const hasDraft =
+    fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
   const showInterruptButton =
     isWorking &&
     (!hasDraft ||
@@ -4013,7 +4018,7 @@ function ComposerImpl(
     const trimmed = fullText.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
-      (!trimmed && files.length === 0 && !hasMentions) ||
+      (!trimmed && files.length === 0 && !hasMentions && localReviewComments.length === 0) ||
       disabled ||
       sendDisabledReason !== null ||
       hasPendingElicitation
@@ -4058,7 +4063,8 @@ function ComposerImpl(
       draft.quotes.length === 0 &&
       (skill !== null || isSlashCommandText(trimmed)) &&
       files.length === 0 &&
-      !hasMentions
+      !hasMentions &&
+      localReviewComments.length === 0
     ) {
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
@@ -4142,6 +4148,12 @@ function ComposerImpl(
     // the harness's "[Attached: <path>]" wording (the vendor reads the on-disk
     // path; no upload), sessions as "[Session: …]". A tagged session also adds
     // one tool hint at the end.
+    const hasAuthoredText =
+      !!draft.text.trim() || draft.quotes.some((quote) => quote.before.trim());
+    const reviewContext =
+      localReviewComments.length > 0
+        ? formatLocalReviewComments(localReviewComments, { includeInstruction: !hasAuthoredText })
+        : "";
     const tagsSessions = liveMentions.some((m) => m.marker.startsWith("[Session: "));
     const expand = (text: string) => expandMentionTokens(text, liveMentions);
     // Sending while a prior response is streaming is fine — the
@@ -4152,21 +4164,32 @@ function ComposerImpl(
     const sendFiles = files.length > 0 ? files : undefined;
     if (draft.quotes.length > 0) {
       // Preserve authored whitespace and quote provenance, including mention markers.
-      const outgoing = {
-        ...draft,
-        text: withSessionMentionHint(expand(draft.text), tagsSessions),
-        quotes: draft.quotes.map((quote) => ({ ...quote, before: expand(quote.before) })),
-      };
+      const outgoing = appendReplyDraft(
+        {
+          ...draft,
+          text: expand(draft.text),
+          quotes: draft.quotes.map((quote) => ({ ...quote, before: expand(quote.before) })),
+        },
+        { quotes: [], text: reviewContext },
+      );
+      outgoing.text = withSessionMentionHint(outgoing.text, tagsSessions);
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
       const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
-      onSend(withSessionMentionHint(expand(message), tagsSessions), sendFiles);
+      onSend(
+        withSessionMentionHint(
+          [expand(message), reviewContext].filter(Boolean).join("\n\n"),
+          tagsSessions,
+        ),
+        sendFiles,
+      );
     }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
     clearAttachments();
     setMentionedItems([]);
     setMentionedSessions([]);
+    if (conversationId) clearLocalReviewContexts(conversationId);
     setMention(null);
   };
 
@@ -4204,7 +4227,8 @@ function ComposerImpl(
   };
 
   // An empty composer with no attachments or @-mentions; ↑ recalls from the queue here.
-  const composerEmptyForRecall = fullText === "" && files.length === 0 && !hasMentions;
+  const composerEmptyForRecall =
+    fullText === "" && files.length === 0 && !hasMentions && localReviewComments.length === 0;
   // The queued row ↑ recalls: the queue tail, only while the composer takes input and
   // is empty and quote-free.
   const arrowUpRecallQueueId =
@@ -4650,6 +4674,7 @@ function ComposerImpl(
               {attachmentError !== null && (
                 <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
               )}
+              <ComposerLocalReviewChips comments={localReviewComments} />
               {/* Inline slash-command feedback: errors and /help output */}
               {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
             </>

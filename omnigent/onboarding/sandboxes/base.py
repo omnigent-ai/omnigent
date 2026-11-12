@@ -971,6 +971,14 @@ class SandboxHostLauncher(SandboxLifecycle):
     supports_sandbox_profile_lookup: ClassVar[bool] = False
     """Whether sandbox-scoped discovery returns the durable assigned revision."""
 
+    automation_notice: ClassVar[str | None] = None
+    """User-safe note on what this provider's unattended runs need from their owner.
+
+    ``/v1/info`` reports it in ``sandbox_provider_automation_notices``, and the
+    automation form shows it while a new sandbox is the run target, e.g. for a
+    credential that must stay fresh on the owner's machine. ``None`` shows nothing.
+    """
+
     def list_profiles(self, context: SandboxProfileContext) -> list[ProviderSandboxProfile] | None:
         """Return only profiles currently authorized for the trusted caller context.
 

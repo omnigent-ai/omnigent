@@ -268,6 +268,10 @@ export function CreateScheduledTaskDialog({
     info !== "loading" && info.scheduled_task_sandbox_workspaces === true && info.sandbox_provider
       ? (info.sandbox_provider_capabilities?.[info.sandbox_provider]?.repo_catalog ?? [])
       : [];
+  const sandboxAutomationNotice =
+    info !== "loading" && info.sandbox_provider
+      ? (info.sandbox_provider_automation_notices?.[info.sandbox_provider] ?? null)
+      : null;
 
   const {
     data: projects = [],
@@ -1503,6 +1507,14 @@ export function CreateScheduledTaskDialog({
                     {!sandboxMode && selectedHost?.status === "offline" && (
                       <p className="text-sm text-muted-foreground">
                         This host is offline. Runs fail until it reconnects.
+                      </p>
+                    )}
+                    {sandboxMode && sandboxAutomationNotice && (
+                      <p
+                        className="text-sm text-muted-foreground"
+                        data-testid="task-sandbox-automation-notice"
+                      >
+                        {sandboxAutomationNotice}
                       </p>
                     )}
                   </div>
