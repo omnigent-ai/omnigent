@@ -1592,6 +1592,12 @@ def test_redirect_ampersand_stays_in_its_word_and_the_pipeline_still_splits() ->
         ("gh", "pr", "create", "--title", "x", "2>&1"),
         ("tail", "-2"),
     ]
+    # An escaped ``>`` is a literal, so the ``&`` after it still separates commands.
+    escaped = _shell_segments("printf \\>& gh pr view 41")
+    assert [segment.invocation_tokens for segment in escaped] == [
+        ("printf", ">"),
+        ("gh", "pr", "view", "41"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1822,6 +1828,38 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
             {},
             ["/work/repo"],
             id="noclobber-redirect-keeps-the-cd",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(case x in x) cd /a;; esac); git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="case-pattern-paren-does-not-close-the-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "case x in a|b) cd /a && git pp;; esac"},
+            "/start",
+            {},
+            ["/a"],
+            id="case-pattern-alternatives-are-words",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "printf \\>& git -C /b status"},
+            "/start",
+            {},
+            ["/b"],
+            id="escaped-greater-then-ampersand-is-a-separator",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "printf \\>| git -C /b status"},
+            "/start",
+            {},
+            ["/b"],
+            id="escaped-greater-then-pipe-is-a-separator",
         ),
         pytest.param(
             "Bash",

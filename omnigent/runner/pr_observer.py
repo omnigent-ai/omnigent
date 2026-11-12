@@ -357,16 +357,33 @@ def _array_literal_end(command: str, start: int) -> int | None:
     return None
 
 
+# A ``case`` header up to its first pattern. The ``)`` that ends it is not a subshell closer.
+_CASE_HEADER = re.compile(r"\s*case\s+\S+\s+in\b")
+
+
 def _shell_items(command: str) -> list[list[str] | str] | None:
     """Split *command* at unquoted operators, returning each simple command's words.
 
     Quotes and backslashes are honored while scanning, so ``"("`` and ``\\(`` stay
-    words. Returns None when the command cannot be lexed.
+    words. The characters of ``>&``, ``<&``, ``&>`` and ``>|`` are not separators.
+    The ``)`` and ``|`` of a ``case`` pattern are words, so the pattern does not
+    open or close a group. Returns None when the command cannot be lexed.
     """
     items: list[list[str] | str] = []
     chunk: list[str] = []
     quote: str | None = None
     index = 0
+    paren_depth = 0
+    # Paren depth of each open ``case`` statement.
+    case_depths: list[int] = []
+    # The next ``)`` at the innermost case's level closes a pattern.
+    pattern_expected = False
+
+    def flush() -> None:
+        nonlocal chunk
+        items.append(shlex.split("".join(chunk)))
+        chunk = []
+
     try:
         while index < len(command):
             char = command[index]
@@ -393,23 +410,58 @@ def _shell_items(command: str) -> list[list[str] | str] | None:
                 chunk.append(command[index:end])
                 index = end
             else:
-                # ``>&``, ``<&``, ``&>`` and ``>|`` are redirections, not separators.
-                previous = chunk[-1][-1:] if chunk else ""
-                part_of_redirect = (
-                    char == "&" and (command.startswith("&>", index) or previous in ("<", ">"))
-                ) or (char == "|" and previous == ">")
+                # An escaped ``>`` is a literal, so the character after it is a separator.
+                last = chunk[-1] if chunk else ""
+                previous_char = "" if len(last) == 2 and last[0] == "\\" else last[-1:]
+                text = "".join(chunk)
                 operator = next(
                     (op for op in _SHELL_OPERATORS if command.startswith(op, index)), None
                 )
-                if operator is None or part_of_redirect:
+                if operator is not None and case_depths and text.split()[:1] == ["esac"]:
+                    case_depths.pop()
+                    pattern_expected = False
+                at_case_level = bool(case_depths) and paren_depth == case_depths[-1]
+                if (
+                    operator is None
+                    or (
+                        operator == "&"
+                        and (command.startswith("&>", index) or previous_char in ("<", ">"))
+                    )
+                    or (operator == "|" and previous_char == ">")
+                ):
                     chunk.append(char)
                     index += 1
                     continue
-                items.append(shlex.split("".join(chunk)))
-                chunk = []
+                if operator == "|" and (
+                    _CASE_HEADER.match(text) or (at_case_level and pattern_expected)
+                ):
+                    chunk.append(char)
+                    index += 1
+                    continue
+                if operator == ")" and _CASE_HEADER.match(text):
+                    # The first pattern of a case statement.
+                    flush()
+                    items.append(";")
+                    case_depths.append(paren_depth)
+                    pattern_expected = False
+                    index += 1
+                    continue
+                if operator == ")" and at_case_level and pattern_expected:
+                    flush()
+                    items.append(";")
+                    pattern_expected = False
+                    index += 1
+                    continue
+                flush()
                 items.append(";" if operator == "\n" else operator)
+                if operator == "(":
+                    paren_depth += 1
+                elif operator == ")":
+                    paren_depth = max(0, paren_depth - 1)
+                elif operator == ";" and command.startswith(";;", index) and at_case_level:
+                    pattern_expected = True
                 index += len(operator)
-        items.append(shlex.split("".join(chunk)))
+        flush()
     except ValueError:
         return None
     return items
