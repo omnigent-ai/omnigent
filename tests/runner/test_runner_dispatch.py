@@ -13251,6 +13251,7 @@ async def test_cross_path_resolution_contract(
     scenario: str,
     path: str,
     expected: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Pin the resolution behaviour matrix across all three dispatch paths.
 
@@ -13269,6 +13270,7 @@ async def test_cross_path_resolution_contract(
     :param scenario: Which resolution outcome the fake resolver produces.
     :param path: Which dispatch path adapter drives the turn.
     :param expected: Subset of the adapter's normalized result to assert.
+    :param caplog: Captured lookup diagnostics after session initialization.
     """
     conv = f"conv_contract_{scenario}_{path}"
     calls: list[str] = []
@@ -13293,6 +13295,7 @@ async def test_cross_path_resolution_contract(
             )
             assert created.status_code == 201, created.text
             assert len(calls) == 1, f"session-create should resolve once, got {calls!r}"
+            caplog.clear()
         result = await _CONTRACT_ADAPTERS[path](http, conv, recording)
         if path == "background" and result.get("terminal_status") is None:
             # Background adapter needs the app's queue to drain terminal status.
@@ -13301,6 +13304,10 @@ async def test_cross_path_resolution_contract(
             )
             result["terminal_status"] = statuses[-1] if statuses else None
     result["resolver_calls"] = len(calls)
+
+    if scenario == "cache_holds_child" and path != "background":
+        assert "no workdir resolved" not in caplog.text
+        assert "falling back to the parent spec" not in caplog.text
 
     for key, want in expected.items():
         assert result.get(key) == want, (

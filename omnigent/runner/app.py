@@ -9189,7 +9189,7 @@ async def _resolve_harness_config(
         so the spawn-env advertises the child's bundle rather than the
         parent's. ``None`` for top-level sessions.
     :param cwd: Runtime working directory for harnesses that need it.
-    :param effective_spec_entry: Trusted cached spec with launch transforms applied.
+    :param effective_spec_entry: Trusted selected spec with launch transforms applied.
     :returns: ``(harness, spawn_env)`` derived from the resolved spec.
     :raises RuntimeError: When a spec_resolver is configured but the spec
         cannot be resolved. Callers catch this to surface a clean error
@@ -9213,7 +9213,7 @@ async def _resolve_harness_config(
             # The child's bundle dir comes from the same resolution, so the
             # spawn-env below advertises the child's bundle — not the
             # parent's, whose skills and tools the child has no claim to.
-            if sub_agent_name:
+            if sub_agent_name and (effective_spec_entry is None or spec.name != sub_agent_name):
                 sub_entry = _native_runtime._resolve_sub_agent_spec_entry(
                     spec_entry, sub_agent_name
                 )
