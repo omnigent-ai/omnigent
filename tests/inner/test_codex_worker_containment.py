@@ -704,31 +704,63 @@ def test_explicit_none_sandbox_keeps_direct_worker_path(tmp_path: Path) -> None:
     assert codex.exists()
 
 
+@pytest.mark.parametrize(
+    "failure,error_type,message",
+    [
+        ("preparation", OSError, "containment failed"),
+        ("unsupported-policy", ValueError, "Codex cannot enforce filesystem or network policy"),
+        ("unavailable-backend", OSError, "sandbox unavailable"),
+    ],
+)
 async def test_session_containment_failure_prevents_worker_spawn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    failure: str,
+    error_type: type[Exception],
+    message: str,
 ) -> None:
     spawn = AsyncMock()
-    monkeypatch.setattr(
-        "omnigent.inner.codex_executor.prepare_codex_worker",
-        Mock(side_effect=OSError("containment failed")),
-    )
+    if failure == "preparation":
+        monkeypatch.setattr(
+            "omnigent.inner.codex_executor.prepare_codex_worker",
+            Mock(side_effect=OSError("containment failed")),
+        )
+    elif failure == "unavailable-backend":
+        monkeypatch.setattr(
+            "omnigent.inner.codex_worker.resolve_sandbox",
+            Mock(side_effect=OSError("sandbox unavailable")),
+        )
     monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    populate_home = Mock()
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", populate_home)
+    provider_prepare = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.prepare_codex_provider_config",
+        provider_prepare,
+    )
 
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
         cwd=str(tmp_path),
         env={},
         tool_executor=None,
-        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+        os_env=OSEnvSpec(
+            sandbox=OSEnvSandboxSpec(
+                type="windows_jobobject" if failure == "unsupported-policy" else "darwin_seatbelt"
+            )
+        ),
     )
+    session._request = AsyncMock()
 
-    with pytest.raises(OSError, match="containment failed"):
+    with pytest.raises(error_type, match=message):
         await session.start()
 
+    provider_prepare.assert_not_awaited()
     spawn.assert_not_awaited()
+    session._request.assert_not_awaited()
+    assert session.cleaned
     assert session._codex_home_dir is None
+    assert not populate_home.call_args.args[0].exists()
 
 
 @pytest.mark.parametrize("brokered_gateway", [False, True])

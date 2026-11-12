@@ -6965,44 +6965,6 @@ async def test_provider_discovery_uses_prepared_worker_and_staged_environment(
 
 
 @pytest.mark.parametrize(
-    "failure,error_type,message",
-    [
-        ("unsupported-policy", ValueError, "Codex cannot enforce filesystem or network policy"),
-        ("unavailable-backend", OSError, "sandbox unavailable"),
-    ],
-)
-async def test_provider_discovery_rejects_sandbox_failure_before_spawning(
-    disabled_mcp_session, monkeypatch, failure, error_type, message
-):
-    harness = disabled_mcp_session
-    session = harness.session
-    session._os_env_spec = OSEnvSpec(
-        sandbox=OSEnvSandboxSpec(
-            type="windows_jobobject" if failure == "unsupported-policy" else "darwin_seatbelt"
-        )
-    )
-    if failure == "unavailable-backend":
-        monkeypatch.setattr(
-            "omnigent.inner.codex_worker.resolve_sandbox",
-            Mock(side_effect=OSError("sandbox unavailable")),
-        )
-    provider_prepare = AsyncMock()
-    monkeypatch.setattr(
-        "omnigent.harnesses.codex_native.app_server.prepare_codex_provider_config",
-        provider_prepare,
-    )
-
-    with pytest.raises(error_type, match=message):
-        await session.start()
-
-    provider_prepare.assert_not_awaited()
-    assert harness.spawns == []
-    harness.initialize.assert_not_awaited()
-    assert session.cleaned
-    assert session._codex_home_dir is None
-
-
-@pytest.mark.parametrize(
     "error",
     [BrokenPipeError(), ConnectionResetError(), None],
     ids=["broken-pipe", "connection-reset", "stdout-eof"],
