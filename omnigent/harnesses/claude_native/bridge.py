@@ -3719,15 +3719,25 @@ def _read_transcript_edge_lines(
     from omnigent.harnesses.claude_native.status_file import sessions_dir
 
     try:
-        projects_root = (sessions_dir().parent / "projects").resolve()
-        resolved_path = transcript_path.resolve()
-        if not resolved_path.is_relative_to(projects_root) or not resolved_path.is_file():
+        projects_dir = sessions_dir().parent / "projects"
+        configured_prefix = os.path.normcase(os.path.abspath(projects_dir)) + os.sep
+        canonical_prefix = os.path.normcase(os.path.realpath(projects_dir)) + os.sep
+        candidate_path = os.path.normcase(os.path.abspath(transcript_path))
+        if not candidate_path.startswith(configured_prefix) and not candidate_path.startswith(
+            canonical_prefix
+        ):
+            return []
+        resolved_path = os.path.normcase(os.path.realpath(candidate_path))
+        if not resolved_path.startswith(canonical_prefix):
+            return []
+        validated_path = Path(resolved_path)
+        if not validated_path.is_file():
             return []
     except (OSError, RuntimeError, ValueError):
         return []
     head: list[str] = []
     tail: deque[str] = deque(maxlen=tail_limit)
-    with resolved_path.open("rb") as handle:
+    with validated_path.open("rb") as handle:
         remaining = os.fstat(handle.fileno()).st_size
         while remaining > 0:
             raw_line = handle.readline(remaining)

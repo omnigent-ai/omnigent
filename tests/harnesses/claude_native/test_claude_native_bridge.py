@@ -239,7 +239,11 @@ def test_transcript_metadata_scan_stops_at_its_snapshot(
             )
         return snapshot
 
-    monkeypatch.setattr(claude_native_bridge, "os", SimpleNamespace(fstat=snapshot_then_append))
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "os",
+        SimpleNamespace(path=os.path, sep=os.sep, fstat=snapshot_then_append),
+    )
     if reader == "recent_command":
         assert not claude_native_bridge.transcript_has_recent_local_command(
             transcript,
@@ -348,6 +352,25 @@ def test_transcript_metadata_scan_rejects_paths_outside_claude_projects(
         outside = transcript
 
     original_open = Path.open
+    original_realpath = os.path.realpath
+
+    def refuse_outside_resolution(path: Any) -> str:
+        assert os.path.abspath(path) != str(outside), "an untrusted path reached the filesystem"
+        return original_realpath(path)
+
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "os",
+        SimpleNamespace(
+            path=SimpleNamespace(
+                abspath=os.path.abspath,
+                normcase=os.path.normcase,
+                realpath=refuse_outside_resolution,
+            ),
+            sep=os.sep,
+            fstat=os.fstat,
+        ),
+    )
 
     def refuse_outside_read(path: Path, *args: Any, **kwargs: Any) -> Any:
         assert path.resolve() != outside.resolve(), "an untrusted transcript was opened"
