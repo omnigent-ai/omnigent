@@ -78,7 +78,7 @@ if (args[0] === "status") {
       `
 const path = require("node:path");
 const src = ${JSON.stringify(path.join(APP_ROOT, "src"))};
-const { registerTestOverride } = require(path.join(src, "testOverrides.js"));
+const { registerTestOverride } = require(path.join(src, "testOverrides.ts"));
 registerTestOverride("managed_preferences", () => ({ getDatabricksInternalFeaturesEnabled: () => true }));
 const urls = {};
 registerTestOverride("url", () => urls);

@@ -230,20 +230,22 @@ function loadMainHarness({
         },
       }),
     },
-    "./omnigent_cli": {
+    "./omnigent_cli.ts": {
       isExecutableFile: () => false,
       resolveCliPath: () => null,
       localHostId: () => "host_test",
       getCliStatus: () => ({ installed: false }),
     },
-    "./server_manager": {
-      shutdown: () => serverShutdown(),
-      runningWork: () => runningWork,
-      onChange: () => {},
-      ensureServerAuth: async () => ({ ok: true }),
-      ensureHostConnected: async () => ({ ok: true }),
-      restartHost: async () => ({ ok: true }),
-      disconnectHost: async () => ({ ok: true }),
+    "./server_manager.ts": {
+      createServerManager: () => ({
+        shutdown: () => serverShutdown(),
+        runningWork: () => runningWork,
+        onChange: () => {},
+        ensureServerAuth: async () => ({ ok: true }),
+        ensureHostConnected: async () => ({ ok: true }),
+        restartHost: async () => ({ ok: true }),
+        disconnectHost: async () => ({ ok: true }),
+      }),
     },
   };
 

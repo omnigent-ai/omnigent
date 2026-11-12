@@ -1,19 +1,35 @@
-// Tests for the auth gate in src/server_manager.js (`ensureServerAuth`), run
+// Tests for the auth gate in src/server_manager.ts (`ensureServerAuth`), run
 // with `node --test`: the decision logic (loopback skip → /v1/me probe →
 // (idempotent) login → error), then the login failure copy against fixture CLIs.
 //
-// `server_manager` captures the `omnigent_cli` module object once at require
-// time, so mocking methods on that same shared object (via `mock.method`) is
-// seen by the code under test.
+// The manager is given a copy of the `omnigent_cli` exports, so mocking methods
+// on that copy (via `mock.method`) is seen by the code under test.
 
-const { describe, it, mock, before, after, afterEach } = require("node:test");
-const assert = require("node:assert/strict");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
+import { describe, it, mock, before, after, afterEach } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-const cli = require("../src/omnigent_cli");
-const { ensureServerAuth, runningWork, _hostChildren } = require("../src/server_manager");
+import * as omnigentCli from "../src/omnigent_cli.ts";
+import type { CliCommand, CliFailure } from "../src/omnigent_cli.ts";
+import {
+  createServerManager,
+  type EnsureServerAuthOptions,
+  type HostChildEntry,
+  type ServerAuthFailure,
+  type ServerAuthResult,
+  type ServerManagerCli,
+} from "../src/server_manager.ts";
+
+const cli: ServerManagerCli = { ...omnigentCli };
+const { ensureServerAuth, runningWork, _hostChildren } = createServerManager({ cli });
+
+/** The result as a failure; fails the test when sign-in succeeded. */
+function authFailure(result: ServerAuthResult): ServerAuthFailure {
+  assert.ok(!result.ok);
+  return result;
+}
 
 const SERVER = "https://app.example.com";
 const CLI_PATH = "/bin/omnigent";
@@ -23,7 +39,9 @@ describe("ensureServerAuth", () => {
     mock.method(cli, "probeServerAuth", async () => ({ authed: true, reachable: true }));
     const login = mock.method(cli, "loginServer", async () => ({ ok: false, output: "SECRET" }));
     const command = { executable: "/bin/isaac", prefixArgs: ["omni"], displayName: "Custom label" };
-    const result = await ensureServerAuth(command, "https://account.databricks.com/omnigent?o=123");
+    const result = authFailure(
+      await ensureServerAuth(command, "https://account.databricks.com/omnigent?o=123"),
+    );
     assert.equal(result.authError, true);
     assert.equal(login.mock.callCount(), 1);
     assert.doesNotMatch(result.error, /SECRET/);
@@ -89,7 +107,7 @@ describe("ensureServerAuth", () => {
     assert.deepEqual(res, { ok: true });
     assert.equal(login.mock.callCount(), 1);
     assert.equal(onLogin.mock.callCount(), 1);
-    assert.deepEqual(login.mock.calls[0].arguments, [CLI_PATH, SERVER]);
+    assert.deepEqual(login.mock.calls[0]?.arguments, [CLI_PATH, SERVER]);
   });
 
   it("passes an isaac omni descriptor through login and names it in the safe error", async () => {
@@ -102,9 +120,9 @@ describe("ensureServerAuth", () => {
       displayName: "isaac omni",
     };
 
-    const res = await ensureServerAuth(command, SERVER);
+    const res = authFailure(await ensureServerAuth(command, SERVER));
 
-    assert.deepEqual(login.mock.calls[0].arguments, [command, SERVER]);
+    assert.deepEqual(login.mock.calls[0]?.arguments, [command, SERVER]);
     assert.equal(res.authError, true);
     assert.match(res.error, /isaac omni login https:\/\/app\.example\.com/);
     assert.doesNotMatch(res.error, /SECRET/);
@@ -120,7 +138,7 @@ describe("ensureServerAuth", () => {
       output: "Opening browser for login: https://app.example.com/auth/login?ticket=SECRET123",
     }));
 
-    const res = await ensureServerAuth(CLI_PATH, SERVER);
+    const res = authFailure(await ensureServerAuth(CLI_PATH, SERVER));
 
     assert.equal(res.ok, false);
     assert.equal(res.authError, true);
@@ -142,7 +160,7 @@ describe("ensureServerAuth", () => {
     mock.method(cli, "probeServerAuth", async () => ({ authed: false, reachable: true }));
     mock.method(cli, "loginServer", async () => ({ ok: false, output: "" }));
 
-    const res = await ensureServerAuth(CLI_PATH, SERVER);
+    const res = authFailure(await ensureServerAuth(CLI_PATH, SERVER));
 
     assert.equal(res.ok, false);
     assert.equal(res.authError, true);
@@ -170,7 +188,14 @@ describe("ensureServerAuth", () => {
 });
 
 /** The full failure shape: legacy `error` is exactly the message and action joined. */
-function assertLoginFailure(res, { errorMessage, errorAction, failure }) {
+function assertLoginFailure(
+  res: ServerAuthResult,
+  {
+    errorMessage,
+    errorAction,
+    failure,
+  }: { errorMessage: string; errorAction: string; failure: CliFailure },
+) {
   assert.deepEqual(res, {
     ok: false,
     authError: true,
@@ -204,9 +229,9 @@ describe("ensureServerAuth with a real login subprocess", () => {
     errorAction:
       "Check that it's installed and on your PATH (or at the configured CLI path). If it is, reinstall it to repair it, then try again.",
   };
-  let fixtureDir;
+  let fixtureDir = "";
 
-  const fixtureCommand = (script) => ({
+  const fixtureCommand = (script: string) => ({
     executable: process.execPath,
     prefixArgs: [path.join(fixtureDir, script)],
     displayName: "fixture-cli",
@@ -231,7 +256,7 @@ describe("ensureServerAuth with a real login subprocess", () => {
     mock.restoreAll();
   });
 
-  async function loginWith(cliCommand, opts) {
+  async function loginWith(cliCommand: CliCommand, opts?: EnsureServerAuthOptions) {
     mock.method(cli, "probeServerAuth", async () => ({ authed: false, reachable: true }));
     return ensureServerAuth(cliCommand, SERVER, opts);
   }
@@ -252,7 +277,7 @@ describe("ensureServerAuth with a real login subprocess", () => {
   });
 
   it("never returns the login output's ticket URL or token in any field", async () => {
-    const res = await loginWith(fixtureCommand("prints-secrets.js"));
+    const res = authFailure(await loginWith(fixtureCommand("prints-secrets.js")));
 
     assertLoginFailure(res, {
       errorMessage:
@@ -341,7 +366,7 @@ describe("ensureServerAuth with a real login subprocess", () => {
     "keeps the timeout diagnosis when the login answers the kill with an exit code",
     { skip: process.platform === "win32" && "POSIX signals", timeout: 10000 },
     async () => {
-      const trapsSigterm = path.join(__dirname, "fixtures", "traps-sigterm.sh");
+      const trapsSigterm = path.join(import.meta.dirname, "fixtures", "traps-sigterm.sh");
       const res = await loginWith(
         { executable: "/bin/sh", prefixArgs: [trapsSigterm], displayName: "fixture-cli" },
         { loginTimeoutMs: 1000 },
@@ -357,6 +382,25 @@ describe("ensureServerAuth with a real login subprocess", () => {
   );
 });
 
+/** A host entry whose child has the given lifecycle state. */
+function hostEntry(exitCode: number | null, killed: boolean): HostChildEntry {
+  const ignore = () => undefined;
+  const output = { on: ignore };
+  return {
+    child: {
+      exitCode,
+      killed,
+      stdout: output,
+      stderr: output,
+      kill: ignore,
+      on: ignore,
+      once: ignore,
+    },
+    serverUrl: "",
+    log: { text: "" },
+  };
+}
+
 describe("runningWork", () => {
   afterEach(() => {
     _hostChildren.clear();
@@ -365,10 +409,9 @@ describe("runningWork", () => {
   it("counts only live host children and reports no owned local server", () => {
     assert.deepEqual(runningWork(), { hosts: 0, localServer: false });
 
-    const live = { exitCode: null, killed: false };
-    _hostChildren.set("https://one.example", { child: live });
-    _hostChildren.set("https://two.example", { child: { exitCode: 0, killed: false } });
-    _hostChildren.set("https://three.example", { child: { exitCode: null, killed: true } });
+    _hostChildren.set("https://one.example", hostEntry(null, false));
+    _hostChildren.set("https://two.example", hostEntry(0, false));
+    _hostChildren.set("https://three.example", hostEntry(null, true));
 
     assert.deepEqual(runningWork(), { hosts: 1, localServer: false });
   });

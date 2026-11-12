@@ -50,13 +50,13 @@ it("bundled injected-script builders emit the same scripts as source", async (t)
 
 it("bundled main-process code applies test overrides only in an unpackaged app", async (t) => {
   const { bundleMainProcess } = await import("../scripts/build.mjs");
-  const { registerTestOverride } = require("../src/testOverrides");
+  const { registerTestOverride } = require("../src/testOverrides.ts");
   const outDir = temporaryOutDir(t);
   const entry = path.join(outDir, "overrides.js");
   fs.writeFileSync(
     entry,
     [
-      `const { withTestOverrides } = require(${JSON.stringify(path.join(SRC_DIR, "testOverrides.js"))});`,
+      `const { withTestOverrides } = require(${JSON.stringify(path.join(SRC_DIR, "testOverrides.ts"))});`,
       `module.exports = withTestOverrides("url", require(${JSON.stringify(path.join(SRC_DIR, "url.ts"))}));`,
     ].join("\n"),
   );

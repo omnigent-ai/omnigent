@@ -119,7 +119,7 @@ async function fixtureArca({ stateDir, serverUrl, hostId, secret }) {
 function fixturePolicy({ appRoot, arcaPath, serverUrl }) {
   const path = require("node:path");
   const src = path.join(appRoot, "src");
-  const { registerTestOverride } = require(path.join(src, "testOverrides.js"));
+  const { registerTestOverride } = require(path.join(src, "testOverrides.ts"));
   const managed = {};
   registerTestOverride("managed_preferences", () => managed);
   managed.getDatabricksInternalFeaturesEnabled = () => true;

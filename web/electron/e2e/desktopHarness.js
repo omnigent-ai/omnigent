@@ -398,7 +398,7 @@ async function launchDesktop(opts) {
   fs.writeFileSync(
     profileBootstrap,
     `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n` +
-      `const { registerTestOverride } = require(${JSON.stringify(path.join(APP_ROOT, "src/testOverrides.js"))});\n` +
+      `const { registerTestOverride } = require(${JSON.stringify(path.join(APP_ROOT, "src/testOverrides.ts"))});\n` +
       `global.omnigentTestBrowserRegistries = [];\n` +
       `registerTestOverride("browserViewRegistry", ({ createBrowserViewRegistry: create }) => ({ createBrowserViewRegistry: (...args) => { const registry = create(...args); global.omnigentTestBrowserRegistries.push(registry); return registry; } }));\n`,
   );

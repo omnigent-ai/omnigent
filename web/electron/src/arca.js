@@ -57,7 +57,7 @@ const SAFE_URL_RE = /^[A-Za-z0-9\-._~:/?=&%]+$/;
 /**
  * Well-known install locations for the arca binary. Probed because a
  * GUI-launched Electron app inherits a minimal PATH (mirrors the omnigent CLI
- * resolution in omnigent_cli.js).
+ * resolution in omnigent_cli.ts).
  *
  * @returns {string[]}
  */

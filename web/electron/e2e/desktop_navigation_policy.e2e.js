@@ -51,7 +51,7 @@ function writeResponseObserver(scratch) {
   fs.writeFileSync(
     observer,
     `
-    const { registerTestOverride } = require(${JSON.stringify(path.resolve(__dirname, "../src/testOverrides.js"))});
+    const { registerTestOverride } = require(${JSON.stringify(path.resolve(__dirname, "../src/testOverrides.ts"))});
     global.allowedNetworkResponses = [];
     registerTestOverride("browserViewRegistry", ({ createBrowserViewRegistry: create }) => ({
       createBrowserViewRegistry: (opts) => {
@@ -192,7 +192,7 @@ it(
     });
     const localUrl = `http://localhost:${fixture.address().port}/`;
     const preload = path.join(scratch, "observe-network.cjs");
-    const modulePath = path.resolve(__dirname, "../src/testOverrides.js");
+    const modulePath = path.resolve(__dirname, "../src/testOverrides.ts");
     // Main-only fault injection isolates the response guard from preflight.
     // No renderer gains an exception or a way to manufacture an Arca identity.
     fs.writeFileSync(
