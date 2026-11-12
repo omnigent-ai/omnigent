@@ -1158,6 +1158,47 @@ async def test_a_run_during_an_unregistered_sandboxs_teardown_keeps_the_session(
     assert abandoned.error == runs[claimed.lease.run.id].error
 
 
+async def test_an_unregistered_sandbox_whose_teardown_fails_still_settles_its_launch(
+    store, db_uri, monkeypatch
+) -> None:
+    """Requests waiting on the abandoned launch get its failure even when teardown
+    raises, and the run stays for recovery to fail once its lease expires."""
+    from omnigent.server.routes import sessions
+
+    claimed = _claim(
+        store,
+        execution_target="managed_sandbox",
+        session_mode="continue",
+        host_id=None,
+        workspace=None,
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+
+    async def launch(**kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(sessions, "_run_managed_launch", AsyncMock(side_effect=launch))
+    monkeypatch.setattr(
+        fire_mod, "_terminate_run_sandbox", AsyncMock(side_effect=RuntimeError("provider down"))
+    )
+    tracker = ManagedLaunchTracker()
+    executor = _unregistered_executor(store, conversations, tracker)
+    try:
+        with pytest.raises(RuntimeError, match="provider down"):
+            await asyncio.wait_for(executor.fire(claimed.task, claimed.lease), 10)
+    finally:
+        await _drain_managed_launches()
+
+    unstarted = store.get(claimed.task.id).session_id
+    abandoned = tracker.get(unstarted)
+    assert abandoned is not None
+    assert abandoned.settled.is_set()
+    assert abandoned.error == "the sandbox did not register within 0.2 seconds"
+    run = next(run for run in _runs(store, claimed.task) if run.id == claimed.lease.run.id)
+    assert (run.status, run.conversation_id) == ("starting", unstarted)
+    assert await executor.recover(run) == "failed"
+
+
 def _bound_unstarted_session_waits(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bound the waits a run continuing an unstarted session makes."""
     from omnigent.server import managed_hosts

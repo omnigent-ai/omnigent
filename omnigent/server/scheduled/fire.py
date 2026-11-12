@@ -925,7 +925,7 @@ async def _release_replaceable_session(deps: FireDeps, task: ScheduledTask) -> S
     """Drop a continued session that was deleted or never started, so this run starts a new one.
 
     Only a session that no longer exists, or the task's sandbox session whose
-    sandbox never connected, is replaced: nothing ever ran in the latter. One the
+    first launch failed, is replaced: nothing ever ran in the latter. One the
     owner archived or that no longer fits the task still fails the run, so a
     change they made is never undone silently. The new session is recorded like a
     first run's, and a managed sandbox is provisioned again when the earlier
@@ -952,7 +952,7 @@ async def _release_replaceable_session(deps: FireDeps, task: ScheduledTask) -> S
 
 
 async def _sandbox_never_started(deps: FireDeps, task: ScheduledTask, conv: Conversation) -> bool:
-    """Whether *conv* is the task's sandbox session whose launch failed before binding a host."""
+    """Whether *conv* is the task's sandbox session left hostless by a failed first launch."""
     from omnigent.server.startup_inputs import STARTUP_LABEL, STARTUP_SETTLED_BY_LABEL
 
     if task.execution_target != "managed_sandbox" or conv.host_id is not None:
