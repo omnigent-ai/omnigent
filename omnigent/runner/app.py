@@ -18,7 +18,6 @@ import logging
 import math
 import os
 import re
-import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -417,6 +416,22 @@ def _resolve_human_wait_hold_s() -> float:
         )
         return _DEFAULT_HUMAN_WAIT_HOLD_S
     return value
+
+
+_PROMPT_WAIT_EXPIRED_MESSAGE = (
+    "The terminal prompt this message was waiting behind went unanswered, so "
+    "Omnigent stopped waiting and the message was not sent. Answer the prompt in "
+    "the terminal, then send the message again."
+)
+
+
+def _on_event_loop() -> bool:
+    """Return whether the caller runs on an event loop rather than a plain thread."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 # Cached server version from the /api/version probe; ``None`` until a probe
@@ -1671,8 +1686,6 @@ def create_runner_app(
     # Start and logged expiry of each human-wait episode (see ``_human_wait_holds``).
     _human_wait_since: dict[tuple[str, object], float] = {}
     _human_wait_expired: set[tuple[str, object]] = set()
-    # The parent-death thread checks for active work too.
-    _human_wait_lock = threading.Lock()
 
     def _record_native_pane_status(
         session_id: str, status: str, blocked_on: object = None, *, inferred: object = False
@@ -1707,9 +1720,41 @@ def create_runner_app(
         dialog = _native_dialog_waits.pop(session_id, None)
         if dialog is None:
             return
-        with _human_wait_lock:
-            _human_wait_since.pop((session_id, dialog), None)
-            _human_wait_expired.discard((session_id, dialog))
+        _human_wait_since.pop((session_id, dialog), None)
+        _human_wait_expired.discard((session_id, dialog))
+
+    def _expire_prompt_wait(session_id: str, waiter: asyncio.Task[None], waited_s: float) -> None:
+        """Stop waiting on an unanswered prompt; report each queued message as not sent.
+
+        The runner accepted these messages (``202 buffered``) but holds them only in
+        memory, so letting it idle out would lose them silently. Each one becomes an
+        undelivered ``response.failed``, which the server records with the message,
+        so the person sees it was not sent and can send it again.
+        """
+        if _claude_prompt_waiters.get(session_id) is not waiter or session_id in _active_turns:
+            return
+        queued = list(_session_message_buffers.get(session_id, ()))
+        _cancel_claude_prompt_waiter(session_id)
+        _logger.info(
+            "session %s has waited on a human for %.0fs; reporting %d queued message(s) "
+            "as not delivered",
+            session_id,
+            waited_s,
+            len(queued),
+            extra={"session_id": session_id},
+        )
+        for body in queued:
+            _publish_event(
+                session_id,
+                _response_failed_payload(
+                    {
+                        "code": "native_prompt_wait_expired",
+                        "message": _PROMPT_WAIT_EXPIRED_MESSAGE,
+                        "undelivered": True,
+                    },
+                    input_identity=_input_identity(body),
+                ),
+            )
 
     def _human_wait_holds(session_ids: set[str], approval_waits: dict[str, list[str]]) -> bool:
         """Whether a session parked on a human still holds the idle watchdog open.
@@ -1717,12 +1762,14 @@ def create_runner_app(
         A native dialog nobody answers is not agent work: a turn parked on it, a
         permission hook parked on its verdict, or a queued-message prompt
         waiter behind it. Each such wait holds the runner for at most
-        ``_human_wait_hold_s`` from the first active-work check that sees it;
-        ``0`` keeps the old unbounded hold. A wait ends where its state
+        ``_human_wait_hold_s`` from the first check on the event loop that sees
+        it; ``0`` keeps the old unbounded hold. A wait ends where its state
         changes, not on a later check, since nothing checks while a turn runs:
-        the next status edge ends a dialog. A dialog serial, waiter task or hook
-        marker identifies each wait, so a new one starts fresh even if a check
-        running on another thread re-adds a finished wait's timestamp.
+        the next status edge ends a dialog, and a dialog serial, waiter task or
+        hook marker identifies each wait, so a new one starts fresh. Checks from
+        another thread (the parent-death killer) only read this bookkeeping. An
+        expired prompt waiter holds until the loop has reported its queued
+        messages as not delivered.
 
         :param session_ids: Sessions the runner currently tracks.
         :param approval_waits: Fresh permission-hook marker names per session.
@@ -1738,27 +1785,40 @@ def create_runner_app(
             for session_id, markers in approval_waits.items()
             for marker in markers
         )
-        newly_expired: list[tuple[tuple[str, object], float]] = []
-        held = False
-        with _human_wait_lock:
+        on_loop = _on_event_loop()
+        if on_loop:
             for episode in _human_wait_since.keys() - episodes:
-                _human_wait_since.pop(episode, None)
+                del _human_wait_since[episode]
             _human_wait_expired.intersection_update(episodes)
-            now = time.monotonic()
-            for episode in episodes:
-                waited_s = now - _human_wait_since.setdefault(episode, now)
-                if _human_wait_hold_s <= 0 or waited_s < _human_wait_hold_s:
-                    held = True
-                elif episode not in _human_wait_expired:
-                    _human_wait_expired.add(episode)
-                    newly_expired.append((episode, waited_s))
-        for (session_id, _), waited_s in newly_expired:
-            _logger.info(
-                "session %s has waited on a human for %.0fs; no longer holding the runner open",
-                session_id,
-                waited_s,
-                extra={"session_id": session_id},
-            )
+        now = time.monotonic()
+        held = False
+        for episode in episodes:
+            since = _human_wait_since.get(episode)
+            if since is None:
+                if on_loop:
+                    _human_wait_since[episode] = now
+                held = True
+                continue
+            waited_s = now - since
+            if _human_wait_hold_s <= 0 or waited_s < _human_wait_hold_s:
+                held = True
+                continue
+            session_id, identity = episode
+            if isinstance(identity, asyncio.Task):
+                held = True
+                with contextlib.suppress(RuntimeError):
+                    identity.get_loop().call_soon_threadsafe(
+                        _expire_prompt_wait, session_id, identity, waited_s
+                    )
+            elif on_loop and episode not in _human_wait_expired:
+                _human_wait_expired.add(episode)
+                _logger.info(
+                    "session %s has waited on a human for %.0fs; no longer holding the "
+                    "runner open",
+                    session_id,
+                    waited_s,
+                    extra={"session_id": session_id},
+                )
         return held
 
     def _has_active_work(*, include_pane_activity: bool = True) -> bool:

@@ -456,18 +456,31 @@ async def test_buffered_turn_restores_its_own_occurrence(
 
 
 @pytest.mark.asyncio
-async def test_unanswered_prompt_waiter_releases_runner_after_human_wait_hold(
+async def test_unanswered_prompt_reports_queued_messages_then_releases_runner(
     monkeypatch: pytest.MonkeyPatch, pending_prompt: dict[str, bool]
 ) -> None:
-    """An unanswered Claude prompt holds the idle watchdog only for the configured hold."""
+    """When the hold runs out, each queued message is reported as not sent, then the runner stops.
+
+    The runner accepted these messages but holds them only in memory, so they
+    must not vanish silently when an unanswered prompt lets it idle out.
+    """
     monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", "0.05")
     app, _harness = _build_app()
     sid = uuid.uuid4().hex
+    queued = [
+        {
+            **_message(text),
+            "pending_id": f"pending_{uuid.uuid4().hex}",
+            "input_stable_id": uuid.uuid4().hex,
+        }
+        for text in ("first follow-up", "second follow-up")
+    ]
     async with _runner_client(app) as client:
         await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
-        buffered = await client.post(f"/v1/sessions/{sid}/events", json=_message("later"))
-        assert buffered.status_code == 202
-        assert buffered.json()["status"] == "buffered"
+        for body in queued:
+            buffered = await client.post(f"/v1/sessions/{sid}/events", json=body)
+            assert buffered.status_code == 202
+            assert buffered.json()["status"] == "buffered"
         assert sid in app.state.claude_prompt_waiters
         assert app.state.has_active_work() is True
 
@@ -485,8 +498,26 @@ async def test_unanswered_prompt_waiter_releases_runner_after_human_wait_hold(
         try:
             await asyncio.wait_for(monitor, timeout=5)
             assert shutdowns == ["shutdown"]
-            # The dialog is still unanswered: the hold expired, not the wait.
-            assert sid in app.state.claude_prompt_waiters
+            assert sid not in app.state.claude_prompt_waiters
+            assert not app.state.session_message_buffers.get(sid)
+            events = runner_app._session_event_queues_ref[sid]
+            failures = [
+                event
+                for event in (events.get_nowait() for _ in range(events.qsize()))
+                if isinstance(event, dict) and event.get("type") == "response.failed"
+            ]
+            assert [
+                (
+                    failure["pending_id"],
+                    failure["input_stable_id"],
+                    failure["error"]["code"],
+                    failure["error"]["undelivered"],
+                )
+                for failure in failures
+            ] == [
+                (body["pending_id"], body["input_stable_id"], "native_prompt_wait_expired", True)
+                for body in queued
+            ]
         finally:
             monitor.cancel()
             with contextlib.suppress(asyncio.CancelledError):

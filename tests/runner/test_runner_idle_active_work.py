@@ -640,14 +640,15 @@ async def test_permission_hook_wait_is_bounded_per_hook(
 
 
 @pytest.mark.asyncio
-async def test_a_check_on_another_thread_cannot_age_the_next_dialog(
+async def test_a_check_on_another_thread_cannot_change_a_dialog_hold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A check that read a dialog before it was answered cannot shorten the next one.
+    """A stale check from another thread neither ages nor restarts a dialog's hold.
 
-    The parent-death thread checks for active work off the event loop. If it
-    reads a dialog, pauses while the dialog is answered, and only then records
-    that dialog's start, a later dialog must still get its full hold.
+    The parent-death thread checks for active work off the event loop. Here it
+    reads a dialog and pauses while that dialog is answered and the next one
+    opens and starts its hold. When it resumes, the new dialog must keep its
+    original deadline.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
@@ -680,20 +681,23 @@ async def test_a_check_on_another_thread_cannot_age_the_next_dialog(
         probe = threading.Thread(target=app.state.has_active_work, name="active-work-probe")
         probe.start()
         assert await asyncio.to_thread(read_dialog.wait, 5)
-        # The dialog is answered while the probe is paused; the turn runs on.
+        # While the probe is paused, the dialog is answered and the next one opens.
         _publish_native_status(app, conv_id, "running", None)
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        assert app.state.has_active_work() is True
         resume.set()
         await asyncio.to_thread(probe.join, 5)
         assert not probe.is_alive()
 
-        clock.advance(120)
-        _publish_native_status(app, conv_id, "running", "permission prompt")
+        clock.advance(59)
         assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
 
 
 @pytest.mark.asyncio
 async def test_replaced_prompt_waiter_gets_a_fresh_hold(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A prompt waiter that drains and is later recreated starts a fresh hold.
+    """An expired prompt waiter is stopped, and a later waiter starts a fresh hold.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
@@ -712,10 +716,15 @@ async def test_replaced_prompt_waiter_gets_a_fresh_hold(monkeypatch: pytest.Monk
         clock.advance(59)
         assert app.state.has_active_work() is True
         clock.advance(2)
+        # Expired: the runner first reports any queued messages (none here) and
+        # stops the waiter on the loop, then lets go.
+        assert app.state.has_active_work() is True
+        await asyncio.sleep(0)
+        assert sid not in app.state.claude_prompt_waiters
         assert app.state.has_active_work() is False
+        with pytest.raises(asyncio.CancelledError):
+            await first
 
-        app.state.claude_prompt_waiters.pop(sid)
-        first.cancel()
         second = asyncio.create_task(asyncio.sleep(3600))
         tasks.append(second)
         app.state.claude_prompt_waiters[sid] = second
