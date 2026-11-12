@@ -186,6 +186,8 @@ export interface ElicitationRequest {
   nativeDelivery?: NativePermissionDelivery;
   type: "elicitation_request";
   elicitationId: string;
+  /** False when the agent keeps working while the card waits, e.g. a Codex async question. */
+  isBlocking?: false;
   /**
    * Session that owns the parked elicitation Future. Usually the
    * active session; set to a child session id when the server mirrors

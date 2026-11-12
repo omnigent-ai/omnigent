@@ -17855,6 +17855,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
      * snapshot; `pendingFirstOpenFor` parks that session's first open pre-headers,
      * and `failFirstOpenFor` answers it with a 503.
      */
+    // A hostless open carries the client's own random key.
+    const CLIENT_KEY_RE = /^[0-9a-f]{32}$/;
+    function routeLabel(key: string | null): string {
+      if (key === null) return "none";
+      return CLIENT_KEY_RE.test(key) ? "client" : key;
+    }
+
     function routeKeyedStreamOpens(
       opts: {
         snapshotExtras?: Map<string, Record<string, unknown>>;
@@ -17874,7 +17881,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         if (streamMatch) {
           const open: StreamOpen = { headers: new Headers(init?.headers), aborted: false };
           opens.push(open);
-          log.push(`open:${open.headers.get(SLICE_KEY) ?? "none"}`);
+          log.push(`open:${routeLabel(open.headers.get(SLICE_KEY))}`);
           if (opts.failFirstOpenFor === streamMatch[1] && !firstOpenFailed) {
             firstOpenFailed = true;
             return mockResponse({}, { ok: false, status: 503 });
@@ -17964,8 +17971,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
       expect(route.opens).toHaveLength(1);
-      // Opened before the host was known: keyless, to the default replica.
-      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+      // Opened before the host was known: on the client key.
+      expect(route.opens[0]!.headers.get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
 
       // Bytes are flowing, so no stale or stall path could explain a recycle.
       route.sinks[0]!.push(sse("session.heartbeat", {}));
@@ -18012,7 +18019,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
-      expect(route.log).toEqual(["open:none"]);
+      expect(route.log).toEqual(["open:client"]);
 
       // The message was dispatched on the owning replica while this stream sat
       // on the wrong one: its commit and the reply never arrived here.
@@ -18024,7 +18031,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await drainAsync(50);
 
       expect(route.log.filter((entry) => entry.startsWith("open:"))).toEqual([
-        "open:none",
+        "open:client",
         "open:host_b",
       ]);
       const reopenedAt = route.log.indexOf("open:host_b");
@@ -18056,7 +18063,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
       // The keyless open's headers never arrive: nothing has connected yet.
-      expect(route.log).toEqual(["open:none"]);
+      expect(route.log).toEqual(["open:client"]);
       expect(route.sinks).toHaveLength(0);
 
       const committed = userMessage("pend_gap", "only once");
@@ -18101,7 +18108,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const loop = startStreamPump(id, controller, setState, getState);
       await drainAsync();
       // The keyless open failed; the first backoff (125-250 ms) is pending.
-      expect(route.log).toEqual(["open:none"]);
+      expect(route.log).toEqual(["open:client"]);
 
       const committed = userMessage("backoff_gap", "only once");
       const reply = assistantMessage("backoff_gap", "the reply");
@@ -18112,7 +18119,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await drainAsync(50);
 
       expect(route.log.filter((entry) => entry.startsWith("open:"))).toEqual([
-        "open:none",
+        "open:client",
         "open:host_b",
       ]);
       // No attempt was live to recycle, but the host still changed after the
@@ -18144,7 +18151,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       const loop = startStreamPump(child, controller, setState, getState);
       await drainAsync();
       expect(route.opens).toHaveLength(1);
-      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+      expect(route.opens[0]!.headers.get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
 
       // The child keys by its nearest host-bound ancestor.
       setSessionHost(parent, "host_p");
@@ -18177,7 +18184,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await drainAsync();
       expect(route.opens).toHaveLength(1);
       // No parent link yet, so the child resolves no host of its own.
-      expect(route.opens[0]!.headers.has(SLICE_KEY)).toBe(false);
+      expect(route.opens[0]!.headers.get(SLICE_KEY)).toMatch(CLIENT_KEY_RE);
 
       // A cold /c/<child> open learns the parent from the child's own snapshot
       // after the parent's host is already on the map.

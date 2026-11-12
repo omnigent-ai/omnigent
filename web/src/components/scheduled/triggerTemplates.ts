@@ -94,6 +94,8 @@ export interface TriggerPromptContext {
   model?: string;
   /** The task's reasoning effort override. */
   effort?: string;
+  /** The workers' permission mode; omitted, they use their agent's default. */
+  permissionMode?: string;
   /** The initial search must cover the wait until the first poll. */
   pollingIntervalMinutes?: number;
   /** "continue" sends every match to one task session; "new" is the default. */
@@ -659,6 +661,8 @@ export interface TriggerWorkerSettings {
   agentId: string | null;
   model: string;
   effort: string;
+  /** "" keeps the agent's default. */
+  permissionMode: string;
 }
 
 const QUOTED_WORKER_VALUE = String.raw`"(?:[^"\\]|\\.)*"`;
@@ -667,6 +671,7 @@ const WORKER_SETTINGS_PATTERN = new RegExp(
     `(placement "(?:same_host|managed)", title ${QUOTED_WORKER_VALUE})` +
     `(?:, model (${QUOTED_WORKER_VALUE}))?` +
     `(?:, reasoning_effort (${QUOTED_WORKER_VALUE}))?` +
+    `(?:, permission_mode (${QUOTED_WORKER_VALUE}))?` +
     `, and a message under 8000 characters\\.`,
   "g",
 );
@@ -688,6 +693,7 @@ function workerSettingsMatch(prompt: string) {
       agentId: match[1] === "set to your agent ID" ? null : JSON.parse(match[1]),
       model: match[3] === undefined ? "" : JSON.parse(match[3]),
       effort: match[4] === undefined ? "" : JSON.parse(match[4]),
+      permissionMode: match[5] === undefined ? "" : JSON.parse(match[5]),
     };
     return { parts, match, settings };
   } catch {
@@ -720,6 +726,9 @@ export function updateTriggerWorkerSettings(
     match[2],
     ...(settings.model ? [`model ${JSON.stringify(settings.model)}`] : []),
     ...(settings.effort ? [`reasoning_effort ${JSON.stringify(settings.effort)}`] : []),
+    ...(settings.permissionMode
+      ? [`permission_mode ${JSON.stringify(settings.permissionMode)}`]
+      : []),
   ];
   const systemPrompt = parts.systemPrompt!.replace(
     match[0],
@@ -1421,6 +1430,7 @@ export function renderTriggerPrompt(
     `title ${shared ? taskSessionTitle : text.title}`,
     ...(ctx.model ? [`model ${JSON.stringify(ctx.model)}`] : []),
     ...(ctx.effort ? [`reasoning_effort ${JSON.stringify(ctx.effort)}`] : []),
+    ...(ctx.permissionMode ? [`permission_mode ${JSON.stringify(ctx.permissionMode)}`] : []),
   ];
   const managerPostsLink = fields.linkBack && source !== "slack";
   const workerPostingInstructions =
@@ -1447,7 +1457,7 @@ export function renderTriggerPrompt(
           `For each pending delivery, find the session it went to: by the conversation_id on its line, or, for an unconfirmed start, among the sessions step ${findTaskSessionStep} lists: one with that title that wasn't known as a task session before this run, archived or not, which can be the one step ${findTaskSessionStep} just made your task session. If there is none and the listed rows carry an archived field (so archived sessions were included), the start never happened: drop the entry, fetch that ${text.item} again by the key in its title, and handle it with this run's matches below, since the search window may have moved past it. If the rows have no archived field, an archived session could be hiding: keep the entry pending and ask the owner in your reply to check for that session. Otherwise read that session's latest items with ${taskSessionHistory}. If a task message from your session there names the entry's title, it was delivered: drop the entry. If none does, keep the entry pending and point the owner to that session in your reply: the task message may still be queued, or be older than the items you can read, so never resend it.`,
         ]
       : [
-          `For each pending delivery, find its session: by its conversation_id, or, for an unconfirmed start listed without one, by its title among the sessions you created (sys_session_list with include_archived true). If no such session exists and the listed rows carry an archived field (so archived sessions were included), the start never happened: drop the entry, fetch that ${text.item} again by the key in its title, and handle it with this run's matches below, since the search window may have moved past it. If the rows have no archived field, an archived session could be hiding: keep the entry pending and ask the owner in your reply to check for that session. Otherwise read that session's history with sys_session_get_history. If your task message is there, it was delivered: drop the entry. If it isn't, keep the entry pending and point the owner to that session in your reply: the task may still be queued where the history can't show it, so never resend it and never create another session for it.`,
+          `For each pending delivery, find its session: by its conversation_id, or, for an unconfirmed start listed without one, by its title among the sessions you created (sys_session_list with include_archived true, following next_cursor through every page). If no such session exists and the listed rows carry an archived field (so archived sessions were included), the start never happened: drop the entry, fetch that ${text.item} again by the key in its title, and handle it with this run's matches below, since the search window may have moved past it. If the rows have no archived field, an archived session could be hiding: keep the entry pending and ask the owner in your reply to check for that session. Otherwise read that session's history with sys_session_get_history. If your task message is there, it was delivered: drop the entry. If it isn't, keep the entry pending and point the owner to that session in your reply: the task may still be queued where the history can't show it, so never resend it and never create another session for it.`,
         ]),
     ...(managerPostsLink
       ? [

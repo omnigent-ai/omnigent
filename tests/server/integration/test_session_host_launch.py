@@ -4554,9 +4554,9 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
     real_replace = store.replace_runner_id
     bound_runner_ids: list[str] = []
 
-    def record_binding(session_id: str, runner_id: str) -> Conversation:
+    def record_binding(session_id: str, runner_id: str, **kwargs: Any) -> Conversation:
         bound_runner_ids.append(runner_id)
-        return real_replace(session_id, runner_id)
+        return real_replace(session_id, runner_id, **kwargs)
 
     async def replace_during_admission(conn: HostConnection, session_id: str) -> None:
         admissions.append(conn)

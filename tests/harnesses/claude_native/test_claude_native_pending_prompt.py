@@ -40,6 +40,12 @@ _WRAPPED_SELECT_QUESTION = _QUESTION.replace("Enter to select", "Enter to\nselec
 _WRAPPED_MULTISELECT = _WRAPPED_QUESTION.replace(
     "Enter to select", "Space to select · Enter to\nsubmit"
 )
+_SPLIT_CANCEL_QUESTION = _QUESTION.replace("cancel", "ca\nncel")
+_SPLIT_SELECT_QUESTION = _QUESTION.replace("select", "sel\nect")
+_SPLIT_ESCAPE_QUESTION = _QUESTION.replace("Esc", "Es\nc")
+_SPLIT_SUBMIT_QUESTION = _QUESTION.replace(
+    "Enter to select", "Space to select · Enter to sub\nmit"
+)
 _EXIT_PLAN_QUESTION = """\
 ────────────────────────────────────────────────────────────────────────────────
  Exit plan mode?
@@ -91,6 +97,10 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
         _WRAPPED_QUESTION,
         _WRAPPED_SELECT_QUESTION,
         _WRAPPED_MULTISELECT,
+        _SPLIT_CANCEL_QUESTION,
+        _SPLIT_SELECT_QUESTION,
+        _SPLIT_ESCAPE_QUESTION,
+        _SPLIT_SUBMIT_QUESTION,
         _PERMISSION,
         _EXIT_PLAN_QUESTION,
         _EXIT_PLAN_QUESTION.replace("❯ 1.", "  1.").replace("  2. No", "❯ 2. No"),
@@ -102,6 +112,10 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
         "wrapped-cancel",
         "wrapped-select",
         "wrapped-submit",
+        "split-cancel-word",
+        "split-select-word",
+        "split-escape-word",
+        "split-submit-word",
         "permission",
         "clipped-plan-yes",
         "clipped-plan-no",
@@ -134,6 +148,10 @@ def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
         _WRAPPED_QUESTION,
         _WRAPPED_SELECT_QUESTION,
         _WRAPPED_MULTISELECT,
+        _SPLIT_CANCEL_QUESTION,
+        _SPLIT_SELECT_QUESTION,
+        _SPLIT_ESCAPE_QUESTION,
+        _SPLIT_SUBMIT_QUESTION,
         _PERMISSION,
         _EXIT_PLAN_QUESTION,
     ],
@@ -142,6 +160,10 @@ def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
         "wrapped-cancel",
         "wrapped-select",
         "wrapped-submit",
+        "split-cancel-word",
+        "split-select-word",
+        "split-escape-word",
+        "split-submit-word",
         "permission",
         "clipped-plan",
     ],
@@ -181,8 +203,17 @@ def test_plan_decision_text_without_live_controls_does_not_block_delivery(
     assert not bridge.has_pending_user_prompt(native_bridge)
 
 
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "Settings panel\nEscape to close",
+        "──────────────────────────────\n"
+        "Showing detailed transcript · ctrl+o to toggle · ? for shortcuts\n",
+    ],
+    ids=["settings", "detailed-transcript"],
+)
 def test_hook_that_parks_between_overlay_captures_prevents_escape(
-    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
     captures = 0
     sent = []
@@ -192,7 +223,7 @@ def test_hook_that_parks_between_overlay_captures_prevents_escape(
         captures += 1
         if captures == 2:
             _park_hook(native_bridge)
-        return "Settings panel\nEscape to close"
+        return pane
 
     monkeypatch.setattr(bridge, "_capture_pane", capture)
     monkeypatch.setattr(bridge, "_run_tmux", lambda *args: sent.append(args))
@@ -223,9 +254,23 @@ def test_question_appearing_after_readiness_prevents_paste(
         _WRAPPED_QUESTION,
         _WRAPPED_SELECT_QUESTION,
         _WRAPPED_MULTISELECT,
+        _SPLIT_CANCEL_QUESTION,
+        _SPLIT_SELECT_QUESTION,
+        _SPLIT_ESCAPE_QUESTION,
+        _SPLIT_SUBMIT_QUESTION,
         _EXIT_PLAN_QUESTION,
     ],
-    ids=["question", "wrapped-cancel", "wrapped-select", "wrapped-submit", "clipped-plan"],
+    ids=[
+        "question",
+        "wrapped-cancel",
+        "wrapped-select",
+        "wrapped-submit",
+        "split-cancel-word",
+        "split-select-word",
+        "split-escape-word",
+        "split-submit-word",
+        "clipped-plan",
+    ],
 )
 def test_question_appearing_during_readiness_does_not_become_a_terminal_timeout(
     native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str

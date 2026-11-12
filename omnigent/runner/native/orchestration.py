@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
+    from omnigent.terminals.registry import TerminalRegistry
 
 import click
 import httpx
@@ -183,6 +184,68 @@ def _publish_tmux_target_for_bridge(
         socket_path=instance.socket_path,
         tmux_target=instance.tmux_target,
     )
+
+
+def _readvertise_live_claude_tmux_target(
+    bridge_dir: Path,
+    instance: TerminalInstance,
+    *,
+    terminal_registry: TerminalRegistry,
+    session_id: str,
+) -> None:
+    """
+    Advertise a registered live Claude pane whose ``tmux.json`` is missing or stale.
+
+    Injection can only reach the pane once the advertisement names its socket
+    and target. Publication runs through
+    :meth:`TerminalRegistry.publish_if_registered`, so a pane closed or
+    replaced since the caller's probe never advertises over its successor.
+    Failures are logged and leave injection to its existing wait.
+
+    :param bridge_dir: The session's claude-native bridge directory.
+    :param instance: The registered, alive ``claude`` pane instance.
+    :param terminal_registry: Registry that holds *instance*.
+    :param session_id: Owning session/conversation id.
+    :returns: None.
+    """
+    from omnigent.harnesses.claude_native.bridge import read_tmux_target, write_tmux_target
+
+    expected = {"socket_path": str(instance.socket_path), "tmux_target": instance.tmux_target}
+    try:
+        advertised = read_tmux_target(bridge_dir)
+        if advertised == expected:
+            return
+        published = terminal_registry.publish_if_registered(
+            session_id,
+            instance.name,
+            instance.session_key,
+            instance,
+            lambda: write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            ),
+        )
+        if published:
+            _logger.warning(
+                "live claude pane had %s tmux advertisement for conv=%s; re-advertised",
+                "no" if advertised is None else "a stale",
+                session_id,
+                extra={"session_id": session_id},
+            )
+        else:
+            _logger.info(
+                "claude pane for conv=%s was closed or replaced before re-advertising; skipped",
+                session_id,
+                extra={"session_id": session_id},
+            )
+    except Exception:
+        _logger.warning(
+            "failed to re-advertise claude tmux target for conv=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
 
 
 # Background transcript-forwarder tasks for host-spawned claude-native and
@@ -1955,8 +2018,10 @@ async def _auto_create_opencode_terminal(
         extra_providers=extra_providers,
     )
     # The per-session XDG_CONFIG_HOME hides the user's global config; carry over
-    # their providers, default model, plugins and MCP servers (v1 or v2 spelling).
-    config = maybe_merge_user_provider_config(config)
+    # providers, the default model, and plugins, but never ambient user MCP
+    # servers. The agent spec plus the Omnigent relay above are the complete
+    # task-scoped tool allowlist for this bridge-owned session.
+    config = maybe_merge_user_provider_config(config, include_user_mcp_servers=False)
     write_opencode_provider_config(
         xdg_config_home,
         config,
@@ -2811,6 +2876,7 @@ async def _auto_create_pi_terminal(
     from omnigent.harnesses.pi_native.main import resolve_pi_executable
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.runner._entry import _make_auth_token_factory
+    from omnigent.runtime.prompt import raw_author_instructions
 
     launch_config = await _pi_native_launch_config(
         session_id=session_id,
@@ -2895,14 +2961,16 @@ async def _auto_create_pi_terminal(
         workspace=launch_config.workspace,
         server_client=server_client,
     )
-    raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
-    instructions_path = write_agent_instructions(bridge_dir, raw_instructions)
     pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     context_files = True
     system_prompt_mode = "append"
     if pi_spec is not None:
         context_files = pi_spec.executor.config.get("context_files", True)
         system_prompt_mode = pi_spec.executor.config.get("system_prompt_mode", "append")
+        if system_prompt_mode == "replace" and raw_author_instructions(pi_spec) is None:
+            raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
+    startup_instructions = _native_startup_instructions_from_spec(agent_spec)
+    instructions_path = write_agent_instructions(bridge_dir, startup_instructions)
     provider_args: list[str] = []
     pi_env_unset = pi_native_env_unset(os.environ)
     pi_env = {
@@ -4205,6 +4273,7 @@ async def _auto_create_devin_terminal(
     )
     from omnigent.harnesses.devin_native.main import build_devin_launch, resolve_devin_launch_model
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.runtime.prompt import build_native_startup_instructions, raw_author_instructions
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args + model_override); reused here, not
@@ -4219,17 +4288,15 @@ async def _auto_create_devin_terminal(
     workspace = str(workspace_path)
     bridge_dir = prepare_bridge_dir(session_id)
 
-    # Deliver a custom agent's instructions as an always-on Windsurf rule (the
-    # only channel Devin applies to every turn); a plain agent clears any stale
-    # rule a prior custom-agent launch left in this workspace. Where that rule
-    # would not be session-scoped — a home-directory workspace Devin reads from
-    # every cwd, or one another agent's live rule already owns — the instructions
-    # ride the first message instead, which is weaker but stays in this session.
-    raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
-    rule_is_live = write_devin_agent_rule(workspace_path, raw_instructions, session_id=session_id)
-    if raw_instructions and not rule_is_live:
-        write_agent_instructions_preamble(bridge_dir, raw_instructions)
-    elif rule_is_live:
+    # Reserve the workspace rule for authored roles; framework guidance belongs
+    # in this session's preamble so plain sessions cannot occupy the shared slot.
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    authored = raw_author_instructions(spec) if spec is not None else None
+    rule_is_live = write_devin_agent_rule(workspace_path, authored, session_id=session_id)
+    write_agent_instructions_preamble(
+        bridge_dir, build_native_startup_instructions(None if rule_is_live else spec)
+    )
+    if rule_is_live:
         # Record the workspace so the SessionEnd hook can remove this rule when
         # the session ends, rather than leaving it to load into a later Devin run.
         write_devin_workspace_hint(bridge_dir, workspace_path)
@@ -5792,16 +5859,13 @@ async def _auto_create_codex_terminal(
         from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
 
         _codex_routing_note = smart_routing_spawn_note("codex-native")
-    _codex_developer_instructions = (
-        "\n\n".join(
-            x
-            for x in [
-                _native_startup_raw_instructions_from_spec(agent_spec),
-                _codex_routing_note,
-            ]
-            if x
-        )
-        or None
+    _codex_developer_instructions = "\n\n".join(
+        x
+        for x in [
+            _native_startup_instructions_from_spec(agent_spec),
+            _codex_routing_note,
+        ]
+        if x
     )
     # SDK initialization can block on DNS/auth before model discovery times out.
     # Keep it off the runner loop so heartbeats and other sessions can progress.
@@ -7742,41 +7806,36 @@ def _opencode_session_instructions_from_spec(
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
-    :returns: The composed text, or ``None`` when there is no spec.
+    :returns: The composed text, or stable image guidance when there is no spec.
     """
-    from omnigent.runtime.prompt import build_instructions_nullable
+    from omnigent.runtime.prompt import (
+        build_instructions_nullable,
+        build_native_startup_instructions,
+    )
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     if spec is None:
-        return None
+        return build_native_startup_instructions(None)
     return build_instructions_nullable(spec, None, [])
 
 
-def _native_startup_raw_instructions_from_spec(
+def _native_startup_instructions_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
-) -> str | None:
-    """Read raw author instructions for a native harness's startup-additive channel.
+) -> str:
+    """Compose native startup instructions without turn-bound framework metadata.
 
     Shared by Claude/Pi native's ``--append-system-prompt`` and Codex native's
-    ``developer_instructions``. Returns the verbatim ``AgentSpec.instructions``
-    text only — never the fully framework-composed per-turn string. Terminal
-    launch is not tied to any one turn, while the composed string is
-    assembled per conversation for the turn about to run (late-bound
-    framework text like ``SHARED_SESSION_AUTHORSHIP_INSTRUCTION`` is
-    selected per conversation), so a startup channel carrying one turn's
-    composition would address every later turn with it.
+    ``developer_instructions``. The shared composer preserves author text and
+    adds only guidance that applies throughout the native session.
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
-    :returns: The original resolved instructions text, or ``None`` when
-        absent/whitespace-only.
+    :returns: Author instructions followed by stable framework guidance.
     """
-    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.runtime.prompt import build_native_startup_instructions
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    if spec is None:
-        return None
-    return raw_author_instructions(spec)
+    return build_native_startup_instructions(spec)
 
 
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
@@ -9165,6 +9224,7 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
+        claude_terminal_relay_env,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
         validate_claude_hook_interpreter_compatibility,
@@ -9845,11 +9905,8 @@ async def _auto_create_claude_terminal(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(
-            x
-            for x in [_native_startup_raw_instructions_from_spec(agent_spec), routed_spawn_note]
-            if x
-        )
-        or None,
+            x for x in [_native_startup_instructions_from_spec(agent_spec), routed_spawn_note] if x
+        ),
         allowed_tools=routed_spawn_tools,
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.
@@ -9901,10 +9958,13 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=build_native_claude_terminal_env(
-            claude_config,
-            client_surface=resource_registry.client_surface(session_id),
-        ),
+        env={
+            **build_native_claude_terminal_env(
+                claude_config,
+                client_surface=resource_registry.client_surface(session_id),
+            ),
+            **claude_terminal_relay_env(bridge_dir),
+        },
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
         # inherit this env and several build ``WorkspaceClient`` without pinning
