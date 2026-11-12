@@ -5125,8 +5125,14 @@ async def _host_may_be_in_use(
     limit = _ARCHIVE_STOP_MAX_SESSIONS
 
     async def all_archived(ids: list[str]) -> bool:
-        archived = await asyncio.to_thread(conversation_store.get_archived_states, ids)
-        return all(archived.get(conversation_id) is True for conversation_id in ids)
+        if not ids:
+            return True
+        # Reads no labels, so the cost stays bounded by the page of ids.
+        activity = await asyncio.to_thread(conversation_store.get_session_activity, ids)
+        return all(
+            conversation_id in activity and activity[conversation_id].archived is True
+            for conversation_id in ids
+        )
 
     host_sessions = await asyncio.to_thread(
         conversation_store.list_host_conversation_ids, host_id, limit=limit

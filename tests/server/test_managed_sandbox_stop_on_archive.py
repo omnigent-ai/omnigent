@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import click
 import pytest
 
@@ -210,14 +212,22 @@ async def test_keeps_a_scheduled_task_runs_sandbox(db_uri):
     assert fake.stopped == []
 
 
-@pytest.mark.parametrize("missing", ["host-listing", "archived-states"])
+@pytest.mark.parametrize("missing", ["host-listing", "archived-state"])
 async def test_keeps_the_sandbox_when_the_store_cannot_list_the_hosts_sessions(
     db_uri, monkeypatch, missing
 ):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
-    # The base store's defaults for both reads: nothing, read as unknown.
-    method = "list_host_conversation_ids" if missing == "host-listing" else "get_archived_states"
-    monkeypatch.setattr(conversations, method, lambda *a, **k: {} if "states" in method else [])
+    # The host listing's base default (nothing), or a store that reports
+    # activity without the archived flag: both read as unknown.
+    if missing == "host-listing":
+        monkeypatch.setattr(conversations, "list_host_conversation_ids", lambda *a, **k: [])
+    else:
+        real = conversations.get_session_activity
+
+        def without_archived(ids):
+            return {i: replace(a, archived=None) for i, a in real(ids).items()}
+
+        monkeypatch.setattr(conversations, "get_session_activity", without_archived)
     assert await _stop(fake, host_store, conversations, conv) is False
     assert fake.stopped == []
 

@@ -350,6 +350,8 @@ class SessionActivity:
     :param pending_elicitation_count: Current unresolved session approvals/questions;
         ``None`` when not reported.
     :param runner_id: Bound runner, or ``None`` for an in-process session.
+    :param archived: Whether the session is archived; ``None`` when the store
+        doesn't report it.
     """
 
     updated_at: int
@@ -357,6 +359,7 @@ class SessionActivity:
     total_cost_usd: float | None = None
     pending_elicitation_count: int | None = None
     runner_id: str | None = None
+    archived: bool | None = None
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
@@ -531,20 +534,6 @@ class ConversationStore(ABC):
     ) -> list[str]:
         """Page the sessions assigned to a host, including not-yet-launched sessions."""
         return []
-
-    def get_archived_states(self, conversation_ids: list[str]) -> dict[str, bool]:  # noqa: ARG002
-        """
-        Read only the archived flag of a bounded batch of sessions.
-
-        Unlike :meth:`get_conversations`, this loads no labels or metadata, so
-        its cost is bounded by the number of ids. A store that doesn't implement
-        it returns ``{}``, which callers must treat as unknown.
-
-        :param conversation_ids: At most 1000 session ids, e.g.
-            ``["conv_abc123"]``.
-        :returns: ``{conversation_id: archived}`` for the ids that resolve.
-        """
-        return {}
 
     def __init__(
         self, storage_location: str, conversation_storage_location: str | None = None
