@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._helpers.operator_agents import operator_agent_store
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -116,13 +117,15 @@ def test_scheduled_renewal_preserves_an_inflight_tool_and_session(
         )
         agent_dir = tmp_path / "agent"
         _write_gated_tool_agent(agent_dir)
-        agent_name = register_dir_agent_with_mock_llm(
-            stack.client,
-            agent_dir=agent_dir,
-            name=f"renewal-{uuid.uuid4().hex[:8]}",
-            model=model,
-            mock_llm_base_url=f"{mock_llm_server_url}/v1",
-        )
+        # Python source tools need trusted registration through the server's stores.
+        with operator_agent_store(stack.base_url, stack._database_uri, stack._artifact_dir):
+            agent_name = register_dir_agent_with_mock_llm(
+                stack.client,
+                agent_dir=agent_dir,
+                name=f"renewal-{uuid.uuid4().hex[:8]}",
+                model=model,
+                mock_llm_base_url=f"{mock_llm_server_url}/v1",
+            )
         session_id = create_runner_bound_session(
             stack.client, agent_name=agent_name, runner_id=stack.runner_id
         )

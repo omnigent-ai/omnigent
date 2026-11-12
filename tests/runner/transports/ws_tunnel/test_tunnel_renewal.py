@@ -111,12 +111,22 @@ async def test_renewal_uses_prepared_credential_for_the_next_handshake(
                 getattr(record, "event_name", None) == "runner_tunnel_renewal_started"
                 for record in caplog.records
             )
+            disconnected = [
+                record.attributes
+                for record in caplog.records
+                if getattr(record, "event_name", None) == "runner_tunnel_disconnected"
+            ]
+            assert disconnected
+            assert all(row["disconnect_reason"] == "scheduled_renewal" for row in disconnected)
+            assert all(row["recycle"] is True for row in disconnected)
+            assert "server recycled" not in caplog.text
 
 
 @pytest.mark.parametrize("failure", ["error", "missing"])
 async def test_failed_refresh_keeps_the_old_socket_responsive(
     short_renewal: None,
     failure: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The credential service is unavailable; renewal must leave traffic flowing."""
     attempted = asyncio.Event()
@@ -136,18 +146,32 @@ async def test_failed_refresh_keeps_the_old_socket_responsive(
             raise OSError("credential provider unavailable")
         return None
 
-    async with _running_tunnel(credential) as (accepted, _task):
-        first = await asyncio.wait_for(accepted.get(), timeout=2)
-        await asyncio.wait_for(attempted.wait(), timeout=2)
-        await first.socket.send(encode_frame(PingFrame(ts=123)))
-        response = decode_frame(await asyncio.wait_for(first.messages.get(), timeout=2))
-        assert isinstance(response, PongFrame)
-        assert response.ts == 123
-        assert first.socket.close_code is None
-        assert accepted.empty()
-        allow_refresh.set()
-        second = await asyncio.wait_for(accepted.get(), timeout=2)
-        assert second.socket.request.headers["Authorization"] == "Bearer renewed"
+    with caplog.at_level("WARNING", logger=serve_module.__name__):
+        async with _running_tunnel(credential) as (accepted, _task):
+            first = await asyncio.wait_for(accepted.get(), timeout=2)
+            await asyncio.wait_for(attempted.wait(), timeout=2)
+            await first.socket.send(encode_frame(PingFrame(ts=123)))
+            response = decode_frame(await asyncio.wait_for(first.messages.get(), timeout=2))
+            assert isinstance(response, PongFrame)
+            assert response.ts == 123
+            assert first.socket.close_code is None
+            assert accepted.empty()
+            allow_refresh.set()
+            second = await asyncio.wait_for(accepted.get(), timeout=2)
+            assert second.socket.request.headers["Authorization"] == "Bearer renewed"
+    deferred = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_tunnel_renewal_deferred"
+    ]
+    assert deferred
+    expected = (
+        ("credential_refresh_failed", "OSError")
+        if failure == "error"
+        else ("credential_unavailable", None)
+    )
+    assert {(row["reason"], row["error_type"]) for row in deferred} == {expected}
+    assert all(row["connection_id"] == first.hello.connection_id for row in deferred)
 
 
 async def test_shutdown_during_refresh_does_not_start_another_connection(
@@ -236,11 +260,37 @@ async def test_zero_interval_disables_renewal(monkeypatch: pytest.MonkeyPatch) -
     async with _running_tunnel(credential) as (accepted, _task):
         first = await asyncio.wait_for(accepted.get(), timeout=2)
         # Span multiple short-renewal test intervals while keeping real traffic.
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.15)  # custom-lint: disable=sleep-then-assert -- must stay idle
         await first.socket.send(encode_frame(PingFrame(ts=1)))
         assert isinstance(decode_frame(await first.messages.get()), PongFrame)
         assert accepted.empty()
         assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("setting", "window"),
+    [(None, (85500.0, 85800.0)), ("120", (118.8, 120.0)), ("86400", (86100.0, 86400.0))],
+)
+def test_renewal_jitter_only_shortens_the_interval(
+    monkeypatch: pytest.MonkeyPatch,
+    setting: str | None,
+    window: tuple[float, float],
+) -> None:
+    if setting is None:
+        monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_RENEWAL_S", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_RENEWAL_S", setting)
+    bounds: list[tuple[float, float]] = []
+
+    def uniform(low: float, high: float) -> float:
+        bounds.append((low, high))
+        return low
+
+    monkeypatch.setattr(serve_module.random, "uniform", uniform)
+    interval = serve_module._tunnel_renewal_interval_s()
+    assert interval is not None
+    assert serve_module._tunnel_renewal_delay_s(interval) == pytest.approx(window[0])
+    assert bounds == [pytest.approx(window)]
 
 
 @pytest.mark.parametrize("interval", ["-1", "nan", "inf", "invalid"])

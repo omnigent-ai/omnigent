@@ -24,7 +24,7 @@ import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TypeAlias, TypedDict, cast
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -234,6 +234,16 @@ def _tunnel_renewal_interval_s() -> float | None:
         extra={"session_id": runner_primary_session_id()},
     )
     return _DEFAULT_TUNNEL_RENEWAL_S
+
+
+def _tunnel_renewal_delay_s(interval_s: float) -> float:
+    """Pick this connection's renewal age; jitter only shortens the interval.
+
+    Subtracts up to the smaller of five minutes or 1% so a fleet started
+    together does not renew in lockstep.
+    """
+    jitter_s = min(300.0, interval_s * 0.01)
+    return random.uniform(interval_s - jitter_s, interval_s)
 
 
 async def dispatch_via_asgi(
@@ -666,6 +676,9 @@ async def serve_tunnel(
             if shutdown_event is not None and shutdown_event.is_set():
                 return
             delay_s = _INITIAL_RECONNECT_DELAY_S
+            if close_details is not None and close_details.scheduled_renewal:
+                recycle = True
+                retry_reason = f"{_TUNNEL_RENEWAL_REASON}; reconnecting promptly"
         except asyncio.CancelledError as exc:
             disconnect_error = exc
             raise
@@ -796,12 +809,14 @@ async def serve_tunnel(
             local_shutdown = (
                 shutdown_event is not None and shutdown_event.is_set()
             ) or isinstance(disconnect_error, asyncio.CancelledError)
+            scheduled_renewal = close_details is not None and close_details.scheduled_renewal
             if connected_this_attempt:
                 record_websocket_disconnected(
                     "runner",
                     disconnect_error,
                     local_shutdown=local_shutdown,
                     resumed_from_suspend=woke_from_suspend,
+                    scheduled_renewal=scheduled_renewal,
                 )
             terminal_error = sys.exception()
             if terminal_error is not None or (
@@ -900,6 +915,7 @@ async def serve_tunnel(
                     disconnect_error,
                     local_shutdown=local_shutdown,
                     resumed_from_suspend=resumed_from_suspend,
+                    scheduled_renewal=scheduled_renewal,
                 ),
                 error_type=(
                     type(disconnect_error).__name__ if disconnect_error is not None else None
@@ -1411,10 +1427,12 @@ async def _serve_tunnel_once(
             name=f"runner-suspend-watch:{runner_id}",
         )
 
+        renewal_requested = False
+
         async def _renew_connection() -> None:
+            nonlocal renewal_requested
             assert renewal_interval_s is not None and on_prepare_renewal is not None
-            jitter_s = min(300.0, renewal_interval_s * 0.01)
-            delay = random.uniform(renewal_interval_s - jitter_s, renewal_interval_s)
+            delay = _tunnel_renewal_delay_s(renewal_interval_s)
             await asyncio.sleep(max(0.0, connected_at + delay - time.monotonic()))
             while shutdown_event is None or not shutdown_event.is_set():
                 if await on_prepare_renewal():
@@ -1432,6 +1450,7 @@ async def _serve_tunnel_once(
                     )
                     # A transport recycle must not invoke the idle-shutdown hook,
                     # which finishes session streams and stops reconnecting.
+                    renewal_requested = True
                     await ws.close(code=1001, reason=_TUNNEL_RENEWAL_REASON)
                     return
                 await asyncio.sleep(_TUNNEL_RENEWAL_RETRY_S)
@@ -1447,7 +1466,11 @@ async def _serve_tunnel_once(
                     try:
                         await receive_frame()
                     except ConnectionClosedOK as exc:
-                        if _websocket_close_code(exc) in _TUNNEL_RECYCLE_CLOSE_CODES:
+                        # The server echoes our renewal 1001; it is not a recycle.
+                        if (
+                            not renewal_requested
+                            and _websocket_close_code(exc) in _TUNNEL_RECYCLE_CLOSE_CODES
+                        ):
                             # A server recycle (e.g. 1001) must reach
                             # serve_tunnel's handler for the spread-jitter
                             # reconnect, not end quietly like an ordinary
@@ -1511,7 +1534,10 @@ async def _serve_tunnel_once(
                             # ``ws.recv()`` loop above: ends silently unless
                             # the code is a server recycle (e.g. 1001), which
                             # must reach serve_tunnel's handler instead.
-                            if _websocket_close_code(exc) in _TUNNEL_RECYCLE_CLOSE_CODES:
+                            if (
+                                not renewal_requested
+                                and _websocket_close_code(exc) in _TUNNEL_RECYCLE_CLOSE_CODES
+                            ):
                                 raise
                             break
                 finally:
@@ -1540,7 +1566,8 @@ async def _serve_tunnel_once(
             await _cancel_ws_channels(ws_channels)
     # Read after the context closed the socket: a clean 1000/1001 close ends
     # the iteration without an exception, and only the connection knows its frames.
-    return _CloseDetails.from_connection(ws)
+    details = _CloseDetails.from_connection(ws)
+    return replace(details, scheduled_renewal=True) if renewal_requested else details
 
 
 async def _graceful_drain(
@@ -2106,12 +2133,14 @@ class _CloseDetails:
     :param reason: The connection's close reason.
     :param rcvd_code: Code of the close frame the peer sent, if any.
     :param sent_code: Code of the close frame this side sent, if any.
+    :param scheduled_renewal: Whether this side closed it for a planned renewal.
     """
 
     code: int | None = None
     reason: str | None = None
     rcvd_code: int | None = None
     sent_code: int | None = None
+    scheduled_renewal: bool = False
 
     @classmethod
     def from_error(cls, exc: BaseException) -> _CloseDetails:

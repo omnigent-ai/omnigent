@@ -44,3 +44,22 @@ def test_failed_proactive_refresh_does_not_restore_a_rejected_bootstrap(
     factory.invalidate()
     assert factory.refresh() is None
     assert factory() is None
+
+
+def test_deferred_renewal_leaves_the_relogin_error_for_a_real_rejection(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The bootstrap still works, so a failed renewal must not ask for a re-login."""
+    monkeypatch.setattr(_entry, "_make_auth_token_factory", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_entry, "_AUTH_DISCOVERY_RETRY_INTERVAL_S", 0.0)
+    factory = _entry._InitialAuthTokenFactory("bootstrap", "https://example.invalid")
+
+    with caplog.at_level("ERROR", logger=_entry.__name__):
+        assert factory.refresh() is None
+        assert factory.refresh() is None
+        assert factory() == "bootstrap"
+        assert "databricks auth login" not in caplog.text
+
+        factory.invalidate()
+        assert factory() is None
+    assert caplog.text.count("databricks auth login") == 1

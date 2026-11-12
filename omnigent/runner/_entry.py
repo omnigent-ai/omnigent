@@ -515,21 +515,26 @@ class _InitialAuthTokenFactory:
             return self._call_locked()
 
     def refresh(self) -> str | None:
-        """Resolve renewal credentials without losing a usable bootstrap on failure."""
+        """Resolve renewal credentials without losing a usable bootstrap on failure.
+
+        The caller reports a failure as a deferred renewal: the bootstrap still
+        works, so this must not emit the re-login error a real rejection gets.
+        """
         with self._lock:
             bootstrap = self._initial_token
             self._initial_token = None
             renewed: str | None = None
             try:
-                renewed = self._call_locked()
+                renewed = self._call_locked(renewal=True)
             finally:
                 if not renewed:
                     self._initial_token = bootstrap
             return renewed
 
-    def _call_locked(self) -> str | None:
+    def _call_locked(self, *, renewal: bool = False) -> str | None:
         """Body of :meth:`__call__`, run under :attr:`_lock`.
 
+        :param renewal: Whether a proactive renewal, not a rejection, asked.
         :returns: See :meth:`__call__`.
         """
         if self._initial_token is not None:
@@ -556,11 +561,11 @@ class _InitialAuthTokenFactory:
             token = self._fallback_factory() if self._fallback_factory is not None else None
         if self._fallback_factory is None:
             self._retry_discovery_at = time.monotonic() + _AUTH_DISCOVERY_RETRY_INTERVAL_S
-            if not self._no_credential_logged:
+            if not renewal and not self._no_credential_logged:
                 self._no_credential_logged = True
                 _logger.error(
-                    "no SDK/OIDC credential is available to renew the host bootstrap bearer; "
-                    "run `databricks auth login` to re-authenticate",
+                    "host bootstrap bearer expired and no SDK/OIDC credential is available "
+                    "to renew it; run `databricks auth login` to re-authenticate",
                     extra={"session_id": runner_primary_session_id()},
                 )
         elif token:
