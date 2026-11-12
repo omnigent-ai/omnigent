@@ -954,6 +954,9 @@ Request body:
 is used on a non-Codex-native session; or `external_session_id` would
 overwrite a different existing value
 404 Not Found - no session with that id
+409 Conflict - `runner_id` was sent while a move onto a new sandbox holds
+the session (see "Move Session to a New Sandbox"), or the session's
+runner changed while the request was being handled
 
 This is the mutable affinity primitive for Alpha. The same endpoint
 serves create-bind, resume-bind, and recover-bind: the client starts a
@@ -1378,6 +1381,86 @@ The response is a full `SessionResponse` snapshot of the fork — same
 shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
 copied items in chronological order. Clients must bind a runner
 before opening the fork's SSE stream or posting events.
+
+### Move Session to a New Sandbox
+
+```
+POST /v1/sessions/{session_id}/managed-host
+Content-Type: application/json
+
+{
+  "sandbox_provider": "modal",                          // optional
+  "host_id": "0123456789abcdef0123456789abcdef",        // optional
+  "workspace": "https://github.com/org/repo#main"       // optional
+}
+
+Request body matches `SessionManagedHostRequest`. Each field means what
+it does on a `host_type: "managed"` fork:
+
+  sandbox_provider (string | null, optional)
+    Which configured sandbox provider to provision; null takes the
+    server's first.
+
+  host_id (string | null, optional)
+    Id for the new sandbox host: 32 lowercase hex characters, sent
+    only when `GET /v1/info` reports `request_managed_sandbox_host_id`.
+    Recorded in the `omnigent.sandbox.requested_host_id` label until
+    the host binds; null lets the server mint one.
+
+  workspace (string | null, optional)
+    Git repository URL, optionally `#<branch>`, cloned into the
+    sandbox as the session's working directory; null gives the
+    session an empty sandbox.
+
+202 Accepted — body matches `SessionResponse`, with `host_id` and
+  `workspace` null and `sandbox_status` reporting the launch.
+
+400 Bad Request — the session is a sub-agent or side chat, has no
+  agent binding, already runs in a sandbox, or asks for a sandbox
+  this server has not configured or whose provider manages sandbox
+  profiles
+403 / 404 — the caller does not own the session, or (403) the server's
+  nested-agent destination policy keeps this session off new sandboxes
+409 Conflict — a runner is still bound, the session has no host to
+  move from (it may already be moving), its host or runner changed
+  while the move ran, or host_id names a host already in use
+422 Unprocessable Entity — a malformed host_id, or a workspace that is
+  not a repository URL
+```
+
+Servers that support this route report `move_to_managed_sandbox` on
+`GET /v1/info`; clients should not release a session's runner for a
+move on a server that doesn't. A provider takes a moved session only if
+its `sandbox_provider_capabilities` entry reports `accepts_session_move`
+(one that manages sandbox profiles doesn't); treat a provider that
+doesn't say as one that can't.
+
+Moves an existing session onto a new server-provisioned sandbox — the
+sandbox counterpart of `POST /v1/hosts/{host_id}/runners`. Release the
+session's runner first with `PATCH /v1/sessions/{id}` and
+`{"runner_id": ""}`. The call then claims the session against the
+binding it checked, so a runner bound or a host changed in the
+meantime, or a concurrent move, makes it fail with 409. The claim stays
+on the session until the sandbox's runner replaces it; meanwhile a host
+launch is refused, a message is held for the sandbox, and
+`PATCH /v1/sessions/{id}` with a `runner_id` returns 409, on every
+replica. Only the move releases its claim, after it has settled the
+session; a claim over an hour old is left by a server that stopped
+mid-move, and `PATCH` may clear it, marking messages held for that move
+not sent. The call clears the session's host,
+workspace and branch, drops any earlier sandbox's
+`omnigent.sandbox.repo*` and `omnigent.sandbox.requested_host_id`
+labels, and registers the sandbox to the caller. Like a managed fork,
+the request should be routed by the new sandbox's `host_id`, where the
+launch connects. A failed launch leaves the session unbound with the
+reason in `sandbox_status`, and held messages are reported as not
+delivered, before the claim is released. When the sandbox's host
+connects to another replica, the claim is handed over for that replica
+to start the runner; if another host binds the session then, that
+binding wins: the sandbox is torn down without failing the session, and
+held messages are marked not sent. A request the server refuses
+restores the previous binding and labels, and releases the claim. Files
+don't move with the session; the transcript does.
 
 ### Read Fork Repository Branch Suggestions
 

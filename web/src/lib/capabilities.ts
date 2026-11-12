@@ -84,6 +84,8 @@ export function parseSiblingSessionDestinations(value: unknown): SiblingSessionD
 
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
+  /** The server enforces the browser's Admin view cookie; absent on older servers. */
+  admin_view?: boolean;
   sibling_sessions?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
@@ -147,6 +149,8 @@ export interface ServerInfo {
     string,
     {
       multi_repo?: boolean;
+      /** Whether a session can move onto a new sandbox of this provider (Switch host). */
+      accepts_session_move?: boolean;
       inference_models?: boolean;
       default_models?: boolean;
       repo_catalog?: { name: string; url: string }[];
@@ -274,6 +278,13 @@ export interface ServerInfo {
   request_managed_sandbox_host_id?: boolean;
   /** True when sandbox forks accept an explicit `workspaces` list; absent on older servers. */
   session_fork_workspaces?: boolean;
+  /**
+   * True when ``POST /v1/sessions/{id}/managed-host`` can move a session onto
+   * a new sandbox. Gates Switch host's sandbox rows: an older server lacks the
+   * route, and the switch releases the runner before calling it. Fails to
+   * ``false``.
+   */
+  move_to_managed_sandbox?: boolean;
   /**
    * True when the server stores user agents (``omnigent agent add``,
    * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
@@ -458,6 +469,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
+  move_to_managed_sandbox: false,
   branding: null,
   picker: UNRESTRICTED_PICKER,
 };
@@ -633,6 +645,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
+          move_to_managed_sandbox: data.move_to_managed_sandbox === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
           agent_config_edit: data.agent_config_edit === true,
@@ -642,6 +655,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_pull_requests: data.session_pull_requests === true,
           session_title_instructions: data.session_title_instructions === true,
+          admin_view: data.admin_view === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,

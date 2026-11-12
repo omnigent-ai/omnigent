@@ -2652,7 +2652,7 @@ describe("Sidebar project sections", () => {
     expect(screen.queryByText("conv_filed")).toBeNull();
   });
 
-  it("auto-expands the project folder holding the selected session", () => {
+  it("holds the selected session under its collapsed project folder", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -2675,10 +2675,9 @@ describe("Sidebar project sections", () => {
       </QueryClientProvider>,
     );
 
-    // No click: the folder opens because its session is selected, and the row
-    // is visible under the project section.
+    // Selecting the session doesn't open the folder; its row stays listed under it.
     const header = screen.getByRole("button", { name: /^Customer X/ });
-    expect(header).toHaveAttribute("aria-expanded", "true");
+    expect(header).toHaveAttribute("aria-expanded", "false");
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_filed")).toBeInTheDocument();
   });
@@ -3223,9 +3222,10 @@ describe("Sidebar project Show more", () => {
   it("lists the open session when it sits past the first five", () => {
     projectsMock.push("Customer X");
     mockConversations(filedSessions(12));
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Customer X"]));
     renderOnSession("conv_filed_7");
 
-    // The folder auto-expands for the open session and grows a whole page to list it.
+    // The expanded folder grows a whole page to list the open session.
     expect(folderRowIds()).toEqual(filedIds(10));
     expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
   });
@@ -4300,6 +4300,59 @@ describe("Sidebar view options", () => {
         .getAllByRole("link", { name: /^conv_/ })
         .map((link) => link.textContent),
     ).toEqual(["conv_done_new", "conv_done_old", "conv_running"]);
+  });
+
+  it("opens view submenus in place of the main menu on a mobile viewport", () => {
+    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === "(max-width: 767.98px)",
+    }));
+    try {
+      mockConversations([conv("conv_idle", "Codex", { status: "idle" })]);
+      renderGroupingSidebar();
+      const openMenu = () => {
+        fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+          button: 0,
+          ctrlKey: false,
+          pointerType: "mouse",
+        });
+        return screen.getByRole("menu");
+      };
+      const menu = openMenu();
+
+      fireEvent.click(within(menu).getByTestId("session-grouping-menu"));
+      expect(screen.getAllByRole("menu")).toEqual([menu]);
+      expect(within(menu).getByRole("menuitem", { name: "Back from Grouping" })).toHaveTextContent(
+        "Grouping",
+      );
+      expect(within(menu).getByRole("menuitemradio", { name: "Harness" })).toBeInTheDocument();
+      expect(within(menu).queryByTestId("session-ordering-menu")).toBeNull();
+
+      fireEvent.click(within(menu).getByTestId("session-filter-menu-back"));
+      expect(within(menu).queryByRole("menuitemradio")).toBeNull();
+      fireEvent.click(within(menu).getByTestId("session-show-menu"));
+      fireEvent.click(within(menu).getByTestId("session-show-branch"));
+      expect(within(menu).getByTestId("session-show-repo")).toBeInTheDocument();
+
+      fireEvent.click(within(menu).getByTestId("session-filter-menu-back"));
+      fireEvent.click(within(menu).getByTestId("session-ordering-menu"));
+      fireEvent.click(within(menu).getByRole("menuitemradio", { name: "Created" }));
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
+        ordering: "created",
+        show: ["branch"],
+      });
+      // Reopening starts from the main list, not the last submenu.
+      const reopened = openMenu();
+      fireEvent.click(within(reopened).getByTestId("session-grouping-menu"));
+      fireEvent.keyDown(reopened, { key: "Escape" });
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(within(openMenu()).getByTestId("session-grouping-menu")).toBeInTheDocument();
+    } finally {
+      matchMedia.mockRestore();
+    }
   });
 
   it.each(["default", "status", "created", "updated"])(

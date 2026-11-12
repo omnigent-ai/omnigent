@@ -21,6 +21,8 @@ interface ChangesView {
   /** The Changes tab's source; `commit` needs `commitSha`. */
   mode: ChangesMode;
   commitSha: string | null;
+  /** In `changes` mode, show only the changes after this PR commit, up to the head. */
+  sinceSha: string | null;
   /** Files expanded temporarily (find, deep links), apart from the reader's collapse state. */
   revealedPaths: ReadonlySet<string>;
   find: FindState;
@@ -39,6 +41,7 @@ export interface ChangesViewState extends ChangesView {
   /** Shows the changed files or the commit list, leaving any open commit. */
   setMode: (mode: "changes" | "commits") => void;
   openCommit: (commitSha: string) => void;
+  setSinceSha: (sinceSha: string | null) => void;
 }
 
 const EMPTY_VIEW: ChangesView = {
@@ -47,6 +50,7 @@ const EMPTY_VIEW: ChangesView = {
   commitQuery: "",
   mode: "changes",
   commitSha: null,
+  sinceSha: null,
   revealedPaths: new Set(),
   find: { open: false, query: "", matchCase: false, regex: false },
   dismissedResetHead: null,
@@ -91,6 +95,7 @@ export function useChangesViewState(conversationId: string, prUrl: string): Chan
       setDismissedResetHead: (dismissedResetHead) => update(key, () => ({ dismissedResetHead })),
       setMode: (mode) => update(key, () => ({ mode, commitSha: null })),
       openCommit: (commitSha) => update(key, () => ({ mode: "commit", commitSha })),
+      setSinceSha: (sinceSha) => update(key, () => ({ sinceSha })),
     }),
     [key],
   );
