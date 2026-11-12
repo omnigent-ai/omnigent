@@ -649,9 +649,9 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   /** Runners the onboarding runner step offers for `url`: `{remote, bundledCli}`.
    *  @param {string} url */
   getRunnerOptions: (url) => ipcRenderer.invoke("omnigent:get-runner-options", url),
-  /** Connect the onboarding runner ("local" | "remote") to `url`. Resolves
+  /** Connect the local onboarding runner to `url`. Resolves
    *  `{ok, error?}`; output streams via onRunnerConnectLog.
-   *  @param {string} url @param {"local"|"remote"} runner */
+   *  @param {string} url @param {"local"} runner */
   connectRunner: (url, runner) => ipcRenderer.invoke("omnigent:connect-runner", url, runner),
   /** Subscribe to connectRunner output. Returns an unsubscribe function.
    *  @param {(line: string) => void} callback */

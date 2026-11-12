@@ -1,11 +1,8 @@
 // Onboarding: "Where do you work today?", shown after picking a preset server
-// from the landing. Pick the runner (a remote environment when offered, else
-// this laptop), then install/open.
+// from the landing. Connect this laptop, then install/open.
 
-import { useState } from "react";
-import { Cloud, Laptop } from "lucide-react";
+import { Laptop } from "lucide-react";
 import { Card } from "@/components/ui/card";
-import { cn } from "@/lib/utils";
 import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
 import {
   ConnectStatus,
@@ -15,10 +12,9 @@ import {
   OnboardingRail,
 } from "@/pages/onboarding/primitives";
 
-export type Runner = "remote" | "local";
+export type Runner = "local";
 
 export function RunnerStep({
-  remoteAvailable,
   installed,
   error,
   connection = null,
@@ -26,8 +22,6 @@ export function RunnerStep({
   onBack,
   onInstall,
 }: {
-  /** Offer the remote environment, and pick it by default. */
-  remoteAvailable: boolean;
   /** Returning user (CLI installed) → "Open Omnigent"; new → "Install Omnigent". */
   installed?: boolean;
   /** A connect error to show above the actions. */
@@ -38,49 +32,19 @@ export function RunnerStep({
   onBack: () => void;
   onInstall: (runner: Runner) => void;
 }) {
-  const [runner, setRunner] = useState<Runner>(remoteAvailable ? "remote" : "local");
-
   return (
     <div className="flex h-full flex-col px-2 pb-1 pt-3">
       <OnboardingHeading>Where do you work today?</OnboardingHeading>
 
-      {remoteAvailable && (
-        <label htmlFor="runner-remote">
-          <Card
-            className={cn(
-              "cursor-pointer flex-row pl-4 border-transparent items-center",
-              runner === "remote" ? "shadow-sm" : "shadow-none",
-            )}
-          >
-            <input
-              id="runner-remote"
-              type="radio"
-              name="runner"
-              checked={runner === "remote"}
-              onChange={() => setRunner("remote")}
-              className="size-[13px] shrink-0 appearance-none rounded-full border border-foreground text-foreground checked:bg-[radial-gradient(circle_at_center,currentColor_0_3px,transparent_3.5px)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-            />
-            <span className="flex items-center justify-center gap-1">
-              <Cloud className="size-4" aria-hidden />
-              Arca
-            </span>
-          </Card>
-        </label>
-      )}
       <div className="mt-2" />
       <label htmlFor="runner-local">
-        <Card
-          className={cn(
-            "cursor-pointer flex-row pl-4 items-center",
-            runner === "local" ? "shadow-sm" : "shadow-none",
-          )}
-        >
+        <Card className="cursor-pointer flex-row pl-4 items-center shadow-sm">
           <input
             id="runner-local"
             type="radio"
             name="runner"
-            checked={runner === "local"}
-            onChange={() => setRunner("local")}
+            checked
+            readOnly
             className="size-[13px] shrink-0 appearance-none rounded-full border border-foreground text-foreground checked:bg-[radial-gradient(circle_at_center,currentColor_0_3px,transparent_3.5px)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
           />
           <div className="flex flex-col">
@@ -115,7 +79,7 @@ export function RunnerStep({
         <InstallActionButton
           installed={installed}
           loading={connection !== null}
-          onClick={() => onInstall(runner)}
+          onClick={() => onInstall("local")}
         />
       </OnboardingRail>
     </div>

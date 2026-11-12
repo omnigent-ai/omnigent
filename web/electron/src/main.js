@@ -89,7 +89,6 @@ const {
   getManagedServerUrls,
 } = require("./managed_preferences");
 const arca = require("./arca");
-const arcaOnboarding = require("./arca_onboarding");
 const cliInstall = require("./cli_install");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { createArcaAutoConnect } = require("./arca_autoconnect");
@@ -217,7 +216,6 @@ function serverSelectorV2DevUrl() {
  *   OMNIGENT_ONBOARDING_MOCK_MANAGED=url,url   managed preset servers
  *   OMNIGENT_ONBOARDING_MOCK_RECENTS=url,url   recent servers
  *   OMNIGENT_ONBOARDING_MOCK_INSTALLED=1       returning user
- *   OMNIGENT_ONBOARDING_MOCK_REMOTE_ENV=1      offer the remote environment
  *
  * @returns {string} A query string without the leading "?", or "".
  */
@@ -229,7 +227,6 @@ function onboardingMockSearch() {
   if (process.env.OMNIGENT_ONBOARDING_MOCK_RECENTS)
     p.set("recents", process.env.OMNIGENT_ONBOARDING_MOCK_RECENTS);
   if (process.env.OMNIGENT_ONBOARDING_MOCK_INSTALLED === "1") p.set("installed", "1");
-  if (process.env.OMNIGENT_ONBOARDING_MOCK_REMOTE_ENV === "1") p.set("remote", "1");
   return p.toString();
 }
 
@@ -472,124 +469,6 @@ const arcaAutoConnect = createArcaAutoConnect({
   },
   log: (message) => console.log(`[omnigent] ${message}`),
 });
-/**
- * The auto-connect opt-in shared by overlapping onboarding connects: how many
- * are running, the preference from before the first of them, and whether any
- * succeeded.
- */
-const onboardingArcaOptIn = { pending: 0, baseline: undefined, succeeded: false };
-const onboardingArcaSetups = new Map();
-
-/**
- * Onboarding's Arca connect, run through the auto-connect state machine so
- * the window's own launch-time connect joins it instead of racing a second
- * `arca ssh`. Picking Arca opts into auto-connect; overlapping attempts share
- * the opt-in, and the last to finish keeps it only if any of them succeeded.
- * Browser sign-in is canceled when the last setup window closes; a started
- * noninteractive connection may finish in the background.
- *
- * @param {string} serverUrl
- * @param {(line: string) => void} log
- * @param {Electron.WebContents} sender The shell-owned setup page.
- * @returns {Promise<{
- *   ok: boolean,
- *   canceled?: boolean,
- *   alreadyRunning?: boolean,
- *   error?: string,
- *   errorMessage?: string,
- *   errorAction?: string,
- *   authError?: boolean,
- *   errorKind?: import("./arca").ArcaErrorKind,
- * }>}
- */
-async function connectOnboardingArca(serverUrl, log, sender) {
-  const isClosed = () => sender.isDestroyed();
-  const optIn = onboardingArcaOptIn;
-  const settings = loadSettings();
-  if (optIn.pending === 0) {
-    optIn.baseline = settings.arca_auto_connect;
-    optIn.succeeded = false;
-  }
-  optIn.pending += 1;
-  settings.arca_auto_connect = true;
-  saveSettings(settings);
-  let result;
-  try {
-    await refreshArcaBinary();
-    if (isClosed()) {
-      result = { ok: false, canceled: true };
-    } else {
-      // The setup page's Install click authorizes browser sign-in before host startup.
-      log(`$ arca ${arcaOnboarding.buildSetupArgs(serverUrl).join(" ")}`);
-      log("If sign-in is needed, a browser opens on your laptop. Finish signing in to continue.");
-      const target = omnigentCli.normalizeServerUrl(new URL(serverUrl).href);
-      let setup = onboardingArcaSetups.get(target);
-      if (!setup) {
-        setup = { ...arcaOnboarding.startArcaSetup(serverUrl), waiters: 0 };
-        onboardingArcaSetups.set(target, setup);
-        setup.promise = setup.promise.finally(() => {
-          if (onboardingArcaSetups.get(target) === setup) onboardingArcaSetups.delete(target);
-        });
-      }
-      setup.waiters += 1;
-      let onClosed;
-      const closed = new Promise((resolve) => {
-        onClosed = () => resolve({ ok: false, canceled: true });
-        sender.once("destroyed", onClosed);
-      });
-      let prepared;
-      try {
-        prepared = await Promise.race([setup.promise, closed]);
-      } finally {
-        sender.removeListener("destroyed", onClosed);
-        setup.waiters -= 1;
-        // A closed setup window must not cancel another window's sign-in.
-        if (setup.waiters === 0 && onboardingArcaSetups.get(target) === setup) {
-          onboardingArcaSetups.delete(target);
-          setup.cancel();
-        }
-      }
-      if (isClosed()) {
-        result = { ok: false, canceled: true };
-      } else if (!prepared.ok) {
-        result = prepared;
-      } else {
-        log("Sign-in ready. Connecting Arca…");
-        const current = arcaAutoConnect.getStatus(serverUrl);
-        // Joining a run already in flight streams nothing, so only a new run shows its command.
-        if (current.command && (current.state === "idle" || current.state === "failed")) {
-          log(`$ ${current.command}`);
-        }
-        const status =
-          current.state === "failed"
-            ? await arcaAutoConnect.retry(serverUrl, log)
-            : await arcaAutoConnect.ensure(serverUrl, log);
-        result =
-          status.state === "online"
-            ? { ok: true, alreadyRunning: status.alreadyRunning === true }
-            : {
-                ok: false,
-                error:
-                  status.state === "unavailable"
-                    ? "The arca CLI was not found on this machine."
-                    : (status.error ?? "Couldn't connect Arca."),
-              };
-      }
-    }
-  } catch (error) {
-    result = { ok: false, error: error instanceof Error ? error.message : String(error) };
-  }
-  optIn.pending -= 1;
-  if (result.ok) optIn.succeeded = true;
-  if (optIn.pending === 0 && !optIn.succeeded) {
-    const latest = loadSettings();
-    if (optIn.baseline === undefined) delete latest.arca_auto_connect;
-    else latest.arca_auto_connect = optIn.baseline;
-    saveSettings(latest);
-  }
-  return result;
-}
-
 /**
  * Quit-safety timeouts (see the before-quit handler near the end of this
  * file). `let` (not const) so tests can shrink them via testApi.setQuitTimeouts
@@ -4536,18 +4415,12 @@ function registerIpc() {
     };
   });
 
-  // Setup page → runners the onboarding step offers for `url`: the remote
-  // environment behind the host picker's gate plus its CLI; `bundledCli` means
-  // the host CLI brings its own Omnigent, so onboarding skips the install.
-  ipcMain.handle("omnigent:get-runner-options", (event, url) => {
+  // Older bundled setup pages still request these capabilities.
+  ipcMain.handle("omnigent:get-runner-options", (event) => {
     if (!isSetupPageSender(event)) {
       throw new Error("get-runner-options is only available to the setup page");
     }
-    const internal =
-      typeof url === "string" &&
-      databricksInternalFeaturesEnabled() &&
-      isDatabricksManagedServerUrl(url);
-    return { remote: internal && arca.resolveArcaPath() !== null, bundledCli: internal };
+    return { remote: false, bundledCli: false };
   });
 
   // Setup page → connect the runner picked in onboarding to `url`, streaming
@@ -4557,7 +4430,7 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("connect-runner is only available to the setup page");
     }
-    if (runner !== "local" && runner !== "remote") throw new TypeError("unknown runner");
+    if (runner !== "local") throw new TypeError("unknown runner");
     if (typeof url !== "string") throw new TypeError("connect-runner requires a URL string");
     const target = await resolveConnectTarget(url);
     // Resolving can probe the network; don't start anything for a closed window.
@@ -4569,14 +4442,6 @@ function registerIpc() {
         /* window torn down mid-connect */
       }
     };
-    if (runner === "remote") {
-      if (!databricksInternalFeaturesEnabled() || !isDatabricksManagedServerUrl(target)) {
-        return { ok: false, error: "A remote environment isn't available for this server." };
-      }
-      const result = await connectOnboardingArca(target, log, event.sender);
-      if (result.ok) rememberOnboardingRunner(target, runner);
-      return result;
-    }
     const cliCommand = resolvedCliPath();
     if (!cliCommand) {
       const missingCli = missingHostCliErrorParts();

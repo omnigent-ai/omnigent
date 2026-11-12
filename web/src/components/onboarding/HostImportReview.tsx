@@ -103,7 +103,7 @@ function resolveReviewTarget(
   if (runner === "local") {
     return identity.hostId ? { status: "found", hostId: identity.hostId } : { status: "abandoned" };
   }
-  // The shell hands "remote" over once Arca reports online, so a lone other host is Arca.
+  // Older shells may hand over a remote host once it reports online.
   const resolved = resolveRunnerHost("remote", identity.hostId, hosts);
   if (resolved.ambiguous) return { status: "abandoned" };
   return resolved.hostId ? { status: "found", hostId: resolved.hostId } : { status: "waiting" };
@@ -113,7 +113,7 @@ function resolveReviewTarget(
 function connectingMessage(host: Host | null, runner: ImportReviewTarget["runner"]) {
   if (host?.status === "online") return undefined;
   if (host) return `Connecting to ${host.name}…`;
-  if (runner === "remote") return "Connecting to Arca…";
+  if (runner === "remote") return "Connecting to the remote host…";
   if (runner === "local") return "Connecting this Mac…";
   return "Connecting…";
 }

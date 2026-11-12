@@ -114,9 +114,6 @@ export interface ServerSelectorV2Setup {
   onInstallCli?: () => Promise<SetupResult>;
   /** Subscribe to the CLI installer's output lines; returns an unsubscribe. */
   onInstallLog?: (cb: (line: string) => void) => () => void;
-  /** Runners the "Where do you work today?" step offers for `url`, and whether
-   *  its host CLI comes bundled (no CLI install). Absent → this laptop only. */
-  getRunnerOptions?: (url: string) => Promise<{ remote: boolean; bundledCli?: boolean }>;
   /** Connect the picked runner to `url` before opening it. Absent → the runner
    *  step just opens the server. */
   onConnectRunner?: (url: string, runner: Runner) => Promise<SetupResult>;
@@ -180,26 +177,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const [colorScheme, setColorScheme] = useState<"system" | "light" | "dark">(
     setup.initialColorScheme ?? "system",
   );
-  // The server picked on the MDM landing, whether its runner step offers the
-  // remote environment, and whether its host CLI is bundled.
-  const [runnerTarget, setRunnerTarget] = useState<{
-    url: string;
-    remote: boolean;
-    bundledCli: boolean;
-  } | null>(null);
+  // The server selected for enrolling this laptop.
+  const [runnerTarget, setRunnerTarget] = useState<{ url: string } | null>(null);
   const [runnerError, setRunnerError] = useState<string>();
-  // Bumped per pick, so a slow lookup can't replace a newer pick's runner step.
-  const runnerPick = useRef(0);
-  const pickRunnerFor = async (url: string) => {
-    const pick = ++runnerPick.current;
-    // A failed lookup falls back to this laptop only.
-    const options = await setup.getRunnerOptions?.(url).catch(() => undefined);
-    if (pick !== runnerPick.current) return;
-    setRunnerTarget({
-      url,
-      remote: options?.remote === true,
-      bundledCli: options?.bundledCli === true,
-    });
+  const pickRunnerFor = (url: string) => {
+    setRunnerTarget({ url });
     setRunnerError(undefined);
     setStep("runner");
   };
@@ -210,7 +192,6 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     | { kind: "local"; back: Step; url?: string }
     | { kind: "connect"; back: Step; url: string; runner?: Runner; skipInstall?: boolean }
   >({ kind: "local", back: "local" });
-  const [remoteRunnerFailed, setRemoteRunnerFailed] = useState(false);
   // Install runs in the terminal step only when the CLI is missing AND in-app
   // install is actually offered (macOS — onInstallCli is present). An installed
   // CLI skips installation; unsupported platforms show manual instructions
@@ -312,15 +293,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   // Checked at run time (Retry re-checks): a picked local install that's up opens
   // that exact URL; one that's down starts like "Get started locally".
   const runTerminal = async () => {
-    setRemoteRunnerFailed(false);
     const t = terminalTarget;
     if (t.kind === "connect" && t.runner && setup.onConnectRunner) {
       if (!confirmServer(t.url)) return { ok: false, error: "Connection cancelled." };
       const res = await setup.onConnectRunner(t.url, t.runner);
-      if (!res.ok) {
-        setRemoteRunnerFailed(t.runner === "remote");
-        return res;
-      }
+      if (!res.ok) return res;
     }
     if (t.kind === "connect") return connectInTerminal(t.url);
     if (t.url !== undefined && (await setup.onCheckServer(t.url)).status !== "unreachable")
@@ -333,8 +310,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
     setup.installed === false && setup.installSupported === false && !skipInstall;
   const terminalUrl = terminalTarget.url;
   const connectAnyway =
-    terminalUrl !== undefined &&
-    (terminalTarget.kind === "local" || remoteRunnerFailed || manualInstall)
+    terminalUrl !== undefined && (terminalTarget.kind === "local" || manualInstall)
       ? () =>
           setTerminalTarget({
             kind: "connect",
@@ -455,9 +431,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
         )}
         {step === "runner" && runnerTarget !== null && (
           <RunnerStep
-            remoteAvailable={runnerTarget.remote}
-            // A bundled host CLI skips the install, so the action only opens.
-            installed={setup.installed || runnerTarget.bundledCli}
+            installed={setup.installed}
             error={runnerError}
             connection={connection}
             onCancelConnect={cancelConnect}
@@ -469,13 +443,11 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
                 if (result.error) setRunnerError(result.error);
                 return;
               }
-              // No local install for a remote runner, or when the host CLI is bundled.
               setTerminalTarget({
                 kind: "connect",
                 back: "runner",
                 url: runnerTarget.url,
                 runner,
-                skipInstall: runner === "remote" || runnerTarget.bundledCli,
               });
               setStep("terminal");
             }}
@@ -536,12 +508,6 @@ function terminalRunningCopy(
   kind: "local" | "connect",
   localServerRunning: boolean,
 ): { label: string; hint: string } {
-  if (runner === "remote") {
-    return {
-      label: "Connecting your remote environment",
-      hint: "Starting your remote environment…",
-    };
-  }
   if (runner === "local") {
     return { label: "Connecting this laptop", hint: "Connecting this laptop to the server…" };
   }
