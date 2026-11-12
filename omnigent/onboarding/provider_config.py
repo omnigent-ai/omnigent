@@ -1713,6 +1713,43 @@ def set_default_provider(
     return result
 
 
+def _parses(name: str, raw: dict[str, object]) -> bool:
+    try:
+        _parse_provider(name, raw)
+    except OmnigentError:
+        return False
+    return True
+
+
+def drop_unserved_default_scopes(name: str, entry: dict[str, object]) -> dict[str, object] | None:
+    """Return a copy of *entry* whose ``default`` keeps only scopes it serves.
+
+    Repairs an entry whose ``default`` names a family the provider does not
+    serve, e.g. one rewritten by a build that read its families differently.
+
+    :param name: Provider name, for error messages, e.g. ``"databricks-gemini-work"``.
+    :param entry: The raw provider entry, e.g. ``{"kind": "databricks",
+        "profile": "work", "native_gemini": True, "default": "openai"}``.
+    :returns: The repaired entry (here without ``default``), or ``None`` when
+        the entry is invalid for another reason.
+    """
+    body = {key: value for key, value in entry.items() if key != "default"}
+    if not _parses(name, body):
+        return None
+    if _parses(name, entry):
+        return dict(entry)
+    default_raw = entry.get("default")
+    requested = default_raw if isinstance(default_raw, (list, tuple)) else [default_raw]
+    kept = [
+        scope
+        for scope in requested
+        if isinstance(scope, str) and _parses(name, {**body, "default": [scope]})
+    ]
+    if kept:
+        body["default"] = kept[0] if len(kept) == 1 else kept
+    return body
+
+
 def provider_entry_settings(
     name: str, entry: dict[str, object], *, make_default: bool
 ) -> dict[str, object]:

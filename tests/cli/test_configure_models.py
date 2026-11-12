@@ -3945,6 +3945,47 @@ def test_setup_repairs_gemini_upgrade_default_conflict(isolated_config, choice, 
         )
 
 
+@pytest.mark.parametrize("choice", ["1", "2", "3", "q"])
+def test_setup_repairs_provider_default_it_does_not_serve(isolated_config, monkeypatch, choice):
+    config_path = isolated_config / "config.yaml"
+    gemini_entry = {
+        "kind": "databricks",
+        "profile": "example",
+        "native_gemini": True,
+        "default": "openai",
+    }
+    anthropic_entry = {
+        "kind": "key",
+        "default": True,
+        "anthropic": {"base_url": "https://gateway.example/anthropic", "api_key": "fake"},
+    }
+    original = {
+        "providers": {"databricks-gemini-example": gemini_entry, "anthropic": anthropic_entry}
+    }
+    config_path.write_text(yaml.safe_dump(original))
+    before = config_path.read_bytes()
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    result = CliRunner().invoke(cli, ["setup"], input=f"{choice}\nq\n")
+    output = " ".join(result.output.split())
+    assert "'default' names ['openai'], which it does not serve (serves ['gemini'])" in output
+    assert "Traceback" not in result.output
+    if choice in {"3", "q"}:
+        assert result.exit_code == 1, result.output
+        assert "Invalid provider configuration in" in output
+        assert config_path.read_bytes() == before
+        return
+    assert result.exit_code == 0, result.output
+    providers = _config_yaml(isolated_config)["providers"]
+    assert providers["anthropic"] == anthropic_entry
+    if choice == "1":
+        assert providers["databricks-gemini-example"] == {
+            key: value for key, value in gemini_entry.items() if key != "default"
+        }
+    else:
+        assert "databricks-gemini-example" not in providers
+    assert set(load_providers({"providers": providers})) == set(providers)
+
+
 @pytest.mark.parametrize(
     "profile_text",
     [

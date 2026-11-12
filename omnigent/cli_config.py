@@ -3665,6 +3665,56 @@ def _manage_opencode_harness() -> None:
             status = None
 
 
+def _repair_invalid_provider_entries() -> bool:
+    """Offer to repair or remove provider entries that fail to load; allow cancellation.
+
+    :returns: ``False`` when the user leaves an invalid entry unchanged; the
+        config is then not written. ``True`` otherwise.
+    """
+    from rich.markup import escape
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.onboarding.interactive import select
+    from omnigent.onboarding.provider_config import drop_unserved_default_scopes, load_providers
+
+    block = _load_global_config().get("providers")
+    if not isinstance(block, dict):
+        return True
+    repaired: dict[str, object] = {}
+    for name, entry in block.items():
+        try:
+            load_providers({"providers": {name: entry}})
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.INVALID_INPUT:
+                raise
+            error = exc
+        else:
+            repaired[name] = entry
+            continue
+        fixed = drop_unserved_default_scopes(str(name), entry) if isinstance(entry, dict) else None
+        options = ["Remove this provider", "Leave unchanged and exit"]
+        descriptions = [
+            "Deletes this entry from the config. Stored keys stay in place.",
+            "Exits setup without changing the config.",
+        ]
+        if fixed is not None:
+            options.insert(0, "Keep it without the invalid default")
+            descriptions.insert(0, "Removes only the default scopes this provider does not serve.")
+        choice = select(
+            f"Invalid provider configuration: {escape(str(error))}",
+            options,
+            descriptions=descriptions,
+            default=0 if fixed is not None else len(options) - 1,
+        )
+        if choice < 0 or choice == len(options) - 1:
+            return False
+        if fixed is not None and choice == 0:
+            repaired[name] = fixed
+    if repaired != block:
+        _save_global_config({"providers": repaired})
+    return True
+
+
 def _repair_conflicting_provider_defaults() -> bool:
     """Resolve ambiguous defaults before adoption or menu construction; allow cancellation."""
     from rich.markup import escape
