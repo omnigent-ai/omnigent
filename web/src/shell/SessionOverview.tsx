@@ -77,7 +77,15 @@ function OverviewSubagent({
           to={destination}
           onClick={(event) => {
             openInPanel(child.id, event, destination);
-            onNavigate?.();
+            if (
+              event.button === 0 &&
+              !event.metaKey &&
+              !event.ctrlKey &&
+              !event.shiftKey &&
+              !event.altKey
+            ) {
+              onNavigate?.();
+            }
           }}
           className="flex min-w-0 flex-1 items-center gap-2 rounded-md p-1 hover:bg-accent focus-visible:outline-ring"
         >

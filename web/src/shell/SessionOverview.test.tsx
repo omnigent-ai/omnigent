@@ -257,6 +257,13 @@ describe("Session overview", () => {
       expect(screen.getByText("Includes subagents")).toBeInTheDocument();
       expect(useChildSessionsMock).toHaveBeenCalledWith("session", 10_000);
       expect(props.onOpenChanges).not.toHaveBeenCalled();
+      for (const modifier of ["ctrlKey", "metaKey"]) {
+        fireEvent.click(screen.getByRole("link", { name: /Review changes/ }), { [modifier]: true });
+        expect(screen.getByText("Includes subagents")).toBeInTheDocument();
+      }
+      fireEvent.click(screen.getByRole("link", { name: /Review changes/ }));
+      expect(screen.queryByText("Includes subagents")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
       fireEvent.click(screen.getByText("View changes →"));
       expect(props.onOpenChanges).toHaveBeenCalledOnce();
       expect(screen.queryByText("Includes subagents")).toBeNull();
