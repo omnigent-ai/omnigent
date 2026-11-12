@@ -1,7 +1,12 @@
 import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { WorkflowIcon } from "lucide-react";
+import { MonitorCloudIcon, WorkflowIcon } from "lucide-react";
 
+import {
+  SandboxProfilePicker,
+  useSandboxProfileCatalog,
+  type SandboxProfileSelection,
+} from "@/components/SandboxProfilePicker";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -23,23 +28,48 @@ import { Textarea } from "@/components/ui/textarea";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { readRecentWorkspaces, useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
+import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
+import { previewIsUnsupported, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
 import { readLastAgentId } from "@/lib/agentPreferences";
-import { pickerCuration } from "@/lib/capabilities";
+import { pickerCuration, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { nativeModelLabel } from "@/lib/composerModelLabel";
 import { getCliServerUrl } from "@/lib/host";
-import { readLastHostChoice } from "@/lib/hostPreferences";
+import {
+  SANDBOX_HOST_CHOICE,
+  readLastHostChoice,
+  readLastSandboxProvider,
+  sandboxHostChoice,
+  sandboxHostChoiceProvider,
+} from "@/lib/hostPreferences";
+import { getCurrentUserId } from "@/lib/identity";
 import {
   nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
 import { CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY } from "@/lib/nativeHarnessModes";
+import { randomUUID } from "@/lib/randomUUID";
+import {
+  readLastSandboxRepos,
+  writeLastSandboxRepos,
+  type LastSandboxRepo,
+} from "@/lib/repoPreferences";
 import { useNavigate } from "@/lib/routing";
+import { readLastSandboxProfile } from "@/lib/sandboxProfilePreferences";
+import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
+import {
+  MAX_SANDBOX_REPOS,
+  composeSandboxWorkspaces,
+  isValidSandboxBranch,
+  isValidSandboxWorkspaceLength,
+} from "@/lib/sandboxRepositories";
 import { createSession } from "@/lib/sessionsApi";
 import { runSavedWorkflowPrompt } from "@/lib/workflow";
 import { ForkRunConfig, HostLabel, type ForkRunConfigValue } from "@/shell/ForkSessionDialog";
 import { ConnectHostInstructions } from "@/shell/NewChatDialog";
+import { SandboxRepositoryPicker } from "@/shell/SandboxRepositoryPicker";
 import { resolveWorkspacePath, useResolvedHostHome } from "@/shell/WorkspacePicker";
 import { WorkspacePathField } from "@/shell/WorkspacePathField";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
@@ -53,9 +83,10 @@ export interface RunWorkflowDialogProps {
 }
 
 /**
- * Run a saved workflow: pick the host, directory and agent for a new session,
- * check its first message, and start it. Laid out like the Clone session
- * dialog, whose host label and model, effort and permission fields it reuses.
+ * Run a saved workflow: pick where a new session runs (a connected host and
+ * directory, or a new sandbox and its repositories) and its agent, check its
+ * first message, and start it. Laid out like the Clone session dialog, whose
+ * host label and model, effort and permission fields it reuses.
  */
 export function RunWorkflowDialog({ workflow, open, onOpenChange }: RunWorkflowDialogProps) {
   return (
@@ -119,7 +150,22 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
   const { data: hosts } = useHosts();
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status !== "online"), [hosts]);
-  const [hostId, setHostId] = useState<string | null>(null);
+  // One row per sandbox provider the server can launch, as on the new-session page.
+  const sandboxRows = useMemo(
+    () =>
+      info !== "loading" && info.managed_sandboxes_enabled ? sandboxProviderOptions(info) : [],
+    [info],
+  );
+  // A host id, or a sandbox row's sandboxHostChoice value.
+  const [target, setTarget] = useState<string | null>(null);
+  const sandboxRow = target === null ? undefined : sandboxHostChoiceProvider(target);
+  const sandboxSelected = sandboxRow !== undefined;
+  const hostId = target !== null && !sandboxSelected ? target : null;
+  // The provider the sandbox launches on: its row's, else the server's first.
+  const sandboxProvider = sandboxSelected
+    ? (sandboxRow ?? (info !== "loading" ? info.sandbox_provider : null))
+    : null;
+
   const [workspace, setWorkspace] = useState("");
   const [browsing, setBrowsing] = useState(false);
   const { recent, addRecent } = useRecentWorkspaces(hostId);
@@ -131,20 +177,65 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
     typedWorkspace !== "" && workspacePath === null && !typedWorkspace.startsWith("~");
   const hostOnline = onlineHosts.some((h) => h.host_id === hostId);
 
-  // Each host starts in its most recent directory.
-  const selectHost = (id: string) => {
-    setHostId(id);
-    setWorkspace(readRecentWorkspaces(id)[0] ?? "");
+  // A host starts in its most recent directory.
+  const selectTarget = (value: string) => {
+    setTarget(value);
     setBrowsing(false);
+    if (sandboxHostChoiceProvider(value) === undefined) {
+      setWorkspace(readRecentWorkspaces(value)[0] ?? "");
+    }
   };
-  // Start on the host the new-session page last used if it's online, else the first online one.
+  // Start where the new-session page last ran, a sandbox or an online host, when
+  // that's still offered; else on a sandbox, as that page does, or the first online host.
   useEffect(() => {
-    if (hostId !== null || onlineHosts.length === 0) return;
-    const lastHostId = readLastHostChoice();
-    const host = onlineHosts.find((h) => h.host_id === lastHostId) ?? onlineHosts[0]!;
-    setHostId(host.host_id);
-    setWorkspace(readRecentWorkspaces(host.host_id)[0] ?? "");
-  }, [hostId, onlineHosts]);
+    if (target !== null || hosts === undefined || info === "loading") return;
+    const lastChoice = readLastHostChoice();
+    const lastProvider = readLastSandboxProvider();
+    const sandbox =
+      sandboxRows.length > 0
+        ? sandboxHostChoice(
+            sandboxRows.includes(lastProvider) ? lastProvider : (sandboxRows[0] ?? null),
+          )
+        : null;
+    const next =
+      (lastChoice === SANDBOX_HOST_CHOICE ? sandbox : null) ??
+      onlineHosts.find((h) => h.host_id === lastChoice)?.host_id ??
+      sandbox ??
+      onlineHosts[0]?.host_id ??
+      null;
+    if (next === null) return;
+    setTarget(next);
+    if (sandboxHostChoiceProvider(next) === undefined) {
+      setWorkspace(readRecentWorkspaces(next)[0] ?? "");
+    }
+  }, [target, hosts, info, onlineHosts, sandboxRows]);
+
+  // Repositories the sandbox clones, starting on the new-session page's last ones.
+  const [sandboxRepos, setSandboxRepos] = useState<LastSandboxRepo[]>(readLastSandboxRepos);
+  const [pendingRepoUrl, setPendingRepoUrl] = useState("");
+  const capabilities =
+    info !== "loading" && sandboxProvider !== null
+      ? info.sandbox_provider_capabilities?.[sandboxProvider]
+      : undefined;
+  const maxRepos = capabilities?.multi_repo === true ? MAX_SANDBOX_REPOS : 1;
+  // The picker explains each of these beside the repository.
+  const reposInvalid =
+    sandboxRepos.length > maxRepos ||
+    sandboxRepos.some(
+      (repo) =>
+        !isValidSandboxBranch(repo.branch) || !isValidSandboxWorkspaceLength(repo.url, repo.branch),
+    );
+  const repoUrlPending = pendingRepoUrl.trim() !== "";
+  const [sandboxProfile, setSandboxProfile] = useState<SandboxProfileSelection | null>(null);
+  const rememberedProfileId = useMemo(
+    () => readLastSandboxProfile(sandboxProvider),
+    [sandboxProvider],
+  );
+  const { launchError: profileError, selection: profileSelection } = useSandboxProfileCatalog(
+    sandboxProvider,
+    sandboxProfile,
+    rememberedProfileId,
+  );
 
   const { data: agents } = useAvailableAgents();
   const curation = pickerCuration(info);
@@ -166,24 +257,66 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
     agentList[0];
   const [runConfig, setRunConfig] = useState<ForkRunConfigValue>({});
 
+  // A sandbox's models come from its provider; a host lists its own.
+  const harness = agent
+    ? (nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent.harness ?? null)
+    : null;
+  const sandboxModelsOffered =
+    sandboxSelected &&
+    (capabilities?.inference_models === true || capabilities?.default_models === true);
+  const sandboxModels = useSandboxModelOptions(
+    sandboxProvider,
+    harness,
+    agent?.id ?? null,
+    getCurrentUserId(),
+    sandboxModelsOffered,
+  );
+  const agentUnsupported =
+    sandboxModelsOffered && previewIsUnsupported(sandboxModels)
+      ? (sandboxModels.data?.error ?? `${agent?.display_name} can’t run in this sandbox.`)
+      : null;
+
   const [instructions, setInstructions] = useState(() => runSavedWorkflowPrompt(workflow));
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const canRun =
-    hostOnline &&
-    workspacePath !== null &&
-    agent !== undefined &&
-    instructions.trim() !== "" &&
-    !submitting;
+  const targetReady = sandboxSelected
+    ? profileError === null && !reposInvalid && !repoUrlPending && agentUnsupported === null
+    : hostOnline && workspacePath !== null;
+  const canRun = targetReady && agent !== undefined && instructions.trim() !== "" && !submitting;
 
   async function run() {
-    if (!canRun || hostId === null || workspacePath === null || agent === undefined) return;
+    if (!canRun || agent === undefined) return;
     setSubmitting(true);
     setError(null);
+    const text = instructions.trim();
+    // A sandbox create can carry the first message, which the server sends once the sandbox is up.
+    const serverSendsText =
+      sandboxSelected && info !== "loading" && info.durable_initial_input === true;
+    const modelOverride = pinnedValue(runConfig.modelOverride);
+    const reasoningEffort = pinnedValue(runConfig.reasoningEffort);
     try {
       const session = await createSession(agent.id, [], {
-        hostId,
-        workspace: workspacePath,
+        ...(sandboxSelected
+          ? {
+              sandbox: {
+                provider: sandboxProvider,
+                profileId: profileSelection?.id,
+                profileRevision: profileSelection?.revision,
+                workspaces: composeSandboxWorkspaces(sandboxRepos),
+                // Some servers have the client name the new sandbox's host.
+                hostId:
+                  info !== "loading" && info.request_managed_sandbox_host_id
+                    ? randomUUID().replace(/-/g, "")
+                    : undefined,
+              },
+              initialInput: serverSendsText
+                ? {
+                    type: "message",
+                    data: { role: "user", content: [{ type: "input_text", text }] },
+                  }
+                : undefined,
+            }
+          : { hostId: hostId ?? undefined, workspace: workspacePath ?? undefined }),
         labels: {
           ...nativeWrapperLabelsForAgent(agent),
           ...(runConfig.codexBypassSandbox ? { [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" } : {}),
@@ -191,16 +324,30 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
         terminalLaunchArgs: runConfig.terminalLaunchArgs?.length
           ? runConfig.terminalLaunchArgs
           : undefined,
-        modelOverride: pinnedValue(runConfig.modelOverride),
-        reasoningEffort: pinnedValue(runConfig.reasoningEffort),
+        modelOverride,
+        reasoningEffort,
       });
-      // The session page sends this as the first message once the session is ready.
-      setPendingInitialPrompt(session.id, { text: instructions.trim(), skill: null, files: [] });
-      addRecent(workspacePath);
+      // Otherwise the session page sends it as the first message once the session is ready.
+      if (!serverSendsText) setPendingInitialPrompt(session.id, { text, skill: null, files: [] });
+      if (sandboxSelected) {
+        writeLastSandboxRepos(sandboxRepos);
+        // The session page drops a picked model or effort the new sandbox doesn't offer.
+        const launchedModel = sandboxModels.data?.models.find((m) => m.id === modelOverride);
+        markSandboxLaunch(session.id, {
+          model: modelOverride ?? null,
+          effort: reasoningEffort ?? null,
+          modelLabel: launchedModel ? nativeModelLabel(launchedModel) : null,
+        });
+      } else if (workspacePath !== null) {
+        addRecent(workspacePath);
+      }
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       onClose();
       navigate(`/c/${session.id}`);
     } catch (e) {
+      // A profile can change under the dialog; reload them so the next try sees it.
+      if (sandboxSelected)
+        void queryClient.invalidateQueries({ queryKey: SANDBOX_PROFILES_QUERY_KEY });
       setError(e instanceof Error ? e.message : "Couldn’t start the session. Try again.");
       setSubmitting(false);
     }
@@ -213,7 +360,7 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
         <Field label="Host" htmlFor={hostFieldId}>
           {hosts === undefined ? (
             <p className="text-sm text-muted-foreground">Loading hosts…</p>
-          ) : onlineHosts.length === 0 ? (
+          ) : onlineHosts.length === 0 && sandboxRows.length === 0 ? (
             <ConnectHostInstructions
               serverUrl={getCliServerUrl()}
               label={
@@ -221,12 +368,12 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
                   ? "No hosts connected yet. Connect one from your terminal:"
                   : "No hosts online. Reconnect one from your terminal:"
               }
-              onSshConnected={selectHost}
+              onSshConnected={selectTarget}
             />
           ) : (
             <Select
-              value={hostId ?? ""}
-              onValueChange={selectHost}
+              value={target ?? ""}
+              onValueChange={selectTarget}
               componentId="workflows.run.host"
             >
               <SelectTrigger
@@ -234,9 +381,22 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
                 className="w-full text-sm"
                 data-testid="run-workflow-host"
               >
-                <SelectValue placeholder="Select a host" />
+                <SelectValue
+                  placeholder={
+                    sandboxRows.length > 0 ? "Select a host or sandbox" : "Select a host"
+                  }
+                />
               </SelectTrigger>
               <SelectContent>
+                {sandboxRows.map((provider) => (
+                  <SelectItem key={provider ?? "default"} value={sandboxHostChoice(provider)}>
+                    <span className="flex items-center gap-2">
+                      <MonitorCloudIcon className="size-4 text-muted-foreground" />
+                      <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                    </span>
+                  </SelectItem>
+                ))}
+                {sandboxRows.length > 0 && hosts.length > 0 && <SelectSeparator />}
                 {[...onlineHosts, ...offlineHosts].map((host) => (
                   <SelectItem
                     key={host.host_id}
@@ -248,6 +408,19 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
                 ))}
               </SelectContent>
             </Select>
+          )}
+          {sandboxProvider !== null && (
+            <SandboxProfilePicker
+              provider={sandboxProvider}
+              value={sandboxProfile}
+              onChange={setSandboxProfile}
+              rememberedProfileId={rememberedProfileId}
+            />
+          )}
+          {sandboxSelected && profileError !== null && (
+            <p role="status" className="text-sm text-muted-foreground">
+              {profileError}
+            </p>
           )}
         </Field>
 
@@ -283,6 +456,29 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
           </Field>
         )}
 
+        {sandboxSelected && (
+          <Field label={maxRepos > 1 ? "Repositories" : "Repository"}>
+            <SandboxRepositoryPicker
+              selections={sandboxRepos}
+              onChange={(repos) => setSandboxRepos(repos)}
+              maxRepos={maxRepos}
+              testIdPrefix="run-workflow-sandbox-repo"
+              pendingUrl={pendingRepoUrl}
+              onPendingUrlChange={setPendingRepoUrl}
+            />
+            {sandboxRepos.length === 0 && (
+              <p className="text-sm text-muted-foreground">
+                With no repository, the session starts in an empty workspace.
+              </p>
+            )}
+            {repoUrlPending && (
+              <p className="text-sm text-muted-foreground">
+                Add or clear the repository URL to run.
+              </p>
+            )}
+          </Field>
+        )}
+
         <Field label="Agent" htmlFor={agentFieldId}>
           <Select
             value={agent?.id ?? ""}
@@ -312,6 +508,9 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
               ))}
             </SelectContent>
           </Select>
+          {agentUnsupported !== null && (
+            <p className="text-sm text-destructive">{agentUnsupported}</p>
+          )}
         </Field>
 
         {/* Model, effort and permission settings for a native agent; remounts per agent. */}
@@ -324,6 +523,11 @@ function RunWorkflowForm({ workflow, onClose }: { workflow: SavedWorkflow; onClo
             sameFamilyAsSource={false}
             sameAgentAsSource={false}
             selectedHostId={hostOnline ? hostId : null}
+            modelCatalog={
+              sandboxSelected
+                ? { options: sandboxModels.data?.models ?? [], loading: sandboxModels.isLoading }
+                : undefined
+            }
             onChange={setRunConfig}
           />
         )}

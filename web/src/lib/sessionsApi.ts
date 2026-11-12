@@ -565,6 +565,7 @@ function postEventResponseFromWire(wire: {
  * parent's declared sub-agent tree. It also covers a session started on a
  * connected host: `hostId` + `workspace` make the server launch its runner
  * there, with the labels and launch settings the new-session page sends.
+ * `sandbox` instead asks the server to provision a sandbox for it.
  * Optional fields are only sent when provided, so a plain
  * `createSession(agentId)` posts the same minimal body as before.
  *
@@ -577,6 +578,12 @@ function postEventResponseFromWire(wire: {
  * @param options.title - Child title, e.g. "ui:claude-native-ui:1".
  * @param options.hostId - Connected host to run on, e.g. "host_1".
  * @param options.workspace - Absolute directory on that host.
+ * @param options.sandbox - Run in a new sandbox instead: the provider (null
+ *   for the server's first), an optional profile, the repository workspaces
+ *   to clone (empty for an empty workspace), and the new host's id when the
+ *   server asks the client to choose it.
+ * @param options.initialInput - The first message, for a sandbox create; the
+ *   server delivers it once the sandbox is up.
  * @param options.labels - Session labels, e.g. a native agent's wrapper labels.
  * @param options.terminalLaunchArgs - Native CLI flags, e.g. a permission mode.
  * @param options.modelOverride - Model to pin, e.g. "claude-opus-4-7".
@@ -591,6 +598,14 @@ export async function createSession(
     title?: string;
     hostId?: string;
     workspace?: string;
+    sandbox?: {
+      provider: string | null;
+      profileId?: string;
+      profileRevision?: string;
+      workspaces: string[];
+      hostId?: string;
+    };
+    initialInput?: SessionEventInput;
     labels?: Record<string, string>;
     terminalLaunchArgs?: string[];
     modelOverride?: string;
@@ -605,11 +620,29 @@ export async function createSession(
     title?: string;
     host_id?: string;
     workspace?: string;
+    host_type?: "managed";
+    sandbox_provider?: string;
+    sandbox_profile_id?: string;
+    sandbox_profile_revision?: string;
+    workspaces?: string[];
+    initial_input?: SessionEventInput;
     labels?: Record<string, string>;
     terminal_launch_args?: string[];
     model_override?: string;
     reasoning_effort?: string;
   } = { agent_id: agentId, initial_items: initialItems };
+  const { sandbox } = options;
+  if (sandbox !== undefined) {
+    body.host_type = "managed";
+    if (sandbox.provider !== null) body.sandbox_provider = sandbox.provider;
+    if (sandbox.profileId !== undefined) {
+      body.sandbox_profile_id = sandbox.profileId;
+      body.sandbox_profile_revision = sandbox.profileRevision;
+    }
+    body.workspaces = sandbox.workspaces;
+    if (sandbox.hostId !== undefined) body.host_id = sandbox.hostId;
+  }
+  if (options.initialInput !== undefined) body.initial_input = options.initialInput;
   if (options.parentSessionId !== undefined) {
     body.parent_session_id = options.parentSessionId;
   }

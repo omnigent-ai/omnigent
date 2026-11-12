@@ -7,7 +7,11 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { type Host, useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
+import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { nativeWrapperLabelsForAgent } from "@/lib/nativeCodingAgents";
 import type * as RoutingModule from "@/lib/routing";
 import { createSession } from "@/lib/sessionsApi";
@@ -21,6 +25,10 @@ import { RunWorkflowDialog } from "./RunWorkflowDialog";
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn(), useHostModelOptions: vi.fn() }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
+vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxModelOptionsModule>()),
+  useSandboxModelOptions: vi.fn(),
+}));
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsApiModule>()),
   createSession: vi.fn(),
@@ -51,22 +59,43 @@ function setHosts(hosts: Partial<Host>[]) {
   } as ReturnType<typeof useHosts>);
 }
 
-function renderDialog() {
+// A server that can launch Modal and Daytona sandboxes.
+const SANDBOXES: Partial<ServerInfo> = {
+  managed_sandboxes_enabled: true,
+  sandbox_provider: "modal",
+  sandbox_providers: ["modal", "daytona"],
+};
+
+function renderDialog(info: Partial<ServerInfo> = {}) {
   const onOpenChange = vi.fn();
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
     <QueryClientProvider client={client}>
-      <TooltipProvider>
-        <MemoryRouter>
-          <RunWorkflowDialog workflow={WORKFLOW} open onOpenChange={onOpenChange} />
-        </MemoryRouter>
-      </TooltipProvider>
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...info }}>
+        <TooltipProvider>
+          <MemoryRouter>
+            <RunWorkflowDialog workflow={WORKFLOW} open onOpenChange={onOpenChange} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </CapabilitiesProvider>
     </QueryClientProvider>,
   );
   return { onOpenChange };
 }
 
+function setSandboxModels(data: Partial<SandboxModelOptionsModule.SandboxModelOptions>) {
+  vi.mocked(useSandboxModelOptions).mockReturnValue({
+    data: { models: [], configured: true, status: "ready", ...data },
+    isLoading: false,
+    isError: false,
+  } as unknown as ReturnType<typeof useSandboxModelOptions>);
+}
+
 const submit = () => screen.getByTestId("run-workflow-submit");
+const startedSession = () =>
+  vi
+    .mocked(createSession)
+    .mockResolvedValue({ id: "conv_run" } as Awaited<ReturnType<typeof createSession>>);
 
 describe("RunWorkflowDialog", () => {
   beforeEach(() => {
@@ -84,6 +113,11 @@ describe("RunWorkflowDialog", () => {
       data: undefined,
       isLoading: false,
     } as unknown as ReturnType<typeof useHostFilesystem>);
+    vi.mocked(useSandboxModelOptions).mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useSandboxModelOptions>);
   });
   afterEach(cleanup);
 
@@ -168,6 +202,102 @@ describe("RunWorkflowDialog", () => {
       screen.getByText("No hosts online. Reconnect one from your terminal:"),
     ).toBeInTheDocument();
     expect(screen.queryByPlaceholderText("Type a path or browse…")).toBeNull();
+    expect(submit()).toBeDisabled();
+  });
+
+  it("runs in the sandbox the new-session page last used, cloning its last repositories", async () => {
+    setHosts([{ host_id: "host_1" }]);
+    localStorage.setItem("omnigent:last-host-choice", "__sandbox__");
+    localStorage.setItem("omnigent:last-sandbox-provider", "daytona");
+    localStorage.setItem(
+      "omnigent:last-sandbox-repos",
+      JSON.stringify([{ url: "https://github.com/example/app", branch: "main" }]),
+    );
+    localStorage.setItem("omnigent:last-agent-id", CLAUDE_CODE.id);
+    startedSession();
+    renderDialog({
+      ...SANDBOXES,
+      durable_initial_input: true,
+      request_managed_sandbox_host_id: true,
+    });
+
+    expect(screen.getByTestId("run-workflow-host")).toHaveTextContent("Daytona Sandbox");
+    expect(screen.queryByPlaceholderText("Type a path or browse…")).toBeNull();
+    expect(screen.getByTestId("run-workflow-sandbox-repo-row")).toHaveTextContent("app");
+    fireEvent.click(submit());
+
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith("/c/conv_run"));
+    expect(createSession).toHaveBeenCalledWith(CLAUDE_CODE.id, [], {
+      sandbox: {
+        provider: "daytona",
+        workspaces: ["https://github.com/example/app#main"],
+        hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
+      },
+      // This server sends the first message itself once the sandbox is up.
+      initialInput: {
+        type: "message",
+        data: {
+          role: "user",
+          content: [{ type: "input_text", text: runSavedWorkflowPrompt(WORKFLOW) }],
+        },
+      },
+      labels: nativeWrapperLabelsForAgent(CLAUDE_CODE),
+    });
+    expect(consumePendingInitialPrompt("conv_run")).toBeNull();
+  });
+
+  it("starts on a sandbox when no host is online, sending the first message from the page", async () => {
+    setHosts([{ host_id: "host_1", status: "offline" }]);
+    startedSession();
+    renderDialog(SANDBOXES);
+
+    expect(screen.getByTestId("run-workflow-host")).toHaveTextContent("Modal Sandbox");
+    expect(screen.queryByText(/Reconnect one from your terminal/)).toBeNull();
+    expect(screen.getByText(/starts in an empty workspace/)).toBeInTheDocument();
+    fireEvent.click(submit());
+
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith("/c/conv_run"));
+    expect(vi.mocked(createSession).mock.calls[0]![2]).toMatchObject({
+      sandbox: { provider: "modal", workspaces: [] },
+      initialInput: undefined,
+    });
+    expect(consumePendingInitialPrompt("conv_run")).toEqual({
+      text: runSavedWorkflowPrompt(WORKFLOW),
+      skill: null,
+      files: [],
+    });
+  });
+
+  it("waits for a typed repository URL to be added or cleared", () => {
+    setHosts([]);
+    renderDialog(SANDBOXES);
+
+    fireEvent.change(screen.getByTestId("run-workflow-sandbox-repo-input"), {
+      target: { value: "https://github.com/example/app" },
+    });
+    expect(screen.getByText("Add or clear the repository URL to run.")).toBeInTheDocument();
+    expect(submit()).toBeDisabled();
+
+    fireEvent.click(screen.getByTestId("run-workflow-sandbox-repo-add"));
+    expect(screen.getByTestId("run-workflow-sandbox-repo-row")).toHaveTextContent("app");
+    expect(submit()).toBeEnabled();
+  });
+
+  it("lists the sandbox's models, and blocks an agent it can't run", () => {
+    setHosts([]);
+    localStorage.setItem("omnigent:last-agent-id", CLAUDE_CODE.id);
+    const catalog = { sandbox_provider_capabilities: { modal: { default_models: true } } };
+    setSandboxModels({ models: [{ id: "sonnet", displayName: "Sonnet 4.5", isDefault: true }] });
+    renderDialog({ ...SANDBOXES, ...catalog });
+
+    expect(screen.getByTestId("fork-session-config-model")).toHaveTextContent("Sonnet 4.5");
+    expect(submit()).toBeEnabled();
+
+    cleanup();
+    setSandboxModels({ status: "unsupported", error: "No sandbox model can run Claude Code." });
+    renderDialog({ ...SANDBOXES, ...catalog });
+
+    expect(screen.getByText("No sandbox model can run Claude Code.")).toBeInTheDocument();
     expect(submit()).toBeDisabled();
   });
 });

@@ -366,6 +366,55 @@ describe("createSession", () => {
     });
   });
 
+  it("asks for a managed sandbox, with its first message, for a sandbox start", async () => {
+    const created = () =>
+      mockJsonResponse({
+        id: "conv_run",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+      });
+    fetchMock.mockResolvedValueOnce(created()).mockResolvedValueOnce(created());
+    const firstMessage = {
+      type: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "Run it" }] },
+    };
+
+    await createSession("agent_xyz", [], {
+      sandbox: {
+        provider: "modal",
+        profileId: "profile_1",
+        profileRevision: "rev_1",
+        workspaces: ["https://github.com/example/app#main"],
+        hostId: "0123456789abcdef0123456789abcdef",
+      },
+      initialInput: firstMessage,
+    });
+    await createSession("agent_xyz", [], { sandbox: { provider: null, workspaces: [] } });
+
+    const bodies = fetchMock.mock.calls.map(([, init]) =>
+      JSON.parse((init as RequestInit).body as string),
+    );
+    expect(bodies[0]).toEqual({
+      agent_id: "agent_xyz",
+      initial_items: [],
+      host_type: "managed",
+      sandbox_provider: "modal",
+      sandbox_profile_id: "profile_1",
+      sandbox_profile_revision: "rev_1",
+      workspaces: ["https://github.com/example/app#main"],
+      host_id: "0123456789abcdef0123456789abcdef",
+      initial_input: firstMessage,
+    });
+    // No provider leaves the choice to the server; no repositories is an empty workspace.
+    expect(bodies[1]).toEqual({
+      agent_id: "agent_xyz",
+      initial_items: [],
+      host_type: "managed",
+      workspaces: [],
+    });
+  });
+
   it("omits the optional fields entirely when no options are passed", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

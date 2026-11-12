@@ -53,7 +53,7 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useSession } from "@/hooks/useSession";
-import type { Session } from "@/lib/types";
+import type { NativeModelOption, Session } from "@/lib/types";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
 import {
   nativeAgentHasCapability,
@@ -294,6 +294,8 @@ export interface ForkRunConfigValue {
  *   backend carries only on a same-agent fork.
  * @param selectedHostId - Host whose model catalog feeds the model picker; null
  *   leaves it on Default until a host is chosen.
+ * @param modelCatalog - Models to offer instead of the host's, e.g. a new
+ *   sandbox's; omitted to list the selected host's.
  * @param onChange - Reports the ready-to-send value on every change.
  */
 export function ForkRunConfig({
@@ -303,6 +305,7 @@ export function ForkRunConfig({
   sameFamilyAsSource,
   sameAgentAsSource,
   selectedHostId,
+  modelCatalog,
   onChange,
 }: {
   targetHarness: string | null;
@@ -311,6 +314,7 @@ export function ForkRunConfig({
   sameFamilyAsSource: boolean;
   sameAgentAsSource: boolean;
   selectedHostId: string | null;
+  modelCatalog?: { options: NativeModelOption[]; loading: boolean };
   onChange: (value: ForkRunConfigValue) => void;
 }) {
   const hasPermission = nativeAgentHasCapability(targetAgent, "permissionMode");
@@ -327,19 +331,21 @@ export function ForkRunConfig({
   // native harnesses that expose a picker resolve a catalog; others pass a
   // harmless unused harness key with the query disabled.
   const catalogHarness = showModel && targetHarness ? targetHarness : "claude-native";
-  const { data: hostModelOptions, isLoading: modelsLoading } = useHostModelOptions(
+  const hostCatalog = useHostModelOptions(
     selectedHostId,
     catalogHarness,
-    showModel && selectedHostId !== null,
+    showModel && selectedHostId !== null && modelCatalog === undefined,
   );
+  const catalogOptions = modelCatalog?.options ?? hostCatalog.data;
+  const modelsLoading = modelCatalog?.loading ?? hostCatalog.isLoading;
   const modelOptions = useMemo(
     () =>
-      (hostModelOptions ?? []).map((option) => ({
+      (catalogOptions ?? []).map((option) => ({
         id: option.id,
         displayName: option.displayName ?? option.id,
         isDefault: option.isDefault,
       })),
-    [hostModelOptions],
+    [catalogOptions],
   );
   const modelSelectOptions = useMemo(
     () => modelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
@@ -544,7 +550,9 @@ export function ForkRunConfig({
             )}
             {!modelsLoading && modelOptions.length === 0 && (
               <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                {selectedHostId === null ? "Select a host to list models" : "Models unavailable"}
+                {selectedHostId === null && modelCatalog === undefined
+                  ? "Select a host to list models"
+                  : "Models unavailable"}
               </div>
             )}
           </RoutingModelSelect>
