@@ -20,6 +20,7 @@ import httpx
 import pytest
 
 from omnigent.native.native_policy_hook import (
+    TOOL_FAILED_PAYLOAD_KEY,
     evaluation_response_to_hook_output,
     hook_payload_to_evaluation_request,
 )
@@ -185,3 +186,36 @@ async def test_thrashing_fires_on_claude_native_failed_tool_hooks(
             ),
         }
     }
+
+
+async def test_thrashing_fires_on_reported_failures_without_error_text(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A harness-reported failure counts even when its text looks benign.
+
+    Devin reports a failed call through ``PostToolUse`` with
+    ``"success": false`` and plain stderr as output, which no error prefix
+    matches. Its adapter's failure flag must survive the evaluate endpoint
+    so ``detect_thrashing`` still counts both calls.
+    """
+    _install_thrashing_policy(monkeypatch, consecutive_threshold=2, action="DENY")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    verdicts = []
+    for attempt in (1, 2):
+        payload: dict[str, object] = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec",
+            "tool_input": {"command": f"cat /nonexistent/t{attempt}"},
+            "tool_output": f"cat: /nonexistent/t{attempt}: No such file or directory",
+            TOOL_FAILED_PAYLOAD_KEY: True,
+        }
+        eval_request = hook_payload_to_evaluation_request("PostToolUse", payload)
+        assert eval_request is not None
+        resp = await client.post(f"/v1/sessions/{session_id}/policies/evaluate", json=eval_request)
+        assert resp.status_code == 200, resp.text
+        verdicts.append(resp.json()["result"])
+
+    assert verdicts == ["POLICY_ACTION_ALLOW", "POLICY_ACTION_DENY"]

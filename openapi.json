@@ -6473,6 +6473,11 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "admin_view": {
+            "default": false,
+            "title": "Admin View",
+            "type": "boolean"
+          },
           "agent_config_edit": {
             "default": false,
             "title": "Agent Config Edit",
