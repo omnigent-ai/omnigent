@@ -88,9 +88,7 @@ const {
   getManagedServerNames,
   getManagedServerUrls,
 } = require("./managed_preferences");
-const arca = require("./arca");
 const cliInstall = require("./cli_install");
-const { createArcaConnectFlow } = require("./arca_connect_window");
 const sshConnect = require("./ssh_connect");
 const { createSshConnectFlow } = require("./ssh_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
@@ -336,44 +334,6 @@ function managedServerNames() {
 function databricksInternalFeaturesEnabled() {
   return getDatabricksInternalFeaturesEnabled({ platform: process.platform, getUserDefault });
 }
-
-/**
- * The Arca connect console: a modal owned by the shell that asks consent by
- * showing the exact command, then streams its live output. A repeat connect
- * while one is in flight re-focuses the console and shares its outcome.
- */
-function startArcaHostConnect(serverUrl, deps) {
-  const run = arca.startArcaConnect(serverUrl, {
-    ...deps,
-    onIdentityUnavailable: (reason) =>
-      console.log(`[omnigent] Arca daemon identity unavailable: ${reason}`),
-  });
-  return run;
-}
-
-const arcaConnectFlow = createArcaConnectFlow({
-  BrowserWindow,
-  ipcMain,
-  pagePath: path.join(__dirname, "..", "arca-connect", "index.html"),
-  preloadPath: path.join(__dirname, "arca_connect_preload.js"),
-  startConnect: (serverUrl, onOutput) => startArcaHostConnect(serverUrl, { onOutput }),
-  startLogin: (serverUrl) => arca.startArcaLogin(serverUrl),
-  loginCommandLine: (serverUrl) => {
-    try {
-      return `arca ${arca.buildLoginArgs(serverUrl).join(" ")}`;
-    } catch {
-      return "arca ssh isaac omni login …";
-    }
-  },
-  commandLine: (serverUrl) => {
-    try {
-      return `arca ${arca.buildConnectArgs(serverUrl).join(" ")}`;
-    } catch {
-      return "arca ssh isaac omni host …"; // the run itself re-validates and fails loud
-    }
-  },
-  log: (message) => console.log(`[omnigent] ${message}`),
-});
 
 /** Shell-owned flow for connecting a remote machine over SSH (ssh_connect.js). */
 const sshConnectFlow = createSshConnectFlow({
@@ -1338,18 +1298,6 @@ function setWindowServerUrl(win, serverUrl) {
 }
 
 /**
- * The URL a window's Arca host connects to: the one the user picked, even after
- * sign-in moved to another host, so one server keeps one Arca host.
- *
- * @param {Electron.BrowserWindow | null} win
- * @returns {string | null}
- */
-function windowArcaServerUrl(win) {
-  const state = win ? windows.get(win) : undefined;
-  return state?.arcaServerUrl ?? state?.serverUrl ?? null;
-}
-
-/**
  * Record the version manifest of the server a window connected to (see
  * `fetchServerManifest` in src/url.js). Stored per-window because different
  * windows can be pinned to different servers — and therefore to servers of
@@ -2072,12 +2020,6 @@ async function loadServerUrl(
     const windowState = windows.get(win);
     if (windowState) {
       windowState.authKind = null;
-      // An explicit connect targets what was typed; a restore or switch lands on
-      // the workspace host and maps back to the URL picked for it.
-      windowState.arcaServerUrl =
-        (!interactive &&
-          serverLabel(parseServerLabels(loadSettings().server_labels), requestedServerUrl)) ||
-        requestedServerUrl;
     }
     let target = loadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
     let manifest = null;
@@ -5033,36 +4975,6 @@ function registerIpc() {
       };
     }
     return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
-  });
-
-  // SPA → connect the user's Arca instance to the window's server as a host,
-  // by running `isaac omni host --background` on the instance over `arca ssh`.
-  // Gated three ways: pinned-origin sender, the managed features flag re-checked
-  // HERE (the renderer is not trusted to have checked it), and user consent in
-  // the connect console (arca_connect_window.js), which shows the exact command.
-  // A connect already in flight is re-surfaced, never refused. The runner
-  // enforces CONNECT_TIMEOUT_MS so a wedged command always settles.
-  ipcMain.handle("omnigent:arca-connect", async (event) => {
-    if (!isPinnedOriginSender(event)) {
-      throw new Error("arca-connect is only available to a connected server page");
-    }
-    if (!databricksInternalFeaturesEnabled()) {
-      return { ok: false, error: "Arca support is not enabled on this machine." };
-    }
-    const serverUrl = senderServerUrl(event);
-    if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
-    // Same scope as get-desktop-features, re-checked here: an Arca instance may
-    // only be enrolled against a managed server.
-    if (!isDatabricksManagedServerUrl(serverUrl)) {
-      return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
-    }
-    const win = BrowserWindow.fromWebContents(event.sender);
-    const arcaServerUrl = windowArcaServerUrl(win);
-    // It can come from a settings label, so it passes the same gate.
-    if (!isDatabricksManagedServerUrl(arcaServerUrl)) {
-      return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
-    }
-    return arcaConnectFlow.run(win, arcaServerUrl);
   });
 
   // Push a status ping when a host child connects or exits on its own (no

@@ -242,12 +242,6 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * Resolves null off a connected server.
    */
   getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
-  /**
-   * Connect the user's Arca instance to the window's
-   * server as a host, via `arca ssh`. Native consent is asked in the main
-   * process. Resolves a `{ ok, error?, authError? }` result.
-   */
-  connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
   // Windows' built-in ssh can't share one connection, so it gets this later.
   ...(process.platform === "win32"
     ? {}
@@ -341,7 +335,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} url
    * @param {{x:number,y:number,width:number,height:number,devicePixelRatio?:number}} [bounds]
-   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, sessionHostProtocol?: number, rememberedArcaHostId?: string}} [opts]
+   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, sessionHostProtocol?: number}} [opts]
    */
   browserOpenOrNavigate: (conversationId, url, bounds, opts) =>
     ipcRenderer.invoke("omnigent:browser-open-or-navigate", { conversationId, url, bounds, opts }),

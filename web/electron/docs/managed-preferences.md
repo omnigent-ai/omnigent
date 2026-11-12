@@ -63,37 +63,9 @@ and saved servers still reconnect on launch. Other platforms
 keep the legacy default; `OMNIGENT_SERVER_SELECTOR_V2=1` still
 forces V2.
 
-When `databricksInternalFeaturesEnabled` is `true` **and** the window is
-connected to an eligible HTTPS server, the new-session host picker offers
-**Run on Arca**, which connects the user's Arca instance to the current server
-as a host. On any other server
-the Arca option is disabled. Selecting it opens a connect console that shows the
-exact command. After confirmation, the command's live output streams into an
-embedded terminal pane. A connect already in flight is re-surfaced (console
-focused, outcome shared) rather than refused, and the run has a hard timeout so
-a stalled connection always settles. Once connected, the option disappears and
-the box's host row is tagged **Arca instance** (recognized by the host id
-remembered at connect time). Like the server list, the flag is read from macOS
-on demand, so profile changes apply without a restart.
-
-In those same windows, **Run on Arca** replaces connecting a machine over SSH:
-the SSH field under **Connect a host** is hidden and the app refuses an SSH
-connect. Everywhere else, including flagged Macs on a self-hosted server, the
-SSH field stays.
-
-Remote hosts need their own renewable **Omnigent** OAuth grant. Desktop browser
-sign-in does not replace it. During explicit runner setup, an
-authentication-required result starts `isaac omni login <server-url>` on Arca
-and retries the noninteractive host command once after sign-in. The connect
-console does the same after the same consent click. Tokens and login output are
-not forwarded to the desktop renderer. Closing the sign-in console cancels the
-command.
-
-A server URL can include `/omnigent?o=<workspace-id>` to select the workspace;
-the same full server URL is used for remote login and host startup.
-Connection status and overlapping setup sign-ins are shared only for the same
-full target, including `?o=`. Closing one setup window leaves a shared sign-in
-running for the others; closing the last waiting window cancels it.
+On macOS and Linux, **Connect a host** can enroll a machine over SSH using an
+alias, host name, or `user@host`. The SSH console asks for consent, handles SSH
+prompts and remote sign-in, and keeps remote credentials on that host.
 
 ## MDM profile example
 
