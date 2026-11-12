@@ -1327,6 +1327,20 @@ export function CreateScheduledTaskDialog({
       onSelectOpenChange={handleSelectOpenChange}
     />
   );
+  const workerFields = workerSettings !== null && (
+    <TriggerWorkerSettingsFields
+      value={workerSettings}
+      settings={workerHarnessSettings}
+      permissionModesSupported={sessionPermissionModesSupported}
+      pollingPermissionMode={effectivePermission}
+      taskSession={sendsToTaskSession}
+      creating={creatingTriggerWorkers}
+      followsPolling={creatingTriggerWorkers && newTriggerWorkerSettings === null}
+      disabled={curationPending}
+      onSelectOpenChange={handleSelectOpenChange}
+      onChange={handleWorkerSettingsChange}
+    />
+  );
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
@@ -2028,16 +2042,7 @@ export function CreateScheduledTaskDialog({
                           >
                             <SettingsGroupHeading>{workerGroupName}</SettingsGroupHeading>
                             {workerSettings !== null && editingTask ? (
-                              <TriggerWorkerSettingsFields
-                                value={workerSettings}
-                                settings={workerHarnessSettings}
-                                permissionModesSupported={sessionPermissionModesSupported}
-                                pollingPermissionMode={effectivePermission}
-                                taskSession={sendsToTaskSession}
-                                disabled={curationPending}
-                                onSelectOpenChange={handleSelectOpenChange}
-                                onChange={handleWorkerSettingsChange}
-                              />
+                              workerFields
                             ) : (
                               <p className="text-sm text-muted-foreground" role="status">
                                 Worker controls are unavailable for these customized instructions.
@@ -2132,18 +2137,7 @@ export function CreateScheduledTaskDialog({
                           {showAdvanced && creatingTriggerWorkers && workerSettings !== null && (
                             <div className="space-y-3 border-t border-border pt-4">
                               <SettingsGroupHeading>{workerGroupName}</SettingsGroupHeading>
-                              <TriggerWorkerSettingsFields
-                                value={workerSettings}
-                                settings={workerHarnessSettings}
-                                permissionModesSupported={sessionPermissionModesSupported}
-                                pollingPermissionMode={effectivePermission}
-                                taskSession={sendsToTaskSession}
-                                creating
-                                followsPolling={newTriggerWorkerSettings === null}
-                                disabled={curationPending}
-                                onSelectOpenChange={handleSelectOpenChange}
-                                onChange={handleWorkerSettingsChange}
-                              />
+                              {workerFields}
                             </div>
                           )}
                         </>

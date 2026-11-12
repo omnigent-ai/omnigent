@@ -62,6 +62,13 @@ export function ModelEffortFields({
     (option) => settings.harness === "claude-native" || option.value !== "default",
   );
   const inheritsPermission = Boolean(inheritedPermissionLabel) && permissionMode === "";
+  let permissionSelectValue = permissionMode;
+  if (inheritsPermission) permissionSelectValue = PERMISSION_SELECT_INHERITED;
+  else if (
+    permissionMode === "" ||
+    (settings.harness !== "claude-native" && permissionMode === "default")
+  )
+    permissionSelectValue = PERMISSION_SELECT_DEFAULT;
 
   return (
     <div className="flex flex-col gap-3 sm:gap-4">
@@ -158,14 +165,7 @@ export function ModelEffortFields({
           <Label htmlFor={`${idPrefix}-permission`}>Permissions</Label>
           <Select
             disabled={disabled}
-            value={
-              inheritsPermission
-                ? PERMISSION_SELECT_INHERITED
-                : permissionMode === "" ||
-                    (settings.harness !== "claude-native" && permissionMode === "default")
-                  ? PERMISSION_SELECT_DEFAULT
-                  : permissionMode
-            }
+            value={permissionSelectValue}
             componentId="tasks.scheduled.permission_mode"
             valueHasNoPii
             onValueChange={(v) => {
