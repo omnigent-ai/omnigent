@@ -4458,6 +4458,13 @@ class HostProcess:
                 cast("str | None", params.get("pr_url")),
                 commit_sha=cast("str | None", params.get("commit_sha")),
             )
+        if op == "github_compare_diff":
+            return r.github_compare_diff(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+                from_sha=cast("str | None", params.get("from_sha")),
+            )
         if op == "github_labels":
             return r.github_labels(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_merge_options":

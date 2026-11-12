@@ -743,7 +743,7 @@ export interface PullRequestDiffResponse {
 /** GET one patch resource of the session's GitHub panel: the whole PR, or one commit. */
 async function fetchPullRequestPatch(
   conversationId: string,
-  resource: "diff" | "commit-diff",
+  resource: "diff" | "commit-diff" | "compare-diff",
   query: string,
 ): Promise<PullRequestDiffResponse> {
   const res = await authenticatedFetch(
@@ -798,6 +798,8 @@ export interface PullRequestCommit {
   author: string | null;
   /** The git author date, ISO 8601. */
   date: string | null;
+  /** Other pull requests whose head is this commit, such as a stacked PR's parent. */
+  head_of?: { number: number; url: string | null; state: string | null }[];
 }
 
 /** The most commits the server lists for one pull request (GitHub's own limit). */
@@ -906,20 +908,45 @@ async function fetchPullRequestCommitDiff(
   );
 }
 
+async function fetchPullRequestChangesSince(
+  conversationId: string,
+  prUrl: string,
+  commitSha: string,
+  headSha: string,
+): Promise<PullRequestDiffResponse> {
+  const query = new URLSearchParams({ pr_url: prUrl, head_sha: headSha, from_sha: commitSha });
+  return fetchPullRequestPatch(conversationId, "compare-diff", `?${query}`).catch(
+    (error: unknown) => {
+      // A peer without the route still serves single commits, so only this view is unavailable.
+      if (error instanceof PullRequestApiError && error.status === 404) {
+        throw new Error(
+          "Showing changes since a commit needs an updated Omnigent server and host.",
+        );
+      }
+      throw error;
+    },
+  );
+}
+
 /**
- * One commit's patch, read by its full id. Enabled only while a commit is open.
- * A commit's patch never changes, so it stays fresh for the whole cache lifetime.
+ * One commit's patch, read by its full id, or with `untilHeadSha` the PR's changes after
+ * that commit up to that head. Enabled only while a commit is picked. Both ends are fixed
+ * commits, so the patch never changes and stays fresh for the whole cache lifetime.
  */
 export function usePullRequestCommitDiff(
   conversationId: string | undefined,
   prUrl: string | undefined,
   commitSha: string | null,
+  untilHeadSha: string | null = null,
 ) {
   const serveable = useWorkspaceServeable(conversationId);
   const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
-    queryKey: ["github-pr-commit-diff", conversationId, prUrl, commitSha],
-    queryFn: () => fetchPullRequestCommitDiff(conversationId!, prUrl!, commitSha!),
+    queryKey: ["github-pr-commit-diff", conversationId, prUrl, commitSha, untilHeadSha],
+    queryFn: () =>
+      untilHeadSha
+        ? fetchPullRequestChangesSince(conversationId!, prUrl!, commitSha!, untilHeadSha)
+        : fetchPullRequestCommitDiff(conversationId!, prUrl!, commitSha!),
     enabled: !!conversationId && !!prUrl && !!commitSha && serveable !== false,
     retry,
     retryDelay: runnerOfflineRetryDelay,

@@ -3003,6 +3003,45 @@ def register_resources_routes(
         )
 
     @file_read_router.get(
+        "/sessions/{session_id}/resources/github/compare-diff",
+        # Internal (UI "Changes since" view) — hidden from the public API reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def read_github_compare_diff(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+        head_sha: str | None = None,
+        from_sha: str | None = None,
+    ) -> Any:
+        """
+        Return the selected PR's changes after one of its commits, up to its head.
+
+        Falls back to the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param head_sha: The PR head the panel shows, a full commit id.
+        :param from_sha: One of the PR's commits, a full commit id.
+        :returns: JSON with the ``patch`` text.
+        """
+        conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if head_sha is not None:
+            params["head_sha"] = head_sha
+        if from_sha is not None:
+            params["from_sha"] = from_sha
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_compare_diff",
+            host_params=params,
+            runner_params=params or None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/compare-diff",
+        )
+
+    @file_read_router.get(
         "/sessions/{session_id}/resources/github/diff/{relative_path:path}",
         # Internal (UI GitHub diff view) — hidden from the public API reference.
         include_in_schema=False,
