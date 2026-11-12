@@ -624,7 +624,12 @@ function renderShell(
             <ForkDialogProbe />
             <NavProbe />
             {options.sessionNavTo && <SessionNavButton to={options.sessionNavTo} />}
-            {options.dirtyFileViewer && <DirtyFileViewerProbe />}
+            {options.dirtyFileViewer && (
+              <>
+                <DirtyFileViewerProbe />
+                <PathDisplay />
+              </>
+            )}
             <LocationDisplay />
           </>
         }
@@ -814,6 +819,56 @@ afterEach(() => {
 });
 
 describe("AppShell session overview", () => {
+  it("guards child navigation until unsaved parent edits are explicitly left", () => {
+    mockConversations([
+      { id: "conv_parent", permission_level: null },
+      { id: "conv_child", permission_level: null },
+    ]);
+    useChildSessionsMock.mockImplementation((id) => ({
+      children:
+        id === "conv_parent"
+          ? [
+              {
+                id: "conv_child",
+                title: "Review changes",
+                task_summary: "Review changes",
+                tool: "agent",
+                session_name: "review",
+                current_task_status: "completed",
+                busy: false,
+                last_message_preview: null,
+                pending_elicitations_count: 0,
+              },
+            ]
+          : [],
+      isLoading: false,
+      error: null,
+    }));
+    renderShell(
+      "/c/conv_parent?file=draft.md&debug=1",
+      serverInfo({ features: { session_overview: true } }),
+      { dirtyFileViewer: true },
+    );
+    const openChild = () => {
+      fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
+      fireEvent.click(screen.getByRole("link", { name: /Review changes/ }));
+    };
+    const expectParent = () => {
+      expect(screen.getByTestId("url-pathname")).toHaveTextContent("/c/conv_parent");
+      expect(screen.getByTestId("url-params")).toHaveTextContent("file=draft.md");
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "draft.md");
+    };
+    openChild();
+    expectParent();
+    fireEvent.click(screen.getByRole("button", { name: "cancel leaving" }));
+    expectParent();
+    openChild();
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(screen.getByTestId("url-pathname")).toHaveTextContent("/c/conv_child");
+    expect(screen.getByTestId("url-params").textContent).toBe("debug=1");
+    expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+  });
+
   it.each([
     { action: "View all agents →", tab: "Agents", overview: true },
     { action: "View changes →", tab: "Changes", overview: true },

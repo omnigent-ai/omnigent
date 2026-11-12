@@ -1,5 +1,7 @@
+import { MemoryRouter } from "react-router-dom";
+import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext";
 import { renderHook } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
 import { SubagentPanelOpenerContext, useOpenSubagentInPanel } from "./subagentPanelOpener";
@@ -20,13 +22,34 @@ function plainClick() {
   };
 }
 
-function renderWithOpener(opener: ((id: string) => boolean) | null) {
-  const wrapper = ({ children }: { children: ReactNode }) => (
-    <SubagentPanelOpenerContext.Provider value={opener}>
-      {children}
-    </SubagentPanelOpenerContext.Provider>
-  );
-  return renderHook(() => useOpenSubagentInPanel(), { wrapper }).result.current;
+function renderWithOpener(
+  opener: ((id: string) => boolean) | null,
+  guardFileNavigation?: FileNavigationGuard,
+) {
+  function Wrapper({ children }: { children: ReactNode }) {
+    const fileViewer = useMemo(
+      () => ({
+        openFile: vi.fn(),
+        openGithubTab: vi.fn(),
+        isChangedPath: () => false,
+        conversationId: "conv_parent",
+        workspaceRoot: null,
+        workspaceHome: null,
+        guardFileNavigation,
+      }),
+      [],
+    );
+    return (
+      <MemoryRouter>
+        <FileViewerContext.Provider value={fileViewer}>
+          <SubagentPanelOpenerContext.Provider value={opener}>
+            {children}
+          </SubagentPanelOpenerContext.Provider>
+        </FileViewerContext.Provider>
+      </MemoryRouter>
+    );
+  }
+  return renderHook(() => useOpenSubagentInPanel(), { wrapper: Wrapper }).result.current;
 }
 
 afterEach(() => {
@@ -72,10 +95,12 @@ describe("useOpenSubagentInPanel", () => {
   ])("keeps navigation for a %s click", (_name, modifiers) => {
     writeOpenSubagentsInPanel(true);
     const opener = vi.fn(() => true);
-    const openInPanel = renderWithOpener(opener);
+    const guard = vi.fn();
+    const openInPanel = renderWithOpener(opener, guard);
 
     expect(openInPanel("conv_child", { ...plainClick(), ...modifiers })).toBe(false);
     expect(opener).not.toHaveBeenCalled();
+    expect(guard).not.toHaveBeenCalled();
   });
 
   it("keeps navigation on a phone viewport", () => {

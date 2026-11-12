@@ -1,5 +1,8 @@
 import { createContext, useCallback, useContext } from "react";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useLocation, useNavigate } from "@/lib/routing";
+import { sessionNavigationSearch } from "@/lib/sessionNavigation";
+import { FileViewerContext } from "./FileViewerContext";
 import { readOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
 
 /**
@@ -21,8 +24,8 @@ interface SubagentLinkClick {
 }
 
 /**
- * Click handler for sub-agent links. For a plain desktop click with the setting
- * on, it opens the tab, cancels the link's navigation and returns true.
+ * Handles plain sub-agent clicks through the file guard, opening a Workspace tab
+ * when enabled or navigating to the child. Returns true when the click is handled.
  */
 export function useOpenSubagentInPanel(): (
   childSessionId: string,
@@ -30,16 +33,32 @@ export function useOpenSubagentInPanel(): (
 ) => boolean {
   const opener = useContext(SubagentPanelOpenerContext);
   const isMobile = useIsMobileViewport();
+  const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
+  const navigate = useNavigate();
+  const location = useLocation();
   return useCallback(
     (childSessionId, event) => {
-      if (opener === null || isMobile || !readOpenSubagentsInPanel()) return false;
       if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
         return false;
       }
-      if (!opener(childSessionId)) return false;
+      const openInPanel = () =>
+        opener !== null && !isMobile && readOpenSubagentsInPanel() && opener(childSessionId);
+      if (guardFileNavigation) {
+        event.preventDefault();
+        guardFileNavigation(null, undefined, () => {
+          if (!openInPanel()) {
+            navigate({
+              pathname: `/c/${childSessionId}`,
+              search: sessionNavigationSearch(location.search),
+            });
+          }
+        });
+        return true;
+      }
+      if (!openInPanel()) return false;
       event.preventDefault();
       return true;
     },
-    [opener, isMobile],
+    [opener, isMobile, guardFileNavigation, navigate, location.search],
   );
 }

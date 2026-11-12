@@ -7378,7 +7378,11 @@ async def test_external_session_usage_cost_is_monotonic(
         f"/v1/sessions/{session['id']}/events",
         json={
             "type": "external_session_usage",
-            "data": {"cumulative_cost_usd": 0.90, "policy_cost_usd": 0.95},
+            "data": {
+                "cumulative_cost_usd": 0.90,
+                "policy_cost_usd": 0.95,
+                "attributed_cost_usd": 0.80,
+            },
         },
     )
     assert high.status_code == 202, high.text
@@ -7388,7 +7392,11 @@ async def test_external_session_usage_cost_is_monotonic(
         f"/v1/sessions/{session['id']}/events",
         json={
             "type": "external_session_usage",
-            "data": {"cumulative_cost_usd": 0.0, "policy_cost_usd": 0.0},
+            "data": {
+                "cumulative_cost_usd": 0.0,
+                "policy_cost_usd": 0.0,
+                "attributed_cost_usd": 0.0,
+            },
         },
     )
     assert low.status_code == 202, low.text
@@ -7396,6 +7404,7 @@ async def test_external_session_usage_cost_is_monotonic(
     usage = _read_session_usage(db_uri, session["id"])
     assert usage.get("total_cost_usd") == 0.90
     assert usage.get("policy_cost_usd") == 0.95
+    assert usage.get("attributed_cost_usd") == 0.80
 
 
 async def test_external_session_usage_codex_tokens_priced(
