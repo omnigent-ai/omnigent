@@ -2689,6 +2689,25 @@ def register_events_routes(
             # A confirmed turn completion after a failure means a later turn
             # succeeded, so the earlier failure must not outlive it.
             turn_completed = status == "idle" and data.get("turn_completed") is True
+            harness: str | None = None
+            harness_resolved = False
+            reports_turn_end = False
+            if status == "idle" and session_triggers.enabled():
+                harness = await asyncio.to_thread(
+                    _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+                )
+                harness_resolved = True
+                # The same rule as a sub-agent's return: a Claude idle without its
+                # Stop hook is an activity observation, not the end of the turn.
+                reports_turn_end = (
+                    native_subagent_terminal_status(
+                        status,
+                        harness=harness,
+                        turn_outcome=data.get("turn_outcome"),
+                        turn_completed=data.get("turn_completed"),
+                    )
+                    == "completed"
+                )
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
             )
@@ -2710,6 +2729,7 @@ def register_events_routes(
                 status,
                 status_error,
                 turn_completed=turn_completed,
+                reports_turn_end=reports_turn_end,
                 failure_origin="external_session_status",
                 failure_intake=failure_intake,
                 failure_context=data.get("failure_context"),
@@ -2723,12 +2743,13 @@ def register_events_routes(
                 and status in {"idle", "failed"}
                 and conv.labels.get("omnigent.wrapper") != "claude-code-native-ui-subagent"
             ):
-                harness = await asyncio.to_thread(
-                    _native_pane_harness,
-                    conv,
-                    agent_store=agent_store,
-                    agent_cache=agent_cache,
-                )
+                if not harness_resolved:
+                    harness = await asyncio.to_thread(
+                        _native_pane_harness,
+                        conv,
+                        agent_store=agent_store,
+                        agent_cache=agent_cache,
+                    )
                 outcome = native_subagent_terminal_status(
                     status,
                     harness=harness,

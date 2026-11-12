@@ -5128,6 +5128,7 @@ def _publish_status(
     disconnect_evidence: Mapping[str, str] | None = None,
     turn_completed: bool = False,
     background_agents: list[BackgroundTaskInfo] | None = None,
+    reports_turn_end: bool = False,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -5171,6 +5172,10 @@ def _publish_status(
     :param background_agents: Background agents a finished claude-native turn
         left running, on its ``"waiting"`` edge. Kept for snapshots until the
         next non-``waiting`` edge; ignored on every other status.
+    :param reports_turn_end: Whether an ``"idle"`` edge is the caller's proof that
+        a turn finished, which session triggers report as ``turn.completed``. Idle
+        also marks transcript lulls, PTY quiet, stops and undelivered input, so
+        only a caller holding a terminal signal sets it.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -5214,13 +5219,16 @@ def _publish_status(
         session_pull_requests.notify_turn_end(session_id)
     if (
         status == "idle"
+        and reports_turn_end
         and persist_live_status
         and (
             previous_status in ("running", "waiting")
-            # A confirmed completion counts after a previous turn's late failure,
-            # and when a short turn ended before its running edge was seen; its
-            # response ID keys it, so a replayed completion records nothing new.
-            or (turn_completed and (previous_status == "failed" or response_id is not None))
+            # A reported end counts when its running edge was never seen (a short
+            # turn, or a forwarder's end after the relay's PTY idle): its response
+            # ID keys it, so a replay records nothing new.
+            or response_id is not None
+            # A confirmed completion also clears a previous turn's late failure.
+            or (turn_completed and previous_status == "failed")
         )
     ):
         # Native harnesses settle turns only through these edges, never response events.

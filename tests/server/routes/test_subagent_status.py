@@ -23,6 +23,7 @@ from omnigent.server import session_live_state, session_metadata_logging
 from omnigent.server.routes import sessions
 from omnigent.server.routes._sessions import common
 from omnigent.server.routes.sessions import routes_events
+from omnigent.server.scheduled import session_triggers
 from omnigent.server.schemas import BackgroundTaskInfo, ErrorDetail
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -51,6 +52,15 @@ class _StatusRoute:
     published: Mock
     telemetry: Mock
     forwarded: list[tuple[str, dict[str, Any]]]
+    # (event type, session, occurrence) for each session-trigger notification.
+    triggered: list[tuple[str, str, str | None]]
+
+    def completed_turns(self, session_id: str) -> list[str | None]:
+        return [
+            occurrence
+            for event_type, sid, occurrence in self.triggered
+            if event_type == "turn.completed" and sid == session_id
+        ]
 
 
 @pytest.fixture
@@ -121,6 +131,15 @@ async def status_route(
         monkeypatch.setattr(sessions, "_get_runner_client", get_runner_client)
         monkeypatch.setattr(session_stream, "publish", published)
         monkeypatch.setattr(routes_events, "_tel_emit", telemetry)
+        triggered: list[tuple[str, str, str | None]] = []
+        monkeypatch.setattr(session_triggers, "enabled", lambda: True)
+        monkeypatch.setattr(
+            session_triggers,
+            "notify",
+            lambda event_type, sid, occurrence=None, **_: triggered.append(
+                (event_type, sid, occurrence)
+            ),
+        )
         session_live_state.configure(store, scheduled)
         try:
             yield _StatusRoute(
@@ -133,6 +152,7 @@ async def status_route(
                 published,
                 telemetry,
                 forwarded,
+                triggered,
             )
         finally:
             await _flush_live_state()
@@ -241,6 +261,8 @@ async def test_subagent_idle_publishes_status_without_completion(
         assert len(events) == 1
     assert route.forwarded == []
     route.telemetry.assert_not_called()
+    # A transcript lull is not the end of a turn, so no automation hears of one.
+    assert route.completed_turns(sid) == []
 
 
 @pytest.mark.parametrize("fail_idle_top_level", [False, True])
@@ -563,6 +585,7 @@ async def test_claude_child_idle_observations_do_not_complete_new_response_ids(
             )
             assert response.status_code == 202, response.text
             assert len(route.store.list_items(route.parent_id).data) == turn
+            assert len(route.completed_turns(route.child_id)) == turn
 
         response = await route.client.post(
             f"/v1/sessions/{route.child_id}/events",
@@ -581,6 +604,9 @@ async def test_claude_child_idle_observations_do_not_complete_new_response_ids(
         assert all(item.data.event_type == "session.subagent.returned" for item in notices)
         assert all(item.data.resource_id == route.child_id for item in notices)
         assert all(item.data.resource["status"] == "completed" for item in notices)
+        assert route.completed_turns(route.child_id) == [
+            f"claude-turn-{done}-observation-2" for done in range(turn + 1)
+        ]
 
 
 @pytest.mark.parametrize(
@@ -752,6 +778,11 @@ async def test_native_child_completes_once_per_confirmed_turn(
         assert all(item.data.event_type == "session.subagent.returned" for item in notices)
         assert all(item.data.resource_id == route.child_id for item in notices)
         assert all(item.data.resource["status"] == "completed" for item in notices)
+        # Only the forwarder's completion counts, never the delivery acknowledgment;
+        # its repeat carries the same occurrence, which the store records once.
+        assert set(route.completed_turns(route.child_id)) == {
+            f"native-turn-{done}" for done in range(index + 1)
+        }
 
 
 async def test_bare_external_failure_preserves_intake_presence_before_enrichment(
@@ -779,3 +810,29 @@ async def test_bare_external_failure_preserves_intake_presence_before_enrichment
     assert attributes["active_response_id_at_failure"] == "resp_active"
     assert route.store.get_conversation(route.child_id) is not None
     assert common._session_status_cache[route.child_id] == "failed"
+
+
+async def test_a_runner_driven_turn_reports_its_completion_once(
+    status_route: _StatusRoute,
+) -> None:
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    route = status_route
+    route.store.update_conversation(route.parent_id, harness_override="claude-sdk")
+    release = asyncio.Event()
+    release.set()
+    await _relay_runner_stream_once(
+        route.parent_id,
+        _ScriptedRunnerClient(
+            release,
+            [
+                {"type": "response.in_progress", "response": {"id": "resp_sdk"}},
+                {"type": "session.status", "status": "running"},
+                {"type": "response.completed", "response": {"id": "resp_sdk"}},
+                # The idle edge after it is not a second report.
+                {"type": "session.status", "status": "idle"},
+            ],
+        ),
+        route.store,
+    )
+    assert route.completed_turns(route.parent_id) == ["resp_sdk"]

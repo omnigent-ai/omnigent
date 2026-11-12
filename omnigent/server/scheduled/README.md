@@ -326,9 +326,11 @@ the server's own session events: `session.created`, `session.renamed`,
 - The server queues each event where it happens; one background worker matches
   it and records runs, so the request path does no extra database work. A run
   survives a replica restart once it is recorded; an event still queued when
-  the replica stops is lost. Native Claude and Codex turns are seen through
-  their `session.status` edges, including a confirmed completion that arrives
-  after a previous turn's late failure.
+  the replica stops is lost. A turn the runner drives ends at its
+  `response.completed`. A native turn ends when its forwarder reports it
+  (Claude's `Stop` hook, Codex's turn end), by the rule a sub-agent's return
+  uses, including a confirmed completion after a previous turn's late failure.
+  An idle edge alone (a transcript lull, PTY quiet, a stop) is not a turn end.
 - Only sessions the owner holds a grant on (their own, or shared with them)
   fire; admin access and public sessions don't count. A sub-agent session is
   checked through its root.

@@ -50,6 +50,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.harness_aliases import is_native_harness
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_CLI_UNRESPONSIVE,
@@ -7126,6 +7127,31 @@ def _opens_codex_side_chat(harness: str | None, body: SessionEventInput) -> bool
     )
 
 
+async def _report_runner_turn_completed(
+    session_id: str, response: object, conversation_store: ConversationStore
+) -> None:
+    """Report a finished turn of a harness the runner drives to session triggers.
+
+    A native harness's ``response.completed`` only acknowledges that the prompt
+    reached its terminal; its forwarder's ``external_session_status`` reports the
+    turn's end instead.
+
+    :param session_id: Session whose turn completed, e.g. ``"conv_abc"``.
+    :param response: The event's ``response`` object, whose ``id`` keys the occurrence.
+    :param conversation_store: Store read for the session's harness.
+    """
+    if not session_triggers.enabled():
+        return
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None or is_native_harness(await asyncio.to_thread(_native_pane_harness, conv)):
+        return
+    raw_id = response.get("id") if isinstance(response, dict) else None
+    response_id = raw_id if isinstance(raw_id, str) and raw_id else None
+    session_triggers.notify(
+        "turn.completed", session_id, occurrence=response_id, response_id=response_id
+    )
+
+
 def _native_pane_harness(
     conv: Conversation,
     *,
@@ -9982,6 +10008,9 @@ async def _relay_runner_stream_once(
                                 conversation_store,
                             )
                     if evt_type == "response.completed":
+                        await _report_runner_turn_completed(
+                            session_id, event.get("response"), conversation_store
+                        )
                         # Persist the turn's usage (cost + token buckets) so
                         # policy callables can read
                         # event["context"]["usage"]["total_cost_usd"] and the
