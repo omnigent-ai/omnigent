@@ -252,7 +252,7 @@ function renderWorkspace(
   let overrides = initialOverrides;
   const openFileViewer = vi.fn();
   const onCloseFile = vi.fn();
-  const onRightRailTabChange = vi.fn();
+  const onRightRailTabChange = vi.fn((_next: unknown, afterCommit?: () => void) => afterCommit?.());
   const onClosePanel = vi.fn();
   const onReveal = vi.fn();
   const openTerminalTab = vi.fn();
@@ -482,9 +482,15 @@ describe("WorkspacePanel surface presentation", () => {
       ).toBe(true);
     }
     expect(desktop.onReveal).not.toHaveBeenCalled();
+    desktop.onRightRailTabChange.mockImplementationOnce(() => {});
     expect(fireEvent.keyDown(window, { code: "KeyF", ctrlKey: true, shiftKey: true })).toBe(false);
+    expect(desktop.onReveal).not.toHaveBeenCalled();
+    act(() => desktop.onRightRailTabChange.mock.calls.at(-1)?.[1]?.());
     expect(desktop.onReveal).toHaveBeenCalledOnce();
-    expect(desktop.onRightRailTabChange).toHaveBeenCalledWith("content-search");
+    expect(desktop.onRightRailTabChange).toHaveBeenCalledWith(
+      "content-search",
+      expect.any(Function),
+    );
   });
 
   it("gates content search and exposes it in the tab strip and panel picker", async () => {
@@ -514,7 +520,10 @@ describe("WorkspacePanel surface presentation", () => {
     );
     enabled.onRightRailTabChange.mockClear();
     pressTabNumber(5);
-    expect(enabled.onRightRailTabChange).toHaveBeenLastCalledWith("content-search");
+    expect(enabled.onRightRailTabChange).toHaveBeenLastCalledWith(
+      "content-search",
+      enabled.onReveal,
+    );
 
     writePinnedWorkspaceTabs([]);
     enabled.rerender({ rightRailTab: "content-search" });
@@ -627,15 +636,18 @@ describe("WorkspacePanel surface presentation", () => {
       workspaceTabAriaShortcut("4"),
     );
 
+    onRightRailTabChange.mockImplementationOnce(() => {});
     expect(pressTabNumber(2)).toBe(false);
+    expect(onReveal).not.toHaveBeenCalled();
+    act(() => onRightRailTabChange.mock.calls.at(-1)?.[1]?.());
     // No fifth fixed tab: the key passes through.
     expect(pressTabNumber(5)).toBe(true);
     expect(pressTabNumber(4)).toBe(false);
     // A bare digit types as usual.
     fireEvent.keyDown(changes, { key: "3", code: "Digit3" });
 
-    expect(onRightRailTabChange).toHaveBeenNthCalledWith(1, "files");
-    expect(onRightRailTabChange).toHaveBeenNthCalledWith(2, "subagents");
+    expect(onRightRailTabChange).toHaveBeenNthCalledWith(1, "files", onReveal);
+    expect(onRightRailTabChange).toHaveBeenNthCalledWith(2, "subagents", onReveal);
     expect(onRightRailTabChange).toHaveBeenCalledTimes(2);
     expect(onReveal).toHaveBeenCalledTimes(2);
   });
@@ -673,7 +685,7 @@ describe("WorkspacePanel surface presentation", () => {
     );
 
     pressTabNumber(3);
-    expect(onRightRailTabChange).toHaveBeenCalledWith("subagents");
+    expect(onRightRailTabChange).toHaveBeenCalledWith("subagents", expect.any(Function));
   });
 
   it("keeps the remaining order when the default tab is unavailable", () => {

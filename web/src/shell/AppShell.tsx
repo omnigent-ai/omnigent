@@ -2030,7 +2030,7 @@ function AppShellImpl() {
   // per-tab file to stash and restore; switching tabs just closes any
   // open file to reveal the picked tab's scope list.
   const handleRightRailTabChange = useCallback(
-    (next: RightRailTab | null) => {
+    (next: RightRailTab | null, afterCommit?: () => void) => {
       const commit = () => {
         selectRightRailTab(next);
         if (selectedFilePath !== null) {
@@ -2040,6 +2040,7 @@ function AppShellImpl() {
         }
         // Static nav tabs deselect the shell without closing its tab.
         if (selectedTerminalKey !== null) setSelectedTerminalKey(null);
+        afterCommit?.();
       };
       if (selectedFilePath !== null) guardFileNavigation(null, undefined, commit);
       else commit();
@@ -2076,8 +2077,7 @@ function AppShellImpl() {
       // Persist here only for background sessions that have no mounted hook.
       if (sourceConversationId !== conversationId) openBrowserTab(sourceConversationId, tabId);
       if (sourceConversationId === conversationId) {
-        handleRightRailTabChange("browser");
-        setRightPanelOpenAnimated(true);
+        handleRightRailTabChange("browser", () => setRightPanelOpenAnimated(true));
       }
     };
     const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
@@ -2375,8 +2375,7 @@ function AppShellImpl() {
   const openFilesDrawer = useCallback(
     (flatView: boolean) => {
       if (!isMobileViewport()) {
-        handleRightRailTabChange(flatView ? "changes" : "files");
-        revealRightPanel();
+        handleRightRailTabChange(flatView ? "changes" : "files", revealRightPanel);
         return;
       }
       setSelectedFilePath(null); // close file viewer
@@ -2399,8 +2398,7 @@ function AppShellImpl() {
   // Open the agent tree in the desktop workspace or mobile drawer.
   function openSubagentsPanel() {
     if (!isMobileViewport()) {
-      handleRightRailTabChange("subagents");
-      revealRightPanel();
+      handleRightRailTabChange("subagents", revealRightPanel);
       return;
     }
     setSelectedFilePath(null); // close file viewer

@@ -43,7 +43,10 @@ import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTi
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
-import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
+import {
+  readWorkspacePanelDefault,
+  writeWorkspacePanelDefault,
+} from "@/lib/workspacePanelPreferences";
 import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
@@ -441,9 +444,14 @@ function DirtyFileViewerProbe() {
     [registerNavigationGuard],
   );
   return allowLeaving ? (
-    <button type="button" onClick={allowLeaving}>
-      allow leaving
-    </button>
+    <>
+      <button type="button" onClick={allowLeaving}>
+        allow leaving
+      </button>
+      <button type="button" onClick={() => setAllowLeaving(null)}>
+        cancel leaving
+      </button>
+    </>
   ) : null;
 }
 
@@ -831,19 +839,34 @@ describe("AppShell session overview", () => {
         serverInfo({ features: { session_overview: true } }),
         { dirtyFileViewer: true },
       );
-      if (overview) {
-        fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
-        fireEvent.click(screen.getByText(action));
-      } else {
-        fireEvent.mouseDown(screen.getByRole("tab", { name: new RegExp(tab) }));
-      }
-      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "draft.md");
-      expect(screen.getByTestId("url-params").textContent).toContain("file=draft.md");
-      expect(screen.getByRole("tab", { name: new RegExp(tab) })).not.toHaveAttribute(
-        "aria-selected",
-        "true",
-      );
+      if (overview) fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+      const workspaceBefore = readSessionWorkspaceState("conv_overview");
+      const defaultBefore = readWorkspacePanelDefault();
+      const urlBefore = screen.getByTestId("url-params").textContent;
+      const openTab = () => {
+        if (overview) {
+          fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
+          fireEvent.click(screen.getByText(action));
+        } else {
+          fireEvent.mouseDown(screen.getByRole("tab", { name: new RegExp(tab) }));
+        }
+      };
+      const expectUnchanged = () => {
+        expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "draft.md");
+        expect(screen.getByTestId("url-params").textContent).toBe(urlBefore);
+        expect(readSessionWorkspaceState("conv_overview")).toEqual(workspaceBefore);
+        expect(readWorkspacePanelDefault()).toBe(defaultBefore);
+        expect(railOpenState()).toBe(overview ? "closed" : "open");
+      };
+      openTab();
+      expectUnchanged();
+      fireEvent.click(screen.getByRole("button", { name: "cancel leaving" }));
+      expectUnchanged();
+      openTab();
       fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+      expect(railOpenState()).toBe("open");
+      expect(readSessionWorkspaceState("conv_overview").open).toBe(true);
+      if (overview) expect(readWorkspacePanelDefault()).toBe("open");
       expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
       expect(screen.getByTestId("url-params").textContent).not.toContain("file=");
       expect(screen.getByRole("tab", { name: new RegExp(tab) })).toHaveAttribute(

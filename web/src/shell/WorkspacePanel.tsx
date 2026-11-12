@@ -707,7 +707,7 @@ interface WorkspacePanelProps {
    * Switch rail tabs. AppShell owns the side effects (clearing any open
    * file + its comments + URL) so they can't drift from the tab state.
    */
-  onRightRailTabChange: (next: RightRailTab | null) => void;
+  onRightRailTabChange: (next: RightRailTab | null, afterCommit?: () => void) => void;
   /** Unpinned built-in pages opened as closable tabs for this session. */
   openPanels: DefaultWorkspaceTab[];
   onClosePanel: (tab: DefaultWorkspaceTab) => void;
@@ -1257,9 +1257,10 @@ function WorkspacePanelImpl({
         return;
       event.preventDefault();
       event.stopPropagation();
-      onRightRailTabChange("content-search");
-      onReveal?.();
-      setContentSearchFocusSession(conversationId);
+      onRightRailTabChange("content-search", () => {
+        onReveal?.();
+        setContentSearchFocusSession(conversationId);
+      });
     };
     // Capture so workspace search also works from Monaco and terminal inputs.
     window.addEventListener("keydown", handleKeyDown, true);
@@ -1445,13 +1446,14 @@ function WorkspacePanelImpl({
     const index = visiblePermanentTabs.findIndex((candidate) => candidate === tab);
     return index === -1 ? undefined : String(index + 1);
   };
-  const selectPermanentTab = (tab: RightRailTab) => {
+  const selectPermanentTab = (tab: RightRailTab, afterCommit?: () => void) => {
     // Files, Changes and Pull Requests need the session's host, so picking one wakes
     // an asleep sandbox.
     if ((tab === "files" || tab === "changes" || tab === "github") && conversationId) {
       requestSandboxWake(conversationId);
     }
-    onRightRailTabChange(tab);
+    if (afterCommit) onRightRailTabChange(tab, afterCommit);
+    else onRightRailTabChange(tab);
   };
   const tabAriaShortcut = (tab: RightRailTab) => {
     const digit = shortcutFor(tab);
@@ -1462,8 +1464,7 @@ function WorkspacePanelImpl({
   workspaceTabHotkeyRef.current = (index) => {
     const tab = visiblePermanentTabs[index];
     if (!tab || pending || !keyboardTarget) return false;
-    selectPermanentTab(tab);
-    onReveal?.();
+    selectPermanentTab(tab, onReveal);
     return true;
   };
   useWorkspaceTabHotkeys(workspaceTabHotkeyRef);
