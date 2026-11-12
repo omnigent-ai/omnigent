@@ -253,7 +253,11 @@ export function CreateScheduledTaskDialog({
   onCreated?: (task: ScheduledTask) => void;
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
-  const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
+  const {
+    data: hosts,
+    isPending: hostsPending,
+    isError: hostsFailed,
+  } = useHosts({ enabled: open });
   const info = useServerInfo();
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
@@ -713,10 +717,12 @@ export function CreateScheduledTaskDialog({
   const hostOptions = hosts ?? [];
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
-  // Say so when no host can take the automation; a picked offline host has its own note.
+  // Say so when no host can take the automation; a picked offline host has its own note,
+  // and a failed lookup proves nothing about the hosts.
   const showNoHostOnline =
     !sandboxMode &&
     !hostsPending &&
+    !hostsFailed &&
     selectedHost?.status !== "offline" &&
     !hostOptions.some((h) => h.status === "online");
   function handleWorkerSettingsChange(settings: TriggerWorkerSettings) {

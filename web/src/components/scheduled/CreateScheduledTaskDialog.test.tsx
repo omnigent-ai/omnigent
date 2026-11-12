@@ -1483,13 +1483,24 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.getByTestId("task-no-host-online")).toHaveTextContent("No host is connected.");
   });
 
-  it("leaves out the auto-pick promise when editing, which keeps the saved host", () => {
+  it("leaves out the auto-pick promise when editing", () => {
     vi.mocked(hostsHook.useHosts).mockReturnValue({
       data: [],
     } as unknown as ReturnType<typeof hostsHook.useHosts>);
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />);
 
     expect(screen.getByTestId("task-no-host-online")).toHaveTextContent(/^No host is connected\.$/);
+  });
+
+  it("says nothing about hosts when the host lookup fails", () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: undefined,
+      isPending: false,
+      isError: true,
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    renderDialog();
+
+    expect(screen.queryByTestId("task-no-host-online")).not.toBeInTheDocument();
   });
 
   it("shows no host notice when a host is online, an offline host is picked, or a sandbox runs it", () => {
