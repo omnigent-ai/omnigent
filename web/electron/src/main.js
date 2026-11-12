@@ -40,6 +40,8 @@ const { createConnectionLoading } = require("./connection_loading.ts");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window.ts");
 const { registerFileReveal } = require("./fileReveal.ts");
 const { registerFolderChooser } = require("./folderChooser.ts");
+const { createFindBar } = require("./find_bar.ts");
+const { createContextMenu } = require("./context_menu.ts");
 const { ICON_PNG, pagePath, preloadPath } = require("./paths.ts");
 const { withTestOverrides } = require("./testOverrides.ts");
 const fs = require("node:fs");
@@ -300,20 +302,10 @@ function loadSetupPage(win, search = "") {
   });
 }
 
-/** Absolute path to the bundled find-in-page bar page. */
-const FIND_PAGE = pagePath("find");
 // Built by web's `build:overlay` into electron/overlay/ (shipped by
 // electron-builder). Shell-owned so the update UI is independent of the
 // connected server's web-bundle version.
 const UPDATE_OVERLAY_PAGE = pagePath("overlay", "update-overlay.html");
-
-/** The find bar's file:// URL, for verifying IPC sender frames. */
-const FIND_PAGE_URL = pathToFileURL(FIND_PAGE);
-
-/** Find bar dimensions and inset from the parent's top-right corner. */
-const FIND_BAR_WIDTH = 320;
-const FIND_BAR_HEIGHT = 44;
-const FIND_BAR_INSET = 16;
 
 /**
  * Chromium net error for a cancelled/superseded navigation (ERR_ABORTED) —
@@ -2912,242 +2904,28 @@ function createWindow(targetUrl, opts = {}) {
     windows.delete(win);
     updateBadge(); // drop this window's contribution from the app-wide badge
   });
-  attachContextMenu(win);
+  contextMenu.attach(win);
   cascadeIfCovering(win);
   if (savedBounds?.maximized) win.maximize();
   trackWindowBounds(win);
   return win;
 }
 
-/** Maximum number of spelling suggestions offered in the context menu. */
-const MAX_SPELL_SUGGESTIONS = 5;
+// Right-click menu for every shell window's page; see context_menu.ts.
+const contextMenu = createContextMenu({ Menu, clipboard });
 
-/**
- * Attach a right-click context menu to a window's webContents. Electron
- * ships NO context menu by default, so without this there is no
- * copy/paste/spell-suggestion UI anywhere in the app.
- *
- * The menu is built per-invocation from Chromium's hit-test `params`:
- *   - spelling suggestions + "Add to Dictionary" over a misspelled word
- *     (`spellcheck: true` is set on the window's webPreferences),
- *   - Copy Link Address over a link,
- *   - Cut / Copy / Paste / Select All in editable fields, Copy over a
- *     text selection — each enabled per Chromium's `editFlags`.
- * Right-clicking dead space shows nothing (no popup) rather than a menu
- * of disabled items.
- *
- * @param {BrowserWindow} win The shell window to attach to.
- */
-function attachContextMenu(win) {
-  win.webContents.on("context-menu", (_event, params) => {
-    /** @type {Electron.MenuItemConstructorOptions[]} */
-    const template = [];
-
-    if (params.misspelledWord) {
-      for (const suggestion of params.dictionarySuggestions.slice(0, MAX_SPELL_SUGGESTIONS)) {
-        template.push({
-          label: suggestion,
-          click: () => win.webContents.replaceMisspelling(suggestion),
-        });
-      }
-      template.push({
-        label: "Add to Dictionary",
-        click: () => win.webContents.session.addWordToSpellCheckerDictionary(params.misspelledWord),
-      });
-      template.push({ type: "separator" });
-    }
-
-    if (params.linkURL) {
-      template.push({
-        label: "Copy Link Address",
-        click: () => clipboard.writeText(params.linkURL),
-      });
-      template.push({ type: "separator" });
-    }
-
-    if (params.isEditable) {
-      template.push(
-        { role: "cut", enabled: params.editFlags.canCut },
-        { role: "copy", enabled: params.editFlags.canCopy },
-        { role: "paste", enabled: params.editFlags.canPaste },
-        { role: "selectAll", enabled: params.editFlags.canSelectAll },
-      );
-    } else if (params.selectionText.trim() !== "") {
-      template.push({ role: "copy" });
-    }
-
-    // Drop a trailing separator (e.g. link menu over a non-editable,
-    // unselected area) and skip the popup entirely when nothing applies.
-    while (template.length > 0 && template[template.length - 1].type === "separator") {
-      template.pop();
-    }
-    if (template.length === 0) return;
-    Menu.buildFromTemplate(template).popup({ window: win });
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Find in page. Cmd/Ctrl+F opens a small frameless child window (the bundled
-// find/index.html) anchored to the parent's top-right corner; the actual
-// search runs in the main process against the PARENT's webContents via
-// findInPage. A child window (rather than DOM injected into the remote SPA)
-// keeps the shell's hands off server-controlled pages entirely.
-// ---------------------------------------------------------------------------
-
-/**
- * The open find bar per shell window. At most one bar per window; absent
- * when the window has no bar open.
- * @type {Map<BrowserWindow, BrowserWindow>} shell window → its find bar
- */
-const findBars = new Map();
-
-/**
- * Anchor a find bar to its parent's top-right content corner. Called at
- * creation and again whenever the parent moves or resizes.
- *
- * @param {BrowserWindow} target The shell window being searched.
- * @param {BrowserWindow} bar The find bar child window.
- */
-function positionFindBar(target, bar) {
-  if (target.isDestroyed() || bar.isDestroyed()) return;
-  const content = target.getContentBounds();
-  bar.setBounds({
-    x: content.x + content.width - FIND_BAR_WIDTH - FIND_BAR_INSET,
-    y: content.y + FIND_BAR_INSET,
-    width: FIND_BAR_WIDTH,
-    height: FIND_BAR_HEIGHT,
-  });
-}
-
-/**
- * Open the find bar for a shell window (or re-focus the one already open).
- * The bar is a frameless always-on-top-of-parent child window with its own
- * narrow preload (`find_preload.ts`); search results stream back to it via
- * the parent webContents' `found-in-page` event.
- *
- * @param {BrowserWindow} target The shell window to search.
- */
-function openFindBar(target) {
-  // The menu item opens the bar without a page keydown; the page must still
-  // render every transcript row for find to reach off-screen messages.
-  target.webContents.send("omnigent:find-opened");
-  const existing = findBars.get(target);
-  if (existing && !existing.isDestroyed()) {
-    existing.focus();
-    existing.webContents.send("omnigent:find-activate");
-    return;
-  }
-  const bar = new BrowserWindow({
-    parent: target,
-    frame: false,
-    resizable: false,
-    movable: false,
-    minimizable: false,
-    maximizable: false,
-    fullscreenable: false,
-    // Transparent so the page's rounded-corner card is the visible shape.
-    transparent: true,
-    show: false,
-    webPreferences: {
-      preload: preloadPath("find_preload"),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  });
-  findBars.set(target, bar);
-  void bar.loadFile(FIND_PAGE);
-
-  const reposition = () => positionFindBar(target, bar);
-  const onFound = (_event, result) => {
-    if (bar.isDestroyed()) return;
-    bar.webContents.send("omnigent:find-result", {
-      active: result.activeMatchOrdinal,
-      matches: result.matches,
-    });
-  };
-  // Results belong to the searched conversation, so switching closes the bar.
-  const openedIn = findConversationId(target.webContents.getURL());
-  const onNavigate = (_event, url, isMainFrame) => {
-    if (isMainFrame && findConversationId(url) !== openedIn) bar.close();
-  };
-  target.on("resize", reposition);
-  target.on("move", reposition);
-  target.webContents.on("found-in-page", onFound);
-  target.webContents.on("did-navigate-in-page", onNavigate);
-
-  bar.once("ready-to-show", () => {
-    reposition();
-    bar.show();
-  });
-  bar.on("closed", () => {
-    findBars.delete(target);
-    if (target.isDestroyed()) return;
-    target.removeListener("resize", reposition);
-    target.removeListener("move", reposition);
-    target.webContents.removeListener("found-in-page", onFound);
-    target.webContents.removeListener("did-navigate-in-page", onNavigate);
-    // Closing the parent (Cmd+W) destroys its webContents before this child's
-    // "closed" fires, while the parent window itself is not yet destroyed.
-    if (target.webContents.isDestroyed()) return;
-    target.webContents.stopFindInPage("clearSelection");
-    target.focus();
-  });
-}
-
-/** The conversation a shell URL shows, or null. Routes end in `/c/<id>` after any mount. */
-function findConversationId(url) {
-  return /\/c\/([^/]+)\/?$/.exec(URL.parse(url)?.pathname ?? "")?.[1] ?? null;
-}
-
-/**
- * The shell window Cmd/Ctrl+F should act on. Like activeWindow(), but when
- * the focused window is a find BAR (focus sits in its input), the shortcut
- * targets the bar's parent shell window rather than falling back to an
- * arbitrary one.
- *
- * @returns {BrowserWindow | null}
- */
-function findTargetForShortcut() {
-  const focused = BrowserWindow.getFocusedWindow();
-  if (focused && !windows.has(focused)) {
-    const parent = focused.getParentWindow();
-    if (parent && windows.has(parent)) return parent;
-  }
-  return activeWindow();
-}
-
-/**
- * Resolve which shell window a find-bar IPC message controls: the entry in
- * `findBars` whose bar owns the sending webContents. Null for senders that
- * aren't a live find bar — callers must drop those messages.
- *
- * @param {Electron.IpcMainEvent} event
- * @returns {BrowserWindow | null}
- */
-function findBarTarget(event) {
-  for (const [target, bar] of findBars) {
-    if (!bar.isDestroyed() && bar.webContents === event.sender) return target;
-  }
-  return null;
-}
-
-/**
- * True when an IPC event was sent by the bundled find bar page. Same
- * path-compare approach as isSetupPageSender.
- *
- * @param {Electron.IpcMainEvent} event
- * @returns {boolean}
- */
-function isFindBarSender(event) {
-  const frameUrl = event.senderFrame?.url ?? "";
-  let url;
-  try {
-    url = new URL(frameUrl);
-  } catch {
-    return false;
-  }
-  return url.protocol === "file:" && url.pathname === FIND_PAGE_URL.pathname;
-}
+// Find in page (Cmd/Ctrl+F): a shell-owned child window; see find_bar.ts.
+const findBar = createFindBar({
+  BrowserWindow,
+  ipcMain,
+  pagePath: pagePath("find"),
+  preloadPath: preloadPath("find_preload"),
+  getFocusedWindow: () => BrowserWindow.getFocusedWindow(),
+  windowForSender: (sender) => BrowserWindow.fromWebContents(sender),
+  isShellWindow: (win) => windows.has(win),
+  activeWindow,
+  warn: (message) => console.warn(message),
+});
 
 /**
  * Open a new window cloning the focused window's current URL when it's a
@@ -3855,8 +3633,8 @@ function buildMenu() {
         label: "Find…",
         accelerator: "CmdOrCtrl+F",
         click: () => {
-          const target = findTargetForShortcut();
-          if (target) openFindBar(target);
+          const target = findBar.targetForShortcut();
+          if (target) findBar.open(target);
         },
       },
     ],
@@ -4870,38 +4648,7 @@ function registerIpc() {
     void loadSetupPage(win, params.toString());
   });
 
-  // Find bar → run/continue a search in its parent window. Empty text
-  // clears the highlight and zeroes the counter (findInPage rejects empty
-  // queries, so it never reaches it).
-  ipcMain.on("omnigent:find-query", (event, params) => {
-    if (!isFindBarSender(event)) {
-      console.warn("[omnigent] find-query from untrusted sender dropped");
-      return;
-    }
-    const target = findBarTarget(event);
-    if (!target || target.isDestroyed()) return;
-    const text = String(params?.text ?? "");
-    if (text === "") {
-      target.webContents.stopFindInPage("clearSelection");
-      event.sender.send("omnigent:find-result", { active: 0, matches: 0 });
-      return;
-    }
-    target.webContents.findInPage(text, {
-      forward: params?.forward !== false,
-      findNext: params?.findNext === true,
-    });
-  });
-
-  // Find bar → dismiss itself (Esc / ✕). Cleanup (stop search, refocus the
-  // parent) lives in the bar's "closed" handler in openFindBar.
-  ipcMain.on("omnigent:find-close", (event) => {
-    if (!isFindBarSender(event)) {
-      console.warn("[omnigent] find-close from untrusted sender dropped");
-      return;
-    }
-    const bar = BrowserWindow.fromWebContents(event.sender);
-    if (bar && !bar.isDestroyed()) bar.close();
-  });
+  findBar.registerIpc();
 
   // Which native menu commands the SPA can act on right now, plus the open
   // session's pin/archive state for the Session menu labels.
