@@ -20,8 +20,29 @@ agent can't run workflows and stop.
 2. Write the plan with `sys_journal_write_plan` before you start working. Name
    the plan for its goal in a few words ("Cut GET /orders p95 by 20%"). Give
    each step a short, stable ID (`profile`, `opt-pool`), a name, and its
-   dependencies. A single goal is a one-step plan.
-3. Ask first only if the description is ambiguous. Otherwise start.
+   dependencies.
+3. Make the first step exploring the work (`explore`), without changing
+   anything, deeply enough that the steps you add from it are reasonably
+   specific: each a concrete piece of work, such as one change or one PR,
+   rather than a broad phase like "implement the changes". A small, clear task
+   needs only a quick look.
+4. Once you've explored, replan: keep the exploration first and add the work
+   after it, depending on it. A single goal is one step after the exploration.
+5. Ask first only if the description is ambiguous. Otherwise start.
+
+## Review the plan
+
+When the user asks to review the plan before the work starts:
+
+- Make the review the second step (`review`), depending on the exploration,
+  and make every step you add after it depend on the review. Keep those two
+  steps first in every version of the plan.
+- Once you've explored and added the work, write `needs_input` on the review
+  and ask the user to approve the plan. Start none of the later steps until
+  they approve, then write `done` on the review.
+- If they ask for changes, write `started` on the review first, then restart
+  the exploration to look into what they asked, update the steps after the
+  review, and ask again.
 
 ## Work through it
 

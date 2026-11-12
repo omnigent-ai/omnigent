@@ -72,11 +72,11 @@ reconnects, returns the entry the first attempt wrote instead of adding another.
 
 Pick **Run a workflow** from the composer's **+** menu, in a session or when
 starting one, describe the work, and choose **Run workflow**. The workflow goes
-straight to the chat. **Review the plan before work starts**, on by default,
-starts the plan with two steps, exploring without changing anything and then
-your review. The exploration adds the work as specific steps after the review,
-and the agent waits for your approval before any of them. If you ask for
-changes, it explores again, updates those steps and asks again. You can also type `/workflow` and a
+straight to the chat. The agent always explores first, without changing
+anything, deeply enough to plan the work as specific steps. **Review the plan
+before work starts**, on by default, adds your review right after the
+exploration: the agent waits for your approval before any of the work, and if
+you ask for changes, it explores again, updates the steps and asks again. You can also type `/workflow` and a
 description in the composer, for example:
 
 ```
