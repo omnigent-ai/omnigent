@@ -870,6 +870,7 @@ export function CreateScheduledTaskDialog({
   const triggerMode =
     trigger !== null ||
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
+  const usesTriggerSchedule = triggerMode || triggerType !== "schedule";
   const pollingBlockedReason =
     editingWorkerSettings && reusesExistingSession ? null : harnessSettings.blockedReason;
   const recurrenceValid =
@@ -882,8 +883,12 @@ export function CreateScheduledTaskDialog({
     (!anchoredScheduling && schedule.end?.type === "count");
   useEffect(() => {
     if (!open) return;
-    if (triggerMode) {
-      if (scheduleInvalid) setScheduleMenuOpen(true);
+    if (usesTriggerSchedule) {
+      setScheduleMenuOpen(false);
+      if (scheduleInvalid) {
+        setSchedule(defaultTriggerSchedule);
+        setScheduleUnsupported(false);
+      }
       return;
     }
     if (!recurrenceValid || scheduleUnsupported || unsupportedByScheduler) {
@@ -895,8 +900,9 @@ export function CreateScheduledTaskDialog({
     }
   }, [
     open,
-    triggerMode,
+    usesTriggerSchedule,
     scheduleInvalid,
+    defaultTriggerSchedule,
     recurrenceValid,
     scheduleUnsupported,
     unsupportedByScheduler,
@@ -1314,7 +1320,11 @@ export function CreateScheduledTaskDialog({
                         >
                           <Tooltip>
                             <TooltipTrigger asChild>
-                              <span className="inline-flex w-full sm:col-span-3">
+                              <span
+                                className={`inline-flex w-full ${
+                                  usesTriggerSchedule ? "sm:col-span-6" : "sm:col-span-3"
+                                }`}
+                              >
                                 <SelectTrigger
                                   id="task-trigger-type"
                                   aria-label="Trigger type"
@@ -1341,77 +1351,50 @@ export function CreateScheduledTaskDialog({
                             ))}
                           </SelectContent>
                         </Select>
-                        <Popover open={scheduleMenuOpen} onOpenChange={changeScheduleMenuOpen}>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <span className="inline-flex w-full sm:col-span-3">
-                                <PopoverTrigger asChild>
-                                  <ComposerHarnessTrigger
-                                    label="Schedule"
-                                    model={scheduleSummary}
-                                    icon={<ClockIcon className="size-4 shrink-0" />}
-                                    className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
-                                    data-testid="task-schedule-trigger"
-                                  />
-                                </PopoverTrigger>
-                              </span>
-                            </TooltipTrigger>
-                            <TooltipContent>Schedule</TooltipContent>
-                          </Tooltip>
-                          <PopoverContent
-                            align="end"
-                            className="menu-surface w-[max(var(--radix-popover-trigger-width),20rem)] max-w-[calc(100vw-2rem)] gap-0 p-0 ring-0"
-                            onPointerDownOutside={keepParentPopoverOpenForNestedMenu}
-                            onFocusOutside={keepParentPopoverOpenOnFocus}
-                            onInteractOutside={keepParentPopoverOpenForNestedMenu}
-                          >
-                            <PickerSectionHeader className="px-5 pt-3 pb-2">
-                              Schedule
-                            </PickerSectionHeader>
-                            {!triggerMode && recurrenceFields}
-                            {triggerMode && !scheduleInvalid && (
-                              <p
-                                className="px-4 py-3 text-sm text-muted-foreground"
-                                data-testid="task-trigger-cadence"
-                              >
-                                Checks for new matches: {describeSchedule(buildRRule(schedule))}.
-                                Matching items start sessions automatically.
-                              </p>
-                            )}
-                            {triggerMode && scheduleInvalid && (
-                              <div className="space-y-2 px-4 py-3">
-                                <p className="text-sm text-destructive" role="alert">
-                                  This polling configuration is no longer supported. Use the server
-                                  default to save your changes.
+                        {!usesTriggerSchedule && (
+                          <Popover open={scheduleMenuOpen} onOpenChange={changeScheduleMenuOpen}>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="inline-flex w-full sm:col-span-3">
+                                  <PopoverTrigger asChild>
+                                    <ComposerHarnessTrigger
+                                      label="Schedule"
+                                      model={scheduleSummary}
+                                      icon={<ClockIcon className="size-4 shrink-0" />}
+                                      className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                                      data-testid="task-schedule-trigger"
+                                    />
+                                  </PopoverTrigger>
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent>Schedule</TooltipContent>
+                            </Tooltip>
+                            <PopoverContent
+                              align="end"
+                              className="menu-surface w-[max(var(--radix-popover-trigger-width),20rem)] max-w-[calc(100vw-2rem)] gap-0 p-0 ring-0"
+                              onPointerDownOutside={keepParentPopoverOpenForNestedMenu}
+                              onFocusOutside={keepParentPopoverOpenOnFocus}
+                              onInteractOutside={keepParentPopoverOpenForNestedMenu}
+                            >
+                              <PickerSectionHeader className="px-5 pt-3 pb-2">
+                                Schedule
+                              </PickerSectionHeader>
+                              {recurrenceFields}
+                              {scheduleUnsupported && (
+                                <p className="px-4 pb-3 text-sm text-destructive" role="alert">
+                                  This schedule can&apos;t be edited in this form yet. Choose a
+                                  frequency to replace it.
                                 </p>
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={() => {
-                                    setSchedule(defaultTriggerSchedule);
-                                    setScheduleUnsupported(false);
-                                  }}
-                                >
-                                  Use server default (
-                                  {describeSchedule(buildRRule(defaultTriggerSchedule))})
-                                </Button>
-                              </div>
-                            )}
-                            {!triggerMode && scheduleUnsupported && (
-                              <p className="px-4 pb-3 text-sm text-destructive" role="alert">
-                                This schedule can&apos;t be edited in this form yet. Choose a
-                                frequency to replace it.
-                              </p>
-                            )}
-                            {!triggerMode && unsupportedByScheduler && (
-                              <p className="px-4 pb-3 text-sm text-destructive" role="alert">
-                                This server does not support custom schedules or occurrence limits.
-                                Choose a supported frequency to replace this schedule.
-                              </p>
-                            )}
-                          </PopoverContent>
-                        </Popover>
+                              )}
+                              {unsupportedByScheduler && (
+                                <p className="px-4 pb-3 text-sm text-destructive" role="alert">
+                                  This server does not support custom schedules or occurrence
+                                  limits. Choose a supported frequency to replace this schedule.
+                                </p>
+                              )}
+                            </PopoverContent>
+                          </Popover>
+                        )}
                       </div>
                       {!curationPending && !triggersSupported && (
                         <p className="text-sm text-muted-foreground sm:col-span-6">
@@ -1733,7 +1716,7 @@ export function CreateScheduledTaskDialog({
                               </div>
                             )}
 
-                          {(isEdit || fromSession !== null) && (
+                          {!usesTriggerSchedule && (isEdit || fromSession !== null) && (
                             <div className="flex min-h-9 items-center justify-between gap-4 py-px">
                               <span className="text-ui text-muted-foreground">Schedule</span>
                               <Popover
@@ -1759,44 +1742,14 @@ export function CreateScheduledTaskDialog({
                                   <PickerSectionHeader className="px-5 pt-3 pb-2">
                                     Schedule
                                   </PickerSectionHeader>
-                                  {!triggerMode && recurrenceFields}
-                                  {triggerMode && !scheduleInvalid && (
-                                    <p
-                                      className="px-4 py-3 text-sm text-muted-foreground"
-                                      data-testid="task-trigger-cadence"
-                                    >
-                                      Checks for new matches:{" "}
-                                      {describeSchedule(buildRRule(schedule))}. Matching items start
-                                      sessions automatically.
-                                    </p>
-                                  )}
-                                  {triggerMode && scheduleInvalid && (
-                                    <div className="space-y-2 px-4 py-3">
-                                      <p className="text-sm text-destructive" role="alert">
-                                        This polling configuration is no longer supported. Use the
-                                        server default to save your changes.
-                                      </p>
-                                      <Button
-                                        type="button"
-                                        variant="outline"
-                                        size="sm"
-                                        onClick={() => {
-                                          setSchedule(defaultTriggerSchedule);
-                                          setScheduleUnsupported(false);
-                                        }}
-                                      >
-                                        Use server default (
-                                        {describeSchedule(buildRRule(defaultTriggerSchedule))})
-                                      </Button>
-                                    </div>
-                                  )}
-                                  {!triggerMode && scheduleUnsupported && (
+                                  {recurrenceFields}
+                                  {scheduleUnsupported && (
                                     <p className="px-4 pb-3 text-sm text-destructive" role="alert">
                                       This schedule can&apos;t be edited in this form yet. Choose a
                                       frequency to replace it.
                                     </p>
                                   )}
-                                  {!triggerMode && unsupportedByScheduler && (
+                                  {unsupportedByScheduler && (
                                     <p className="px-4 pb-3 text-sm text-destructive" role="alert">
                                       This server does not support custom schedules or occurrence
                                       limits. Choose a supported frequency to replace this schedule.
@@ -1807,7 +1760,7 @@ export function CreateScheduledTaskDialog({
                             </div>
                           )}
 
-                          {!triggerMode && (
+                          {!usesTriggerSchedule && (
                             <div className="flex min-h-9 items-center justify-between gap-4 py-px">
                               <span className="text-ui text-muted-foreground">Ends</span>
                               <DropdownMenu
