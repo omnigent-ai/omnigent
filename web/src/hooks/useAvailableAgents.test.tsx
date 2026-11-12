@@ -1955,6 +1955,59 @@ describe("useCuratedOutHarnesses", () => {
     },
   );
 
+  it.each(["session-only agents", "own agents", "a catalog template"] as const)(
+    "keeps the harness of a pinned older agent from %s",
+    async (source) => {
+      const older = {
+        id: "ag_pinned",
+        name: "my-agent",
+        harness: "codex-native",
+        builtin: false,
+        created_at: 100,
+      };
+      const newer = { ...older, id: "ag_newer", harness: "claude-native", created_at: 200 };
+      routeFetch({
+        [BUILTINS_URL]: mockResponse({
+          data: source === "a catalog template" ? [older] : [],
+          has_more: false,
+          suppressed_agent_names: ["codex-native-ui"],
+        }),
+        [HARNESSES_URL]: mockResponse({ data: [] }),
+        [USER_AGENTS_URL]: mockResponse({
+          data:
+            source === "session-only agents"
+              ? []
+              : source === "own agents"
+                ? [newer, older]
+                : [newer],
+          has_more: false,
+        }),
+        [MINE_URL]: sessionResponse({
+          data: source === "session-only agents" ? [newer, older] : [],
+          has_more: false,
+        }),
+        "/v1/sessions/session_0/agent": mockResponse(newer),
+        "/v1/sessions/session_1/agent": mockResponse(older),
+      });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const { result } = renderHook(
+        () => ({
+          curated: useCuratedOutHarnesses(),
+          picker: useAvailableAgents({ pinnedAgentIds: [older.id] }),
+          catalog: useAgentCatalog(true, { sessionAgents: true }),
+        }),
+        { wrapper: settingsProviders(client, true) },
+      );
+
+      await waitFor(() => {
+        expect(result.current.catalog.complete).toBe(true);
+        expect(result.current.picker.isPlaceholderData).toBe(false);
+        expect(result.current.picker.data?.map((agent) => agent.id)).toContain(older.id);
+      });
+      expect([...result.current.curated]).toEqual([]);
+    },
+  );
+
   it("looks a session agent's unknown harness up again the next time Settings opens", async () => {
     const routes = {
       [BUILTINS_URL]: HIDES_CODEX,
@@ -1985,20 +2038,30 @@ describe("useCuratedOutHarnesses", () => {
     await waitFor(() => expect([...second.result.current]).toEqual(["codex-native"]));
   });
 
-  it("looks up no session agent's harness when the deployment hides nothing", async () => {
-    routeFetch({
-      [BUILTINS_URL]: mockResponse({ data: [], has_more: false }),
-      [HARNESSES_URL]: mockResponse({ data: [] }),
-      [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
-      [MINE_URL]: sessionResponse({ data: [{ id: "ag_one_off", name: "my-one-off" }] }),
-    });
-    const { client, result } = renderCuration(true);
+  it.each([
+    ["nothing", []],
+    ["only non-native built-ins", ["polly"]],
+  ])(
+    "looks up no session agent's harness when the deployment hides %s",
+    async (_, suppressedNames) => {
+      routeFetch({
+        [BUILTINS_URL]: mockResponse({
+          data: [],
+          has_more: false,
+          suppressed_agent_names: suppressedNames,
+        }),
+        [HARNESSES_URL]: mockResponse({ data: [] }),
+        [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
+        [MINE_URL]: sessionResponse({ data: [{ id: "ag_one_off", name: "my-one-off" }] }),
+      });
+      const { client, result } = renderCuration(true);
 
-    await waitFor(() => expect(client.getQueryState(USER_AGENTS_KEY)?.status).toBe("success"));
-    await waitFor(() => expect(client.getQueryState(CATALOG_KEY)?.status).toBe("success"));
-    expect([...result.current]).toEqual([]);
-    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/agent"))).toBe(false);
-  });
+      await waitFor(() => expect(client.getQueryState(USER_AGENTS_KEY)?.status).toBe("success"));
+      await waitFor(() => expect(client.getQueryState(CATALOG_KEY)?.status).toBe("success"));
+      expect([...result.current]).toEqual([]);
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/agent"))).toBe(false);
+    },
+  );
 
   it("hides nothing while the user's own agents fail to load", async () => {
     routeFetch({

@@ -6,6 +6,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import {
+  NATIVE_CODING_AGENTS,
   nativeCodingAgentForAvailableAgent,
   type NativeCodingAgentSpec,
 } from "@/lib/nativeCodingAgents";
@@ -536,15 +537,13 @@ export function useAgentCatalog(
   { sessionAgents: includeSessionAgents = false }: { sessionAgents?: boolean } = {},
 ): {
   data: AvailableAgent[] | undefined;
-  /** With ``sessionAgents``: the agents only a recent session offers, harness resolved. */
-  sessionAgents: AvailableAgent[];
+  /** All catalog, own and session candidates a pin can restore, with harnesses resolved. */
+  harnessAgents: AvailableAgent[];
   /** Built-in names the deployment hides; empty until the catalog loads. */
   suppressedNames: ReadonlySet<string>;
   /**
-   * Whether *data* holds every agent the user can pick: the built-in catalog
-   * and, where the server has them, all of the user's own agents, neither
-   * failing its latest fetch; with ``sessionAgents``, also every session-only
-   * agent's harness.
+   * Whether every candidate source loaded without truncation or a failed
+   * latest fetch; with ``sessionAgents``, also every session-only harness.
    */
   complete: boolean;
   isLoading: boolean;
@@ -585,21 +584,16 @@ export function useAgentCatalog(
   const mineData = includeSessionAgents ? mine?.data : undefined;
   // New Chat also offers these, found only in a recent session, without a harness.
   // Only a deployment that hides a built-in needs them: nothing else is curated.
-  const hidesBuiltins = (catalog?.suppressedNames.size ?? 0) > 0;
+  const hidesBuiltins = NATIVE_CODING_AGENTS.some((spec) =>
+    catalog?.suppressedNames.has(spec.agentName),
+  );
   const sessionOnly = useMemo(() => {
     if (catalog === undefined || mineData === undefined || !hidesBuiltins) return [];
-    const discovered = discoverSessionAgents(mineData).map((agent) => ({
-      agentId: agent.id,
-      agentName: agent.name,
-      createdAt: agent.created_at ?? null,
-      agent,
-    }));
-    return mergeAvailableAgents(
-      catalog.agents,
-      discovered,
-      userAgents ?? [],
-      catalog.suppressedNames,
-    ).filter((agent) => agent.sessionId !== undefined);
+    const knownIds = new Set([...catalog.agents, ...(userAgents ?? [])].map((agent) => agent.id));
+    // Pins can restore older same-named agents, so keep candidates by id here.
+    return discoverSessionAgents(mineData).filter(
+      (agent) => !knownIds.has(agent.id) && !catalog.suppressedNames.has(agentRootName(agent.name)),
+    );
   }, [catalog, mineData, userAgents, hidesBuiltins]);
   const sessionHarnesses = useQueries({
     queries: sessionOnly.map((agent) => ({
@@ -614,13 +608,16 @@ export function useAgentCatalog(
       resolved: results.every((result) => result.isSuccess),
     }),
   });
-  const sessionAgents = useMemo(
-    () =>
-      sessionOnly.map((agent, index) => ({
+  const harnessAgents = useMemo(
+    () => [
+      ...(catalog?.agents ?? []),
+      ...(userAgents ?? []),
+      ...sessionOnly.map((agent, index) => ({
         ...agent,
         harness: sessionHarnesses.harnesses[index] ?? null,
       })),
-    [sessionOnly, sessionHarnesses.harnesses],
+    ],
+    [catalog, userAgents, sessionOnly, sessionHarnesses.harnesses],
   );
   const sessionAgentsComplete =
     !includeSessionAgents ||
@@ -636,7 +633,7 @@ export function useAgentCatalog(
       (userAgentList !== undefined && !userAgentsQuery.isError && !userAgentList.truncated));
   return {
     data,
-    sessionAgents,
+    harnessAgents,
     suppressedNames: catalog?.suppressedNames ?? NO_SUPPRESSED_NAMES,
     complete:
       data !== undefined && !catalogQuery.isError && userAgentsComplete && sessionAgentsComplete,

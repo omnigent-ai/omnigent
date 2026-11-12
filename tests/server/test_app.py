@@ -2263,16 +2263,15 @@ def test_ensure_default_agents_keeps_an_extra_whose_path_is_gone(
     seed_stores: _SeedStores, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An extra seeded on an earlier boot isn't retired when its mount goes missing."""
-    from omnigent.db.utils import builtin_agent_id
-
     spec = tmp_path / "house-agent.yaml"
-    seed_stores.agent_store.create(builtin_agent_id("house-agent"), "house-agent", "old/bundle")
-    monkeypatch.setenv(SEEDED_AGENTS_ENV, "")
+    spec.write_text("name: house-agent\nexecutor:\n  harness: claude-sdk\nprompt: hi\n")
     monkeypatch.setenv(server_app._EXTRA_BUILTIN_AGENTS_ENV, str(spec))
+    stores = (seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
+    assert server_app._ensure_extra_builtin_agents(*stores) == {"house-agent"}
+    spec.unlink()
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "")
 
-    suppressed = server_app._ensure_default_agents(
-        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
-    )
+    suppressed = server_app._ensure_default_agents(*stores)
 
     assert not spec.exists()
     assert "house-agent" not in suppressed

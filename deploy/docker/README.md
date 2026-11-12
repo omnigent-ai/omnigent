@@ -142,6 +142,8 @@ CLI harness rows are always seeded, even when trimmed, because transcript
 imports bind to them. Adding a name back to the allowlist brings it straight
 back on the next restart. A built-in an older release seeded under a name this
 release no longer packages (for example `devin`) is trimmed the same way.
+If its stored bundle cannot be read, the row stays visible because startup
+cannot rule out operator ownership.
 
 Settings → Harnesses follows the allowlist too: it leaves out a native harness
 whose agent is trimmed, unless an agent users can still pick runs on it, and

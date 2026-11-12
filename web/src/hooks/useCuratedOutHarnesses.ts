@@ -35,17 +35,11 @@ export function curatedOutHarnesses(
  * @param enabled - Whether to fetch the agent catalog; defaults true.
  */
 export function useCuratedOutHarnesses(enabled = true): ReadonlySet<string> {
-  const {
-    data: agents,
-    sessionAgents,
-    suppressedNames,
-    complete,
-  } = useAgentCatalog(enabled, { sessionAgents: true });
+  const { harnessAgents, suppressedNames, complete } = useAgentCatalog(enabled, {
+    sessionAgents: true,
+  });
   return useMemo(
-    () =>
-      !complete || agents === undefined
-        ? NONE
-        : curatedOutHarnesses(suppressedNames, [...agents, ...sessionAgents]),
-    [agents, sessionAgents, suppressedNames, complete],
+    () => (!complete ? NONE : curatedOutHarnesses(suppressedNames, harnessAgents)),
+    [harnessAgents, suppressedNames, complete],
   );
 }
