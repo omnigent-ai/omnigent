@@ -1566,13 +1566,19 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
                 assert response.status_code == (503 if failure == "outage" else 400)
                 assert "conv_spec_resolver_failed" not in app.state.active_turns
                 assert not app.state.session_message_buffers.get("conv_spec_resolver_failed")
-                statuses = await _drain_published_statuses(
+                events = await _drain_turn_events(
                     app.state.session_event_queues,
                     "conv_spec_resolver_failed",
-                    until="failed",
+                    until_status="failed",
                     timeout=2.0,
                 )
+                statuses = [
+                    event["status"] for event in events if event["type"] == "session.status"
+                ]
                 assert statuses == ["running", "failed"]
+                if failure != "outage":
+                    failed = next(event for event in events if event.get("status") == "failed")
+                    assert failed["error"] == response.json()["error"]
 
     get_client.assert_not_called()
     body = response.json()
@@ -1675,6 +1681,14 @@ _SPAWN_LOG_DETAIL = "Request failed on the runner; see the runner log for detail
 @pytest.mark.parametrize(
     "response, expected",
     [
+        pytest.param(
+            JSONResponse(
+                status_code=400,
+                content={"error": {"code": "invalid_input", "message": _SPAWN_LOG_DETAIL}},
+            ),
+            {"code": "invalid_input", "message": _SPAWN_LOG_DETAIL},
+            id="nested-error-keeps-code-and-message",
+        ),
         pytest.param(
             JSONResponse(
                 status_code=503,

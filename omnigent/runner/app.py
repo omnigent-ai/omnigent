@@ -1128,6 +1128,8 @@ def _harness_error_response_error(response: object) -> dict[str, str]:
     if isinstance(payload, dict):
         raw_detail = payload.get("detail")
         raw_code = payload.get("error")
+        if isinstance(raw_code, dict):
+            return _normalize_turn_error(raw_code)
         detail = raw_detail.strip() if isinstance(raw_detail, str) else ""
         code = raw_code.strip() if isinstance(raw_code, str) else ""
         if code == ErrorCode.SESSION_AGENT_MISSING:

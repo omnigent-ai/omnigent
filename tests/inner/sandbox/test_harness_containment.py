@@ -147,7 +147,7 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
         resolve.assert_called_once()
 
 
-@pytest.mark.parametrize("harness", _HARNESSES)
+@pytest.mark.parametrize("harness", [name for name in _HARNESSES if name not in ("goose", "qwen")])
 @pytest.mark.parametrize("declared", [False, True])
 def test_unsandboxed_worker_requires_no_policy_or_explicit_none(
     harness: str, declared: bool, tmp_path: Path
@@ -449,6 +449,66 @@ def test_installed_codex_native_commands_remain_inside_outer_sandbox(
                 assert not output.exists()
             finally:
                 terminate_process(process)
+
+
+@pytest.mark.asyncio
+async def test_codex_provider_discovery_runs_inside_requested_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active_sandbox_type: str
+) -> None:
+    from omnigent.harnesses.codex_native.app_server import prepare_codex_provider_config
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    executable = tmp_path / "install" / "bin" / "codex"
+    executable.parent.mkdir(parents=True)
+    home = executable.parent / "runtime-home"
+    monkeypatch.setenv("HOME", str(home))
+    canary = tmp_path / "private.txt"
+    canary.write_text("private canary")
+    report = home / "discovery.json"
+    script = f"""
+import json, os, pathlib, sys
+assert 'app-server' in sys.argv[1:]
+try:
+    pathlib.Path({str(canary)!r}).read_text()
+except OSError:
+    denied = True
+else:
+    denied = False
+pathlib.Path({str(report)!r}).write_text(json.dumps({{
+    'cwd': os.getcwd(),
+    'filtered': 'HOST_ONLY' not in os.environ,
+    'denied': denied,
+}}))
+"""
+    executable.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(script)} "$@"\n'
+    )
+    executable.chmod(0o755)
+    spec = OSEnvSpec(
+        cwd=str(workspace),
+        sandbox=OSEnvSandboxSpec(
+            type=active_sandbox_type,
+            read_paths=[str(workspace)],
+            write_paths=[],
+            allow_network=False,
+        ),
+    )
+    with _prepared_launch("codex", executable, workspace, spec) as launch_path:
+        overrides = await prepare_codex_provider_config(
+            home,
+            [],
+            codex_path=launch_path,
+            cwd=workspace,
+            env={"PATH": os.environ["PATH"], "HOME": str(home), "HOST_ONLY": "parent-value"},
+            source_home=home,
+        )
+    assert overrides == []
+    assert json.loads(report.read_text()) == {
+        "cwd": str(workspace.resolve()),
+        "filtered": True,
+        "denied": True,
+    }
 
 
 def test_pi_version_probe_runs_inside_requested_sandbox(

@@ -4989,7 +4989,16 @@ def test_prepare_claude_cli_path_rejects_failed_wrap_probe(noop: bool) -> None:
 
 
 @pytest.mark.parametrize(
-    "cwd_source", ["default", "spec_relative", "spec_absolute", "explicit_none", "explicit_dot"]
+    "cwd_source",
+    [
+        "default",
+        "spec_relative",
+        "spec_absolute",
+        "explicit_none",
+        "explicit_dot",
+        "explicit_relative",
+        "explicit_conflict",
+    ],
 )
 def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
     monkeypatch, tmp_path: Path, cwd_source: str
@@ -5012,7 +5021,12 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
         spec.cwd = "repo"
         expected_cwd = tmp_path / "repo"
     elif cwd_source.startswith("explicit"):
-        spec.cwd = None if cwd_source == "explicit_none" else "."
+        spec.cwd = {
+            "explicit_none": None,
+            "explicit_dot": ".",
+            "explicit_relative": "repo",
+            "explicit_conflict": "other",
+        }[cwd_source]
         expected_cwd = tmp_path / "repo"
         cwd = str(expected_cwd)
     else:
@@ -5038,6 +5052,12 @@ def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
         lambda path, sandbox, **kwargs: "/tmp/launcher",
     )
 
+    if cwd_source == "explicit_conflict":
+        with pytest.raises(ValueError, match="working directory conflicts"):
+            prepare_claude_cli_path("/usr/bin/claude", spec, cwd=cwd)
+        resolve.assert_not_called()
+        assert seen == {}
+        return
     prepared = prepare_claude_cli_path("/usr/bin/claude", spec, cwd=cwd)
 
     assert prepared.cli_path == "/tmp/launcher"
