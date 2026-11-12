@@ -60,11 +60,16 @@ describe("unpinWithUndo", () => {
     await waitFor(() => expect(screen.queryByText("Unpinned session")).not.toBeInTheDocument());
   });
 
-  it("restores the family pin position instead of a legacy personal pin", async () => {
+  it.each([true, false])("restores the pin position with a family pin: %s", async (familyPin) => {
     act(() =>
       unpinWithUndo(queryClient, writePin, "conv_a", {
         ...row("Group", "1"),
-        family: { id: "family", representative_id: "conv_a", pinned: true, pinned_at: "2000" },
+        family: {
+          id: "family",
+          representative_id: "conv_a",
+          pinned: familyPin,
+          ...(familyPin ? { pinned_at: "2000" } : {}),
+        },
       }),
     );
     await screen.findByText("Unpinned session");
@@ -79,7 +84,11 @@ describe("unpinWithUndo", () => {
       filterHonored: true,
     });
     act(() => fireEvent.click(screen.getByRole("button", { name: "Undo" })));
-    expect(writePin).toHaveBeenLastCalledWith({ id: "conv_a", pinned: true, pinnedAt: 2000 });
+    expect(writePin).toHaveBeenLastCalledWith({
+      id: "conv_a",
+      pinned: true,
+      pinnedAt: familyPin ? 2000 : 1,
+    });
   });
 
   it("offers nothing when the unpin is refused or fails", async () => {
@@ -105,6 +114,20 @@ describe("unpinWithUndo", () => {
   });
 
   it.each([
+    [
+      "older server representative pin",
+      () =>
+        queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, {
+          conversations: [
+            {
+              id: "conv_a",
+              ...row("Group", "2"),
+              family: { id: "family", representative_id: "conv_a", pinned: false },
+            },
+          ],
+          filterHonored: true,
+        }),
+    ],
     [
       "server pinned cache",
       () =>

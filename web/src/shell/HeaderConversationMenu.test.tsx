@@ -865,6 +865,23 @@ describe("HeaderConversationMenu desktop menu commands", () => {
         }),
       ),
     );
+    view.rerender(
+      menuTree({
+        conversation: {
+          ...CONVERSATION,
+          labels: { [PINNED_LABEL_KEY]: "1" },
+          family: { id: "family", representative_id: "parent", pinned: true },
+        },
+      }),
+    );
+    await waitFor(() =>
+      expect(setDesktopCommandState).toHaveBeenLastCalledWith(
+        expect.objectContaining({ commands: ["archive-session", "fork-session"] }),
+      ),
+    );
+    mocks.togglePinned.mockClear();
+    act(() => sendCommand({ command: "toggle-pin-session", browserViewId: null }));
+    expect(mocks.togglePinned).not.toHaveBeenCalled();
   });
 
   it("disables Session → Pin while a pin write is pending", async () => {

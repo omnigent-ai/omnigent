@@ -6630,7 +6630,7 @@ function NewChatLandingContent({
       if (siblingSource && createdSessionId) {
         const stillViewing = localConv
           ? stillViewingLocalSession(localConv.tempConvId)
-          : onScreenRef.current;
+          : onScreenRef.current && window.location.href === createLocation;
         if (
           undeliveredPrompt &&
           (localConv === null || hasPendingLocalMessage(localConv.tempConvId))

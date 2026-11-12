@@ -49,6 +49,12 @@ describe("nested draft sidebar rows", () => {
       updated_at: 5,
     });
     expect(row.family).toBeUndefined();
+    const pinnedSource = { ...row, labels: { "omnigent.pinned": "50" } };
+    expect(withNestedSessionDrafts([pinnedSource], drafts(client))[1].family).toMatchObject({
+      pinned: true,
+      pinned_at: "50",
+    });
+    expect(withNestedSessionDrafts([row], drafts(client))[1].family?.pinned).toBe(false);
     updateNestedSessionDraft(client, "temp:nested");
     expect(
       withNestedSessionDrafts([row], drafts(client))[1].nested_draft_source_id,

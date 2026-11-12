@@ -36,5 +36,7 @@ describe("session families", () => {
     expect(orderSessionFamilies([b, pinned, a], collapsed).map((row) => row.id)).toEqual(["a"]);
     expect(isSessionPinned(pinned, new Set(["c"]))).toBe(false);
     expect(isSessionPinned({ ...pinned, family: { ...pinned.family!, pinned: true } })).toBe(true);
+    expect(isSessionPinned({ ...a, labels: { "omnigent.pinned": "50" } })).toBe(true);
+    expect(isSessionPinned(b, new Set(["a"]))).toBe(true);
   });
 });

@@ -3,9 +3,9 @@ import { PINNED_LABEL_KEY } from "./sessionListCache";
 
 /** Legacy personal pins do not detach members from their family. */
 export function isSessionPinned(row: Conversation, pinnedIds?: ReadonlySet<string>): boolean {
-  return row.family
-    ? row.family.pinned
-    : row.labels?.[PINNED_LABEL_KEY] !== undefined || pinnedIds?.has(row.id) === true;
+  if (row.family?.pinned) return true;
+  if (isIndentedSibling(row)) return pinnedIds?.has(row.family!.representative_id!) === true;
+  return row.labels?.[PINNED_LABEL_KEY] !== undefined || pinnedIds?.has(row.id) === true;
 }
 
 /** Display groups retain a surviving representative while deletion metadata refreshes. */

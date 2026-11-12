@@ -923,6 +923,28 @@ it("keeps nested drafts at the representative's active or frozen sort position",
     );
     expect(rows[0].id).toBe(other.id);
   }
+  const tiedParent = { ...parent, id: "conv_a", created_at: 150, updated_at: 200 };
+  const tiedOther = { ...tiedParent, id: "conv_b", created_at: 160 };
+  const tiedDraft = {
+    ...draft,
+    created_at: 300,
+    family: { ...draft.family, representative_id: tiedParent.id },
+  };
+  const rows = [tiedParent, tiedOther, tiedDraft];
+  expect(sortConversations(rows, null).map((row) => row.id)).toEqual([
+    "conv_b",
+    "conv_a",
+    "temp:draft",
+  ]);
+  expect(
+    sortConversations(
+      rows,
+      null,
+      null,
+      "updated_at",
+      customSortOrder({ base: "updated", since: 100, ids: [] }),
+    ).map((row) => row.id),
+  ).toEqual(["conv_b", "conv_a", "temp:draft"]);
 });
 
 describe("Custom order", () => {

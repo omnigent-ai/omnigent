@@ -2244,17 +2244,30 @@ function ConversationList({
     [authoritativeRows, nestedDrafts],
   );
   useEffect(() => {
-    const knownRows = [...authoritativeRows, ...loadedRows];
+    const knownRows = [
+      ...pagedConversations,
+      ...pinnedConversations,
+      ...(openSessionRow ? [openSessionRow] : []),
+      ...loadedRows,
+    ];
     for (const draft of nestedDrafts) {
       if (
         draft.created &&
         (knownRows.some((row) => row.id === draft.id && row.family) ||
-          draftBackfills.some(({ id, row }) => id === draft.id && (!row || row.id === id)))
+          draftBackfills.some(({ id, row }) => id === draft.id && (row === null || row?.archived)))
       ) {
         removeNestedSessionDraft(draftQueryClient, draft.key);
       }
     }
-  }, [nestedDrafts, authoritativeRows, loadedRows, draftBackfills, draftQueryClient]);
+  }, [
+    nestedDrafts,
+    pagedConversations,
+    pinnedConversations,
+    openSessionRow,
+    loadedRows,
+    draftBackfills,
+    draftQueryClient,
+  ]);
   const groupOrder = useMemo<readonly string[]>(
     () =>
       view.grouping === "harness"

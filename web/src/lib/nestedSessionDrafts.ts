@@ -87,7 +87,12 @@ export function withNestedSessionDrafts(
   const byId = new Map(rows.map((row) => [row.id, row]));
   for (const draft of drafts) {
     const source = byId.get(draft.source.id) ?? draft.source;
-    const family = source.family ?? draft.source.family;
+    const family = source.family ?? {
+      id: source.id,
+      representative_id: source.id,
+      pinned: source.labels?.[PINNED_LABEL_KEY] !== undefined,
+      pinned_at: source.labels?.[PINNED_LABEL_KEY],
+    };
     byId.set(source.id, { ...source, family });
     if (draft.id !== draft.key) byId.delete(draft.key);
     // Keep one row if the push arrives before the create response.
