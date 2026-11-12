@@ -1723,10 +1723,17 @@ def _session_labels(
     The task's MCP services become the deployment's selection labels, so every
     run starts with the same services. A continue task's sandbox session records
     the host id it routes by, so a relaunched sandbox keeps connecting to the
-    replica that owns that id.
+    replica that owns that id. A task with no services writes no selection
+    labels, even ones a deployment would use to encode an empty selection, so a
+    copied session keeps its own.
     """
+    selection_labels = (
+        (mcp_selection or session_mcp_selection(None)).session_labels(task.mcp_services)
+        if task.mcp_services
+        else {}
+    )
     labels = {
-        **(mcp_selection or session_mcp_selection(None)).session_labels(task.mcp_services),
+        **selection_labels,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id,
         **managed_repo_labels(_sandbox_workspaces(task)),
     }
