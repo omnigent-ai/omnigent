@@ -2293,6 +2293,8 @@ class ClaudeSDKExecutor(Executor):
                 self._cli_path = prepared.cli_path
                 self._cli_sandbox = prepared.sandbox
                 self._cli_sandbox_cwd = prepared.cwd
+                if prepared.cwd is not None:
+                    self._cwd = prepared.cwd
             if self._os_env_spec is not None and self._cwd is None:
                 self._cwd = self._os_env_spec.cwd
             logger.info("Using system claude CLI: %s", self._cli_path)

@@ -548,26 +548,35 @@ class TestConstructor(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, PreparedClaudeCli
         from omnigent.inner.datamodel import OSEnvSpec
 
-        spec = OSEnvSpec(type="caller_process", cwd="/tmp/work")
-        with (
-            patch(
-                "omnigent.inner.claude_sdk_executor._find_system_claude",
-                return_value="/usr/bin/claude",
-            ),
-            patch(
-                "omnigent.inner.claude_sdk_executor.prepare_claude_cli_path",
-                return_value=PreparedClaudeCli(
-                    cli_path="/tmp/omnigent-claude-wrapper",
-                    enable_native_tools=True,
-                ),
-            ),
+        for declared_cwd, selected_cwd, prepared_cwd, expected_cwd in (
+            ("/tmp/work", None, None, "/tmp/work"),
+            ("./project", "/tmp/work", None, "/tmp/work"),
+            ("./project", "/tmp/work", "/tmp/work/project", "/tmp/work/project"),
         ):
-            executor = ClaudeSDKExecutor(os_env=spec)
+            spec = OSEnvSpec(type="caller_process", cwd=declared_cwd)
+            with (
+                self.subTest(selected_cwd=selected_cwd, prepared_cwd=prepared_cwd),
+                patch(
+                    "omnigent.inner.claude_sdk_executor._find_system_claude",
+                    return_value="/usr/bin/claude",
+                ),
+                patch(
+                    "omnigent.inner.claude_sdk_executor.prepare_claude_cli_path",
+                    return_value=PreparedClaudeCli(
+                        cli_path="/tmp/omnigent-claude-wrapper",
+                        enable_native_tools=True,
+                        cwd=prepared_cwd,
+                    ),
+                ) as prepare,
+            ):
+                executor = ClaudeSDKExecutor(cwd=selected_cwd, os_env=spec)
 
-        self.assertTrue(executor._os_env)
-        self.assertEqual(executor._os_env_spec, spec)
-        self.assertEqual(executor._cli_path, "/tmp/omnigent-claude-wrapper")
-        self.assertEqual(executor._cwd, "/tmp/work")
+                prepare.assert_called_once_with("/usr/bin/claude", spec, cwd=selected_cwd)
+                self.assertTrue(executor._os_env)
+                self.assertEqual(executor._os_env_spec, spec)
+                self.assertEqual(executor._cli_path, "/tmp/omnigent-claude-wrapper")
+                self.assertEqual(executor._cwd, expected_cwd)
+                self.assertEqual(executor._cli_sandbox_cwd, prepared_cwd)
 
     def test_prepare_claude_cli_path_adds_internal_roots_to_read_allowlist(self):
         from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
@@ -650,30 +659,39 @@ class TestConstructor(unittest.TestCase):
             executor._cli_path,
             "/tmp/omnigent-claude-tight-wrapper",
         )
+        self.assertIsNone(executor._cwd)
+        self.assertIsNone(executor._cli_sandbox_cwd)
 
     def test_os_env_spec_without_supported_native_sandbox_disables_native_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, PreparedClaudeCli
         from omnigent.inner.datamodel import OSEnvSpec
 
         spec = OSEnvSpec(type="caller_process", cwd="/tmp/work")
-        with (
-            patch(
-                "omnigent.inner.claude_sdk_executor._find_system_claude",
-                return_value="/usr/bin/claude",
-            ),
-            patch(
-                "omnigent.inner.claude_sdk_executor.prepare_claude_cli_path",
-                return_value=PreparedClaudeCli(
-                    cli_path="/usr/bin/claude",
-                    enable_native_tools=False,
-                ),
-            ),
+        for selected_cwd, expected_cwd in (
+            (None, "/tmp/work"),
+            ("/tmp/selected", "/tmp/selected"),
         ):
-            executor = ClaudeSDKExecutor(os_env=spec)
+            with (
+                self.subTest(selected_cwd=selected_cwd),
+                patch(
+                    "omnigent.inner.claude_sdk_executor._find_system_claude",
+                    return_value="/usr/bin/claude",
+                ),
+                patch(
+                    "omnigent.inner.claude_sdk_executor.prepare_claude_cli_path",
+                    return_value=PreparedClaudeCli(
+                        cli_path="/usr/bin/claude",
+                        enable_native_tools=False,
+                    ),
+                ),
+            ):
+                executor = ClaudeSDKExecutor(cwd=selected_cwd, os_env=spec)
 
-        self.assertFalse(executor._os_env)
-        self.assertEqual(executor._os_env_spec, spec)
-        self.assertEqual(executor._cli_path, "/usr/bin/claude")
+                self.assertFalse(executor._os_env)
+                self.assertEqual(executor._os_env_spec, spec)
+                self.assertEqual(executor._cli_path, "/usr/bin/claude")
+                self.assertEqual(executor._cwd, expected_cwd)
+                self.assertIsNone(executor._cli_sandbox_cwd)
 
     def test_model_override(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
