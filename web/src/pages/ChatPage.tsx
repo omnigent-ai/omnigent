@@ -2953,7 +2953,7 @@ function ComposerImpl(
   // the input, which would delete the draft. Only save when the user
   // has actually changed the value since the last restore.
   const dirtyRef = useRef(false);
-  // Pending tabs typed `/side <question>` opened, by parent and question, reused if one repeats.
+  // Pending side-chat tab ids keyed by parent + question, so a repeated `/side` reuses its tab.
   const slashSideChatsRef = useRef(new Map<string, string>());
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");

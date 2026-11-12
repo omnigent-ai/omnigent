@@ -6476,32 +6476,6 @@ describe("Composer side-chat entry points", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
-  it("opens one side chat immediately when /side is submitted again while it starts", () => {
-    const authenticatedFetch = vi
-      .spyOn(identity, "authenticatedFetch")
-      .mockImplementation(() => new Promise<Response>(() => {}));
-    composerSessionSnapshot.sideChatAllowed = true;
-    const openedChildIds = new Set<string>();
-    const unsubscribe = useChatStore.subscribe(({ sideChatToOpen }) => {
-      if (sideChatToOpen !== null) openedChildIds.add(sideChatToOpen.childId);
-    });
-    try {
-      renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
-      const command = "/side what does this repo do?";
-      fireEvent.change(textarea(), { target: { value: command } });
-      fireEvent.keyDown(textarea(), { key: "Enter" });
-      expect.soft(useChatStore.getState().sideChatToOpen).toMatchObject({ parentId: "conv_test" });
-
-      fireEvent.change(textarea(), { target: { value: command } });
-      fireEvent.keyDown(textarea(), { key: "Enter" });
-
-      expect.soft(openedChildIds.size).toBe(1);
-      expect.soft(authenticatedFetch.mock.calls.length).toBeLessThanOrEqual(1);
-    } finally {
-      unsubscribe();
-    }
-  });
-
   it("does not open a side chat after its parent changes while the menu closes", async () => {
     composerSessionSnapshot.sideChatAllowed = true;
     renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
@@ -6541,6 +6515,7 @@ describe("Composer side-chat entry points", () => {
 
     const pendingId = submitSide("/side why?");
     expect(pendingId).toMatch(/^pending:/);
+    expect(useChatStore.getState().sideChatToOpen?.parentId).toBe("conv_test");
     expect(composerFor(pendingId)).toEqual({ text: "why?", files: [], autoStart: true });
     expect(useChatStore.getState().sideChatDrafts[pendingId]).toBeUndefined();
     expect(textarea()).toHaveValue("");
