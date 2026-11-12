@@ -113,10 +113,12 @@ def test_automation_sandbox_repository(
         expect(page.get_by_label("Run on", exact=True)).to_be_visible()
         advanced = page.get_by_role("button", name="Advanced settings (optional)", exact=True)
         expect(advanced).to_have_attribute("aria-expanded", "false")
-        page.get_by_test_id("task-schedule-trigger").click()
+        schedule_trigger = page.get_by_test_id("task-schedule-trigger")
+        schedule_trigger.click()
         expect(page.get_by_label("Frequency", exact=True)).to_be_visible()
         expect(page.get_by_label("Time", exact=True)).to_be_visible()
-        page.keyboard.press("Escape")
+        schedule_trigger.click()
+        expect(page.get_by_label("Frequency", exact=True)).to_have_count(0)
         page.get_by_label("Automation title", exact=True).fill("Repository maintenance")
         page.get_by_label("Instructions", exact=True).fill(
             "Review the repository for stale documentation."
