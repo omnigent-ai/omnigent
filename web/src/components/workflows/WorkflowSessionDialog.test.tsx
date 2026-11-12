@@ -350,7 +350,7 @@ describe("WorkflowSessionDialog", () => {
 
     await waitFor(() => expect(navigate).toHaveBeenCalledWith("/c/conv_run"));
     expect(vi.mocked(createSession).mock.calls[0]![2]).toMatchObject({
-      title: "Create workflow Upgrade a dependency",
+      title: "Create workflow: Upgrade a dependency",
       hostId: "host_1",
       workspace: "/srv/app",
     });

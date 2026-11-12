@@ -326,7 +326,7 @@ function WorkflowSessionForm({
     try {
       const session = await createSession(agent.id, [], {
         // The drafting session is named for the workflow it creates.
-        title: request.kind === "create" ? `Create workflow ${request.name}` : undefined,
+        title: request.kind === "create" ? `Create workflow: ${request.name}` : undefined,
         ...(sandboxSelected
           ? {
               sandbox: {
