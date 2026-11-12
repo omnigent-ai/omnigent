@@ -14,9 +14,13 @@ import {
 } from "./workflow";
 
 describe("taskActionMessage", () => {
-  it("asks to run or continue the task by name", () => {
-    expect(taskActionMessage("run", "Share the files")).toBe('Run the task "Share the files".');
-    expect(taskActionMessage("continue", "Review #6109")).toBe('Continue the task "Review #6109".');
+  it("asks to run or continue the task by name, then the rest of the plan", () => {
+    expect(taskActionMessage("run", "Share the files")).toBe(
+      'Run the task "Share the files", then go on with the rest of the plan.',
+    );
+    expect(taskActionMessage("continue", "Review #6109")).toBe(
+      'Continue the task "Review #6109", then go on with the rest of the plan.',
+    );
   });
 });
 

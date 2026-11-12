@@ -18,6 +18,7 @@ import {
   openTasksTab,
   registerSaveWorkflow,
   registerStartWorkflow,
+  registerStopWork,
   registerTaskAction,
   useSessionTasksActions,
 } from "@/store/sessionTasksActions";
@@ -412,6 +413,25 @@ describe("TasksPanel", () => {
       setSession({ sessionStatus: "running" });
       const [running] = screen.getAllByTestId("tasks-row");
       expect(within(running!).queryByTestId("tasks-row-menu")).toBeNull();
+    } finally {
+      act(withdraw);
+    }
+  });
+
+  it("offers Stop on a running task while the composer can stop the agent", () => {
+    showJournal([journalPlan(0, ["baseline"]), status(1, "baseline", "started")]);
+    setSession({ sessionStatus: "running" });
+    renderPanel();
+    expect(screen.queryByTestId("tasks-row-menu")).toBeNull();
+    cleanup();
+
+    const stop = vi.fn();
+    const withdraw = registerStopWork("conv", stop);
+    try {
+      renderPanel();
+      fireEvent.pointerDown(screen.getByTestId("tasks-row-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-row-stop"));
+      expect(stop).toHaveBeenCalledTimes(1);
     } finally {
       act(withdraw);
     }
