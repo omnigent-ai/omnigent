@@ -1826,6 +1826,7 @@ def create_app(
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
             await _pane_reaper.shutdown()
+        await app.state.native_approval_waits.close()
         # Host shutdown skips per-session deletion, so close native servers here.
         from omnigent.runner.native import (
             teardown_all_codex_native_app_servers,

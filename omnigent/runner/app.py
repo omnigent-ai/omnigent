@@ -1586,6 +1586,11 @@ def create_runner_app(
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
+    from omnigent.runner.approval_waits import NativeApprovalWaits
+
+    _native_approval_waits = NativeApprovalWaits()
+    app.state.native_approval_waits = _native_approval_waits
+
     def _native_pane_shows_live_work(
         terminals: Any, session_id: str, terminal_name: str, *, include_pane_activity: bool = True
     ) -> bool:
@@ -1593,7 +1598,7 @@ def create_runner_app(
 
         A pane parked on a permission prompt is quiet and can read ``idle``, and a
         pane still redrawing output can too, so the status edge alone misses them.
-        Reads the same in-memory signals the reaper uses, not its tmux calls.
+        Reads in-memory pane signals and background approval observations.
 
         :param terminals: Terminal registry holding the pane instance.
         :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
@@ -1605,21 +1610,19 @@ def create_runner_app(
             outlives the settled turn, or, with *include_pane_activity*, the
             pane shows recent input or output.
         """
-        from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
 
-        if approval_wait_is_fresh(session_id):
-            return True
         if resource_registry.session_has_background_agents(session_id):
             return True
-        if not include_pane_activity:
-            return False
         instance = terminals.get(session_id, terminal_name, "main")
         if instance is None:
             return False
-        if instance.client_interaction_within(PANE_OUTPUT_BUSY_WINDOW_S):
-            return True
-        return instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True
+        if include_pane_activity:
+            if instance.client_interaction_within(PANE_OUTPUT_BUSY_WINDOW_S):
+                return True
+            if instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True:
+                return True
+        return _native_approval_waits.is_busy(session_id, instance)
 
     # Sessions whose Claude pane reports a background shell still running after
     # its turn ended. Real work: it keeps the runner and its sandbox up, but only
@@ -1645,7 +1648,9 @@ def create_runner_app(
         # Read current resources so deleting a terminal also retires this pin.
         terminals = resource_registry.terminal_registry
         if terminals is not None:
-            for session_id, name, _ in terminals.native_panes():
+            native_panes = terminals.native_panes()
+            _native_approval_waits.retain({session_id for session_id, _, _ in native_panes})
+            for session_id, name, _ in native_panes:
                 if not is_native_harness(
                     resource_registry.terminal_resource_role(
                         session_id, terminal_resource_id(name, "main")
