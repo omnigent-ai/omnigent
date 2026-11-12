@@ -192,7 +192,9 @@ describe("ServerSelectorV2", () => {
 
   it("never installs the CLI from a picked local installation, even a stopped one", async () => {
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
-    const onStartLocal = vi.fn().mockResolvedValue({ ok: true });
+    const onStartLocal = vi
+      .fn()
+      .mockResolvedValue({ ok: false, error: "The omnigent CLI was not found." });
     render(
       <ServerSelectorV2
         setup={makeSetup({
@@ -205,8 +207,12 @@ describe("ServerSelectorV2", () => {
       />,
     );
     fireEvent.click(await screen.findByRole("button", { name: "Start Omnigent" }));
-    await waitFor(() => expect(onStartLocal).toHaveBeenCalledOnce());
+    expect(await screen.findByText("The omnigent CLI was not found.")).toBeInTheDocument();
+    expect(onStartLocal).toHaveBeenCalledOnce();
     expect(onInstallCli).not.toHaveBeenCalled();
+    for (const name of ["Retry", "Continue anyway", "Back"]) {
+      expect(screen.getByRole("button", { name })).toBeInTheDocument();
+    }
   });
 
   it("re-checks on click: a local install that stopped since the list loaded is booted", async () => {
@@ -342,14 +348,14 @@ describe("ServerSelectorV2", () => {
     fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
     fireEvent.click(screen.getByRole("button", { name: "Join your team (typed.example.com)" }));
     const laptop = await screen.findByRole("radio", { name: /my laptop/i });
-    resolveFirst({ remote: true });
+    await act(async () => resolveFirst({ remote: true }));
     await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledTimes(2));
     expect(laptop).toBeChecked();
     expect(screen.queryByRole("radio", { name: "Arca" })).not.toBeInTheDocument();
+    expect(onConnect).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
-    await waitFor(() =>
-      expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/", expect.any(Function)),
-    );
+    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+    expect(onConnect).toHaveBeenCalledWith("https://typed.example.com/", expect.any(Function));
   });
 
   it.each<[string, Partial<ServerSelectorV2Setup>]>([
@@ -545,18 +551,28 @@ describe("ServerSelectorV2", () => {
   it.each(["install", "laptop", "server"])(
     "does not offer Continue anyway after a %s failure",
     async (failure) => {
+      const onInstallCli = vi
+        .fn()
+        .mockResolvedValue({ ok: failure !== "install", error: "install failed" });
+      const onConnectRunner = vi
+        .fn()
+        .mockResolvedValue({ ok: failure !== "laptop", error: "laptop failed" });
+      const onConnect = vi.fn().mockResolvedValue({ error: "server failed" });
       await installFromRunnerStep(
         {
           installed: false,
-          onInstallCli: vi.fn().mockResolvedValue({ ok: failure !== "install", error: "failed" }),
-          onConnectRunner: vi.fn().mockResolvedValue({ ok: failure !== "laptop", error: "failed" }),
-          onConnect: vi.fn().mockResolvedValue({ error: "failed" }),
+          onInstallCli,
+          onConnectRunner,
+          onConnect,
           getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
         },
         failure === "server" ? undefined : /my laptop/i,
       );
-      expect(await screen.findByText("failed")).toBeInTheDocument();
+      expect(await screen.findByText(`${failure} failed`)).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
+      // An earlier stage's failure stops the later ones.
+      expect(onConnectRunner).toHaveBeenCalledTimes(failure === "install" ? 0 : 1);
+      expect(onConnect).toHaveBeenCalledTimes(failure === "server" ? 1 : 0);
     },
   );
 

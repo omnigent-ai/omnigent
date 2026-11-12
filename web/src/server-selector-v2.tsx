@@ -295,7 +295,7 @@ export function BridgeSetupApp() {
     onInstallLog: setupBridge()?.onCliInstallLog
       ? (cb) => setupBridge()?.onCliInstallLog?.(cb) ?? (() => {})
       : undefined,
-    // Older shells omit it → the runner step offers this laptop only.
+    // Older shells omit it → picked servers open without the runner step.
     getRunnerOptions: setupBridge()?.getRunnerOptions
       ? async (url) => {
           const options = await setupBridge()?.getRunnerOptions?.(url);
