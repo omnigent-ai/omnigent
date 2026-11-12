@@ -87,6 +87,7 @@ from omnigent.server import (
 )
 from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
+    AdminViewMiddleware,
     AuthProvider,
     SharingMode,
     auth_mode,
@@ -320,6 +321,9 @@ class ServerInfoResponse(BaseModel):
     # A multipart create's metadata accepts ``model_override``; older servers
     # reject it.
     session_bundle_model_override: bool = True
+    # POST /v1/sessions/{id}/managed-host moves a session onto a new sandbox;
+    # absent on older servers, which clients treat as unsupported.
+    move_to_managed_sandbox: bool = False
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
@@ -338,6 +342,7 @@ class ServerInfoResponse(BaseModel):
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
+    admin_view: bool = False
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
@@ -347,6 +352,12 @@ class ServerInfoResponse(BaseModel):
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
+    # Every other agent-tool organizing write checks it too: session title, pin
+    # and archive, and project rename, icon and delete.
+    session_organize_source_checks: bool = False
+    # An agent's create that names a project other than its source's project makes a
+    # standalone session; older servers refuse it while sibling sessions are on.
+    sibling_other_project_standalone: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -2650,6 +2661,11 @@ def create_app(
     # outermost WS middleware — a forbidden origin is closed without even
     # reaching the metrics counter (which only counts on accept anyway).
     app.add_middleware(WebSocketOriginMiddleware)
+    admin_view_supported = (
+        authentication_requires_identity(auth_provider) and permission_store is not None
+    )
+    if admin_view_supported:
+        app.add_middleware(AdminViewMiddleware)
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
     # request/route closure) the runner router so it can reach the bound
@@ -3727,6 +3743,7 @@ def create_app(
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,
+                "move_to_managed_sandbox": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
@@ -3736,6 +3753,7 @@ def create_app(
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
                 "session_title_instructions": user_settings_store is not None,
+                "admin_view": admin_view_supported,
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,
@@ -3743,6 +3761,8 @@ def create_app(
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
                 "session_move_source_checks": True,
+                "session_organize_source_checks": True,
+                "sibling_other_project_standalone": True,
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
