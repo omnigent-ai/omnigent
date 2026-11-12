@@ -374,7 +374,7 @@ def render_host_config_write_command(host_config: dict[str, object]) -> str:
     in the destination directory followed by :func:`os.replace`, so an
     interrupted write cannot expose a truncated destination file. A pre-existing
     ``config.yaml`` symlink is replaced by a real file — durability of the write
-    is favored over following the link, which an internal sandbox config never
+    is favored over following the link, which a sandbox config never
     relies on.
 
     The payload travels as base64-encoded JSON substituted into a fixed
@@ -504,8 +504,8 @@ class SandboxLifecycle(ABC):
 
     # Package index URL exported as ``UV_INDEX_URL`` for the local wheel
     # build, or ``None`` to use ambient uv configuration. Providers tied
-    # to networks where public PyPI is unreachable (Lakebox on the
-    # Databricks corp network) override this.
+    # to networks where public PyPI is unreachable (for example, Lakebox on a
+    # restricted network) override this.
     wheel_build_index_url: ClassVar[str | None] = None
 
     # Legacy class vars — kept for backward compat while providers migrate
@@ -557,6 +557,9 @@ class SandboxLifecycle(ABC):
         if base_method is None:
             return False
         return self_method is not base_method
+
+    # Provider ID learned during start; managed launch persists it over the reserved ID.
+    started_sandbox_id: str | None = None
 
     @abstractmethod
     def prepare(self) -> None:
@@ -617,9 +620,10 @@ class SandboxLifecycle(ABC):
         ``True`` otherwise.
 
         Called BOTH once after a CLI bootstrap provision AND periodically
-        by the managed path for as long as the sandbox has a live runner
-        (:mod:`omnigent.server.managed_host_keepalive`), so an implementation
-        must be idempotent and cheap enough to repeat. Either shape
+        by the managed path while the sandbox's runner does work, and for the
+        runner idle timeout after (:mod:`omnigent.server.managed_host_keepalive`),
+        so an implementation must be idempotent and cheap enough to repeat.
+        Either shape
         satisfies it: "configure once to maximize lifetime" (disable idle
         autostop, restate a cap) or "push a deadline forward" (refresh an
         absolute expiry). Managed-only launchers that cannot extend a
@@ -967,12 +971,22 @@ class SandboxHostLauncher(SandboxLifecycle):
     supports_sandbox_profile_lookup: ClassVar[bool] = False
     """Whether sandbox-scoped discovery returns the durable assigned revision."""
 
-    def list_profiles(self, context: SandboxProfileContext) -> list[ProviderSandboxProfile]:
+    automation_notice: ClassVar[str | None] = None
+    """User-safe note on what this provider's unattended runs need from their owner.
+
+    ``/v1/info`` reports it in ``sandbox_provider_automation_notices``, and the
+    automation form shows it while a new sandbox is the run target, e.g. for a
+    credential that must stay fresh on the owner's machine. ``None`` shows nothing.
+    """
+
+    def list_profiles(self, context: SandboxProfileContext) -> list[ProviderSandboxProfile] | None:
         """Return only profiles currently authorized for the trusted caller context.
 
         Use bounded provider I/O, including explicit network timeouts. This
         synchronous hook must not provision resources or perform launch preflight.
         Return public metadata only; keep configuration and access rules private.
+        For sandbox-scoped lookup only, None confirms an authorized legacy sandbox
+        has no profile. Denied access must raise SandboxProfileAccessDenied.
         """
         raise self._capability_error("list provider-managed sandbox profiles")
 

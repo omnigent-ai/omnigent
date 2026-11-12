@@ -22,6 +22,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   sessionStatus: true,
   backgroundTaskCount: true,
   backgroundTasks: true,
+  backgroundAgents: true,
   blockedOn: true,
   isNativeTerminalSession: true,
   nativeVendorOwnsModel: true,
@@ -67,6 +68,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   pendingRetryStableId: true,
   restoredSendDraft: true,
   sendLatchedAt: true,
+  sendLatchSeenRunning: true,
   historyGeneration: true,
   awaitingSideChatFor: true,
 };
@@ -93,6 +95,7 @@ export function createInitialConversationState(): ConversationState {
     sessionStatus: "idle",
     backgroundTaskCount: 0,
     backgroundTasks: [],
+    backgroundAgents: [],
     blockedOn: null,
     isNativeTerminalSession: false,
     nativeVendorOwnsModel: false,
@@ -138,6 +141,7 @@ export function createInitialConversationState(): ConversationState {
     pendingRetryStableId: null,
     restoredSendDraft: null,
     sendLatchedAt: null,
+    sendLatchSeenRunning: null,
     historyGeneration: 0,
     awaitingSideChatFor: null,
   };

@@ -1,9 +1,22 @@
+import type { FileDiff } from "@pierre/diffs/react";
+import type { Comment } from "@/hooks/useComments";
+import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 // Tests for PullRequestPanel — the stacked "Files changed" view. The GitHub data
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  render,
+  renderHook,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { parsePatchFiles } from "@pierre/diffs";
 import type * as DiffsModule from "@pierre/diffs";
 import userEvent from "@testing-library/user-event";
@@ -130,6 +143,9 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
       error: state.diffError,
       isFetching: false,
     }),
+    usePullRequestCommits: () => ({ data: undefined, isLoading: false, error: null }),
+    usePullRequestCommitDiff: () => ({ data: undefined, isLoading: false, error: null }),
+    usePullRequestCommitsUnsupported: () => false,
     fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
     // The account selector (shown in the repo-unresolved empty state) calls this;
     // stub the mutation shape it reads.
@@ -167,6 +183,8 @@ vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => {
   };
 });
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => state.canEdit }));
+let sandboxStarting = false;
+vi.mock("@/hooks/useSessionReconnect", () => ({ useSandboxStarting: () => sandboxStarting }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   ...(await importOriginal<typeof UseWorkspaceChangedFilesModule>()),
   useWorkspaceAsleep: () => state.sandboxAsleep,
@@ -181,8 +199,20 @@ vi.mock("@pierre/diffs", () => ({
   parsePatchFiles: vi.fn(() => [{ files: state.parsedFiles }]),
 }));
 vi.mock("@pierre/diffs/react", () => ({
-  FileDiff: ({ fileDiff }: { fileDiff: { name: string } }) => (
-    <div data-testid="diff" data-path={fileDiff.name} />
+  FileDiff: ({
+    fileDiff,
+    renderGutterUtility,
+    lineAnnotations,
+    renderAnnotation,
+  }: React.ComponentProps<typeof FileDiff>) => (
+    <div data-testid="diff" data-path={fileDiff.name}>
+      {renderGutterUtility?.(() => ({ lineNumber: 1, side: "additions" }))}
+      {lineAnnotations?.map((annotation) => (
+        <div key={`${annotation.side}:${annotation.lineNumber}`}>
+          {renderAnnotation?.(annotation)}
+        </div>
+      ))}
+    </div>
   ),
 }));
 // The resolved theme mode drives @pierre/diffs' themeType.
@@ -250,15 +280,17 @@ function renderPanel(mobile = false, active?: boolean) {
     client,
     ...render(<PullRequestPanel conversationId="conv_1" active={active} />, {
       wrapper: ({ children }) => (
-        <QueryClientProvider client={client}>
-          {mobile ? (
-            <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
-              {children}
-            </MobilePanelDrawer>
-          ) : (
-            children
-          )}
-        </QueryClientProvider>
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, comment_anchor_metadata: true }}>
+          <QueryClientProvider client={client}>
+            {mobile ? (
+              <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
+                {children}
+              </MobilePanelDrawer>
+            ) : (
+              children
+            )}
+          </QueryClientProvider>
+        </CapabilitiesProvider>
       ),
     }),
   };
@@ -1514,7 +1546,7 @@ describe("PullRequestPanel", () => {
     renderChanges();
 
     fireEvent.click(await screen.findByRole("checkbox", { name: "Viewed hello.py" }));
-    const key = viewedStorageKey(window.location.origin, "alice", selected, "head");
+    const key = viewedStorageKey(window.location.origin, "alice", selected);
     expect(localStorage.getItem(key)).toContain("hello.py");
   });
 
@@ -1836,30 +1868,40 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText("GitHub")).toBeNull();
   });
 
-  it("tells a GitHub Enterprise user to sign in to the remote's host", () => {
-    state.info = {
-      data: {
-        object: "session.github.info",
-        available: false,
-        reason: "unsupported_remote",
-        remote_host: "git.example.com",
-        provider: null,
-      },
-      isLoading: false,
-      error: null,
-      isFetching: false,
-    };
-    renderPanel();
-    // A second line under the sentence about the host; the command is set as code.
-    const hint = screen.getByText(/which isn’t a supported/);
-    const note = screen.getByText(/For a GitHub Enterprise host, run/);
-    expect(note).not.toBe(hint);
-    expect(hint.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(note).toHaveTextContent(
-      "For a GitHub Enterprise host, run gh auth login --hostname git.example.com on the host.",
-    );
-    expect(screen.getByText("gh auth login --hostname git.example.com")).toHaveClass("font-mono");
-  });
+  it.each(["git.example.com", "github.com-work"])(
+    "shows provider setup for unrecognized host %s",
+    (remoteHost) => {
+      state.info = {
+        data: {
+          object: "session.github.info",
+          available: false,
+          reason: "unsupported_remote",
+          remote_host: remoteHost,
+          provider: null,
+        },
+        isLoading: false,
+        error: null,
+        isFetching: false,
+      };
+      renderPanel();
+      // A second line under the sentence about the host; commands are set as code.
+      const hint = screen.getByText(/couldn’t identify the git provider/);
+      const note = screen.getByText(/On the execution host, run/);
+      expect(note).not.toBe(hint);
+      expect(hint.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(note).toHaveTextContent(
+        `On the execution host, run glab auth login --hostname ${remoteHost} for GitLab or gh auth login --hostname ${remoteHost} for GitHub Enterprise.`,
+      );
+      expect(screen.getByText(`glab auth login --hostname ${remoteHost}`)).toHaveClass("font-mono");
+      expect(screen.getByText(`gh auth login --hostname ${remoteHost}`)).toHaveClass("font-mono");
+      expect(note).toHaveTextContent(
+        "For a GitHub SSH alias, run git config --local omnigent.gitprovider github in this checkout, then refresh for installation or sign-in help.",
+      );
+      expect(screen.getByText("git config --local omnigent.gitprovider github")).toHaveClass(
+        "font-mono",
+      );
+    },
+  );
 
   it("leaves out the sign-in line when the remote's host is unknown", () => {
     state.info = {
@@ -1875,10 +1917,11 @@ describe("PullRequestPanel", () => {
     };
     renderPanel();
     expect(
-      screen.getByText("This workspace’s remote isn’t on a supported git provider."),
+      screen.getByText("Omnigent couldn’t identify this workspace’s git provider."),
     ).toBeInTheDocument();
     expect(screen.queryByText(/GitHub Enterprise/)).toBeNull();
     expect(screen.queryByText(/gh auth login/)).toBeNull();
+    expect(screen.queryByText(/glab auth login/)).toBeNull();
   });
 
   describe("header when no provider is known", () => {
@@ -2078,6 +2121,30 @@ describe("PullRequestPanel", () => {
       expect(screen.getByText("glab")).toHaveClass("font-mono");
       expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
       expect(screen.queryByText(/GitHub/)).toBeNull();
+    });
+
+    it("shows a GitLab merge request authenticated by a token without a CLI", () => {
+      const { repo, pr } = state.info!.data!;
+      state.info!.data = {
+        ...gitlab({ cli: null }),
+        repo,
+        pr: { ...pr!, url: "https://git.example.com/acme/app/-/merge_requests/6000" },
+      };
+      renderPanel();
+      expect(screen.getByText("chore: dummy PR")).toBeInTheDocument();
+      expect(screen.queryByText(/CLI not found/)).toBeNull();
+    });
+
+    it("shows the GitLab token error without asking to install a CLI", () => {
+      state.info!.data = gitlab({
+        authenticated: false,
+        cli: null,
+        hint: "Check `GITLAB_TOKEN` on the execution host.",
+      });
+      renderPanel();
+      expect(screen.getByText("Can’t reach the upstream repo")).toBeInTheDocument();
+      expect(screen.getByText("GITLAB_TOKEN")).toHaveClass("font-mono");
+      expect(screen.queryByText(/CLI not found/)).toBeNull();
     });
 
     it("shows the host's sign-in hint when the repo can't be reached", () => {
@@ -2428,6 +2495,8 @@ describe("PullRequestPanel", () => {
       "github-review-threads",
       "github-changed-files",
       "github-pr-diff",
+      "github-pr-commits",
+      "github-pr-commit-diff",
       "session-pull-requests",
     ]);
   });
@@ -3320,6 +3389,36 @@ describe("session PR selection", () => {
     );
   });
 
+  it("says the sandbox is starting while it wakes", async () => {
+    const url = "https://github.com/acme/app/pull/6001";
+    state.sandboxAsleep = true;
+    sandboxStarting = true;
+    try {
+      state.info = { isLoading: false, error: null, isFetching: false };
+      state.stored.conv_1 = [
+        {
+          url,
+          host: "github.com",
+          repository: "acme/app",
+          number: 6001,
+          title: "Waking PR",
+          relationship: "created",
+          state: "OPEN",
+          is_draft: false,
+          state_checked_at: null,
+        },
+      ];
+      renderPanel();
+      await waitFor(() =>
+        expect(
+          within(screen.getByTestId("github-stored-pr")).getByRole("status"),
+        ).toHaveTextContent(/^Starting the session’s sandbox\. The PR details will load/),
+      );
+    } finally {
+      sandboxStarting = false;
+    }
+  });
+
   it.each([undefined, null, "", "   "])(
     "falls back to the PR identity when its title is %j",
     (title) => {
@@ -3446,3 +3545,146 @@ it.each(["capabilities", "selected_pr_url"] as const)(
     expect(screen.getByText("No comments yet.").parentElement).toHaveClass("pb-16");
   },
 );
+
+it("saves a local comment as agent context and retains earlier revisions", async () => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+  const diffs = await vi.importActual<typeof DiffsModule>("@pierre/diffs");
+  state.parsedFiles = diffs.parsePatchFiles(
+    "diff --git a/hello.py b/hello.py\n--- a/hello.py\n+++ b/hello.py\n@@ -1 +1 @@\n-old\n+new\n",
+  )[0]!.files;
+  state.changes!.data!.data = [file("hello.py", "modified")];
+  state.diff = {
+    object: "session.github.pr_diff",
+    patch: "PATCH",
+    head_sha: "a".repeat(40),
+    base_sha: "b".repeat(40),
+  };
+  const comments: Comment[] = [];
+  const requests: string[] = [];
+  let failMutation = false;
+  const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const url = String(input);
+    requests.push(`${init?.method ?? "GET"} ${url}`);
+    if (failMutation && (init?.method === "PATCH" || init?.method === "DELETE"))
+      return new Response(null, { status: 500, statusText: "Try again" });
+    if (url.endsWith("/comments") && init?.method === "POST") {
+      const comment = {
+        ...JSON.parse(String(init.body)),
+        id: "local-1",
+        conversation_id: "conv_1",
+        status: "draft",
+        created_by: null,
+        created_at: 0,
+        updated_at: 1,
+        anchor_content: null,
+      } as Comment;
+      comments.push(comment);
+      return new Response(JSON.stringify(comment));
+    }
+    if (url.endsWith("/comments/local-1") && init?.method === "PATCH") {
+      Object.assign(comments[0]!, JSON.parse(String(init.body)));
+      return new Response(JSON.stringify(comments[0]));
+    }
+    if (url.endsWith("/comments/local-1") && init?.method === "DELETE") {
+      comments.splice(0);
+      return new Response(null, { status: 204 });
+    }
+    return new Response(JSON.stringify(comments));
+  });
+  onTestFinished(() => {
+    fetch.mockRestore();
+    clearLocalReviewContexts("conv_1");
+  });
+  const { client } = renderChanges();
+  const contexts = renderHook(() => usePendingLocalReviewContexts("conv_1"));
+  await userEvent.click(screen.getByRole("button", { name: "Start a new review conversation" }));
+  expect(
+    within(screen.getByRole("group", { name: "Comment destination" }))
+      .getAllByRole("button")
+      .map((button) => button.textContent),
+  ).toEqual(["GitHub", "Agent"]);
+  expect(screen.getByRole("button", { name: "Agent" })).toHaveAttribute("aria-pressed", "true");
+  await userEvent.hover(screen.getByRole("button", { name: "Agent" }));
+  expect(await screen.findByRole("tooltip")).toHaveTextContent(
+    "Leave a comment for your agent in this session.",
+  );
+  await userEvent.unhover(screen.getByRole("button", { name: "Agent" }));
+  await userEvent.type(
+    screen.getByRole("textbox", { name: "New review comment" }),
+    "Handle empty input",
+  );
+  fireEvent.keyDown(screen.getByRole("textbox", { name: "New review comment" }), {
+    key: "Enter",
+    metaKey: true,
+  });
+  await screen.findByRole("region", { name: "Local review comment" });
+  expect(comments[0]?.anchor_metadata).toMatchObject({
+    side: "RIGHT",
+    line: 1,
+    head_sha: "a".repeat(40),
+  });
+  expect(requests.filter((request) => request.startsWith("POST"))).toEqual([
+    "POST /v1/sessions/conv_1/comments",
+  ]);
+  expect(contexts.result.current).toHaveLength(1);
+  expect(contexts.result.current[0]).toMatchObject({ id: "local-1", body: "Handle empty input" });
+  expect(requests.some((request) => request.includes("/comments/send"))).toBe(false);
+  const other = {
+    ...comments[0]!,
+    id: "other",
+    body: "Feedback on a different PR",
+    anchor_metadata: { ...comments[0]!.anchor_metadata!, pr_url: "https://example.com/pr/other" },
+  };
+  const addressed = { ...comments[0]!, id: "addressed", status: "addressed" as const };
+  await act(async () => {
+    client.setQueryData(["comments", "conv_1"], [...comments, other, addressed]);
+  });
+  expect(screen.queryByText("Feedback on a different PR")).not.toBeInTheDocument();
+  expect(screen.queryByText(/Add to chat/)).not.toBeInTheDocument();
+  state.diff = { ...state.diff!, head_sha: "c".repeat(40) };
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Summary" }));
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+  expect(screen.queryByText(/Earlier revision/)).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "More actions for hello.py" }));
+  await userEvent.click(screen.getByRole("menuitem", { name: "Show earlier comments" }));
+  expect(screen.getAllByText(/Earlier revision/).length).toBeGreaterThan(0);
+  const card = within(screen.getAllByRole("region", { name: "Local review comment" })[0]!);
+  expect(
+    card.queryByRole("button", { name: /Attach to agent|Mark addressed|Reopen/ }),
+  ).not.toBeInTheDocument();
+  await userEvent.click(card.getByRole("button", { name: "Edit local comment" }));
+  await userEvent.clear(card.getByRole("textbox", { name: "Edit local comment" }));
+  await userEvent.type(
+    card.getByRole("textbox", { name: "Edit local comment" }),
+    "Validate empty input",
+  );
+  const originalAnchor = { ...comments[0]!.anchor_metadata! };
+  failMutation = true;
+  await userEvent.click(card.getByRole("button", { name: "Save" }));
+  expect(await card.findByRole("alert")).toHaveTextContent("Try again");
+  expect(card.getByRole("textbox", { name: "Edit local comment" })).toHaveValue(
+    "Validate empty input",
+  );
+  expect(contexts.result.current[0]).toMatchObject({
+    body: "Handle empty input",
+    anchor_metadata: originalAnchor,
+  });
+  failMutation = false;
+  await userEvent.click(card.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(comments[0]?.body).toBe("Validate empty input"));
+  expect(contexts.result.current[0]?.body).toBe("Validate empty input");
+  expect(contexts.result.current[0]?.anchor_metadata).toEqual(originalAnchor);
+  failMutation = true;
+  await userEvent.click(card.getByRole("button", { name: "Delete local comment" }));
+  expect(await card.findByRole("alert")).toHaveTextContent("Try again");
+  expect(contexts.result.current[0]).toMatchObject({
+    body: "Validate empty input",
+    anchor_metadata: originalAnchor,
+  });
+  failMutation = false;
+  await userEvent.click(card.getByRole("button", { name: "Delete local comment" }));
+  await waitFor(() =>
+    expect(screen.queryByRole("region", { name: "Local review comment" })).not.toBeInTheDocument(),
+  );
+  expect(contexts.result.current).toHaveLength(0);
+});

@@ -511,7 +511,25 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const conversationId = args?.conversationId ?? null;
     const r = g.registry.setActive(conversationId);
+    // A tab the user returns to gets keyboard focus back in its page.
+    if (r.ok && conversationId !== null && args?.focus === true) {
+      g.registry.get(conversationId)?.view.webContents.focus();
+    }
     return { ok: r.ok, error: r.error };
+  });
+
+  // The attached page if it has keyboard focus, so the renderer can tell a click
+  // into that page apart from the window losing focus to another app.
+  ipcMain.handle("omnigent:browser-focused-view", (event) => {
+    const g = gateRegistry(event);
+    if (g.error) return null;
+    const viewId = g.registry.activeConversationId();
+    if (viewId === null) return null;
+    try {
+      return g.registry.get(viewId)?.view.webContents.isFocused() ? viewId : null;
+    } catch {
+      return null;
+    }
   });
 
   // Hide/show the active view in place while a DOM overlay is open. The native
@@ -530,6 +548,14 @@ function registerBrowserIpc({
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
     return g.registry.setRecentSessionSwitchSupported(!!args?.supported);
+  });
+
+  // Turn Cmd/Ctrl-clicked page links into new tabs only while a compatible
+  // renderer handles `browser-open-tab`; older server UIs keep in-place loads.
+  ipcMain.handle("omnigent:browser-set-open-tab-supported", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    return g.registry.setOpenTabSupported(!!args?.supported);
   });
 
   // A supported renderer can still decline the gesture when no sessions exist.

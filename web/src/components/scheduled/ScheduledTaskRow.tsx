@@ -12,9 +12,10 @@
 // client-recomputed instant can't match the server anchor for INTERVAL>1 rules)
 // is not violated. Paused rows are NOT dimmed — the title stays fully legible
 // and the pill is the sole paused signal. A hover-revealed ellipsis (⋯) action
-// menu (Run now / Pause / Resume / Edit / Delete) sits on the right.
+// menu (Run now / Pause / Resume / Edit / Delete) sits on the right; right-clicking
+// the card opens the same actions as a context menu.
 
-import { useId, useMemo, useState } from "react";
+import { useId, useMemo, useState, type ComponentType, type ReactNode } from "react";
 import {
   CirclePlayIcon,
   MoreHorizontalIcon,
@@ -28,6 +29,12 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useNavigate } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -66,7 +73,6 @@ export function ScheduledTaskRow({
   const detailPageEnabled = isFeatureEnabled(info, "automations_v2");
   const triggerMode = task.sessionMode === "continue" && isTriggerPrompt(task.prompt);
   const [menuOpen, setMenuOpen] = useState(false);
-  const { trackClick } = useOmnigentAnalytics();
   const failureLabelId = useId();
   const failed = task.lastRunStatus === "failed";
   const paused = task.state === "paused";
@@ -123,7 +129,9 @@ export function ScheduledTaskRow({
     </>
   );
 
-  return (
+  const menuItemProps = { task, paused, triggerMode, onEdit, onPauseToggle, onRunNow, onDelete };
+
+  const card = (
     <div
       data-testid="scheduled-task-row"
       data-state={task.state}
@@ -191,60 +199,113 @@ export function ScheduledTaskRow({
           onClick={(e) => e.stopPropagation()}
           onPointerDown={(e) => e.stopPropagation()}
         >
-          {!triggerMode && (
-            <DropdownMenuItem
-              onSelect={() => {
-                trackClick("tasks.scheduled.run_now", "button");
-                onRunNow(task);
-              }}
-              data-testid="task-run-now"
-            >
-              <PlayIcon className="size-4" />
-              Run now
-            </DropdownMenuItem>
-          )}
-          <DropdownMenuItem
-            onSelect={() => {
-              trackClick("tasks.scheduled.edit", "button");
-              onEdit(task);
-            }}
-            data-testid="task-edit"
-          >
-            <PencilIcon className="size-4" />
-            Edit
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            onSelect={() => {
-              trackClick("tasks.scheduled.pause_resume", "button");
-              onPauseToggle(task);
-            }}
-            data-testid="task-pause-toggle"
-          >
-            {paused ? (
-              <>
-                <CirclePlayIcon className="size-4" />
-                Resume
-              </>
-            ) : (
-              <>
-                <PauseIcon className="size-4" />
-                Pause
-              </>
-            )}
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            variant="destructive"
-            onSelect={() => {
-              trackClick("tasks.scheduled.delete", "button");
-              onDelete(task);
-            }}
-            data-testid="task-delete"
-          >
-            <Trash2Icon className="size-4" />
-            Delete
-          </DropdownMenuItem>
+          <TaskMenuItems Item={DropdownMenuItem} {...menuItemProps} />
         </DropdownMenuContent>
       </DropdownMenu>
     </div>
+  );
+
+  // Right-clicking the card opens the same actions in place of the browser menu.
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild disabled={busy}>
+        {card}
+      </ContextMenuTrigger>
+      <ContextMenuContent
+        className="min-w-40"
+        onClick={(e) => e.stopPropagation()}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        <TaskMenuItems Item={ContextMenuItem} {...menuItemProps} />
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+}
+
+// Item props shared by the dropdown and context-menu item primitives.
+interface TaskMenuItemProps {
+  children?: ReactNode;
+  variant?: "default" | "destructive";
+  onSelect?: (event: Event) => void;
+  "data-testid"?: string;
+}
+
+// The action list, authored once and rendered under both the ⋯ dropdown and the
+// card's right-click context menu.
+function TaskMenuItems({
+  Item,
+  task,
+  paused,
+  triggerMode,
+  onEdit,
+  onPauseToggle,
+  onRunNow,
+  onDelete,
+}: {
+  Item: ComponentType<TaskMenuItemProps>;
+  task: ScheduledTask;
+  paused: boolean;
+  triggerMode: boolean;
+  onEdit: (task: ScheduledTask) => void;
+  onPauseToggle: (task: ScheduledTask) => void;
+  onRunNow: (task: ScheduledTask) => void;
+  onDelete: (task: ScheduledTask) => void;
+}) {
+  const { trackClick } = useOmnigentAnalytics();
+  return (
+    <>
+      {!triggerMode && (
+        <Item
+          onSelect={() => {
+            trackClick("tasks.scheduled.run_now", "button");
+            onRunNow(task);
+          }}
+          data-testid="task-run-now"
+        >
+          <PlayIcon className="size-4" />
+          Run now
+        </Item>
+      )}
+      <Item
+        onSelect={() => {
+          trackClick("tasks.scheduled.edit", "button");
+          onEdit(task);
+        }}
+        data-testid="task-edit"
+      >
+        <PencilIcon className="size-4" />
+        Edit
+      </Item>
+      <Item
+        onSelect={() => {
+          trackClick("tasks.scheduled.pause_resume", "button");
+          onPauseToggle(task);
+        }}
+        data-testid="task-pause-toggle"
+      >
+        {paused ? (
+          <>
+            <CirclePlayIcon className="size-4" />
+            Resume
+          </>
+        ) : (
+          <>
+            <PauseIcon className="size-4" />
+            Pause
+          </>
+        )}
+      </Item>
+      <Item
+        variant="destructive"
+        onSelect={() => {
+          trackClick("tasks.scheduled.delete", "button");
+          onDelete(task);
+        }}
+        data-testid="task-delete"
+      >
+        <Trash2Icon className="size-4" />
+        Delete
+      </Item>
+    </>
   );
 }

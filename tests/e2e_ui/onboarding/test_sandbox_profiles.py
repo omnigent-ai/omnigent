@@ -45,7 +45,10 @@ def sandbox_profile_server(
 
 
 @pytest.fixture
-def provider_profile_server(built_spa: None, tmp_path: Path) -> Iterator[tuple[str, Path]]:
+def provider_profile_server(
+    built_spa: None, tmp_path: Path, request: pytest.FixtureRequest
+) -> Iterator[tuple[str, Path]]:
+    default_profile_id = getattr(request, "param", None)
     repo = Path(__file__).resolve().parents[3]
     example = repo / "examples/sandbox-profile-provider"
     plugin_dir = tmp_path / "plugin"
@@ -88,7 +91,8 @@ def provider_profile_server(built_spa: None, tmp_path: Path) -> Iterator[tuple[s
         "sandbox:\n"
         "  provider: profile_demo\n"
         "  server_url: http://sandbox-browser-test.invalid\n"
-        "  profile_demo:\n"
+        + (f"  default_profile_id: {default_profile_id}\n" if default_profile_id else "")
+        + "  profile_demo:\n"
         f"    catalog_file: {catalog_file}\n"
     )
     with isolated_local_server(
@@ -292,6 +296,106 @@ def test_provider_owned_profiles(
     ).to_be_visible()
     expect(page.get_by_role("button", name="Start session", exact=True)).to_be_disabled()
     assert "invalid-private-catalog" not in page.locator("body").inner_text()
+
+
+@pytest.mark.parametrize("provider_profile_server", ["demo-small"], indirect=True)
+def test_composer_preselects_the_provider_default(
+    page: Page, provider_profile_server: tuple[str, Path], tmp_path: Path
+) -> None:
+    base, _catalog_file = provider_profile_server
+    evidence = Path(os.environ.get("OMNIGENT_SANDBOX_PROFILE_EVIDENCE_DIR", str(tmp_path)))
+    evidence.mkdir(parents=True, exist_ok=True)
+    page.set_viewport_size({"width": 1440, "height": 1000})
+    page.set_extra_http_headers({"X-Forwarded-Email": "alice@example.test"})
+    page.goto(base)
+    expect(
+        page.get_by_role("button", name="Sandbox profile: Small development sandbox", exact=True)
+    ).to_be_visible()
+    page.get_by_test_id("new-chat-landing-input").fill("Build in the default sandbox.")
+    expect(page.get_by_role("button", name="Start session", exact=True)).to_be_enabled()
+    page.screenshot(
+        path=evidence / "provider-08-default-preselected.png",
+        full_page=True,
+        animations="disabled",
+    )
+    launches: list[dict[str, Any]] = []
+
+    def intercept_launch(route: Route) -> None:
+        if route.request.method != "POST":
+            route.continue_()
+            return
+        launches.append(route.request.post_data_json)
+        route.fulfill(
+            status=422,
+            content_type="application/json",
+            body=json.dumps({"detail": "Provisioning is disconnected in this browser test."}),
+        )
+
+    page.route("**/v1/sessions", intercept_launch)
+    with page.expect_response(
+        lambda r: r.request.method == "POST" and r.url == f"{base}/v1/sessions"
+    ):
+        page.get_by_role("button", name="Start session", exact=True).click()
+    assert launches[0]["sandbox_profile_id"] == "demo-small"
+
+
+@pytest.mark.parametrize("provider_profile_server", ["demo-small"], indirect=True)
+def test_composer_starts_on_the_last_picked_profile(
+    page: Page, provider_profile_server: tuple[str, Path], tmp_path: Path
+) -> None:
+    base, _catalog_file = provider_profile_server
+    evidence = Path(os.environ.get("OMNIGENT_SANDBOX_PROFILE_EVIDENCE_DIR", str(tmp_path)))
+    evidence.mkdir(parents=True, exist_ok=True)
+    page.set_viewport_size({"width": 1440, "height": 1000})
+    page.set_extra_http_headers({"X-Forwarded-Email": "alice@example.test"})
+    launches: list[dict[str, Any]] = []
+
+    def intercept_launch(route: Route) -> None:
+        if route.request.method != "POST":
+            route.continue_()
+            return
+        launches.append(route.request.post_data_json)
+        route.fulfill(
+            status=422,
+            content_type="application/json",
+            body=json.dumps({"detail": "Provisioning is disconnected in this browser test."}),
+        )
+
+    def start(prompt: str) -> None:
+        page.get_by_test_id("new-chat-landing-input").fill(prompt)
+        expect(page.get_by_role("button", name="Start session", exact=True)).to_be_enabled()
+        with page.expect_response(
+            lambda r: r.request.method == "POST" and r.url == f"{base}/v1/sessions"
+        ):
+            page.get_by_role("button", name="Start session", exact=True).click()
+
+    page.route("**/v1/sessions", intercept_launch)
+    page.goto(base)
+    page.get_by_role(
+        "button", name="Sandbox profile: Small development sandbox", exact=True
+    ).click()
+    page.get_by_role("combobox", name="Search sandbox profiles").fill("Large development")
+    page.get_by_role("option", name="Large development sandbox", exact=False).click()
+    expect(
+        page.get_by_role("button", name="Sandbox profile: Large development sandbox", exact=True)
+    ).to_be_visible()
+    page.screenshot(
+        path=evidence / "provider-09-pick-non-default.png", full_page=True, animations="disabled"
+    )
+    start("Build in the large sandbox.")
+
+    # A fresh composer starts on the profile picked last, not the default.
+    page.goto(base)
+    expect(
+        page.get_by_role("button", name="Sandbox profile: Large development sandbox", exact=True)
+    ).to_be_visible()
+    page.screenshot(
+        path=evidence / "provider-10-last-profile-remembered.png",
+        full_page=True,
+        animations="disabled",
+    )
+    start("Build in the large sandbox again.")
+    assert [launch["sandbox_profile_id"] for launch in launches] == ["demo-large", "demo-large"]
 
 
 @pytest.mark.parametrize("sandbox_profile_server", [False], indirect=True)

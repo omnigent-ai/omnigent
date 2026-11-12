@@ -398,7 +398,10 @@ idle -> running -> idle
   for an external signal (background tools, sub-agent completion,
   client tool result). Surfaced as a `session.status` event with
   `status: "waiting"`. The loop resumes (back to `running`) when
-  the signal arrives.
+  the signal arrives. A claude-native session also reports `waiting`
+  when its turn has ended but a background agent it started is still
+  running. That edge names the agents in `background_agents`, and the
+  session takes a new message right away.
 - **failed**: An unrecoverable error occurred during processing.
   The session cannot accept new events.
 
@@ -445,7 +448,15 @@ Fields:
 
   status (string, required)
     Current lifecycle state: `"idle"`, `"running"`, `"waiting"`, or
-    `"failed"`.
+    `"failed"`. A live `waiting` reads `"running"` here, which headless
+    clients treat as unfinished.
+
+  background_agents (array, optional)
+    Background agents a claude-native turn left running after it ended,
+    while the session waits on them. `status` still reads `"running"`
+    then, so older clients keep waiting; clients that know this field
+    show the session as waiting, with its composer free. Each entry has
+    the same shape as a `background_tasks` entry. Omitted otherwise.
 
   created_at (integer, required)
     Unix timestamp (seconds) when the session was created.
@@ -556,7 +567,11 @@ Request parts:
 
   metadata (JSON string, required)
     Session metadata. Shape matches `SessionCreateMetadata`:
-    `{title?: string | null, labels?: object, reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null, workspace?: string | null, terminal_launch_args?: string[] | null}`.
+    `{title?: string | null, labels?: object, reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null, model_override?: string | null, workspace?: string | null, terminal_launch_args?: string[] | null}`.
+    `model_override` and `reasoning_effort` are session-level and win over
+    the uploaded bundle's `executor.model` / `executor.reasoning_effort`, as on
+    the JSON create. Servers that accept `model_override` here report
+    `session_bundle_model_override` in `GET /v1/info`; older ones reject it.
     `terminal_launch_args` carries pass-through CLI args for a native
     terminal wrapper, e.g. `["--permission-mode", "bypassPermissions"]`
     (same field as the JSON create path below). Unknown fields fail with 400.
@@ -939,6 +954,9 @@ Request body:
 is used on a non-Codex-native session; or `external_session_id` would
 overwrite a different existing value
 404 Not Found - no session with that id
+409 Conflict - `runner_id` was sent while a move onto a new sandbox holds
+the session (see "Move Session to a New Sandbox"), or the session's
+runner changed while the request was being handled
 
 This is the mutable affinity primitive for Alpha. The same endpoint
 serves create-bind, resume-bind, and recover-bind: the client starts a
@@ -1010,7 +1028,22 @@ Request body matches `SessionEventInput`:
                                   in place); the harness then moves the
                                   terminal onto a fresh session that live
                                   viewers follow via `session.superseded`.
-                                  Other harnesses get a 400. Payload: `{}`.
+                                  For claude-sdk (servers reporting
+                                  `session_claude_sdk_clear` in
+                                  `/v1/info`), the server checks the
+                                  caller owns the top-level session, asks
+                                  the runner to drop its live SDK client
+                                  with `continue_in_new_session: true`
+                                  (an older runner's 204 is accepted), and
+                                  continues the work in an empty session
+                                  on the same host, workspace and runner,
+                                  returning its id as `session_id`. A
+                                  running or starting turn is a 400; a
+                                  clear already moving the session is a
+                                  409, as is a message sent meanwhile. A
+                                  runner leaves an unmarked claude-sdk
+                                  clear unsupported (204). Other harnesses
+                                  get a 400. Payload: `{}`.
       - "stop_session"          — terminate the live session without
                                   deleting the conversation (owner-only;
                                   requires LEVEL_OWNER). Forwarded
@@ -1349,6 +1382,86 @@ shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
 copied items in chronological order. Clients must bind a runner
 before opening the fork's SSE stream or posting events.
 
+### Move Session to a New Sandbox
+
+```
+POST /v1/sessions/{session_id}/managed-host
+Content-Type: application/json
+
+{
+  "sandbox_provider": "modal",                          // optional
+  "host_id": "0123456789abcdef0123456789abcdef",        // optional
+  "workspace": "https://github.com/org/repo#main"       // optional
+}
+
+Request body matches `SessionManagedHostRequest`. Each field means what
+it does on a `host_type: "managed"` fork:
+
+  sandbox_provider (string | null, optional)
+    Which configured sandbox provider to provision; null takes the
+    server's first.
+
+  host_id (string | null, optional)
+    Id for the new sandbox host: 32 lowercase hex characters, sent
+    only when `GET /v1/info` reports `request_managed_sandbox_host_id`.
+    Recorded in the `omnigent.sandbox.requested_host_id` label until
+    the host binds; null lets the server mint one.
+
+  workspace (string | null, optional)
+    Git repository URL, optionally `#<branch>`, cloned into the
+    sandbox as the session's working directory; null gives the
+    session an empty sandbox.
+
+202 Accepted — body matches `SessionResponse`, with `host_id` and
+  `workspace` null and `sandbox_status` reporting the launch.
+
+400 Bad Request — the session is a sub-agent or side chat, has no
+  agent binding, already runs in a sandbox, or asks for a sandbox
+  this server has not configured or whose provider manages sandbox
+  profiles
+403 / 404 — the caller does not own the session, or (403) the server's
+  nested-agent destination policy keeps this session off new sandboxes
+409 Conflict — a runner is still bound, the session has no host to
+  move from (it may already be moving), its host or runner changed
+  while the move ran, or host_id names a host already in use
+422 Unprocessable Entity — a malformed host_id, or a workspace that is
+  not a repository URL
+```
+
+Servers that support this route report `move_to_managed_sandbox` on
+`GET /v1/info`; clients should not release a session's runner for a
+move on a server that doesn't. A provider takes a moved session only if
+its `sandbox_provider_capabilities` entry reports `accepts_session_move`
+(one that manages sandbox profiles doesn't); treat a provider that
+doesn't say as one that can't.
+
+Moves an existing session onto a new server-provisioned sandbox — the
+sandbox counterpart of `POST /v1/hosts/{host_id}/runners`. Release the
+session's runner first with `PATCH /v1/sessions/{id}` and
+`{"runner_id": ""}`. The call then claims the session against the
+binding it checked, so a runner bound or a host changed in the
+meantime, or a concurrent move, makes it fail with 409. The claim stays
+on the session until the sandbox's runner replaces it; meanwhile a host
+launch is refused, a message is held for the sandbox, and
+`PATCH /v1/sessions/{id}` with a `runner_id` returns 409, on every
+replica. Only the move releases its claim, after it has settled the
+session; a claim over an hour old is left by a server that stopped
+mid-move, and `PATCH` may clear it, marking messages held for that move
+not sent. The call clears the session's host,
+workspace and branch, drops any earlier sandbox's
+`omnigent.sandbox.repo*` and `omnigent.sandbox.requested_host_id`
+labels, and registers the sandbox to the caller. Like a managed fork,
+the request should be routed by the new sandbox's `host_id`, where the
+launch connects. A failed launch leaves the session unbound with the
+reason in `sandbox_status`, and held messages are reported as not
+delivered, before the claim is released. When the sandbox's host
+connects to another replica, the claim is handed over for that replica
+to start the runner; if another host binds the session then, that
+binding wins: the sandbox is torn down without failing the session, and
+held messages are marked not sent. A request the server refuses
+restores the previous binding and labels, and releases the claim. Files
+don't move with the session; the transcript does.
+
 ### Read Fork Repository Branch Suggestions
 
 `GET /v1/sessions/{session_id}/resources/repository-branches` requires session
@@ -1431,7 +1544,7 @@ stream and surface queue/interrupt semantics.
 
 | Event | Pydantic class | Wire shape (illustrative) |
 |---|---|---|
-| `session.status` | `SessionStatusEvent` | `{type, conversation_id, status: "running" \| "waiting" \| "idle" \| "failed"}` |
+| `session.status` | `SessionStatusEvent` | `{type, conversation_id, status: "running" \| "waiting" \| "idle" \| "failed", background_agents?: BackgroundTaskInfo[]}` |
 | `session.reasoning_effort` | `SessionReasoningEffortEvent` | `{type, conversation_id, reasoning_effort: string \| null}` |
 | `session.collaboration_mode` | `SessionCollaborationModeEvent` | `{type, conversation_id, mode: string}` |
 | `session.codex_approval_mode` | `SessionCodexApprovalModeEvent` | `{type, conversation_id, approval_mode: "ask-for-approval" \| "approve-for-me" \| "full-access" \| "read-only"}` |

@@ -13,8 +13,8 @@ import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { hasCommandModifier } from "@/lib/hotkeys";
-import { isSystemUserContent } from "@/lib/systemMessage";
-import { isTerminalCommandInput } from "@/lib/blocks";
+import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import { isTerminalCommandInput, isTextBlock } from "@/lib/blocks";
 import {
   type Bubble,
   type BubbleCache,
@@ -51,12 +51,13 @@ import {
   KeepBottomOnResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
-  WorkingIndicator,
+  WorkingIndicatorRow,
   bubbleKey,
   collectPendingElicitations,
   computeIsWorking,
   extractUserText,
   isSystemBubble,
+  keyboardActiveQuestionId,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
@@ -87,6 +88,29 @@ export interface TranscriptProps {
   sandboxLaunching: boolean;
   /** Pub/sub ref for the LatestTurnSpacer's synchronous re-measure handle. */
   spacerMeasureRef: React.RefObject<(() => void) | null>;
+}
+
+function isHiddenSubagentWakeBubble(bubble: Bubble): boolean {
+  if (bubble.kind !== "user") return false;
+  const first = bubble.content[0];
+  if (!first || !isTextBlock(first) || !first.text.startsWith("[System: sub-agent ")) return false;
+  if (!bubble.content.every(isTextBlock)) return false;
+  const parsed = parseSystemMessage(extractUserText(bubble.content));
+  return parsed?.kind === "subagent_wake" && parsed.body === "";
+}
+
+/** Keep model-facing sub-agent wake messages out of the visible row geometry. */
+export function visibleTranscriptBubbles(bubbles: Bubble[]): Bubble[] {
+  let visible: Bubble[] | null = null;
+  for (let index = 0; index < bubbles.length; index += 1) {
+    const bubble = bubbles[index]!;
+    if (isHiddenSubagentWakeBubble(bubble)) {
+      visible ??= bubbles.slice(0, index);
+    } else {
+      visible?.push(bubble);
+    }
+  }
+  return visible ?? bubbles;
 }
 
 export function isNativeFindShortcut(
@@ -175,8 +199,15 @@ function TranscriptImpl({
   ]);
 
   const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
+  const keyboardActiveElicitationId = useMemo(
+    () => keyboardActiveQuestionId(pendingElicitations),
+    [pendingElicitations],
+  );
   const streamBubbles = useMemo(
-    () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
+    () =>
+      visibleTranscriptBubbles(
+        pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles),
+      ),
     [bubbles, pendingElicitations.length],
   );
   const committedUserIds = useMemo(() => {
@@ -200,6 +231,7 @@ function TranscriptImpl({
       bubbles,
       streamBubbles,
       pendingElicitations,
+      keyboardActiveElicitationId,
       blockCount: blocks.length,
       committedUserIds,
       hasCommittedAnchor:
@@ -215,6 +247,7 @@ function TranscriptImpl({
       bubbles,
       streamBubbles,
       pendingElicitations,
+      keyboardActiveElicitationId,
       blocks,
       committedUserIds,
       hasTasks,
@@ -346,11 +379,12 @@ function TranscriptImpl({
       conversation area without requiring Conversation to forward refs. */}
       <div
         ref={setConversationEl}
-        className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
+        className="session-chat-transcript @container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
         <Conversation
           className={cn(
-            hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade",
+            !isMobileViewport &&
+              (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
             "flex-1",
           )}
         >
@@ -366,7 +400,6 @@ function TranscriptImpl({
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
             <KeepBottomOnResize />
-            <ConversationScrollRefBridge onScroller={setScroller} />
             <HistoryAutoLoader
               scrollElement={scroller?.el ?? null}
               rowCount={display.streamBubbles.length}
@@ -415,12 +448,18 @@ function TranscriptImpl({
                     data-testid="bottom-elicitation"
                   >
                     <MessageContent className="w-full">
-                      <ElicitationCard item={item} />
+                      <ElicitationCard
+                        item={item}
+                        keyboardActive={item.elicitationId === display.keyboardActiveElicitationId}
+                      />
                     </MessageContent>
                   </Message>
                 ))}
                 {/* Working… shimmer, lit for the whole busy turn. */}
-                {showWorkingIndicator && <WorkingIndicator />}
+                <WorkingIndicatorRow
+                  key={display.conversationId ?? "landing"}
+                  show={showWorkingIndicator}
+                />
                 {/* Managed-sandbox launch status; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the
@@ -441,7 +480,15 @@ function TranscriptImpl({
               remeasureNonce={spacerMeasureNonce}
             />
           </ConversationContent>
-          <ConversationScrollButton />
+          {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
+          <ConversationScrollRefBridge onScroller={setScroller} />
+          <ConversationScrollButton
+            className={
+              isMobileViewport
+                ? "bottom-[calc(var(--session-composer-height,0px)+1rem)]"
+                : undefined
+            }
+          />
         </Conversation>
         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
         chat-scroll-fade mask. */}
@@ -576,6 +623,43 @@ const ROW_GAP_PX = 16;
 const RESTORE_CANCEL_EVENTS = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
 function isElAtBottom(el: HTMLElement): boolean {
   return el.scrollHeight - el.clientHeight - el.scrollTop <= BOTTOM_EPSILON_PX;
+}
+
+/**
+ * Re-apply `pin` every frame while row heights settle, for the restore budget or until
+ * the reader scrolls, taps, or types. Returns a function that stops it early.
+ */
+export function pinUntilSettled(
+  scrollEl: HTMLElement,
+  pin: () => void,
+  isCurrent: () => boolean,
+  onFinish: () => void,
+): () => void {
+  const deadline = performance.now() + SCROLL_RESTORE_BUDGET_MS;
+  let frame = 0;
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    cancelAnimationFrame(frame);
+    for (const type of RESTORE_CANCEL_EVENTS) scrollEl.removeEventListener(type, finish);
+    onFinish();
+  };
+  const tick = () => {
+    if (done || !isCurrent()) return;
+    if (performance.now() >= deadline) {
+      finish();
+      return;
+    }
+    pin();
+    frame = requestAnimationFrame(tick);
+  };
+  for (const type of RESTORE_CANCEL_EVENTS) {
+    scrollEl.addEventListener(type, finish, { passive: true });
+  }
+  pin();
+  frame = requestAnimationFrame(tick);
+  return finish;
 }
 
 export function VirtualBubbleList({
@@ -870,6 +954,11 @@ export function VirtualBubbleList({
   bubblesRef.current = bubbles;
   const virtualizerRef = useRef(virtualizer);
   virtualizerRef.current = virtualizer;
+  // Where a row's top sits, by key, as the virtualizer currently measures it.
+  const anchorStart = useCallback((key: string): number | undefined => {
+    const index = bubblesRef.current.findIndex((bubble) => bubbleKey(bubble) === key);
+    return index < 0 ? undefined : virtualizerRef.current.getOffsetForIndex(index, "start")?.[0];
+  }, []);
 
   // Persist the item crossing the viewport top, not only a raw scrollTop.
   // Virtual row estimates can change while a conversation is hidden; the key
@@ -922,9 +1011,6 @@ export function VirtualBubbleList({
       done = true;
       if (restoringRef.current === conversationId) restoringRef.current = null;
       cancelAnimationFrame(frame);
-      for (const type of RESTORE_CANCEL_EVENTS) {
-        scrollEl.removeEventListener(type, finish);
-      }
     };
 
     if (!saved || saved.atBottom) {
@@ -948,31 +1034,15 @@ export function VirtualBubbleList({
     }
 
     c.stopScroll();
-    const deadline = performance.now() + SCROLL_RESTORE_BUDGET_MS;
-    const pinAnchor = () => {
-      scrollEl.scrollTop = resolveTranscriptViewOffset(saved, (key) => {
-        const index = bubblesRef.current.findIndex((bubble) => bubbleKey(bubble) === key);
-        return index < 0
-          ? undefined
-          : virtualizerRef.current.getOffsetForIndex(index, "start")?.[0];
-      });
-    };
-    const tick = () => {
-      if (done || restoringRef.current !== conversationId) return;
-      if (performance.now() >= deadline) {
-        finish();
-        return;
-      }
-      pinAnchor();
-      frame = requestAnimationFrame(tick);
-    };
-    for (const type of RESTORE_CANCEL_EVENTS) {
-      scrollEl.addEventListener(type, finish, { passive: true });
-    }
-    pinAnchor();
-    frame = requestAnimationFrame(tick);
-    return finish;
-  }, [conversationId, scrollEl, messageId]);
+    return pinUntilSettled(
+      scrollEl,
+      () => {
+        scrollEl.scrollTop = resolveTranscriptViewOffset(saved, anchorStart);
+      },
+      () => restoringRef.current === conversationId,
+      finish,
+    );
+  }, [conversationId, scrollEl, messageId, anchorStart]);
 
   const scrollToItem = useCallback((itemId: string): boolean => {
     const index = bubblesRef.current.findIndex(

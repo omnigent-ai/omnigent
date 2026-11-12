@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
@@ -13,6 +13,7 @@ import {
   overlayArchivedIntoCaches,
   overlayTitleIntoCaches,
   removeIdsFromPages,
+  settleOpenSessionRow,
 } from "./sessionListCache";
 
 function conv(id: string, overrides: Partial<Conversation> = {}): Conversation {
@@ -613,5 +614,31 @@ describe("insertNewRowsIntoPages", () => {
       (id) => id === "gone",
     );
     expect(inserted).toHaveLength(0);
+  });
+});
+
+describe("settleOpenSessionRow", () => {
+  const key = ["conversation-backfill", "a"];
+
+  it("skips a session with no fetched row", () => {
+    const client = new QueryClient();
+    const isFetching = vi.spyOn(client, "isFetching");
+
+    settleOpenSessionRow(client, "a", { archived: true });
+
+    expect(client.getQueryState(key)).toBeUndefined();
+    expect(isFetching).not.toHaveBeenCalled();
+  });
+
+  it("patches only the given fields, keeping the owner", () => {
+    const client = new QueryClient();
+    client.setQueryData(key, conv("a", { owner: "teammate", archived: false }));
+
+    settleOpenSessionRow(client, "a", { archived: true });
+    settleOpenSessionRow(client, "a", { title: "Renamed", updated_at: 5 });
+
+    expect(client.getQueryData(key)).toEqual(
+      conv("a", { owner: "teammate", archived: true, title: "Renamed", updated_at: 5 }),
+    );
   });
 });

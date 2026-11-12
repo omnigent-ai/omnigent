@@ -23,7 +23,8 @@ import {
   Trash2Icon,
   TriangleAlertIcon,
 } from "lucide-react";
-import { Link, useNavigate, useParams } from "@/lib/routing";
+import { Link, useNavigate, useParams, useRebasePath } from "@/lib/routing";
+import { getShareableSessionLink } from "@/lib/shareLink";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -31,7 +32,11 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
-import { isTriggerPrompt, splitTriggerPrompt } from "@/components/scheduled/triggerTemplates";
+import {
+  isTriggerPrompt,
+  SESSION_LINK_ID_PLACEHOLDER,
+  splitTriggerPrompt,
+} from "@/components/scheduled/triggerTemplates";
 import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
@@ -45,6 +50,7 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { useNow } from "@/hooks/useNow";
+import { useSession } from "@/hooks/useSession";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useProjects } from "@/hooks/useConversations";
@@ -80,6 +86,9 @@ export function TaskDetailPage() {
 function TaskDetail({ taskId }: { taskId: string }) {
   const navigate = useNavigate();
   const now = useNow();
+  // Switching a trigger's source renders a new template whose workers post this share link.
+  const rebasePath = useRebasePath();
+  const sessionLink = getShareableSessionLink(SESSION_LINK_ID_PLACEHOLDER, rebasePath);
 
   // "Awaiting new run row" loading state for the Run now button. The button
   // stays in its loading state after the POST returns 202 until a new run row
@@ -424,13 +433,30 @@ function TaskDetail({ taskId }: { taskId: string }) {
         </span>
       </div>
 
+      {task.sourceSessionId && (
+        <Section title="Starts from">
+          <SourceSessionLink sessionId={task.sourceSessionId} />
+          <p className="mt-1 text-sm text-muted-foreground">
+            Each run starts with a copy of this session&apos;s history.
+          </p>
+        </Section>
+      )}
+
       {/* Prompt. */}
-      <Section title={systemPrompt === null ? "Prompt" : "Your prompt"}>
+      <Section
+        title={
+          task.sourceSessionId
+            ? "Additional instructions"
+            : systemPrompt === null
+              ? "Prompt"
+              : "Your prompt"
+        }
+      >
         <p
           className="whitespace-pre-wrap text-sm text-foreground/90"
           data-testid="task-detail-prompt"
         >
-          {userPrompt}
+          {task.sourceSessionId && userPrompt.trim() === "" ? "None" : userPrompt}
         </p>
       </Section>
 
@@ -457,7 +483,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
       )}
 
       {/* Saved configuration for launching sessions. */}
-      <Collapsible defaultOpen className="mt-6">
+      <Collapsible className="mt-6">
         <h2 className="mb-2 text-sm font-medium text-muted-foreground">
           <CollapsibleTrigger className="group flex cursor-pointer items-center gap-1 rounded-sm text-left transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
             <ChevronDownIcon
@@ -562,7 +588,12 @@ function TaskDetail({ taskId }: { taskId: string }) {
         </ul>
       )}
 
-      <CreateScheduledTaskDialog open={editOpen} onOpenChange={setEditOpen} editingTask={task} />
+      <CreateScheduledTaskDialog
+        open={editOpen}
+        onOpenChange={setEditOpen}
+        editingTask={task}
+        sessionLink={sessionLink}
+      />
     </PageScroll>
   );
 }
@@ -587,6 +618,20 @@ function Section({ title, children }: { title: string; children: React.ReactNode
       <h2 className="mb-2 text-sm font-medium text-muted-foreground">{title}</h2>
       {children}
     </section>
+  );
+}
+
+/** Link to the session every run copies, named after it once its snapshot loads. */
+function SourceSessionLink({ sessionId }: { sessionId: string }) {
+  const { session } = useSession(sessionId);
+  return (
+    <Link
+      to={`/c/${encodeURIComponent(sessionId)}`}
+      className="text-sm text-primary underline underline-offset-2 hover:text-primary/80"
+      data-testid="task-detail-starts-from"
+    >
+      {session?.title || "Source session"}
+    </Link>
   );
 }
 
@@ -650,7 +695,9 @@ function RunRow({
   // Unread only applies to a succeeded run that produced a conversation.
   const unread = useRunUnread(run);
   const failure = isUnsuccessfulRun(run) ? describeRunFailure(run.errorCode, run.status) : null;
-  const inFlightLabel = IN_FLIGHT_RUN_LABELS[run.status];
+  const inFlightLabel =
+    IN_FLIGHT_RUN_LABELS[run.status] ??
+    (isSessionStillRunning(run) ? "Session running" : undefined);
 
   const body = (
     <>
@@ -696,6 +743,14 @@ function RunRow({
             {failure.reason}
           </span>
         )}
+        {failure && run.errorDetail && (
+          <span
+            className="text-xs break-words text-muted-foreground [overflow-wrap:anywhere]"
+            data-testid="run-failure-detail"
+          >
+            {run.errorDetail}
+          </span>
+        )}
       </span>
     </>
   );
@@ -737,6 +792,7 @@ function RunRow({
  *   1. failed / incomplete → amber warning triangle, tooltip = "Failed".
  *   2. skipped             → muted calendar-off icon, tooltip = "Skipped".
  *   3. starting / running  → spinning loader icon, tooltip = the status.
+ *      succeeded, session still running → the same spinner, tooltip "Session still running".
  *   4. succeeded + UNREAD  → blue filled dot, tooltip = "Unread".
  *   5. succeeded + READ / no conversation → muted grey dot, tooltip = "Completed".
  *   6. scheduled           → muted grey dot, no tooltip (not started yet).
@@ -780,6 +836,17 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
       </IndicatorWithTooltip>
     );
   }
+  if (isSessionStillRunning(run)) {
+    return (
+      <IndicatorWithTooltip tooltip="Session still running" announce={false}>
+        <Loader2Icon
+          data-testid="run-status-icon"
+          data-run-icon="session-running"
+          className="size-3.5 shrink-0 animate-spin text-muted-foreground"
+        />
+      </IndicatorWithTooltip>
+    );
+  }
   if (run.status === "succeeded" && unread) {
     return (
       <IndicatorWithTooltip tooltip="Unread">
@@ -808,6 +875,19 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
     return <IndicatorWithTooltip tooltip="Completed">{dot}</IndicatorWithTooltip>;
   }
   return dot;
+}
+
+/**
+ * A succeeded run whose session is still working. The run row settles when its
+ * turn ends, but the session can keep running (background work, a manager
+ * session that outlives the turn), so a "completed" dot would read as finished.
+ */
+function isSessionStillRunning(run: ScheduledTaskRun): boolean {
+  return (
+    run.status === "succeeded" &&
+    run.conversationId !== null &&
+    run.conversationStatus === "running"
+  );
 }
 
 // A run that hasn't finished says what it's doing; the spinner alone doesn't
