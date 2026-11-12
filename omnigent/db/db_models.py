@@ -1960,8 +1960,9 @@ class SqlWorkflow(OmnigentBase):
     name: Mapped[str] = mapped_column(String(80), nullable=False)
     # A few paragraphs: at most 8,000 bytes in UTF-8.
     description: Mapped[str] = mapped_column(String(2000), nullable=False)
+    # Deferred so whole-row reads skip it; list pages never need it.
     plan: Mapped[str] = mapped_column(
-        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False
+        CompressedText(max_stored_bytes=MAX_STORED_VALUE_BYTES), nullable=False, deferred=True
     )
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

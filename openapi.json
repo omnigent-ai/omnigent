@@ -2163,6 +2163,37 @@
         "title": "CreateSessionPolicyRequest",
         "type": "object"
       },
+      "CreateWorkflowRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /v1/workflows`.",
+        "properties": {
+          "description": {
+            "description": "What the workflow is for, at most 2,000 characters.",
+            "title": "Description",
+            "type": "string"
+          },
+          "name": {
+            "description": "One line of at most 80 characters, unique among the caller's workflows.",
+            "title": "Name",
+            "type": "string"
+          },
+          "steps": {
+            "description": "The graph: unique step IDs, dependencies inside it, no cycles, at most 100 steps.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "steps"
+        ],
+        "title": "CreateWorkflowRequest",
+        "type": "object"
+      },
       "CreatedEvent": {
         "description": "Initial event emitted at the start of every streaming response.\n\nCarries the freshly-allocated\n`omnigent.server.schemas.ResponseObject` (status will\nbe `\"queued\"` or `\"in_progress\"` depending on whether the\ntask started immediately).",
         "properties": {
@@ -6779,6 +6810,11 @@
           },
           "smart_routing_sources": {
             "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
+          },
+          "workflows": {
+            "default": false,
+            "title": "Workflows",
+            "type": "boolean"
           }
         },
         "required": [
@@ -13375,6 +13411,53 @@
         "title": "UpdateSessionRequest",
         "type": "object"
       },
+      "UpdateWorkflowRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `PATCH /v1/workflows/{workflow_id}`; `None` keeps a field.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A new description.",
+            "title": "Description"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A new name.",
+            "title": "Name"
+          },
+          "steps": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/WorkflowStep"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New steps, replacing the old ones.",
+            "title": "Steps"
+          }
+        },
+        "title": "UpdateWorkflowRequest",
+        "type": "object"
+      },
       "UpsertMCPServerRequest": {
         "description": "Request body for creating or updating a session agent MCP server.\n\n`env` is still excluded. `headers` is accepted for HTTP servers;\nwhen omitted, existing headers in the bundle are preserved unchanged.",
         "properties": {
@@ -13654,6 +13737,228 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "WorkflowDeleted": {
+        "description": "Response for `DELETE /v1/workflows/{workflow_id}`.",
+        "properties": {
+          "deleted": {
+            "const": true,
+            "default": true,
+            "description": "Always `True`.",
+            "title": "Deleted",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "The deleted workflow's ID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "object": {
+            "const": "workflow.deleted",
+            "default": "workflow.deleted",
+            "description": "Discriminator; always `\"workflow.deleted\"`.",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "WorkflowDeleted",
+        "type": "object"
+      },
+      "WorkflowList": {
+        "description": "One page of the caller's workflows by name, for `GET /v1/workflows`.",
+        "properties": {
+          "data": {
+            "description": "The page's workflows, without their steps.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowSummary"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The page's first workflow ID, or `None` when empty.",
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "description": "Whether another page follows.",
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The page's last workflow ID; pass it as `after` for the next page.",
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "description": "Discriminator; always `\"list\"`.",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "WorkflowList",
+        "type": "object"
+      },
+      "WorkflowObject": {
+        "description": "A saved workflow with its steps, the plan a run copies into a journal.",
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "object": {
+            "const": "workflow",
+            "default": "workflow",
+            "title": "Object",
+            "type": "string"
+          },
+          "steps": {
+            "description": "The workflow's graph.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowStep"
+            },
+            "title": "Steps",
+            "type": "array"
+          },
+          "updated_at": {
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "created_at",
+          "updated_at",
+          "steps"
+        ],
+        "title": "WorkflowObject",
+        "type": "object"
+      },
+      "WorkflowStep": {
+        "additionalProperties": false,
+        "description": "One step of a saved workflow, in the journal plan's step format.",
+        "properties": {
+          "depends_on": {
+            "description": "IDs of the steps that must be done before it.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Depends On",
+            "type": "array"
+          },
+          "goal": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the step achieves, at most 300 characters, or `None`.",
+            "title": "Goal"
+          },
+          "id": {
+            "description": "Stable step ID, e.g. `\"build\"`: lowercase letters, digits, `-` and `_`, starting with a letter or digit; at most 64 characters.",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "description": "One line of at most 80 characters, e.g. `\"Build\"`.",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "WorkflowStep",
+        "type": "object"
+      },
+      "WorkflowSummary": {
+        "description": "A saved workflow as a list page returns it, without its steps.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds when it was saved.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "description": {
+            "description": "What the workflow is for.",
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "description": "Workflow ID, a bare 32-character hex UUID.",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "description": "One line, unique among the owner's workflows.",
+            "title": "Name",
+            "type": "string"
+          },
+          "object": {
+            "const": "workflow",
+            "default": "workflow",
+            "description": "Discriminator; always `\"workflow\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "Unix epoch seconds of the last write.",
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "WorkflowSummary",
         "type": "object"
       }
     },
@@ -23424,6 +23729,279 @@
         "summary": "Get Usage",
         "tags": [
           "usage"
+        ]
+      }
+    },
+    "/v1/workflows": {
+      "get": {
+        "description": "List the caller's workflows by name, without their steps.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 400 for an `after` that isn't one of the caller's workflows.",
+        "operationId": "list_workflows_v1_workflows_get",
+        "parameters": [
+          {
+            "description": "Page size, e.g. `50`.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The previous page's `last_id`.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "description": "Only the workflow with this exact name, for `/workflow <name>`.",
+            "in": "query",
+            "name": "name",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Name"
+            }
+          },
+          {
+            "description": "Only names starting with this, for autocomplete.",
+            "in": "query",
+            "name": "name_prefix",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Name Prefix"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Workflows",
+        "tags": [
+          "workflows"
+        ]
+      },
+      "post": {
+        "description": "Save a workflow owned by the caller.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 400 for an invalid field or steps too large to store, 409 if the caller already has a workflow with this name.",
+        "operationId": "create_workflow_v1_workflows_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkflowRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Workflow",
+        "tags": [
+          "workflows"
+        ]
+      }
+    },
+    "/v1/workflows/{workflow_id}": {
+      "delete": {
+        "description": "Delete one of the caller's workflows.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow.",
+        "operationId": "delete_workflow_v1_workflows__workflow_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowDeleted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Workflow",
+        "tags": [
+          "workflows"
+        ]
+      },
+      "get": {
+        "description": "Return one of the caller's workflows, with its steps.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow.",
+        "operationId": "get_workflow_v1_workflows__workflow_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Workflow",
+        "tags": [
+          "workflows"
+        ]
+      },
+      "patch": {
+        "description": "Change one of the caller's workflows; fields left out keep their values.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 400 for an invalid field, 404 if the caller has no such workflow, 409 if another of the caller's workflows has the new name.",
+        "operationId": "update_workflow_v1_workflows__workflow_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWorkflowRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Workflow",
+        "tags": [
+          "workflows"
         ]
       }
     }
