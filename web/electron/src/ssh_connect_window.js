@@ -5,8 +5,7 @@
  * the exact commands, then shows progress, ssh's prompts (password, passphrase,
  * new host key) and the install question for the remote machine.
  *
- * Same trust model as the Arca connect console (arca_connect_window.js): the
- * server page can open it but can neither draw over it nor reach its IPC
+ * The server page can open it but can neither draw over it nor reach its IPC
  * channels, and messages are honored only from this window's own webContents.
  *
  * All Electron surfaces are injected so the flow is unit-testable.

@@ -24,9 +24,9 @@ const fs = require("node:fs");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
-const { lastLine, SAFE_URL_RE } = require("./arca");
+const { lastLine, SAFE_URL_RE } = require("./remoteCommand");
 const { isDatabricksOAuthServerUrl } = require("./url");
-const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity");
+const { readRemoteHostIdentity, IDENTITY_START, IDENTITY_END } = require("./hostIdentity");
 const { UV_INSTALLER } = require("./cli_install");
 const { createAskpass } = require("./ssh_askpass");
 
@@ -131,7 +131,7 @@ function loginScript(serverUrl) {
 }
 
 /**
- * Start the host, then print its status between markers for {@link readArcaIdentity}.
+ * Start the host, then print its status between markers for {@link readRemoteHostIdentity}.
  *
  * @param {string} serverUrl Already checked by {@link safeServerUrl}.
  * @returns {string}
@@ -799,7 +799,7 @@ async function runSshConnect(ctx) {
           : `Starting the Omnigent host on ${destination} failed: ${detail || `exit code ${host.code}`}`,
       };
     }
-    const identity = readArcaIdentity(host.stdout, serverUrl, full.onIdentityUnavailable);
+    const identity = readRemoteHostIdentity(host.stdout, serverUrl, full.onIdentityUnavailable);
     return {
       ok: true,
       alreadyRunning: /already running/i.test(host.stdout + host.stderr),

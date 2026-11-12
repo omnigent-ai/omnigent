@@ -2,7 +2,7 @@
 
 /**
  * Preload for the SHELL-OWNED SSH connect console (ssh-connect/index.html).
- * Deliberately narrow, like arca_connect_preload.js: the page can confirm or
+ * The page can confirm or
  * cancel its own flow, answer a prompt it was shown, and receive events.
  */
 
