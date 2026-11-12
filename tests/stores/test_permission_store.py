@@ -226,7 +226,7 @@ def _seed_grant(
     """Create the user row and a grant, as the share route does before granting.
 
     :param store: The permission store to write to.
-    :param user_id: The grantee, e.g. ``"alice@test.com"``.
+    :param user_id: The grantee, e.g. ``"alice@example.com"``.
     :param conversation_id: The session to grant on.
     :param level: The level to store.
     """
@@ -242,11 +242,11 @@ def test_grant_many_never_lowers_an_existing_grant(
     If this fails, grant_many wrote a level that does not outrank the stored one.
     """
     conv_id = _create_conversation(db_uri)
-    _seed_grant(store, "rita@test.com", conv_id, 3)
+    _seed_grant(store, "rita@example.com", conv_id, 3)
 
-    assert grant_many(conv_id, [("rita@test.com", 1)]) == []
+    assert grant_many(conv_id, [("rita@example.com", 1)]) == []
 
-    fetched = store.get("rita@test.com", conv_id)
+    fetched = store.get("rita@example.com", conv_id)
     assert fetched is not None
     assert fetched.level == 3, f"Expected the manage grant to stay at 3, got {fetched.level}."
 
@@ -256,12 +256,12 @@ def test_grant_many_raises_a_lower_grant(
 ) -> None:
     """A request above the stored level raises it and returns the raised grant."""
     conv_id = _create_conversation(db_uri)
-    _seed_grant(store, "sam@test.com", conv_id, 1)
+    _seed_grant(store, "sam@example.com", conv_id, 1)
 
-    written = grant_many(conv_id, [("sam@test.com", 2)])
+    written = grant_many(conv_id, [("sam@example.com", 2)])
 
-    assert written == [SessionPermission("sam@test.com", conv_id, 2)]
-    fetched = store.get("sam@test.com", conv_id)
+    assert written == [SessionPermission("sam@example.com", conv_id, 2)]
+    fetched = store.get("sam@example.com", conv_id)
     assert fetched is not None
     assert fetched.level == 2, f"Expected the raised level 2, got {fetched.level}."
 
@@ -272,16 +272,16 @@ def test_grant_many_creates_new_grants_and_user_rows(
     """Grantees with no grant or user row get both, and each new grant is returned."""
     conv_id = _create_conversation(db_uri)
 
-    written = grant_many(conv_id, [("pia@test.com", 1), ("quinn@test.com", 2)])
+    written = grant_many(conv_id, [("pia@example.com", 1), ("quinn@example.com", 2)])
 
     assert written == [
-        SessionPermission("pia@test.com", conv_id, 1),
-        SessionPermission("quinn@test.com", conv_id, 2),
+        SessionPermission("pia@example.com", conv_id, 1),
+        SessionPermission("quinn@example.com", conv_id, 2),
     ]
-    assert store.user_exists("pia@test.com") and store.user_exists("quinn@test.com"), (
+    assert store.user_exists("pia@example.com") and store.user_exists("quinn@example.com"), (
         "grant_many must create the user rows that session_permissions references."
     )
-    fetched = store.get("quinn@test.com", conv_id)
+    fetched = store.get("quinn@example.com", conv_id)
     assert fetched is not None
     assert fetched.level == 2
 
@@ -294,18 +294,18 @@ def test_grant_many_leaves_the_owner_grant_untouched(
     Owner requests are dropped before any write, so the requested user gets no row.
     """
     conv_id = _create_conversation(db_uri)
-    _seed_grant(store, "olga@test.com", conv_id, LEVEL_OWNER)
+    _seed_grant(store, "olga@example.com", conv_id, LEVEL_OWNER)
 
     written = grant_many(
         conv_id,
-        [("olga@test.com", 1), ("olga@test.com", 3), ("nora@test.com", LEVEL_OWNER)],
+        [("olga@example.com", 1), ("olga@example.com", 3), ("nora@example.com", LEVEL_OWNER)],
     )
 
     assert written == [], f"No grant should be written over the owner, got {written}."
-    owner = store.get("olga@test.com", conv_id)
+    owner = store.get("olga@example.com", conv_id)
     assert owner is not None
     assert owner.level == LEVEL_OWNER, f"Owner grant changed to {owner.level}."
-    assert store.get("nora@test.com", conv_id) is None
+    assert store.get("nora@example.com", conv_id) is None
 
 
 def test_grant_many_returns_only_grants_it_wrote_or_raised(
@@ -316,25 +316,25 @@ def test_grant_many_returns_only_grants_it_wrote_or_raised(
     Skipped here: a higher stored grant, an equal stored grant, and the owner.
     """
     conv_id = _create_conversation(db_uri)
-    _seed_grant(store, "owner@test.com", conv_id, LEVEL_OWNER)
-    _seed_grant(store, "higher@test.com", conv_id, 3)
-    _seed_grant(store, "equal@test.com", conv_id, 2)
-    _seed_grant(store, "lower@test.com", conv_id, 1)
+    _seed_grant(store, "owner@example.com", conv_id, LEVEL_OWNER)
+    _seed_grant(store, "higher@example.com", conv_id, 3)
+    _seed_grant(store, "equal@example.com", conv_id, 2)
+    _seed_grant(store, "lower@example.com", conv_id, 1)
 
     written = grant_many(
         conv_id,
         [
-            ("new@test.com", 1),
-            ("higher@test.com", 1),
-            ("lower@test.com", 2),
-            ("owner@test.com", 3),
-            ("equal@test.com", 2),
+            ("new@example.com", 1),
+            ("higher@example.com", 1),
+            ("lower@example.com", 2),
+            ("owner@example.com", 3),
+            ("equal@example.com", 2),
         ],
     )
 
     assert written == [
-        SessionPermission("new@test.com", conv_id, 1),
-        SessionPermission("lower@test.com", conv_id, 2),
+        SessionPermission("new@example.com", conv_id, 1),
+        SessionPermission("lower@example.com", conv_id, 2),
     ]
 
 
@@ -347,24 +347,24 @@ def test_grant_many_writes_a_repeated_user_once_at_the_highest_level(
     that does not outrank the stored grant writes nothing.
     """
     conv_id = _create_conversation(db_uri)
-    _seed_grant(store, "uma@test.com", conv_id, 2)
+    _seed_grant(store, "uma@example.com", conv_id, 2)
 
     written = grant_many(
         conv_id,
         [
-            ("tina@test.com", 1),
-            ("tina@test.com", 3),
-            ("tina@test.com", 2),
-            ("uma@test.com", 1),
-            ("uma@test.com", 2),
+            ("tina@example.com", 1),
+            ("tina@example.com", 3),
+            ("tina@example.com", 2),
+            ("uma@example.com", 1),
+            ("uma@example.com", 2),
         ],
     )
 
-    assert written == [SessionPermission("tina@test.com", conv_id, 3)]
-    tina = store.get("tina@test.com", conv_id)
+    assert written == [SessionPermission("tina@example.com", conv_id, 3)]
+    tina = store.get("tina@example.com", conv_id)
     assert tina is not None
     assert tina.level == 3, f"Expected the highest requested level 3, got {tina.level}."
-    uma = store.get("uma@test.com", conv_id)
+    uma = store.get("uma@example.com", conv_id)
     assert uma is not None
     assert uma.level == 2, f"Expected the equal stored grant to stay at 2, got {uma.level}."
 
@@ -388,16 +388,16 @@ def test_grant_many_is_scoped_to_the_current_workspace(
     there, and the default-workspace row stays at 3.
     """
     conv_id = _create_conversation(db_uri)
-    _seed_grant(store, "lena@test.com", conv_id, 3)
+    _seed_grant(store, "lena@example.com", conv_id, 3)
 
     with workspace_scope(42):
-        written = grant_many(conv_id, [("lena@test.com", 1)])
-        scoped = store.get("lena@test.com", conv_id)
+        written = grant_many(conv_id, [("lena@example.com", 1)])
+        scoped = store.get("lena@example.com", conv_id)
 
-    assert written == [SessionPermission("lena@test.com", conv_id, 1)]
+    assert written == [SessionPermission("lena@example.com", conv_id, 1)]
     assert scoped is not None
     assert scoped.level == 1, f"Expected the workspace-42 grant at 1, got {scoped.level}."
-    default = store.get("lena@test.com", conv_id)
+    default = store.get("lena@example.com", conv_id)
     assert default is not None
     assert default.level == 3, f"Default-workspace grant changed to {default.level}."
 
@@ -463,10 +463,10 @@ def test_grant_many_skips_an_overlong_id_and_grants_the_rest(
     """An ID longer than the users table allows is skipped before the database sees it."""
     conv_id = _create_conversation(db_uri)
 
-    written = grant_many(conv_id, [("x" * 129, 1), ("ivy@test.com", 1)])
+    written = grant_many(conv_id, [("x" * 129, 1), ("ivy@example.com", 1)])
 
-    assert written == [SessionPermission("ivy@test.com", conv_id, 1)]
-    assert store.get("ivy@test.com", conv_id) is not None
+    assert written == [SessionPermission("ivy@example.com", conv_id, 1)]
+    assert store.get("ivy@example.com", conv_id) is not None
 
 
 @pytest.mark.parametrize(
@@ -476,7 +476,7 @@ def test_grant_many_skips_an_overlong_id_and_grants_the_rest(
         pytest.param((42, 1), id="int-id"),
         pytest.param(("", 1), id="empty-id"),
         pytest.param(("bad\x00id", 1), id="nul-id"),
-        pytest.param(("quinn@test.com", 5), id="level-5"),
+        pytest.param(("quinn@example.com", 5), id="level-5"),
     ],
 )
 def test_grant_many_skips_an_entry_the_tables_cannot_store(
@@ -490,17 +490,17 @@ def test_grant_many_skips_an_entry_the_tables_cannot_store(
 
     The skip happens before any write, so the bad entry leaves no grant or user row.
     """
-    owner = "owner-skip@test.com"
+    owner = "owner-skip@example.com"
     conv_id = _create_conversation(db_uri)
     _seed_grant(store, owner, conv_id, LEVEL_OWNER)
 
     with caplog.at_level(logging.WARNING):
-        written = grant_many(conv_id, [bad_entry, ("good-skip@test.com", 2)])
+        written = grant_many(conv_id, [bad_entry, ("good-skip@example.com", 2)])
 
-    assert written == [SessionPermission("good-skip@test.com", conv_id, 2)]
+    assert written == [SessionPermission("good-skip@example.com", conv_id, 2)]
     assert "grant_many skipped an entry" in caplog.text, "The skip must be logged."
     granted = {row.user_id for row in store.list_for_session(conv_id, limit=100)[0]}
-    assert granted == {owner, "good-skip@test.com"}, f"Unexpected grants: {granted}"
+    assert granted == {owner, "good-skip@example.com"}, f"Unexpected grants: {granted}"
 
 
 def test_grant_many_ignores_a_pin_set_in_another_workspace(
@@ -599,12 +599,12 @@ def test_grant_many_refreshes_a_cached_resolve_access(
 ) -> None:
     """A positive resolve_access cached before grant_many reflects the raised grant."""
     conv_id = _create_conversation(db_uri)
-    _seed_grant(store, "vic@test.com", conv_id, 1)
-    assert store.resolve_access("vic@test.com", conv_id).user_grant_level == 1
+    _seed_grant(store, "vic@example.com", conv_id, 1)
+    assert store.resolve_access("vic@example.com", conv_id).user_grant_level == 1
 
-    grant_many(conv_id, [("vic@test.com", 3)])
+    grant_many(conv_id, [("vic@example.com", 3)])
 
-    assert store.resolve_access("vic@test.com", conv_id).user_grant_level == 3, (
+    assert store.resolve_access("vic@example.com", conv_id).user_grant_level == 3, (
         "The cached read must be evicted when grant_many raises the grant."
     )
 
@@ -616,11 +616,11 @@ def test_grant_many_on_a_store_that_reorders_levels_runs_the_default_loop(db_uri
     """
     store = _ReversedLevelOrderStore(db_uri)
     conv_id = _create_conversation(db_uri)
-    _seed_grant(store, "nia@test.com", conv_id, 3)
+    _seed_grant(store, "nia@example.com", conv_id, 3)
 
-    written = store.grant_many(conv_id, [("nia@test.com", 1)])
+    written = store.grant_many(conv_id, [("nia@example.com", 1)])
 
-    assert written == [SessionPermission("nia@test.com", conv_id, 1)]
+    assert written == [SessionPermission("nia@example.com", conv_id, 1)]
 
 
 def test_grant_many_keeps_a_grant_raised_between_its_read_and_write(
@@ -634,7 +634,7 @@ def test_grant_many_keeps_a_grant_raised_between_its_read_and_write(
     window. Without the stored-level guard in the upsert, the grant would drop to 2.
     """
     conv_id = _create_conversation(db_uri)
-    _seed_grant(store, "kim@test.com", conv_id, 1)
+    _seed_grant(store, "kim@example.com", conv_id, 1)
     raised = False
 
     def _raise_before_upsert(
@@ -654,7 +654,7 @@ def test_grant_many_keeps_a_grant_raised_between_its_read_and_write(
             update(SqlSessionPermission)
             .where(
                 SqlSessionPermission.workspace_id == current_workspace_id(),
-                SqlSessionPermission.user_id == "kim@test.com",
+                SqlSessionPermission.user_id == "kim@example.com",
                 SqlSessionPermission.conversation_id == conv_id,
             )
             .values(level=3)
@@ -662,13 +662,13 @@ def test_grant_many_keeps_a_grant_raised_between_its_read_and_write(
 
     event.listen(store._engine, "before_cursor_execute", _raise_before_upsert)
     try:
-        written = store.grant_many(conv_id, [("kim@test.com", 2)])
+        written = store.grant_many(conv_id, [("kim@example.com", 2)])
     finally:
         event.remove(store._engine, "before_cursor_execute", _raise_before_upsert)
 
     assert raised, "The upsert never ran, so the race was not exercised."
     assert written == [], f"A grant that was not written must not be returned, got {written}."
-    fetched = store.get("kim@test.com", conv_id)
+    fetched = store.get("kim@example.com", conv_id)
     assert fetched is not None
     assert fetched.level == 3, f"The raised grant was lowered to {fetched.level}."
 
@@ -683,7 +683,7 @@ def test_grant_many_keeps_a_grant_inserted_into_a_missing_row_before_its_write(
     above. Without the guard, the grant would be overwritten with 2.
     """
     conv_id = _create_conversation(db_uri)
-    store.ensure_user("lou@test.com")
+    store.ensure_user("lou@example.com")
     inserted = False
 
     def _insert_before_upsert(
@@ -704,7 +704,7 @@ def test_grant_many_keeps_a_grant_inserted_into_a_missing_row_before_its_write(
         connection.execute(
             insert(SqlSessionPermission).values(
                 workspace_id=current_workspace_id(),
-                user_id="lou@test.com",
+                user_id="lou@example.com",
                 conversation_id=conv_id,
                 level=3,
             )
@@ -712,13 +712,13 @@ def test_grant_many_keeps_a_grant_inserted_into_a_missing_row_before_its_write(
 
     event.listen(store._engine, "before_cursor_execute", _insert_before_upsert)
     try:
-        written = store.grant_many(conv_id, [("lou@test.com", 2)])
+        written = store.grant_many(conv_id, [("lou@example.com", 2)])
     finally:
         event.remove(store._engine, "before_cursor_execute", _insert_before_upsert)
 
     assert inserted, "The upsert never ran, so the race was not exercised."
     assert written == [], f"A grant that was not written must not be returned, got {written}."
-    fetched = store.get("lou@test.com", conv_id)
+    fetched = store.get("lou@example.com", conv_id)
     assert fetched is not None
     assert fetched.level == 3, (
         f"The grant inserted before the upsert was lowered to {fetched.level}."
@@ -733,15 +733,15 @@ def test_grant_many_default_orders_levels_through_level_outranks(db_uri: str) ->
     """
     store = _ReversedLevelOrderStore(db_uri)
     conv_id = _create_conversation(db_uri)
-    _seed_grant(store, "mia@test.com", conv_id, 3)
-    _seed_grant(store, "owen@test.com", conv_id, LEVEL_OWNER)
+    _seed_grant(store, "mia@example.com", conv_id, 3)
+    _seed_grant(store, "owen@example.com", conv_id, LEVEL_OWNER)
 
     written = PermissionStore.grant_many(
-        store, conv_id, [("mia@test.com", 1), ("owen@test.com", 1)]
+        store, conv_id, [("mia@example.com", 1), ("owen@example.com", 1)]
     )
 
-    assert written == [SessionPermission("mia@test.com", conv_id, 1)]
-    owner = store.get("owen@test.com", conv_id)
+    assert written == [SessionPermission("mia@example.com", conv_id, 1)]
+    owner = store.get("owen@example.com", conv_id)
     assert owner is not None
     assert owner.level == LEVEL_OWNER, f"Owner grant changed to {owner.level}."
 
