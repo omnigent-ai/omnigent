@@ -6454,9 +6454,13 @@ describe("Composer workflow entry point", () => {
     const taskAction = (action: "run" | "continue", name: string) =>
       act(() => useSessionTasksActions.getState().taskAction.conv_test?.(action, name));
     taskAction("continue", "Run the tests");
-    expect(onSend).toHaveBeenLastCalledWith('Continue the task "Run the tests".');
+    expect(onSend).toHaveBeenLastCalledWith(
+      'Continue the task "Run the tests", then go on with the rest of the plan.',
+    );
     taskAction("run", "Ship it");
-    expect(onSend).toHaveBeenLastCalledWith('Run the task "Ship it".');
+    expect(onSend).toHaveBeenLastCalledWith(
+      'Run the task "Ship it", then go on with the rest of the plan.',
+    );
 
     rerender(
       <TooltipProvider>
@@ -6467,6 +6471,23 @@ describe("Composer workflow entry point", () => {
     expect(error).toHaveBeenCalledWith("The session is offline. Reconnect it to run the task.");
     expect(onSend).toHaveBeenCalledTimes(2);
     error.mockRestore();
+  });
+
+  it("lets the Tasks tab stop the agent only while it works", () => {
+    setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
+    const onStop = vi.fn();
+    const { rerender } = renderWithTooltips(
+      <Composer {...composerProps({ onStop, isWorking: true })} />,
+    );
+    act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
+    expect(onStop).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ onStop, isWorking: false })} />
+      </TooltipProvider>,
+    );
+    expect(useSessionTasksActions.getState().stopWork.conv_test).toBeUndefined();
   });
 
   it("opens the dialog for the Tasks tab's empty state", async () => {

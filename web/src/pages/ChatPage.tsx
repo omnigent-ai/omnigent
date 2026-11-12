@@ -122,6 +122,7 @@ import {
 import {
   registerSaveWorkflow,
   registerStartWorkflow,
+  registerStopWork,
   registerTaskAction,
 } from "@/store/sessionTasksActions";
 import { isRetryableRequestError } from "@/lib/queryRetry";
@@ -3179,6 +3180,13 @@ function ComposerImpl(
       taskActionRef.current(action, taskName),
     );
   }, [isReadOnly, composerSessionId]);
+  // While the agent works, a running task's ⋯ menu can stop it, as Stop here does.
+  const stopRef = useRef(onStop);
+  stopRef.current = onStop;
+  useEffect(() => {
+    if (!isWorking || isReadOnly || composerSessionId === null) return;
+    return registerStopWork(composerSessionId, () => stopRef.current());
+  }, [isWorking, isReadOnly, composerSessionId]);
   const slashCommands = useMemo(
     () =>
       buildSlashCommandMap(

@@ -66,13 +66,15 @@ export function savedWorkflowMessage(
 export type TaskAction = "run" | "continue";
 
 /**
- * The message that asks the agent to run a ready task or continue a stopped one.
+ * The message that asks the agent to run a ready task or continue a stopped one,
+ * then go on with the rest of the plan rather than stop after that task.
  *
  * @param taskName The task's name, e.g. `"Review #6109"`.
- * @returns e.g. `Run the task "Share the review files".`
+ * @returns e.g. `Run the task "Share the review files", then go on with the rest of the plan.`
  */
 export function taskActionMessage(action: TaskAction, taskName: string): string {
-  return `${action === "run" ? "Run" : "Continue"} the task "${taskName}".`;
+  const verb = action === "run" ? "Run" : "Continue";
+  return `${verb} the task "${taskName}", then go on with the rest of the plan.`;
 }
 
 /**
