@@ -41,7 +41,7 @@ export function WorkflowsPage() {
         <div className="flex flex-col gap-1">
           <h1 className="text-2xl font-semibold">Workflows</h1>
           <p className="text-ui text-muted-foreground">
-            Reusable step-by-step plans an agent can run for you.
+            Reusable step-by-step routines that agents can run for you.
           </p>
         </div>
         <Button
