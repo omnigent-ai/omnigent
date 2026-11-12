@@ -1091,7 +1091,7 @@ def test_claude_provider_symlinked_cache_does_not_trust_its_siblings(
     assert str((tmp_path / "shared-cache").resolve()) in rejection
 
 
-@pytest.mark.parametrize("cache_link", ["loop", "dangling"])
+@pytest.mark.parametrize("cache_link", ["loop", "dangling", "loop_then_parent"])
 def test_claude_provider_survives_broken_plugin_cache_link(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1104,16 +1104,30 @@ def test_claude_provider_survives_broken_plugin_cache_link(
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     cfg = tmp_path / "profile"
     (cfg / "plugins").mkdir(parents=True)
-    (cfg / "plugins" / "cache").symlink_to(
-        "cache" if cache_link == "loop" else tmp_path / "missing"
-    )
+    if cache_link == "loop_then_parent":
+        # The OS can't traverse ``cache`` (ELOOP at ``loop``), but a lexical
+        # resolve collapses ``loop/../..`` and lands on a real directory.
+        (cfg / "plugins" / "loop").symlink_to("loop")
+        (cfg / "plugins" / "cache").symlink_to("loop/../../outside")
+    else:
+        (cfg / "plugins" / "cache").symlink_to(
+            "cache" if cache_link == "loop" else tmp_path / "missing"
+        )
+    outside = cfg / "outside" / "mkt" / "escaped" / "1.0.0"
+    _write_skill(outside / "skills", "exfil")
     ordinary = cfg / "plugins" / "ordinary" / "sp" / "1.0.0"
     _write_skill(ordinary / "skills", "using-superpowers")
     fallback = cfg / "plugins" / "ordinary" / "multi" / "1.0.0"
     _write_skill(fallback / "skills", "plan")
     behind_link = cfg / "plugins" / "cache" / "mkt" / "cached" / "1.0.0"
     (cfg / "settings.json").write_text(
-        json.dumps({"enabledPlugins": dict.fromkeys(["sp@mkt", "cached@mkt", "multi@mkt"], True)})
+        json.dumps(
+            {
+                "enabledPlugins": dict.fromkeys(
+                    ["sp@mkt", "cached@mkt", "multi@mkt", "escaped@mkt"], True
+                )
+            }
+        )
     )
     (cfg / "plugins" / "installed_plugins.json").write_text(
         json.dumps(
@@ -1126,6 +1140,7 @@ def test_claude_provider_survives_broken_plugin_cache_link(
                         {"installPath": str(behind_link)},
                         {"installPath": str(fallback)},
                     ],
+                    "escaped@mkt": [{"installPath": str(outside)}],
                 },
             }
         )
@@ -1135,7 +1150,8 @@ def test_claude_provider_survives_broken_plugin_cache_link(
         _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
     )
     # The entry behind the link is unresolvable (loop) or outside every root
-    # (dangling); the plugin's next scope entry still counts either way.
+    # (dangling); the plugin's next scope entry still counts either way. A
+    # broken link never makes a directory outside the plugins root trusted.
     assert sorted(s.name for s in out) == ["multi:plan", "sp:using-superpowers"]
     assert any(
         "plugins cache" in m and str(cfg / "plugins" / "cache") in m for m in caplog.messages

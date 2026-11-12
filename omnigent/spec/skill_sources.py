@@ -451,7 +451,9 @@ def _plugin_install_paths(
     cache_link = plugins_root / "cache"
     try:
         if cache_link.is_symlink():
-            cache_target = cache_link.resolve()
+            # Strict: a non-strict resolve can lexically collapse ``..`` past a
+            # loop and name a real directory the link can't actually reach.
+            cache_target = cache_link.resolve(strict=True)
             if cache_target.is_dir():
                 plugin_roots.append(cache_target)
             else:
@@ -461,7 +463,7 @@ def _plugin_install_paths(
                     cache_target,
                 )
     except (OSError, RuntimeError) as exc:
-        # A symlink loop raises here; the root alone keeps other plugins usable.
+        # A loop or dangling link raises here; the root alone keeps other plugins usable.
         _log.warning("Ignoring unresolvable plugins cache %s: %s", cache_link, exc)
     out: dict[str, Path] = {}
     for key, entries in plugins.items():
