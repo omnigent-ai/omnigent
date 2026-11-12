@@ -1637,18 +1637,30 @@ class TestCodexExecutor(unittest.TestCase):
             import omnigent.inner.codex_executor as codex_executor_module
 
             clock = SimpleNamespace(now=0.0)
+            final_response = "done!" if progress == "agent_delta" else "done"
             notification = {
                 "method": "account/rateLimits/updated",
                 "params": {"private": "credential-must-not-be-logged"},
             }
             events = [(float(tick), notification) for tick in range(1, 11)]
-            if progress == "reasoning":
+            if progress in ("reasoning", "agent_delta"):
+                method = (
+                    "item/reasoning/textDelta"
+                    if progress == "reasoning"
+                    else "item/agentMessage/delta"
+                )
                 for index in (0, 2, 4, 6, 8):
                     events[index] = (
                         events[index][0],
                         {
-                            "method": "item/reasoning/textDelta",
-                            "params": {"turnId": "turn-1", "delta": "private reasoning"},
+                            "method": method,
+                            "params": {
+                                "turnId": "turn-1",
+                                "itemId": "final-1",
+                                "delta": final_response[index // 2]
+                                if progress == "agent_delta"
+                                else "private reasoning",
+                            },
                         },
                     )
             elif progress in ("command", "command_output"):
@@ -1733,7 +1745,7 @@ class TestCodexExecutor(unittest.TestCase):
                             "item": {
                                 "id": "final-1",
                                 "type": "agentMessage",
-                                "text": "done",
+                                "text": final_response,
                                 "phase": "final_answer",
                             },
                         },
@@ -1783,10 +1795,11 @@ class TestCodexExecutor(unittest.TestCase):
                     )
                 ]
             self.assertEqual(
-                [event.response for event in output if isinstance(event, TurnComplete)], ["done"]
+                [event.response for event in output if isinstance(event, TurnComplete)],
+                [final_response],
             )
             self.assertIsNone(session.active_turn_id)
-            if progress in ("reasoning", "command_output"):
+            if progress in ("reasoning", "agent_delta", "command_output"):
                 self.assertEqual(warnings, [])
             else:
                 expected_times = {
@@ -1820,6 +1833,7 @@ class TestCodexExecutor(unittest.TestCase):
             "steering_ack",
             "unrelated_turn",
             "reasoning",
+            "agent_delta",
             "command",
             "command_output",
             "tool_result",
