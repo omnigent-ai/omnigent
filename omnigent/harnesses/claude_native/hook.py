@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, NoReturn, TextIO
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
+    CLAUDE_STARTUP_CONTEXT_FILE,
     approval_wait_marker_path,
     hold_approval_wait_marker,
     read_active_session_id,
@@ -225,8 +226,8 @@ def main(argv: list[str] | None = None) -> int:
         return _main_evaluate_policy(raw_argv[1:])
     if raw_argv and raw_argv[0] == "route-turn":
         return _main_route_turn(raw_argv[1:])
-    if raw_argv and raw_argv[0] == "framework-context":
-        return _main_framework_context(raw_argv[1:])
+    if raw_argv and raw_argv[0] in ("framework-context", "startup-context"):
+        return _main_framework_context(raw_argv[1:], startup=raw_argv[0] == "startup-context")
     # Backwards compat: older bridge dirs may still reference the
     # pre-tool-use subcommand before the terminal is restarted.
     if raw_argv and raw_argv[0] == "pre-tool-use":
@@ -1143,12 +1144,13 @@ def _skip_httpx_cli_import() -> None:
 def _main_evaluate_policy(argv: list[str]) -> int:
     """
     Evaluate a Claude Code ``PreToolUse`` / ``PostToolUse`` /
-    ``UserPromptSubmit`` hook against Omnigent policies.
+    ``PostToolUseFailure`` / ``UserPromptSubmit`` hook against Omnigent
+    policies.
 
     Reads the hook JSON payload from stdin, converts it into the
     proto-compatible ``EvaluationRequest`` schema (``PHASE_TOOL_CALL``
-    for PreToolUse, ``PHASE_TOOL_RESULT`` for PostToolUse,
-    ``PHASE_REQUEST`` for UserPromptSubmit), POSTs to
+    for PreToolUse, ``PHASE_TOOL_RESULT`` for PostToolUse and
+    PostToolUseFailure, ``PHASE_REQUEST`` for UserPromptSubmit), POSTs to
     ``/v1/sessions/{id}/policies/evaluate``, and converts the
     ``EvaluationResponse`` back into Claude Code's hook output format.
 
@@ -1167,9 +1169,9 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     drops the prompt before the model sees it; ASK is resolved
     server-side; ALLOW proceeds with no output.
 
-    For ``PostToolUse``, policy denials are surfaced as
-    ``additionalContext`` (Claude sees the warning but the tool result
-    is already committed — PostToolUse hooks are observational).
+    For ``PostToolUse`` and ``PostToolUseFailure``, policy denials are
+    surfaced as ``additionalContext`` (Claude sees the warning but the
+    tool result is already committed — these hooks are observational).
 
     Failure handling is phase-aware (mirroring the runner-side default
     from PR #163). Once the session is known to be governed (an active
@@ -1179,7 +1181,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     a ``PreToolUse`` (``PHASE_TOOL_CALL``) call fails CLOSED with a
     ``deny`` (this hook is the sole enforcement point for native tools, so
     a transient outage must not silently let a gated call through), while
-    ``UserPromptSubmit`` and ``PostToolUse`` fail OPEN. Pre-evaluation
+    ``UserPromptSubmit`` blocks and the tool-result hooks fail OPEN. Pre-evaluation
     conditions that mean the session simply is not governed — no active
     session, no ``ap_server_url``, an unparseable hook payload, or an
     ``mcp__omnigent__*`` tool already gated on the relay path — still
@@ -1315,14 +1317,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _main_framework_context(argv: list[str]) -> int:
-    """Add pending framework context to one submitted prompt."""
+def _main_framework_context(argv: list[str], *, startup: bool = False) -> int:
+    """Return persistent startup context or consume one pending prompt notice."""
     args = _parse_evaluate_policy_args(argv)
     sys.stdin.read()
-    path = Path(args.bridge_dir) / CLAUDE_FRAMEWORK_CONTEXT_FILE
+    filename = CLAUDE_STARTUP_CONTEXT_FILE if startup else CLAUDE_FRAMEWORK_CONTEXT_FILE
+    path = Path(args.bridge_dir) / filename
     try:
         text = path.read_text(encoding="utf-8")
-        path.unlink(missing_ok=True)
+        if not startup:
+            path.unlink(missing_ok=True)
     except OSError:
         return 0
     if text:
@@ -1330,7 +1334,7 @@ def _main_framework_context(argv: list[str]) -> int:
             json.dumps(
                 {
                     "hookSpecificOutput": {
-                        "hookEventName": "UserPromptSubmit",
+                        "hookEventName": "SessionStart" if startup else "UserPromptSubmit",
                         "additionalContext": text,
                     }
                 }

@@ -72,7 +72,12 @@ Env vars read at startup:
   ``ClaudeAgentOptions(skills=[], setting_sources=[])`` — the
   pair that suppresses both host-discovered (user/project)
   skills and the SDK's auto-default of
-  ``setting_sources=["user","project"]``.
+  ``setting_sources=["user","project"]``. Because those empty
+  sources also hide a project's ``disableClaudeAiConnectors``
+  opt-out, ``"none"`` carries that opt-out in the launch
+  settings and sets ``ENABLE_CLAUDEAI_MCP_SERVERS=false`` for
+  the CLI (older Claude Code builds predate the setting), so
+  claude.ai connectors stay off.
 - ``HARNESS_CLAUDE_SDK_BUNDLE_DIR``: Absolute path to the
   agent bundle's extracted root. When set, the inner executor
   passes ``plugins=[{"type": "local", "path": <bundle_dir>}]``
@@ -101,6 +106,7 @@ from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
+from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.spec.types import RetryPolicy
 
@@ -298,6 +304,7 @@ def _build_claude_sdk_executor() -> Executor:
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
     return ClaudeSDKExecutor(
+        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
         # Run the CLI in the session workspace: an explicit
         # HARNESS_CLAUDE_SDK_CWD wins, else the runner's
         # OMNIGENT_RUNNER_WORKSPACE (the folder the user launched in, and

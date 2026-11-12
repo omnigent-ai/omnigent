@@ -31,7 +31,7 @@ import {
   FILE_CONTENT_FAILING_POLL_MS,
   FILE_CONTENT_POLL_MAX_BYTES,
   FILE_CONTENT_POLL_MS,
-  fetchWorkspaceFileBlob,
+  fetchWorkspaceVideoBlob,
   fileContentPollInterval,
   fileContentToBlob,
   triggerBrowserDownload,
@@ -249,14 +249,29 @@ const DOWNLOAD_URL =
 
 describe("downloadWorkspaceFile", () => {
   it("fetches complete video bytes with cancellation and encoded host paths", async () => {
-    const file = new Blob(["complete recording"], { type: "video/webm" });
-    fetchMock.mockResolvedValueOnce(blobResponse(file));
+    fetchMock.mockResolvedValueOnce(
+      new Response("complete recording", { headers: { "content-type": "video/webm" } }),
+    );
     const signal = new AbortController().signal;
-    expect(await fetchWorkspaceFileBlob("sess_123", "/Users/me/demo clip.webm", signal)).toBe(file);
+    const video = await fetchWorkspaceVideoBlob("sess_123", "/Users/me/demo clip.webm", signal);
+    expect(video.type).toBe("video/webm");
+    expect(await video.text()).toBe("complete recording");
     expect(fetchMock).toHaveBeenCalledWith(
       "/v1/sessions/sess_123/resources/environments/default/filesystem/Users/me/demo%20clip.webm?download=true&base=host",
       expect.objectContaining({ signal, cache: "no-store" }),
     );
+  });
+
+  it("cancels the video body on an HTTP error", async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({ cancel });
+    fetchMock.mockResolvedValueOnce(
+      new Response(body, { status: 503, statusText: "Service Unavailable" }),
+    );
+    await expect(fetchWorkspaceVideoBlob("sess_123", "demo.webm")).rejects.toThrow(
+      "503 Service Unavailable",
+    );
+    await waitFor(() => expect(cancel).toHaveBeenCalledOnce());
   });
 
   it("clicks a link to the raw download URL so the browser streams it to disk", async () => {

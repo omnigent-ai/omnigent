@@ -19,6 +19,11 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.native.native_policy_hook import (
+    TOOL_FAILED_PAYLOAD_KEY,
+    evaluation_response_to_hook_output,
+    hook_payload_to_evaluation_request,
+)
 from omnigent.runtime import get_caps
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef, Phase, PhaseSelector
 from tests.server.helpers import create_session_for_agent as _create_session
@@ -139,3 +144,78 @@ async def test_thrashing_fires_after_consecutive_errors(
     assert body["result"] == "POLICY_ACTION_ALLOW", (
         f"Success after errors should ALLOW (run broken), got {body['result']}"
     )
+
+
+async def test_thrashing_fires_on_claude_native_failed_tool_hooks(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude Code PostToolUseFailure hooks count as errors and surface the DENY.
+
+    A failing Bash call fires PostToolUseFailure with an ``Exit code N``
+    error string. The hook conversion must reach the endpoint and be
+    counted, and the second failure's DENY must come back as context.
+    """
+    _install_thrashing_policy(monkeypatch, consecutive_threshold=2, action="DENY")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    outputs = []
+    for attempt in (1, 2):
+        payload: dict[str, object] = {
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": f"cat /nonexistent/t{attempt}"},
+            "tool_use_id": f"toolu_{attempt}",
+            "error": f"Exit code 1\ncat: /nonexistent/t{attempt}: No such file or directory",
+            "is_interrupt": False,
+        }
+        eval_request = hook_payload_to_evaluation_request("PostToolUseFailure", payload)
+        assert eval_request is not None, "failed tool calls must reach TOOL_RESULT policies"
+        resp = await client.post(f"/v1/sessions/{session_id}/policies/evaluate", json=eval_request)
+        assert resp.status_code == 200, resp.text
+        outputs.append(evaluation_response_to_hook_output("PostToolUseFailure", resp.json()))
+
+    assert outputs[0] is None
+    assert outputs[1] == {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUseFailure",
+            "additionalContext": (
+                "[Policy violation] The agent has hit 2 consecutive tool errors. "
+                "It may be stuck — review and redirect, or start a fresh session."
+            ),
+        }
+    }
+
+
+async def test_thrashing_fires_on_reported_failures_without_error_text(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A harness-reported failure counts even when its text looks benign.
+
+    Devin reports a failed call through ``PostToolUse`` with
+    ``"success": false`` and plain stderr as output, which no error prefix
+    matches. Its adapter's failure flag must survive the evaluate endpoint
+    so ``detect_thrashing`` still counts both calls.
+    """
+    _install_thrashing_policy(monkeypatch, consecutive_threshold=2, action="DENY")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    verdicts = []
+    for attempt in (1, 2):
+        payload: dict[str, object] = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec",
+            "tool_input": {"command": f"cat /nonexistent/t{attempt}"},
+            "tool_output": f"cat: /nonexistent/t{attempt}: No such file or directory",
+            TOOL_FAILED_PAYLOAD_KEY: True,
+        }
+        eval_request = hook_payload_to_evaluation_request("PostToolUse", payload)
+        assert eval_request is not None
+        resp = await client.post(f"/v1/sessions/{session_id}/policies/evaluate", json=eval_request)
+        assert resp.status_code == 200, resp.text
+        verdicts.append(resp.json()["result"])
+
+    assert verdicts == ["POLICY_ACTION_ALLOW", "POLICY_ACTION_DENY"]

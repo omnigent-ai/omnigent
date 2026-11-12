@@ -15,8 +15,6 @@ from unittest.mock import patch
 
 import databricks.sdk.config as _sdk_config_mod
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from omnigent.inner.databricks_executor import (
     DatabricksExecutor,
     _convert_messages,
@@ -2974,7 +2972,7 @@ def test_databrickscfg_workspace_id_for_host_reads_matching_profile(
             """
             [acme]
             host = https://acme.databricks.com
-            workspace_id = 1965859176160743
+            workspace_id = 4242424242424242
             auth_type = databricks-cli
 
             [no-ws]
@@ -2985,7 +2983,7 @@ def test_databrickscfg_workspace_id_for_host_reads_matching_profile(
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
 
-    assert databrickscfg_workspace_id_for_host("https://acme.databricks.com") == "1965859176160743"
+    assert databrickscfg_workspace_id_for_host("https://acme.databricks.com") == "4242424242424242"
     # A profile without the field, and an unknown host, both resolve to None.
     assert databrickscfg_workspace_id_for_host("https://plain.databricks.com") is None
     assert databrickscfg_workspace_id_for_host("https://other.databricks.com") is None
@@ -3030,7 +3028,15 @@ def test_databrickscfg_workspace_id_for_host_missing_file_returns_none(
     assert databrickscfg_workspace_id_for_host("https://acme.databricks.com") is None
 
 
-def test_reused_token_source_re_resolves_when_cached_auth_goes_stale(monkeypatch):
+@pytest.mark.parametrize(
+    "stale_headers",
+    [None, {}, {"Authorization": "Basic invalid"}, {"Authorization": "Bearer "}],
+    ids=["exception", "missing-header", "non-bearer", "empty-bearer"],
+)
+@pytest.mark.parametrize("credentials_repaired", [True, False], ids=["repaired", "unavailable"])
+def test_reused_token_source_re_resolves_when_cached_auth_goes_stale(
+    monkeypatch, stale_headers, credentials_repaired
+):
     """A stale cached auth is replaced before retrying the mint."""
     from omnigent.inner.databricks_executor import (
         _DatabricksBearerAuth,
@@ -3044,13 +3050,16 @@ def test_reused_token_source_re_resolves_when_cached_auth_goes_stale(monkeypatch
 
         def authenticate(self):
             if self.stale:
-                raise FileNotFoundError("baked CLI binary path was deleted")
+                if stale_headers is None:
+                    raise FileNotFoundError("baked CLI binary path was deleted")
+                return stale_headers
             return {"Authorization": f"Bearer {self.token}"}
 
     cfgs = []
 
     def _fake_resolve(profile=None, *, host=None):
         cfgs.append(_Cfg(f"tok-{len(cfgs) + 1}"))
+        cfgs[-1].stale = len(cfgs) > 1 and not credentials_repaired
         return _DatabricksBearerAuth(cfgs[-1], profile_name=None), "https://ex.test"
 
     monkeypatch.setattr(
@@ -3063,10 +3072,12 @@ def test_reused_token_source_re_resolves_when_cached_auth_goes_stale(monkeypatch
     assert len(cfgs) == 1, "happy-path mints must reuse the resolved auth"
 
     cfgs[0].stale = True
-    assert source.current_token() == "tok-2", (
-        "the source kept the stale auth instead of re-resolving"
-    )
+    refreshed = source.current_token()
+    assert refreshed == "tok-2" if credentials_repaired else not refreshed
     assert len(cfgs) == 2
+    refreshed_again = source.current_token()
+    assert refreshed_again == "tok-2" if credentials_repaired else not refreshed_again
+    assert len(cfgs) == (2 if credentials_repaired else 3)
 
 
 def test_reused_token_source_retries_resolution_after_failure(monkeypatch):

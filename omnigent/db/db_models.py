@@ -32,6 +32,7 @@ from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
+from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
 from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
@@ -1152,6 +1153,8 @@ class SqlComment(OmnigentBase):
     :param created_by: Email of the user who created this comment,
         e.g. ``"alice@example.com"``. ``NULL`` for legacy comments or
         comments created in single-user mode.
+    :param anchor_metadata: Bounded provider-specific coordinates for comments
+        that are not anchored by workspace-file character offsets.
     """
 
     __tablename__ = "comments"
@@ -1185,6 +1188,10 @@ class SqlComment(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(BigInteger)
     anchor_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    anchor_metadata: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=COMMENT_ANCHOR_MAX_STORED_BYTES), nullable=True
+    )
 
     __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
 
@@ -1601,6 +1608,8 @@ class SqlScheduledTask(OmnigentBase):
     # (Claude Code). The fire path converts it to the runner's
     # ``--permission-mode`` launch arg. NULL = use the agent default.
     permission_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # JSON list of MCP service names every fired session starts with. NULL = none.
+    mcp_services: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     # Per-firing cost budget in USD. When set, the fire path attaches a
     # cost_budget policy to each spawned session. NULL = no per-firing cap.
     max_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -1636,6 +1645,9 @@ class SqlScheduledTask(OmnigentBase):
     session_mode: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     # Relates to conversations.id. No DB foreign key (Rule R032).
     session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # The session each run's new session starts as a copy of. Relates to
+    # conversations.id. No DB foreign key (Rule R032).
+    source_session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 

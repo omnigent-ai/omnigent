@@ -8,6 +8,7 @@ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 vi.mock("@/pages/CanvasPage", () => ({ CanvasPage: () => <div>canvas board</div> }));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type { TerminalInfo } from "@/lib/terminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
@@ -32,6 +33,7 @@ import { setEmbedRoot } from "@/lib/host";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
 import { FileViewerContext, useFileViewer } from "./FileViewerContext";
+import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -317,7 +319,8 @@ const useHostsMock = vi.mocked(useHosts);
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { Agent } from "@/hooks/useAgents";
 import { forkSession, getSessionSlim } from "@/lib/sessionsApi";
-import type { Session } from "@/lib/types";
+import type { Session, SessionStatus } from "@/lib/types";
+import type { Conversation } from "@/hooks/useConversations";
 import { toast } from "sonner";
 
 const useSessionAgentMock = vi.mocked(useSessionAgent);
@@ -581,11 +584,17 @@ function sessionShellTree(
 function renderShell(
   path: string,
   info?: ServerInfo,
-  options: { rerenderable?: boolean; sessionNavTo?: string; dirtyFileViewer?: boolean } = {},
+  options: {
+    rerenderable?: boolean;
+    sessionNavTo?: string;
+    dirtyFileViewer?: boolean;
+    seedQueryClient?: (client: QueryClient) => void;
+  } = {},
 ) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  options.seedQueryClient?.(qc);
   const tree = shellTree(
     qc,
     path,
@@ -781,6 +790,8 @@ beforeEach(() => {
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
   useChatStore.setState({
+    conversationId: null,
+    loadingConversation: false,
     terminalPending: false,
     sessionStatus: "idle",
     status: "idle",
@@ -886,6 +897,133 @@ describe("AppShell header", () => {
       ).toBeInTheDocument();
       if (sibling) expect(screen.queryByTestId("header-move-to-project")).toBeNull();
       else expect(screen.getByTestId("header-move-to-project")).toBeInTheDocument();
+    },
+  );
+
+  it.each<{
+    source: string;
+    snapshot: SessionStatus;
+    backgroundTasks?: number;
+    bound: SessionStatus | null;
+    row: Partial<Conversation> | null;
+    asks: boolean;
+  }>([
+    { source: "the bound live store", snapshot: "idle", bound: "running", row: null, asks: true },
+    {
+      source: "the snapshot before binding",
+      snapshot: "waiting",
+      bound: null,
+      row: null,
+      asks: true,
+    },
+    {
+      source: "the snapshot while the bind loads",
+      snapshot: "running",
+      bound: "idle",
+      row: null,
+      asks: true,
+    },
+    {
+      source: "the streamed row's goal-driven background work",
+      snapshot: "idle",
+      bound: "idle",
+      row: { status: "idle", background_work_running: true },
+      asks: true,
+    },
+    {
+      source: "the streamed row's pending approval",
+      snapshot: "idle",
+      bound: "idle",
+      row: { status: "idle", pending_elicitations_count: 1 },
+      asks: true,
+    },
+    {
+      source: "the streamed row over a stale snapshot",
+      snapshot: "running",
+      bound: "idle",
+      row: { status: "idle", pending_elicitations_count: 0, background_work_running: false },
+      asks: false,
+    },
+    {
+      // A row fetched by id has no background flag until the stream settles it.
+      source: "the snapshot's background tasks under a fetched row",
+      snapshot: "idle",
+      backgroundTasks: 1,
+      bound: null,
+      row: { status: "idle", pending_elicitations_count: 0 },
+      asks: true,
+    },
+  ])(
+    "archive confirmation for an off-window session follows $source",
+    async ({ snapshot, backgroundTasks = 0, bound, row, asks }) => {
+      const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) =>
+        Response.json({ id: "conv_off_window", archived: true }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      onTestFinished(() => {
+        vi.unstubAllGlobals();
+      });
+      const archiveRequests = () =>
+        fetchMock.mock.calls.filter(([, init]) => init?.method === "PATCH");
+      mockConversations([]);
+      useChatStore.setState({
+        conversationId: bound === null ? "conv_other" : "conv_off_window",
+        sessionStatus: bound ?? "idle",
+        // A bound store without a streamed row may still be hydrating.
+        loadingConversation: bound !== null && row === null,
+      });
+      useSessionMock.mockReturnValue({
+        session: sessionSnapshot({
+          id: "conv_off_window",
+          agentId: "ag_owner",
+          agentName: "developer",
+          status: snapshot,
+          createdAt: 1_700_000_000,
+          title: "Off-window owner session",
+          archived: false,
+          backgroundTaskCount: backgroundTasks,
+          // A stale snapshot still lists an approval the streamed row reports resolved.
+          pendingElicitations: snapshot === "running" && row ? [{ id: "elicit_resolved" }] : [],
+        }),
+        isLoading: false,
+        error: null,
+      });
+
+      renderShell("/c/conv_off_window", undefined, {
+        // The open-session row the session-updates stream keeps current.
+        seedQueryClient: (client) => {
+          if (!row) return;
+          client.setQueryData(["conversation-backfill", "conv_off_window"], {
+            id: "conv_off_window",
+            object: "conversation",
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            labels: {},
+            permission_level: 4,
+            ...row,
+          });
+        },
+      });
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+        button: 0,
+        ctrlKey: false,
+      });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+
+      if (!asks) {
+        expect(await screen.findByText("home")).toBeInTheDocument();
+        expect(screen.queryByTestId("archive-running-dialog")).toBeNull();
+        await waitFor(() => expect(archiveRequests()).toHaveLength(1));
+        const [url, init] = archiveRequests()[0];
+        expect(String(url)).toContain("/v1/sessions/conv_off_window");
+        expect(JSON.parse(String(init?.body))).toEqual({ archived: true });
+        return;
+      }
+      const dialog = await screen.findByRole("dialog", { name: "Archive running session?" });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      await waitFor(() => expect(screen.queryByTestId("archive-running-dialog")).toBeNull());
+      expect(screen.queryByText("home")).toBeNull();
+      expect(archiveRequests()).toHaveLength(0);
     },
   );
 
@@ -6149,6 +6287,100 @@ describe("AppShell design-mode submission", () => {
       undefined,
     );
   });
+});
+
+describe("shell command drafts", () => {
+  const command = "printf 'hello\\n'\npwd";
+
+  function CommandProbe() {
+    const action = useContext(ShellCommandContext);
+    const drafts = useContext(ShellCommandDraftContext);
+    return (
+      <>
+        {action && (
+          <button
+            type="button"
+            disabled={action.disabled}
+            onClick={() => action.open(command, "bash")}
+          >
+            Open command
+          </button>
+        )}
+        <output data-testid="command-drafts">{JSON.stringify(drafts?.drafts)}</output>
+      </>
+    );
+  }
+
+  it.each([
+    { mobile: false, permission: 4, terminal: "bash" },
+    { mobile: true, permission: 4, terminal: "bash" },
+    { mobile: false, permission: 2, terminal: "bash" },
+    { mobile: false, permission: 4, terminal: "shell" },
+  ])(
+    "opens fresh shells for owners (mobile=$mobile, permission=$permission, terminal=$terminal)",
+    async ({ mobile, permission, terminal }) => {
+      const matchMedia = window.matchMedia;
+      const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...matchMedia(query),
+        matches: query === "(min-width: 768px)" ? !mobile : matchMedia(query).matches,
+      }));
+      onTestFinished(() => viewport.mockRestore());
+      const terminals: TerminalInfo[] = [];
+      const createShell = vi.fn(async () => {
+        const session = `u-${terminals.length}`;
+        const info = {
+          id: `terminal_${terminal}_${session}`,
+          name: terminal,
+          session,
+          running: true,
+        };
+        terminals.push(info);
+        useTerminalsMock.mockReturnValue({
+          terminals: [...terminals],
+          isLoading: false,
+          error: null,
+        });
+        return info;
+      });
+      vi.mocked(useCreateTerminal).mockReturnValue({
+        mutateAsync: createShell,
+        isPending: false,
+      } as unknown as ReturnType<typeof useCreateTerminal>);
+      useTerminalsMock.mockReturnValue({ terminals, isLoading: false, error: null });
+      useSessionAgentMock.mockReturnValue({
+        data: { id: "agent", name: "test", terminals: [terminal] },
+      } as ReturnType<typeof useSessionAgent>);
+      mockConversations([{ id: "conv_command", permission_level: permission }]);
+      render(sessionShellTree(new QueryClient(), "/c/conv_command", <CommandProbe />));
+      const button = screen.queryByRole("button", { name: "Open command" });
+      if (permission < 4) {
+        expect(button).toBeNull();
+        expect(createShell).not.toHaveBeenCalled();
+        return;
+      }
+      fireEvent.click(button!);
+      await waitFor(() =>
+        expect(screen.getByTestId("command-drafts")).toHaveTextContent(`terminal_${terminal}_u-0`),
+      );
+      expect(createShell).toHaveBeenCalledWith(terminal);
+      expect(JSON.parse(screen.getByTestId("command-drafts").textContent!)).toEqual({
+        [`conv_command:terminal_${terminal}_u-0`]: command,
+      });
+      if (mobile)
+        expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
+      else
+        await waitFor(() =>
+          expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent(
+            `terminal_${terminal}_u-0`,
+          ),
+        );
+      fireEvent.click(button!);
+      await waitFor(() =>
+        expect(screen.getByTestId("command-drafts")).toHaveTextContent(`terminal_${terminal}_u-1`),
+      );
+      expect(createShell).toHaveBeenCalledTimes(2);
+    },
+  );
 });
 
 describe("new-session browser shortcut", () => {

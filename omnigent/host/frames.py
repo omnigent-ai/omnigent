@@ -85,6 +85,7 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+CAP_MCP_SERVER_ENABLED = "mcp_server_enabled"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_HARNESS_ACCOUNTS = "harness_accounts"
 CAP_HARNESS_LOGIN = "harness_login"
@@ -101,6 +102,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
+    CAP_MCP_SERVER_ENABLED,
     CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
@@ -265,6 +267,8 @@ class HostFrameKind(str, Enum):
     PLUGINS_RESULT = "host.plugins_result"
     SKILL_CONTENT = "host.skill_content"
     SKILL_CONTENT_RESULT = "host.skill_content_result"
+    SET_MCP_SERVER_ENABLED = "host.set_mcp_server_enabled"
+    SET_MCP_SERVER_ENABLED_RESULT = "host.set_mcp_server_enabled_result"
     MCP_TOOLS = "host.mcp_tools"
     MCP_TOOLS_RESULT = "host.mcp_tools_result"
     HARNESS_STARTUP = "host.harness_startup"
@@ -386,11 +390,16 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param mcp_disabled_servers_active_harnesses: Harness families whose MCP preferences
+        apply to this launch. Absent on older servers or while the feature is disabled.
     :param superseded_runner_ids: Runners this launch replaces, which the
         host stops once the new runner is alive. ``None`` (an older server)
         falls back to stopping every runner launched for ``session_id``; an
         empty tuple stops none, e.g. after /clear moved the old runner to
         another session.
+    :param session_env_handoff_id: Opaque ID of the launching CLI's local
+        forwarded-environment handoff, e.g. ``"3qA0x_7Kp2..."``. ``None`` when
+        no CLI handed values to this launch, as for a server-driven restart.
     """
 
     request_id: str
@@ -401,6 +410,8 @@ class HostLaunchRunnerFrame:
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
     scheduled_run: ScheduledRunLogContext | None = None
+    mcp_disabled_servers_active_harnesses: list[str] | None = None
+    session_env_handoff_id: str | None = None
 
 
 @dataclass
@@ -1189,7 +1200,8 @@ class HostFsWriteFrame:
     (``op="github_details_update"``), comments (``op="github_comment_create"``),
     review replies (``op="github_review_thread_reply"``), description attachment uploads
     (``op="github_attachment_upload"``, the file base64-encoded in
-    ``content_base64``), merges (``op="github_merge"``),
+    ``content_base64``), merges (``op="github_merge"``, or ``op="github_merge_as"``
+    with ``account``),
     and disabling auto-merge (``op="github_disable_auto_merge"``), for every git
     provider; the op names are
     stable wire ids. The host runs the mutation against
@@ -1201,7 +1213,8 @@ class HostFsWriteFrame:
         ``"github_prs_update"``, ``"github_labels_update"``,
         ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
         ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
-        ``"github_attachment_upload"``, ``"github_merge"``, or ``"github_disable_auto_merge"``.
+        ``"github_attachment_upload"``, ``"github_merge"``, ``"github_merge_as"``, or
+        ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.
@@ -1364,6 +1377,29 @@ class HostSkillContentResultFrame:
     status: str
     skill: dict[str, str | bool] | None = None
     error: str | None = None
+
+
+@dataclass
+class HostSetMcpServerEnabledFrame:
+    """Server → host: save an Omnigent-only MCP launch preference."""
+
+    request_id: str
+    harness: str
+    server: str
+    enabled: bool
+    plugin: str | None = None
+    source_id: str | None = None
+
+
+@dataclass
+class HostSetMcpServerEnabledResultFrame:
+    """Host → server: saved server summary or a stable failure code."""
+
+    request_id: str
+    status: str
+    server: dict[str, str] | None = None
+    error: str | None = None
+    error_code: str | None = None
 
 
 @dataclass
@@ -1567,6 +1603,8 @@ HostFrame = (
     | HostPluginsResultFrame
     | HostSkillContentFrame
     | HostSkillContentResultFrame
+    | HostSetMcpServerEnabledFrame
+    | HostSetMcpServerEnabledResultFrame
     | HostMcpToolsFrame
     | HostMcpToolsResultFrame
     | HostHarnessStartupFrame
@@ -1694,7 +1732,12 @@ def encode_host_frame(frame: HostFrame) -> str:
             "session_id": frame.session_id,
             "harness": frame.harness,
             "inference_config": frame.inference_config,
+            "session_env_handoff_id": frame.session_env_handoff_id,
         }
+        if frame.mcp_disabled_servers_active_harnesses is not None:
+            payload["mcp_disabled_servers_active_harnesses"] = (
+                frame.mcp_disabled_servers_active_harnesses
+            )
         if frame.scheduled_run is not None:
             payload["scheduled_run"] = frame.scheduled_run.model_dump()
         if frame.superseded_runner_ids is not None:
@@ -2167,6 +2210,29 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "status": frame.status,
                 "skill": frame.skill,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostSetMcpServerEnabledFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SET_MCP_SERVER_ENABLED.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+                "server": frame.server,
+                "enabled": frame.enabled,
+                "plugin": frame.plugin,
+                "source_id": frame.source_id,
+            }
+        )
+    if isinstance(frame, HostSetMcpServerEnabledResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SET_MCP_SERVER_ENABLED_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "server": frame.server,
+                "error": frame.error,
+                "error_code": frame.error_code,
             }
         )
     if isinstance(frame, HostMcpToolsFrame):
@@ -2691,6 +2757,30 @@ def _decode_known_host_frame(
             )
         case HostFrameKind.SKILL_CONTENT_RESULT:
             return _decode_skill_content_result(msg)
+        case HostFrameKind.SET_MCP_SERVER_ENABLED:
+            return HostSetMcpServerEnabledFrame(
+                request_id=_required_str(msg, "request_id"),
+                harness=_required_str(msg, "harness"),
+                server=_required_str(msg, "server"),
+                enabled=_required_bool(msg, "enabled"),
+                plugin=_optional_nullable_str(msg, "plugin"),
+                source_id=_optional_nullable_str(msg, "source_id"),
+            )
+        case HostFrameKind.SET_MCP_SERVER_ENABLED_RESULT:
+            raw_server = msg.get("server")
+            servers = _decode_mcp_servers_result(
+                {
+                    **msg,
+                    "mcp_servers": [raw_server] if raw_server is not None else [],
+                }
+            ).mcp_servers
+            return HostSetMcpServerEnabledResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                server=servers[0] if servers else None,
+                error=_optional_nullable_str(msg, "error"),
+                error_code=_optional_nullable_str(msg, "error_code"),
+            )
         case HostFrameKind.MCP_TOOLS:
             return HostMcpToolsFrame(
                 request_id=_required_str(msg, "request_id"),
@@ -2776,12 +2866,18 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
         scheduled_run=parse_scheduled_run(msg.get("scheduled_run")),
+        mcp_disabled_servers_active_harnesses=(
+            _optional_str_list(msg, "mcp_disabled_servers_active_harnesses")
+            if "mcp_disabled_servers_active_harnesses" in msg
+            else None
+        ),
         # Absent (an older server) is distinct from an empty list.
         superseded_runner_ids=(
             tuple(_optional_str_list(msg, "superseded_runner_ids"))
             if "superseded_runner_ids" in msg
             else None
         ),
+        session_env_handoff_id=_optional_nullable_str(msg, "session_env_handoff_id"),
     )
 
 
@@ -3325,7 +3421,7 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
 
 
 _MCP_SERVER_FIELDS = ("name", "harness", "transport", "scope")
-_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id", "managed")
+_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id", "managed", "enabled", "locked")
 #: Account states a host may report. Anything else is dropped rather than rejected, so a
 #: newer host reporting a state this build does not know degrades to "no state reported".
 MCP_AUTH_STATUSES = ("connected", "sign_in_required")

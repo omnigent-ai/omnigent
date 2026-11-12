@@ -118,6 +118,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { sandboxSessionCatalogKey, writeModelCatalogCache } from "@/lib/modelCatalogCache";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import {
   useHostModelOptions,
@@ -1430,11 +1431,14 @@ function LandingNavigationProbe() {
   );
 }
 
+const hostNavigationCalls = vi.fn();
+
 function useHostNavigate(): ReturnType<typeof useNavigate> {
   const navigate = useNavigate();
   // Embedded hosts serialize partial paths; createPath defaults a missing pathname to "/".
   return useCallback(
     (to: To | number, options?: NavigateOptions) => {
+      hostNavigationCalls(to, options);
       if (typeof to === "number") return navigate(to);
       return navigate(typeof to === "string" ? to : createPath(to), options);
     },
@@ -1532,6 +1536,7 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
 
 describe("prompt URL handoff", () => {
   beforeEach(setupLandingMocks);
+  beforeEach(() => hostNavigationCalls.mockClear());
 
   it.each(["/omnigent", "/omnigent/", "/tools/omnigent"])(
     "keeps an embedded prompt link under %s with host navigation",
@@ -1546,6 +1551,7 @@ describe("prompt URL handoff", () => {
         `${pathname}?o=123#composer`,
       );
       expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      expect(hostNavigationCalls).not.toHaveBeenCalled();
     },
   );
 
@@ -3767,7 +3773,7 @@ describe("desktop Arclet credential preflight", () => {
   });
 });
 
-describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
+describe("Run on Arca (flag-gated)", () => {
   beforeEach(() => {
     setupLandingMocks();
     mockHosts([]);
@@ -3785,7 +3791,7 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     cleanup();
     localStorage.clear();
     // Restore the browser defaults so these overrides don't leak into the
-    // other describe blocks (which assume no desktop shell / no MDM flag).
+    // other describe blocks (which assume no desktop shell / no desktop flags).
     vi.mocked(isElectronShell).mockReturnValue(false);
     vi.mocked(getDesktopFeatures).mockResolvedValue(null);
   });
@@ -3796,7 +3802,7 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     fireEvent.click(chip);
   }
 
-  it("offers the Arca option only when the desktop shell reports the MDM flag", async () => {
+  it("offers the Arca option only when the desktop shell reports the flag", async () => {
     renderLanding();
     await openHostMenu();
     expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toBeTruthy();
@@ -9177,11 +9183,11 @@ describe("NewChatLandingScreen", () => {
         );
         fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
         fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
-        fireEvent.click(
-          await screen.findByRole("button", { name: "Sandbox profile: Choose profile" }),
-        );
-        fireEvent.click(screen.getByText("Large workspace"));
-        await waitFor(() => expect(screen.queryByText("Loading sandbox profiles…")).toBeNull());
+        // Back on the first provider, the profile picked there is picked again.
+        expect(
+          await screen.findByRole("button", { name: "Sandbox profile: Large workspace" }),
+        ).toBeVisible();
+        await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
       }
       const file = new File(["build context"], "context.txt", { type: "text/plain" });
       if (attachments)
@@ -9206,6 +9212,52 @@ describe("NewChatLandingScreen", () => {
       });
     },
   );
+
+  it("opens the next composer on the profile last picked", async () => {
+    const profile = {
+      id: "large",
+      name: "Large workspace",
+      description: "For builds",
+      provider: "agent_sandbox",
+      revision: "revision-1",
+    };
+    vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+      profiles: [profile, { ...profile, id: "small", name: "Small workspace" }],
+      managed_providers: ["agent_sandbox"],
+      default_profile_ids: { agent_sandbox: "small" },
+      next_cursor: null,
+    });
+    authenticatedFetchMock.mockResolvedValue(new Response(JSON.stringify({ id: "conv_profile" })));
+    const info = {
+      features: { sandbox_profiles: true },
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_providers: ["agent_sandbox"],
+    };
+    renderLanding(info);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Sandbox profile: Small workspace" }),
+    );
+    fireEvent.click(screen.getByText("Large workspace"));
+    cleanup();
+    // A fresh composer, not this one's draft.
+    resetLandingDraft();
+
+    renderLanding(info);
+    expect(
+      await screen.findByRole("button", { name: "Sandbox profile: Large workspace" }),
+    ).toBeVisible();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "build it again" },
+    });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    expect(JSON.parse(authenticatedFetchMock.mock.calls[0][1]?.body as string)).toMatchObject({
+      sandbox_profile_id: "large",
+      sandbox_profile_revision: "revision-1",
+    });
+  });
 
   it.each([403, 409])(
     "refreshes rejected profile choices after HTTP %s without silently reselecting",
@@ -13643,6 +13695,64 @@ describe("managed sandbox gateway preview", () => {
       null,
       true,
     );
+  });
+
+  it("offers a running session's saved catalog and effort ladder instead of the gateway list", async () => {
+    getCurrentUserIdMock.mockReturnValue("alice");
+    const luna = {
+      id: "gpt-6-luna",
+      displayName: "GPT 6 Luna",
+      supportedReasoningEfforts: [{ reasoningEffort: "ultra" }],
+    };
+    writeModelCatalogCache(sandboxSessionCatalogKey("arclet", "codex-native", "a2"), [luna], false);
+    writeModelCatalogCache(
+      sandboxSessionCatalogKey("arclet", "claude-native", "a1"),
+      [{ id: "opus", displayName: "Opus" }],
+      false,
+    );
+    preview();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    selectAgent("a1");
+    openAgentModels("a1");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
+    pickPrimaryOption("model", "Opus");
+    // Claude Code's in-session ladder, not the gateway model's metadata.
+    expect(screen.getByTestId("new-chat-landing-agent-effort-xhigh")).toBeInTheDocument();
+    closeMenu();
+    selectAgent("a2");
+    openAgentModels("a2");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
+    pickPrimaryOption("model", "GPT 6 Luna");
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-max")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-ultra"));
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      agent_id: "a2",
+      sandbox_provider: "arclet",
+      model_override: luna.id,
+      reasoning_effort: "ultra",
+    });
+  });
+
+  it("does not offer another agent's saved catalog", async () => {
+    getCurrentUserIdMock.mockReturnValue("alice");
+    const luna = { id: "gpt-6-luna", displayName: "GPT 6 Luna" };
+    writeModelCatalogCache(sandboxSessionCatalogKey("arclet", "codex-native", "a3"), [luna], false);
+    preview();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    selectAgent("a2");
+    openAgentModels("a2");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${luna.id}`)).toBeNull();
+    expect(screen.getByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeInTheDocument();
   });
 
   it("drops an effort unsupported by the newly selected model", async () => {
