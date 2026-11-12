@@ -341,7 +341,9 @@ Claude and Codex launches load only the `omnigent` server plus the allowlist.
 It needs no server flag and has no UI. Project config cannot change it. Claude
 gets `allowedMcpServers` through `--settings`, and because Claude unions
 allowlists across settings sources, every other inherited user, project, local
-or managed `allowedMcpServers` entry is mirrored into `deniedMcpServers`. Codex
+or managed `allowedMcpServers` entry is mirrored into `deniedMcpServers`, except
+a `serverCommand`/`serverUrl` entry exactly matching an allowlisted server's
+readable transport; a wildcard URL matching one raises `McpStrictModeError`. Codex
 gets an `enabled=false` override for every other discovered server (TOML 1.1
 layers are read with `tomlkit`) and no relaunch without them. A strict launch
 whose Claude settings or Codex config layer exists but is unreadable raises

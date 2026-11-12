@@ -1,6 +1,7 @@
 """Public contract for host-owned MCP disable state and launch planning."""
 
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -313,6 +314,57 @@ def test_claude_strict_denies_inherited_allow_entries(executor, tmp_path, claude
         ],
         "allowedMcpServers": [{"serverName": "omnigent"}, {"serverName": "kept"}],
     }
+
+
+def test_claude_strict_keeps_exact_transport_entries_of_allowlisted_servers(claude_project):
+    """A deny matching an allowlisted server's transport would block that server too."""
+    write_mcp_inheritance({"inherit": False, "allow": ["kept", "kept_project", "kept_http"]})
+    _write_json(
+        claude_project.parent / "claude-config/.claude.json",
+        {
+            "mcpServers": {
+                "kept": {"command": "npx", "args": ["kept-server"]},
+                "other": {"command": "npx", "args": ["other-server"]},
+            },
+            "projects": {
+                str(claude_project): {"mcpServers": {"kept_project": {"command": "uvx"}}}
+            },
+        },
+    )
+    _write_json(
+        claude_project / ".mcp.json",
+        {"mcpServers": {"kept_http": {"type": "http", "url": "https://mcp.example.com/kept"}}},
+    )
+    other = {"serverCommand": ["npx", "other-server"]}
+    _write_json(
+        claude_project / ".claude/settings.json",
+        {
+            "allowedMcpServers": [
+                {"serverCommand": ["npx", "kept-server"]},
+                {"serverCommand": ["uvx"]},
+                {"serverUrl": "https://mcp.example.com/kept"},
+                other,
+            ]
+        },
+    )
+    result = apply_claude_settings({}, executor="claude-native", active_harnesses=None)
+    assert result["deniedMcpServers"] == [other]
+
+
+def test_claude_strict_refuses_wildcard_url_matching_an_allowlisted_server(claude_project):
+    write_mcp_inheritance({"inherit": False, "allow": ["local"]})
+    _write_json(
+        claude_project / ".mcp.json",
+        {"mcpServers": {"local": {"type": "http", "url": "http://localhost:8123/mcp"}}},
+    )
+    settings = claude_project / ".claude/settings.json"
+    _write_json(settings, {"allowedMcpServers": [{"serverUrl": "http://localhost:*"}]})
+    with pytest.raises(
+        McpStrictModeError,
+        match=re.escape("pattern http://localhost:*, which also matches allowlisted server local"),
+    ) as raised:
+        apply_claude_settings({}, executor="claude-native", active_harnesses=None)
+    assert raised.value.path == settings
 
 
 @pytest.mark.parametrize("content", ["{", "[]", None])

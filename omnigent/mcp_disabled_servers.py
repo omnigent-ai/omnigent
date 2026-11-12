@@ -62,11 +62,15 @@ class ServerKey:
 class McpStrictModeError(RuntimeError):
     """Strict MCP mode refused a launch because a config layer the CLI reads is unreadable."""
 
-    def __init__(self, executor: str, path: Path, reason: str) -> None:
+    def __init__(
+        self, executor: str, path: Path, reason: str, *, problem: str | None = None
+    ) -> None:
         self.path = path
+        problem = problem or (
+            f"{path} could not be read ({reason}), so MCP servers it configures could still load"
+        )
         super().__init__(
-            f"Strict MCP mode stopped this {executor} launch: {path} could not be read "
-            f"({reason}), so MCP servers it configures could still load. Fix that file, or "
+            f"Strict MCP mode stopped this {executor} launch: {problem}. Fix that file, or "
             f"set harness.{executor}.mcp.inherit: true in {global_config_path()}."
         )
         _logger.warning(
@@ -234,9 +238,7 @@ def _claude_inherited_settings_paths(cwd: Path, executor: str) -> list[Path]:
     """List the user, project, local and managed settings files Claude merges from *cwd*."""
     from omnigent.onboarding import ambient
 
-    project_root = next(
-        (directory for directory in (cwd, *cwd.parents) if (directory / ".git").exists()), cwd
-    )
+    project_root = _claude_project_root(cwd)
     paths = [
         ambient.claude_user_settings_path(cwd),
         project_root / ".claude" / "settings.json",
@@ -255,6 +257,66 @@ def _claude_inherited_settings_paths(cwd: Path, executor: str) -> list[Path]:
     return list(dict.fromkeys(paths))
 
 
+def _claude_project_root(cwd: Path) -> Path:
+    return next(
+        (directory for directory in (cwd, *cwd.parents) if (directory / ".git").exists()), cwd
+    )
+
+
+def _claude_allowlisted_servers(
+    cwd: Path, inheritance: McpInheritance
+) -> list[tuple[str, Mapping[str, object]]]:
+    """Return the readable configs of strict-allowlisted servers Claude may load from *cwd*."""
+    from omnigent.host.mcp_inventory import managed_claude_mcp_config
+
+    def servers_in(data: object) -> Mapping[str, object]:
+        servers = data.get("mcpServers") if isinstance(data, Mapping) else None
+        return servers if isinstance(servers, Mapping) else {}
+
+    def read(path: Path) -> Mapping[str, object]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError, RecursionError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    present, managed = managed_claude_mcp_config()
+    tables = [managed]
+    if not present:
+        configured = os.environ.get("CLAUDE_CONFIG_DIR")
+        user = read(
+            cwd / Path(configured) / ".claude.json" if configured else Path.home() / ".claude.json"
+        )
+        projects = user.get("projects")
+        directories = list(dict.fromkeys((cwd, _claude_project_root(cwd))))
+        tables.append(servers_in(user))
+        for directory in directories:
+            tables.append(
+                servers_in(projects.get(str(directory)) if isinstance(projects, dict) else None)
+            )
+            tables.append(servers_in(read(directory / ".mcp.json")))
+    return [
+        (name, config)
+        for table in tables
+        for name, config in table.items()
+        if isinstance(config, Mapping) and inheritance.allows(name)
+    ]
+
+
+def _claude_transport_matches(field: str, value: object, config: Mapping[str, object]) -> bool:
+    """Whether a ``serverCommand`` or ``serverUrl`` entry matches a server, as Claude does."""
+    if field == "serverCommand":
+        args = config.get("args", [])
+        return isinstance(config.get("command"), str) and value == [
+            config["command"],
+            *(args if isinstance(args, list) else []),
+        ]
+    url = config.get("url")
+    if not isinstance(value, str) or not isinstance(url, str):
+        return False
+    return re.fullmatch(".*".join(re.escape(part) for part in value.split("*")), url) is not None
+
+
 def _claude_inherited_denials(
     cwd: Path, inheritance: McpInheritance, executor: str
 ) -> list[dict[str, object]]:
@@ -262,7 +324,13 @@ def _claude_inherited_denials(
 
     Claude unions allowlists across its settings sources, but a deny from any source
     wins, so mirroring them is the only way an injected allowlist can narrow them.
+    A command or URL entry matching an allowlisted server is kept when exact, since
+    it admits only that server's own transport.
+
+    :raises McpStrictModeError: When a wildcard URL entry matches an allowlisted
+        server, since denying it would block that server.
     """
+    allowlisted: list[tuple[str, Mapping[str, object]]] | None = None
     denials: list[dict[str, object]] = []
     for path in _claude_inherited_settings_paths(cwd, executor):
         try:
@@ -280,16 +348,39 @@ def _claude_inherited_denials(
         inherited = payload.get("allowedMcpServers")
         for entry in inherited if isinstance(inherited, list) else ():
             for field, value in entry.items() if isinstance(entry, dict) else ():
-                named = field == "serverName" and isinstance(value, str)
-                if (
-                    (named and not inheritance.allows(value))
-                    or (field == "serverUrl" and isinstance(value, str))
-                    or (
-                        field == "serverCommand"
-                        and isinstance(value, list)
-                        and all(isinstance(part, str) for part in value)
+                if field == "serverName":
+                    mirrored = isinstance(value, str) and not inheritance.allows(value)
+                elif (field == "serverUrl" and isinstance(value, str)) or (
+                    field == "serverCommand"
+                    and isinstance(value, list)
+                    and all(isinstance(part, str) for part in value)
+                ):
+                    if allowlisted is None:
+                        allowlisted = _claude_allowlisted_servers(cwd, inheritance)
+                    matched = next(
+                        (
+                            name
+                            for name, config in allowlisted
+                            if _claude_transport_matches(field, value, config)
+                        ),
+                        None,
                     )
-                ) and {field: value} not in denials:
+                    if matched is not None and field == "serverUrl" and "*" in value:
+                        raise McpStrictModeError(
+                            executor,
+                            path,
+                            "wildcard serverUrl matches an allowlisted server",
+                            problem=(
+                                f"{path} allows the serverUrl pattern {value}, which also "
+                                f"matches allowlisted server {matched}, so it can be neither "
+                                "denied nor kept. Replace it with that server's exact URL or "
+                                "a serverName entry"
+                            ),
+                        )
+                    mirrored = matched is None
+                else:
+                    mirrored = False
+                if mirrored and {field: value} not in denials:
                     denials.append({field: value})
     return denials
 
