@@ -6916,6 +6916,11 @@
             "title": "Session Claude Sdk Clear",
             "type": "boolean"
           },
+          "session_create_permission_modes": {
+            "default": true,
+            "title": "Session Create Permission Modes",
+            "type": "boolean"
+          },
           "session_event_types": {
             "default": [],
             "items": {
@@ -22090,6 +22095,48 @@
           }
         },
         "summary": "Merge Session Github Pr",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/merge-as": {
+      "post": {
+        "description": "Merge the selected PR as the account the merge dialog showed.\n\nA route apart from `/merge`, so a server, runner, or host that can't\nbind the account refuses the request instead of merging as the saved one.\n\n**Returns:** A `session.github.pr_merge`.",
+        "operationId": "merge_session_github_pr_as_v1_sessions__session_id__resources_github_merge_as_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Merge Session Github Pr As",
         "tags": [
           "session_resources"
         ]

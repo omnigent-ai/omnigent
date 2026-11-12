@@ -1171,6 +1171,40 @@ describe("PullRequestPanel", () => {
       expect(screen.getByText("Merge pull request #6000?")).toBeInTheDocument();
     });
 
+    it.each([
+      [true, true, true],
+      [false, true, false],
+      // An older host would merge as its saved account, whatever the dialog sent.
+      [true, undefined, false],
+    ])(
+      "offers the PR's accounts to merge as (switching: %s, merge as account: %s)",
+      (switching, mergeAsAccount, offered) => {
+        state.info!.data!.capabilities!.account_switching = switching;
+        state.info!.data!.capabilities!.merge_as_account = mergeAsAccount;
+        state.info!.data!.accounts = ["work", "personal"].map((login) => ({
+          login,
+          active: login === "work",
+          state: "success",
+          host: "github.com",
+        }));
+        state.info!.data!.selected_account = "work";
+        renderPanel();
+
+        // The repository resolved, so only the merge dialog asks for an account.
+        expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
+        const merge = screen.getByRole("region", { name: "Merge" });
+        fireEvent.click(within(merge).getByRole("button", { name: "Merge pull request" }));
+        const picker = within(screen.getByRole("dialog")).queryByRole("combobox", {
+          name: "Merge as",
+        });
+        if (offered) {
+          expect(picker).toHaveTextContent("work (active)");
+        } else {
+          expect(picker).toBeNull();
+        }
+      },
+    );
+
     it("divides the metadata from the description", () => {
       renderPanel();
 
@@ -2867,6 +2901,51 @@ describe("session PR selection", () => {
       expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
     },
   );
+
+  it("offers the PR's accounts to merge as from its compact row", () => {
+    const pr = {
+      ...state.info!.data!.pr!,
+      checks: { total: 1, passing: 1, failing: 0, pending: 0, runs: [] },
+      merge_state_status: "CLEAN",
+      head_sha: "head",
+    };
+    Object.assign(state.info!.data!, {
+      pr,
+      capabilities: {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        merging: true,
+        merge_as_account: true,
+      },
+      accounts: ["work", "personal"].map((login) => ({
+        login,
+        active: login === "work",
+        state: "success",
+        host: "github.com",
+      })),
+      selected_account: "work",
+      tracking_available: true,
+      prs: [
+        OTHER_PR,
+        {
+          url: pr.url,
+          repository: "example/repo",
+          host: "github.com",
+          number: pr.number,
+          relationship: "created",
+        },
+      ],
+    });
+    renderPanel();
+
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Merge" }));
+    expect(
+      within(screen.getByRole("dialog")).getByRole("combobox", { name: "Merge as" }),
+    ).toHaveTextContent("work (active)");
+  });
 
   it.each(["failing", "pending", "cancelled", "skipped", "partial", "read-only"])(
     "keeps check details and uses mergeability for %s",

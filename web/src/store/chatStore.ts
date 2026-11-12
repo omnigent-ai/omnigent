@@ -100,6 +100,7 @@ import { describeSendFailure } from "@/lib/sendFailure";
 import { isRetryableRequestError, queryRetryDelay } from "@/lib/queryRetry";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+import { fetchConversationSnapshot } from "./conversationSnapshot";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
   SSE_STALL_TIMEOUT_MS,
@@ -5287,54 +5288,10 @@ async function bindStream(
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
     // the reader sees as the transcript shifting seconds after it settled.
-    const client = queryClient;
-    // Each request retries on its own, so a failed one doesn't repeat the other.
-    // Set once a session read times out, and kept set through later failures: the shared
-    // read it may have joined is still the one that never answers.
-    let sessionReadTimedOut = false;
-    const [session, page] = await Promise.all([
-      withSnapshotRetries(id, (attempt) =>
-        withReadTimeout((signal) => {
-          const queryKey = ["session", id];
-          const joinsSharedRead = client.isFetching({ queryKey, exact: true }) > 0;
-          // A retry after a timeout reads directly rather than rejoin a shared read that
-          // may never answer, and its result seeds the shared cache.
-          if (sessionReadTimedOut && joinsSharedRead) {
-            return getSessionSlim(id, { refreshState: true, signal }).then((fresh) => {
-              client.setQueryData(queryKey, fresh);
-              return fresh;
-            });
-          }
-          // An attempt that starts the request drops it on timeout, so the retry reads
-          // afresh. One that joins another caller's read leaves that read to its caller.
-          if (!joinsSharedRead) {
-            signal.addEventListener(
-              "abort",
-              () => void client.cancelQueries({ queryKey, exact: true }),
-              { once: true },
-            );
-          }
-          return client.fetchQuery({
-            queryKey,
-            queryFn: ({ signal: querySignal }) =>
-              getSessionSlim(id, { refreshState: true, signal: querySignal }),
-            staleTime: 0,
-            retry: false,
-          });
-        }, snapshotLoadDeadlineMs(attempt)).catch((error: unknown) => {
-          if (error instanceof DOMException && error.name === "TimeoutError") {
-            sessionReadTimedOut = true;
-          }
-          throw error;
-        }),
-      ),
-      withSnapshotRetries(id, (attempt) =>
-        withReadTimeout(
-          (signal) => fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
-          snapshotLoadDeadlineMs(attempt),
-        ),
-      ),
-    ]);
+    const { session, page } = await fetchConversationSnapshot(queryClient, id, {
+      withRetries: (read) => withSnapshotRetries(id, read),
+      withDeadline: (read, attempt) => withReadTimeout(read, snapshotLoadDeadlineMs(attempt)),
+    });
     if (!ownsSessionBind(entry, controller)) return;
     const items = page.items;
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);

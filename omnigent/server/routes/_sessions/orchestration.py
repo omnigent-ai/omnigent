@@ -11873,6 +11873,7 @@ async def _create_session_from_existing_agent(
     project_store: ProjectStore | None = None,
     created_by_session_id: str | None = None,
     created_by_project_id: str | None = None,
+    created_by_scheduled_task_id: str | None = None,
 ) -> tuple[SessionResponse, Conversation]:
     """
     Create a session bound to an already-registered agent.
@@ -11905,6 +11906,8 @@ async def _create_session_from_existing_agent(
     :param created_by_session_id: Server-authorized source of an independent worker.
     :param created_by_project_id: That source's project. A worker whose request names
         no project is filed there, so it sits beside the session that started it.
+    :param created_by_scheduled_task_id: The automation whose run is that source, if
+        any. A worker whose request carries no launch args runs in its permission mode.
     :returns: The newly created session snapshot and its conversation row.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -12346,6 +12349,22 @@ async def _create_session_from_existing_agent(
         labels=body.labels,
         host_registry=getattr(request.app.state, "host_registry", None),
     )
+    # Checked before a worktree exists, so a refused mode leaves nothing behind.
+    permission_launch_args: list[str] | None = None
+    if body.permission_mode is not None:
+        from omnigent.native.permission_modes import created_session_launch_args
+
+        if body.sub_agent_name or body.terminal_launch_args is not None:
+            raise OmnigentError(
+                "permission_mode can't be combined with terminal_launch_args or sub_agent_name",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            permission_launch_args = created_session_launch_args(
+                selected_harness, body.permission_mode
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
     # Git worktree options (optional). Two modes on body.git:
     #  - create (default): make a worktree; it becomes the stored
@@ -12400,9 +12419,11 @@ async def _create_session_from_existing_agent(
     # the validated body args (e.g. ``["--permission-mode",
     # "bypassPermissions"]`` from the web permission-mode selector). The
     # flat-list shape plus this bounds check is the security boundary;
-    # mirrors the multipart create + PATCH paths. When the body carries no
-    # args, the agent's own trusted spec seeds them below — explicit
-    # opt-ins only, never the headless worker default bypass.
+    # mirrors the multipart create + PATCH paths. A ``permission_mode``
+    # (from ``sys_session_create``) maps to its harness's args instead, and
+    # never to a mode that skips approval. When the body carries neither,
+    # the agent's own trusted spec seeds them below — explicit opt-ins
+    # only, never the headless worker default bypass.
     sub_spec: AgentSpec | None = None
     if body.sub_agent_name:
         sub_spec = _resolve_subagent_spec(
@@ -12419,6 +12440,8 @@ async def _create_session_from_existing_agent(
                 f"invalid terminal_launch_args in sub-agent spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+    elif body.permission_mode is not None:
+        validated_launch_args = permission_launch_args
     else:
         try:
             validated_launch_args = _validate_terminal_launch_args(body.terminal_launch_args)
@@ -12428,11 +12451,36 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    # Workers an automation's run starts are unattended like the run itself, so they
+    # use the automation's permission mode instead of their agent's default. A mode
+    # the request names wins.
+    automation_launch_options: tuple[list[str] | None, dict[str, str]] | None = None
+    if not body.sub_agent_name and validated_launch_args is None and body.permission_mode is None:
+        from omnigent.server.scheduled.harness_settings import automation_session_launch_options
+
+        automation_launch_options = await automation_session_launch_options(
+            getattr(request.app.state, "scheduled_task_store", None),
+            created_by_scheduled_task_id,
+            source_session_id=created_by_session_id,
+            user_id=user_id,
+            harness=selected_harness,
+        )
+    automation_permission_labels: dict[str, str] = {}
+    if automation_launch_options is not None:
+        validated_launch_args, automation_permission_labels = automation_launch_options
+
     # Spec-seeded defaults: a self-resolved agent's stored spec supplies the
     # spec-level reasoning effort and, when the body carried no launch args,
     # its explicit native-bypass opt-ins; one tolerant load serves both.
     own_spec: AgentSpec | None = None
-    needs_launch_args_from_spec = not body.sub_agent_name and validated_launch_args is None
+    # A requested or inherited mode, even the harness default, replaces the spec's
+    # own opt-ins.
+    needs_launch_args_from_spec = (
+        not body.sub_agent_name
+        and validated_launch_args is None
+        and body.permission_mode is None
+        and automation_launch_options is None
+    )
     needs_effort_from_spec = reasoning_effort is None and sub_spec is None
     if (
         (needs_launch_args_from_spec or needs_effort_from_spec)
@@ -12485,6 +12533,7 @@ async def _create_session_from_existing_agent(
     if created_by_session_id is not None:
         initial_labels[CREATED_BY_SESSION_LABEL_KEY] = created_by_session_id
     initial_labels.update(registry_labels)
+    initial_labels.update(automation_permission_labels)
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (
             WORKTREE_ROOT_LABEL_KEY,

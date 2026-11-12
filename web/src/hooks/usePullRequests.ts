@@ -232,6 +232,8 @@ export interface PullRequestCapabilities {
   reviewer_editing?: boolean;
   /** The PR's title and description can be edited; absent from older hosts. */
   details_editing?: boolean;
+  /** A merge runs as the account the dialog sends; absent from older hosts. */
+  merge_as_account?: boolean;
   /** Images and videos can be uploaded into the description; absent from older hosts. */
   attachment_uploads?: boolean;
   /** The PR's commits can be listed and read one at a time; absent from older hosts. */
@@ -632,20 +634,49 @@ async function postPullRequestPreference(
 
 /**
  * Save the account / base-repo selection through the runner or host fallback,
- * update the info cache, and invalidate the selected PR's files and diff.
+ * update the info cache, and invalidate the selected PR's files, diff, and
+ * merge options (which name the account's last-used method).
  */
 export function useSetPullRequestPreference(conversationId: string | undefined) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (body: PullRequestPreferenceInput) =>
       postPullRequestPreference(conversationId!, body),
-    onSuccess: (info) => {
-      queryClient.setQueryData(["github-info", conversationId], info);
+    onSuccess: (info, body) => {
+      // A `pr_url` reply describes that PR, so it belongs in that PR's query.
+      queryClient.setQueryData(
+        ["github-info", conversationId, ...(body.pr_url ? [body.pr_url] : [])],
+        info,
+      );
+    },
+    // The host may have saved the account before the reply failed, so the cached
+    // one is no longer known to be right; nothing shows it until the refetch does.
+    onError: (_error, body) => {
+      if (body.account === undefined) return;
+      queryClient.setQueriesData<PullRequestInfo>(
+        { queryKey: ["github-info", conversationId] },
+        (info) =>
+          info && (!body.pr_url || info.selected_pr_url === body.pr_url)
+            ? withoutSelectedAccount(info)
+            : info,
+      );
+    },
+    // The host may save the choice and still fail the reply, so refetch either way.
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
       queryClient.invalidateQueries({ queryKey: ["github-changed-files", conversationId] });
       queryClient.invalidateQueries({ queryKey: ["github-pr-diff", conversationId] });
+      queryClient.invalidateQueries({ queryKey: ["github-merge-options", conversationId] });
     },
   });
+}
+
+function withoutSelectedAccount(info: PullRequestInfo): PullRequestInfo {
+  return {
+    ...info,
+    ...(info.selected_account !== undefined ? { selected_account: null } : {}),
+    ...(info.auth ? { auth: { ...info.auth, selected_account: null } } : {}),
+  };
 }
 
 /** `pr_url` plus the `base:head` revision the diff and file list are pinned to. */
@@ -1024,6 +1055,7 @@ async function fetchPullRequestEditResource<T>(
     | "attachments"
     | "merge-options"
     | "merge"
+    | "merge-as"
     | "disable-auto-merge",
   request: { prUrl: string } | { body: unknown } | { form: FormData },
 ): Promise<T> {
@@ -1154,6 +1186,21 @@ export interface PullRequestMergeRequest {
   mergeMethod: PullRequestMergeMethod;
   /** The head commit the panel showed; GitHub refuses the merge if the branch moved. */
   expectedHead: string;
+  /** The account the dialog showed. The merge runs as it, through a route that a
+   *  server or host unable to bind it refuses, and it becomes the PR's account. */
+  account?: string;
+}
+
+const MERGE_AS_UNSUPPORTED =
+  "This Omnigent server or host can’t merge as a chosen account. Update them, or merge on GitHub.";
+
+/** An older server or runner has no merge-as route; an older host has no such op. */
+function mergeAsUnsupported(error: unknown): boolean {
+  if (!(error instanceof PullRequestApiError)) return false;
+  return (
+    (error.status === 404 && error.message === "Not Found") ||
+    error.message.startsWith("unknown fs write op")
+  );
 }
 
 /**
@@ -1165,14 +1212,24 @@ export function useMergePullRequest(conversationId: string) {
   return useMutation({
     mutationKey: ["github-merge", conversationId],
     scope: { id: `github-merge-${conversationId}` },
-    mutationFn: (request: PullRequestMergeRequest) =>
-      fetchPullRequestEditResource<PullRequestMergeResult>(conversationId, "merge", {
-        body: {
-          pr_url: request.prUrl,
-          merge_method: request.mergeMethod,
-          expected_head: request.expectedHead,
-        },
-      }),
+    mutationFn: async (request: PullRequestMergeRequest) => {
+      const body = {
+        pr_url: request.prUrl,
+        merge_method: request.mergeMethod,
+        expected_head: request.expectedHead,
+      };
+      if (request.account === undefined) {
+        return fetchPullRequestEditResource<PullRequestMergeResult>(conversationId, "merge", {
+          body,
+        });
+      }
+      // Never retried as a plain merge: that would run as whichever account is saved.
+      return fetchPullRequestEditResource<PullRequestMergeResult>(conversationId, "merge-as", {
+        body: { ...body, account: request.account },
+      }).catch((error: unknown) => {
+        throw mergeAsUnsupported(error) ? new Error(MERGE_AS_UNSUPPORTED) : error;
+      });
+    },
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] }),
   });
 }
