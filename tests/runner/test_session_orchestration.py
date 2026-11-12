@@ -1141,9 +1141,20 @@ async def test_independent_creation_supports_disabled_or_missing_sibling_capabil
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("supported", [True, False, None])
-@pytest.mark.parametrize("project_field", ["project_id", "project_name"])
-async def test_explicit_host_create_preserves_worktree_and_project(supported, project_field):
+@pytest.mark.parametrize(
+    "supported,project_field,placement",
+    [
+        (True, "project_id", "host"),
+        (True, "project_name", "host"),
+        (False, "project_id", "host"),
+        (None, "project_id", "host"),
+        (False, "project_id", "same_host"),
+        (None, "project_id", "same_host"),
+    ],
+)
+async def test_explicit_host_create_preserves_worktree_and_project(
+    supported, project_field, placement
+):
     requests = []
     destination = uuid4().hex
     session = uuid4().hex
@@ -1151,7 +1162,9 @@ async def test_explicit_host_create_preserves_worktree_and_project(supported, pr
     def respond(request):
         requests.append(request)
         if request.url.path == "/v1/info":
-            return httpx.Response(200, json={"scripted_sessions": supported})
+            return httpx.Response(
+                200, json={} if supported is None else {"scripted_sessions": supported}
+            )
         if request.url.path == "/v1/projects":
             return httpx.Response(200, json={"data": [{"id": _PROJECT_ID, "name": "Triage"}]})
         if request.url.path.startswith("/v1/projects/"):
@@ -1169,10 +1182,16 @@ async def test_explicit_host_create_preserves_worktree_and_project(supported, pr
                 arguments=json.dumps(
                     {
                         "agent_id": "worker",
-                        "placement": "host",
-                        "host_id": destination,
-                        "workspace": "/repos/example",
-                        "git": {"branch_name": "review", "base_branch": "main"},
+                        "placement": placement,
+                        **(
+                            {
+                                "host_id": destination,
+                                "workspace": "/repos/example",
+                                "git": {"branch_name": "review", "base_branch": "main"},
+                            }
+                            if placement == "host"
+                            else {}
+                        ),
                         project_field: _PROJECT_ID if project_field == "project_id" else "Triage",
                         "message": "Review the change",
                     }
@@ -1228,18 +1247,32 @@ async def test_invalid_host_options_do_not_create(arguments):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["attach", "remove"])
-@pytest.mark.parametrize("supported", [True, False])
-async def test_pr_link_routes_to_target_and_requires_capability(action, supported):
+@pytest.mark.parametrize(
+    "action,supported,explicit_target",
+    [
+        ("attach", True, False),
+        ("remove", True, False),
+        ("attach", True, True),
+        ("attach", False, False),
+        ("attach", None, False),
+    ],
+)
+async def test_pr_link_routes_to_target_and_requires_capability(
+    action, supported, explicit_target
+):
     requests = []
-    target = uuid4().hex
+    source = uuid4().hex
+    target = uuid4().hex if explicit_target else source
     host = uuid4().hex
 
     def respond(request):
         requests.append(request)
         if request.url.path == "/v1/info":
-            return httpx.Response(200, json={"scripted_sessions": supported})
+            return httpx.Response(
+                200, json={} if supported is None else {"scripted_sessions": supported}
+            )
         if request.method == "GET":
+            assert request.url.path == f"/v1/sessions/{target}"
             return httpx.Response(200, json={"host_id": host})
         return httpx.Response(200, json={"prs": []})
 
@@ -1250,14 +1283,18 @@ async def test_pr_link_routes_to_target_and_requires_capability(action, supporte
             await execute_tool(
                 tool_name="sys_session_link_pr",
                 arguments=json.dumps(
-                    {"url": "https://github.com/example/repo/pull/1", "action": action}
+                    {
+                        "url": "https://github.com/example/repo/pull/1",
+                        "action": action,
+                        **({"session_id": target} if explicit_target else {}),
+                    }
                 ),
                 server_client=client,
-                conversation_id=target,
+                conversation_id=source,
             )
         )
     posts = [r for r in requests if r.method == "POST"]
-    if not supported:
+    if supported is not True:
         assert "unavailable" in result["error"]
         assert not posts
         return
@@ -1265,7 +1302,7 @@ async def test_pr_link_routes_to_target_and_requires_capability(action, supporte
     assert len(posts) == 1
     assert posts[0].url.path == f"/v1/sessions/{target}/resources/github/prs/orchestrated"
     assert posts[0].extensions["omnigent_host_id"] == host
-    assert posts[0].headers[ORCHESTRATION_SOURCE_HEADER] == target
+    assert posts[0].headers[ORCHESTRATION_SOURCE_HEADER] == source
     assert json.loads(posts[0].content)["action"] == action
 
 

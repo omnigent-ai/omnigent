@@ -2396,7 +2396,17 @@ async def test_scripted_host_worktree_respects_ownership_and_policy(
     assert launch.workspace == "/repos/review"
 
 
-@pytest.mark.parametrize("scenario", ["allowed", "disabled", "shared_source", "read_only_target"])
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "allowed",
+        "disabled",
+        "shared_source",
+        "read_only_target",
+        "missing_source",
+        "legacy_disabled",
+    ],
+)
 async def test_scripted_pr_link_checks_source_and_target(
     auth_client, auth_app, peers, db_uri, monkeypatch, scenario
 ):
@@ -2407,7 +2417,11 @@ async def test_scripted_pr_link_checks_source_and_target(
 
     source, target, _ = peers
     auth_app.state.feature_flags = resolve_feature_flags(
-        {FEATURES_ENV_VAR: "" if scenario == "disabled" else "scripted_sessions"}
+        {
+            FEATURES_ENV_VAR: ""
+            if scenario in ("disabled", "legacy_disabled")
+            else "scripted_sessions"
+        }
     )
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
@@ -2432,9 +2446,15 @@ async def test_scripted_pr_link_checks_source_and_target(
         return {"object": "session.github.info", "prs": []}
 
     monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    path = f"/v1/sessions/{target['id']}/resources/github/prs"
+    if scenario != "legacy_disabled":
+        path += "/orchestrated"
+    headers = {"X-Forwarded-Email": "alice"}
+    if scenario != "missing_source":
+        headers[ORCHESTRATION_SOURCE_HEADER] = source["id"]
     response = await auth_client.post(
-        f"/v1/sessions/{target['id']}/resources/github/prs/orchestrated",
-        headers={ORCHESTRATION_SOURCE_HEADER: source["id"], "X-Forwarded-Email": "alice"},
+        path,
+        headers=headers,
         json={"url": "https://github.com/example/repo/pull/1", "action": "attach"},
     )
     if scenario != "allowed":
