@@ -18,7 +18,6 @@ import type { StepProgress, StepState } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 import {
   layoutWorkflowSteps,
-  STEP_NODE_HEIGHT,
   STEP_NODE_WIDTH,
   type StepNodeData,
   type WorkflowStep,
@@ -28,9 +27,11 @@ import { SEGMENT_COLORS, STATE_LABELS, StepGlyph } from "@/shell/TasksPanel";
 import "@xyflow/react/dist/style.css";
 
 const HANDLE_CLASS = "!h-1.5 !w-1.5 !border-0 !bg-muted-foreground/40";
-// The graph grows with its rows, up to a height that still leaves the runs in view.
+// The graph grows with its steps, up to a share of the window that leaves the runs in view.
 const MIN_HEIGHT = 160;
-const MAX_HEIGHT = 480;
+const MAX_HEIGHT = "40dvh";
+// fitView's margin around the steps, as a share of their size.
+const FIT_PADDING = 0.2;
 
 // A node's border and tint, in the Tasks tab's colors for where the step stands.
 const NODE_TINT: Record<StepState, string> = {
@@ -101,7 +102,7 @@ function StepsFlow({
       edges={edges}
       nodeTypes={nodeTypes}
       fitView
-      fitViewOptions={{ padding: 0.2, maxZoom: 1 }}
+      fitViewOptions={{ padding: FIT_PADDING, maxZoom: 1 }}
       panOnDrag
       panOnScroll={false}
       zoomOnScroll={full}
@@ -209,15 +210,13 @@ export function WorkflowStepsGraph({
   title: string;
 }) {
   const [fullscreen, setFullscreen] = useState(false);
-  const { rowCount } = useMemo(() => layoutWorkflowSteps(steps), [steps]);
-  const height = Math.min(
-    MAX_HEIGHT,
-    Math.max(MIN_HEIGHT, rowCount * (STEP_NODE_HEIGHT + 40) + 64),
-  );
+  const { height: stepsHeight } = useMemo(() => layoutWorkflowSteps(steps), [steps]);
+  // Full size when it fits, with room for fitView's margin; past the cap it zooms out.
+  const height = Math.ceil(stepsHeight * (1 + FIT_PADDING)) + 32;
   return (
     <div
       className="relative overflow-hidden rounded-xl border border-border bg-card"
-      style={{ height }}
+      style={{ height, minHeight: MIN_HEIGHT, maxHeight: MAX_HEIGHT }}
       data-testid="workflow-steps-graph"
     >
       <StepsFlow steps={steps} />

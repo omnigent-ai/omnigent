@@ -28,8 +28,11 @@ export interface StepNodeData extends Record<string, unknown> {
 export const STEP_NODE_WIDTH = 220;
 // Room for the name and two lines of the goal.
 export const STEP_NODE_HEIGHT = 72;
+// A step with no goal shows its name alone.
+export const STEP_NAME_ONLY_HEIGHT = 36;
 const COLUMN_GAP = 32;
-const ROW_GAP = 40;
+// Room for a short arrow from one row to the next.
+const ROW_GAP = 28;
 
 const EDGE_STYLE = { stroke: "var(--muted-foreground)", strokeWidth: 1.5, opacity: 0.4 };
 
@@ -64,10 +67,12 @@ export function stepRows(steps: readonly WorkflowStep[]): Map<string, number> {
  * Lay a workflow's steps out top to bottom by dependency, for React Flow.
  * Within a row, steps keep the workflow's order, and each row is centered.
  *
+ * Each row is as tall as its tallest node, so steps without goals sit close.
+ *
  * @param states - Where each step stands in a run, by step ID; the edges into a
  *   running step move.
  * @returns The nodes, an edge from each step to each step that waits for it,
- *   and how many rows the steps take.
+ *   and how tall the steps are at full size, in pixels.
  */
 export function layoutWorkflowSteps(
   steps: readonly WorkflowStep[],
@@ -75,13 +80,20 @@ export function layoutWorkflowSteps(
 ): {
   nodes: Node<StepNodeData>[];
   edges: Edge[];
-  rowCount: number;
+  height: number;
 } {
   const rows = stepRows(steps);
   const byRow = new Map<number, WorkflowStep[]>();
   for (const step of steps) {
     const row = rows.get(step.id) ?? 0;
     byRow.set(row, [...(byRow.get(row) ?? []), step]);
+  }
+  const rowTops = new Map<number, number>();
+  let nextTop = 0;
+  for (const row of [...byRow.keys()].sort((first, second) => first - second)) {
+    rowTops.set(row, nextTop);
+    const hasGoal = byRow.get(row)!.some((step) => step.goal);
+    nextTop += (hasGoal ? STEP_NODE_HEIGHT : STEP_NAME_ONLY_HEIGHT) + ROW_GAP;
   }
   const widest = Math.max(0, ...[...byRow.values()].map((row) => row.length));
   const numbers = new Map(steps.map((step, index) => [step.id, index + 1]));
@@ -94,7 +106,7 @@ export function layoutWorkflowSteps(
         type: "step",
         position: {
           x: offset + index * (STEP_NODE_WIDTH + COLUMN_GAP),
-          y: row * (STEP_NODE_HEIGHT + ROW_GAP),
+          y: rowTops.get(row) ?? 0,
         },
         data: {
           name: step.name,
@@ -118,5 +130,5 @@ export function layoutWorkflowSteps(
         markerEnd: { type: "arrowclosed" as MarkerType, color: "var(--muted-foreground)" },
       })),
   );
-  return { nodes, edges, rowCount: byRow.size };
+  return { nodes, edges, height: Math.max(0, nextTop - ROW_GAP) };
 }

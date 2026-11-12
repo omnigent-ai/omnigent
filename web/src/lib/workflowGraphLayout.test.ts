@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   layoutWorkflowSteps,
+  STEP_NAME_ONLY_HEIGHT,
   STEP_NODE_HEIGHT,
   STEP_NODE_WIDTH,
   stepRows,
@@ -43,12 +44,13 @@ describe("stepRows", () => {
 
 describe("layoutWorkflowSteps", () => {
   it("lays steps out top to bottom, centering each row on the widest", () => {
-    const { nodes, rowCount } = layoutWorkflowSteps(STEPS);
+    const { nodes, height } = layoutWorkflowSteps(STEPS);
     const at = Object.fromEntries(nodes.map((node) => [node.id, node.position]));
 
-    expect(rowCount).toBe(4);
+    // Four rows of names, 28px apart.
+    expect(height).toBe(4 * STEP_NAME_ONLY_HEIGHT + 3 * 28);
     expect(at.fix!.y).toBe(at.history!.y);
-    expect(at.pr!.y).toBe(3 * (STEP_NODE_HEIGHT + 40));
+    expect(at.pr!.y).toBe(3 * (STEP_NAME_ONLY_HEIGHT + 28));
     // The two-step row keeps the workflow's order; one-step rows sit between them.
     expect(at.fix!.x).toBeLessThan(at.history!.x);
     expect(at.explore!.x).toBe((at.fix!.x + at.history!.x) / 2);
@@ -58,6 +60,17 @@ describe("layoutWorkflowSteps", () => {
       goal: null,
       number: 3,
     });
+  });
+
+  it("makes room for a goal only in the rows that have one", () => {
+    const withGoal = { ...step("fix", "explore"), goal: "The suite passes" };
+    const { nodes, height } = layoutWorkflowSteps([step("explore"), withGoal, step("pr", "fix")]);
+    const at = Object.fromEntries(nodes.map((node) => [node.id, node.position]));
+
+    expect(at.fix!.y).toBe(STEP_NAME_ONLY_HEIGHT + 28);
+    expect(at.pr!.y).toBe(at.fix!.y + STEP_NODE_HEIGHT + 28);
+    expect(height).toBe(at.pr!.y + STEP_NAME_ONLY_HEIGHT);
+    expect(layoutWorkflowSteps([]).height).toBe(0);
   });
 
   it("gives each node its run state, and moves the edges into a running step", () => {
