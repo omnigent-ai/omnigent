@@ -154,6 +154,13 @@ implements them separately, so a fix for one harness does not reach the others.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
   including those sent while it works, stay in that thread, and closing it
   leaves the parent usable.
+- `codex-async-questions`: each Codex `request_user_input_async` question shows
+  a card in Chat and Inbox that leaves the composer usable, like the Codex TUI's
+  queued-question picker. A card closes when the question is answered from the
+  card or the TUI picker, when the user sends any other message, when Cancel is
+  pressed (Codex keeps working), or when the turn ends. A server whose
+  `/v1/info` lacks `codex_nonblocking_decline` shows no card, so answer in the
+  terminal.
 - `codex-plan-mode`: Codex starts in, or switches to, its own Plan mode from the
   composer's Plan row; see `plan-mode` in [composer.md](./composer.md).
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
@@ -381,6 +388,20 @@ turn, and Stop separately. For an offline host use the reconnect paths in
 **Codex side chat:** type `/side <question>` in the parent composer, send a
 follow-up in the side pane, then close its tab. The parent conversation stays
 separate. See [sessions](./sessions.md) for all side-chat entry points.
+
+**Codex async question:** in Default mode, ask Codex to call
+`request_user_input_async` and keep working. The cards follow the Codex TUI's
+queued questions (shift+← in the terminal): one card per question, its options
+plus a free-text "Other" row, and the composer stays usable. Answer a card in
+Chat or Inbox: the answer is sent as an ordinary message in the TUI picker's
+reply format, which steers Codex's current turn, and the transcript shows it as
+the TUI does (`↪ Re: <question>` above the answer). So does an answer picked
+in the TUI. A card closes when its question is answered there or in the card,
+when any other user message is sent from either side, on Cancel (Codex keeps
+working, like the TUI's skip), or when the turn ends. Cancel does not clear the
+question in the terminal. If the answer can't be sent, a notice asks the user
+to answer in the terminal. An open question is not restored after the
+forwarder reconnects.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -649,6 +670,21 @@ Cross-harness journeys:
   model context, distinct native threads on one runner, transcript isolation,
   follow-ups that switch model and effort on the same thread, and a working
   parent after side-chat closure.
+- **`codex-async-questions`:**
+  `tests/harnesses/codex_native/session/test_elicitation.py` (the
+  `*codex_async_question*` tests) drives the forwarder with a fake app-server
+  client: one card per question, each answer sent as its own user message, a
+  skipped or closed card, an older server, the notice when the answer can't be
+  sent, and the cards closing on a tagged reply, any other user message, and
+  the turn's end.
+  `tests/server/integration/test_sessions_permission_request_hook.py::test_codex_request_user_input_decline_interrupts_only_blocking_questions`
+  covers Cancel on the server. `web/src/lib/codexAsyncQuestionReply.test.ts`
+  covers the `↪ Re:` transcript, `web/src/lib/blockStream.test.ts` and
+  `web/src/lib/blocks.test.ts` the non-blocking card,
+  `web/src/pages/ChatPage.composer.test.tsx` the composer,
+  `web/src/pages/ChatPage.indicators.test.tsx` the working indicator's terminal
+  guidance, and `web/src/components/chat/chatBubbleParts.test.tsx` Retry. No
+  test drives a real Codex CLI, the browser, Inbox, or a child thread.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus

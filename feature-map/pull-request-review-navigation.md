@@ -48,6 +48,12 @@ and a changed file is flagged.
   shows its patch with the same file list, diff and find bar, plus **Back to commits**,
   **Previous commit** and **Next commit**. A commit view has no viewed controls, review
   conversations or drafts, or context expansion, and **Open in** uses the commit's sha.
+  In Changes, **Changes since** picks a start point: the PR base (default, every change)
+  or one of the PR's commits, newest first, leaving out the head. Picking a commit shows
+  only the changes after it, up to the head, so a stacked PR is reviewed by picking its
+  parent's head; a commit that is another PR's head is labeled `head of #N`. Like a
+  commit view, it has no viewed controls, conversations or context expansion, and
+  **Open in** uses the head.
 
 ## How to get to it (user POV)
 
@@ -129,12 +135,16 @@ new head where only `main.py` changes. `README.md` keeps its mark, `main.py` sho
 covers `rail`. It checks the viewed controls in Changes, switches to Commits, searches
 the list, opens a commit and checks that only its file is listed and the viewed
 controls are gone, steps with **Next commit**, and returns with **Back to commits**.
+Back in Changes it picks a commit in **Changes since**, checks only the later changes
+are listed from a read pinned to the head, and picks the PR base again.
 
 - `composer-desktop`, `composer-mobile` and `canvas`: Open Changes on a GitHub pull
   request with several commits and choose **Commits**. Search by an author's name and
   confirm the list narrows. Open a commit: only its files should be listed, with no
   **Viewed** checkbox or **Hide viewed**. Use **Next commit**, then **Back to commits**,
-  then **Changes**, and confirm your viewed marks are unchanged.
+  then **Changes**, and confirm your viewed marks are unchanged. On a stacked PR, open
+  **Changes since**: the parent PR's head should be labeled `head of #N`, and picking it
+  should leave only this PR's own changes.
 
 Component coverage for these helpers and views lives in
 `web/src/shell/PullRequestChangesTab.test.tsx`,

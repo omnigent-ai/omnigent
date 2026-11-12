@@ -393,6 +393,43 @@ MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 # available before the host binds, and never copied from a fork's source.
 REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 
+# A move onto a new sandbox holds the session's runner with an id of this shape
+# until the sandbox binds. It keeps the token-bound prefix, so checks that
+# require a runner's tunnel token stay strict, but no real token-bound id (hex
+# after the prefix) can equal it, so every replica can tell a move is underway.
+MOVE_CLAIM_RUNNER_ID_PREFIX = "runner_token_move_"
+# Only the move releases its claim, so nothing else can take the session while
+# it settles. A claim older than this was left by a server that stopped
+# mid-move, and may be cleared: longer than any provider's provisioning plus
+# the host-registration wait and the runner's start.
+MOVE_CLAIM_LEASE_S = MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S + 3600
+# Hex digits of the claim's creation time (seconds), after the prefix.
+_MOVE_CLAIM_TIME_DIGITS = 12
+
+
+def new_move_claim() -> str:
+    """Return a fresh runner id for a move to claim a session with."""
+    created = f"{int(time.time()):0{_MOVE_CLAIM_TIME_DIGITS}x}"
+    return MOVE_CLAIM_RUNNER_ID_PREFIX + created + secrets.token_hex(16)
+
+
+def is_move_claim(runner_id: str | None) -> bool:
+    """Whether *runner_id* is a move's claim rather than a real runner."""
+    return runner_id is not None and runner_id.startswith(MOVE_CLAIM_RUNNER_ID_PREFIX)
+
+
+def move_claim_is_live(runner_id: str | None) -> bool:
+    """Whether *runner_id* is a move's claim still within its lease."""
+    if not is_move_claim(runner_id):
+        return False
+    assert runner_id is not None
+    start = len(MOVE_CLAIM_RUNNER_ID_PREFIX)
+    try:
+        created = int(runner_id[start : start + _MOVE_CLAIM_TIME_DIGITS], 16)
+    except ValueError:
+        return False
+    return time.time() - created < MOVE_CLAIM_LEASE_S
+
 
 def managed_host_name(host_id: str) -> str:
     """
@@ -610,6 +647,10 @@ class ManagedLaunch:
     settled: asyncio.Event
     error: str | None = None
     bound: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
+    # Set when another host took the session before its sandbox was ready.
+    superseded: bool = False
+    # The sandbox host this launch bound the session to, once it has.
+    host_id: str | None = None
     host_online_failure_hint: Callable[[], str | None] | None = None
 
 
@@ -985,7 +1026,12 @@ class ManagedSandboxDeployment:
         for config in self.configs:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
-                caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
+                caps[config.provider] = {
+                    "multi_repo": launcher.capabilities.multi_repo,
+                    # A provider that manages sandbox profiles binds one at session
+                    # create, so the move route refuses it as a destination.
+                    "accepts_session_move": not config.manages_profiles,
+                }
                 from omnigent.inference_config import parse_inference_config
                 from omnigent.server.inference_catalog import ambient_gateway_providers
 
@@ -1001,6 +1047,22 @@ class ManagedSandboxDeployment:
                 ):
                     caps[config.provider]["default_models"] = True
         return caps
+
+    def provider_automation_notices(self) -> dict[str, str]:
+        """
+        Each launchable provider's ``automation_notice``, for ``/v1/info``.
+
+        Kept apart from :meth:`provider_ui_capabilities`, whose values are flags.
+
+        :returns: Notice text keyed by provider name; a provider without one is absent.
+        """
+        notices: dict[str, str] = {}
+        for config in self.configs:
+            if config.managed_launch_supported and config.provider is not None:
+                notice = config.launcher_factory().automation_notice
+                if notice:
+                    notices[config.provider] = notice
+        return notices
 
 
 @dataclass
