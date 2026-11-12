@@ -477,6 +477,16 @@ class ManagedSessionEnv:
     conv_store: SqlAlchemyConversationStore
 
 
+def _failed_move_is_fully_settled(env: ManagedSessionEnv, session_id: str) -> bool:
+    """Whether failed inputs are recorded and the move claim is released."""
+    conv = env.conv_store.get_conversation(session_id)
+    return (
+        [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
+        and conv is not None
+        and conv.runner_id is None
+    )
+
+
 async def _fake_sandbox_host(
     app: FastAPI, host_id: str, host_name: str, token: str
 ) -> ApplicationCommunicator:
@@ -1347,11 +1357,7 @@ async def test_concurrent_sandbox_moves_launch_one_sandbox(
         lambda: (launch := tracker.get(session_id)) is not None and launch.settled.is_set()
     )
     assert len(fake.provisioned_names) == 1
-    await poll_until_async(
-        lambda: (
-            [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
-        )
-    )
+    await poll_until_async(lambda: _failed_move_is_fully_settled(env, session_id))
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None and conv.runner_id is None
 
@@ -2597,11 +2603,7 @@ async def test_message_sent_as_the_move_detaches_waits_for_the_sandbox(
     assert resp.status_code == 202, resp.text
     assert len(responses) == 1 and responses[0]["queued"] is True
     assert responses[0].get("pending_id")
-    await poll_until_async(
-        lambda: (
-            [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
-        )
-    )
+    await poll_until_async(lambda: _failed_move_is_fully_settled(env, session_id))
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None
     assert (conv.host_id, conv.runner_id) == (None, None)
