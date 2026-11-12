@@ -1449,6 +1449,7 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
     assert "sys_list_models" in server["enabledTools"]
     assert "sys_project_list" in server["enabledTools"]
     assert "sys_session_update" in server["enabledTools"]
+    assert "sys_project_update" in server["enabledTools"]
     assert server["enabledTools"] == sorted(server["enabledTools"])
     assert server["env"]["TMPDIR"]
     # The relay's HOME and data dir are pinned to the runner's so its bridge-root

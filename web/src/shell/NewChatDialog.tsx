@@ -1,3 +1,8 @@
+import {
+  addNestedSessionDraft,
+  updateNestedSessionDraft,
+  removeNestedSessionDraft,
+} from "@/lib/nestedSessionDrafts";
 import { useSiblingSessionDestinations } from "@/hooks/useSharing";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useComposerContext } from "@/hooks/useComposerContext";
@@ -182,6 +187,7 @@ import {
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import {
+  type PendingInitialPrompt,
   beginLocalConversation,
   hasPendingLocalMessage,
   hydrateLocalConversation,
@@ -351,6 +357,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import {
+  matchWorktree,
   useHostWorktrees,
   useVerifiedGitWorktrees,
   type HostWorktree,
@@ -703,15 +710,9 @@ export function composerWorktreeHeaderState({
   branchName,
   autoSeededBranch,
 }: ComposerWorktreeHeaderInput): ComposerWorktreeHeaderState {
-  const normalizedWorkspace = normalizeWorkspacePath(workspace);
   const currentWorktrees = worktreesResolved ? worktrees : [];
   const mainWorktree = currentWorktrees.find((worktree) => worktree.is_main) ?? null;
-  const selectedWorktree =
-    normalizedWorkspace === null
-      ? null
-      : (currentWorktrees.find(
-          (worktree) => normalizeWorkspacePath(worktree.path) === normalizedWorkspace,
-        ) ?? null);
+  const selectedWorktree = matchWorktree(currentWorktrees, workspace);
   const selectedDirectoryLabel =
     workspace.split("/").filter(Boolean).pop() ?? (workspace.trim() || "Working directory");
   const repositoryLabel =
@@ -2916,6 +2917,18 @@ function NewChatLandingContent({
   // `submittedRef` is flipped once the draft is sent to a create, so the
   // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
+  const [nestedProvisional, setNestedProvisional] = useState(newTempConversation);
+  const siblingSourceRef = useRef(siblingSource);
+  siblingSourceRef.current = siblingSource;
+  const siblingSourceKey = siblingSource?.id;
+  useEffect(() => {
+    const source = siblingSourceRef.current;
+    if (!source || submittedRef.current) return;
+    addNestedSessionDraft(queryClient, nestedProvisional.id, source);
+    return () => {
+      if (!submittedRef.current) removeNestedSessionDraft(queryClient, nestedProvisional.id);
+    };
+  }, [queryClient, nestedProvisional, siblingSourceKey]);
   const submittedDraftRevisionRef = useRef<number | null>(null);
   // Whether this composer is still on screen. The create POST can outlive
   // it — the user opens another session while the session bootstraps — and
@@ -3220,6 +3233,7 @@ function NewChatLandingContent({
   // armed until the host is seeded (the once-per-host guard), and skipped for
   // sandboxes (no host worktrees).
   const forkFreshArmed =
+    !siblingSourceId &&
     prefillSettled &&
     selectedHostId !== null &&
     !sandboxSelected &&
@@ -4926,11 +4940,11 @@ function NewChatLandingContent({
   // The worktree the picked directory currently points at, if any. Set when
   // the user navigated the picker straight into a worktree folder, or clicked
   // one in the list below.
-  const activeWorktree = useMemo(() => {
-    const target = normalizeWorkspacePath(workspaceTrimmed);
-    if (target === null) return null;
-    return linkedWorktrees.find((w) => normalizeWorkspacePath(w.path) === target) ?? null;
-  }, [linkedWorktrees, workspaceTrimmed]);
+  const currentWorktree = useMemo(
+    () => matchWorktree(verifiedGitWorktrees, workspaceTrimmed),
+    [verifiedGitWorktrees, workspaceTrimmed],
+  );
+  const activeWorktree = currentWorktree?.is_main ? null : currentWorktree;
   // An empty New field means the selected workspace itself is authoritative.
   // A non-empty field is exclusively a request to create a new worktree.
   const startInExistingWorktree =
@@ -4981,9 +4995,8 @@ function NewChatLandingContent({
   // until the user touches the base field — then their choice (including a
   // cleared field) stands. Clearing the branch name (so the base field goes
   // away) re-arms the auto-fill, so naming a branch again starts fresh from the
-  // current default. The project's stored default (Project settings) wins over
-  // the user-global one (Settings › Git); an unset project default falls
-  // through to the global one, then to blank (fork from current branch).
+  // current default. Nested agents use the selected checkout's branch; other
+  // sessions use the project default, then the user-global preference.
   useEffect(() => {
     if (!shouldCreateWorktree) {
       if (worktreeVerificationPending && branchName.trim() !== "") return;
@@ -4993,7 +5006,11 @@ function NewChatLandingContent({
       return;
     }
     if (!baseBranchEdited) {
-      _setBaseBranch(projectBaseBranch ?? readDefaultBaseBranch() ?? "");
+      _setBaseBranch(
+        siblingSourceId
+          ? (currentWorktree?.branch ?? "")
+          : (projectBaseBranch ?? readDefaultBaseBranch() ?? ""),
+      );
     }
   }, [
     shouldCreateWorktree,
@@ -5001,6 +5018,8 @@ function NewChatLandingContent({
     branchName,
     baseBranchEdited,
     projectBaseBranch,
+    siblingSourceId,
+    currentWorktree?.branch,
   ]);
   // Existing worktrees stay visible while a new branch name is drafted. The
   // two actions are deliberately separate: radio selection binds an existing
@@ -5072,12 +5091,15 @@ function NewChatLandingContent({
     defaultSandboxProvider,
   ]);
 
+  // Nested agents reuse their source checkout unless a new worktree is explicitly chosen.
+  const defaultUseWorktree =
+    !siblingSourceId && (prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true;
   // Seed a fresh worktree branch once the workspace settles, from the effective
   // default (project `use_worktree` wins, else the user-global setting).
   // Ref-guarded to fire once per workspace and only into an empty branch.
   useEffect(() => {
     if (prefill.project !== projectParam || !prefillDone(prefill)) return;
-    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) !== true) return;
+    if (!defaultUseWorktree) return;
     if (sandboxSelected || selectedHostId === null || workspaceTrimmed === "") return;
     if (branchName !== "" || activeWorktree !== null) return;
     if (worktreeSeededForRef.current === workspaceTrimmed) return;
@@ -5088,7 +5110,7 @@ function NewChatLandingContent({
     worktreeSeededForRef.current = workspaceTrimmed;
     if (hostWorktrees.some((w) => w.is_main)) setAutoSeededBranch(generateBranchName());
   }, [
-    prefillConfig,
+    defaultUseWorktree,
     prefill,
     projectParam,
     sandboxSelected,
@@ -5107,12 +5129,12 @@ function NewChatLandingContent({
   // default off in Settings. Only clears while the field still holds OUR seed.
   useEffect(() => {
     if (autoSeededBranch === "" || branchName !== autoSeededBranch) return;
-    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true) return;
+    if (defaultUseWorktree) return;
     setBranchName("");
     setAutoSeededBranch("");
     // Re-arm the seed guard so flipping the default back on can seed again.
     worktreeSeededForRef.current = null;
-  }, [prefillConfig, branchName, autoSeededBranch]);
+  }, [defaultUseWorktree, branchName, autoSeededBranch]);
 
   // Keep provider changes and unfinished URL edits from silently dropping repositories.
   const sandboxRepoOverCap = sandboxRepoSelections.length > maxSandboxRepos;
@@ -5375,10 +5397,7 @@ function NewChatLandingContent({
   // A drafted branch needs the discovery result unless the repository is
   // already verified; the always-use-worktree default needs it to seed one.
   const worktreeRequestPending =
-    worktreeDiscoveryPending &&
-    (branchName.trim() !== ""
-      ? !workspaceIsGit
-      : (prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true);
+    worktreeDiscoveryPending && (branchName.trim() !== "" ? !workspaceIsGit : defaultUseWorktree);
   const worktreeHeader = composerWorktreeHeaderState({
     workspace: workspaceTrimmed,
     worktrees: hostWorktrees ?? [],
@@ -5731,9 +5750,9 @@ function NewChatLandingContent({
     if (hostId === selectedHostId) return;
     setSandboxSelected(false);
     setSelectedHostId(hostId);
-    // Workspace is host-specific — clear it and let the seeding effect run for
-    // the new host.
-    setWorkspace("");
+    // Returning to the source host restores its checkout, not an unrelated recent path.
+    setWorkspace(hostId === siblingSource?.hostId ? (siblingSource.workspace ?? "") : "");
+    if (siblingSourceId) setBranchName("");
     workspaceFromConfigRef.current = false;
     seededHostRef.current = null;
   }
@@ -5866,6 +5885,10 @@ function NewChatLandingContent({
   function returnDraftToUser(temporaryConversationId?: string) {
     submittedRef.current = false;
     submittedDraftRevisionRef.current = null;
+    removeNestedSessionDraft(queryClient, nestedProvisional.id);
+    if (siblingSource && onScreenRef.current) {
+      setNestedProvisional(newTempConversation());
+    }
     const originalDraft =
       temporaryConversationId && !hasPendingLocalMessage(temporaryConversationId)
         ? { ...draftRef.current, message: "", files: [] }
@@ -5922,6 +5945,8 @@ function NewChatLandingContent({
       pendingMsgTempId: string;
       createToken: string;
     } | null = null;
+    let createdSessionId: string | undefined;
+    let undeliveredPrompt: PendingInitialPrompt | null = null;
     // Single teardown for EVERY create-failure exit (the `catch` and the
     // `"error" in created` early return): drop the client-only conversation and,
     // if the user is still on it, send them back to landing so the restored
@@ -5979,6 +6004,7 @@ function NewChatLandingContent({
       // Spend the draft only once provisioning starts, after the laptop credential check.
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
+      if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
         writeLastSandboxRepos(sandboxRepoSelections);
@@ -6131,7 +6157,7 @@ function NewChatLandingContent({
       // "Sessions" section while the search-indexed session list catches up to
       // the move. A `project_id` create needs no label: the row is born with
       // first-class membership (and a label would go stale on project rename).
-      const createLabels =
+      const createLabels: Record<string, string> =
         selectedProject && createProjectId === null
           ? {
               ...(baseLabels ?? {}),
@@ -6140,11 +6166,13 @@ function NewChatLandingContent({
             }
           : { ...(baseLabels ?? {}), ...composerContextLabels };
 
+      if (siblingSource) createLabels[CLIENT_CREATE_TOKEN_LABEL] = nestedProvisional.token;
       const skill = isNativeTerminalAgent
         ? null
         : matchSkillInvocation(initialPrompt, availableSkills);
       const serverOwnsInitialInput =
         sandboxSelected && info !== "loading" && info.durable_initial_input === true;
+      if (!serverOwnsInitialInput) undeliveredPrompt = { text: initialPrompt, skill, files };
       const initialInput =
         skill !== null
           ? {
@@ -6224,6 +6252,7 @@ function NewChatLandingContent({
           serverOwnsInitialInput ? files : [],
         );
         data = { id: bundled.id };
+        createdSessionId = data.id;
         launchedAgentId = bundled.agentId ?? null;
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
@@ -6236,7 +6265,7 @@ function NewChatLandingContent({
         setPendingAgent(null);
       } else {
         // Normal path: bind to an existing registered agent.
-        const provisional = newTempConversation();
+        const provisional = siblingSource ? nestedProvisional : newTempConversation();
         try {
           localConv = beginLocalConversation(initialPrompt, files, provisional, localProject, {
             // Seed the temp session with the NORMALIZED create identity so the
@@ -6445,6 +6474,7 @@ function NewChatLandingContent({
           return;
         }
         data = { id: created.id };
+        createdSessionId = data.id;
         // Register create_session (created → first AI activity), split by host.
         // New Chat is the only create path that can produce a managed sandbox;
         // interactionTelemetry completes/settles the span once the session runs.
@@ -6565,6 +6595,7 @@ function NewChatLandingContent({
         writeLandingDraft(draftState, null);
       }
 
+      if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id, data.id);
       // `localConv` is set only when a real agent id was resolved up front.
       if (localConv !== null && effectiveAgentId !== null) {
         const tempConvId = localConv.tempConvId;
@@ -6596,6 +6627,25 @@ function NewChatLandingContent({
         }
       }
     } catch {
+      if (siblingSource && createdSessionId) {
+        const stillViewing = localConv
+          ? stillViewingLocalSession(localConv.tempConvId)
+          : onScreenRef.current && window.location.href === createLocation;
+        if (
+          undeliveredPrompt &&
+          (localConv === null || hasPendingLocalMessage(localConv.tempConvId))
+        ) {
+          setPendingInitialPrompt(createdSessionId, undeliveredPrompt);
+        }
+        if (localConv) removeLocalConversation(localConv.tempConvId);
+        updateNestedSessionDraft(queryClient, nestedProvisional.id, createdSessionId);
+        void queryClient.refetchQueries({ queryKey: ["conversations"] });
+        showToast("Session created, but setup didn't finish. Open the session to continue.");
+        if (stillViewing) {
+          navigate(sessionLocation(createdSessionId));
+        }
+        return;
+      }
       const msg = "Couldn't reach the server. Check your connection and try again.";
       returnDraftToUser(localConv?.tempConvId);
       tearDownLocalConversation();

@@ -20,6 +20,9 @@ import {
   writeViewed,
   type PullRequestIdentity,
 } from "@/lib/pullRequestViewed";
+import type { Comment } from "@/hooks/useComments";
+import { getSeenCommentIds } from "@/hooks/useSeenComments";
+import { requestLocalReviewNavigation, useLocalReviewNavigation } from "@/lib/localReviewContext";
 import type * as SonnerModule from "sonner";
 import { PullRequestChangesTab } from "./PullRequestChangesTab";
 import { useChangesViewState } from "./useChangesViewState";
@@ -34,10 +37,18 @@ const mocks = vi.hoisted(() => ({
   commitList: { object: "list", has_more: false, data: [] as unknown[] },
   /** Each commit's patch by sha, as the commit-diff query returns it. */
   commitPatches: new Map<string, string>(),
+  /** The PR's changes after each commit, up to the head, by sha. */
+  sincePatches: new Map<string, string>(),
+  /** Each commit-diff read's commit and until-head sha, in order. */
+  commitDiffReads: [] as [string | null, string | null][],
   /** The commit-diff query's error, when a test wants a failed read. */
   commitDiffError: null as Error | null,
   /** The commit list's query cannot run here, so it has no data. */
   commitsUnavailable: false,
+  /** The commit list's error, when a test wants a failed read. */
+  commitsError: null as Error | null,
+  /** The commit list's refetch, to see a retry. */
+  commitsRefetch: vi.fn(),
   /** The PR's server lacks the commit routes. */
   commitsUnsupported: false,
   /** A saved review draft, anchored to one file's line, as the composer hook reports it. */
@@ -49,6 +60,13 @@ const mocks = vi.hoisted(() => ({
     head_sha: string;
     base_sha: string;
   },
+  animateComment: vi.fn<Element["animate"]>(),
+}));
+const comments = vi.hoisted(() => ({ data: [] as Comment[], isSuccess: true }));
+vi.mock("@/hooks/useComments", () => ({
+  useComments: () => ({ ...comments, isFetching: false }),
+  useUpdateComment: () => ({ mutate: vi.fn(), isPending: false }),
+  useDeleteComment: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 vi.mock("sonner", async (importOriginal) => ({
   ...(await importOriginal<typeof SonnerModule>()),
@@ -78,18 +96,26 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   }),
   // A disabled query has no data, as when the workspace cannot be served.
   usePullRequestCommits: () => ({
-    data: mocks.commitsUnavailable ? undefined : mocks.commitList,
+    data: mocks.commitsUnavailable || mocks.commitsError ? undefined : mocks.commitList,
     isLoading: false,
-    error: null,
+    error: mocks.commitsError,
+    refetch: mocks.commitsRefetch,
   }),
   usePullRequestCommitsUnsupported: () => mocks.commitsUnsupported,
-  usePullRequestCommitDiff: (_conversationId: string, _prUrl: string, sha: string | null) => ({
-    data: sha
-      ? { object: "session.github.pr_diff", patch: mocks.commitPatches.get(sha) }
-      : undefined,
-    isLoading: false,
-    error: mocks.commitDiffError,
-  }),
+  usePullRequestCommitDiff: (
+    _conversationId: string,
+    _prUrl: string,
+    sha: string | null,
+    untilHeadSha: string | null = null,
+  ) => {
+    mocks.commitDiffReads.push([sha, untilHeadSha]);
+    const patches = untilHeadSha ? mocks.sincePatches : mocks.commitPatches;
+    return {
+      data: sha ? { object: "session.github.pr_diff", patch: patches.get(sha) } : undefined,
+      isLoading: false,
+      error: mocks.commitDiffError,
+    };
+  },
 }));
 vi.mock("@/components/theme/useResolvedThemeMode", () => ({
   useResolvedThemeMode: () => "light",
@@ -166,6 +192,9 @@ function renderTab({
   threads = [],
   listing = {},
   commitHistory = false,
+  headRepositoryUrl,
+  loading = false,
+  selected = true,
 }: {
   conversationId: string;
   files?: PullRequestChangedFile[];
@@ -175,8 +204,14 @@ function renderTab({
   listing?: { has_more?: boolean; total_count?: number | null; head_sha?: string | null };
   /** The provider lists commits, so the Changes toolbar offers the Commits view. */
   commitHistory?: boolean;
+  /** A GitHub head repository, so files can be opened on GitHub. */
+  headRepositoryUrl?: string;
+  loading?: boolean;
+  selected?: boolean;
 }) {
   const prUrl = prUrlFor(conversationId);
+  let patchLoading = loading;
+  let tabSelected = selected;
   const tabProps = (current: string) =>
     ({
       conversationId,
@@ -184,13 +219,24 @@ function renderTab({
         selected_pr_url: prUrl,
         capabilities: commitHistory ? { commit_history: true } : {},
         auth: { selected_account: null },
+        ...(headRepositoryUrl ? { provider: "github" } : {}),
       },
-      pr: { url: prUrl, head_sha: "head", base_sha: "base", state: "OPEN" },
+      pr: {
+        url: prUrl,
+        head_sha: "head",
+        base_sha: "base",
+        state: "OPEN",
+        head_repository_url: headRepositoryUrl,
+      },
       prUrl,
       canEdit: false,
-      selected: true,
+      selected: tabSelected,
       changes: { data: { available: true, data: files, ...listing } },
-      prDiff: { data: { head_sha: "head", base_sha: "base", patch: current }, isLoading: false },
+      prDiff: {
+        data: { head_sha: "head", base_sha: "base", patch: current },
+        isLoading: patchLoading,
+        isFetching: patchLoading,
+      },
       reviews: {
         page: { data: threads, head_sha: "head", base_sha: "base" },
         isFetching: false,
@@ -200,13 +246,20 @@ function renderTab({
     }) as unknown as React.ComponentProps<typeof PullRequestChangesTab>;
   const element = (current: string) => (
     <TooltipProvider>
-      <Tabs value="changes">
+      <Tabs value={tabSelected ? "changes" : "summary"}>
         <PullRequestChangesTab {...tabProps(current)} />
       </Tabs>
     </TooltipProvider>
   );
   const result = render(element(patch));
-  return { rerender: (next: string) => result.rerender(element(next)) };
+  return {
+    unmount: result.unmount,
+    rerender: (next: string, pending = false) => {
+      patchLoading = pending;
+      tabSelected = true;
+      result.rerender(element(next));
+    },
+  };
 }
 
 const findInput = () => screen.getByRole("textbox", { name: "Find in changes" });
@@ -225,9 +278,263 @@ const sectionHeader = (path: string, expanded: boolean) =>
     .find((button) => !button.hasAttribute("aria-label"))!;
 
 describe("PullRequestChangesTab", () => {
+  const originalAnimate = Element.prototype.animate;
+  beforeEach(() => {
+    localStorage.clear();
+    Element.prototype.animate = mocks.animateComment;
+  });
   afterEach(() => {
+    Element.prototype.animate = originalAnimate;
+    comments.data = [];
+    comments.isSuccess = true;
+    mocks.commitList.data = [];
+    mocks.sincePatches.clear();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it.each([
+    { selected: true, mode: "changes", reducedMotion: false, earlier: false },
+    { selected: false, mode: "changes", reducedMotion: false, earlier: false },
+    { selected: true, mode: "commits", reducedMotion: true, earlier: false },
+    { selected: true, mode: "since", reducedMotion: false, earlier: false },
+    { selected: true, mode: "changes", reducedMotion: false, earlier: true },
+  ] as const)(
+    "reveals review context from $mode after loading and mounting (selected: $selected, earlier: $earlier)",
+    async ({ selected, mode, reducedMotion, earlier }) => {
+      const cancelHighlight = vi.fn();
+      mocks.animateComment
+        .mockReset()
+        .mockReturnValue({ cancel: cancelHighlight } as unknown as Animation);
+      const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+      vi.spyOn(window, "matchMedia").mockReturnValue({ ...media, matches: reducedMotion });
+      const conversationId = `local-comment-loading-${mode}-${selected}-${earlier}`;
+      const view = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
+      if (mode === "since") {
+        mocks.commitList.data = [{ sha: "earlier-commit" }];
+        mocks.sincePatches.set("earlier-commit", B);
+        act(() => view.result.current.setSinceSha("earlier-commit"));
+      } else {
+        act(() => view.result.current.setMode(mode));
+      }
+      const comment = {
+        id: "local-comment",
+        conversation_id: conversationId,
+        path: "b.ts",
+        body: "Review this line",
+        status: "draft",
+        anchor_metadata: {
+          pr_url: prUrlFor(conversationId),
+          side: "RIGHT",
+          line: 2,
+          start_line: null,
+          head_sha: earlier ? "previous-head" : "head",
+          base_sha: "base",
+        },
+      } as Comment;
+      comments.data = [comment];
+      vi.spyOn(Element.prototype, "getClientRects").mockReturnValue([{}] as unknown as DOMRectList);
+      const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+      const navigation = renderHook(() => useLocalReviewNavigation(conversationId));
+      const tab = renderTab({
+        conversationId,
+        patch: "",
+        loading: true,
+        selected,
+        commitHistory: true,
+        listing: { head_sha: "head" },
+      });
+      expect(getSeenCommentIds().has(comment.id)).toBe(false);
+      vi.useFakeTimers();
+      try {
+        act(() => requestLocalReviewNavigation(comment));
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(100);
+        });
+        expect(navigation.result.current).toBe(comment);
+        expect(scroll).not.toHaveBeenCalled();
+        expect(mocks.animateComment).not.toHaveBeenCalled();
+        const frame = vi.spyOn(window, "requestAnimationFrame");
+        comments.data = [];
+        comments.isSuccess = false;
+        tab.rerender(PATCH);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(100);
+        });
+        expect(frame).not.toHaveBeenCalled();
+        expect(navigation.result.current).toBe(comment);
+        expect(scroll).not.toHaveBeenCalled();
+        frame.mockRestore();
+      } finally {
+        vi.useRealTimers();
+      }
+      comments.data = [comment];
+      comments.isSuccess = true;
+      const focus = vi.spyOn(HTMLElement.prototype, "focus").mockImplementationOnce(() => {});
+      tab.rerender(PATCH);
+      await waitFor(() =>
+        expect(document.querySelector('[data-local-review-comment="local-comment"]')).toHaveFocus(),
+      );
+      await waitFor(() => expect(navigation.result.current).toBeUndefined());
+      expect(getSeenCommentIds().has(comment.id)).toBe(true);
+      expect(view.result.current.mode).toBe("changes");
+      expect(view.result.current.sinceSha).toBeNull();
+      expect(view.result.current.shownEarlierCommentPaths.has("b.ts")).toBe(earlier);
+      expect(focus.mock.calls.length).toBeGreaterThan(1);
+      expect(mocks.animateComment).toHaveBeenCalledWith(
+        [
+          { borderColor: "var(--ring)", offset: 0 },
+          { borderColor: "var(--ring)", offset: reducedMotion ? 1 : 0.8 },
+        ],
+        { duration: 3000, easing: "ease-out" },
+      );
+      act(() => requestLocalReviewNavigation(comment));
+      await waitFor(() => expect(mocks.animateComment).toHaveBeenCalledTimes(2));
+      expect(cancelHighlight).toHaveBeenCalledTimes(1);
+      tab.unmount();
+      expect(cancelHighlight).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each(["collapsed", "filtered", "commits"] as const)(
+    "keeps feedback unread while its surface is %s",
+    (hiddenBy) => {
+      const conversationId = `unread-${hiddenBy}`;
+      const view = renderHook(() => useChangesViewState(conversationId, prUrlFor(conversationId)));
+      comments.data = [
+        {
+          id: "unread-comment",
+          conversation_id: conversationId,
+          path: "b.ts",
+          body: "Unread feedback",
+          status: "draft",
+          anchor_metadata: {
+            pr_url: prUrlFor(conversationId),
+            side: "RIGHT",
+            line: 1,
+            head_sha: "head",
+            base_sha: "base",
+          },
+        } as Comment,
+      ];
+      const tab = renderTab({
+        conversationId,
+        loading: true,
+        commitHistory: true,
+        listing: { head_sha: "head" },
+      });
+      if (hiddenBy === "collapsed") {
+        fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+      } else {
+        act(() =>
+          hiddenBy === "filtered"
+            ? view.result.current.setPathFilter("a.ts")
+            : view.result.current.setMode("commits"),
+        );
+      }
+      tab.rerender(PATCH);
+      expect(screen.queryByText("Unread feedback")).toBeNull();
+      expect(getSeenCommentIds().has("unread-comment")).toBe(false);
+
+      if (hiddenBy === "collapsed") {
+        fireEvent.click(sectionHeader("b.ts", false));
+      } else {
+        act(() =>
+          hiddenBy === "filtered"
+            ? view.result.current.setPathFilter("")
+            : view.result.current.setMode("changes"),
+        );
+      }
+      expect(screen.getByText("Unread feedback")).toBeInTheDocument();
+      expect(getSeenCommentIds().has("unread-comment")).toBe(true);
+    },
+  );
+
+  it("toggles earlier comments per file without hiding current comments", async () => {
+    const conversationId = "earlier-comments";
+    const localComment = (id: string, path: string, head: string, base = "base") =>
+      ({
+        id,
+        conversation_id: conversationId,
+        path,
+        body: id,
+        status: "draft",
+        anchor_metadata: {
+          pr_url: prUrlFor(conversationId),
+          side: "RIGHT",
+          line: 1,
+          head_sha: head,
+          base_sha: base,
+        },
+      }) as Comment;
+    comments.data = [
+      localComment("current-a", "a.ts", "head"),
+      localComment("earlier-a", "a.ts", "previous-head"),
+      localComment("earlier-b", "b.ts", "head", "previous-base"),
+      localComment("earlier-gone", "gone.ts", "previous-head"),
+    ];
+    const thread = {
+      id: "outdated-thread",
+      path: "a.ts",
+      outdated: true,
+      resolved: false,
+    } as ReviewThread;
+    const tab = renderTab({
+      conversationId,
+      files: [changed("a.ts"), changed("b.ts")],
+      patch: A + B,
+      threads: [thread],
+    });
+    const toggleEarlier = async (path: string, label: string) => {
+      fireEvent.pointerDown(screen.getByRole("button", { name: `More actions for ${path}` }), {
+        button: 0,
+      });
+      fireEvent.click(await screen.findByRole("menuitem", { name: label }));
+    };
+    expect(screen.getByText("current-a")).toBeInTheDocument();
+    expect(screen.queryByText("earlier-a")).toBeNull();
+    expect(screen.queryByText("earlier-b")).toBeNull();
+    expect(screen.queryByText("earlier-gone")).toBeNull();
+    expect([...getSeenCommentIds()]).toEqual(["current-a"]);
+    expect(document.querySelector('[data-review-thread="outdated-thread"]')).toBeNull();
+
+    await toggleEarlier("a.ts", "Show earlier comments");
+    expect(screen.getByText("earlier-a")).toBeInTheDocument();
+    expect(getSeenCommentIds().has("earlier-a")).toBe(true);
+    expect(getSeenCommentIds().has("earlier-b")).toBe(false);
+    expect(getSeenCommentIds().has("earlier-gone")).toBe(false);
+    expect(document.querySelector('[data-review-thread="outdated-thread"]')).not.toBeNull();
+    expect(screen.getByText("current-a")).toBeInTheDocument();
+    expect(screen.queryByText("earlier-b")).toBeNull();
+    await toggleEarlier("a.ts", "Hide earlier comments");
+    expect(screen.queryByText("earlier-a")).toBeNull();
+    expect(screen.getByText("current-a")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Next unresolved conversation" }));
+    expect(document.querySelector('[data-review-thread="outdated-thread"]')).not.toBeNull();
+    await toggleEarlier("b.ts", "Show earlier comments");
+    expect(screen.getByText("earlier-b")).toBeInTheDocument();
+    expect(getSeenCommentIds().has("earlier-b")).toBe(true);
+    await toggleEarlier("gone.ts", "Show earlier comments");
+    expect(screen.getByText("earlier-gone")).toBeInTheDocument();
+    expect(getSeenCommentIds().has("earlier-gone")).toBe(true);
+    await toggleEarlier("gone.ts", "Hide earlier comments");
+    expect(screen.queryByText("earlier-gone")).toBeNull();
+
+    tab.unmount();
+    comments.data = comments.data.map((comment) => ({
+      ...comment,
+      conversation_id: "another-pr",
+      anchor_metadata: { ...comment.anchor_metadata!, pr_url: prUrlFor("another-pr") },
+    }));
+    renderTab({
+      conversationId: "another-pr",
+      files: [changed("a.ts"), changed("b.ts")],
+      patch: A + B,
+    });
+    expect(screen.getByText("current-a")).toBeInTheDocument();
+    expect(screen.queryByText("earlier-b")).toBeNull();
+    await toggleEarlier("b.ts", "Show earlier comments");
+    expect(screen.getByText("earlier-b")).toBeInTheDocument();
   });
 
   it("clears the path filter to navigate to a thread on a filtered-out file", () => {
@@ -1553,7 +1860,11 @@ describe("PullRequestChangesTab commits", () => {
     mocks.commitPatches.clear();
     mocks.commitPatches.set(SHA_A, A);
     mocks.commitPatches.set(SHA_B, B);
+    mocks.sincePatches.clear();
+    mocks.commitDiffReads = [];
     mocks.commitDiffError = null;
+    mocks.commitsError = null;
+    mocks.commitsRefetch.mockClear();
     mocks.draftAnchor = null;
     mocks.commitsUnsupported = false;
   });
@@ -1578,6 +1889,78 @@ describe("PullRequestChangesTab commits", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Back to commits" }));
     expect(screen.getByRole("button", { name: /Add a\.ts/ })).toBeInTheDocument();
+  });
+
+  it("shows only the changes since a picked commit, without review controls, then all again", () => {
+    mocks.commitList = {
+      object: "list",
+      has_more: false,
+      data: [
+        { ...commit(SHA_A, "Parent work"), head_of: [{ number: 41, url: null, state: "OPEN" }] },
+        commit(SHA_B, "Own work"),
+      ],
+    };
+    mocks.sincePatches.set(SHA_A, B);
+    renderTab({
+      conversationId: "changes-since",
+      commitHistory: true,
+      listing: { head_sha: SHA_B },
+      headRepositoryUrl: "https://github.com/fork/app",
+    });
+    expect(isListed("a.ts")).toBe(true);
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    // Nothing comes after the head, so it isn't offered.
+    expect(screen.queryByRole("option", { name: /Own work/ })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: /Head of #41.*Parent work/ }));
+
+    expect(mocks.commitDiffReads.at(-1)).toEqual([SHA_A, SHA_B]);
+    expect(isListed("b.ts")).toBe(true);
+    expect(isListed("a.ts")).toBe(false);
+    expect(screen.queryByRole("checkbox", { name: "Hide viewed" })).toBeNull();
+    // The narrowed patch ends at the head, so its files open there.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for b.ts" }), {
+      button: 0,
+    });
+    expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+      "href",
+      `https://github.com/fork/app/blob/${SHA_B}/b.ts`,
+    );
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    fireEvent.click(screen.getByRole("option", { name: "PR base (all changes)" }));
+    expect(isListed("a.ts")).toBe(true);
+  });
+
+  it("offers the newest listed commit when GitHub capped the list before the head", () => {
+    mocks.commitList = {
+      object: "list",
+      has_more: true,
+      data: [commit(SHA_A, "Early work"), commit(SHA_B, "Last listed work")],
+    };
+    renderTab({
+      conversationId: "changes-since-capped",
+      commitHistory: true,
+      listing: { head_sha: "c".repeat(40) },
+    });
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    expect(screen.getByRole("option", { name: /Last listed work/ })).toBeInTheDocument();
+    expect(screen.getByText(/Only the first \d+ commits are listed/)).toBeInTheDocument();
+  });
+
+  it("says why the commits failed to load and retries when the picker opens again", () => {
+    mocks.commitsError = new Error("GitHub could not load the PR's commits.");
+    renderTab({
+      conversationId: "changes-since-failed",
+      commitHistory: true,
+      listing: { head_sha: SHA_B },
+    });
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
+    expect(screen.getByRole("alert")).toHaveTextContent(/could not load the PR's commits/);
+    expect(mocks.commitsRefetch).toHaveBeenCalled();
   });
 
   it("hides the viewed controls and marks in a commit view, and keeps the marks for Changes", () => {

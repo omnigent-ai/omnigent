@@ -17,8 +17,14 @@
             "title": "Anchor Content"
           },
           "anchor_metadata": {
-            "title": "Anchor Metadata",
-            "type": "null"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PullRequestCommentAnchor"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "body": {
             "description": "The comment text.",
@@ -1454,6 +1460,137 @@
           "goal"
         ],
         "title": "CodexGoalResponse",
+        "type": "object"
+      },
+      "Comment": {
+        "description": "A single review comment anchored to a text range in a file.",
+        "properties": {
+          "anchor_content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Plain-text snapshot of the selected range at comment creation time. Used to re-anchor the comment when the file is subsequently edited. `None` for legacy comments.",
+            "title": "Anchor Content"
+          },
+          "anchor_metadata": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PullRequestCommentAnchor"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Immutable provider-specific coordinates used to locate the comment outside a workspace file. When set, character offsets do not locate the comment in the workspace file."
+          },
+          "body": {
+            "description": "The comment text.",
+            "title": "Body",
+            "type": "string"
+          },
+          "conversation_id": {
+            "description": "The conversation this comment belongs to, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "Unix timestamp (seconds) when the comment was created.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Email of the user who created the comment, e.g. `\"alice@example.com\"`. `None` for legacy comments created before per-user attribution was added, or in single-user mode.",
+            "title": "Created By"
+          },
+          "end_index": {
+            "description": "0-based absolute character offset (exclusive) within the file where the anchor range ends.",
+            "format": "int64",
+            "title": "End Index",
+            "type": "integer"
+          },
+          "id": {
+            "description": "UUID for this comment, e.g. `\"a1b2c3d4-...\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "path": {
+            "description": "File path relative to the workspace root, e.g. `\"src/App.tsx\"`.",
+            "title": "Path",
+            "type": "string"
+          },
+          "start_index": {
+            "description": "0-based absolute character offset (inclusive) within the file where the anchor range begins.",
+            "format": "int64",
+            "title": "Start Index",
+            "type": "integer"
+          },
+          "status": {
+            "description": "One of `\"draft\"` (open, not yet addressed) or `\"addressed\"` (fixed by the agent or user).",
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "Unix timestamp in **microseconds** when the comment was last mutated (body or status change); set at creation time for never-edited comments. Microsecond precision (vs `created_at`'s seconds) so back-to-back mutations inside the same second still produce distinct, ordered values for the session comments fingerprint, while staying an exact integer in JavaScript (epoch-\u00b5s < `Number.MAX_SAFE_INTEGER`).",
+            "format": "int64",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "conversation_id",
+          "path",
+          "start_index",
+          "end_index",
+          "body",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "Comment",
+        "type": "object"
+      },
+      "CommentPage": {
+        "description": "A bounded comment page; filtered pages can be empty and still have a cursor.",
+        "properties": {
+          "comments": {
+            "items": {
+              "$ref": "#/components/schemas/Comment"
+            },
+            "title": "Comments",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "comments",
+          "next_cursor"
+        ],
+        "title": "CommentPage",
         "type": "object"
       },
       "CompactionCompletedEvent": {
@@ -5538,6 +5675,54 @@
         "title": "ProjectOrderResponse",
         "type": "object"
       },
+      "PullRequestCommentAnchor": {
+        "description": "Immutable PR coordinates for a session-only review comment.",
+        "properties": {
+          "base_sha": {
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "line": {
+            "format": "int64",
+            "title": "Line",
+            "type": "integer"
+          },
+          "pr_url": {
+            "title": "Pr Url",
+            "type": "string"
+          },
+          "side": {
+            "title": "Side",
+            "type": "string"
+          },
+          "start_line": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Line"
+          }
+        },
+        "required": [
+          "pr_url",
+          "side",
+          "line",
+          "start_line",
+          "head_sha",
+          "base_sha"
+        ],
+        "title": "PullRequestCommentAnchor",
+        "type": "object"
+      },
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
@@ -6473,6 +6658,11 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "admin_view": {
+            "default": false,
+            "title": "Admin View",
+            "type": "boolean"
+          },
           "agent_config_edit": {
             "default": false,
             "title": "Agent Config Edit",
@@ -6506,6 +6696,16 @@
           },
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
+          },
+          "codex_nonblocking_decline": {
+            "default": false,
+            "title": "Codex Nonblocking Decline",
+            "type": "boolean"
+          },
+          "comment_anchor_metadata": {
+            "default": true,
+            "title": "Comment Anchor Metadata",
+            "type": "boolean"
           },
           "databricks_features": {
             "title": "Databricks Features",
@@ -6570,6 +6770,11 @@
             "title": "Managed Sandboxes Enabled",
             "type": "boolean"
           },
+          "move_to_managed_sandbox": {
+            "default": false,
+            "title": "Move To Managed Sandbox",
+            "type": "boolean"
+          },
           "needs_setup": {
             "title": "Needs Setup",
             "type": "boolean"
@@ -6608,6 +6813,14 @@
               }
             ],
             "title": "Sandbox Provider"
+          },
+          "sandbox_provider_automation_notices": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "title": "Sandbox Provider Automation Notices",
+            "type": "object"
           },
           "sandbox_provider_capabilities": {
             "additionalProperties": {
@@ -6691,6 +6904,11 @@
             "title": "Session Claude Sdk Clear",
             "type": "boolean"
           },
+          "session_create_permission_modes": {
+            "default": true,
+            "title": "Session Create Permission Modes",
+            "type": "boolean"
+          },
           "session_event_types": {
             "default": [],
             "items": {
@@ -6712,6 +6930,11 @@
           "session_move_source_checks": {
             "default": false,
             "title": "Session Move Source Checks",
+            "type": "boolean"
+          },
+          "session_organize_source_checks": {
+            "default": false,
+            "title": "Session Organize Source Checks",
             "type": "boolean"
           },
           "session_pull_requests": {
@@ -7710,6 +7933,17 @@
               }
             ],
             "title": "Representative Id"
+          },
+          "representative_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Representative Title"
           }
         },
         "required": [
@@ -8894,6 +9128,50 @@
           "live"
         ],
         "title": "SessionLiveMCPServers",
+        "type": "object"
+      },
+      "SessionManagedHostRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /v1/sessions/{session_id}/managed-host`.\n\nMoves an existing session onto a new server-provisioned sandbox \u2014 the\nsandbox counterpart of `POST /v1/hosts/{host_id}/runners`, which\nbinds a connected host. The fields mean what they do on a managed fork.",
+        "properties": {
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Id for the new sandbox host, 32 lowercase hex characters, sent only when `GET /v1/info` reports `request_managed_sandbox_host_id`; `None` lets the server mint one.",
+            "title": "Host Id"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which configured sandbox provider to provision (one of the server's `sandbox_providers`); `None` takes the server's first.",
+            "title": "Sandbox Provider"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Git repository URL (optionally `#<branch>`) cloned into the sandbox as the session's working directory, e.g. `\"https://github.com/org/repo#main\"`; `None` gives the session an empty sandbox.",
+            "title": "Workspace"
+          }
+        },
+        "title": "SessionManagedHostRequest",
         "type": "object"
       },
       "SessionMcpStartupEvent": {
@@ -18426,7 +18704,7 @@
     },
     "/v1/sessions/{session_id}/comments": {
       "get": {
-        "description": "List comments for a session, optionally filtered by file.\n\nRequires `LEVEL_READ` on the session in multi-user mode.\n\n**Returns:** List of serialized comment dicts.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks read permission.",
+        "description": "List comments for a session, optionally filtered by file.\n\nRequires `LEVEL_READ` on the session in multi-user mode.\n\n**Returns:** A Files-only array, or a page in ID order when opted in. Path filtering happens after paging; follow next_cursor even when comments is empty. Pagination parameters apply only to this mode.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403/404 if the user lacks read permission.",
         "operationId": "list_comments_v1_sessions__session_id__comments_get",
         "parameters": [
           {
@@ -18455,6 +18733,48 @@
               ],
               "title": "Path"
             }
+          },
+          {
+            "description": "Opt in to bounded pages including PR anchors. Legacy callers receive the Files-only array.",
+            "in": "query",
+            "name": "include_pr_comments",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Pr Comments",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Maximum rows examined per page, plus one continuation row.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Exclusive comment ID from the previous page's next_cursor.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{32}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
           }
         ],
         "responses": {
@@ -18462,12 +18782,19 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "additionalProperties": true,
-                    "type": "object"
-                  },
-                  "title": "Response List Comments V1 Sessions  Session Id  Comments Get",
-                  "type": "array"
+                  "anyOf": [
+                    {
+                      "items": {
+                        "additionalProperties": true,
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CommentPage"
+                    }
+                  ],
+                  "title": "Response List Comments V1 Sessions  Session Id  Comments Get"
                 }
               }
             },
@@ -18970,6 +19297,60 @@
         "summary": "Reconnect Live Mcp Server",
         "tags": [
           "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/managed-host": {
+      "post": {
+        "description": "Move an existing session onto a new server-provisioned sandbox.\n\nThe sandbox counterpart of `POST /v1/hosts/{host_id}/runners`: the\ncaller first releases the session's runner (`PATCH` with\n`runner_id: \"\"`), then this claims the session's runner, registers\nthe background launch a managed create does, and only then drops the\nold host binding. It returns before the sandbox exists. Until the new\nhost binds, the claim keeps any other host from taking the session and\na message sent meanwhile waits for the launch rather than relaunching\non the old host.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionManagedHostRequest`.\n\n**Returns:** The session snapshot, with `host_id` and `workspace` null and `sandbox_status` reporting the launch.\n\n**Raises**\n\n- `OmnigentError` \u2014 403/404 unless the caller owns the session; 400 for a sub-agent or side chat, a session with no agent, one already on a sandbox, or a sandbox this server has not configured; 409 while a runner is bound, for a session with no host (such as one already moving), if the binding changed during the move, or if `body.host_id` is taken.",
+        "operationId": "move_session_to_managed_host_v1_sessions__session_id__managed_host_post",
+        "parameters": [
+          {
+            "description": "Session to move, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionManagedHostRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Move Session To Managed Host",
+        "tags": [
+          "sessions"
         ]
       }
     },
@@ -21690,6 +22071,48 @@
           }
         },
         "summary": "Merge Session Github Pr",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/merge-as": {
+      "post": {
+        "description": "Merge the selected PR as the account the merge dialog showed.\n\nA route apart from `/merge`, so a server, runner, or host that can't\nbind the account refuses the request instead of merging as the saved one.\n\n**Returns:** A `session.github.pr_merge`.",
+        "operationId": "merge_session_github_pr_as_v1_sessions__session_id__resources_github_merge_as_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Merge Session Github Pr As",
         "tags": [
           "session_resources"
         ]

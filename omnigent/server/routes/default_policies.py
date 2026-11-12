@@ -28,7 +28,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.registry import is_registered_handler, validate_factory_params
 from omnigent.runtime import get_caps
 from omnigent.runtime.policies.builder import invalidate_default_policy_specs_cache
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import AuthProvider, effective_admin
 from omnigent.server.routes._auth_helpers import get_user_id
 from omnigent.server.schemas import (
     _DOTTED_PATH_RE,
@@ -142,7 +142,7 @@ async def _require_admin(
             code=ErrorCode.UNAUTHORIZED,
         )
     is_admin = await asyncio.to_thread(permission_store.is_admin, user_id)
-    if not is_admin:
+    if not effective_admin(is_admin):
         raise OmnigentError(
             "Admin privileges required to manage default policies",
             code=ErrorCode.FORBIDDEN,

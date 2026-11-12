@@ -294,6 +294,13 @@ class TestLooksLikeError:
     def test_leading_whitespace(self) -> None:
         assert _looks_like_error("  Error: oops") is True
 
+    def test_claude_code_nonzero_exit(self) -> None:
+        assert _looks_like_error("Exit code 1\ncat: /nonexistent: No such file") is True
+        assert _looks_like_error("Exit code 127\nbash: foo: command not found") is True
+
+    def test_zero_exit_code_is_not_error(self) -> None:
+        assert _looks_like_error("Exit code 0") is False
+
 
 # ── non-gated phases abstain ─────────────────────────────────────────────────
 
@@ -326,6 +333,42 @@ class TestDetectThrashingSuccess:
         assert result["result"] == "ALLOW"
         updates = {u["key"]: u["value"] for u in result["state_updates"]}
         assert updates[_THRASHING_HISTORY_KEY] == [1]
+
+
+# ── reported failures ────────────────────────────────────────────────────────
+
+
+class TestDetectThrashingReportedFailure:
+    def test_reported_failure_counts_without_error_text(self) -> None:
+        policy = detect_thrashing()
+        event = _result_event("cat: /nonexistent: No such file or directory")
+        event["data"]["is_error"] = True
+        result = policy(event)
+        updates = {u["key"]: u["value"] for u in result["state_updates"]}
+        assert updates[_THRASHING_HISTORY_KEY] == [1]
+
+    def test_reported_success_does_not_hide_error_text(self) -> None:
+        policy = detect_thrashing()
+        event = _result_event("Error: file not found")
+        event["data"]["is_error"] = False
+        result = policy(event)
+        updates = {u["key"]: u["value"] for u in result["state_updates"]}
+        assert updates[_THRASHING_HISTORY_KEY] == [1]
+
+    def test_non_boolean_flag_is_ignored(self) -> None:
+        policy = detect_thrashing()
+        event = _result_event("file written successfully")
+        event["data"]["is_error"] = "true"
+        result = policy(event)
+        updates = {u["key"]: u["value"] for u in result["state_updates"]}
+        assert updates[_THRASHING_HISTORY_KEY] == [0]
+
+    def test_reported_failures_fire_consecutive_threshold(self) -> None:
+        policy = detect_thrashing(consecutive_threshold=2, action="DENY")
+        event = _result_event("cat: /nonexistent: No such file or directory", history=[1])
+        event["data"]["is_error"] = True
+        result = policy(event)
+        assert result["result"] == "DENY"
 
 
 # ── consecutive threshold ────────────────────────────────────────────────────
