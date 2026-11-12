@@ -1200,7 +1200,8 @@ class HostFsWriteFrame:
     (``op="github_details_update"``), comments (``op="github_comment_create"``),
     review replies (``op="github_review_thread_reply"``), description attachment uploads
     (``op="github_attachment_upload"``, the file base64-encoded in
-    ``content_base64``), merges (``op="github_merge"``),
+    ``content_base64``), merges (``op="github_merge"``, or ``op="github_merge_as"``
+    with ``account``),
     and disabling auto-merge (``op="github_disable_auto_merge"``), for every git
     provider; the op names are
     stable wire ids. The host runs the mutation against
@@ -1212,7 +1213,8 @@ class HostFsWriteFrame:
         ``"github_prs_update"``, ``"github_labels_update"``,
         ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
         ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
-        ``"github_attachment_upload"``, ``"github_merge"``, or ``"github_disable_auto_merge"``.
+        ``"github_attachment_upload"``, ``"github_merge"``, ``"github_merge_as"``, or
+        ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.
