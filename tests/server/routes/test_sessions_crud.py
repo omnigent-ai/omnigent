@@ -186,6 +186,24 @@ async def _create_owned_session(auth_client: httpx.AsyncClient) -> str:
     return response.json()["session_id"]
 
 
+def _count_rollbacks(monkeypatch: pytest.MonkeyPatch, module: object) -> list[None]:
+    """Record each ``rollback_shared_reads`` call a route module makes.
+
+    SQLite does not abort the transaction on a failed statement, so the recovery
+    assertions alone only discriminate on PostgreSQL; this makes the rollback
+    itself observable on every backend.
+    """
+    real_rollback = module.rollback_shared_reads  # type: ignore[attr-defined]
+    calls: list[None] = []
+
+    def counting_rollback() -> None:
+        calls.append(None)
+        real_rollback()
+
+    monkeypatch.setattr(module, "rollback_shared_reads", counting_rollback)
+    return calls
+
+
 def _failing_statement(db_uri: str) -> None:
     """Fail one SQL statement on a read maker that joins the request's shared read scope."""
     from sqlalchemy import text
@@ -209,13 +227,17 @@ async def test_get_session_reads_owner_grant_after_agent_row_failure(
     def failing_get(self: SqlAlchemyAgentStore, agent_id: str) -> None:
         _failing_statement(db_uri)
 
+    from omnigent.server.routes._sessions import orchestration
+
     monkeypatch.setattr(SqlAlchemyAgentStore, "get", failing_get)
+    rollbacks = _count_rollbacks(monkeypatch, orchestration)
     resp = await auth_client.get(f"/v1/sessions/{session_id}", headers=_OWNER)
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["id"] == session_id
     assert body.get("agent_name") is None
     assert body["side_chat_allowed"] is True
+    assert len(rollbacks) == 1, "the failed agent-row read must roll the shared scope back"
 
 
 async def test_list_sessions_recovers_between_batches_after_pull_request_read_failure(
@@ -245,12 +267,14 @@ async def test_list_sessions_recovers_between_batches_after_pull_request_read_fa
         return original_summaries(self, conversation_ids)
 
     monkeypatch.setattr(SessionPullRequestStore, "summaries", summaries_failing_once)
+    rollbacks = _count_rollbacks(monkeypatch, routes_core)
     resp = await auth_client.get(
         "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=mine", headers=_OWNER
     )
     assert resp.status_code == 200, resp.text
     assert {row["id"] for row in resp.json()["data"]} == {first_id, second_id}
     assert len(calls) == 2, "expected one PR-summary read per one-row batch"
+    assert len(rollbacks) == 1, "the failed PR-summary read must roll the shared scope back"
 
 
 async def test_get_session_not_found(client: httpx.AsyncClient) -> None:

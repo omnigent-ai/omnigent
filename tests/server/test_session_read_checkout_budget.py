@@ -156,3 +156,24 @@ async def test_session_sidebar_search_costs_one_checkout(
     assert response.status_code == 200, response.text
     assert [row["id"] for row in response.json()["data"]] == [session_id]
     _assert_one_checkout(meter, f"GET {request}")
+
+
+@pytest.mark.asyncio
+async def test_session_sidebar_list_costs_one_checkout_across_batches(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every per-batch enrichment read shares the request's one checkout."""
+    from omnigent.server.routes.sessions import routes_core
+
+    first_id = await _create_session(auth_client)
+    second_id = await _create_session(auth_client)
+    _skip_background_pull_request_refresh(monkeypatch)
+    monkeypatch.setattr(routes_core, "_SESSION_LIST_BATCH_SIZE", 1)
+    request = f"/v1/sessions?{SIDEBAR_QUERY}"
+
+    with meter_engine(get_or_create_engine(db_uri), monkeypatch) as meter:
+        response = await auth_client.get(request, headers=OWNER)
+
+    assert response.status_code == 200, response.text
+    assert {row["id"] for row in response.json()["data"]} == {first_id, second_id}
+    _assert_one_checkout(meter, f"GET {request} in one-row batches")
