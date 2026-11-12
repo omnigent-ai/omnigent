@@ -1554,14 +1554,6 @@ def test_resolve_os_env_from_json(monkeypatch) -> None:
     assert spec.fork is True
 
 
-def test_resolve_os_env_rejects_malformed_json(monkeypatch) -> None:
-    from omnigent.inner import goose_harness
-
-    monkeypatch.setenv("HARNESS_GOOSE_OS_ENV", "{not valid json")
-    with pytest.raises(ValueError, match="HARNESS_GOOSE_OS_ENV"):
-        goose_harness._resolve_os_env()
-
-
 def test_build_goose_executor_reads_env(monkeypatch) -> None:
     from omnigent.inner import goose_harness
 

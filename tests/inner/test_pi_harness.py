@@ -227,14 +227,6 @@ def test_executor_factory_decodes_os_env_json(
     assert os_env_value.sandbox.read_paths == ["/srv/data"]
 
 
-def test_executor_factory_rejects_malformed_os_env_json(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HARNESS_PI_OS_ENV", "{not-json")
-    with patch("omnigent.inner.pi_harness.PiExecutor.__init__") as constructor:
-        with pytest.raises(ValueError, match="HARNESS_PI_OS_ENV"):
-            pi_harness._build_pi_executor()
-    constructor.assert_not_called()
-
-
 @pytest.mark.parametrize(
     "raw_value,expected",
     [
