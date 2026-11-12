@@ -1592,7 +1592,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             first_document = {"events": [], "omitted": 1}
         workspace_id = task.workspace_id
 
-        def receipt(session: Session, run_id: str | None) -> None:
+        def receipt(session: Session, run_id: str) -> None:
             session.add(
                 SqlScheduledTaskEventReceipt(
                     workspace_id=workspace_id,

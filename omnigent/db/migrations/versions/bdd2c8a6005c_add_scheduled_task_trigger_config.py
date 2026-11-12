@@ -112,7 +112,7 @@ def upgrade() -> None:
             ),
             nullable=False,
         ),
-        sa.Column("run_id", Uuid16(), nullable=True),
+        sa.Column("run_id", Uuid16(), nullable=False),
         sa.Column("created_at", sa.BigInteger(), nullable=False),
         sa.PrimaryKeyConstraint("workspace_id", "id"),
         sa.UniqueConstraint(

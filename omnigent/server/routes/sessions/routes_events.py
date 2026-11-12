@@ -1650,15 +1650,21 @@ def register_events_routes(
             await validate_saved_selection(cast("Request", request), conv, conv.model_override)
 
         startup = getattr(request.app.state, "startup_inputs", None)
-        if (
+        may_wait_for_startup = (
             not isinstance(request, (StartupInputContext, _RunnerEventContext))
             and startup is not None
             and (
                 (body.type == "message" and body.data.get("role") == "user")
                 or (body.type == _SLASH_COMMAND_TYPE and body.data.get("kind") == "skill")
             )
-            and await startup.accepts(conv, request.app)
-        ):
+        )
+
+        async def wait_for_startup(current: Conversation) -> dict[str, Any] | None:
+            """Save this input behind *current*'s startup for its launch to deliver, if it has one."""
+            if not may_wait_for_startup or startup is None:
+                return None
+            if not await startup.accepts(current, request.app):
+                return None
             if peer_message:
                 await asyncio.to_thread(
                     require_orchestration_source,
@@ -1673,12 +1679,15 @@ def register_events_routes(
             saved = await startup.enqueue(
                 session_id, body, user_id=user_id, headers=request.headers, first=False
             )
-            if conv.host_id is not None:
-                startup.host_changed(request.app, conv.host_id)
+            if current.host_id is not None:
+                startup.host_changed(request.app, current.host_id)
             return {
                 "queued": True,
                 "pending_id": pending_inputs.make_pending_id(session_id, saved.id),
             }
+
+        if (held := await wait_for_startup(conv)) is not None:
+            return held
         # ── Policy evaluation (path-agnostic) ────────────────
         # Evaluate policies BEFORE persistence/runner forwarding so
         # enforcement fires on both paths. On DENY, persist the
@@ -3379,6 +3388,19 @@ def register_events_routes(
                         _host_reg,
                         _host_conn,
                     )
+                    from omnigent.server.managed_hosts import is_move_claim
+
+                    if is_move_claim(launch_attempt.runner_id):
+                        # A move claimed the session after this message was
+                        # checked against its startup: wait for the sandbox,
+                        # like a message sent once the move had started.
+                        moving = await asyncio.to_thread(
+                            conversation_store.get_conversation, session_id
+                        )
+                        if moving is None:
+                            raise _session_not_found()
+                        if (held := await wait_for_startup(moving)) is not None:
+                            return held
                     host_error_code = _classify_launch_refusal(
                         launch_attempt.error_code,
                         launch_attempt.error,
