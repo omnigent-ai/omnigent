@@ -866,6 +866,8 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             if isinstance(block, dict):
                 remaining = {k: v for k, v in block.items() if k not in existing_subs}
                 _save_global_config({"providers": remaining})
+        # Signing in again re-enables a login dismissed when setup removed an invalid entry.
+        _clear_detection_dismissal(cli_name)
         # Subscription name is derived from the CLI — no prompt.
         name = f"{cli_name}-subscription"
         entry = build_subscription_provider_entry(cli_name)
@@ -3376,13 +3378,6 @@ def _clear_detection_dismissal(name: str) -> None:
     _save_global_config({DISMISSED_DETECTIONS_KEY: sorted(dismissed - {name})})
 
 
-def _dismissable_detection_names() -> set[str]:
-    """Return live ambient detections that a removal must dismiss to stick."""
-    from omnigent.onboarding.ambient import detect_providers
-
-    return {d.name for d in detect_providers() if d.kind != "subscription"}
-
-
 def _remove_credential(provider: str) -> str | None:
     """Remove the *provider* credential and persist wholesale.
 
@@ -3397,6 +3392,7 @@ def _remove_credential(provider: str) -> str | None:
         records its name under ``dismissed_detections`` so the next
         configure open does not silently re-adopt it).
     """
+    from omnigent.onboarding.ambient import detect_providers
     from omnigent.onboarding.detected import (
         DISMISSED_DETECTIONS_KEY,
         dismissed_detection_names,
@@ -3418,11 +3414,14 @@ def _remove_credential(provider: str) -> str | None:
     # re-adopt. Everything else (env API key, codex config.toml provider,
     # local Ollama) gets a persisted dismissal that the add menu's detected
     # option clears on re-add.
-    backed = provider in _dismissable_detection_names()
-    if backed:
+    backing = next(
+        (d for d in detect_providers() if d.name == provider and d.kind != "subscription"),
+        None,
+    )
+    if backing is not None:
         settings[DISMISSED_DETECTIONS_KEY] = sorted(dismissed_detection_names(config) | {provider})
     _save_global_config(settings)  # wholesale replace per key
-    if backed:
+    if backing is not None:
         return f"✓ Removed {label} — it stays on your machine but won't be auto-configured again"
     return f"✓ Removed {label}"
 
@@ -3668,10 +3667,34 @@ def _manage_opencode_harness() -> None:
             status = None
 
 
+def _repair_removal_dismissals(removed: dict[str, object], kept: dict[str, object]) -> set[str]:
+    """Return live ambient detections that would re-adopt the *removed* entries.
+
+    Unlike :func:`_remove_credential`, setup's repair does not sign out, so a removed
+    subscription dismisses its CLI's login unless a *kept* entry still covers that CLI.
+    """
+    from omnigent.onboarding.ambient import SUBSCRIPTION_KIND, detect_providers
+
+    def subscription_clis(block: dict[str, object]) -> set[object]:
+        return {
+            entry.get("cli")
+            for entry in block.values()
+            if isinstance(entry, dict) and entry.get("kind") == SUBSCRIPTION_KIND
+        }
+
+    removed_clis = subscription_clis(removed) - subscription_clis(kept)
+    dismissed: set[str] = set()
+    for detection in detect_providers():
+        names = removed_clis if detection.kind == SUBSCRIPTION_KIND else removed.keys()
+        if detection.name in names:
+            dismissed.add(detection.name)
+    return dismissed
+
+
 def _repair_invalid_provider_entries() -> bool:
     """Offer to repair or remove provider entries that fail to load; allow cancellation.
 
-    Like :func:`_remove_credential`, removing an entry dismisses its live ambient detection.
+    Removing an entry dismisses the live ambient detection that would re-adopt it.
 
     :returns: ``False`` when the user leaves an invalid entry unchanged; the
         config is then not written. ``True`` otherwise.
@@ -3688,7 +3711,7 @@ def _repair_invalid_provider_entries() -> bool:
     if not isinstance(block, dict):
         return True
     repaired: dict[str, object] = {}
-    removed: set[str] = set()
+    removed: dict[str, object] = {}
     for name, entry in block.items():
         try:
             load_providers({"providers": {name: entry}})
@@ -3719,10 +3742,10 @@ def _repair_invalid_provider_entries() -> bool:
         if fixed is not None and choice == 0:
             repaired[name] = fixed
         else:
-            removed.add(str(name))
+            removed[str(name)] = entry
     if repaired != block:
         settings: dict[str, object] = {"providers": repaired}
-        dismissed = removed & _dismissable_detection_names() if removed else set()
+        dismissed = _repair_removal_dismissals(removed, repaired) if removed else set()
         if dismissed:
             settings[DISMISSED_DETECTIONS_KEY] = sorted(
                 dismissed_detection_names(config) | dismissed

@@ -817,11 +817,15 @@ def test_add_subscription_invokes_harness_login(isolated_config, monkeypatch) ->
     Proves "configure is the single place to sign in": picking "Claude —
     subscription" calls ``harness_login("anthropic")``. A failure means the menu
     recorded a subscription without ever logging the user in (the original bug).
+    The sign-in also clears that login's detection dismissal.
     """
     calls: list[str] = []
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_login",
         lambda family: calls.append(family) or True,
+    )
+    (isolated_config / "config.yaml").write_text(
+        yaml.safe_dump({"dismissed_detections": ["claude", "ollama"]})
     )
     stdin = "\n".join(["1", "1", "2", "q", "q"]) + "\n"  # Claude → +Add → subscription
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
@@ -830,6 +834,8 @@ def test_add_subscription_invokes_harness_login(isolated_config, monkeypatch) ->
     assert calls == ["anthropic"]
     cfg = _config_yaml(isolated_config)
     assert cfg["providers"]["claude-subscription"]["kind"] == "subscription"
+    # Signing in again re-enables a dismissed detection of that login.
+    assert cfg["dismissed_detections"] == ["ollama"]
 
 
 def test_add_subscription_aborts_when_login_fails(isolated_config, monkeypatch) -> None:
@@ -4046,6 +4052,42 @@ def test_setup_removing_invalid_provider_keeps_stored_key_and_dismisses_detectio
     assert "anthropic" not in (config.get("providers") or {})
     assert config["dismissed_detections"] == ["anthropic"]
     assert secrets.load_secret("anthropic") == "stored-key"
+
+
+@pytest.mark.parametrize("name", ["codex", "codex-subscription"])
+def test_setup_removing_invalid_subscription_keeps_login_and_dismisses_detection(
+    isolated_config, monkeypatch, name
+):
+    login = '{"tokens": {"refresh_token": "fake"}}'
+    auth = isolated_config / ".codex" / "auth.json"
+    auth.parent.mkdir()
+    auth.write_text(login)
+    entry = {"kind": "subscription", "cli": "codex", "default": "anthropic"}
+    (isolated_config / "config.yaml").write_text(yaml.safe_dump({"providers": {name: entry}}))
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_logout",
+        lambda family: pytest.fail("repair must not sign out"),
+    )
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    result = CliRunner().invoke(cli, ["setup"], input="2\nq\n")
+    assert result.exit_code == 0, result.output
+    assert "Remove this provider" in result.output
+    config = _config_yaml(isolated_config)
+    assert not config.get("providers")
+    assert config["dismissed_detections"] == ["codex"]
+    assert auth.read_text() == login
+
+
+def test_repair_removal_keeps_a_login_that_a_kept_subscription_covers(monkeypatch):
+    from omnigent.cli_config import _repair_removal_dismissals
+    from omnigent.onboarding.ambient import DetectedProvider
+
+    login = DetectedProvider(name="codex", kind="subscription", family="openai", source="login")
+    monkeypatch.setattr("omnigent.onboarding.ambient.detect_providers", lambda: [login])
+    removed = {"codex": {"kind": "subscription", "cli": "codex", "default": "anthropic"}}
+    kept = {"codex-subscription": {"kind": "subscription", "cli": "codex"}}
+    assert _repair_removal_dismissals(removed, {}) == {"codex"}
+    assert _repair_removal_dismissals(removed, kept) == set()
 
 
 @pytest.mark.parametrize(
