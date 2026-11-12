@@ -147,9 +147,16 @@ def git_repo(tmp_path: Path) -> Iterator[Path]:
     yield repo
 
 
-def test_create_worktree_places_sibling_of_repo_root(git_repo: Path) -> None:
+@pytest.mark.parametrize("base_branch", [None, "main", "master"])
+def test_create_worktree_places_sibling_of_repo_root(
+    git_repo: Path, base_branch: str | None
+) -> None:
     """A new worktree lands at ``<repo>-worktrees/<branch>`` with the branch checked out."""
-    created = create_worktree(repo_path=str(git_repo), branch_name="feature/login")
+    if base_branch == "master":
+        _git(git_repo, "branch", "-m", "master")
+    created = create_worktree(
+        repo_path=str(git_repo), branch_name="feature/login", base_branch=base_branch
+    )
     expected = git_repo.parent / "myrepo-worktrees" / "feature-login"
     # Path proves the sibling layout + slash->dash dir sanitization;
     # a regression in _resolve_worktree_path would change this.
@@ -158,6 +165,7 @@ def test_create_worktree_places_sibling_of_repo_root(git_repo: Path) -> None:
     assert Path(created.worktree_path).is_dir()
     # The branch is actually checked out in the worktree (not just the dir made).
     assert _current_branch(Path(created.worktree_path)) == "feature/login"
+    assert _rev_parse(Path(created.worktree_path)) == _rev_parse(git_repo)
     assert isinstance(created, CreatedWorktree)
 
 
@@ -218,7 +226,11 @@ def test_create_worktree_missing_subdir_leaves_no_worktree(
     assert _branch_exists(git_repo, "old-base")
 
 
-def test_create_worktree_from_linked_worktree_anchors_at_main_repo(git_repo: Path) -> None:
+@pytest.mark.parametrize("detached", [False, True])
+@pytest.mark.parametrize("subdirectory", [False, True])
+def test_create_worktree_from_linked_worktree_anchors_at_main_repo(
+    git_repo: Path, detached: bool, subdirectory: bool
+) -> None:
     """Creating a worktree while inside a LINKED worktree anchors at the MAIN repo.
 
     Resolving the repo root naively (``rev-parse --show-toplevel``) from a
@@ -232,9 +244,16 @@ def test_create_worktree_from_linked_worktree_anchors_at_main_repo(git_repo: Pat
     first = create_worktree(repo_path=str(git_repo), branch_name="feature/a")
     first_path = Path(first.worktree_path)
     assert first_path == git_repo.parent / "myrepo-worktrees" / "feature-a"
+    (first_path / "src").mkdir()
+    (first_path / "src" / "source.txt").write_text("Only in the source checkout")
+    _git(first_path, "add", ".")
+    _git(first_path, "commit", "-qm", "advance source checkout")
+    if detached:
+        _git(first_path, "checkout", "--detach", "-q")
 
     # Second worktree, requested from INSIDE the first (linked) worktree.
-    second = create_worktree(repo_path=str(first_path), branch_name="feature/b")
+    source_directory = first_path / "src" if subdirectory else first_path
+    second = create_worktree(repo_path=str(source_directory), branch_name="feature/b")
 
     # Sibling of the MAIN repo, NOT nested under the first worktree. A
     # regression to --show-toplevel would put it under
@@ -243,6 +262,11 @@ def test_create_worktree_from_linked_worktree_anchors_at_main_repo(git_repo: Pat
     assert "feature-a-worktrees" not in second.worktree_path
     assert Path(second.worktree_path).is_dir()
     assert _current_branch(Path(second.worktree_path)) == "feature/b"
+    assert _rev_parse(Path(second.worktree_path)) == _rev_parse(first_path)
+    assert _rev_parse(Path(second.worktree_path)) != _rev_parse(git_repo)
+    assert (
+        Path(second.worktree_path) / "src" / "source.txt"
+    ).read_text() == "Only in the source checkout"
 
 
 def test_create_worktree_from_base_branch(git_repo: Path) -> None:
@@ -482,25 +506,41 @@ def test_list_worktrees_fetches_all_timestamps_with_one_git_command(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Timestamp metadata stays O(1) as the number of worktrees grows."""
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "@1700000000 +0000")
+    _git(git_repo, "commit", "--amend", "--no-edit")
+    expected_timestamps = {_rev_parse(git_repo): 1_700_000_000}
     for index in range(4):
-        create_worktree(repo_path=str(git_repo), branch_name=f"feature/{index}")
+        created = create_worktree(repo_path=str(git_repo), branch_name=f"feature/{index}")
+        worktree_path = Path(created.worktree_path)
+        timestamp = 1_700_000_001 + index
+        monkeypatch.setenv("GIT_COMMITTER_DATE", f"@{timestamp} +0000")
+        _git(worktree_path, "commit", "--allow-empty", "-m", f"worktree {index}")
+        expected_timestamps[_rev_parse(worktree_path)] = timestamp
+    create_worktree(repo_path=str(git_repo), branch_name="feature/shared-head")
 
     original_run_git = git_worktree_module._run_git
-    show_calls: list[list[str]] = []
+    timestamp_calls: list[list[str]] = []
 
     def run_git(args: list[str], *, cwd: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        if args[:3] == ["show", "-s", "--format=%H%x00%ct"]:
-            show_calls.append(args)
+        if "--format=%H%x00%ct" in args:
+            timestamp_calls.append(args)
         return original_run_git(args, cwd=cwd, **kwargs)
 
     monkeypatch.setattr(git_worktree_module, "_run_git", run_git)
 
     result = list_worktrees(repo_path=str(git_repo))
 
-    assert len(result) == 5
-    assert len(show_calls) == 1
-    assert len(show_calls[0][3:]) == len({_rev_parse(Path(worktree.path)) for worktree in result})
-    assert all(isinstance(worktree.updated_at, int) for worktree in result)
+    assert len(result) == 6
+    assert len(timestamp_calls) == 1
+    assert timestamp_calls[0][:3] == ["log", "--no-walk=unsorted", "--format=%H%x00%ct"]
+    assert timestamp_calls[0][-1] == "--"
+    assert set(timestamp_calls[0][3:-1]) == {
+        _rev_parse(Path(worktree.path)) for worktree in result
+    }
+    assert all(
+        worktree.updated_at == expected_timestamps[_rev_parse(Path(worktree.path))]
+        for worktree in result
+    )
 
 
 def test_list_worktrees_from_linked_resolves_same_list(git_repo: Path) -> None:
