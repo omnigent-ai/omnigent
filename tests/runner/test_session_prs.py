@@ -1585,12 +1585,26 @@ def test_an_array_literal_is_not_a_command_for_pr_attribution() -> None:
     # An escaped quote inside an array element does not end its quoted region.
     segments = _shell_segments('msg=("say \\"hi\\"") && gh pr view 41')
     assert [segment.invocation_tokens for segment in segments] == [("gh", "pr", "view", "41")]
+    # A line continuation inside the array or the definition does not change what runs.
+    url_output = "https://github.com/example/one/pull/41\n"
+    for command in ("cmd=\\\n(gh pr create --fill)\necho https://github.com/example/one/pull/41",):
+        refs, was_created = extract_prs("Bash", {"command": command}, url_output)
+        assert refs == []
+        assert was_created is False
 
 
 def test_an_uncalled_function_body_is_not_a_command_for_pr_attribution() -> None:
     refs, was_created = extract_prs(
         "Bash",
         {"command": "f() (gh pr create --fill)\necho https://github.com/example/one/pull/41"},
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+    # A continuation inside the name's parentheses does not change what runs.
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "f(\\\n) (gh pr create --fill)\necho https://github.com/example/one/pull/41"},
         "https://github.com/example/one/pull/41\n",
     )
     assert refs == []
@@ -1885,6 +1899,22 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
             {},
             ["/b"],
             id="escaped-greater-then-pipe-is-a-separator",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(cd /tmp && echo a\\ #)\ngit status"},
+            "/",
+            {},
+            ["/"],
+            id="literal-hash-does-not-end-the-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(cd /tmp && echo $(echo x)#)\ngit status"},
+            "/",
+            {},
+            ["/"],
+            id="literal-hash-after-a-substitution-does-not-end-the-subshell",
         ),
         pytest.param(
             "Bash",

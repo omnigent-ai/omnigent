@@ -282,6 +282,15 @@ _UNMODELED_SHELL = re.compile(
     r"\b(?:case|esac|function|eval|if|then|else|elif|fi|do|done|while|until|for|select)\b"
     r"|[{}]|\(\s*\)|\(\s*\(|=\s*\("
 )
+
+
+def _has_unmodeled_shell(command: str) -> bool:
+    """Whether *command* has unmodeled syntax, with or without line continuations."""
+    return bool(
+        _UNMODELED_SHELL.search(command) or _UNMODELED_SHELL.search(re.sub(r"\\\n", "", command))
+    )
+
+
 # Operators, longest first. Quoted and backslash-escaped characters are never operators.
 _SHELL_OPERATORS = ("&&", "||", "(", ")", ";", "&", "|", "\n")
 
@@ -379,10 +388,19 @@ def _shell_steps(
             steps.append(ShellSegment(raw_tokens=tuple(item), invocation_tokens=tuple(tokens)))
             continue
         nested = _shell_steps(inner, depth + 1, or_lists=or_lists)
-        if nested is None or not any(isinstance(step, ShellSegment) for step in nested):
+        if nested is None:
+            return None
+        if not any(isinstance(step, ShellSegment) for step in nested):
             output_eligible = False
-        if nested is not None:
-            steps.extend(["(", *nested, ")"])
+        steps.extend(["(", *nested, ")"])
+    # Preparation can strip a ``#`` that is part of a word, and with it a closing parenthesis.
+    depth = 0
+    for step in steps:
+        depth += (step == "(") - (step == ")")
+        if depth < 0:
+            return None
+    if depth:
+        return None
     if output_eligible:
         return steps
     return [
@@ -398,11 +416,11 @@ def _shell_segments(command: str) -> list[ShellSegment]:
     which of its commands ran is unknown. A command with unmodeled shell syntax
     gets the flat parse.
     """
-    if _UNMODELED_SHELL.search(command):
+    if _has_unmodeled_shell(command):
         return _flat_shell_segments(command)
     steps = _shell_steps(command)
     if steps is None:
-        return []
+        return _flat_shell_segments(command)
     return [step for step in steps if isinstance(step, ShellSegment)]
 
 
@@ -806,14 +824,14 @@ class _CheckoutWalker:
         return directories, directories
 
 
-def _checkout_steps(command: str) -> list[ShellSegment | str] | None:
+def _checkout_steps(command: str) -> list[ShellSegment | str]:
     """Return the steps the checkout walker runs for *command*."""
-    if _UNMODELED_SHELL.search(command):
-        steps: list[ShellSegment | str] = []
+    steps = None if _has_unmodeled_shell(command) else _shell_steps(command, or_lists=True)
+    if steps is None:
+        steps = []
         for segment in _flat_shell_segments(command):
             steps.extend([segment, ";"])
-        return steps
-    return _shell_steps(command, or_lists=True)
+    return steps
 
 
 def _git_checkouts(
@@ -836,8 +854,6 @@ def _git_checkouts(
         runs_git = any(os.path.basename(s.invocation_tokens[0]) == "git" for s in segments)
         return [reported] if runs_git and isinstance(reported, str) and reported else []
     steps = _checkout_steps(command)
-    if steps is None:
-        return []
     workdir = arguments.get("workdir")
     start = _resolve_directory(cwd, workdir) if isinstance(workdir, str) and workdir else cwd
     walker = _CheckoutWalker(steps)
