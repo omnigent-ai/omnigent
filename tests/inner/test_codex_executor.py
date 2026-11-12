@@ -464,6 +464,189 @@ class _FakeProcess:
         return self.returncode or 0
 
 
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "text",
+        "attachments",
+        "old-attachment",
+        "current-file-too-large",
+        "no-history",
+        "legacy-effort",
+        "unicode",
+        "current-tool-results",
+        "retry-rejected",
+        "resumed",
+        "current-too-large",
+        "progress-observed",
+        "wrong-code",
+        "missing-data",
+        "invalid-limit",
+        "inconsistent-limit",
+        "ambiguous-error",
+        "cancelled",
+        "retries-disabled",
+    ],
+)
+async def test_cold_replay_recovers_only_from_explicit_input_size_rejection(scenario):
+    import copy
+
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+        retry_policy=RetryPolicy(max_retries=0 if scenario == "retries-disabled" else 2),
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    if scenario == "resumed":
+        session.thread_id = "existing-thread"
+    current = "Answer using the RECENT42 code."
+    if scenario == "unicode":
+        current += ' 漢字😀\n"quoted"\\path'
+    if scenario in {"attachments", "current-file-too-large"}:
+        current = [
+            {"type": "input_text", "text": current},
+            {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="},
+            {"type": "input_file", "file_data": "data:text/plain;base64,ZXhhY3QgZmlsZQ=="},
+        ]
+        if scenario == "current-file-too-large":
+            current[2]["file_data"] = (
+                "data:text/plain;base64," + base64.b64encode(b"f" * 500).decode()
+            )
+    messages = [
+        {"role": "user", "content": "old request " * 1000},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "Remember the recent code."},
+        {"role": "assistant", "content": "The code is RECENT42."},
+        {"role": "user", "content": current},
+    ]
+    if scenario == "old-attachment":
+        messages[0]["content"] = [{"type": "input_file", "file_data": "old file " * 1000}]
+    if scenario == "no-history":
+        messages = [{"role": "user", "content": "current input " * 1000}]
+    if scenario == "current-too-large":
+        messages[-1]["content"] = "current input " * 1000
+    if scenario == "current-tool-results":
+        messages.extend(
+            [
+                {"role": "assistant", "content": "current tool call"},
+                {"role": "tool", "content": "current tool output"},
+            ]
+        )
+    original = copy.deepcopy(messages)
+    calls = []
+    turn_calls = []
+    limit = 420
+
+    async def respond(payload):
+        calls.append(copy.deepcopy(payload))
+        if payload["method"] == "thread/start":
+            response = {"result": {"thread": {"id": "new-thread"}}}
+        elif payload["method"] == "thread/settings/update":
+            response = {
+                "error": {
+                    "code": -32600,
+                    "message": "unknown variant `thread/settings/update`",
+                }
+            }
+        else:
+            assert payload["method"] == "turn/start"
+            turn_calls.append(copy.deepcopy(payload["params"]))
+            if len(turn_calls) == 1 or scenario == "retry-rejected":
+                actual = sum(len(item.get("text", "")) for item in payload["params"]["input"])
+                error = {
+                    "code": -32602,
+                    "message": "Input exceeds maximum length.",
+                    "data": {
+                        "input_error_code": "input_too_large",
+                        "max_chars": limit,
+                        "actual_chars": actual,
+                    },
+                }
+                if scenario == "progress-observed":
+                    session._native_progress_observed = True
+                if scenario == "wrong-code":
+                    error["code"] = -32603
+                if scenario == "missing-data":
+                    error.pop("data")
+                if scenario == "invalid-limit":
+                    error["data"]["max_chars"] = True
+                if scenario == "inconsistent-limit":
+                    error["data"]["actual_chars"] = limit
+                if scenario == "ambiguous-error":
+                    raise RuntimeError("connection closed after dispatch")
+                if scenario == "cancelled":
+                    raise asyncio.CancelledError
+                response = {"error": error}
+            else:
+                response = {"result": {"turn": {"id": "accepted-turn"}}}
+                session._events.put_nowait(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": "accepted-turn"}},
+                    }
+                )
+        session._pending_requests[payload["id"]].set_result(response)
+
+    session._send_message = AsyncMock(side_effect=respond)
+    run = session.run_turn(
+        messages=messages,
+        tools=[],
+        system_prompt="original instructions",
+        model=None,
+        cwd="/tmp/workspace",
+        sandbox="workspace-write",
+        reasoning_effort="high" if scenario == "legacy-effort" else None,
+    )
+    recovers = scenario in {
+        "text",
+        "attachments",
+        "old-attachment",
+        "unicode",
+        "legacy-effort",
+        "current-tool-results",
+    }
+    if recovers:
+        events = [event async for event in run]
+        assert isinstance(events[-1], TurnComplete)
+    elif scenario == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            _ = [event async for event in run]
+    else:
+        with pytest.raises(RuntimeError):
+            _ = [event async for event in run]
+    assert messages == original
+    assert not session._pending_requests
+    assert len(turn_calls) == (2 if recovers or scenario == "retry-rejected" else 1)
+    if recovers or scenario == "retry-rejected":
+        recovered = turn_calls[1]
+        assert recovered["threadId"] == turn_calls[0]["threadId"]
+        assert {k: v for k, v in recovered.items() if k != "input"} == {
+            k: v for k, v in turn_calls[0].items() if k != "input"
+        }
+        text = "\n".join(item["text"] for item in recovered["input"] if item["type"] == "text")
+        assert sum(len(item.get("text", "")) for item in recovered["input"]) <= limit
+        assert "omitted" in text
+        assert "old request" not in text
+        assert "Remember the recent code." in text
+        assert "The code is RECENT42." in text
+        assert "Answer using the RECENT42 code." in text
+        if scenario == "unicode":
+            assert current in text
+        if scenario == "legacy-effort":
+            assert recovered["effort"] == "high"
+            assert recovered["summary"] == "detailed"
+        if scenario == "attachments":
+            assert "exact file" in text
+            assert {"type": "image", "url": current[1]["image_url"]} in recovered["input"]
+        if scenario == "current-tool-results":
+            assert "current tool call" in text
+            assert "current tool output" in text
+    assert sum(call["method"] == "thread/start" for call in calls) == (scenario != "resumed")
+
+
 @pytest.mark.parametrize("failures", [1, 2])
 async def test_required_mcp_startup_timeout_recovers_before_sending_one_turn(failures):
     session = _CodexAppServerSession(
