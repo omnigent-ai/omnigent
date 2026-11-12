@@ -1142,13 +1142,24 @@ describe('WorkspacePanel "+" new-tab menu', () => {
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
 
-    const { openTerminalTab } = renderWorkspace({ showBrowserTab: false });
+    let accept: (() => void) | undefined;
+    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+      accept = commit;
+    });
+    const { openTerminalTab } = renderWorkspace({
+      showBrowserTab: false,
+      selectedFilePath: "notes.md",
+      fileGuard,
+    });
 
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
     // The default's type is shown inline in the row's label.
     const shellItem = await screen.findByRole("menuitem", { name: /shell \(zsh\)/i });
     fireEvent.click(shellItem);
 
+    expect(launch).not.toHaveBeenCalled();
+    act(() => accept?.());
+    expect(fileGuard).toHaveBeenCalledOnce();
     // Launches the default (first-declared) shell without a further pick.
     expect(launch).toHaveBeenCalledWith("zsh", expect.any(Object));
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
@@ -1920,6 +1931,42 @@ describe("WorkspacePanel sub-agent tabs", () => {
       openSideChats: ["conv_child"],
       selectedSideChatId: "conv_child",
     });
+  });
+
+  it("retires a declined queued reveal without changing tabs or replaying on remount", () => {
+    const guard = vi.fn();
+    const first = renderWorkspace({
+      selectedFilePath: "notes.md",
+      openFiles: ["notes.md"],
+      fileGuard: guard,
+    });
+    act(() =>
+      useChatStore.setState({ sideChatToOpen: { childId: SUBAGENT_TAB, parentId: "conv_ws" } }),
+    );
+    expect(guard).toHaveBeenCalledOnce();
+    expect(first.onRightRailTabChange).not.toHaveBeenCalled();
+    expect(useChatStore.getState().sideChatToOpen).toBeNull();
+    expect(readSessionWorkspaceState("conv_ws").selectedSideChatId).toBeUndefined();
+    first.view.unmount();
+    renderWorkspace({ fileGuard: guard });
+    expect(guard).toHaveBeenCalledOnce();
+  });
+
+  it("does not apply a queued reveal accepted after its owning session changed", () => {
+    let accept: (() => void) | undefined;
+    const view = renderWorkspace({
+      selectedFilePath: "notes.md",
+      fileGuard: (_path, _options, commit) => {
+        accept = commit;
+      },
+    });
+    act(() =>
+      useChatStore.setState({ sideChatToOpen: { childId: SUBAGENT_TAB, parentId: "conv_ws" } }),
+    );
+    view.rerender({ conversationId: "conv_other" });
+    act(() => accept?.());
+    expect(view.onRightRailTabChange).not.toHaveBeenCalled();
+    expect(readSessionWorkspaceState("conv_other").selectedSideChatId).toBeUndefined();
   });
 
   it("closes the tab without stopping the sub-agent", () => {

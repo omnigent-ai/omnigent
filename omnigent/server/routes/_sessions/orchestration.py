@@ -390,6 +390,7 @@ from omnigent.server.schemas import (
     ErrorDetail,
     NativeModelOption,
     NativeUsageBaseline,
+    SessionChildSessionUpdatedEvent,
     SessionCreateInput,
     SessionCreateMetadata,
     SessionEventInput,
@@ -1343,6 +1344,9 @@ def _build_session_list_item(
     # `user_id` is the requesting caller, never broadcast to other viewers.
     viewer_last_seen, viewer_unread = _read_state_entry(user_id, conv.id)
     return SessionListItem(
+        own_cost_usd=(conv.session_usage or {}).get(
+            "attributed_cost_usd", (conv.session_usage or {}).get("total_cost_usd")
+        ),
         id=conv.id,
         agent_id=conv.agent_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
@@ -1443,6 +1447,16 @@ def _publish_subtree_cost_to_ancestors(
         conv_store,
         conv.root_conversation_id if conv is not None else None,
     )
+    child = next((row for row in tree if row.id == session_id), None)
+    if child is not None and child.parent_conversation_id is not None:
+        usage = child.session_usage or {}
+        child_event = SessionChildSessionUpdatedEvent(
+            type="session.child_session.updated",
+            conversation_id=child.parent_conversation_id,
+            child_session_id=session_id,
+            child={"own_cost_usd": usage.get("attributed_cost_usd", usage.get("total_cost_usd"))},
+        )
+        session_stream.publish(child.parent_conversation_id, child_event.model_dump())
     for ancestor_id in ancestor_ids_from_tree(tree, session_id):
         ancestor_usage = _sum_subtree_usage(tree, ancestor_id)
         subtree_cost = _priced_cost_for_display(ancestor_usage)
@@ -1981,6 +1995,24 @@ def _persist_native_cumulative_usage(
         cumulative field was present.
     :raises OmnigentError: When a cumulative field is the wrong type.
     """
+    attributed_cost = _coerce_cumulative_field(data, "attributed_cost_usd", numeric=True)
+    if attributed_cost is not None:
+        # Display-only own-agent attribution; the parent's bill already includes it.
+        conv = conversation_store.get_conversation(session_id)
+        if conv is None or not conv.parent_conversation_id:
+            raise OmnigentError(
+                "Cost attribution requires a child session", code=ErrorCode.INVALID_INPUT
+            )
+        if any(key.startswith("cumulative_") or key == "policy_cost_usd" for key in data):
+            raise OmnigentError(
+                "Cost attribution must be reported separately", code=ErrorCode.INVALID_INPUT
+            )
+        current = dict(conv.session_usage or {})
+        current["attributed_cost_usd"] = max(
+            float(current.get("attributed_cost_usd", 0)), float(attributed_cost)
+        )
+        conversation_store.set_session_usage(session_id, current)
+        return _priced_cost_for_display(current)
     cost = _coerce_cumulative_field(data, "cumulative_cost_usd", numeric=True)
     policy_cost = _coerce_cumulative_field(data, "policy_cost_usd", numeric=True)
     cin = _coerce_cumulative_field(data, "cumulative_input_tokens", numeric=False)
@@ -2196,6 +2228,7 @@ async def _persist_external_session_usage(
             code=ErrorCode.INVALID_INPUT,
         )
     _CUMULATIVE_USAGE_KEYS = (
+        "attributed_cost_usd",
         "cumulative_cost_usd",
         # ``policy_cost_usd`` alone is a valid post: mid-turn the displayed
         # statusLine total (``cumulative_cost_usd``) is frozen, so the

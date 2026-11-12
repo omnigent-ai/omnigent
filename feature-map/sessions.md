@@ -9,6 +9,8 @@ the header menu), and each place is a separate entry point.
 
 ## Sub-features
 
+- `overview`: With the default-off `session_overview` server flag enabled, the header cost control opens an operational summary. It docks beside chat when Workspace is closed and space permits; narrow windows use an overlay. Explicit dismissal is remembered per session. Child rows navigate through the editor acceptance guard; modified clicks open their normal links.
+
 - `siblings`: **Add nested agent** creates a private, fresh conversation in the
   same sidebar family. Its composer follows the server's Add Agent destination
   policy and offers only the clicked member's ephemeral host among existing
@@ -253,6 +255,8 @@ the header menu), and each place is a separate entry point.
   keep their own touch handling.
 
 ## How to get to it (user POV)
+
+- **Session overview:** open a session, close Workspace on a wide window, or click the persistent header cost control. Select a child row to open that session.
 
 - For siblings, open an owned active session's sidebar kebab, right-click menu,
   or header menu and choose **Add nested agent**. Mobile row/header menus offer
@@ -1319,6 +1323,15 @@ outside the checkout to retain recordings.
 The component tests in `web/src/shell/HeaderConversationMenu.test.tsx` and
 `web/src/components/KeyboardShortcutsDialog.test.tsx` cover Cmd/Ctrl+Alt+A and
 its discoverability.
+
+The overview's cost/loading and child-navigation boundary is covered by
+`web/src/shell/SessionOverview.test.tsx`; pagination and cache patches have focused
+hook/store tests. Manual check: enable `session_overview` through
+`OMNIGENT_FEATURES`, open a session with children and changed files, close
+Workspace, then narrow the window and reopen the overview from the header.
+Dismiss and reload to confirm it stays hidden. With unsaved file edits, cancel
+child navigation and confirm the editor and URL remain; accept to navigate.
+Command-click or Ctrl-click a child to open its link separately.
 
 ## Gotchas
 

@@ -1,3 +1,4 @@
+import { formatSessionCostUsd } from "@/lib/formatCost";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { NodeTypes, NodeProps, Node } from "@xyflow/react";
 import { ReactFlow, Background, Position, Handle, useReactFlow } from "@xyflow/react";
@@ -75,6 +76,10 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
           <span className="flex-1" />
           <NodeStatusDot activity={activity} />
         </div>
+        <p className="text-[10px] text-muted-foreground">
+          Own cost:{" "}
+          {data.ownCostUsd == null ? "Unavailable" : formatSessionCostUsd(data.ownCostUsd)}
+        </p>
         {preview && (
           <p className="mt-1 truncate text-[10px] leading-tight text-muted-foreground">{preview}</p>
         )}

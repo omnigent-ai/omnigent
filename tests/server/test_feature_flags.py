@@ -34,6 +34,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
     )
     assert flags.frontend_dict() == {
         "sandbox_profiles": False,
+        "session_overview": False,
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
@@ -257,3 +258,13 @@ def test_mcp_harness_feature_mapping_is_complete():
     from omnigent.server.feature_flags import MCP_DISABLED_SERVERS_HARNESS_FEATURES
 
     assert MCP_DISABLED_SERVERS_HARNESS_FEATURES.keys() == HARNESS_EXECUTORS.keys()
+
+
+def test_session_overview_is_opt_in_and_advertised() -> None:
+    assert resolve_feature_flags({}).frontend_dict()["session_overview"] is False
+    assert (
+        resolve_feature_flags({FEATURES_ENV_VAR: "session_overview"}).frontend_dict()[
+            "session_overview"
+        ]
+        is True
+    )

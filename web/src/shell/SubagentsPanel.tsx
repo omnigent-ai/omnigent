@@ -1,3 +1,4 @@
+import { formatSessionCostUsd } from "@/lib/formatCost";
 // Subagents tab content for the right-side rail. Renders the session
 // tree under the root conversation — a "main" link back to the root,
 // then its sub-agent sessions recursively (children, grandchildren,
@@ -588,6 +589,11 @@ function SubagentRow({
             )}
             <StatusAvatar {...status} />
             <div className="min-w-0 flex-1">
+              <span title="Own-agent cost" className="text-xs font-mono text-muted-foreground">
+                {child.own_cost_usd == null
+                  ? "Unavailable"
+                  : formatSessionCostUsd(child.own_cost_usd)}
+              </span>
               <div className="flex min-w-0 items-center gap-[2px]">
                 <span
                   data-testid="subagent-agent-avatar"

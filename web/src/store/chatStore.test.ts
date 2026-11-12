@@ -794,11 +794,13 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().blocks).toHaveLength(1);
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+    expect(useChatStore.getState().sessionUsageLoading).toBe(true);
 
     finishUsage(usage("conv_usage", 3.5));
     await tick();
 
     expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+    expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     expect(useChatStore.getState().sessionUsageByModel).toEqual({
       "model-a": {
         inputTokens: 100,
@@ -11265,6 +11267,31 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
           pending_elicitations_count: 0,
         },
       ]);
+    });
+
+    it("preserves omitted own cost and honors zero/null in warm and cold child caches", () => {
+      const key = childSessionsQueryKey("conv_parent");
+      const send = (fields: Record<string, unknown>) =>
+        handleSessionEvent({
+          type: "session_child_session_updated",
+          conversationId: "conv_parent",
+          childSessionId: "conv_child1",
+          child: fields,
+        });
+      client.removeQueries({ queryKey: key });
+      send({ own_cost_usd: 2 });
+      const cost = () => client.getQueryData<ChildSessionInfo[]>(key)?.[0].own_cost_usd;
+      expect(cost()).toBe(2);
+      expect(client.getQueryState(key)?.dataUpdatedAt).toBe(0);
+      send({ busy: true });
+      expect(cost()).toBe(2);
+      send({ own_cost_usd: 0 });
+      expect(cost()).toBe(0);
+      send({ own_cost_usd: null });
+      expect(cost()).toBeNull();
+      client.removeQueries({ queryKey: key });
+      send({ own_cost_usd: 0 });
+      expect(cost()).toBe(0);
     });
 
     it("merges an existing child in place on a status change", () => {

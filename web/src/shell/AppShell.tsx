@@ -1,3 +1,4 @@
+import { SessionOverview, SessionCost } from "./SessionOverview";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
@@ -354,6 +355,11 @@ function AppShellImpl() {
   const navigateTo = useNavigate();
   const rebasePath = useRebasePath();
   const serverInfo = useServerInfo();
+  const [overviewState, setOverviewState] = useState<{
+    sessionId: string;
+    requested: boolean;
+    dismissed: boolean;
+  } | null>(null);
   const canvasMode =
     extensionId === undefined &&
     isCanvasPathname(location.pathname, rebasePath("/canvas")) &&
@@ -1599,6 +1605,21 @@ function AppShellImpl() {
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId, setRightPanelOpenAnimated],
   );
 
+  const overviewEnabled =
+    !!serverConversationId && isFeatureEnabled(serverInfo, "session_overview");
+  const overviewDismissed =
+    overviewState !== null && overviewState.sessionId === serverConversationId
+      ? overviewState.dismissed
+      : readSessionWorkspaceState(serverConversationId ?? "").overviewDismissed === true;
+  const overviewRequested =
+    overviewState !== null &&
+    overviewState.sessionId === serverConversationId &&
+    overviewState.requested;
+  const setOverviewVisible = (visible: boolean) => {
+    if (!serverConversationId) return;
+    setOverviewState({ sessionId: serverConversationId, requested: visible, dismissed: !visible });
+    writeSessionWorkspaceState(serverConversationId, { overviewDismissed: !visible });
+  };
   const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
   const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
     fileNavigationGuardsRef.current.add(guard);
@@ -1606,13 +1627,18 @@ function AppShellImpl() {
       fileNavigationGuardsRef.current.delete(guard);
     };
   }, []);
+  const guardVisit = useRef({ sessionId: conversationId, version: 0 });
+  if (guardVisit.current.sessionId !== conversationId) {
+    guardVisit.current = { sessionId: conversationId, version: guardVisit.current.version + 1 };
+  }
   const guardFileNavigation = useCallback(
     (path: string | null, options: OpenFileOptions | undefined, commit: () => void) => {
+      const visit = guardVisit.current;
       const guards = [...fileNavigationGuardsRef.current];
       const navigate = (index: number) => {
         const guard = guards[index];
         if (guard) guard(path, options, () => navigate(index + 1));
-        else commit();
+        else if (guardVisit.current === visit) commit();
       };
       navigate(0);
     },
@@ -1722,8 +1748,6 @@ function AppShellImpl() {
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
     if (rightPanelOpen) return;
-    writeSessionWorkspaceState(conversationId, { open: true });
-    writeDefaultWorkspacePanelOpen(true);
     setRightPanelOpenAnimated(true);
   }, [
     conversationId,
@@ -2063,8 +2087,10 @@ function AppShellImpl() {
       // Persist here only for background sessions that have no mounted hook.
       if (sourceConversationId !== conversationId) openBrowserTab(sourceConversationId, tabId);
       if (sourceConversationId === conversationId) {
-        handleRightRailTabChange("browser");
-        setRightPanelOpenAnimated(true);
+        guardFileNavigation(null, undefined, () => {
+          handleRightRailTabChange("browser");
+          setRightPanelOpenAnimated(true);
+        });
       }
     };
     const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
@@ -2076,7 +2102,7 @@ function AppShellImpl() {
       unsubscribeLink();
       unsubscribeAction();
     };
-  }, [conversationId, handleRightRailTabChange, setRightPanelOpenAnimated]);
+  }, [conversationId, handleRightRailTabChange, setRightPanelOpenAnimated, guardFileNavigation]);
 
   // Mobile FAB → "Side chats" opens the session's side chats as a full-screen
   // drawer (the desktop rail shows them as soft tabs). Also used when a side
@@ -2098,18 +2124,6 @@ function AppShellImpl() {
   // shows it — the Workspace rail, or the drawer on a phone. WorkspacePanel
   // owns opening/selecting the tab and clearing the one-shot `sideChatToOpen`
   // signal (it holds the side-chat tab state, like the browser tabs).
-  const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
-  useEffect(() => {
-    // Only the parent that owns the side chat reveals it: a fork that resolves
-    // after the user moved to another conversation must not surface over the
-    // one on screen (WorkspacePanel applies the same test before taking the
-    // signal, so it stays queued). Keyed on `conversationId` too, so coming
-    // back to the owner re-runs this and still reveals the tab.
-    if (sideChatToOpen === null || sideChatToOpen.parentId !== conversationId) return;
-    setRightPanelOpenAnimated(true);
-    // Phones hide the rail, so the side chat opens in its drawer instead.
-    if (isMobileViewport()) openSideChatsPanel();
-  }, [sideChatToOpen, conversationId, openSideChatsPanel, setRightPanelOpenAnimated]);
   const canStartSideChat = useCanStartSideChat(serverConversationId, permissionLevel);
   const showSideChats = supportsSideChat(
     useChatStore((s) => s.sessionHarness),
@@ -2133,7 +2147,6 @@ function AppShellImpl() {
       ) {
         return false;
       }
-      revealRightPanel();
       useChatStore.setState({
         sideChatToOpen: { childId: subagentTabId(childSessionId), parentId: conversationId },
       });
@@ -2146,7 +2159,6 @@ function AppShellImpl() {
       rootSessionId,
       parentSessionId,
       queryClient,
-      revealRightPanel,
     ],
   );
   // Side-chat and sub-agent tabs opened elsewhere must stay reachable from a
@@ -2848,7 +2860,7 @@ function AppShellImpl() {
                 data-workspace-panel-resizing={inlinePanelResizing || undefined}
                 data-workspace-panel-animate={rightPanelVisibilityAnimating || undefined}
                 className={cn(
-                  "relative flex min-h-0 min-w-0 flex-1",
+                  "@container relative flex min-h-0 min-w-0 flex-1",
                   panelOpen && !terminalFirst && "md:hidden",
                 )}
                 style={
@@ -2861,6 +2873,18 @@ function AppShellImpl() {
               >
                 {!extensionOwnsHeader && (
                   <ChatHeader
+                    sessionOverviewControl={
+                      overviewEnabled && (
+                        <button
+                          type="button"
+                          aria-label="Open session overview"
+                          className="flex shrink-0 items-center rounded-md px-2 py-1 font-mono text-xs hover:bg-muted"
+                          onClick={() => setOverviewVisible(true)}
+                        >
+                          <SessionCost sessionId={serverConversationId!} />
+                        </button>
+                      )
+                    }
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
                     // is a transient card floating over the collapsed layout (the
                     // docked sidebar stays w-0), so the header must keep its
@@ -2924,14 +2948,17 @@ function AppShellImpl() {
                       changedCount,
                       subagentsWorking,
                       agentCount,
-                      onOpenFiles: openFilesPanel,
-                      onOpenChanges: openChangesPanel,
-                      onOpenShells: openShellsPanel,
-                      onOpenSubagents: openSubagentsPanel,
-                      onOpenGithub: openGithubPanel,
+                      onOpenFiles: () => guardFileNavigation(null, undefined, openFilesPanel),
+                      onOpenChanges: () => guardFileNavigation(null, undefined, openChangesPanel),
+                      onOpenShells: () => guardFileNavigation(null, undefined, openShellsPanel),
+                      onOpenSubagents: () =>
+                        guardFileNavigation(null, undefined, openSubagentsPanel),
+                      onOpenGithub: () => guardFileNavigation(null, undefined, openGithubPanel),
                       showContentSearch: railTabsAvailable["content-search"],
-                      onOpenContentSearch: openContentSearchPanel,
-                      onOpenSideChats: openSideChatsPanel,
+                      onOpenContentSearch: () =>
+                        guardFileNavigation(null, undefined, openContentSearchPanel),
+                      onOpenSideChats: () =>
+                        guardFileNavigation(null, undefined, openSideChatsPanel),
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
                   />
@@ -2949,6 +2976,50 @@ function AppShellImpl() {
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
                 </GridSessionMain>
+
+                {overviewEnabled && !overviewDismissed && (
+                  <aside
+                    key={serverConversationId}
+                    className={cn(
+                      "absolute right-3 top-16 bottom-3 z-40 hidden w-64",
+                      overviewRequested && "block",
+                      !rightPanelOpen &&
+                        "@min-[1100px]:relative @min-[1100px]:inset-auto @min-[1100px]:z-10 @min-[1100px]:block @min-[1100px]:shrink-0 @min-[1100px]:px-2 @min-[1100px]:pt-14 @min-[1100px]:pb-3",
+                    )}
+                  >
+                    <SessionOverview
+                      onOpenAgents={() => {
+                        if (isMobileViewport()) openSubagentsPanel();
+                        else {
+                          handleRightRailTabChange("subagents");
+                          revealRightPanel();
+                        }
+                        setOverviewState({
+                          sessionId: serverConversationId!,
+                          requested: false,
+                          dismissed: true,
+                        });
+                      }}
+                      onOpenChanges={() => {
+                        if (isMobileViewport()) openChangesPanel();
+                        else {
+                          handleRightRailTabChange("changes");
+                          revealRightPanel();
+                        }
+                        setOverviewState({
+                          sessionId: serverConversationId!,
+                          requested: false,
+                          dismissed: true,
+                        });
+                      }}
+                      requested={overviewRequested}
+                      sessionId={serverConversationId!}
+                      canBrowseFiles={showFilesPanel}
+                      guard={guardFileNavigation}
+                      onDismiss={() => setOverviewVisible(false)}
+                    />
+                  </aside>
+                )}
 
                 {/* Debug-mode execution-logs rail — desktop only, hidden when a
               push panel is open (the panel itself becomes the focus). Only
@@ -2994,6 +3065,10 @@ function AppShellImpl() {
                     showContentSearch={railTabsAvailable["content-search"]}
                     showBrowserTab={railTabsAvailable.browser}
                     onReveal={revealRightPanel}
+                    onRevealSideChat={() => {
+                      revealRightPanel();
+                      if (isMobileViewport()) openSideChatsPanel();
+                    }}
                     onHide={rightPanelOpen ? toggleRightPanel : undefined}
                     changedCount={changedCount}
                     subagentsWorking={subagentsWorking}

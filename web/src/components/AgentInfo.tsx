@@ -179,7 +179,11 @@ const MODEL_TOKEN_ROWS: readonly { key: keyof ModelUsage; label: string }[] = [
  *
  * @param usageByModel - Map of raw harness model id to its cumulative usage.
  */
-function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, ModelUsage> }) {
+export function ModelUsageBreakdown({
+  usageByModel,
+}: {
+  usageByModel: Record<string, ModelUsage>;
+}) {
   const [isOpen, setIsOpen] = useState(false);
   // Stable display order: most total tokens first, so the dominant model
   // leads. Falls back to 0 for models that haven't recorded a total yet.
@@ -1452,6 +1456,7 @@ export function AgentInfoContent({
         </div>
       )}
       {sessionId &&
+        !(serverInfo !== "loading" && serverInfo.features.session_overview === true) &&
         (sessionCostUsd != null ||
           (usageByModel != null && Object.keys(usageByModel).length > 0)) && (
           <div className="flex flex-col gap-2 py-3">

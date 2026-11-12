@@ -11,6 +11,7 @@ export interface AgentNodeData {
   statusLabel: string;
   sessionId: string;
   isActive: boolean;
+  ownCostUsd?: number | null;
   preview: string | null;
   [key: string]: unknown;
 }
@@ -20,6 +21,7 @@ export interface TreeNode {
   label: string;
   activity: AgentActivity;
   statusLabel: string;
+  ownCostUsd?: number | null;
   preview: string | null;
   children: TreeNode[];
 }
@@ -92,6 +94,7 @@ export function layoutTree(
         sessionId: node.id,
         isActive: node.id === activeId,
         preview: node.preview,
+        ownCostUsd: node.ownCostUsd,
       },
     });
 
@@ -172,16 +175,19 @@ export function buildTree(
                     child.title ??
                     child.tool ??
                     child.id);
-              return buildTree(
-                child.id,
-                label,
-                status.activity,
-                status.label,
-                child.last_message_preview,
-                childrenMap,
-                depth + 1,
-                visited,
-              );
+              return {
+                ...buildTree(
+                  child.id,
+                  label,
+                  status.activity,
+                  status.label,
+                  child.last_message_preview,
+                  childrenMap,
+                  depth + 1,
+                  visited,
+                ),
+                ownCostUsd: child.own_cost_usd,
+              };
             }),
   };
 }

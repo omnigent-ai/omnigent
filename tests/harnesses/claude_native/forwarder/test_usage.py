@@ -697,3 +697,66 @@ async def test_forward_session_cost_tags_display_advance_with_model(
         estimate_box["value"] = 0.90
         await run()
         assert posted[-1] == {"policy_cost_usd": pytest.approx(0.90)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [400, 404, 429, 503, None])
+async def test_child_attribution_backfills_dedupes_and_retries_without_health_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: int | None,
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(forwarder.time, "monotonic", lambda: clock[0])
+    prices = [0.5]
+
+    def price(path: Path, *, include_sidechains: bool, cache: dict) -> float:
+        assert include_sidechains is True
+        return prices[0]
+
+    monkeypatch.setattr(forwarder, "_transcript_cost_size_cached", price)
+    posts = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content)["data"])
+        return httpx.Response(failure if len(posts) == 1 and failure else 202)
+
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "child": forwarder.SubagentEntry(
+                subagent_id="child",
+                child_conversation_id="conv_child",
+                byte_offset=999,
+            )
+        }
+    )
+    dedupe = forwarder._ForwardDedupeState()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="https://example.test"
+    ) as client:
+
+        async def run() -> None:
+            await forwarder._forward_child_costs(
+                client=client,
+                parent_transcript_path=tmp_path / "parent.jsonl",
+                subagent_state=state,
+                dedupe=dedupe,
+                cost_cache={},
+            )
+
+        await run()
+        await run()
+        assert len(posts) == 1
+        clock[0] += 31
+        await run()
+        if failure in (400, 404):
+            assert len(posts) == 1
+            dedupe = forwarder._ForwardDedupeState()
+            await run()
+            assert len(posts) == 2
+        else:
+            assert len(posts) == (1 if failure is None else 2)
+            prices[0] = 0.2
+            await run()
+            assert dedupe.attributed_costs["conv_child"] == 0.5
+        assert all(post == {"attributed_cost_usd": 0.5} for post in posts)

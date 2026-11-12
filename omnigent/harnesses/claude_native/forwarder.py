@@ -901,6 +901,9 @@ class _ForwardDedupeState:
     # ``max(S, forwarder transcript estimate)``, which reflects in-flight
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
+    attributed_costs: dict[str, float] = field(default_factory=dict)
+    attribution_disabled: bool = False
+    attribution_retry_at: float = 0.0
     posted_policy_cost: float | None = None
     # Last permission mode POSTed as ``external_permission_mode_change`` —
     # mirrors the launch mode and any in-pane shift+tab switch, neither of
@@ -3158,6 +3161,49 @@ def _session_cost_estimate(
     return max(candidates)
 
 
+async def _forward_child_costs(
+    *,
+    client: httpx.AsyncClient,
+    parent_transcript_path: Path,
+    subagent_state: SubagentForwardState,
+    dedupe: _ForwardDedupeState,
+    cost_cache: dict[Path, _TranscriptCostCacheEntry],
+) -> None:
+    """Backfill display-only child attribution, independently of transcript delivery."""
+    if dedupe.attribution_disabled or time.monotonic() < dedupe.attribution_retry_at:
+        return
+    directory = _subagents_dir_for_transcript(parent_transcript_path)
+    for entry in subagent_state.subagents.values():
+        child_id = entry.child_conversation_id
+        if not child_id:
+            continue
+        cost = await asyncio.to_thread(
+            _transcript_cost_size_cached,
+            directory / f"agent-{entry.subagent_id}.jsonl",
+            include_sidechains=True,
+            cache=cost_cache,
+        )
+        if cost is None or cost <= dedupe.attributed_costs.get(child_id, -1):
+            continue
+        try:
+            await _post_external_session_usage(
+                client,
+                session_id=child_id,
+                usage={"attributed_cost_usd": cost},
+            )
+        except httpx.HTTPError as exc:
+            if (
+                isinstance(exc, httpx.HTTPStatusError)
+                and 400 <= exc.response.status_code < 500
+                and exc.response.status_code not in (408, 429)
+            ):
+                dedupe.attribution_disabled = True
+            else:
+                dedupe.attribution_retry_at = time.monotonic() + 30
+            return
+        dedupe.attributed_costs[child_id] = cost
+
+
 async def _forward_session_cost(
     *,
     client: httpx.AsyncClient,
@@ -3219,6 +3265,13 @@ async def _forward_session_cost(
         mutated in place.
     :returns: None.
     """
+    await _forward_child_costs(
+        client=client,
+        parent_transcript_path=parent_transcript_path,
+        subagent_state=subagent_state,
+        dedupe=dedupe,
+        cost_cache=cost_cache,
+    )
     if time.monotonic() < dedupe.cost_retry_not_before:
         return
     status_state = await asyncio.to_thread(read_claude_context_state, bridge_dir)

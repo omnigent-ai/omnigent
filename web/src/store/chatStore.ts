@@ -1045,6 +1045,7 @@ export interface ConversationState {
    * session metadata and updated by ``session.usage`` SSE events.
    * ``null`` while unknown or unpriced, never a misleading ``$0.00``.
    */
+  sessionUsageLoading: boolean;
   sessionCostUsd: number | null;
   /**
    * Per-model usage breakdown over the active session's subtree (itself +
@@ -2254,6 +2255,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   subAgentName: null,
   contextWindow: null,
   tokensUsed: null,
+  sessionUsageLoading: true,
   sessionCostUsd: null,
   sessionUsageByModel: null,
   gitBranch: null,
@@ -5532,6 +5534,7 @@ async function bindStream(
       };
     });
     if (session.usageIncluded === false) void hydrateSessionUsage(id);
+    else set({ sessionUsageLoading: false });
     racedNativeModelOptions.delete(id);
   } catch (err) {
     if (isConversationDisposed(id)) return;
@@ -5584,6 +5587,8 @@ async function hydrateSessionUsage(id: string): Promise<void> {
   } catch {
     // Usage is optional display data; retain known totals or leave them unknown.
   } finally {
+    if (!controller.signal.aborted && conversationRegistry.peek(id) === entry)
+      entrySetter(entry)({ sessionUsageLoading: false });
     sessionUsageHydrations.delete(controller);
   }
 }
@@ -9750,6 +9755,7 @@ function applyChildSessionUpdated(
   // sends full child rows over the stream, so seeding here lets child
   // status/preview update live even when no useChildSessions is mounted.
   const current = queryClient.getQueryData<ChildSessionInfo[]>(key) ?? [];
+  const updatedAt = queryClient.getQueryState(key)?.dataUpdatedAt ?? 0;
 
   // Build a patch from only the fields PRESENT in the payload (undefined
   // = "not in this delta, leave as-is"); explicit null is a real value.
@@ -9771,6 +9777,8 @@ function applyChildSessionUpdated(
     if (!record.code || !record.message) return null;
     return { code: record.code, message: record.message };
   };
+  if (child.own_cost_usd !== undefined)
+    patch.own_cost_usd = typeof child.own_cost_usd === "number" ? child.own_cost_usd : null;
   if (child.title !== undefined) patch.title = strOrNull(child.title);
   if (child.tool !== undefined) patch.tool = strOrNull(child.tool);
   if (child.session_name !== undefined) patch.session_name = strOrNull(child.session_name);
@@ -9793,6 +9801,7 @@ function applyChildSessionUpdated(
     // update (snapshot/refetch) fills them in.
     const inserted: ChildSessionInfo = {
       id: childId,
+      ...(patch.own_cost_usd !== undefined ? { own_cost_usd: patch.own_cost_usd } : {}),
       title: patch.title ?? null,
       task_summary: patch.task_summary ?? null,
       tool: patch.tool ?? null,
@@ -9804,12 +9813,12 @@ function applyChildSessionUpdated(
       last_message_preview: patch.last_message_preview ?? null,
       pending_elicitations_count: patch.pending_elicitations_count ?? 0,
     };
-    queryClient.setQueryData<ChildSessionInfo[]>(key, [inserted, ...current]);
+    queryClient.setQueryData<ChildSessionInfo[]>(key, [inserted, ...current], { updatedAt });
     return;
   }
   const next = [...current];
   next[idx] = { ...current[idx], ...patch };
-  queryClient.setQueryData<ChildSessionInfo[]>(key, next);
+  queryClient.setQueryData<ChildSessionInfo[]>(key, next, { updatedAt });
 }
 
 /**

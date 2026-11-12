@@ -400,6 +400,31 @@ def test_harness_override_is_streamed_and_cleared(app: FastAPI, stores, fast_res
         assert item["harness"] is None
 
 
+def test_watched_child_cost_changes_without_activity_change(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    store = stores[0]
+    parent = _seed_session(stores, owner=ALICE, title="parent")
+    child = store.create_conversation(
+        kind="sub_agent",
+        title="child",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        parent_conversation_id=parent,
+    )
+    stores[2].grant(ALICE, child.id, LEVEL_OWNER)
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [child.id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        assert snapshot["items"][0]["own_cost_usd"] is None
+        for usage, expected in [({"total_cost_usd": 0}, 0), ({"attributed_cost_usd": 0.5}, 0.5)]:
+            store.set_session_usage(child.id, usage)
+            changed = _recv_until(ws, {"changed"})
+            assert changed["items"][0]["parent_session_id"] == parent
+            assert changed["items"][0]["own_cost_usd"] == expected
+
+
 def test_no_change_emits_no_changed_frame(app: FastAPI, stores, fast_rescan: None) -> None:
     """An idle watched session produces no ``changed`` frames — only
     heartbeats — so a static list generates no diff traffic."""
@@ -1078,6 +1103,23 @@ def test_daily_cost_tracks_display_cost_not_policy_cost(app: FastAPI, stores) ->
     # Daily = S (0.20), NOT the 0.90 enforcement figure. A value of 0.90 would
     # mean the rollup tracked policy_cost_usd and inherited the gate's
     # mid-turn inflation — the daily over-report this split prevents.
+    assert conversation_store.get_daily_cost(ALICE, today) == pytest.approx(0.20)
+
+    child = conversation_store.create_conversation(
+        title="child",
+        agent_id="0123456789abcdef0123456789abcdef",
+        parent_conversation_id=sid,
+    )
+    for cost in (0.6, 0.6, 0.2):
+        response = TestClient(app).post(
+            f"/v1/sessions/{child.id}/events",
+            json={"type": "external_session_usage", "data": {"attributed_cost_usd": cost}},
+            headers={"X-Forwarded-Email": ALICE},
+        )
+        assert response.status_code == 202, response.text
+    usage = conversation_store.get_conversation(child.id).session_usage
+    assert usage["attributed_cost_usd"] == pytest.approx(0.6)
+    assert "total_cost_usd" not in usage
     assert conversation_store.get_daily_cost(ALICE, today) == pytest.approx(0.20)
 
 

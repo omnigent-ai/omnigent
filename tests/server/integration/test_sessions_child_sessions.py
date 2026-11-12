@@ -188,6 +188,8 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
         agent_id=session["agent_id"],
     )
 
+    conv_store.set_session_usage(child.id, {"total_cost_usd": 3.0, "attributed_cost_usd": 0.5})
+
     resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
     assert resp.status_code == 200
     body = resp.json()
@@ -225,6 +227,7 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     assert row["pending_elicitations_count"] == 0
     # Set only by ``?descendants=true``; clients use it to tell the modes apart.
     assert row["depth"] is None
+    assert row["own_cost_usd"] == 0.5
 
 
 async def test_child_sessions_surfaces_durable_failure_error(

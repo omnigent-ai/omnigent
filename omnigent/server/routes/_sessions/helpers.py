@@ -11842,6 +11842,9 @@ def _child_session_summary_from_conversation(
 
     routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
     return ChildSessionSummary(
+        own_cost_usd=(conv.session_usage or {}).get(
+            "attributed_cost_usd", (conv.session_usage or {}).get("total_cost_usd")
+        ),
         id=conv.id,
         parent_session_id=parent_session_id,
         title=display_title,

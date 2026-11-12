@@ -28,6 +28,7 @@ class Feature(StrEnum):
     SIBLING_SESSIONS = "sibling_sessions"
     PEER_SESSION_MESSAGING = "peer_session_messaging"
     CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
+    SESSION_OVERVIEW = "session_overview"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     MCP_DISABLED_SERVERS = "mcp_disabled_servers"
@@ -59,6 +60,12 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.SESSION_OVERVIEW,
+        description="Compact operational session overview beside chat",
+        owner="web",
+        review_by_release="0.24.0",
+    ),
     FeatureDefinition(
         feature=Feature.CODEX_PLAN_AT_LAUNCH,
         description="Start Codex in Plan mode with host compatibility checks",

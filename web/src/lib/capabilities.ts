@@ -64,6 +64,7 @@ export type FeatureKey =
   | "import_review"
   | "custom_agents_settings_ui"
   | "sidebar_grouping_ui"
+  | "session_overview"
   | "workspace_content_search"
   | "grid_sessions_display_ui"
   | "automations_v2"

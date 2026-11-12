@@ -61,6 +61,7 @@ export interface ChildSessionInfo {
    * ``"databricks-claude-sonnet-5"``. ``null``/absent when the child was
    * not routed (routing off, or a server that predates the field).
    */
+  own_cost_usd?: number | null;
   routed_model?: string | null;
 }
 
@@ -81,12 +82,15 @@ interface ChildSessionWire {
   busy: boolean;
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
+  own_cost_usd?: number | null;
   routed_model?: string | null;
 }
 
 interface ChildSessionsResponse {
   object: "list";
   data: ChildSessionWire[];
+  has_more?: boolean;
+  last_id?: string | null;
 }
 
 /**
@@ -203,12 +207,34 @@ interface UseChildSessionsResult {
  * Exported for unit testing of the HTTP-shape contract; production
  * code should call ``useChildSessions``.
  */
-export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions`,
-  );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as ChildSessionsResponse;
+export async function fetchChildSessions(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<ChildSessionInfo[]> {
+  const rows = new Map<string, ChildSessionWire>();
+  const cursors = new Set<string>();
+  let after: string | null = null;
+  let hasMore = true;
+  while (hasMore) {
+    const params = new URLSearchParams({ limit: "100" });
+    if (after !== null) params.set("after", after);
+    // Cursor pages depend on the preceding response.
+    // oxlint-disable-next-line no-await-in-loop
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions?${params}`,
+      { signal },
+    );
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    // oxlint-disable-next-line no-await-in-loop
+    const page = (await res.json()) as ChildSessionsResponse;
+    for (const row of page.data) rows.set(row.id, row);
+    hasMore = page.has_more === true;
+    if (!hasMore) break;
+    after = page.last_id ?? page.data.at(-1)?.id ?? null;
+    if (after === null || cursors.has(after)) throw new Error("Repeated child-session cursor");
+    cursors.add(after);
+  }
+  const json = { data: [...rows.values()] };
   // Children run on this session's runner: record the link so their
   // session-scoped requests key by this session's host before their own
   // snapshot loads.
@@ -226,6 +252,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
     routed_model: row.routed_model ?? null,
+    own_cost_usd: row.own_cost_usd ?? null,
   }));
 }
 
@@ -255,11 +282,11 @@ export function useChildSessions(
       sessionId === null
         ? ["conversation", null, "child_sessions"]
         : childSessionsQueryKey(sessionId),
-    queryFn: () => fetchChildSessions(sessionId as string),
+    queryFn: ({ signal }) => fetchChildSessions(sessionId as string, signal),
     enabled: sessionId !== null,
     staleTime: 60_000,
     retry: false,
-    refetchOnMount: false,
+    refetchOnMount: true,
     refetchInterval: pollMs ?? false,
   });
   return {

@@ -1196,6 +1196,18 @@
             "title": "Object",
             "type": "string"
           },
+          "own_cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Own Cost Usd"
+          },
           "parent_session_id": {
             "description": "Parent conversation id (echo of the route's `session_id` path parameter), e.g. `\"conv_parent987\"`. Stable join key for clients that cache child rows across multiple parents.",
             "title": "Parent Session Id",
@@ -8852,6 +8864,18 @@
             "description": "Session-scoped guardrails labels.",
             "title": "Labels",
             "type": "object"
+          },
+          "own_cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Own Cost Usd"
           },
           "owner": {
             "anyOf": [

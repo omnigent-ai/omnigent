@@ -226,6 +226,7 @@ function NewTabMenu({
 }) {
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
+  const guard = useContext(FileViewerContext)?.guardFileNavigation;
   const connectState = shellConnectState(liveness);
   // Remembered shell type, persisted across remounts/reloads. Seeded from
   // localStorage so the "+" in either strip spot agrees on the current pick.
@@ -247,16 +248,20 @@ function NewTabMenu({
   const defaultShell = resolveDefaultShell(declaredTerminals, preferred) as string;
 
   const launchShell = (name: string) => {
-    setMenuOpen(false);
-    // Signal the create is starting so the shell gets focused the moment its
-    // tab lands in the list — not only when this POST resolves. On a waking
-    // (runner-asleep) session the POST can lag the tab's arrival by seconds;
-    // ``onOpenTerminal`` on success is a backstop for when it's already open.
-    onCreateStart?.();
-    create.launch(name, {
-      onOpen: (info) => onOpenTerminal(terminalTabKey(info)),
-      onError: (_error, opened) => onCreateError?.(opened),
-    });
+    const launch = () => {
+      setMenuOpen(false);
+      // Signal the create is starting so the shell gets focused the moment its
+      // tab lands in the list — not only when this POST resolves. On a waking
+      // (runner-asleep) session the POST can lag the tab's arrival by seconds;
+      // ``onOpenTerminal`` on success is a backstop for when it's already open.
+      onCreateStart?.();
+      create.launch(name, {
+        onOpen: (info) => onOpenTerminal(terminalTabKey(info)),
+        onError: (_error, opened) => onCreateError?.(opened),
+      });
+    };
+    if (guard) guard(null, undefined, launch);
+    else launch();
   };
 
   // Launch a type and remember it as the new default for next time.
@@ -707,6 +712,7 @@ interface WorkspacePanelProps {
    * Switch rail tabs. AppShell owns the side effects (clearing any open
    * file + its comments + URL) so they can't drift from the tab state.
    */
+  onRevealSideChat?: () => void;
   onRightRailTabChange: (next: RightRailTab | null) => void;
   /** Unpinned built-in pages opened as closable tabs for this session. */
   openPanels: DefaultWorkspaceTab[];
@@ -888,6 +894,7 @@ function WorkspacePanelImpl({
   rightRailTab,
   tabListRef,
   onRightRailTabChange,
+  onRevealSideChat,
   openPanels,
   onClosePanel,
   showFilesPanel,
@@ -1065,7 +1072,9 @@ function WorkspacePanelImpl({
     ) {
       focus = { element: active };
     }
+    const visit = sessionVisitRef.current;
     const openBrowser = () => {
+      if (sessionVisitRef.current !== visit) return;
       const tabId = browsers.add();
       returnPointRef.current = {
         tabId,
@@ -1123,27 +1132,42 @@ function WorkspacePanelImpl({
     // screen now.
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
-    const subagentId = subagentSessionIdFromTab(childId);
-    if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
-      // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
-      sideChats.select(subagentId);
-    } else if (childId.startsWith("pending:") || subagentId !== null) {
-      // "Ask in side chat" (a not-yet-forked tab) and sub-agent tabs (an
-      // existing session) must not take a slot in the Codex awaiting queue.
-      sideChats.open(childId);
-    } else {
-      const awaiting = awaitingPendingIdsRef.current.shift();
-      if (awaiting !== undefined) {
-        sideChats.rekey(awaiting, childId);
-        useChatStore.getState().clearSideChatComposer(awaiting);
-      } else {
-        // Generic already rekeyed its own tab; this just re-selects it (idempotent).
-        sideChats.open(childId);
-      }
-    }
-    onRightRailTabChange("sidechat");
     clearSideChatToOpen();
-  }, [sideChatToOpen, conversationId, sideChats, onRightRailTabChange, clearSideChatToOpen]);
+    const visit = sessionVisitRef.current;
+    const commit = () => {
+      if (sessionVisitRef.current !== visit) return;
+      const subagentId = subagentSessionIdFromTab(childId);
+      if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
+        // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
+        sideChats.select(subagentId);
+      } else if (childId.startsWith("pending:") || subagentId !== null) {
+        // "Ask in side chat" (a not-yet-forked tab) and sub-agent tabs (an
+        // existing session) must not take a slot in the Codex awaiting queue.
+        sideChats.open(childId);
+      } else {
+        const awaiting = awaitingPendingIdsRef.current.shift();
+        if (awaiting !== undefined) {
+          sideChats.rekey(awaiting, childId);
+          useChatStore.getState().clearSideChatComposer(awaiting);
+        } else {
+          // Generic already rekeyed its own tab; this just re-selects it (idempotent).
+          sideChats.open(childId);
+        }
+      }
+      onRightRailTabChange("sidechat");
+      onRevealSideChat?.();
+    };
+    if (guardFileNavigation) guardFileNavigation(null, undefined, commit);
+    else commit();
+  }, [
+    sideChatToOpen,
+    conversationId,
+    sideChats,
+    onRightRailTabChange,
+    clearSideChatToOpen,
+    guardFileNavigation,
+    onRevealSideChat,
+  ]);
   const sideChatSelected =
     rightRailTab === "sidechat" &&
     selectedFilePath === null &&
@@ -1177,8 +1201,10 @@ function WorkspacePanelImpl({
   }, [savedSideChats, discoverSideChats, restoreSideChats]);
   const onNewSideChat = supportsSideChat(sideChatHarness, canStartSideChat)
     ? () => {
-        useChatStore.getState().requestSideChatFocus(sideChats.openPending());
-        onRightRailTabChange("sidechat");
+        leaveFileRef.current(null, () => {
+          useChatStore.getState().requestSideChatFocus(sideChats.openPending());
+          onRightRailTabChange("sidechat");
+        });
       }
     : undefined;
   // First message sent in a pending side-chat tab: create the fork now. The
@@ -1421,7 +1447,7 @@ function WorkspacePanelImpl({
     <NewTabMenu
       conversationId={conversationId}
       panels={unpinnedTabs}
-      onOpenPanel={selectPermanentTab}
+      onOpenPanel={(tab) => leaveFileRef.current(null, () => selectPermanentTab(tab))}
       onOpenBrowser={showBrowserTab ? addBrowserFromMenu : undefined}
       onOpen={noteMenuOrigin}
       onOpenSideChat={onNewSideChat}
@@ -1462,8 +1488,10 @@ function WorkspacePanelImpl({
   workspaceTabHotkeyRef.current = (index) => {
     const tab = visiblePermanentTabs[index];
     if (!tab || pending || !keyboardTarget) return false;
-    selectPermanentTab(tab);
-    onReveal?.();
+    leaveFileRef.current(null, () => {
+      selectPermanentTab(tab);
+      onReveal?.();
+    });
     return true;
   };
   useWorkspaceTabHotkeys(workspaceTabHotkeyRef);
@@ -1856,7 +1884,9 @@ function WorkspacePanelImpl({
                     ? "__tab__"
                     : (rightRailTab ?? "__empty__")
               }
-              onValueChange={(value) => selectPermanentTab(value as RightRailTab)}
+              onValueChange={(value) =>
+                leaveFileRef.current(null, () => selectPermanentTab(value as RightRailTab))
+              }
               componentId="chat.right_rail.tabs"
             >
               <TabsList variant="pill" className="gap-1">
@@ -1901,7 +1931,7 @@ function WorkspacePanelImpl({
                         aria-label={label}
                         aria-selected={active}
                         className="flex items-center gap-1"
-                        onClick={() => selectPermanentTab(tab)}
+                        onClick={() => leaveFileRef.current(null, () => selectPermanentTab(tab))}
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();
@@ -1935,7 +1965,7 @@ function WorkspacePanelImpl({
                   closingKey={closingTerminalKey ?? null}
                   canClose={isEditorLevel(permissionLevel)}
                   labelFor={terminalLabelFor}
-                  onSelect={openTerminalTab}
+                  onSelect={(key) => leaveFileRef.current(null, () => openTerminalTab(key))}
                   onClose={onCloseTerminal}
                 />
                 {showBrowserTab &&
@@ -1962,10 +1992,12 @@ function WorkspacePanelImpl({
                             void closeBrowserTab(tabId);
                           }
                         }}
-                        onClick={() => {
-                          browsers.select(tabId);
-                          onRightRailTabChange("browser");
-                        }}
+                        onClick={() =>
+                          leaveFileRef.current(null, () => {
+                            browsers.select(tabId);
+                            onRightRailTabChange("browser");
+                          })
+                        }
                       >
                         <GlobeIcon className="size-4 shrink-0" />
                         <span className="max-w-44 truncate">{browsers.labelFor(tabId, index)}</span>
@@ -2007,10 +2039,12 @@ function WorkspacePanelImpl({
                             closeSideChat(childId);
                           }
                         }}
-                        onClick={() => {
-                          sideChats.select(childId);
-                          onRightRailTabChange("sidechat");
-                        }}
+                        onClick={() =>
+                          leaveFileRef.current(null, () => {
+                            sideChats.select(childId);
+                            onRightRailTabChange("sidechat");
+                          })
+                        }
                       >
                         <TabIcon className="size-4 shrink-0" />
                         <span className="max-w-[16ch] truncate">{label}</span>
@@ -2075,7 +2109,10 @@ function WorkspacePanelImpl({
                   {panelOptions.map((option) => (
                     <DropdownMenuItem
                       key={option.key}
-                      onSelect={option.select}
+                      onSelect={() => {
+                        if (option.key.startsWith("file:")) option.select();
+                        else leaveFileRef.current(null, option.select);
+                      }}
                       disabled={option.disabled}
                       title={option.label}
                       aria-current={option.active ? "true" : undefined}

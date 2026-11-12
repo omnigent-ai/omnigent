@@ -25,6 +25,7 @@ const RAIL_TABS: readonly RightRailTab[] = [
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
+  overviewDismissed?: boolean;
   open?: boolean;
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
@@ -99,6 +100,8 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (typeof entry !== "object" || entry === null) return {};
   const record = entry as Record<string, unknown>;
   const state: SessionWorkspaceState = {};
+  if (typeof record.overviewDismissed === "boolean")
+    state.overviewDismissed = record.overviewDismissed;
   if (typeof record.open === "boolean") state.open = record.open;
   if (isValidWidth(record.widthPx)) state.widthPx = record.widthPx;
   if (record.rightRailTab === null || isRailTab(record.rightRailTab)) {

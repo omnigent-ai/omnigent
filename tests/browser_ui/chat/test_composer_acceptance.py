@@ -134,7 +134,7 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
         ),
     )
     page.route(
-        f"**/v1/sessions/{session_id}/child_sessions",
+        f"**/v1/sessions/{session_id}/child_sessions?*",
         lambda route: route.fulfill(
             json={
                 "data": [

@@ -1019,6 +1019,7 @@ class ChildSessionSummary(BaseModel):
     pending_elicitations_count: int = 0
     routed_model: str | None = None
     routing_decision_id: str | None = None
+    own_cost_usd: float | None = None
     depth: int | None = None
 
 
@@ -3375,6 +3376,7 @@ class SessionListItem(BaseModel):
         "not known yet". ``None`` on servers without PR storage.
     """
 
+    own_cost_usd: float | None = None
     family: SessionFamily | None = None
     id: str
     agent_id: str

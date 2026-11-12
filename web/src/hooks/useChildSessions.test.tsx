@@ -4,7 +4,12 @@ import type { PropsWithChildren } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { useChildSessions, useDescendantSession } from "./useChildSessions";
+import {
+  childSessionsQueryKey,
+  fetchChildSessions,
+  useChildSessions,
+  useDescendantSession,
+} from "./useChildSessions";
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
@@ -61,6 +66,45 @@ describe("useDescendantSession", () => {
 
     expect(result.current).toBeNull();
     await waitFor(() => expect(result.current?.task_summary).toBe("Investigate auth flow"));
-    expect(authenticatedFetch).toHaveBeenCalledWith("/v1/sessions/conv_parent/child_sessions");
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/sessions/conv_parent/child_sessions?limit=100",
+      { signal: expect.any(AbortSignal) },
+    );
   });
+});
+
+it("loads every bounded page and rejects a repeated cursor", async () => {
+  const fetch = vi.mocked(authenticatedFetch);
+  const page = (id: string, more: boolean) =>
+    new Response(JSON.stringify({ data: [{ id, own_cost_usd: 0 }], has_more: more, last_id: id }));
+  fetch.mockResolvedValueOnce(page("first", true)).mockResolvedValueOnce(page("last", false));
+  const signal = new AbortController().signal;
+  expect(
+    (await fetchChildSessions("parent", signal)).map((child) => [child.id, child.own_cost_usd]),
+  ).toEqual([
+    ["first", 0],
+    ["last", 0],
+  ]);
+  expect(fetch).toHaveBeenLastCalledWith(
+    "/v1/sessions/parent/child_sessions?limit=100&after=first",
+    { signal },
+  );
+  fetch.mockResolvedValueOnce(page("first", true)).mockResolvedValueOnce(page("first", true));
+  await expect(fetchChildSessions("parent")).rejects.toThrow("Repeated child-session cursor");
+});
+
+it("fetches the complete list when SSE seeded only a partial cold cache", async () => {
+  const client = new QueryClient();
+  client.setQueryData(childSessionsQueryKey("parent"), [{ id: "partial" }], { updatedAt: 0 });
+  vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+    new Response(JSON.stringify({ data: [{ id: "first" }, { id: "second" }] })),
+  );
+  const { result } = renderHook(() => useChildSessions("parent"), {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+  await waitFor(() =>
+    expect(result.current.children.map((child) => child.id)).toEqual(["first", "second"]),
+  );
 });
