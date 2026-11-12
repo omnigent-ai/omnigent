@@ -1,4 +1,3 @@
-import { isAdminViewEnabled } from "@/lib/adminView";
 // Session loading for the Canvas page. The sidebar pages through the list 30
 // rows at a time, which is right for a scrolling list but makes a canvas of
 // several hundred sessions take dozens of sequential requests to fill. The
@@ -15,6 +14,7 @@ import {
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
+import { isAdminViewEnabled } from "@/lib/adminView";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
