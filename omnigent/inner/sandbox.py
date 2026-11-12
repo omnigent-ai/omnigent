@@ -569,13 +569,17 @@ def validate_harness_sandbox(
             raise ValueError(f"{harness} does not support os_env.sandbox.{feature}")
 
 
+class UnsupportedHarnessSandboxError(ValueError):
+    """The selected adapter cannot install requested process confinement."""
+
+
 def reject_unsupported_harness_sandbox(spec: OSEnvSpec | None, harness: str) -> None:
     """Prevent native tools from ignoring a sandbox the adapter cannot install."""
     if spec is None:
         return
     validate_harness_sandbox(spec, harness)
     if spec.sandbox is None or spec.sandbox.type != "none":
-        raise ValueError(
+        raise UnsupportedHarnessSandboxError(
             f"{harness} cannot enforce os_env.sandbox; choose a sandbox-capable harness"
         )
 

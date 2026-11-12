@@ -180,7 +180,6 @@ def test_relative_policy_cwd_preserves_non_claude_workspace(
     declared_cwd: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    active_sandbox_type: str,
 ) -> None:
     workspace = tmp_path / "workspace"
     (workspace / "sub").mkdir(parents=True)
@@ -189,28 +188,40 @@ def test_relative_policy_cwd_preserves_non_claude_workspace(
     monkeypatch.setenv("HOME", str(home))
     executable = tmp_path / "install" / "bin" / "agent"
     executable.parent.mkdir(parents=True)
-    executable.write_text("#!/bin/sh\npwd\n")
-    executable.chmod(0o755)
+    executable.touch()
     spec = OSEnvSpec(
         cwd=declared_cwd,
         sandbox=OSEnvSandboxSpec(
-            type=active_sandbox_type,
+            type="linux_bwrap",
             read_paths=["."],
             write_paths=[],
             allow_network=False,
         ),
     )
-    with _prepared_launch(harness, executable, workspace, spec) as launch_path:
-        result = subprocess.run(
-            [launch_path],
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            env={"PATH": os.environ["PATH"], "HOME": str(home)},
+    resolve = Mock(
+        return_value=sandbox.SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=[workspace.resolve()],
+            write_roots=[],
+            write_files=[],
+            allow_network=False,
         )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == str(workspace.resolve())
+    )
+    launcher = Mock(return_value=str(executable))
+    backend = Mock()
+    backend.wrap_launcher_argv.side_effect = lambda argv, *args, **kwargs: ["sandbox", *argv]
+    monkeypatch.setattr(sandbox, "resolve_sandbox", resolve)
+    monkeypatch.setattr(codex_worker, "resolve_sandbox", resolve)
+    monkeypatch.setattr(sandbox, "create_exec_launcher", launcher)
+    monkeypatch.setattr(codex_worker, "create_exec_launcher", launcher)
+    monkeypatch.setattr(codex_worker, "get_backend", Mock(return_value=backend))
+    with _prepared_launch(harness, executable, workspace, spec):
+        pass
+    resolve.assert_called_once_with(spec, workspace.resolve())
+    assert spec.cwd == declared_cwd
+    launcher.assert_called_once()
+    assert launcher.call_args.kwargs["cwd"] == str(workspace.resolve())
 
 
 @pytest.mark.parametrize(

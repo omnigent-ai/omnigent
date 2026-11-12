@@ -1514,7 +1514,9 @@ def test_spec_resolve_error_detail_names_structured_cause(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["outage", "unsupported-policy", "invalid-spec"])
+@pytest.mark.parametrize(
+    "failure", ["outage", "unsupported-policy", "invalid-spec", "private-policy-detail"]
+)
 async def test_runner_post_releases_turn_when_spec_resolution_fails(
     caplog: pytest.LogCaptureFixture,
     pinned_runner_log: Path,
@@ -1526,6 +1528,7 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
     from unittest.mock import AsyncMock
 
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import UnsupportedHarnessSandboxError
 
     async def _failing_spec_resolver(
         agent_id: str, session_id: str | None = None
@@ -1540,6 +1543,8 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
             )
         if failure == "invalid-spec":
             raise ValueError("invalid spec from internal-host:6767/private/agent.yaml")
+        if failure == "private-policy-detail":
+            raise UnsupportedHarnessSandboxError("private-policy-token at internal-host:6767")
         raise RuntimeError(f"spec resolver unavailable for {agent_id}")
 
     manager = _FakeProcessManager()
@@ -1584,14 +1589,20 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
     body = response.json()
     if failure != "outage":
         assert body["error"]["code"] == "invalid_input"
-        assert body["error"]["message"] == (
+        detail = (
             f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
         )
-        cause = (
-            "Antigravity cannot enforce"
-            if failure == "unsupported-policy"
-            else "invalid spec from internal-host:6767/private/agent.yaml"
-        )
+        if failure in ("unsupported-policy", "private-policy-detail"):
+            detail = (
+                "The selected harness cannot enforce os_env.sandbox. "
+                f"Choose a sandbox-capable harness. {detail}"
+            )
+        assert body["error"]["message"] == detail
+        cause = {
+            "unsupported-policy": "Antigravity cannot enforce",
+            "invalid-spec": "invalid spec from internal-host:6767/private/agent.yaml",
+            "private-policy-detail": "private-policy-token at internal-host:6767",
+        }[failure]
         assert cause not in response.text
         assert cause in caplog.text
         return
