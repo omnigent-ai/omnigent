@@ -98,23 +98,18 @@ const {
   getDatabricksInternalFeaturesEnabled,
   getManagedServerNames,
   getManagedServerUrls,
-} = withTestOverrides("managed_preferences", require("./managed_preferences"));
-const arca = require("./arca");
-const arcaOnboarding = require("./arca_onboarding");
-const cliInstall = require("./cli_install");
-const isaac = require("./isaac");
+} = withTestOverrides("managed_preferences", require("./managed_preferences.ts"));
+const arca = withTestOverrides("arca", require("./arca"));
+const arcaOnboarding = withTestOverrides("arca_onboarding", require("./arca_onboarding"));
+const cliInstall = require("./cli_install.ts");
+const isaac = withTestOverrides("isaac", require("./isaac"));
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { createArcaAutoConnect } = require("./arca_autoconnect");
 const sshConnect = require("./ssh_connect");
 const { createSshConnectFlow } = require("./ssh_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry.ts");
-const { ensureDatabricksSession } = require("./databricks-session");
-const {
-  deleteStoredToken: forgetDatabricksToken,
-  expireStoredAccessToken,
-  removeStoredRefreshToken,
-  whenRefreshSettled: whenDatabricksRefreshSettled,
-} = require("./databricks-oauth");
+const { createDatabricksSession } = require("./databricks-session.ts");
+const { createDatabricksOAuth } = require("./databricks-oauth.ts");
 const { createOidcCredentials } = require("./oidc-credentials.ts");
 const { createOidcAuth } = require("./oidc-auth.ts");
 const {
@@ -155,6 +150,18 @@ const oidcCredentials = createOidcCredentials({
   safeStorage,
   openExternal: (url) => shell.openExternal(url),
 });
+// One per process: it owns the stored Databricks tokens and the in-flight refreshes.
+const databricksOAuth = createDatabricksOAuth({
+  safeStorage,
+  openExternal: (url) => shell.openExternal(url),
+});
+const {
+  deleteStoredToken: forgetDatabricksToken,
+  expireStoredAccessToken,
+  removeStoredRefreshToken,
+  whenRefreshSettled: whenDatabricksRefreshSettled,
+} = databricksOAuth;
+const { ensureDatabricksSession } = createDatabricksSession({ net, oauth: databricksOAuth });
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = pagePath("setup");

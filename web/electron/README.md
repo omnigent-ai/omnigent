@@ -198,7 +198,7 @@ configuration:
 
 ```bash
 node --test web/electron/test/setup_connect.test.js
-node --test --test-name-pattern='interactive OAuth cancellation' web/electron/test/databricks-oauth.test.js
+node --test --test-name-pattern='interactive OAuth cancellation' web/electron/test/databricks-oauth.test.ts
 ```
 
 - Run `just electron-dev`, use **Server → Change Server…**, and connect to an
@@ -382,7 +382,7 @@ electron/
   src/preload.ts           # contextBridge: window.omnigentDesktop + omnigentSetup
   src/about_window.ts      # shell-owned About modal + guarded update IPC
   src/about_preload.ts     # narrow contextBridge for the About modal
-  src/managed_preferences.js # read/validate macOS MDM server choices
+  src/managed_preferences.ts # read/validate macOS MDM server choices
   src/find_preload.ts      # contextBridge for the find bar: window.omnigentFind
   src/browserViewRegistry.ts  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.ts    # CSS-px → window-DIP bounds conversion (browser pane)

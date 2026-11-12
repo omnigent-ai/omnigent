@@ -5,21 +5,43 @@
 // workspace FQDN from the account workspaces API and bridges against that host
 // instead. Mirrors genie-one-desktop/src/main/accountWorkspaces.ts.
 
-"use strict";
+import { isTrustedDatabricksOrigin } from "./databricks-oauth.ts";
 
-const { isTrustedDatabricksOrigin } = require("./databricks-oauth");
+/** One row of the account workspaces API, untrusted. */
+interface WorkspaceRow {
+  workspace_id?: unknown;
+  workspace_name?: unknown;
+  workspace_fqdn?: unknown;
+  workspace_status?: unknown;
+}
 
 // Bound on the account-workspaces lookup so a stalled socket can't hang connect.
 const NETWORK_TIMEOUT_MS = 20_000;
 
+/** The account an account-scoped token was issued for. */
+export interface DatabricksAccount {
+  accountOrigin: string;
+  accountId: string;
+}
+
+/** A running workspace the picker offers and the bridge targets. */
+export interface RunningWorkspace {
+  workspaceId: string;
+  name: string;
+  fqdn: string;
+}
+
 /** Decode a JWT's `iss` claim. No verification — the server verifies on use;
  * we read only the public issuer to route the follow-up account API call. */
-function decodeJwtIssuer(token) {
+function decodeJwtIssuer(token: unknown): string | null {
   const parts = String(token).split(".");
   if (parts.length < 2) return null;
   try {
-    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const payload = JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
+    const base64 = parts[1]!.replace(/-/g, "+").replace(/_/g, "/");
+    // A null payload throws on `.iss`, which reads as no issuer.
+    const payload = JSON.parse(Buffer.from(base64, "base64").toString("utf8")) as {
+      iss?: unknown;
+    };
     return typeof payload.iss === "string" ? payload.iss : null;
   } catch {
     return null;
@@ -31,28 +53,24 @@ function decodeJwtIssuer(token) {
  * (``https://accounts.<cloud>.databricks.com/oidc/accounts/<accountId>``).
  * Returns null for a workspace-scoped token (its issuer is a workspace host) —
  * the signal to bridge against the token's own origin, no account hop.
- *
- * @param {string} accessToken
- * @returns {{ accountOrigin: string, accountId: string } | null}
  */
-function parseAccountFromToken(accessToken) {
+export function parseAccountFromToken(accessToken: string): DatabricksAccount | null {
   const iss = decodeJwtIssuer(accessToken);
   if (!iss) return null;
   const m = /^(https:\/\/[^/]+)\/oidc\/accounts\/([^/]+)\/?$/.exec(iss);
-  return m ? { accountOrigin: m[1], accountId: m[2] } : null;
+  return m ? { accountOrigin: m[1]!, accountId: m[2]! } : null;
 }
 
 /**
  * List the account's RUNNING workspaces via
  * ``GET {accountOrigin}/api/2.0/accounts/{id}/workspaces`` with the account
  * bearer. Returns the id / name / fqdn the picker and bridge need.
- *
- * @param {{ accountOrigin: string, accountId: string }} account
- * @param {string} accessToken
- * @param {{ signal?: AbortSignal }} [options]
- * @returns {Promise<Array<{ workspaceId: string, name: string, fqdn: string }>>}
  */
-async function listRunningWorkspaces(account, accessToken, { signal } = {}) {
+export async function listRunningWorkspaces(
+  account: DatabricksAccount,
+  accessToken: string,
+  { signal }: { signal?: AbortSignal | undefined } = {},
+): Promise<RunningWorkspace[]> {
   signal?.throwIfAborted();
   // Never send the bearer to a non-Databricks host. accountOrigin comes from the
   // token's own `iss`, but that claim isn't verified here, so gate it.
@@ -78,17 +96,22 @@ async function listRunningWorkspaces(account, accessToken, { signal } = {}) {
       `account workspaces lookup failed: ${resp.status} ${url} ${body.slice(0, 200)}`,
     );
   }
-  const body = await resp.json();
+  const body: unknown = await resp.json();
   signal?.throwIfAborted();
   // The API returns a bare array; accept an object wrapper defensively.
-  const rows = Array.isArray(body) ? body : (body?.workspaces ?? []);
-  return rows
-    .filter((w) => w.workspace_status === "RUNNING" && typeof w.workspace_fqdn === "string")
+  const rows: unknown = Array.isArray(body)
+    ? body
+    : ((body as { workspaces?: unknown } | null | undefined)?.workspaces ?? []);
+  // Rows are read as the API documents them; a non-array `rows` or a null row throws here.
+  return (rows as WorkspaceRow[])
+    .filter(
+      (w): w is WorkspaceRow & { workspace_fqdn: string } =>
+        w.workspace_status === "RUNNING" && typeof w.workspace_fqdn === "string",
+    )
     .map((w) => ({
       workspaceId: String(w.workspace_id),
-      name: w.workspace_name ?? w.workspace_fqdn,
+      // `workspace_name` is not type-checked; a non-string passes through.
+      name: (w.workspace_name ?? w.workspace_fqdn) as string,
       fqdn: w.workspace_fqdn,
     }));
 }
-
-module.exports = { parseAccountFromToken, listRunningWorkspaces };

@@ -75,7 +75,7 @@ export const SESSION_REJECTED = "SESSION_REJECTED";
 export const IP_ACL_BLOCKED = "IP_ACL_BLOCKED";
 const sessionRejected = (message: string) =>
   Object.assign(new Error(message), { errorCode: SESSION_REJECTED });
-// Session-create timed out or its response was cut off (databricks-session.js).
+// Session-create timed out or its response was cut off (databricks-session.ts).
 export const SESSION_TRANSPORT = "SESSION_TRANSPORT";
 
 /** Whether a renewal failure is worth retrying: no response, HTTP 5xx/429, or an IP ACL block. */

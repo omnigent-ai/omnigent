@@ -77,4 +77,29 @@ describe("withTestOverrides", () => {
     assert.equal(withTestOverrides("answers", namespace).answer(), 2);
     assert.equal(namespace.answer(), 1);
   });
+
+  it("reaches the onboarding module's default path resolver", async () => {
+    stubElectron(false);
+    let resolved = 0;
+    registerTestOverride("arca", () => ({
+      resolveArcaPath: () => {
+        resolved += 1;
+        return null;
+      },
+    }));
+    // A fresh copy so the onboarding module requires its dependency again.
+    const onboardingPath = require.resolve("../src/arca_onboarding");
+    Reflect.deleteProperty(require.cache, onboardingPath);
+    const { startArcaSetup } = require(onboardingPath);
+    Reflect.deleteProperty(require.cache, onboardingPath);
+
+    const run = startArcaSetup("https://example.com");
+
+    assert.equal(resolved, 1);
+    assert.equal(run.command, null);
+    assert.deepEqual(await run.promise, {
+      ok: false,
+      error: "The arca CLI was not found on this machine.",
+    });
+  });
 });

@@ -1,5 +1,3 @@
-"use strict";
-
 /**
  * In-app Omnigent CLI installation (macOS).
  *
@@ -19,36 +17,102 @@
  * shell or network.
  */
 
-const { spawn } = require("node:child_process");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
+import { execFileSync, spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 /** Installing pulls uv + a Python toolchain + the package; give it minutes. */
-const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
+export const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** uv's official installer — the same command install_oss.sh would offer. */
-const UV_INSTALLER = "curl -LsSf https://astral.sh/uv/install.sh | sh";
+export const UV_INSTALLER = "curl -LsSf https://astral.sh/uv/install.sh | sh";
 
 /** The only script name we ever run — never taken from external input. */
 const INSTALL_SCRIPT_NAME = "install_oss.sh";
+
+/** A child's output stream, as far as streaming it goes. */
+export interface InstallerOutput {
+  on: (event: "data", listener: (chunk: unknown) => void) => unknown;
+}
+
+/** The part of a spawned `ChildProcess` the installer uses. */
+export interface InstallerChild {
+  pid?: number | undefined;
+  stdout?: InstallerOutput | null;
+  stderr?: InstallerOutput | null;
+  kill: (signal: NodeJS.Signals) => unknown;
+  // Node passes an `Error` for "error" and the exit code for "exit".
+  on: (event: "error" | "exit", listener: (value: unknown) => void) => unknown;
+}
+
+export interface InstallerSpawnOptions {
+  stdio: ["ignore", "pipe", "pipe"];
+  detached: boolean;
+  env: NodeJS.ProcessEnv;
+}
+
+/** `child_process.spawn`, injectable so tests need no real shell. */
+export type SpawnInstaller = (
+  command: string,
+  args: string[],
+  options: InstallerSpawnOptions,
+) => InstallerChild;
+
+export interface ResolveInstallScriptDeps {
+  resourcesPath?: string | undefined;
+  dirname?: string;
+}
+
+export interface RunStreamingDeps {
+  spawn?: SpawnInstaller | undefined;
+  onOutput?: ((text: string) => void) | undefined;
+  timeoutMs?: number | undefined;
+  killGraceMs?: number | undefined;
+  env?: NodeJS.ProcessEnv | undefined;
+}
+
+export interface RunStreamingResult {
+  code: number | null;
+  timedOut: boolean;
+}
+
+export interface EnsureUvDeps {
+  spawn?: SpawnInstaller | undefined;
+  onOutput?: ((text: string) => void) | undefined;
+  hasUv?: (env: NodeJS.ProcessEnv) => boolean;
+  env?: NodeJS.ProcessEnv;
+  home?: string;
+}
+
+export type EnsureUvResult = { ok: true; env?: NodeJS.ProcessEnv } | { ok: false; error: string };
+
+export interface InstallCliDeps {
+  platform?: NodeJS.Platform;
+  spawn?: SpawnInstaller;
+  onOutput?: (text: string) => void;
+  resolveInstallScript?: () => string | null;
+  ensureUv?: (deps: EnsureUvDeps) => Promise<EnsureUvResult>;
+  timeoutMs?: number;
+  killGraceMs?: number;
+}
+
+export type InstallCliResult = { ok: true } | { ok: false; error: string };
 
 /**
  * Locate the bundled `install_oss.sh`. Packaged builds ship it under the app's
  * resources (electron-builder `extraResources`); an unpackaged dev run reads it
  * from the repo `scripts/` dir. Null when neither exists.
- *
- * @param {{ resourcesPath?: string, dirname?: string }} [deps]
- * @returns {string | null}
  */
-function resolveInstallScript(deps = {}) {
-  const resourcesPath = deps.resourcesPath ?? process.resourcesPath;
-  const dirname = deps.dirname ?? __dirname;
+export function resolveInstallScript(deps: ResolveInstallScriptDeps = {}): string | null {
+  // Electron sets `process.resourcesPath`; plain Node leaves it undefined.
+  const resourcesPath: string | undefined = deps.resourcesPath ?? process.resourcesPath;
+  const dirname = deps.dirname ?? import.meta.dirname;
   const candidates = [
     resourcesPath ? path.join(resourcesPath, INSTALL_SCRIPT_NAME) : null,
     // Dev: web/electron/src -> repo root scripts/install_oss.sh
     path.join(dirname, "..", "..", "..", "scripts", INSTALL_SCRIPT_NAME),
-  ].filter(Boolean);
+  ].filter((candidate) => candidate !== null);
   for (const candidate of candidates) {
     try {
       if (fs.statSync(candidate).isFile()) return candidate;
@@ -62,24 +126,19 @@ function resolveInstallScript(deps = {}) {
 /**
  * Run a command to completion, streaming combined output line-ish chunks to
  * `onOutput`. Never rejects — resolves `{ code }` (null on signal/timeout).
- *
- * @param {string} command
- * @param {string[]} args
- * @param {{
- *   spawn?: typeof spawn,
- *   onOutput?: (text: string) => void,
- *   timeoutMs?: number,
- * }} [deps]
- * @returns {Promise<{ code: number | null, timedOut: boolean }>}
  */
-function runStreaming(command, args, deps = {}) {
-  const spawnFn = deps.spawn || spawn;
+function runStreaming(
+  command: string,
+  args: string[],
+  deps: RunStreamingDeps = {},
+): Promise<RunStreamingResult> {
+  const spawnFn: SpawnInstaller = deps.spawn || spawn;
   const onOutput = deps.onOutput || (() => {});
   const timeoutMs = deps.timeoutMs ?? INSTALL_TIMEOUT_MS;
   // Grace between SIGTERM and the hard SIGKILL escalation on timeout.
   const killGraceMs = deps.killGraceMs ?? 5000;
   return new Promise((resolve) => {
-    let child;
+    let child: InstallerChild;
     try {
       // `detached` puts the child in its own process group so we can signal the
       // whole tree (kill(-pid)) — the installer spawns uv/curl subprocesses that
@@ -90,19 +149,19 @@ function runStreaming(command, args, deps = {}) {
         env: deps.env ?? process.env,
       });
     } catch (error) {
-      onOutput(`Failed to start: ${error.message}\n`);
+      onOutput(`Failed to start: ${(error as Error).message}\n`);
       resolve({ code: null, timedOut: false });
       return;
     }
     let settled = false;
-    const settle = (result) => {
+    const settle = (result: RunStreamingResult) => {
       if (settled) return;
       settled = true;
       resolve(result);
     };
     // Signal the child's whole process group; fall back to the lone child if the
     // group send fails (e.g. no pid, or the injected fake in tests).
-    const killTree = (signal) => {
+    const killTree = (signal: NodeJS.Signals) => {
       try {
         if (typeof child.pid === "number") process.kill(-child.pid, signal);
         else child.kill(signal);
@@ -115,7 +174,7 @@ function runStreaming(command, args, deps = {}) {
       }
     };
     let timedOut = false;
-    let killTimer;
+    let killTimer: NodeJS.Timeout | undefined;
     const timer = setTimeout(() => {
       timedOut = true;
       killTree("SIGTERM");
@@ -128,7 +187,7 @@ function runStreaming(command, args, deps = {}) {
         settle({ code: null, timedOut: true });
       }, killGraceMs);
     }, timeoutMs);
-    const finish = (result) => {
+    const finish = (result: RunStreamingResult) => {
       clearTimeout(timer);
       clearTimeout(killTimer);
       settle(result);
@@ -136,31 +195,24 @@ function runStreaming(command, args, deps = {}) {
     child.stdout?.on("data", (chunk) => onOutput(String(chunk)));
     child.stderr?.on("data", (chunk) => onOutput(String(chunk)));
     child.on("error", (error) => {
-      onOutput(`Error: ${error.message}\n`);
+      onOutput(`Error: ${(error as Error).message}\n`);
       finish({ code: null, timedOut });
     });
-    child.on("exit", (code) => finish({ code, timedOut }));
+    child.on("exit", (code) => finish({ code: code as number | null, timedOut }));
   });
 }
 
 /**
  * Ensure `uv` is available, installing it via the official one-liner when
  * missing (install_oss.sh --non-interactive won't do this itself).
- *
- * @param {{
- *   spawn?: typeof spawn,
- *   onOutput?: (text: string) => void,
- *   hasUv?: () => boolean,
- * }} [deps]
- * @returns {Promise<{ ok: boolean, error?: string }>}
  */
-async function ensureUv(deps = {}) {
+export async function ensureUv(deps: EnsureUvDeps = {}): Promise<EnsureUvResult> {
   const onOutput = deps.onOutput || (() => {});
   // Resolve uv against the env we'll actually use (PATH may have been augmented
   // with uv's install dirs after a fresh install — the app's own PATH won't
   // pick those up mid-run).
   const env = deps.env ?? process.env;
-  const hasUv = deps.hasUv || ((e) => commandExists("uv", e));
+  const hasUv = deps.hasUv || ((e: NodeJS.ProcessEnv) => commandExists("uv", e));
   if (hasUv(env)) return { ok: true, env };
   onOutput("Installing uv (required by the Omnigent installer)…\n");
   const run = await runStreaming("sh", ["-c", UV_INSTALLER], {
@@ -188,12 +240,8 @@ async function ensureUv(deps = {}) {
  * A copy of `env` with uv's well-known install dirs prepended to PATH, so a
  * just-installed uv (and the omnigent binaries it later drops) resolve for the
  * rest of this run even if the app's launch PATH omitted them.
- *
- * @param {NodeJS.ProcessEnv} env
- * @param {string} home
- * @returns {NodeJS.ProcessEnv}
  */
-function withUvDirs(env, home) {
+function withUvDirs(env: NodeJS.ProcessEnv, home: string): NodeJS.ProcessEnv {
   const dirs = [path.join(home, ".local", "bin"), path.join(home, ".cargo", "bin")];
   const current = env.PATH ? env.PATH.split(":") : [];
   const merged = [...dirs.filter((d) => !current.includes(d)), ...current];
@@ -203,14 +251,10 @@ function withUvDirs(env, home) {
 /**
  * True when `name` resolves on PATH, using `env` (so a PATH augmented with uv's
  * install dirs is honored).
- *
- * @param {string} name
- * @param {NodeJS.ProcessEnv} [env]
- * @returns {boolean}
  */
-function commandExists(name, env = process.env) {
+function commandExists(name: string, env: NodeJS.ProcessEnv = process.env): boolean {
   try {
-    require("node:child_process").execFileSync("/bin/sh", ["-c", `command -v ${name}`], {
+    execFileSync("/bin/sh", ["-c", `command -v ${name}`], {
       stdio: "ignore",
       env,
     });
@@ -224,18 +268,8 @@ function commandExists(name, env = process.env) {
  * Install the Omnigent CLI. Ensures uv, then runs the bundled installer,
  * streaming output. Never rejects — resolves `{ ok, error? }`. macOS only; a
  * non-darwin platform resolves an actionable error.
- *
- * @param {{
- *   platform?: NodeJS.Platform,
- *   spawn?: typeof spawn,
- *   onOutput?: (text: string) => void,
- *   resolveInstallScript?: () => string | null,
- *   ensureUv?: (d: object) => Promise<{ ok: boolean, error?: string }>,
- *   timeoutMs?: number,
- * }} [deps]
- * @returns {Promise<{ ok: boolean, error?: string }>}
  */
-async function installCli(deps = {}) {
+export async function installCli(deps: InstallCliDeps = {}): Promise<InstallCliResult> {
   const platform = deps.platform ?? process.platform;
   const onOutput = deps.onOutput || (() => {});
   if (platform !== "darwin") {
@@ -273,11 +307,3 @@ async function installCli(deps = {}) {
   }
   return { ok: true };
 }
-
-module.exports = {
-  INSTALL_TIMEOUT_MS,
-  UV_INSTALLER,
-  resolveInstallScript,
-  ensureUv,
-  installCli,
-};

@@ -117,27 +117,13 @@ function createWorkspaceNetwork(origin, { oauth: oauthOverrides, account = {} } 
     saveWorkspaceToken() {},
     ...oauthOverrides,
   };
-  const file = path.join(__dirname, "../src/databricks-session.js");
-  const realRequire = createRequire(file);
-  const fakes = {
-    electron: { net },
-    "./databricks-oauth": oauth,
-    "./databricks-account": { parseAccountFromToken: () => null, ...account },
-  };
-  const module = { exports: {} };
-  vm.runInNewContext(
-    fs.readFileSync(file, "utf8"),
-    {
-      module,
-      URL,
-      setTimeout,
-      clearTimeout,
-      console: { log() {}, warn() {} },
-      require: (specifier) => fakes[specifier] ?? realRequire(specifier),
-    },
-    { filename: file },
-  );
-  network.ensureDatabricksSession = module.exports.ensureDatabricksSession;
+  const { createDatabricksSession } = require("../src/databricks-session.ts");
+  const session = createDatabricksSession({
+    net,
+    oauth,
+    accountWorkspaces: { parseAccountFromToken: () => null, ...account },
+  });
+  network.ensureDatabricksSession = session.ensureDatabricksSession;
   return network;
 }
 
@@ -206,6 +192,8 @@ function loadNavigationHarness({
     arcaConsentRuns: [],
     cookiesSet: [],
     oidc: { created: 0, refresh: 0, signIn: 0, signOut: 0 },
+    databricksOAuth: [],
+    databricksSessions: [],
     arcaLogins: [],
     arcaLoginCancels: 0,
     arcaSetups: [],
@@ -489,8 +477,8 @@ function loadNavigationHarness({
       },
       PRE_MANIFEST_BASELINE: {},
     },
-    "./managed_preferences": {
-      ...require("../src/managed_preferences"),
+    "./managed_preferences.ts": {
+      ...require("../src/managed_preferences.ts"),
       getManagedServerUrls: () => managedServers,
       getDatabricksInternalFeaturesEnabled: () => internalFeatures,
       getManagedServerNames: () => managedServerNames,
@@ -557,20 +545,31 @@ function loadNavigationHarness({
         };
       },
     },
-    "./databricks-session": {
-      ensureDatabricksSession: (...args) => {
-        calls.auth.push(args);
-        return (network?.ensureDatabricksSession ?? ensureSession)(...args);
+    "./databricks-session.ts": {
+      createDatabricksSession: (deps) => {
+        calls.databricksSessions.push(deps);
+        return {
+          ensureDatabricksSession: (...args) => {
+            calls.auth.push(args);
+            return (network?.ensureDatabricksSession ?? ensureSession)(...args);
+          },
+        };
       },
     },
-    "./databricks-oauth": {
-      deleteStoredToken: (origin) => {
-        deleteStoredToken?.(origin);
-        calls.forgottenTokens = [...(calls.forgottenTokens ?? []), origin];
+    "./databricks-oauth.ts": {
+      createDatabricksOAuth: (deps) => {
+        const instance = {
+          deleteStoredToken: (origin) => {
+            deleteStoredToken?.(origin);
+            calls.forgottenTokens = [...(calls.forgottenTokens ?? []), origin];
+          },
+          whenRefreshSettled: async () => {},
+          expireStoredAccessToken: () => false,
+          removeStoredRefreshToken: () => false,
+        };
+        calls.databricksOAuth.push({ deps, instance });
+        return instance;
       },
-      whenRefreshSettled: async () => {},
-      expireStoredAccessToken: () => false,
-      removeStoredRefreshToken: () => false,
     },
     "./oidc-credentials.ts": {
       createOidcCredentials: (deps) => {
@@ -4511,6 +4510,25 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     assert.equal(network.sessionCreates, 2);
     assert.equal(h.calls.loadURL.length, 1);
     assert.equal(network.browserSignIns, 0);
+  });
+});
+
+describe("Databricks credentials wiring", () => {
+  it("creates one OAuth instance at load and bridges sessions through it", async (t) => {
+    const h = loadNavigationHarness({ databricksMode: "browser" });
+    t.after(h.cleanup);
+    assert.equal(h.calls.databricksOAuth.length, 1);
+    const [{ deps, instance }] = h.calls.databricksOAuth;
+    assert.equal(h.calls.databricksSessions.length, 1);
+    assert.equal(h.calls.databricksSessions[0].net, h.electron.net);
+    assert.equal(h.calls.databricksSessions[0].oauth, instance);
+    const opened = [];
+    h.electron.shell.openExternal = async (url) => opened.push(url);
+    await deps.openExternal("https://example.com/authorize");
+    assert.deepEqual(opened, ["https://example.com/authorize"]);
+    await h.api.loadServerUrl(h.win, "https://host.example/ml/omnigents");
+    assert.equal(h.calls.databricksOAuth.length, 1);
+    assert.equal(h.calls.databricksSessions.length, 1);
   });
 });
 

@@ -1,8 +1,7 @@
-"use strict";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
-const { describe, it } = require("node:test");
-const assert = require("node:assert/strict");
-const {
+import {
   DATABRICKS_INTERNAL_FEATURES_KEY,
   MAX_SERVER_URLS,
   SERVER_URLS_KEY,
@@ -11,14 +10,14 @@ const {
   getManagedServerNames,
   getManagedServerUrls,
   parseManagedServerUrls,
-} = require("../src/managed_preferences");
+} from "../src/managed_preferences.ts";
 
 describe("managed server preferences", () => {
   it("reads the macOS serverUrls array and preserves workspace paths", () => {
-    const calls = [];
+    const calls: unknown[][] = [];
     const urls = getManagedServerUrls({
       platform: "darwin",
-      getUserDefault: (...args) => {
+      getUserDefault: (...args: unknown[]) => {
         calls.push(args);
         return ["omnigent.example.com", "https://workspace.example.com/ml/omnigents?o=123"];
       },
@@ -81,10 +80,10 @@ describe("managed server preferences", () => {
   });
 
   it("reads the managed-features boolean on macOS", () => {
-    const calls = [];
+    const calls: unknown[][] = [];
     const enabled = getDatabricksInternalFeaturesEnabled({
       platform: "darwin",
-      getUserDefault: (...args) => {
+      getUserDefault: (...args: unknown[]) => {
         calls.push(args);
         return true;
       },
@@ -131,8 +130,8 @@ describe("managed server preferences", () => {
   });
 
   it("reads display names from an omnigentServerName query parameter", () => {
-    const calls = [];
-    const getUserDefault = (...args) => {
+    const calls: unknown[][] = [];
+    const getUserDefault = (...args: unknown[]) => {
       calls.push(args);
       return [
         "https://workspace.example.com/?o=123&omnigentServerName=%20Team%20A%20",
