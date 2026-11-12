@@ -1687,13 +1687,9 @@ class TerminalInstance:
             try:
                 if sandbox_for_launcher.copy_on_write_namespace:
                     host_cwd = "/"
-                    launcher_path = create_exec_launcher(
-                        cli_path, sandbox_for_launcher, cwd=effective_cwd
-                    )
-                else:
-                    launcher_path = create_exec_launcher(
-                        cli_path, sandbox_for_launcher, cwd=effective_cwd
-                    )
+                launcher_path = create_exec_launcher(
+                    cli_path, sandbox_for_launcher, cwd=effective_cwd
+                )
             except Exception:
                 self._stop_git_ssh()
                 raise
