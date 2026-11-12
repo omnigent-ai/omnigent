@@ -183,8 +183,6 @@ def test_automation_sandbox_repository(
         page.get_by_role("option", name="Browser host", exact=True).click()
         for trigger_id, role in (
             ("task-host-trigger", "listbox"),
-            ("task-model-trigger", "listbox"),
-            ("task-effort-trigger", "listbox"),
             ("task-permission-trigger", "listbox"),
             ("task-project-trigger", "menu"),
             ("new-chat-landing-agent-select", "menu"),
@@ -197,6 +195,15 @@ def test_automation_sandbox_repository(
             expect(page.get_by_label("Automation title", exact=True)).to_have_value(
                 "Repository maintenance"
             )
+        page.get_by_test_id("new-chat-landing-agent-select").click()
+        page.get_by_test_id("new-chat-landing-agent-config-agent-claude").get_by_text(
+            "Edit", exact=True
+        ).click()
+        expect(page.get_by_test_id("task-agent-models")).to_be_visible()
+        expect(page.get_by_test_id("task-agent-efforts")).to_be_visible()
+        page.get_by_label("Automation title", exact=True).click()
+        expect(page.get_by_role("menu")).to_have_count(0)
+        expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
         contract.json(f"/v1/hosts/{chat.host_id}/filesystem", list_payload([]))
         for _ in range(2):
             page.get_by_test_id("task-workspace-browse").click()
@@ -341,22 +348,15 @@ def test_reused_automation_settings(
         expect(note).to_contain_text("This automation continues in an existing session")
         expect(page.get_by_test_id("new-chat-landing-agent-select")).to_be_visible()
         expect(page.get_by_test_id("task-permission-trigger")).to_be_disabled()
-        if trigger:
-            expect(note).to_contain_text("each match starts a new worker")
-            page.get_by_role("button", name="Edit worker instructions", exact=True).click()
-            editor = page.get_by_role(
-                "textbox",
-                name="Instructions" if prompt_kind == "custom-trigger" else "System prompt",
-                exact=True,
-            )
-            expect(editor).to_be_focused()
-            page.get_by_test_id("task-name-input").click()
-            page.get_by_role("button", name="Edit worker instructions", exact=True).click()
-            expect(editor).to_be_focused()
-        else:
+        if prompt_kind == "custom-trigger":
             expect(
-                page.get_by_role("button", name="Edit worker instructions", exact=True)
-            ).to_have_count(0)
+                page.get_by_text(
+                    "Worker controls are unavailable for these customized instructions. "
+                    "Edit the prompt or system prompt above to configure matching sessions.",
+                    exact=True,
+                )
+            ).to_be_visible()
+            expect(page.get_by_test_id("task-worker-settings")).to_have_count(0)
 
 
 @pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
