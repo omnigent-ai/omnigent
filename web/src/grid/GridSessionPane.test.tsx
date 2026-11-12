@@ -163,6 +163,12 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         <button type="button" onClick={() => props.onCloseFile(props.selectedFilePath!)}>
           Close file
         </button>
+        <button
+          type="button"
+          onClick={() => props.onRightRailTabChange("subagents", () => setDraft("accepted"))}
+        >
+          Open agents
+        </button>
         <button type="button" onClick={props.onToggleMaximized}>
           Maximize
         </button>
@@ -202,11 +208,18 @@ it("opens agent-requested files only in the active workspace and respects naviga
   act(() => emitUiOpenFile({ type: "ui_open_file", path: "guide.md" }, "first"));
   expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
   fireEvent.click(
-    within(screen.getByRole("region", { name: "first (active)" })).getByText("Block navigation"),
+    within(screen.getByRole("region", { name: "first (active)" })).getByText("Edit file"),
   );
   act(() => emitUiOpenFile({ type: "ui_open_file", path: "blocked.md" }, "first"));
   expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
   expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("blocked.md");
+  const workspace = within(screen.getByTestId("workspace-first"));
+  fireEvent.click(workspace.getByText("Open agents"));
+  expect(workspace.getByLabelText("File draft")).toHaveValue("");
+  expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
+  act(() => fixture.discardEdits?.());
+  expect(workspace.getByLabelText("File draft")).toHaveValue("accepted");
+  expect(screen.getByTestId("workspace-first")).toHaveAttribute("data-tab", "subagents");
 });
 
 /** The shell's file-viewer context, collecting the guards registered with it. */

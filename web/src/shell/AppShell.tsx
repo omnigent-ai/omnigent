@@ -1727,6 +1727,10 @@ function AppShellImpl() {
     if (!terminalFirst) setPanelInitialKey(null);
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
+    setSubagentsPanelOpen(false);
+    setShellsPanelOpen(false);
+    setGithubPanelOpen(false);
+    setContentSearchPanelOpen(false);
     if (rightPanelOpen) return;
     writeSessionWorkspaceState(conversationId, { open: true });
     writeDefaultWorkspacePanelOpen(true);
@@ -2023,16 +2027,10 @@ function AppShellImpl() {
     [clearFileViewerUrl, setSearchParams],
   );
 
-  // Switch the workspace rail's tab. The side effect (closing any open
-  // file + its comments + URL) lives here, not in WorkspacePanel, so the
-  // tab state and the file state can't drift apart — the rail stays a
-  // dumb view. The Files/Changes tabs own the viewer, so there's no
-  // per-tab file to stash and restore; switching tabs just closes any
-  // open file to reveal the picked tab's scope list.
-  const handleRightRailTabChange = useCallback(
-    (next: RightRailTab | null, afterCommit?: () => void) => {
+  // Every workspace surface leaves the file and changes panel state only after acceptance.
+  const navigateWorkspace = useCallback(
+    (afterCommit: () => void) => {
       const commit = () => {
-        selectRightRailTab(next);
         if (selectedFilePath !== null) {
           setSelectedFilePath(null);
           setFileViewerCommentsOpen(false);
@@ -2040,18 +2038,35 @@ function AppShellImpl() {
         }
         // Static nav tabs deselect the shell without closing its tab.
         if (selectedTerminalKey !== null) setSelectedTerminalKey(null);
-        afterCommit?.();
+        afterCommit();
       };
       if (selectedFilePath !== null) guardFileNavigation(null, undefined, commit);
       else commit();
     },
-    [
-      selectedFilePath,
-      selectedTerminalKey,
-      clearFileViewerUrl,
-      selectRightRailTab,
-      guardFileNavigation,
-    ],
+    [selectedFilePath, selectedTerminalKey, clearFileViewerUrl, guardFileNavigation],
+  );
+  const handleRightRailTabChange = useCallback(
+    (next: RightRailTab | null, afterCommit?: () => void) =>
+      navigateWorkspace(() => {
+        selectRightRailTab(next);
+        afterCommit?.();
+      }),
+    [navigateWorkspace, selectRightRailTab],
+  );
+  const openMobilePanel = useCallback(
+    (show: () => void) =>
+      navigateWorkspace(() => {
+        setPanelInitialKey(null);
+        setExecutionLogsKey(null);
+        setFilesPanelOpen(false);
+        setSubagentsPanelOpen(false);
+        setShellsPanelOpen(false);
+        setGithubPanelOpen(false);
+        setContentSearchPanelOpen(false);
+        setSideChatsPanelOpen(false);
+        show();
+      }),
+    [navigateWorkspace, setPanelInitialKey],
   );
   const closeWorkspacePanel = useCallback(
     (tab: DefaultWorkspaceTab) => {
@@ -2076,9 +2091,6 @@ function AppShellImpl() {
       // The mounted WorkspacePanel hook owns the active session's tab state.
       // Persist here only for background sessions that have no mounted hook.
       if (sourceConversationId !== conversationId) openBrowserTab(sourceConversationId, tabId);
-      if (sourceConversationId === conversationId) {
-        handleRightRailTabChange("browser", () => setRightPanelOpenAnimated(true));
-      }
     };
     const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
     const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
@@ -2089,40 +2101,15 @@ function AppShellImpl() {
       unsubscribeLink();
       unsubscribeAction();
     };
-  }, [conversationId, handleRightRailTabChange, setRightPanelOpenAnimated]);
+  }, [conversationId]);
 
   // Mobile FAB → "Side chats" opens the session's side chats as a full-screen
   // drawer (the desktop rail shows them as soft tabs). Also used when a side
   // chat the user just started resolves, so it is visible on a phone.
-  const openSideChatsPanel = useCallback(() => {
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setPanelInitialKey(null); // close terminals panel
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
-    setGithubPanelOpen(false); // close mobile github drawer
-    setContentSearchPanelOpen(false); // close mobile content-search drawer
-    setSideChatsPanelOpen(true);
-  }, [clearFileViewerUrl, setPanelInitialKey]);
-
-  // A side chat the user just opened must be visible: reveal the surface that
-  // shows it — the Workspace rail, or the drawer on a phone. WorkspacePanel
-  // owns opening/selecting the tab and clearing the one-shot `sideChatToOpen`
-  // signal (it holds the side-chat tab state, like the browser tabs).
-  const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
-  useEffect(() => {
-    // Only the parent that owns the side chat reveals it: a fork that resolves
-    // after the user moved to another conversation must not surface over the
-    // one on screen (WorkspacePanel applies the same test before taking the
-    // signal, so it stays queued). Keyed on `conversationId` too, so coming
-    // back to the owner re-runs this and still reveals the tab.
-    if (sideChatToOpen === null || sideChatToOpen.parentId !== conversationId) return;
-    setRightPanelOpenAnimated(true);
-    // Phones hide the rail, so the side chat opens in its drawer instead.
-    if (isMobileViewport()) openSideChatsPanel();
-  }, [sideChatToOpen, conversationId, openSideChatsPanel, setRightPanelOpenAnimated]);
+  const openSideChatsPanel = useCallback(
+    () => openMobilePanel(() => setSideChatsPanelOpen(true)),
+    [openMobilePanel],
+  );
   const canStartSideChat = useCanStartSideChat(serverConversationId, permissionLevel);
   const showSideChats = supportsSideChat(
     useChatStore((s) => s.sessionHarness),
@@ -2167,16 +2154,8 @@ function AppShellImpl() {
   const [hasSideChatTabs, setHasSideChatTabs] = useState(false);
 
   const openTerminalsPanel = useCallback(
-    (key: string) => {
-      setSelectedFilePath(null); // close file viewer
-      clearFileViewerUrl();
-      setExecutionLogsKey(null); // close execution-logs panel
-      setFilesPanelOpen(false); // close files drawer
-      setSubagentsPanelOpen(false); // close mobile agents drawer
-      setShellsPanelOpen(false); // close mobile shells drawer
-      setPanelInitialKey(key);
-    },
-    [clearFileViewerUrl, setPanelInitialKey],
+    (key: string) => openMobilePanel(() => setPanelInitialKey(key)),
+    [openMobilePanel, setPanelInitialKey],
   );
 
   // Open a shell as a tab in the desktop workspace rail (the mobile path
@@ -2186,24 +2165,23 @@ function AppShellImpl() {
   // shell tab and a file tab can't both be "active".
   const openTerminalTab = useCallback(
     (key: string, { focus = true }: { focus?: boolean } = {}) => {
-      // The tab already exists (tabs derive 1:1 from the terminal list); this
-      // just focuses it and reveals the rail. The selection is sticky (never
-      // pruned off the list), so a fresh create that's still landing stays
-      // selected and its xterm surfaces the instant the terminal appears.
-      // `focus: false` shows the shell but leaves keyboard focus where it is.
-      autoFocusTerminalRef.current = focus && conversationId ? { conversationId, key } : null;
-      setSelectedTerminalKey(key);
-      setSelectedFilePath(null);
-      setFileViewerCommentsOpen(false);
-      clearFileViewerUrl();
-      setExecutionLogsKey(null);
-      setFilesPanelOpen(false);
-      setSubagentsPanelOpen(false);
-      setShellsPanelOpen(false);
-      setRightPanelOpenAnimated(true);
-      if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+      navigateWorkspace(() => {
+        // The tab already exists (tabs derive 1:1 from the terminal list); this
+        // just focuses it and reveals the rail. The selection is sticky (never
+        // pruned off the list), so a fresh create that's still landing stays
+        // selected and its xterm surfaces the instant the terminal appears.
+        // `focus: false` shows the shell but leaves keyboard focus where it is.
+        autoFocusTerminalRef.current = focus && conversationId ? { conversationId, key } : null;
+        setSelectedTerminalKey(key);
+        setExecutionLogsKey(null);
+        setFilesPanelOpen(false);
+        setSubagentsPanelOpen(false);
+        setShellsPanelOpen(false);
+        setRightPanelOpenAnimated(true);
+        if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+      });
     },
-    [clearFileViewerUrl, conversationId, setRightPanelOpenAnimated],
+    [navigateWorkspace, conversationId, setRightPanelOpenAnimated],
   );
 
   // ⌃` and ⌘⌥T (Ctrl+Alt+T) open a new shell, as does the desktop menu's New
@@ -2359,132 +2337,61 @@ function AppShellImpl() {
   // reappears the instant the terminal returns.
 
   function openExecutionLogsPanel(key: string) {
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setPanelInitialKey(null); // close terminals panel
-    setFilesPanelOpen(false); // close files drawer
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
-    setGithubPanelOpen(false); // close mobile github drawer
-    setContentSearchPanelOpen(false); // close mobile content-search drawer
-    setSideChatsPanelOpen(false); // close mobile side-chats drawer
-    setExecutionLogsKey(key);
+    openMobilePanel(() => setExecutionLogsKey(key));
   }
 
-  // Open the selected scope in the desktop workspace or mobile drawer.
+  // Scope selection and its reveal share the same accepted navigation on every viewport.
   const openFilesDrawer = useCallback(
-    (flatView: boolean) => {
+    (flatView: boolean, afterCommit?: () => void) => {
       if (!isMobileViewport()) {
-        handleRightRailTabChange(flatView ? "changes" : "files", revealRightPanel);
+        handleRightRailTabChange(flatView ? "changes" : "files", () => {
+          revealRightPanel();
+          afterCommit?.();
+        });
         return;
       }
-      setSelectedFilePath(null); // close file viewer
-      clearFileViewerUrl();
-      setPanelInitialKey(null); // close terminals panel
-      setExecutionLogsKey(null); // close execution-logs panel
-      setSubagentsPanelOpen(false); // close mobile agents drawer
-      setShellsPanelOpen(false); // close mobile shells drawer
-      setGithubPanelOpen(false); // close mobile github drawer
-      setContentSearchPanelOpen(false); // close mobile content-search drawer
-      setSideChatsPanelOpen(false); // close mobile side-chats drawer
-      setFilesDrawerFlatView(flatView);
-      setFilesPanelOpen(true);
+      openMobilePanel(() => {
+        setFilesDrawerFlatView(flatView);
+        setFilesPanelOpen(true);
+        afterCommit?.();
+      });
     },
-    [clearFileViewerUrl, setPanelInitialKey, handleRightRailTabChange, revealRightPanel],
+    [openMobilePanel, handleRightRailTabChange, revealRightPanel],
   );
   const openFilesPanel = () => openFilesDrawer(false);
-  const openChangesPanel = () => openFilesDrawer(true);
+  const openChangesPanel = (afterCommit?: () => void) => openFilesDrawer(true, afterCommit);
 
-  // Open the agent tree in the desktop workspace or mobile drawer.
-  function openSubagentsPanel() {
+  function openSubagentsPanel(afterCommit?: () => void) {
     if (!isMobileViewport()) {
-      handleRightRailTabChange("subagents", revealRightPanel);
+      handleRightRailTabChange("subagents", () => {
+        revealRightPanel();
+        afterCommit?.();
+      });
       return;
     }
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setPanelInitialKey(null); // close terminals panel
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
-    setGithubPanelOpen(false); // close mobile github drawer
-    setContentSearchPanelOpen(false); // close mobile content-search drawer
-    setSideChatsPanelOpen(false); // close mobile side-chats drawer
-    setSubagentsPanelOpen(true);
+    openMobilePanel(() => {
+      setSubagentsPanelOpen(true);
+      afterCommit?.();
+    });
   }
 
-  // Mobile FAB → "Shells" opens the session's shells list as a full-screen
-  // drawer (there is no desktop Shells tab; desktop opens shells as soft
-  // tabs). This preserves the "+ New shell" empty state on phones instead
-  // of requiring an existing shell before the entry works.
   function openShellsPanel() {
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setPanelInitialKey(null); // close terminals panel / terminal-first view
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setGithubPanelOpen(false); // close mobile github drawer
-    setContentSearchPanelOpen(false); // close mobile content-search drawer
-    setSideChatsPanelOpen(false); // close mobile side-chats drawer
-    setShellsPanelOpen(true);
+    openMobilePanel(() => setShellsPanelOpen(true));
   }
 
-  // Mobile FAB → "Pull Requests" opens the pull request panel as a full-screen
-  // drawer (matches the desktop rail's Pull Requests tab; the panel handles all
-  // states — not-a-git-repo, no provider CLI, unauthenticated, no PR — itself).
-  const openGithubPanel = useCallback(() => {
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setPanelInitialKey(null); // close terminals panel
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
-    setSideChatsPanelOpen(false); // close mobile side-chats drawer
-    setContentSearchPanelOpen(false); // close mobile content-search drawer
-    setGithubPanelOpen(true);
-  }, [clearFileViewerUrl, setPanelInitialKey]);
+  const openGithubPanel = useCallback(
+    () => openMobilePanel(() => setGithubPanelOpen(true)),
+    [openMobilePanel],
+  );
 
-  // Mobile FAB → "Content search" opens the desktop rail's Content search tab
-  // as a full-screen drawer.
   function openContentSearchPanel() {
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setPanelInitialKey(null); // close terminals panel
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
-    setGithubPanelOpen(false); // close mobile github drawer
-    setSideChatsPanelOpen(false); // close mobile side-chats drawer
-    setContentSearchPanelOpen(true);
+    openMobilePanel(() => setContentSearchPanelOpen(true));
   }
 
-  // Composer links open the mobile drawer or reveal the desktop Pull Requests tab.
-  // Deselect files/shells so the chosen panel owns its content slot.
   const openGithubTab = useCallback(() => {
-    if (isMobileViewport()) {
-      openGithubPanel();
-      return;
-    }
-    setSelectedFilePath(null);
-    setSelectedTerminalKey(null);
-    if (!terminalFirst) setPanelInitialKey(null);
-    setExecutionLogsKey(null);
-    setFilesPanelOpen(false);
-    setSubagentsPanelOpen(false);
-    selectRightRailTab("github");
-    setRightPanelOpenAnimated(true);
-    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
-  }, [
-    conversationId,
-    terminalFirst,
-    setPanelInitialKey,
-    openGithubPanel,
-    selectRightRailTab,
-    setRightPanelOpenAnimated,
-  ]);
+    if (isMobileViewport()) openGithubPanel();
+    else handleRightRailTabChange("github", revealRightPanel);
+  }, [openGithubPanel, handleRightRailTabChange, revealRightPanel]);
 
   function openMainExecutionLog() {
     // Mobile FAB → "Execution logs" jumps straight to the main thread.
@@ -2494,34 +2401,11 @@ function AppShellImpl() {
 
   // A chat link to a folder browses the Files tree there (drawer on mobile).
   const openFolderInFiles = useCallback(
-    (absolutePath: string) =>
-      guardFileNavigation(absolutePath, undefined, () => {
-        if (!conversationId) return;
-        revealFolderInFilesPanel(conversationId, absolutePath);
-        if (isMobileViewport()) {
-          openFilesDrawer(false);
-          return;
-        }
-        showScopeView();
-        setSelectedTerminalKey(null);
-        if (!terminalFirst) setPanelInitialKey(null);
-        setExecutionLogsKey(null);
-        setFilesPanelOpen(false);
-        setSubagentsPanelOpen(false);
-        selectRightRailTab("files");
-        setRightPanelOpenAnimated(true);
-        writeSessionWorkspaceState(conversationId, { open: true });
-      }),
-    [
-      guardFileNavigation,
-      conversationId,
-      openFilesDrawer,
-      showScopeView,
-      terminalFirst,
-      setPanelInitialKey,
-      selectRightRailTab,
-      setRightPanelOpenAnimated,
-    ],
+    (absolutePath: string) => {
+      if (!conversationId) return;
+      openFilesDrawer(false, () => revealFolderInFilesPanel(conversationId, absolutePath));
+    },
+    [conversationId, openFilesDrawer],
   );
 
   // Workspace root + runner home let chat path-links collapse absolute or
@@ -2987,9 +2871,9 @@ function AppShellImpl() {
                       subagentsWorking,
                       agentCount,
                       onOpenFiles: openFilesPanel,
-                      onOpenChanges: openChangesPanel,
+                      onOpenChanges: () => openChangesPanel(),
                       onOpenShells: openShellsPanel,
-                      onOpenSubagents: openSubagentsPanel,
+                      onOpenSubagents: () => openSubagentsPanel(),
                       onOpenGithub: openGithubPanel,
                       showContentSearch: railTabsAvailable["content-search"],
                       onOpenContentSearch: openContentSearchPanel,

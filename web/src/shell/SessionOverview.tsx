@@ -76,16 +76,7 @@ function OverviewSubagent({
         <Link
           to={destination}
           onClick={(event) => {
-            openInPanel(child.id, event, destination);
-            if (
-              event.button === 0 &&
-              !event.metaKey &&
-              !event.ctrlKey &&
-              !event.shiftKey &&
-              !event.altKey
-            ) {
-              onNavigate?.();
-            }
+            openInPanel(child.id, event, destination, onNavigate);
           }}
           className="flex min-w-0 flex-1 items-center gap-2 rounded-md p-1 hover:bg-accent focus-visible:outline-ring"
         >
@@ -161,8 +152,8 @@ interface OverviewContentProps {
   changedFiles: Pick<ReturnType<typeof useWorkspaceChangedFiles>, "data" | "isError">;
   workspaceUnavailable?: boolean;
   showChanges: boolean;
-  onOpenChanges: () => void;
-  onOpenAgents: () => void;
+  onOpenChanges: (afterCommit?: () => void) => void;
+  onOpenAgents: (afterCommit?: () => void) => void;
   onNavigate?: () => void;
 }
 
@@ -235,10 +226,7 @@ function OverviewContent({
           variant="link"
           size="sm"
           className="h-auto p-0 text-xs"
-          onClick={() => {
-            onNavigate?.();
-            onOpenAgents();
-          }}
+          onClick={() => onOpenAgents(onNavigate)}
         >
           View all agents →
         </Button>
@@ -276,17 +264,16 @@ function OverviewContent({
                   {counts.unknown === 1 ? "file" : "files"}.
                 </p>
               )}
-              <p className="text-xs text-muted-foreground">Compared with HEAD</p>
+              {counts.unknown < files.length && (
+                <p className="text-xs text-muted-foreground">Compared with HEAD</p>
+              )}
             </>
           )}
           <Button
             variant="link"
             size="sm"
             className="h-auto p-0 text-xs"
-            onClick={() => {
-              onNavigate?.();
-              onOpenChanges();
-            }}
+            onClick={() => onOpenChanges(onNavigate)}
           >
             View changes →
           </Button>

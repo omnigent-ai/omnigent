@@ -16,7 +16,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
-import { useCallback, useContext, useLayoutEffect, useState } from "react";
+import { useCallback, useContext, useLayoutEffect, useRef, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
@@ -439,8 +439,17 @@ function LocationDisplay() {
 function DirtyFileViewerProbe() {
   const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
   const [allowLeaving, setAllowLeaving] = useState<(() => void) | null>(null);
+  const dirty = useRef(true);
   useLayoutEffect(
-    () => registerNavigationGuard?.((_path, _options, navigate) => setAllowLeaving(() => navigate)),
+    () =>
+      registerNavigationGuard?.((_path, _options, navigate) => {
+        if (!dirty.current) return navigate();
+        setAllowLeaving(() => () => {
+          dirty.current = false;
+          setAllowLeaving(null);
+          navigate();
+        });
+      }),
     [registerNavigationGuard],
   );
   return allowLeaving ? (
@@ -818,6 +827,44 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+// Resizable viewport: matchMedia answers the md queries from `width` and
+// fires change listeners for the queries a resize flips.
+function mockViewportWidth(initialWidth: number) {
+  let width = initialWidth;
+  const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+  const matches = (query: string) => {
+    if (query === "(min-width: 768px)") return width >= 768;
+    if (query === "(max-width: 767.98px)") return width < 768;
+    return false;
+  };
+  const baseMatchMedia = window.matchMedia;
+  const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+    ...baseMatchMedia(query),
+    matches: matches(query),
+    addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+      if (!listeners.has(query)) listeners.set(query, new Set());
+      listeners.get(query)?.add(listener);
+    },
+    removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+      listeners.get(query)?.delete(listener);
+    },
+  }));
+  onTestFinished(() => matchMedia.mockRestore());
+  return (nextWidth: number) =>
+    act(() => {
+      const before = new Map([...listeners.keys()].map((query) => [query, matches(query)]));
+      width = nextWidth;
+      for (const [query, queryListeners] of listeners) {
+        const event = { matches: matches(query), media: query } as MediaQueryListEvent;
+        if (before.get(query) === event.matches) continue;
+        for (const listener of queryListeners) {
+          if (typeof listener === "function") listener(event);
+          else listener.handleEvent(event);
+        }
+      }
+    });
+}
+
 describe("AppShell session overview", () => {
   it("guards child navigation until unsaved parent edits are explicitly left", () => {
     mockConversations([
@@ -850,10 +897,13 @@ describe("AppShell session overview", () => {
       { dirtyFileViewer: true },
     );
     const openChild = () => {
-      fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
+      if (!screen.queryByText("Includes subagents")) {
+        fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
+      }
       fireEvent.click(screen.getByRole("link", { name: /Review changes/ }));
     };
     const expectParent = () => {
+      expect(screen.getByText("Includes subagents")).toBeInTheDocument();
       expect(screen.getByTestId("url-pathname")).toHaveTextContent("/c/conv_parent");
       expect(screen.getByTestId("url-params")).toHaveTextContent("file=draft.md");
       expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "draft.md");
@@ -870,19 +920,16 @@ describe("AppShell session overview", () => {
   });
 
   it.each([
-    { action: "View all agents →", tab: "Agents", overview: true },
-    { action: "View changes →", tab: "Changes", overview: true },
-    { action: "Agents", tab: "Agents", overview: false },
-    { action: "Changes", tab: "Changes", overview: false },
+    { action: "View all agents →", tab: "Agents", overview: true, mobile: false },
+    { action: "View changes →", tab: "Changes", overview: true, mobile: false },
+    { action: "Agents", tab: "Agents", overview: false, mobile: false },
+    { action: "Changes", tab: "Changes", overview: false, mobile: false },
+    { action: "View all agents →", tab: "Agents", overview: true, mobile: true },
+    { action: "View changes →", tab: "Changes", overview: true, mobile: true },
   ])(
-    "preserves unsaved edits before opening $action (overview=$overview)",
-    ({ action, tab, overview }) => {
-      const baseMatchMedia = window.matchMedia;
-      const media = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
-        ...baseMatchMedia(query),
-        matches: query === "(min-width: 768px)",
-      }));
-      onTestFinished(() => media.mockRestore());
+    "preserves unsaved edits before opening $action (overview=$overview, mobile=$mobile)",
+    ({ action, tab, overview, mobile }) => {
+      const resize = mockViewportWidth(1280);
       writeSessionWorkspaceState("conv_overview", {
         open: true,
         openFiles: ["draft.md"],
@@ -894,13 +941,16 @@ describe("AppShell session overview", () => {
         serverInfo({ features: { session_overview: true } }),
         { dirtyFileViewer: true },
       );
-      if (overview) fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+      if (overview) {
+        fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+        fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
+      }
+      if (mobile) resize(700);
       const workspaceBefore = readSessionWorkspaceState("conv_overview");
       const defaultBefore = readWorkspacePanelDefault();
       const urlBefore = screen.getByTestId("url-params").textContent;
       const openTab = () => {
         if (overview) {
-          fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
           fireEvent.click(screen.getByText(action));
         } else {
           fireEvent.mouseDown(screen.getByRole("tab", { name: new RegExp(tab) }));
@@ -912,13 +962,28 @@ describe("AppShell session overview", () => {
         expect(readSessionWorkspaceState("conv_overview")).toEqual(workspaceBefore);
         expect(readWorkspacePanelDefault()).toBe(defaultBefore);
         expect(railOpenState()).toBe(overview ? "closed" : "open");
+        if (overview) expect(screen.getByText("Includes subagents")).toBeInTheDocument();
+        expect(screen.getByTestId("files-panel-drawer")).toHaveAttribute("data-state", "closed");
+        expect(screen.getByTestId("subagents-panel-drawer")).toHaveAttribute(
+          "data-state",
+          "closed",
+        );
       };
       openTab();
       expectUnchanged();
-      fireEvent.click(screen.getByRole("button", { name: "cancel leaving" }));
+      fireEvent.click(screen.getByText("cancel leaving"));
       expectUnchanged();
       openTab();
-      fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+      fireEvent.click(screen.getByText("allow leaving"));
+      expect(screen.queryByText("Includes subagents")).toBeNull();
+      expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+      expect(screen.getByTestId("url-params").textContent).not.toContain("file=");
+      if (mobile) {
+        expect(
+          screen.getByTestId(tab === "Agents" ? "subagents-panel-drawer" : "files-panel-drawer"),
+        ).toHaveAttribute("data-state", "open");
+        return;
+      }
       expect(railOpenState()).toBe("open");
       expect(readSessionWorkspaceState("conv_overview").open).toBe(true);
       if (overview) expect(readWorkspacePanelDefault()).toBe("open");
@@ -2515,44 +2580,6 @@ describe("Workspace rail maximize", () => {
 });
 
 describe("Sidebar across the md breakpoint", () => {
-  // Resizable viewport: matchMedia answers the md queries from `width` and
-  // fires change listeners for the queries a resize flips.
-  function mockViewportWidth(initialWidth: number) {
-    let width = initialWidth;
-    const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
-    const matches = (query: string) => {
-      if (query === "(min-width: 768px)") return width >= 768;
-      if (query === "(max-width: 767.98px)") return width < 768;
-      return false;
-    };
-    const baseMatchMedia = window.matchMedia;
-    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
-      ...baseMatchMedia(query),
-      matches: matches(query),
-      addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
-        if (!listeners.has(query)) listeners.set(query, new Set());
-        listeners.get(query)?.add(listener);
-      },
-      removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
-        listeners.get(query)?.delete(listener);
-      },
-    }));
-    onTestFinished(() => matchMedia.mockRestore());
-    return (nextWidth: number) =>
-      act(() => {
-        const before = new Map([...listeners.keys()].map((query) => [query, matches(query)]));
-        width = nextWidth;
-        for (const [query, queryListeners] of listeners) {
-          const event = { matches: matches(query), media: query } as MediaQueryListEvent;
-          if (before.get(query) === event.matches) continue;
-          for (const listener of queryListeners) {
-            if (typeof listener === "function") listener(event);
-            else listener.handleEvent(event);
-          }
-        }
-      });
-  }
-
   it("pauses the mobile Agents drawer when widening to desktop and resumes on return", () => {
     const resize = mockViewportWidth(700);
     mockConversations([{ id: "conv_abc", permission_level: null }]);

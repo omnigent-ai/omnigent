@@ -87,13 +87,16 @@ describe("useOpenSubagentInPanel", () => {
         hash: "#cost",
       };
 
-      expect(openInPanel("child/with space", click, destination)).toBe(true);
+      const afterCommit = vi.fn();
+      expect(openInPanel("child/with space", click, destination, afterCommit)).toBe(true);
+      expect(afterCommit).not.toHaveBeenCalled();
       expect(click.preventDefault).toHaveBeenCalledOnce();
       expect(guard).toHaveBeenCalledWith(null, undefined, expect.any(Function));
       expect(screen.getByTestId("location").textContent).toBe("/");
       if (opener) expect(opener).not.toHaveBeenCalled();
 
       act(() => guard.mock.calls[0]![2]());
+      expect(afterCommit).toHaveBeenCalledOnce();
       if (opener) {
         if (enabled && !mobile) expect(opener).toHaveBeenCalledWith("child/with space");
         else expect(opener).not.toHaveBeenCalled();

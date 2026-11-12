@@ -8,6 +8,7 @@ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { useChatStore } from "@/store/chatStore";
 import type { ModelUsage } from "@/lib/types";
 import type { WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
+import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext";
 import { SessionOverview } from "./SessionOverview";
 
 const mobile = vi.hoisted(() => ({ value: false }));
@@ -17,6 +18,16 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: useChildSessionsMock,
 }));
+
+const guardedFileViewer = {
+  openFile: vi.fn(),
+  openGithubTab: vi.fn(),
+  isChangedPath: () => false,
+  conversationId: "session",
+  workspaceRoot: null,
+  workspaceHome: null,
+  guardFileNavigation: vi.fn<FileNavigationGuard>(),
+};
 
 type Props = ComponentProps<typeof SessionOverview>;
 let host: HTMLDivElement;
@@ -87,8 +98,8 @@ beforeEach(() => {
     chatWidthMeasure,
     dockAllowed: true,
     showChanges: true,
-    onOpenChanges: vi.fn(),
-    onOpenAgents: vi.fn(),
+    onOpenChanges: vi.fn((afterCommit) => afterCommit?.()),
+    onOpenAgents: vi.fn((afterCommit) => afterCommit?.()),
     changedFiles: {
       data: { available: true, data: [file("app.ts", 12, 4), file("asset.png", null, null)] },
       isError: false,
@@ -193,8 +204,9 @@ describe("Session overview", () => {
   });
 
   it("shows authoritative spend, cumulative tokens and partial workspace counts with working links", () => {
-    render(<SessionOverview {...props} />, { wrapper: Wrapper });
+    const view = render(<SessionOverview {...props} />, { wrapper: Wrapper });
     const card = within(screen.getByRole("complementary", { name: "Session overview" }));
+    expect(card.getByText("Compared with HEAD")).toBeInTheDocument();
     expect(card.getByText("$1.25")).toBeInTheDocument();
     expect(card.getByText("2K")).toBeInTheDocument();
     expect(card.getByText("Includes subagents")).toBeInTheDocument();
@@ -206,6 +218,17 @@ describe("Session overview", () => {
     fireEvent.click(card.getByText("View changes →"));
     expect(props.onOpenAgents).toHaveBeenCalledOnce();
     expect(props.onOpenChanges).toHaveBeenCalledOnce();
+    view.rerender(
+      <SessionOverview
+        {...props}
+        changedFiles={{
+          data: { available: true, data: [file("notes.txt", null, null)] },
+          isError: false,
+        }}
+      />,
+    );
+    expect(screen.getByText("Lines unavailable")).toBeInTheDocument();
+    expect(screen.queryByText("Compared with HEAD")).toBeNull();
   });
 
   it("remembers explicit dismissal and restores from the cost button", () => {
@@ -250,7 +273,13 @@ describe("Session overview", () => {
     "opens an on-demand overview without closing Workspace (mobile=%s)",
     (isMobile) => {
       mobile.value = isMobile;
-      const view = render(<SessionOverview {...props} dockAllowed={false} />, { wrapper: Wrapper });
+      const guard = guardedFileViewer.guardFileNavigation.mockReset();
+      const content = (
+        <FileViewerContext.Provider value={guardedFileViewer}>
+          <SessionOverview {...props} dockAllowed={false} />
+        </FileViewerContext.Provider>
+      );
+      const view = render(content, { wrapper: Wrapper });
       expect(screen.queryByText("Includes subagents")).toBeNull();
       expect(useChildSessionsMock).not.toHaveBeenCalled();
       fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
@@ -261,14 +290,19 @@ describe("Session overview", () => {
         fireEvent.click(screen.getByRole("link", { name: /Review changes/ }), { [modifier]: true });
         expect(screen.getByText("Includes subagents")).toBeInTheDocument();
       }
+      expect(guard).not.toHaveBeenCalled();
       fireEvent.click(screen.getByRole("link", { name: /Review changes/ }));
+      expect(screen.getByText("Includes subagents")).toBeInTheDocument();
+      // Refusing the first navigation keeps the overlay; a second accepted click closes it.
+      fireEvent.click(screen.getByRole("link", { name: /Review changes/ }));
+      act(() => guard.mock.calls[1]![2]());
       expect(screen.queryByText("Includes subagents")).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: /Session overview, cost/ }));
       fireEvent.click(screen.getByText("View changes →"));
       expect(props.onOpenChanges).toHaveBeenCalledOnce();
       expect(screen.queryByText("Includes subagents")).toBeNull();
       useChildSessionsMock.mockClear();
-      view.rerender(<SessionOverview {...props} dockAllowed={false} />);
+      view.rerender(content);
       expect(useChildSessionsMock).not.toHaveBeenCalled();
     },
   );

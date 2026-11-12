@@ -1201,13 +1201,18 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     useChatStore.setState({ sessionHarness: "openai-agents", sideChatComposers: {} });
     try {
       const { onRightRailTabChange } = renderWorkspace({ rightRailTab: "sidechat" });
+      onRightRailTabChange.mockImplementation(() => {});
+      const before = readSessionWorkspaceState("conv_ws");
 
       fireEvent.pointerDown(await screen.findByRole("button", { name: "Open new" }), { button: 0 });
       fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
 
+      expect(readSessionWorkspaceState("conv_ws")).toEqual(before);
+      expect(useChatStore.getState().sideChatComposers).toEqual({});
+      act(() => onRightRailTabChange.mock.lastCall?.[1]?.());
       const pendingId = screen.getByTestId("side-chat-pane-stub").firstChild?.textContent ?? "";
       expect(pendingId).toMatch(/^pending:/);
-      expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+      expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat", expect.any(Function));
       expect(useChatStore.getState().sideChatComposers).toEqual({
         [pendingId]: { text: "", files: [], autoFocus: true },
       });
@@ -1825,17 +1830,22 @@ describe("WorkspacePanel sub-agent tabs", () => {
 
   it("opens a requested sub-agent as a labeled tab without duplicating it", () => {
     const { onRightRailTabChange } = renderWorkspace({ queryClient: clientWithSubagent() });
+    onRightRailTabChange.mockImplementation(() => {});
     const rail = screen.getByRole("complementary", { name: "Workspace" });
 
     for (let attempt = 0; attempt < 2; attempt++) {
+      const before = readSessionWorkspaceState("conv_ws");
       act(() => {
         useChatStore.setState({ sideChatToOpen: { childId: SUBAGENT_TAB, parentId: "conv_ws" } });
       });
+      expect(readSessionWorkspaceState("conv_ws")).toEqual(before);
+      expect(useChatStore.getState().sideChatToOpen).not.toBeNull();
+      act(() => onRightRailTabChange.mock.lastCall?.[1]?.());
       expect(useChatStore.getState().sideChatToOpen).toBeNull();
     }
 
     expect(within(rail).getAllByRole("tab", { name: "Research agent" })).toHaveLength(1);
-    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat", expect.any(Function));
   });
 
   it("shows the sub-agent's whole session with a full-screen link", () => {
@@ -1950,7 +1960,7 @@ describe("WorkspacePanel sub-agent tabs", () => {
       useChatStore.setState({ sideChatToOpen: { childId: SUBAGENT_TAB, parentId: "conv_ws" } });
     });
 
-    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat", expect.any(Function));
     expect(readSessionWorkspaceState("conv_ws")).toEqual({
       openSideChats: ["conv_child"],
       selectedSideChatId: "conv_child",
@@ -1990,7 +2000,7 @@ describe("WorkspacePanel sub-agent tabs", () => {
     const { onRightRailTabChange } = renderWorkspace({ queryClient: clientWithSubagent() });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
     fireEvent.click(screen.getByRole("menuitem", { name: "Research agent" }));
-    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat", expect.any(Function));
     cleanup();
 
     isMobileMock.mockReturnValue(true);
@@ -2111,19 +2121,41 @@ describe("WorkspacePanel panel picker", () => {
     expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh");
   });
 
-  it("selects browser and side-chat tabs", () => {
-    writeSessionWorkspaceState("conv_ws", {
-      openBrowsers: ["browser-one"],
-      openSideChats: ["pending:one"],
-    });
-    const { onRightRailTabChange } = renderWorkspace({ showBrowserTab: true });
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Browser 1" }));
-    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Side chat 1" }));
-    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
-  });
+  it.each(["picker", "strip"])(
+    "selects browser and side-chat tabs only after acceptance (%s)",
+    (surface) => {
+      writeSessionWorkspaceState("conv_ws", {
+        openBrowsers: ["browser-one", "browser-two"],
+        selectedBrowserId: "browser-one",
+        openSideChats: ["pending:one", "pending:two"],
+        selectedSideChatId: "pending:one",
+      });
+      const { onRightRailTabChange } = renderWorkspace({
+        showBrowserTab: true,
+        selectedFilePath: "draft.md",
+      });
+      onRightRailTabChange.mockImplementation(() => {});
+      const select = (name: string) => {
+        if (surface === "picker") {
+          fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), {
+            button: 0,
+          });
+          fireEvent.click(screen.getByRole("menuitem", { name }));
+        } else fireEvent.click(screen.getByRole("tab", { name }));
+      };
+      for (const [name, field, value] of [
+        ["Browser 2", "selectedBrowserId", "browser-two"],
+        ["Side chat 2", "selectedSideChatId", "pending:two"],
+      ] as const) {
+        const before = readSessionWorkspaceState("conv_ws");
+        select(name);
+        expect(readSessionWorkspaceState("conv_ws")).toEqual(before);
+        select(name);
+        act(() => onRightRailTabChange.mock.lastCall?.[1]?.());
+        expect(readSessionWorkspaceState("conv_ws")[field]).toBe(value);
+      }
+    },
+  );
 });
 
 it("keeps a contained workspace inline on narrow viewports and scopes its file browser", () => {
@@ -2319,23 +2351,31 @@ describe("WorkspacePanel desktop menu commands", () => {
     expect(onHide).not.toHaveBeenCalled();
   });
 
-  it("opens New Browser Tab over an open file only once its viewer allows it", () => {
-    const allowLeaving: (() => void)[] = [];
-    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
-      allowLeaving.push(commit);
-    });
-    const { onRightRailTabChange } = renderWorkspace({
-      showBrowserTab: true,
-      openFiles: ["src/a.ts"],
-      selectedFilePath: "src/a.ts",
-      fileGuard,
-    });
-    sendCommand({ command: "new-browser-tab", browserViewId: null });
-    expect(fileGuard).toHaveBeenCalledWith(null, undefined, expect.any(Function));
-    expect(onRightRailTabChange).not.toHaveBeenCalledWith("browser");
-    act(() => allowLeaving[0]!());
-    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
-  });
+  it.each(["command", "agent"])(
+    "opens a browser over a file only after acceptance (%s)",
+    (source) => {
+      const { onRightRailTabChange, onReveal } = renderWorkspace({
+        showBrowserTab: true,
+        openFiles: ["src/a.ts"],
+        selectedFilePath: "src/a.ts",
+      });
+      onRightRailTabChange.mockImplementation(() => {});
+      const before = readSessionWorkspaceState("conv_ws");
+      act(() => {
+        if (source === "command") sendCommand({ command: "new-browser-tab", browserViewId: null });
+        else
+          emitBrowserActionRequest(
+            { type: "browser_action_request", actionId: "navigate", action: "navigate", args: {} },
+            "conv_ws",
+          );
+      });
+      expect(readSessionWorkspaceState("conv_ws")).toEqual(before);
+      expect(onReveal).not.toHaveBeenCalled();
+      act(() => onRightRailTabChange.mock.lastCall?.[1]?.());
+      expect(readSessionWorkspaceState("conv_ws").openBrowsers).toHaveLength(1);
+      expect(onReveal).toHaveBeenCalledOnce();
+    },
+  );
 
   it("does not close a page that a stale shell selection leaves unselected", () => {
     // Unpinned, Changes is an open page tab that Close could remove.
@@ -2625,8 +2665,8 @@ describe("WorkspacePanel desktop menu commands", () => {
 
   it("opens a browser tab for New Browser Tab when the workspace offers browsers", () => {
     const { onRightRailTabChange, onReveal } = renderWorkspace({ showBrowserTab: true });
-    sendCommand({ command: "new-browser-tab", browserViewId: null });
-    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+    act(() => sendCommand({ command: "new-browser-tab", browserViewId: null }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("browser", expect.any(Function));
     expect(onReveal).toHaveBeenCalled();
   });
 

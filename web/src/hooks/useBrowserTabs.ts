@@ -178,7 +178,7 @@ function retainOpenTabRequests(): () => void {
   };
 }
 
-export function useBrowserTabs(conversationId: string) {
+export function useBrowserTabs(conversationId: string, onOpen?: (commit: () => void) => void) {
   const [state, setState] = useState(() => readBrowserTabsState(conversationId));
   // Reload on a conversation switch during render, so the session's first frame
   // (and the rail's tab fallback) never sees the previous session's tabs.
@@ -271,8 +271,12 @@ export function useBrowserTabs(conversationId: string) {
   useEffect(() => {
     const selectBrowser = (sourceConversationId: string, tabId: string) => {
       if (sourceConversationId === conversationId) {
-        noteBrowserSelection(conversationId);
-        setState(openBrowserTab(conversationId, tabId));
+        const commit = () => {
+          noteBrowserSelection(conversationId);
+          setState(openBrowserTab(conversationId, tabId));
+        };
+        if (onOpen) onOpen(commit);
+        else commit();
       }
     };
     const unsubscribeAction = onBrowserActionRequest((event, sourceConversationId) => {
@@ -285,7 +289,7 @@ export function useBrowserTabs(conversationId: string) {
       unsubscribeAction();
       unsubscribeLink();
     };
-  }, [conversationId]);
+  }, [conversationId, onOpen]);
 
   /** Open and select a tab, loading `url` into its view before the pane mounts; returns its id. */
   const add = (url?: string): string => {

@@ -935,7 +935,18 @@ function WorkspacePanelImpl({
   const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
   const railRef = useRef<HTMLElement | null>(null);
   const railContentRef = useRef<HTMLDivElement | null>(null);
-  const browsers = useBrowserTabs(conversationId);
+  const mobileViewport = useIsMobileViewport();
+  const isMobile = mobileViewport && !contained;
+  const openBrowserFromEvent = useCallback(
+    (commit: () => void) => {
+      onRightRailTabChange("browser", () => {
+        commit();
+        onReveal?.();
+      });
+    },
+    [onRightRailTabChange, onReveal],
+  );
+  const browsers = useBrowserTabs(conversationId, openBrowserFromEvent);
   const returnPointRef = useRef<ReturnPoint | null>(null);
   // The latest returnFrom, so a close that finishes later uses the tabs open by then.
   const returnFromRef = useRef<(point: ReturnPoint) => void>(() => {});
@@ -1065,7 +1076,7 @@ function WorkspacePanelImpl({
     ) {
       focus = { element: active };
     }
-    const openBrowser = () => {
+    onRightRailTabChange("browser", () => {
       const tabId = browsers.add();
       returnPointRef.current = {
         tabId,
@@ -1075,15 +1086,8 @@ function WorkspacePanelImpl({
         shown: false,
       };
       setBrowserFocus({ viewId: browserViewId(conversationId, tabId), target: "address" });
-      onRightRailTabChange("browser");
       onReveal?.();
-    };
-    // A new browser tab replaces the file on screen, so its viewer confirms unsaved edits first.
-    if (selectedFilePath !== null && guardFileNavigation) {
-      guardFileNavigation(null, undefined, openBrowser);
-    } else {
-      openBrowser();
-    }
+    });
   };
   useDesktopCommand(
     "new-browser-tab",
@@ -1114,7 +1118,8 @@ function WorkspacePanelImpl({
   const awaitingPendingIdsRef = useRef<string[]>([]);
   // A side chat the server just created (Codex's native fork, or the generic
   // fork) announces itself via `sideChatToOpen`. If a pending tab is awaiting,
-  // rekey it in place; otherwise open a fresh tab. AppShell reveals the rail.
+  // rekey it in place; otherwise open a fresh tab after navigation is accepted.
+  const requestedSideChatRef = useRef<typeof sideChatToOpen>(null);
   useEffect(() => {
     if (sideChatToOpen === null) return;
     // Only the parent that owns this side chat consumes (and clears) the signal
@@ -1122,28 +1127,42 @@ function WorkspacePanelImpl({
     // own parent's rail rather than landing in whatever conversation is on
     // screen now.
     if (sideChatToOpen.parentId !== conversationId) return;
-    const { childId } = sideChatToOpen;
-    const subagentId = subagentSessionIdFromTab(childId);
-    if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
-      // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
-      sideChats.select(subagentId);
-    } else if (childId.startsWith("pending:") || subagentId !== null) {
-      // "Ask in side chat" (a not-yet-forked tab) and sub-agent tabs (an
-      // existing session) must not take a slot in the Codex awaiting queue.
-      sideChats.open(childId);
-    } else {
-      const awaiting = awaitingPendingIdsRef.current.shift();
-      if (awaiting !== undefined) {
-        sideChats.rekey(awaiting, childId);
-        useChatStore.getState().clearSideChatComposer(awaiting);
-      } else {
-        // Generic already rekeyed its own tab; this just re-selects it (idempotent).
+    if (requestedSideChatRef.current === sideChatToOpen) return;
+    requestedSideChatRef.current = sideChatToOpen;
+    onRightRailTabChange("sidechat", () => {
+      const { childId } = sideChatToOpen;
+      const subagentId = subagentSessionIdFromTab(childId);
+      if (subagentId !== null && sideChats.tabs.includes(subagentId)) {
+        // Already open as a side chat (a Codex /side fork is listed as a sub-agent).
+        sideChats.select(subagentId);
+      } else if (childId.startsWith("pending:") || subagentId !== null) {
+        // "Ask in side chat" (a not-yet-forked tab) and sub-agent tabs (an
+        // existing session) must not take a slot in the Codex awaiting queue.
         sideChats.open(childId);
+      } else {
+        const awaiting = awaitingPendingIdsRef.current.shift();
+        if (awaiting !== undefined) {
+          sideChats.rekey(awaiting, childId);
+          useChatStore.getState().clearSideChatComposer(awaiting);
+        } else {
+          // Generic already rekeyed its own tab; this just re-selects it (idempotent).
+          sideChats.open(childId);
+        }
       }
-    }
-    onRightRailTabChange("sidechat");
-    clearSideChatToOpen();
-  }, [sideChatToOpen, conversationId, sideChats, onRightRailTabChange, clearSideChatToOpen]);
+      clearSideChatToOpen();
+      onReveal?.();
+      if (isMobile) onMobileSideChatsOpenChange?.(true);
+    });
+  }, [
+    sideChatToOpen,
+    conversationId,
+    sideChats,
+    onRightRailTabChange,
+    clearSideChatToOpen,
+    onReveal,
+    isMobile,
+    onMobileSideChatsOpenChange,
+  ]);
   const sideChatSelected =
     rightRailTab === "sidechat" &&
     selectedFilePath === null &&
@@ -1177,8 +1196,9 @@ function WorkspacePanelImpl({
   }, [savedSideChats, discoverSideChats, restoreSideChats]);
   const onNewSideChat = supportsSideChat(sideChatHarness, canStartSideChat)
     ? () => {
-        useChatStore.getState().requestSideChatFocus(sideChats.openPending());
-        onRightRailTabChange("sidechat");
+        onRightRailTabChange("sidechat", () => {
+          useChatStore.getState().requestSideChatFocus(sideChats.openPending());
+        });
       }
     : undefined;
   // First message sent in a pending side-chat tab: create the fork now. The
@@ -1241,8 +1261,6 @@ function WorkspacePanelImpl({
   };
   // The selected side chat's pane, shown in the rail or the mobile drawer. A
   // `pending:` tab has no child yet; its first send creates the fork.
-  const mobileViewport = useIsMobileViewport();
-  const isMobile = mobileViewport && !contained;
   useEffect(() => {
     if (!showContentSearch || !showFilesPanel || pending || isMobile) return;
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -1496,6 +1514,10 @@ function WorkspacePanelImpl({
   const markPickerKeyboard = useCallback(() => {
     pickerInputRef.current = "keyboard";
   }, []);
+  const selectBrowserTab = (tabId: string) =>
+    onRightRailTabChange("browser", () => browsers.select(tabId));
+  const selectSideChatTab = (childId: string) =>
+    onRightRailTabChange("sidechat", () => sideChats.select(childId));
   const panelOptions = [
     ...[...visiblePermanentTabs, ...visibleOpenPanels].map((tab) => ({
       key: tab,
@@ -1527,20 +1549,14 @@ function WorkspacePanelImpl({
       key: `browser:${tabId}`,
       label: browsers.labelFor(tabId, index),
       active: browserSelected && browsers.selected === tabId,
-      select: () => {
-        browsers.select(tabId);
-        onRightRailTabChange("browser");
-      },
+      select: () => selectBrowserTab(tabId),
       disabled: false,
     })),
     ...sideChats.tabs.map((childId) => ({
       key: `sidechat:${childId}`,
       label: chatTabLabels[childId] ?? childId,
       active: sideChatSelected && sideChats.selected === childId,
-      select: () => {
-        sideChats.select(childId);
-        onRightRailTabChange("sidechat");
-      },
+      select: () => selectSideChatTab(childId),
       disabled: false,
     })),
   ];
@@ -1963,10 +1979,7 @@ function WorkspacePanelImpl({
                             void closeBrowserTab(tabId);
                           }
                         }}
-                        onClick={() => {
-                          browsers.select(tabId);
-                          onRightRailTabChange("browser");
-                        }}
+                        onClick={() => selectBrowserTab(tabId)}
                       >
                         <GlobeIcon className="size-4 shrink-0" />
                         <span className="max-w-44 truncate">{browsers.labelFor(tabId, index)}</span>
@@ -2008,10 +2021,7 @@ function WorkspacePanelImpl({
                             closeSideChat(childId);
                           }
                         }}
-                        onClick={() => {
-                          sideChats.select(childId);
-                          onRightRailTabChange("sidechat");
-                        }}
+                        onClick={() => selectSideChatTab(childId)}
                       >
                         <TabIcon className="size-4 shrink-0" />
                         <span className="max-w-[16ch] truncate">{label}</span>

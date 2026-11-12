@@ -31,13 +31,14 @@ export function useOpenSubagentInPanel(): (
   childSessionId: string,
   event: SubagentLinkClick,
   destination: To,
+  afterCommit?: () => void,
 ) => boolean {
   const opener = useContext(SubagentPanelOpenerContext);
   const isMobile = useIsMobileViewport();
   const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
   const navigate = useNavigate();
   return useCallback(
-    (childSessionId, event, destination) => {
+    (childSessionId, event, destination, afterCommit) => {
       if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
         return false;
       }
@@ -47,11 +48,16 @@ export function useOpenSubagentInPanel(): (
         event.preventDefault();
         guardFileNavigation(null, undefined, () => {
           if (!openInPanel()) navigate(destination);
+          afterCommit?.();
         });
         return true;
       }
-      if (!openInPanel()) return false;
+      if (!openInPanel()) {
+        afterCommit?.();
+        return false;
+      }
       event.preventDefault();
+      afterCommit?.();
       return true;
     },
     [opener, isMobile, guardFileNavigation, navigate],

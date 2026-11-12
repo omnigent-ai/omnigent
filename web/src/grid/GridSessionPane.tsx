@@ -289,8 +289,11 @@ export function GridSessionPane({
     }));
   }, []);
   const selectTab = useCallback(
-    (rightRailTab: RightRailTab | null) => {
-      navigateWorkspace("", undefined, () => showTab(rightRailTab));
+    (rightRailTab: RightRailTab | null, afterCommit?: () => void) => {
+      navigateWorkspace("", undefined, () => {
+        showTab(rightRailTab);
+        afterCommit?.();
+      });
     },
     [navigateWorkspace, showTab],
   );
