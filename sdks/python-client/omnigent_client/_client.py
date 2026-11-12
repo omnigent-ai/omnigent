@@ -142,8 +142,11 @@ class OmnigentClient:
         # sentinel is what lets it through. Caller-supplied headers win on
         # conflict (so an explicit Origin override is still honored).
         # The User-Agent names the SDK so the server can tell an SDK script from
-        # Omnigent's own components, whose headers override it.
-        default_headers = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, "User-Agent": SDK_USER_AGENT}
+        # Omnigent's own components, whose headers override it. httpx.Headers
+        # merges case-insensitively, so "user-agent" also replaces the default.
+        default_headers = httpx.Headers(
+            {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN, "User-Agent": SDK_USER_AGENT}
+        )
         if headers:
             default_headers.update(headers)
         self._http = httpx.AsyncClient(

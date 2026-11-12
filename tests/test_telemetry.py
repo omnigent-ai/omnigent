@@ -263,13 +263,18 @@ def test_server_request_headers_carry_component_user_agent(
 async def test_sdk_client_sends_sdk_user_agent_unless_overridden() -> None:
     from omnigent_client import OmnigentClient
 
+    url = "http://127.0.0.1:1/health"
     async with OmnigentClient(base_url="http://127.0.0.1:1") as client:
-        assert classify_surface(client._http.headers["User-Agent"]) == "sdk"
+        request = client._http.build_request("GET", url)
+        assert request.headers.get_list("User-Agent") == [request.headers["User-Agent"]]
+        assert classify_surface(request.headers["User-Agent"]) == "sdk"
     runner_ua = client_user_agent_for("runner")
-    async with OmnigentClient(
-        base_url="http://127.0.0.1:1", headers={"User-Agent": runner_ua}
-    ) as client:
-        assert client._http.headers["User-Agent"] == runner_ua
+    for name in ("User-Agent", "user-agent", "USER-AGENT", "uSeR-aGeNt"):
+        async with OmnigentClient(
+            base_url="http://127.0.0.1:1", headers={name: runner_ua}
+        ) as client:
+            request = client._http.build_request("GET", url)
+            assert request.headers.get_list("User-Agent") == [runner_ua], name
 
 
 @pytest.fixture(autouse=True)

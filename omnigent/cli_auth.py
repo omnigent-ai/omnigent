@@ -737,8 +737,8 @@ def databricks_request_headers(
     httpx ``Auth`` that mints per request, or the managed-host token header)
     omits the token and still gets routing.
 
-    Both values are omitted when absent, so single-workspace and
-    local-unauthenticated callers get only the ``User-Agent``.
+    Both routing values are omitted when absent, so single-workspace and
+    local-unauthenticated callers get only the identity headers.
 
     Always sets ``User-Agent`` to this component's identity, e.g.
     ``omnigent-runner/0.22.0 python-httpx/0.28.1`` (see
@@ -779,10 +779,7 @@ def databricks_request_headers(
         telemetry_request_headers,
     )
 
-    # A User-Agent naming this component (runner, CLI, ...) so the server can
-    # tell Omnigent's own traffic from custom scripts. Then this machine's
-    # installation ID, so a server-side telemetry emitter can name the machine
-    # an event came from without a lookup (empty when telemetry is opted out).
+    # Include component identity and, when telemetry is enabled, installation identity.
     headers: dict[str, str] = {**client_identity_headers(), **telemetry_request_headers()}
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"

@@ -821,6 +821,7 @@ def test_refresh_stored_token_renews_and_rotates(token_dir, monkeypatch) -> None
     def _fake_post(url, *, data=None, headers=None, timeout=None):
         posted["url"] = url
         posted["data"] = data
+        posted["user_agent"] = (headers or {}).get("User-Agent")
         return httpx.Response(
             200,
             json={
@@ -836,6 +837,7 @@ def test_refresh_stored_token_renews_and_rotates(token_dir, monkeypatch) -> None
     assert refresh_stored_token("http://localhost:6767") == "fresh"
     assert posted["url"] == "http://localhost:6767/oauth/token"
     assert posted["data"] == {"grant_type": "refresh_token", "refresh_token": "refresh-1"}
+    assert str(posted["user_agent"]).startswith("omnigent-")
     # Rotated pair persisted; the fresh token now loads normally.
     data = json.loads((token_dir / "auth_tokens.json").read_text())
     entry = data["http://localhost:6767"]
