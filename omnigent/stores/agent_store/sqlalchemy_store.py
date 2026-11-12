@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import builtins
+from typing import cast
 
-from sqlalchemy import and_, asc, desc, or_, select
+from sqlalchemy import CursorResult, and_, asc, case, desc, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -24,7 +25,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Agent, PagedList
 from omnigent.errors import StaleCursorError
-from omnigent.stores.agent_store import AgentStore
+from omnigent.stores.agent_store import _UNSET, AgentStore
 
 # ponytail: fixed read cap per "my agents" call. A user with more fork/switch
 # copies than this newer than an original sees that original only on a later
@@ -285,6 +286,19 @@ class SqlAlchemyAgentStore(AgentStore):
                 has_more=has_more,
             )
 
+    def get_many(self, agent_ids: builtins.list[str]) -> dict[str, Agent]:
+        """Batch-fetch agents in the current workspace, omitting missing ids."""
+        if not agent_ids:
+            return {}
+        with self._session("load_agents") as session:
+            rows = session.execute(
+                select(SqlAgent).where(
+                    SqlAgent.workspace_id == current_workspace_id(),
+                    SqlAgent.id.in_(agent_ids),
+                )
+            ).scalars()
+            return {row.id: sql_agent_to_entity(row) for row in rows}
+
     def get_names(self, agent_ids: builtins.list[str]) -> dict[str, str]:
         """
         Batch-fetch agent names for a list of IDs.
@@ -313,6 +327,8 @@ class SqlAlchemyAgentStore(AgentStore):
         agent_id: str,
         bundle_location: str,
         created_by: str | None = None,
+        *,
+        description: str | None = _UNSET,
     ) -> Agent | None:
         """
         Update an agent's bundle location, bump version, and set
@@ -326,25 +342,45 @@ class SqlAlchemyAgentStore(AgentStore):
             is a user agent without one (claim-on-write). Heals
             pre-migration session-scoped rows on their first authorized
             mutation; ``None`` leaves any existing owner untouched.
+        :param description: Replacement description; omit to preserve, or pass
+            ``None`` to clear it.
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
         updated_at = now_epoch()
 
         def write(session: Session) -> SqlAgent | None:
-            row = session.get(SqlAgent, (current_workspace_id(), agent_id))
-            if not row:
+            stmt = (
+                update(SqlAgent)
+                .where(
+                    SqlAgent.workspace_id == current_workspace_id(),
+                    SqlAgent.id == agent_id,
+                )
+                .values(
+                    bundle_location=bundle_location,
+                    version=SqlAgent.version + 1,
+                    updated_at=updated_at,
+                )
+            )
+            if description is not _UNSET:
+                stmt = stmt.values(description=description)
+            if created_by is not None:
+                stmt = stmt.values(
+                    created_by=case(
+                        (
+                            and_(
+                                SqlAgent.kind == encode_agent_kind("user"),
+                                SqlAgent.created_by.is_(None),
+                            ),
+                            created_by,
+                        ),
+                        else_=SqlAgent.created_by,
+                    )
+                )
+            result = cast(CursorResult[tuple[object]], session.execute(stmt))
+            if result.rowcount == 0:
                 return None
-            row.bundle_location = bundle_location
-            row.version = row.version + 1
-            row.updated_at = updated_at
-            # Claim-on-write: only fill an empty owner, never overwrite one. Server
-            # agents never get one (their listing requires created_by IS NULL).
-            is_user = row.kind == encode_agent_kind("user")
-            if created_by is not None and row.created_by is None and is_user:
-                row.created_by = created_by
-            session.flush()
-            return row
+            return session.get(SqlAgent, (current_workspace_id(), agent_id))
 
         row = run_write_transaction(self._session_immediate, "update_agent", write)
         if row is None:
@@ -353,6 +389,74 @@ class SqlAlchemyAgentStore(AgentStore):
         session_id: str | None = None
         if row.kind == encode_agent_kind("user"):
             session_id = self._session_id_for_agent(agent_id)
+        return sql_agent_to_entity(row, session_id=session_id)
+
+    @property
+    def supports_config_edit(self) -> bool:
+        """Configuration edits compare and update the revision atomically."""
+        return True
+
+    def update_configuration(
+        self,
+        expected: Agent,
+        bundle_location: str,
+        *,
+        description: str | None,
+        created_by: str | None = None,
+    ) -> Agent | None:
+        """Atomically compare the observed revision and replace its configuration.
+
+        Identical delete/recreate within one second can match the old revision;
+        creation timestamps have second precision and versions restart at one.
+        """
+        matches = (
+            SqlAgent.workspace_id == current_workspace_id(),
+            SqlAgent.id == expected.id,
+            SqlAgent.created_at == expected.created_at,
+            SqlAgent.kind == encode_agent_kind(expected.kind),
+            SqlAgent.created_by == expected.created_by,
+            SqlAgent.version == expected.version,
+            SqlAgent.bundle_location == expected.bundle_location,
+        )
+        claim_owner = (
+            created_by is not None and expected.created_by is None and expected.kind == "user"
+        )
+        unchanged = (
+            bundle_location == expected.bundle_location
+            and description == expected.description
+            and not claim_owner
+        )
+        updated_at = now_epoch()
+
+        def write(session: Session) -> SqlAgent | None:
+            if unchanged:
+                return session.execute(
+                    select(SqlAgent).where(*matches).with_for_update()
+                ).scalar_one_or_none()
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlAgent)
+                    .where(*matches)
+                    .values(
+                        bundle_location=bundle_location,
+                        description=description,
+                        created_by=created_by if claim_owner else expected.created_by,
+                        version=SqlAgent.version + 1,
+                        updated_at=updated_at,
+                    )
+                ),
+            )
+            if result.rowcount == 0:
+                return None
+            return session.get(SqlAgent, (current_workspace_id(), expected.id))
+
+        row = run_write_transaction(self._session_immediate, "edit_agent_configuration", write)
+        if row is None:
+            return None
+        session_id = (
+            self._session_id_for_agent(row.id) if row.kind == encode_agent_kind("user") else None
+        )
         return sql_agent_to_entity(row, session_id=session_id)
 
     def delete(self, agent_id: str) -> bool:

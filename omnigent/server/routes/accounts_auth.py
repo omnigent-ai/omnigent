@@ -770,8 +770,10 @@ def create_accounts_auth_router(
         if user_id == admin_id:
             return JSONResponse(status_code=400, content={"error": "cannot delete self"})
 
+        scheduler = getattr(request.app.state, "scheduled_task_scheduler", None)
+        persistent = getattr(request.app.state, "scheduled_task_dispatch_enabled", False)
         owned_task_ids: list[str] = []
-        if scheduled_task_store is not None:
+        if scheduled_task_store is not None and scheduler is not None and not persistent:
             owned_task_ids = [t.id for t in scheduled_task_store.list(owner_user_id=user_id)]
 
         result = account_store.delete_user(user_id)
@@ -787,8 +789,7 @@ def create_accounts_auth_router(
             )
         # The store already disabled the rows; drop the in-memory timers so
         # the scheduler stops re-arming them.
-        scheduler = getattr(request.app.state, "scheduled_task_scheduler", None)
-        if scheduler is not None:
+        if scheduler is not None and not persistent:
             for task_id in owned_task_ids:
                 scheduler.remove(task_id)
         auth_provider.revoke_user_sessions(user_id)

@@ -1,1 +1,0 @@
-../../../agent-skills/otto-pr-review-loop/review_cycle.py

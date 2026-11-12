@@ -13,7 +13,7 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
 import { getSessionHost } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
-import { prefetchSessionHostChain, useSession } from "./useSession";
+import { isCachedAncestor, prefetchSessionHostChain, useSession } from "./useSession";
 
 const getSessionSlimMock = vi.mocked(getSessionSlim);
 
@@ -301,5 +301,22 @@ describe("prefetchSessionHostChain", () => {
 
     expect(getSessionSlimMock).toHaveBeenCalledTimes(16);
     expect(getSessionHost("boundary_0")).toBe("host_at_budget");
+  });
+});
+
+describe("isCachedAncestor", () => {
+  it("finds an ancestor along the cached parent chain and stops at an uncached hop", () => {
+    const client = new QueryClient();
+    client.setQueryData(["session", "conv_parent"], {
+      id: "conv_parent",
+      parentSessionId: "conv_root",
+    });
+    client.setQueryData(["session", "conv_root"], { id: "conv_root", parentSessionId: null });
+
+    expect(isCachedAncestor(client, "conv_parent", "conv_parent")).toBe(true);
+    expect(isCachedAncestor(client, "conv_parent", "conv_root")).toBe(true);
+    expect(isCachedAncestor(client, "conv_parent", "conv_sibling")).toBe(false);
+    expect(isCachedAncestor(client, "conv_uncached", "conv_root")).toBe(false);
+    expect(isCachedAncestor(client, null, "conv_root")).toBe(false);
   });
 });

@@ -89,6 +89,7 @@ def test_markdown_preview_renders_tex_like_chat(
     bubble = page.locator(_ASSISTANT, has_text=_PROSE_MARKER).first
     expect(bubble).to_be_visible(timeout=30_000)
     expect(bubble.locator(".katex-display").first).to_be_visible(timeout=30_000)
+    expect(bubble.locator(".katex-html > span").first).to_have_css("display", "inline-block")
 
     # File surface: open the seeded file and switch to Preview mode.
     page.goto(f"{base_url}/c/{session_id}?view=explore")
@@ -111,6 +112,7 @@ def test_markdown_preview_renders_tex_like_chat(
     # The bug: no KaTeX output — the preview showed the raw `$$ … \frac … $$`
     # source as literal text instead of one rendered display block.
     expect(preview.locator(".katex-display").first).to_be_visible(timeout=10_000)
+    expect(preview.locator(".katex-html > span").first).to_have_css("display", "inline-block")
     assert preview.locator(".katex-display").count() == 1, (
         "expected the $$-fenced equation to render as one KaTeX display block"
     )

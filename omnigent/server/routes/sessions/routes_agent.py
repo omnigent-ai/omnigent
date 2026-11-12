@@ -16,6 +16,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from omnigent.automations_availability import AUTOMATIONS_HEADER
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
@@ -36,9 +37,8 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
-    local_single_user_enabled,
 )
-from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.bundles import bundle_location, redacted_agent_bundle, validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -199,8 +199,8 @@ def register_agent_routes(
         session_id: str,
     ) -> Response:
         """
-        Download the raw ``.tar.gz`` agent bundle for the session's
-        bound agent.
+        Download the ``.tar.gz`` agent bundle for the session's bound agent.
+        READ-only callers receive a minimal redacted bundle.
 
         Replaces ``GET /api/agents/{id}/contents``. Runners call this
         on cache miss to fetch the spec + bundled files.
@@ -208,11 +208,12 @@ def register_agent_routes(
         :param request: The incoming FastAPI request.
         :param session_id: Session identifier, e.g.
             ``"conv_abc123"``.
-        :returns: Raw bundle bytes as ``application/gzip``.
+        :returns: Bundle bytes as ``application/gzip``.
         :raises OmnigentError: If the session, agent, or bundle is
             not found.
         """
         managed_token = request.headers.get(MANAGED_HOST_TOKEN_HEADER)
+        redacted = False
         if managed_token:
             # A sandbox host can read only bundles for sessions bound to it.
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -230,6 +231,18 @@ def register_agent_routes(
                 user_id, session_id, LEVEL_READ, permission_store, conversation_store
             )
             conv = access.conversation
+            # The bundle can carry its author's credentials, so only EDIT
+            # callers get it verbatim; READ views elsewhere mask them too.
+            if permission_store is not None:
+                redacted = not await asyncio.to_thread(
+                    check_session_access,
+                    user_id,
+                    session_id,
+                    LEVEL_EDIT,
+                    permission_store,
+                    conversation_store,
+                    conversation=conv,
+                )
         if conv is None:
             conv = conversation_store.get_conversation(session_id)
             if conv is None:
@@ -256,6 +269,13 @@ def register_agent_routes(
                 "Agent bundle not found in artifact store",
                 code=ErrorCode.INTERNAL_ERROR,
             )
+        if redacted:
+            bundle_bytes = await asyncio.to_thread(
+                redacted_agent_bundle,
+                agent.name,
+                bundle_bytes,
+                operator_authored=agent.operator_authored,
+            )
         selection_headers = {}
         if request.headers.get(MCP_SELECTION_HEADER) == "1":
             selection_headers[MCP_SELECTION_HEADER] = json.dumps(
@@ -265,11 +285,15 @@ def register_agent_routes(
                     if key.startswith(MCP_SELECTION_PREFIX)
                 }
             )
+        automations_available = getattr(request.app.state, "automations_available", None)
+        if automations_available is not None:
+            selection_headers[AUTOMATIONS_HEADER] = "1" if automations_available() else "0"
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",
             headers={
                 "Cache-Control": "no-store",
+                "X-Agent-Bundle-Redacted": "true" if redacted else "false",
                 **selection_headers,
                 "X-Agent-Id": agent.id,
                 "X-Agent-Version": str(agent.version),
@@ -343,6 +367,19 @@ def register_agent_routes(
         # admin may replace it.
         await asyncio.to_thread(_require_agent_owner, user_id, agent, permission_store)
 
+        # A session-scoped agent row can be bound into several sessions, so
+        # replacing its bundle through a session that does not own the row
+        # needs EDIT on the owning session; READ there must not be enough to
+        # overwrite another user's private agent.
+        if agent.session_id != session_id:
+            await _require_access(
+                user_id,
+                agent.session_id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
+            )
+
         bundle_bytes = await bundle.read()
         # Run bundle validation (tar extraction + spec parse, both
         # blocking) off the event loop -- mirrors the POST
@@ -354,7 +391,7 @@ def register_agent_routes(
         spec = await asyncio.to_thread(
             validate_agent_bundle,
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
         if spec.name is None:
             raise OmnigentError("spec missing name", code=ErrorCode.INVALID_INPUT)
@@ -398,7 +435,12 @@ def register_agent_routes(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         artifact_store.put(new_loc, bundle_bytes)
-        updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc, user_id)
+        if agent_store.supports_config_edit:
+            updated = await asyncio.to_thread(
+                agent_store.update, agent.id, new_loc, user_id, description=spec.description
+            )
+        else:
+            updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc, user_id)
         if updated is None:
             raise OmnigentError(
                 f"Agent not found: {agent.id!r}",

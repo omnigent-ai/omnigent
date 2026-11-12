@@ -129,6 +129,37 @@ later author comment reopens the issue and, while V2 is enabled, runs it again.
 Reopening remains available during a V2 rollback so closed reports are not
 trapped behind the classifier switch.
 
+## Production job
+
+The `prod` target is the live job: it applies labels, runs as a service
+principal, and lets a workspace group manage it. The target pins the live
+behavior (App authentication, apply mode, writes on, unpaused trigger). The
+workspace-specific values are kept with the deploying team, outside this
+repository, in a git-ignored overrides file:
+
+```json
+{
+  "prod_root_folder": "<shared workspace folder>",
+  "prod_service_principal": "<service principal application id>",
+  "prod_manager_group": "<workspace group>",
+  "github_secret_scope": "<scope>",
+  "model_endpoint": "<endpoint>"
+}
+```
+
+Save it as `.databricks/bundle/prod/variable-overrides.json` in this directory,
+then deploy with no `--var` flags. Without the file, validation fails before
+anything is deployed:
+
+```bash
+databricks bundle deploy --target prod --profile <profile>
+```
+
+Deployers need the service principal's User role. The service principal needs
+READ on the secret scope, write access to the configured tables and the
+`issue_priority_prod_artifacts` volume, and MANAGE on the latest-scores view,
+which every run recreates.
+
 ## Databricks dry-run
 
 The bundle defines a paused trigger on updates to `github_issues_bronze`. It

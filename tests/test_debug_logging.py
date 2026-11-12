@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -358,7 +359,8 @@ def test_record_to_row_shape_and_coercions() -> None:
     }
 
 
-def test_record_to_row_redacts_token_like_text_fields() -> None:
+@pytest.mark.parametrize("captured_stack", [False, True])
+def test_record_to_row_redacts_token_like_text_fields(captured_stack: bool) -> None:
     secret = "aB3" + "xY7" * 12
     try:
         raise ValueError(f"credential={secret}")
@@ -376,6 +378,9 @@ def test_record_to_row_redacts_token_like_text_fields() -> None:
             func="do_it",
         )
     record.attributes = {"upstream_response": secret, "attempt": 3}
+    if captured_stack:
+        record.exc_info = None
+        record.captured_stack_trace = f'File "{secret}.py", line 1, in blocking_call'
 
     row = dl.record_to_row(record, source="runner")
 
@@ -386,6 +391,9 @@ def test_record_to_row_redacts_token_like_text_fields() -> None:
     assert secret not in attributes["upstream_response"]
     assert attributes["attempt"] == "3"
     assert "[REDACTED]" in str(row)
+    if captured_stack:
+        assert "blocking_call" in str(row["stack_trace"])
+        assert "[REDACTED]" in str(row["stack_trace"])
 
 
 def test_record_to_row_reads_session_id_from_extra(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -428,6 +436,30 @@ def test_record_to_row_without_event_or_attributes() -> None:
     row = dl.record_to_row(record, source="host")
     assert row["event_name"] is None
     assert row["attributes"] == {}
+
+
+async def test_log_attributes_follow_task_and_thread_without_leaking() -> None:
+    record = logging.makeLogRecord({"msg": "ordinary lifecycle log"})
+
+    async def read(task_id: str) -> dict:
+        with dl.log_attributes_scope(task_id=task_id, run_id="outer"):
+            with dl.log_attributes_scope(run_id="inner"):
+                row = await asyncio.to_thread(dl.record_to_row, record, "server")
+                assert row["attributes"] == {"task_id": task_id, "run_id": "inner"}
+            return dl.record_to_row(record, "server")
+
+    rows = await asyncio.gather(read("first"), read("second"))
+    assert [row["attributes"] for row in rows] == [
+        {"task_id": "first", "run_id": "outer"},
+        {"task_id": "second", "run_id": "outer"},
+    ]
+    assert dl.record_to_row(record, "server")["attributes"] == {}
+    record.attributes = {"run_id": "explicit", "secret": "Bearer test-secret-token"}
+    with dl.log_attributes_scope(run_id="ambient", token="Bearer ambient-secret-token"):
+        attributes = dl.record_to_row(record, "server")["attributes"]
+    assert attributes["run_id"] == "explicit"
+    assert "test-secret-token" not in attributes["secret"]
+    assert "ambient-secret-token" not in attributes["token"]
 
 
 def test_record_to_row_captures_stack_trace() -> None:
@@ -977,7 +1009,7 @@ def test_parse_app_host_non_apps_urls_yield_nothing() -> None:
     # Managed service (dbc-<hash> host), localhost, a custom domain, and empty
     # input carry no parseable Databricks Apps identity.
     assert dl._parse_databricks_app_host(
-        "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
+        "https://dbc-12345678-abcd.cloud.databricks.com/omnigent"
     ) == (None, None)
     assert dl._parse_databricks_app_host("http://localhost:8000") == (None, None)
     assert dl._parse_databricks_app_host("https://omnigent.example.com") == (None, None)
@@ -1025,7 +1057,7 @@ def test_process_identity_managed_service_is_none(monkeypatch: pytest.MonkeyPatc
     # Managed service: no DATABRICKS_* env and the server URL is a dbc-<hash> host,
     # not an Apps URL. Identity arrives per-record, so the process constant is empty.
     monkeypatch.setenv(
-        dl.SERVER_URL_ENV_VAR, "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
+        dl.SERVER_URL_ENV_VAR, "https://dbc-12345678-abcd.cloud.databricks.com/omnigent"
     )
     assert dl._process_identity() == (None, None)
 
@@ -1033,6 +1065,93 @@ def test_process_identity_managed_service_is_none(monkeypatch: pytest.MonkeyPatc
 def test_process_identity_unset_is_none() -> None:
     # OSS / local: nothing set anywhere.
     assert dl._process_identity() == (None, None)
+
+
+_HOSTED_API = "https://example.databricks.com/api/2.0/omnigent"
+
+
+@pytest.fixture
+def _data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    return tmp_path
+
+
+def _fail_get(url: str, **kwargs: object) -> httpx.Response:
+    raise AssertionError(f"unexpected probe of {url}")
+
+
+def test_publish_origin_identity_probes_without_changing_auth_state(
+    _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unauthenticated header can attribute logs but cannot update login state.
+    from omnigent.cli_auth import load_databricks_org_id
+
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs: object) -> httpx.Response:
+        calls.append(url)
+        return httpx.Response(401, headers={"x-databricks-org-id": "123456"})
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert dl.publish_origin_identity(_HOSTED_API) == "123456"
+    assert calls == [f"{_HOSTED_API}/v1/me"]
+    assert dl._process_identity()[0] == "123456"
+    assert load_databricks_org_id(_HOSTED_API) is None
+    assert not (_data_dir / "auth_tokens.json").exists()
+
+    monkeypatch.setattr(httpx, "get", _fail_get)
+    assert dl.publish_origin_identity(_HOSTED_API) == "123456"
+
+
+def test_publish_origin_identity_prefers_url_selector(
+    _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(httpx, "get", _fail_get)
+    assert dl.publish_origin_identity(f"{_HOSTED_API}?o=123") == "123"
+    assert dl._process_identity()[0] == "123"
+
+
+def test_publish_origin_identity_skips_non_workspace_servers(
+    _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(httpx, "get", _fail_get)
+    assert dl.publish_origin_identity("http://127.0.0.1:6767") is None
+    assert dl.publish_origin_identity("https://omnigents-1.aws.databricksapps.com") is None
+    assert dl._process_identity() == (None, None)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(401),
+        httpx.Response(401, headers={"x-databricks-org-id": "not-an-id"}),
+    ],
+)
+def test_publish_origin_identity_ignores_missing_or_malformed_header(
+    _data_dir: Path,
+    origin_identity_probe: None,
+    monkeypatch: pytest.MonkeyPatch,
+    response: httpx.Response,
+) -> None:
+    monkeypatch.setattr(httpx, "get", lambda url, **kwargs: response)
+    assert dl.publish_origin_identity(_HOSTED_API) is None
+    assert dl._process_identity()[0] is None
+
+
+def test_publish_origin_identity_probes_unreachable_server_once(
+    _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def unreachable(url: str, **kwargs: object) -> httpx.Response:
+        calls.append(url)
+        raise httpx.ConnectError("unreachable")
+
+    monkeypatch.setattr(httpx, "get", unreachable)
+    assert dl.publish_origin_identity(_HOSTED_API) is None
+    assert dl.publish_origin_identity(_HOSTED_API) is None
+    assert len(calls) == 1
 
 
 def test_record_to_row_prefers_record_workspace_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1624,3 +1743,15 @@ def test_near_deadline_auth_rejection_does_not_start_a_new_mint(_configured_env:
 
     assert client.mints == 1
     assert client.inserts == 1
+
+
+def test_stage_timings_split_wall_time_into_marked_stages() -> None:
+    """Each mark closes the stage since the previous one; repeats accumulate."""
+    moments = iter([0.0, 0.010, 0.250, 0.300, 0.400])
+    timings = dl.StageTimings(clock=lambda: next(moments))
+
+    timings.mark("config")
+    timings.mark("catalog")
+    timings.mark("config")
+
+    assert timings.attributes() == {"config_ms": 60, "catalog_ms": 240, "total_ms": 400}

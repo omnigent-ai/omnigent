@@ -23,6 +23,20 @@ tests), then does one of two things:
   the PR itself, prepares a reviewer-facing body for a workflow-owned publisher,
   or stops after a local commit when `skip_push` is enabled.
 
+## Prompt trial
+
+Resolve opts into `executor.config.system_prompt_preset: claude_code`: Claude
+Code's coding prompt plus Resolve's existing instructions. Tools, permissions,
+model settings, and review requirements are unchanged. Other SDK agents keep
+their current prompt unless they opt in.
+
+After 3–5 days, compare time to a validated fix, review rounds, unresolved
+findings, and token cost with the preceding period, separating new fixes from
+reviews of existing PRs. The harness logs `system_prompt_preset=claude_code`;
+use that marker to identify trial sessions. This is a before/after observation,
+not a controlled benchmark. Remove the setting from `config.yaml` to roll back
+for new sessions; there is no automatic expiry.
+
 ## Prerequisites
 
 - A configured Claude provider (`omnigent setup` — an Anthropic API key, a
@@ -210,11 +224,14 @@ essential constraints, and completion contract. Detailed procedures live in
 | --- | --- |
 | Input, preflight, and existing-fix discovery | `resolve-inputs` (mode-specific resources) |
 | Inherited repro and behavioral baseline | `resolve-repro-audit` |
-| Final diff, consumers, focused checks, and evidence | `resolve-impact-assessment` |
+| Final diff, consumers, focused checks, and evidence | `otto-impact-assessment` |
 | Author or review | `resolve-author-fix` / `resolve-review-pr` |
 | Commit and selected publication mode | `resolve-publish` |
-| Open PR: CI, Polly/OCR, preview, and human validation | `resolve-drive-pr` (substep resources) |
+| Open PR: CI, Polly/OCR, preview, and human validation | `resolve-drive-pr` (substep resources; CI and preview from `otto-drive-pr`) |
 | Complete output contract | `resolve-handoff` |
+
+Skills named `otto-*` are shared with other Otto agents. They live in
+[`dev/agent-skills/`](../agent-skills/) and are linked into `skills/`.
 
 The CLI transports these files with the agent bundle. They need not exist in
 the target checkout. Claude loads them through its native Skill tool; other

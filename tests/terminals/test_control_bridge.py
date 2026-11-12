@@ -2,10 +2,11 @@
 Unit + integration tests for :mod:`omnigent.terminals.control_bridge`.
 
 Covers the pure helpers (``unescape_control_output`` octal round-trip,
-``_hex_send_keys_commands`` chunking) and an end-to-end drive of
+``_WindowNameFilter`` escape stripping, ``_hex_send_keys_commands`` chunking)
+and an end-to-end drive of
 ``bridge_tmux_control_to_websocket`` against a real private tmux server via a
-fake WebSocket: seed-on-attach, ``%output`` streaming of ``send-keys`` input,
-and the detach close code.
+fake WebSocket: seed-on-attach, ``%output`` streaming of ``send-keys`` input
+without window-name escapes, and the detach close code.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -32,9 +34,13 @@ from omnigent.terminals.control_bridge import (
     _clipboard_buffer_name,
     _hex_send_keys_commands,
     _read_tmux_buffer,
+    _run_tmux_capture,
+    _WindowNameFilter,
     bridge_tmux_control_to_websocket,
     unescape_control_output,
 )
+from omnigent.terminals.query_replies import tmux_answered_queries
+from tests._helpers.polling import poll_until_async
 
 _HAS_TMUX = shutil.which("tmux") is not None
 
@@ -67,6 +73,39 @@ def test_unescape_control_output_round_trips_control_bytes() -> None:
     assert unescape_control_output(rb"a\134b") == b"a\\b"
     # Printable bytes pass through untouched.
     assert unescape_control_output(b"plain text 123") == b"plain text 123"
+
+
+@pytest.mark.parametrize(
+    ("stream", "expected"),
+    [
+        # oh-my-zsh names the window after each command it runs.
+        (b"\x1bkecho\x1b\\tmux-256color\r\n", b"\x1b\\tmux-256color\r\n"),
+        # Other escapes, OSC strings, and UTF-8 text pass through unchanged.
+        (
+            "\x1b[31mré\x1b[0m\x1b]7;file://host/tmp\x1b\\\x1b(B".encode(),
+            "\x1b[31mré\x1b[0m\x1b]7;file://host/tmp\x1b\\\x1b(B".encode(),
+        ),
+        # A name ended by another escape keeps that escape.
+        (b"\x1bkname\x1b[0mtext", b"\x1b\\\x1b[0mtext"),
+        # CAN and SUB end a name and are dropped with it.
+        (b"\x1bkone\x18a\x1bktwo\x1ab", b"\x1b\\a\x1b\\b"),
+        # An OSC that the name's ESC ended still ends there.
+        (b"\x1b]0;T\x1bkname\x1b\\text", b"\x1b]0;T\x1b\\text"),
+        # At the end of the stream, a held ESC and an owed ST are flushed,
+        # and an unterminated name stays dropped.
+        (b"text\x1b", b"text\x1b"),
+        (b"\x1bkname\x1b", b"\x1b\\"),
+        (b"text\x1bkname", b"text"),
+    ],
+)
+def test_window_name_filter_drops_window_names(stream: bytes, expected: bytes) -> None:
+    """Window names are dropped whole, however tmux splits the stream."""
+    whole_filter = _WindowNameFilter()
+    assert whole_filter.feed(stream) + whole_filter.finish() == expected
+    # tmux can end an %output line anywhere, including mid-sequence.
+    byte_filter = _WindowNameFilter()
+    by_byte = b"".join(byte_filter.feed(stream[i : i + 1]) for i in range(len(stream)))
+    assert by_byte + byte_filter.finish() == expected
 
 
 def test_clipboard_buffer_name_accepts_only_safe_notifications() -> None:
@@ -156,6 +195,15 @@ class _FakeWebSocket:
             await asyncio.sleep(self._send_delay_s)
         self.sent_text.append(data)
 
+    @property
+    def clipboard_messages(self) -> list[str]:
+        """Clipboard frames, skipping the list of tmux-answered queries sent first."""
+        return [
+            message
+            for message in self.sent_text
+            if json.loads(message).get("type") == "clipboard-write"
+        ]
+
     async def receive(self) -> dict[str, object]:
         if self._inbound:
             return self._inbound.pop(0)
@@ -218,6 +266,20 @@ async def _kill_tmux(sock: Path) -> None:
         )
         await proc.communicate()
     shutil.rmtree(sock.parent, ignore_errors=True)
+
+
+async def _capture_when(
+    sock: Path, target: str, ready: Callable[[bytes], bool], timeout_s: float = 15
+) -> bytes:
+    """Capture the pane until *ready* accepts it; the shell writes on its own schedule."""
+    from omnigent.terminals.control_bridge import _run_tmux_capture
+
+    seed = b""
+    async with asyncio.timeout(timeout_s):
+        while not ready(seed):
+            await asyncio.sleep(0.05)
+            seed = await _run_tmux_capture(str(sock), target) or b""
+    return seed
 
 
 async def _kill_and_join(sock: Path, task: asyncio.Task[None]) -> None:
@@ -504,10 +566,18 @@ async def test_control_bridge_burst_then_exit_delivers_full_tail(
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
 async def test_control_bridge_seeds_streams_and_detaches() -> None:
-    """End-to-end: seed the pre-attach screen, stream typed input, detach clean."""
-    # `cat` echoes input back to the pane (→ %output); the printf lands before
-    # attach so it can only reach the browser via the capture-pane seed.
-    sock, target = await _new_private_tmux("printf 'SEEDED-LINE\\n'; cat")
+    """End-to-end: seed the pre-attach screen, stream typed input, detach clean.
+
+    The pane answers the input with an ``ESC k`` window name, which tmux
+    streams raw; the browser must get the text after it but not the name.
+    """
+    # The first printf lands before attach so it can only reach the browser via
+    # the capture-pane seed. The tty echoes the typed input (→ %output), then
+    # the reply starts with the window name oh-my-zsh sets before a command.
+    sock, target = await _new_private_tmux(
+        "printf 'SEEDED-LINE\\n'; read -r line; "
+        "printf '\\033kWINDOW-NAME\\033\\\\after-name\\n'; cat"
+    )
     await asyncio.sleep(0.3)  # let the printf render before we attach
 
     ws = _FakeWebSocket(
@@ -523,12 +593,13 @@ async def test_control_bridge_seeds_streams_and_detaches() -> None:
         )
 
     task = asyncio.create_task(_run())
-    # Give it time to seed, resize, inject input, and observe the echo.
-    await asyncio.sleep(1.2)
+    # The reply follows the seed, the resize, and the echoed input.
+    await poll_until_async(lambda: b"after-name" in b"".join(ws.sent), timeout_s=10)
 
     joined = b"".join(ws.sent)
     assert b"SEEDED-LINE" in joined, "seed-on-attach did not paint pre-attach screen"
     assert b"typed-input" in joined, "send-keys input was not echoed via %output"
+    assert b"WINDOW-NAME" not in joined, "the pane's window name reached the browser as text"
 
     # The seed frame must not carry bare-LF row separators: capture-pane -p
     # joins rows with a lone \n, which would staircase the whole screen to the
@@ -540,6 +611,65 @@ async def test_control_bridge_seeds_streams_and_detaches() -> None:
     )
 
     # Kill the server → the control client's stdout closes → bridge exits.
+    await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_lists_tmux_answers_before_any_pane_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The browser learns which queries tmux answers before a query can reach it.
+
+    The probe also finishes before the screen capture, so a slow first probe
+    can't leave pane output between the capture and the attach.
+    """
+    sock, target = await _new_private_tmux("printf 'SEEDED-LINE\\n'; cat")
+    await asyncio.sleep(0.3)
+
+    steps: list[str] = []
+
+    async def _probe(tmux: str, client_env: dict[str, str]) -> frozenset[str] | None:
+        steps.append("probe")
+        answers = await tmux_answered_queries(tmux, client_env)
+        steps.append("probed")
+        return answers
+
+    async def _capture(socket_path: str, tmux_target: str) -> bytes | None:
+        steps.append("capture")
+        return await _run_tmux_capture(socket_path, tmux_target)
+
+    monkeypatch.setattr("omnigent.terminals.control_bridge.tmux_answered_queries", _probe)
+    monkeypatch.setattr("omnigent.terminals.control_bridge._run_tmux_capture", _capture)
+    frames: list[str | bytes] = []
+
+    class _OrderedWebSocket(_FakeWebSocket):
+        async def send_bytes(self, data: bytes) -> None:
+            frames.append(data)
+            await super().send_bytes(data)
+
+        async def send_text(self, data: str) -> None:
+            frames.append(data)
+            await super().send_text(data)
+
+    ws = _OrderedWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    await poll_until_async(
+        lambda: b"SEEDED-LINE" in b"".join(frame for frame in frames if isinstance(frame, bytes)),
+        timeout_s=10,
+    )
+
+    first = frames[0]
+    assert isinstance(first, str), f"pane output reached the browser first: {first!r}"
+    message = json.loads(first)
+    assert message["type"] == "tmux-replies"
+    assert {"da1", "dsr:6"} <= set(message["queries"])
+    assert steps[:3] == ["probe", "probed", "capture"]
+
     await _kill_and_join(sock, task)
 
 
@@ -616,10 +746,9 @@ async def test_seed_full_height_pane_does_not_scroll_or_shift_cursor() -> None:
 @pytest.mark.asyncio
 async def test_seed_recovers_primary_screen_scrollback() -> None:
     """On the primary screen the seed captures full history, not just the screen."""
-    from omnigent.terminals.control_bridge import _run_tmux_capture
-
     sock, target = await _new_private_tmux("bash --norc")
-    await asyncio.sleep(0.2)
+    # Type only once bash shows its prompt.
+    await _capture_when(sock, target, lambda seed: b"$" in seed or b"#" in seed)
     tmux = shutil.which("tmux")
     assert tmux
     # Emit 100 history lines — far more than the 24-row visible screen.
@@ -638,10 +767,8 @@ async def test_seed_recovers_primary_screen_scrollback() -> None:
         tmux, "-S", str(sock), "send-keys", "-t", target, "Enter"
     )
     await proc.communicate()
-    await asyncio.sleep(0.6)
     try:
-        seed = await _run_tmux_capture(str(sock), target)
-        assert seed is not None
+        seed = await _capture_when(sock, target, lambda seed: b"hist-100" in seed)
         # Full history recovered (a visible-only capture would show ~23 lines).
         assert seed.count(b"hist-") >= 100, (
             f"scrollback not recovered: only {seed.count(b'hist-')} history lines"
@@ -866,13 +993,13 @@ async def test_control_bridge_forwards_recent_copy_buffer_as_text_frame() -> Non
 
     async def _clipboard_arrived() -> bool:
         for _ in range(50):
-            if ws.sent_text:
+            if ws.clipboard_messages:
                 return True
             await asyncio.sleep(0.05)
         return False
 
     assert await _clipboard_arrived(), "clipboard control frame was not sent"
-    message = json.loads(ws.sent_text[-1])
+    message = json.loads(ws.clipboard_messages[-1])
     assert message["type"] == "clipboard-write"
     assert message["encoding"] == "base64"
     assert base64.b64decode(message["data"]) == copied
@@ -902,7 +1029,7 @@ async def test_control_bridge_ignores_copy_without_recent_input() -> None:
     )
     await proc.communicate()
     await asyncio.sleep(0.3)
-    assert ws.sent_text == []
+    assert ws.clipboard_messages == []
 
     await _kill_and_join(sock, task)
 
@@ -993,16 +1120,16 @@ async def test_native_pbcopy_uses_consent_transport_not_host_clipboard(
         assert not bypass_marker.exists(), "native pbcopy bypassed browser consent"
         if recent_input and not read_only:
             for _ in range(100):
-                if ws.sent_text:
+                if ws.clipboard_messages:
                     break
                 await asyncio.sleep(0.02)
-            assert ws.sent_text, "native copy never reached the browser consent transport"
-            message = json.loads(ws.sent_text[-1])
+            assert ws.clipboard_messages, "native copy never reached the browser consent transport"
+            message = json.loads(ws.clipboard_messages[-1])
             assert message["type"] == "clipboard-write"
             assert base64.b64decode(message["data"]).decode() == copied
         else:
             await asyncio.sleep(0.2)
-            assert not ws.sent_text
+            assert not ws.clipboard_messages
         if sandbox != "none":
             probe = instance.private_dir / "control-socket-probe"
             await instance.send(
@@ -1046,7 +1173,7 @@ async def test_control_bridge_read_only_drops_input() -> None:
     )
     await proc.communicate()
     await asyncio.sleep(0.2)
-    assert ws.sent_text == []
+    assert ws.clipboard_messages == []
 
     await _kill_and_join(sock, task)
 

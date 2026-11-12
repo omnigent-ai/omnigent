@@ -280,7 +280,7 @@ class SdkInprocDriver:
                 ),
                 timeout=timeout,
             )
-        except (asyncio.TimeoutError, httpx.ReadTimeout):
+        except (TimeoutError, httpx.ReadTimeout):
             result.timed_out = True
         return result
 

@@ -96,6 +96,7 @@ class LocalServer:
         self._proc = subprocess.Popen(
             [
                 sys.executable,
+                "-P",
                 "-m",
                 "omnigent.cli",
                 "server",

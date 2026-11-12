@@ -48,7 +48,7 @@ pytestmark = pytest.mark.min_server_version("0.16.0")
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 # First-user-message texts double as the imported sessions' synthesized
-# titles, which the import panel's result list renders.
+# titles, which the normal sidebar session list renders.
 _OLD_TITLE = "inspect oversized-import OLD.md"
 _GIANT_TITLE = "giant session start"
 _NEW_TITLE = "inspect oversized-import NEW.md"
@@ -271,11 +271,6 @@ def test_recent_import_continues_past_oversized_session(
     started = time.monotonic()
     page.get_by_test_id("import-submit").click()
 
-    # The oldest small session streams in first, proving the host read ran.
-    expect(page.get_by_test_id("import-result-sessions")).to_contain_text(
-        _OLD_TITLE, timeout=120_000
-    )
-
     # DESIRED: the run completes with a tally; it must not abort wholesale.
     result = page.get_by_test_id("import-result")
     error = page.get_by_test_id("import-error")
@@ -290,8 +285,13 @@ def test_recent_import_continues_past_oversized_session(
     # Every seeded session imported: the oversized one and the one after it;
     # neither silent omission nor batch abortion can satisfy these assertions.
     expect(result).to_contain_text("Imported 3")
-    expect(page.get_by_test_id("import-result-sessions")).to_contain_text(_GIANT_TITLE)
-    expect(page.get_by_test_id("import-result-sessions")).to_contain_text(_NEW_TITLE)
+    expect(page.get_by_test_id("import-sessions-panel").get_by_role("list")).to_have_count(0)
+    page.get_by_role("link", name="View sessions", exact=True).click()
+    session_list = page.get_by_test_id("sidebar-conversation-list")
+    for title in (_OLD_TITLE, _GIANT_TITLE, _NEW_TITLE):
+        expect(session_list.get_by_role("link", name=title, exact=True)).to_be_visible(
+            timeout=30_000
+        )
 
 
 @pytest.mark.timeout(420)

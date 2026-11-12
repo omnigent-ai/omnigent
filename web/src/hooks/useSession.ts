@@ -16,6 +16,7 @@ import type { SessionHostResolveOptions } from "@/lib/identity";
 import {
   getSessionHost,
   getSessionParent,
+  sessionRoutingHostId,
   setSessionHost,
   setSessionParent,
 } from "@/lib/sessionHost";
@@ -38,6 +39,35 @@ interface UseSessionResult {
   session: Session | null;
   isLoading: boolean;
   error: Error | null;
+}
+
+/**
+ * Whether ``targetId`` is on the cached parent chain starting at
+ * ``parentSessionId``. Synchronous and cache-only: the chain is cached by
+ * {@link useRootSessionId}'s walk, and an uncached hop ends the search.
+ */
+export function isCachedAncestor(
+  queryClient: QueryClient,
+  parentSessionId: string | null | undefined,
+  targetId: string,
+): boolean {
+  let id = parentSessionId ?? null;
+  for (let hop = 0; id !== null && hop < MAX_ROOT_WALK_HOPS; hop++) {
+    if (id === targetId) return true;
+    id = queryClient.getQueryData<Session>(["session", id])?.parentSessionId ?? null;
+  }
+  return false;
+}
+
+/** The shared ``["session", id]`` snapshot query, disabled for a null id; see {@link useSession}. */
+export function sessionQueryOptions(sessionId: string | null) {
+  return {
+    queryKey: ["session", sessionId] as const,
+    queryFn: () => getSessionSlim(sessionId as string, { refreshState: true }),
+    enabled: sessionId !== null,
+    staleTime: Infinity,
+    retry: false,
+  };
 }
 
 /**
@@ -64,13 +94,7 @@ export function useSession(conversationId: string | null | undefined): UseSessio
   // caller can leak a `GET /v1/sessions/temp:*` — cheaper than gating every
   // call site.
   const serverId = isTempConvId(conversationId) ? null : (conversationId ?? null);
-  const { data, isLoading, error } = useQuery({
-    queryKey: serverId ? ["session", serverId] : ["session", null],
-    queryFn: () => getSessionSlim(serverId as string, { refreshState: true }),
-    enabled: serverId !== null,
-    staleTime: Infinity,
-    retry: false,
-  });
+  const { data, isLoading, error } = useQuery(sessionQueryOptions(serverId));
   return {
     session: data ?? null,
     isLoading,
@@ -214,7 +238,7 @@ export async function prefetchSessionHostChain(
     const session: Session = await queryClient.fetchQuery(queryOptions);
     // `sessionFromWire` records these on a live fetch; re-record so a cached
     // snapshot seeds the map the same way.
-    setSessionHost(session.id, session.hostId);
+    setSessionHost(session.id, sessionRoutingHostId(session.hostId, session.labels));
     setSessionParent(session.id, session.parentSessionId, session.labels);
     id = getSessionParent(session.id);
   }

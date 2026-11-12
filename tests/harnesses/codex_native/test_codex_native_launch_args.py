@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 import tomlkit
 
+from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.codex_native import app_server, launch_args
 from omnigent.harnesses.codex_native.launch_args import (
     absolute_codex_path,
@@ -15,6 +16,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     codex_config_profile,
     materialize_codex_config_profile,
     redact_codex_launch_args,
+    without_codex_positional_prompt,
 )
 
 
@@ -112,6 +114,44 @@ def test_options_do_not_parse_values_or_prompt() -> None:
     args = ("-c", 'developer_instructions="--yolo -sread-only"', "--", "-pstrict", "--yolo")
     assert canonical_codex_launch_args(args) == list(args)
     assert codex_config_profile(args) is None
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (("Reply with INITIAL_ONCE",), []),
+        (("--model", "gpt-5.4-mini", "Reply with INITIAL_ONCE"), ["--model", "gpt-5.4-mini"]),
+        # Option values that look like prompts or subcommands are kept.
+        (("-m", "app-server", "fix the tests"), ["-m", "app-server"]),
+        (
+            ("--model=gpt-5.4-mini", "--search", "fix the tests"),
+            ["--model=gpt-5.4-mini", "--search"],
+        ),
+        (
+            ("-sread-only", "-c", 'model="gpt-5.4"', "fix it"),
+            ["-s", "read-only", "-c", 'model="gpt-5.4"'],
+        ),
+        (
+            ("--add-dir", "/tmp/shared", "--image", "shot.png", "describe"),
+            ["--add-dir", "/tmp/shared", "--image", "shot.png"],
+        ),
+        # ``--remote-auth-token-env`` takes a value; its env-var name must be
+        # kept, not dropped as the prompt (dropping it would leave a dangling
+        # flag that swallows the ``resume`` subcommand on cold resume).
+        (
+            ("--remote-auth-token-env", "CODEX_REMOTE_TOKEN", "initial prompt"),
+            ["--remote-auth-token-env", "CODEX_REMOTE_TOKEN"],
+        ),
+        # Everything after ``--`` is prompt text, as is the ``-`` stdin marker.
+        (("-c", 'model="gpt-5.4"', "--", "--yolo", "fix it"), ["-c", 'model="gpt-5.4"']),
+        (("--model", "gpt-5.4-mini", "-"), ["--model", "gpt-5.4-mini"]),
+        ((), []),
+    ],
+)
+def test_without_codex_positional_prompt_keeps_options(
+    args: tuple[str, ...], expected: list[str]
+) -> None:
+    assert without_codex_positional_prompt(args) == expected
 
 
 @pytest.mark.parametrize("profile", ["../other", "/tmp/other", "", "two/parts"])
@@ -591,6 +631,9 @@ def test_redact_codex_launch_args_masks_secret_bearing_values(
     [
         ["app-server", "--listen", "ws://127.0.0.1:7100"],
         ["--remote", "ws://127.0.0.1:57831"],
+        ["--remote=ws://127.0.0.1:57831"],
+        ["--listen=ws://127.0.0.1:7100"],
+        ["--remote-control=ws://127.0.0.1:57831"],
         ["--remote-control", "ws://127.0.0.1:57831"],
         # The real OpenUI-sidecar shape: app-server + --listen + MCP + a
         # trailing --remote, all handed in as pass-through args.
@@ -611,14 +654,41 @@ def test_reject_reserved_codex_transport_args_rejects(reserved_args: list[str]) 
     These compose an incoherent argv (``codex app-server … --remote``) that clap
     exits 2 on, so the thread never starts; reject them at build time instead.
     """
-    assert launch_args.reserved_codex_transport_arg(reserved_args) == reserved_args[0]
-    with pytest.raises(ValueError, match="runner-owned Codex transport"):
+    assert (
+        launch_args.reserved_codex_transport_arg(reserved_args)
+        == reserved_args[0].split("=", 1)[0]
+    )
+    with pytest.raises(ValueError, match="runner-owned Codex transport") as caught:
         launch_args.reject_reserved_codex_transport_args(reserved_args)
+    assert classify_exception(caught.value) == (ErrorCategory.CONFIG, ErrorImpact.BLOCKING)
+    assert "Start a new Codex session without" in str(caught.value)
+    assert "ws://" not in str(caught.value)
     with pytest.raises(ValueError, match="runner-owned Codex transport"):
         app_server.build_codex_remote_args(
             codex_args=tuple(reserved_args),
             thread_id=None,
             remote_url="ws://127.0.0.1:9876",
+        )
+
+
+def test_build_codex_native_server_rejects_transport_args_before_cli_discovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def unexpected_discovery() -> None:
+        pytest.fail("invalid saved arguments must fail before preparing an app-server")
+
+    monkeypatch.setattr(app_server, "_find_codex_cli", unexpected_discovery)
+    with pytest.raises(ValueError, match="runner-owned Codex transport"):
+        app_server.build_codex_native_server(
+            socket_path=tmp_path / "codex.sock",
+            codex_home=tmp_path / "codex-home",
+            cwd=tmp_path,
+            model=None,
+            profile=None,
+            bridge_dir=tmp_path / "bridge",
+            ap_server_url=None,
+            ap_auth_headers={},
+            terminal_launch_args=("app-server", "--listen", "ws://127.0.0.1:7100"),
         )
 
 

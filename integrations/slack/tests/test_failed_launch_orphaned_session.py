@@ -23,7 +23,7 @@ import asyncio
 from pathlib import Path
 
 import respx
-from fakes import FakeOmnigentServer, RecordingSlackClient
+from fakes import FakeOmnigentServer, RecordingSlackClient, resolve_test_auth
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.service import SlackOmnigentService
@@ -89,7 +89,7 @@ async def test_failed_launch_after_create_does_not_leak_orphan_session(tmp_path:
     await _configure_user(store, "T1", "U1")
     key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
 
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
     client = RecordingSlackClient()
 
@@ -143,7 +143,7 @@ async def test_retry_after_failed_launch_does_not_accumulate_orphans(tmp_path: P
     await _configure_user(store, "T1", "U1")
     key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
 
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
     client = RecordingSlackClient()
 

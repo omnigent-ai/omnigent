@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from omnigent.harnesses.codex_native import app_server
 from omnigent.harnesses.codex_native import process_registry as registry
+from tests._helpers.polling import poll_until
 
 fcntl = pytest.importorskip("fcntl")
 _REAL_PROCESS_START_IDENTITY = registry._process_start_identity
@@ -247,6 +252,147 @@ def test_reconciliation_reaps_real_process_after_argv0_marker_is_lost(
             victim.wait(timeout=5.0)
 
 
+_MODEL_PROBE_LAUNCHER = """
+import asyncio, json, os, sys
+from pathlib import Path
+
+from omnigent.harnesses.codex_native import app_server
+
+
+async def main() -> None:
+    codex_path, listen_url, probe_home = sys.argv[1:4]
+    discovery = await app_server._start_codex_model_discovery_process(
+        codex_path=codex_path,
+        listen_url=listen_url,
+        env=app_server._clean_codex_env() | {"CODEX_HOME": probe_home},
+        cwd=Path(probe_home),
+    )
+    pid = discovery.process.pid
+    print(json.dumps({"pid": pid, "pgid": os.getpgid(pid)}), flush=True)
+    await asyncio.sleep(300)
+
+
+asyncio.run(main())"""
+
+
+def _process_has_exited(pid: int) -> bool:
+    """Return whether *pid* is gone or a zombie nobody has reaped yet."""
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+        state = stat.rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        return False
+    return state in {"Z", "X"}
+
+
+def _fake_codex(tmp_path: Path) -> str:
+    """Write a stand-in ``codex`` that stays alive whatever arguments it gets."""
+    codex = tmp_path / "codex"
+    codex.write_text("#!/bin/sh\nexec sleep 300\n", encoding="utf-8")
+    codex.chmod(0o755)
+    return str(codex)
+
+
+def _read_probe_identity(launcher: subprocess.Popen[str], *, timeout: float) -> dict[str, int]:
+    assert launcher.stdout is not None
+    ready, _, _ = select.select([launcher.stdout], [], [], timeout)
+    line = launcher.stdout.readline() if ready else ""
+    if not line:
+        launcher.kill()
+        _, stderr = launcher.communicate(timeout=5.0)
+        pytest.fail(f"launcher never reported its model probe: {stderr.strip()}")
+    return json.loads(line)
+
+
+def test_reconciliation_reaps_crash_leftover_model_probe_app_server(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A fresh Host reaps the model-probe app-server a crashed Host left behind."""
+    monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(registry, "_process_start_identity", _REAL_PROCESS_START_IDENTITY)
+    monkeypatch.setattr(
+        registry, "_process_group_matches_entry", _REAL_PROCESS_GROUP_MATCHES_ENTRY
+    )
+    registry_path = registry.codex_native_process_registry_path()
+    probe_home = tmp_path / "codex-model-probe"
+    probe_home.mkdir()
+    repo_root = Path(app_server.__file__).resolve().parents[3]
+    launcher_env = {**os.environ, "PYTHONPATH": str(repo_root)}
+
+    # Killing the separate launcher releases the probe's owner lock like a real
+    # Host crash; this test process then plays the fresh Host.
+    launcher = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _MODEL_PROBE_LAUNCHER,
+            _fake_codex(tmp_path),
+            f"ws://127.0.0.1:{app_server._allocate_loopback_port()}",
+            str(probe_home),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=launcher_env,
+    )
+    probe_pgid: int | None = None
+    try:
+        probe = _read_probe_identity(launcher, timeout=30.0)
+        probe_pid, probe_pgid = probe["pid"], probe["pgid"]
+        assert not _process_has_exited(probe_pid), "probe exited before the Host could crash"
+        recorded = [(entry.pid, entry.pgid) for entry in registry._read_registry(registry_path)]
+        assert recorded == [(probe_pid, probe_pgid)], (
+            "the discovery spawn did not record the probe in the crash-safe registry"
+        )
+
+        launcher.kill()
+        launcher.wait(timeout=5.0)
+        assert not _process_has_exited(probe_pid), "probe did not outlive the crashed Host"
+
+        registry.reconcile_codex_native_process_registry()
+
+        poll_until(lambda: _process_has_exited(probe_pid), timeout_s=10.0, interval_s=0.05)
+        assert registry._read_registry(registry_path) == []
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            launcher.kill()
+        with contextlib.suppress(Exception):
+            launcher.wait(timeout=5.0)
+        if probe_pgid is not None and probe_pgid != os.getpgrp():
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(probe_pgid, signal.SIGKILL)
+
+
+def test_model_probe_stop_unregisters_and_releases_its_lock(tmp_path: Path, monkeypatch) -> None:
+    """Stopping a probe normally removes its registry entry and owner lock."""
+    monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "state"))
+    registry_path = registry.codex_native_process_registry_path()
+
+    async def _probe_lifecycle() -> None:
+        discovery = await app_server._start_codex_model_discovery_process(
+            codex_path=_fake_codex(tmp_path),
+            listen_url=f"ws://127.0.0.1:{app_server._allocate_loopback_port()}",
+            env=app_server._clean_codex_env(),
+            cwd=tmp_path,
+        )
+        try:
+            entries = registry._read_registry(registry_path)
+            assert [entry.pid for entry in entries] == [discovery.process.pid]
+            owner_lock_path = entries[0].owner_lock_path
+            assert owner_lock_path is not None
+            assert registry._owner_lock_held(owner_lock_path)
+        finally:
+            await app_server._stop_codex_model_discovery_process(discovery)
+        assert registry._read_registry(registry_path) == []
+        assert not Path(owner_lock_path).exists()
+
+    asyncio.run(_probe_lifecycle())
+
+
 def test_reconciliation_skips_live_sibling_when_owner_lock_is_held(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -433,3 +579,81 @@ def test_reap_state_dir_kills_matching_app_server_and_spares_others(tmp_path: Pa
 def test_reap_state_dir_without_matches_is_a_noop(tmp_path: Path) -> None:
     """A state dir no live process references reaps nothing."""
     assert registry.reap_codex_native_processes_for_state_dir(tmp_path / "no-match") == 0
+
+
+def test_liveness_probe_maps_listing_outcomes(monkeypatch, tmp_path: Path) -> None:
+    """The state-dir liveness probe reads matches as alive and an unknown listing as alive."""
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(registry, "_live_codex_app_server_processes", lambda _d: {123: 456})
+    assert registry.codex_native_process_alive_for_state_dir(state_dir) is True
+    monkeypatch.setattr(registry, "_live_codex_app_server_processes", lambda _d: {})
+    assert registry.codex_native_process_alive_for_state_dir(state_dir) is False
+    monkeypatch.setattr(registry, "_live_codex_app_server_processes", lambda _d: None)
+    assert registry.codex_native_process_alive_for_state_dir(state_dir) is True
+
+
+def test_live_app_server_listing_matches_only_state_dir_app_servers(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Only foreign live app-servers naming the state dir count as lease owners."""
+    state_dir = tmp_path / "codex-native" / "abc123"
+    own_pgid = os.getpgid(0)
+    listing = "\n".join(
+        [
+            f"111 222 codex app-server --listen ws://127.0.0.1:1 -c foo={state_dir}",
+            "333 444 codex app-server --listen ws://127.0.0.1:2 -c foo=/other/dir",
+            f"555 666 sqlite3 {state_dir}/state_5.sqlite",
+            f"{os.getpid()} 777 codex app-server {state_dir}",
+            f"888 {own_pgid} codex app-server {state_dir}",
+            "malformed",
+        ]
+    )
+    monkeypatch.setattr(
+        registry.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=listing),
+    )
+
+    assert registry._live_codex_app_server_processes(state_dir) == {111: 222}
+
+
+def test_live_app_server_listing_matches_json_escaped_state_dir(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A live owner whose state dir reaches argv JSON-escaped is still matched."""
+    state_dir = tmp_path / "jos\u00e9" / "codex-native" / "abc123"
+    escaped = json.dumps(str(state_dir))[1:-1]
+    assert escaped != str(state_dir)
+    listing = (
+        "111 222 codex -c mcp_servers.omnigent.args="
+        f'["-m", "bridge", "--bridge-dir", "{escaped}"] app-server --listen ws://127.0.0.1:1'
+    )
+    monkeypatch.setattr(
+        registry.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=listing),
+    )
+
+    assert registry._live_codex_app_server_processes(state_dir) == {111: 222}
+    assert registry.codex_native_process_alive_for_state_dir(state_dir) is True
+
+
+def test_live_app_server_listing_unavailable_reads_unknown(monkeypatch, tmp_path: Path) -> None:
+    """A failed process listing reads as unknown (None), never as empty."""
+
+    def _raise(*_args, **_kwargs):
+        raise OSError("no ps")
+
+    monkeypatch.setattr(registry.subprocess, "run", _raise)
+
+    assert registry._live_codex_app_server_processes(tmp_path) is None
+
+    # A nonzero ``ps`` exit with empty stdout is also unknown, not "no owner".
+    monkeypatch.setattr(
+        registry.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=1, stdout=""),
+    )
+
+    assert registry._live_codex_app_server_processes(tmp_path) is None
+    assert registry.codex_native_process_alive_for_state_dir(tmp_path) is True

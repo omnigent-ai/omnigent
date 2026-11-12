@@ -15,6 +15,7 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shlex
 import sys
@@ -26,6 +27,7 @@ import pytest
 
 from omnigent.inner import _proc
 from omnigent.inner import acp_executor as acp_executor_module
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
 from omnigent.inner.acp_executor import (
     AcpAgentConfig,
@@ -303,6 +305,110 @@ async def test_session_new_server_mode_adopts_returned_id() -> None:
     assert "sessionId" not in captured["params"]  # server assigns it
     assert captured["params"]["cwd"] == ex._cwd
     assert captured["params"]["mcpServers"] == []
+
+
+@pytest.mark.asyncio
+async def test_session_new_records_standard_model_config_option() -> None:
+    """ACP config-option categories identify the live model; option ids are agent-defined."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        return {
+            "result": {
+                "sessionId": "srv-42",
+                "configOptions": [
+                    {
+                        "id": "active-model",
+                        "category": "model",
+                        "currentValue": "grok-4.6",
+                    }
+                ],
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_session()
+
+    assert ex._active_model == "grok-4.6"
+    assert ex._model_config_option_id == "active-model"
+
+    # The learned id is what a warm switch targets, not the literal ``model``.
+    calls: list[tuple[str, dict]] = []
+
+    async def switch_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {
+            "result": {
+                "configOptions": [
+                    {"id": "active-model", "category": "model", "currentValue": params["value"]}
+                ]
+            }
+        }
+
+    ex._rpc = switch_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("srv-42", "grok-4.7")
+
+    assert calls == [
+        (
+            "session/set_config_option",
+            {"sessionId": "srv-42", "configId": "active-model", "value": "grok-4.7"},
+        )
+    ]
+    assert ex._active_model == "grok-4.7"
+
+
+def test_config_option_update_prefers_the_model_id_over_its_category() -> None:
+    """Several matching options resolve deterministically: ``model`` wins, else the first."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_config_options(
+        [
+            {"id": "model-tier", "category": "model", "currentValue": "fast"},
+            {"id": "model", "currentValue": "grok-4.6"},
+        ]
+    )
+    assert ex._model_config_option_id == "model"
+    assert ex._active_model == "grok-4.6"
+
+    ex._note_config_options(
+        [
+            {"id": "active-model", "category": "model", "currentValue": "grok-4.7"},
+            {"id": "fallback-model", "category": "model", "currentValue": "grok-3"},
+        ]
+    )
+    assert ex._model_config_option_id == "active-model"
+    assert ex._active_model == "grok-4.7"
+
+
+@pytest.mark.asyncio
+async def test_drain_ignores_malformed_session_update_params() -> None:
+    """A ``session/update`` whose ``params`` is not an object is dropped, not fatal."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._queue.put_nowait({"jsonrpc": "2.0", "method": "session/update", "params": [1, 2]})
+    ex._queue.put_nowait({"jsonrpc": "2.0", "method": "session/update"})
+
+    await ex._drain_stale_queue()
+
+    assert ex._queue.empty()
+    assert ex._active_model is None
+
+
+@pytest.mark.asyncio
+async def test_session_new_records_legacy_model_state() -> None:
+    """Grok 1.0.4's preview ``models`` state still reports its real launch model."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        return {
+            "result": {
+                "sessionId": "srv-42",
+                "models": {"currentModelId": "grok-4.6", "availableModels": []},
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_session()
+
+    assert ex._active_model == "grok-4.6"
 
 
 @pytest.mark.asyncio
@@ -1702,6 +1808,26 @@ async def test_interrupt_sends_session_cancel() -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_interrupt_preserves_original_cancel_grace_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._session_id = "s1"
+    ex._proc = type("P", (), {"returncode": None})()  # type: ignore[assignment]
+    ex._send = AsyncMock()  # type: ignore[method-assign]
+    now = 100.0
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(asyncio.get_running_loop(), "time", lambda: now)
+        assert await ex.interrupt_session("ignored") is True
+        original_deadline = ex._cancel_grace_deadline
+        assert original_deadline == now + acp_executor_module.ACP_CANCEL_GRACE_SECONDS
+
+        now += acp_executor_module.ACP_CANCEL_GRACE_SECONDS / 2
+        assert await ex.interrupt_session("ignored") is True
+        assert ex._cancel_grace_deadline == original_deadline
+
+
+@pytest.mark.asyncio
 async def test_interrupt_noop_without_session() -> None:
     ex = AcpExecutor(AcpAgentConfig(command="x"))
     assert await ex.interrupt_session("ignored") is False
@@ -1813,7 +1939,25 @@ for line in sys.stdin:
             "agentCapabilities": {"promptCapabilities": {"image": False}},
         }})
     elif method == "session/new":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "fake-session-1"}})
+        # The live model is reported before the response, as an agent keying its
+        # model option by category does; the client must not lose it to its drain.
+        update("fake-session-1", {"sessionUpdate": "config_option_update", "configOptions": [
+            {"id": "active-model", "category": "model", "currentValue": "grok-4.6"},
+        ]})
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "sessionId": "fake-session-1",
+            "models": {"currentModelId": "grok-4.5", "availableModels": []},
+        }})
+    elif method == "session/set_config_option":
+        params = msg["params"]
+        if params.get("configId") == "active-model":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"configOptions": [
+                {"id": "active-model", "category": "model", "currentValue": params["value"]},
+            ]}})
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "error": {
+                "code": -32602, "message": "unknown configId %r" % (params.get("configId"),),
+            }})
     elif method == "session/prompt":
         sid = msg["params"]["sessionId"]
         chunk(sid, "agent_thought_chunk", "planning")
@@ -1840,7 +1984,41 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
+async def test_pre_prompt_model_report_steers_first_turn_switch(tmp_path: Path) -> None:
+    """A model report queued behind ``session/new`` is read before the first switch.
+
+    The fake agent keys its model option ``active-model``; a configured model must
+    reach it under that id on the first turn, not the literal ``model`` fallback.
+    """
+    agent_path = tmp_path / "fake_acp_agent.py"
+    agent_path.write_text(_FAKE_ACP_AGENT)
+    command = shlex.join([sys.executable, str(agent_path)])
+
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="Fake", model="grok-4.7"))
+
+    async def elicit(tool_name: str, tool_input: dict) -> bool:
+        return True
+
+    ex._elicitation_handler = elicit  # type: ignore[assignment]
+
+    events = []
+    try:
+        async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], "you are a bot"):
+            events.append(ev)
+    finally:
+        await ex.close()
+
+    assert not [e for e in events if isinstance(e, ExecutorError)]
+    completions = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(completions) == 1
+    assert completions[0].usage["model"] == "grok-4.7"
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_against_fake_acp_agent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=acp_executor_module.__name__)
     agent_path = tmp_path / "fake_acp_agent.py"
     agent_path.write_text(_FAKE_ACP_AGENT)
     command = shlex.join([sys.executable, str(agent_path)])
@@ -1861,6 +2039,7 @@ async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
     finally:
         await ex.close()
 
+    assert f"acp[Fake] session/prompt {ex._rpc_id} stopReason=end_turn" in caplog.text
     # The permission request surfaced through the elicitation handler.
     assert approvals == [("shell", {"command": "echo hi"})]
 
@@ -1874,7 +2053,12 @@ async def test_end_to_end_against_fake_acp_agent(tmp_path: Path) -> None:
 
     completions = [e for e in events if isinstance(e, TurnComplete)]
     assert len(completions) == 1
-    assert completions[0].usage == {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    assert completions[0].usage == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "model": "grok-4.6",
+    }
 
     tool_reqs = [e for e in events if isinstance(e, ToolCallRequest)]
     assert tool_reqs[0].name == "shell" and tool_reqs[0].args == {"command": "echo hi"}
@@ -2744,3 +2928,71 @@ async def test_start_process_guard_deleted_process_cwd_relative_cwd() -> None:
     msg = error_events[0].message
     assert "deleted" in msg, f"expected 'deleted' in: {msg!r}"
     assert "/workspace/project" in msg, f"expected path in: {msg!r}"
+
+
+@pytest.mark.parametrize("fresh_session", [False, True], ids=["warm", "history-replay"])
+@pytest.mark.parametrize(
+    ("tail", "expected_id"),
+    [
+        (
+            {"type": "message", "role": "user", "id": "msg_current", "content": "current"},
+            "msg_current",
+        ),
+        (
+            {"type": "message", "role": "user", "id": "msg_empty", "content": []},
+            "msg_empty",
+        ),
+        (
+            {
+                "type": "message",
+                "role": "user",
+                "id": "msg_empty",
+                "content": [{"type": "input_text", "text": ""}],
+            },
+            "msg_empty",
+        ),
+        ({"type": "message", "role": "user", "content": "Your runner was interrupted"}, None),
+        ({"type": "function_call", "name": "read", "call_id": "call_1", "arguments": "{}"}, None),
+        ({"type": "function_call_output", "call_id": "call_1", "output": "done"}, None),
+    ],
+    ids=[
+        "current",
+        "empty-list",
+        "empty-text",
+        "synthetic-recovery",
+        "tool-resume",
+        "tool-result-resume",
+    ],
+)
+async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expected_id) -> None:
+    """History filtering and replay must never select an older user's identity."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    executor = AcpExecutor(AcpAgentConfig(command="unused", omnigent_mcp=False))
+    messages = _translate_input_to_messages(
+        [
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "assistant", "content": "old reply"},
+            tail,
+        ],
+        preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
+    )
+    executor._proc = Mock(returncode=None)
+    executor._initialized = True
+    executor._session_id = "acp-session"
+    executor._system_prompt_sent = not fresh_session
+    prompts = []
+
+    async def send(message):
+        prompts.append(message)
+        executor._pending[message["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = send
+    events = [event async for event in executor.run_turn(messages, [], "system")]
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert len(prompts) == 1
+    assert prompts[0]["params"]["_meta"] == {_META_INPUT_ITEM_ID: expected_id}
+    if expected_id == "msg_empty" and not fresh_session:
+        assert prompts[0]["params"]["prompt"] == [{"type": "text", "text": ""}]
+    if fresh_session and tail.get("role") == "user":
+        assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
