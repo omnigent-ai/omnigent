@@ -3260,19 +3260,7 @@ class _CodexAppServerSession:
                 else None
             ),
         )
-        if self._signer is None and not brokered_gateway:
-            from omnigent.harnesses.codex_native.app_server import prepare_codex_provider_config
-
-            self._codex_config_overrides = await prepare_codex_provider_config(
-                self._codex_home_dir,
-                self._codex_config_overrides,
-                codex_path=self._codex_path,
-                cwd=Path(self._cwd or os.getcwd()),
-                env=self._env,
-                retry_policy=self._retry_policy,
-                client_surface=harness_client_surface(),
-            )
-        else:
+        if self._signer is not None or brokered_gateway:
             # The signer replaces gateway attribution from its own launch metadata.
             self._codex_config_overrides = materialize_codex_provider_config(
                 self._codex_home_dir,
@@ -3333,6 +3321,20 @@ class _CodexAppServerSession:
                 await asyncio.to_thread(worker_launch.close)
                 raise RuntimeError("Codex session closed during worker preparation")
             self._worker_launch = worker_launch
+            if self._signer is None and not brokered_gateway:
+                from omnigent.harnesses.codex_native.app_server import (
+                    prepare_codex_provider_config,
+                )
+
+                self._codex_config_overrides = await prepare_codex_provider_config(
+                    self._codex_home_dir,
+                    self._codex_config_overrides,
+                    codex_path=worker_launch.launch_path,
+                    cwd=process_cwd,
+                    env=proc_env,
+                    retry_policy=self._retry_policy,
+                    client_surface=harness_client_surface(),
+                )
             from omnigent.mcp_disabled_servers import (
                 RELAUNCH_WITHOUT_OVERRIDES_EVENT,
                 plan_codex_launch,
@@ -5439,8 +5441,6 @@ class CodexExecutor(Executor):
             effective_cwd=effective_cwd,
         )
         sandbox_mode = _sandbox_mode(self._os_env_spec)
-        if tools and sandbox_mode == "read-only":
-            sandbox_mode = "workspace-write"
 
         try:
             async for event in app_session.run_turn(

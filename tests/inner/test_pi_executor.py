@@ -10,6 +10,7 @@ import os
 import shlex
 import shutil
 import socket
+import sys
 import tempfile
 import textwrap
 import threading
@@ -4791,6 +4792,7 @@ def test_models_json_attributes_only_unity_gateway_providers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Providers on ``/ai-gateway/`` paths name Pi and Omnigent; serving endpoints don't."""
+    monkeypatch.delenv("OMNIGENT_CLIENT_SURFACE", raising=False)
     monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
     monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     providers = _build_models_json("https://dbc-1.cloud.databricks.com", "tok")["providers"]
@@ -5472,7 +5474,9 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     executable.parent.mkdir(parents=True, exist_ok=True)
     executable.touch()
 
-    def _fake_create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+    def _fake_create_exec_launcher(
+        target_path: str, sandbox: SandboxPolicy, **_kwargs: object
+    ) -> str:
         assert target_path == str(executable.resolve())
         captured["policy"] = sandbox
         return "/fake/launcher"
@@ -5493,12 +5497,27 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
 
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value=str(pi_binary)):
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value=str(pi_binary)),
+        patch(
+            "subprocess.run", return_value=SimpleNamespace(stdout="0.80.4\n", stderr="")
+        ) as probe,
+    ):
         executor = PiExecutor(
             cwd=str(tmp_path),
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
         )
 
+    probe.assert_called_once_with(
+        ["/fake/launcher", "--version"],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+        env=executor._env,
+        cwd=str(tmp_path),
+    )
+    assert "FAKE_HOST_SECRET" not in probe.call_args.kwargs["env"]
+    assert executor._settled_turn_boundary is True
     # The launcher wrap actually engaged (not the silent no-sandbox
     # fallback in ``_try_sandbox_pi``'s except clause).
     assert executor._sandboxed is True
@@ -5515,6 +5534,80 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     # The host secret is not in the clean env, so it must not be in the
     # launcher's keep-set either.
     assert "FAKE_HOST_SECRET" not in allowlist
+
+
+@pytest.mark.parametrize("failure", ["policy", "setup"])
+def test_pi_rejects_sandbox_before_version_probe(failure: str, tmp_path: Path) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    spec = OSEnvSpec(
+        start_in_scratch=failure == "policy",
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+    )
+    with (
+        patch("subprocess.run") as probe,
+        patch(
+            "omnigent.inner.sandbox.resolve_sandbox", side_effect=OSError("sandbox unavailable")
+        ),
+        pytest.raises((ValueError, OSError), match=r"start_in_scratch|sandbox unavailable"),
+    ):
+        PiExecutor(pi_path="/usr/bin/pi", cwd=str(tmp_path), os_env=spec)
+    probe.assert_not_called()
+
+
+def test_pi_version_probe_runs_inside_requested_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    if sys.platform == "darwin":
+        sandbox_type, sandbox_command = "darwin_seatbelt", "sandbox-exec"
+    elif sys.platform.startswith("linux"):
+        sandbox_type, sandbox_command = "linux_bwrap", "bwrap"
+    else:
+        pytest.skip("requires a filesystem sandbox")
+    if shutil.which(sandbox_command) is None:
+        pytest.skip(f"requires {sandbox_command}")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    executable = tmp_path / "install" / "pi"
+    executable.parent.mkdir()
+    secret = tmp_path / "private.txt"
+    secret.write_text("private canary")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("FAKE_HOST_SECRET", "private value")
+    script = f"""
+import os, pathlib, sys
+assert sys.argv[1:] == ['--version']
+assert pathlib.Path.cwd() == pathlib.Path({str(workspace.resolve())!r})
+assert 'FAKE_HOST_SECRET' not in os.environ
+try:
+    pathlib.Path({str(secret)!r}).read_text()
+except OSError:
+    pass
+else:
+    raise AssertionError('version probe read outside its sandbox')
+print('0.80.4')
+"""
+    executable.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(script)} "$@"\n'
+    )
+    executable.chmod(0o755)
+    executor = PiExecutor(
+        pi_path=str(executable),
+        cwd=str(workspace),
+        os_env=OSEnvSpec(
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type=sandbox_type, allow_network=False),
+        ),
+    )
+    try:
+        assert executor._pi_version == (0, 80, 4)
+    finally:
+        Path(executor._pi_launch_path).unlink(missing_ok=True)
 
 
 def test_pi_bundle_resource_roots_follow_passed_args(tmp_path: Path) -> None:
@@ -5548,7 +5641,9 @@ def test_pi_sandbox_grants_bundle_resource_dirs_as_read_roots(monkeypatch, tmp_p
 
     captured: dict[str, SandboxPolicy] = {}
 
-    def _fake_create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+    def _fake_create_exec_launcher(
+        target_path: str, sandbox: SandboxPolicy, **_kwargs: object
+    ) -> str:
         captured["policy"] = sandbox
         return "/fake/launcher"
 
@@ -6466,7 +6561,7 @@ def test_constructor_probes_pi_version_once() -> None:
         ) as probe,
     ):
         executor = PiExecutor()
-    assert probe.call_count == 1
+    probe.assert_called_once_with(executor._pi_launch_path, env=executor._env, cwd=executor._cwd)
     assert "--approve" in executor._extra_args
 
 

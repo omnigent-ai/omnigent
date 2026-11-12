@@ -1691,7 +1691,9 @@ class TerminalInstance:
                         cli_path, sandbox_for_launcher, cwd=effective_cwd
                     )
                 else:
-                    launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
+                    launcher_path = create_exec_launcher(
+                        cli_path, sandbox_for_launcher, cwd=effective_cwd
+                    )
             except Exception:
                 self._stop_git_ssh()
                 raise

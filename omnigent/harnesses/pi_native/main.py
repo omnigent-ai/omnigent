@@ -179,7 +179,12 @@ PI_APPROVE_MIN_VERSION = (0, 79, 0)
 PI_AGENT_SETTLED_MIN_VERSION = (0, 80, 4)
 
 
-def pi_version(executable: str) -> tuple[int, int, int] | None:
+def pi_version(
+    executable: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    cwd: str | Path | None = None,
+) -> tuple[int, int, int] | None:
     """Return the Pi CLI version as ``(major, minor, patch)``, or ``None``.
 
     Runs ``pi --version`` synchronously with a short timeout. Returns
@@ -188,6 +193,8 @@ def pi_version(executable: str) -> tuple[int, int, int] | None:
     passing flags the installed Pi may not recognise.
 
     :param executable: Resolved path to the Pi CLI.
+    :param env: Explicit subprocess environment; defaults to inheritance.
+    :param cwd: Working directory for the version probe.
     :returns: Parsed version tuple, e.g. ``(0, 79, 10)``, or ``None``.
     """
     import re
@@ -199,6 +206,8 @@ def pi_version(executable: str) -> tuple[int, int, int] | None:
             capture_output=True,
             text=True,
             timeout=5.0,
+            env=env,
+            cwd=cwd,
         )
     except Exception:  # noqa: BLE001
         return None

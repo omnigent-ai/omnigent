@@ -88,6 +88,8 @@ from omnigent.inner.executor import (
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.process_logging import current_process_log_path, display_log_path
 
+from .sandbox import validate_harness_sandbox
+
 logger = logging.getLogger(__name__)
 
 ACP_CANCEL_GRACE_SECONDS = 1.0
@@ -608,8 +610,7 @@ class AcpExecutor(Executor):
 
         When ``os_env.sandbox`` requests confinement, wraps the agent binary in
         the platform sandbox so its whole process tree runs confined to the
-        spec's read/write roots. Falls back to the bare binary (never blocks
-        startup) when no sandbox is requested or the backend is unavailable.
+        spec's read/write roots. Requested sandbox failures prevent startup.
 
         ponytail: a sandboxed *generic* agent gets only its binary dir (read),
         the cwd, and private scratch space (write) — we can't know an arbitrary agent's config
@@ -622,33 +623,26 @@ class AcpExecutor(Executor):
         os_env = self._os_env
         if os_env is None:
             return binary, rest
+        cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+        validate_harness_sandbox(os_env, "ACP", cwd=cwd)
         sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
         if sandbox_spec.type == "none":
             return binary, rest
-        try:
-            from .sandbox import (
-                create_exec_launcher,
-                resolve_sandbox,
-                with_additional_read_roots,
-                with_spawn_env_allowlist,
-            )
+        from .sandbox import (
+            create_exec_launcher,
+            resolve_sandbox,
+            with_additional_read_roots,
+            with_spawn_env_allowlist,
+        )
 
-            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
-            sandbox = resolve_sandbox(os_env, cwd)
-            if not sandbox.active:
-                return binary, rest
-            resolved_bin = Path(binary)
-            if resolved_bin.parent != Path(".") and resolved_bin.exists():
-                sandbox = with_additional_read_roots(sandbox, [resolved_bin.resolve().parent])
-            sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-            return create_exec_launcher(binary, sandbox), rest
-        except (OSError, ImportError, NotImplementedError) as exc:
-            logger.warning(
-                "Could not apply sandbox for ACP agent %s; running unsandboxed: %s",
-                self._config.name,
-                exc,
-            )
-            return binary, rest
+        sandbox = resolve_sandbox(os_env, cwd)
+        if not sandbox.active:
+            raise OSError("ACP requires an active sandbox for the requested policy")
+        resolved_bin = Path(binary)
+        if resolved_bin.parent != Path(".") and resolved_bin.exists():
+            sandbox = with_additional_read_roots(sandbox, [resolved_bin.resolve().parent])
+        sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
+        return create_exec_launcher(binary, sandbox, cwd=str(cwd)), rest
 
     def _startup_error_message(self, exc: BaseException) -> str:
         """Describe a handshake failure, quoting the agent's own stderr.

@@ -72,6 +72,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
 )
+from .sandbox import reject_unsupported_harness_sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -622,6 +623,7 @@ class CursorExecutor(Executor):
             tools (policy DENY still blocks). Any other value keeps the
             interactive per-tool approval card.
         """
+        reject_unsupported_harness_sandbox(os_env, "Cursor")
         self._cwd = cwd or (os_env.cwd if os_env is not None else None)
         self._os_env_spec = os_env
         self._model_override = model

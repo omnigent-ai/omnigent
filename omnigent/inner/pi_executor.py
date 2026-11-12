@@ -118,6 +118,7 @@ from .executor import (
     TurnComplete,
 )
 from .model_credential import _authoritative_expiry
+from .sandbox import validate_harness_sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -1784,40 +1785,35 @@ def _try_sandbox_pi(
     """
     if os_env is None:
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
+    resolved_cwd = pathlib.Path(cwd or os.getcwd()).resolve(strict=False)
+    validate_harness_sandbox(os_env, "Pi", cwd=resolved_cwd)
     sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
     if sandbox_spec.type == "none":
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
-    try:
-        import pathlib
+    from .sandbox import (
+        create_exec_launcher,
+        resolve_sandbox,
+        with_additional_read_roots,
+        with_additional_write_roots,
+        with_spawn_env_allowlist,
+    )
 
-        from .sandbox import (
-            create_exec_launcher,
-            resolve_sandbox,
-            with_additional_read_roots,
-            with_additional_write_roots,
-            with_spawn_env_allowlist,
-        )
-
-        resolved_cwd = pathlib.Path(cwd or os.getcwd()).resolve(strict=False)
-        sandbox = resolve_sandbox(os_env, resolved_cwd)
-        if not sandbox.active:
-            return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
-        # Bundled and legacy CLIs both need their sibling npm dependencies.
-        executable = pathlib.Path(pi_path).resolve()
-        pi_dir = next(
-            (parent for parent in executable.parents if parent.name == "node_modules"),
-            executable.parent,
-        )
-        sandbox = with_additional_read_roots(sandbox, [pi_dir, *(extra_read_roots or ())])
-        home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
-        sandbox = with_additional_write_roots(sandbox, [home_pi])
-        sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-        # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
-        launcher = create_exec_launcher(str(executable), sandbox)
-        return SandboxedPiCli(launch_path=launcher, sandboxed=True)
-    except (OSError, ImportError, NotImplementedError) as exc:
-        logger.warning("Could not apply sandbox for Pi: %s", exc)
-        return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
+    sandbox = resolve_sandbox(os_env, resolved_cwd)
+    if not sandbox.active:
+        raise OSError("Pi requires an active sandbox for the requested policy")
+    # Bundled and legacy CLIs both need their sibling npm dependencies.
+    executable = pathlib.Path(pi_path).resolve()
+    pi_dir = next(
+        (parent for parent in executable.parents if parent.name == "node_modules"),
+        executable.parent,
+    )
+    sandbox = with_additional_read_roots(sandbox, [pi_dir, *(extra_read_roots or ())])
+    home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
+    sandbox = with_additional_write_roots(sandbox, [home_pi])
+    sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
+    # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
+    launcher = create_exec_launcher(str(executable), sandbox, cwd=str(resolved_cwd))
+    return SandboxedPiCli(launch_path=launcher, sandboxed=True)
 
 
 def _resolve_pi_skill_args(
@@ -2290,6 +2286,21 @@ class PiExecutor(Executor):
         self._env: dict[str, str] = _clean_pi_env(
             os_env.sandbox.env_passthrough if os_env is not None and os_env.sandbox else None
         )
+        bundle_args = [
+            *_resolve_pi_skill_args(skills_filter, bundle_dir),
+            *_resolve_pi_bundle_extension_args(bundle_dir),
+        ]
+        # Confine every Pi invocation, including the initial version probe.
+        # PI_CODING_AGENT_DIR joins the filtered environment per RPC spawn.
+        sandboxed = _try_sandbox_pi(
+            self._pi_path,
+            os_env,
+            cwd,
+            spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR"],
+            extra_read_roots=_pi_bundle_resource_roots(bundle_dir, bundle_args),
+        )
+        self._pi_launch_path = sandboxed.launch_path
+        self._sandboxed = sandboxed.sandboxed
         # ``--no-tools`` in pi 0.68.x disables BOTH built-ins AND extension
         # tools by default; we re-enable just the bridged tool names per
         # turn via ``--tools <comma-list>`` in :meth:`_build_env_and_dir`.
@@ -2303,7 +2314,7 @@ class PiExecutor(Executor):
             pi_version,
         )
 
-        self._pi_version = pi_version(self._pi_path)
+        self._pi_version = pi_version(self._pi_launch_path, env=self._env, cwd=self._cwd)
         # Pi >= 0.80.4 reports ``agent_settled`` once a prompt's run is fully
         # finished; older builds only emit ``agent_end`` per run.
         self._settled_turn_boundary = (
@@ -2334,8 +2345,7 @@ class PiExecutor(Executor):
         # change across turns within a session). Each turn's
         # ``_build_env_and_dir`` copies ``self._extra_args`` so this
         # extension is read-only after init.
-        self._extra_args.extend(_resolve_pi_skill_args(skills_filter, bundle_dir))
-        self._extra_args.extend(_resolve_pi_bundle_extension_args(bundle_dir))
+        self._extra_args.extend(bundle_args)
         # The bundle-root context file is an automatic context file like the
         # workspace ones Pi discovers, so ``context_files=False`` drops it too.
         self._bundle_context = _read_pi_bundle_context(bundle_dir) if context_files else None
@@ -2365,21 +2375,6 @@ class PiExecutor(Executor):
         self._gateway_workspace_url = (
             self._gateway_model_service_workspace_url() if gateway else None
         )
-
-        # Apply sandbox.
-        # ``PI_CODING_AGENT_DIR`` is added per-spawn by
-        # ``_build_env_and_dir`` on the gateway path, so it must be in
-        # the launcher's prune allowlist even though it's not in
-        # ``self._env`` yet.
-        sandboxed = _try_sandbox_pi(
-            self._pi_path,
-            os_env,
-            cwd,
-            spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR"],
-            extra_read_roots=_pi_bundle_resource_roots(bundle_dir, self._extra_args),
-        )
-        self._pi_launch_path = sandboxed.launch_path
-        self._sandboxed = sandboxed.sandboxed
 
         self._session_states: dict[str, _PiSessionState] = {}
         self._tool_server: _ToolServer | None = None

@@ -20,6 +20,7 @@ from .sandbox import (
     create_private_tmpdir,
     get_backend,
     resolve_sandbox,
+    validate_harness_sandbox,
     with_additional_read_roots,
     with_additional_write_roots,
     with_spawn_env_allowlist,
@@ -108,7 +109,7 @@ def prepare_codex_catalog_probe(
         raise OSError(
             f"Sandbox backend {policy.backend_type!r} cannot contain the Codex catalog probe"
         )
-    launcher = Path(create_exec_launcher(codex_path, policy))
+    launcher = Path(create_exec_launcher(codex_path, policy, cwd=str(cwd)))
     return CodexWorkerLaunch(
         launch_path=str(launcher),
         sandboxed=True,
@@ -129,6 +130,14 @@ def prepare_codex_worker(
 ) -> CodexWorkerLaunch:
     """Prepare a contained worker or propagate the containment failure."""
     brokered_gateway = worker_env is not None and worker_env.get(BROKERED_CODEX_ENV) == "1"
+    if os_env is not None:
+        validate_harness_sandbox(
+            os_env,
+            "Codex",
+            cwd=cwd,
+            supports_egress_rules=True,
+            supports_credential_proxy=brokered_gateway,
+        )
     if os_env is None or (os_env.sandbox is not None and os_env.sandbox.type == "none"):
         if signer_readiness is not None or brokered_gateway:
             raise OSError("brokered Codex worker requires an active sandbox")
@@ -142,9 +151,7 @@ def prepare_codex_worker(
 
     policy = resolve_sandbox(os_env, cwd)
     if not policy.active:
-        if signer_readiness is not None or brokered_gateway:
-            raise OSError("brokered Codex worker requires an active sandbox")
-        return CodexWorkerLaunch(launch_path=codex_path, sandboxed=False)
+        raise OSError("Codex worker requires an active sandbox for the requested policy")
     if signer_readiness is not None and worker_env is None:
         raise ValueError("signer-backed Codex worker requires an owned worker environment")
     egress_rules = (
@@ -294,7 +301,7 @@ def prepare_codex_worker(
             policy,
             list(staged_env) if staged_env is not None else spawn_env_names,
         )
-        launcher = Path(create_exec_launcher(codex_path, policy))
+        launcher = Path(create_exec_launcher(codex_path, policy, cwd=str(cwd)))
         if staged_env is not None and worker_env is not None:
             worker_env.clear()
             worker_env.update(staged_env)

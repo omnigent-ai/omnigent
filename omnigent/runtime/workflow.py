@@ -2522,7 +2522,13 @@ def _build_antigravity_spawn_env(spec: AgentSpec) -> dict[str, str]:
     :returns: Env-var overrides; may be empty (the wrap then uses the SDK's
         ambient creds and default model).
     """
+    from omnigent.inner.sandbox import reject_unsupported_harness_sandbox
+
+    reject_unsupported_harness_sandbox(spec.os_env, "Antigravity")
     env: dict[str, str] = {}
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_ANTIGRAVITY_OS_ENV"] = os_env_payload
     model = _resolve_spec_model(spec)
     if model is None:
         # Brain-picker sessions often omit executor.model; honor antigravity.model

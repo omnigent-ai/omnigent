@@ -154,7 +154,7 @@ def test_successful_active_sandbox_returns_owned_launcher(
     backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
     captured: dict[str, SandboxPolicy] = {}
 
-    def _create_launcher(target: str, policy: SandboxPolicy) -> str:
+    def _create_launcher(target: str, policy: SandboxPolicy, **_kwargs: object) -> str:
         assert target == str(codex)
         captured["policy"] = policy
         return str(launcher)
@@ -264,7 +264,7 @@ def test_brokered_catalog_probe_is_network_denied(
     ]
     captured: dict[str, SandboxPolicy] = {}
 
-    def _create_launcher(target: str, policy: SandboxPolicy) -> str:
+    def _create_launcher(target: str, policy: SandboxPolicy, **_kwargs: object) -> str:
         assert target == str(codex)
         captured["policy"] = policy
         return str(launcher)
@@ -316,7 +316,7 @@ def test_non_signer_egress_rules_route_only_through_owned_proxy(
     backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
     captured: dict[str, SandboxPolicy] = {}
 
-    def _create_launcher(target: str, policy: SandboxPolicy) -> str:
+    def _create_launcher(target: str, policy: SandboxPolicy, **_kwargs: object) -> str:
         captured["policy"] = policy
         return str(launcher)
 
@@ -325,18 +325,7 @@ def test_non_signer_egress_rules_route_only_through_owned_proxy(
         return egress_tmpdir
 
     start_proxy = Mock(return_value=handle)
-    credentials = CredentialProxySpec(
-        entries=[
-            CredentialProxyEntry(
-                host="other.example.com",
-                scheme="bearer",
-                source=CredentialSourceSpec(kind="command", command="exit 7"),
-                inject_env=["OTHER_TOKEN"],
-            )
-        ]
-    )
     policy = _active_policy(tmp_path)
-    policy.credential_proxy = credentials
     monkeypatch.setattr(
         "omnigent.inner.codex_worker.resolve_sandbox",
         Mock(return_value=policy),
@@ -356,7 +345,6 @@ def test_non_signer_egress_rules_route_only_through_owned_proxy(
                 type="darwin_seatbelt",
                 egress_rules=["POST api.example.com/v1/responses"],
                 egress_allow_private_destinations=True,
-                credential_proxy=credentials,
             )
         ),
         spawn_env_names=list(worker_env),
@@ -429,7 +417,7 @@ def test_brokered_gateway_rewrites_only_parent_secret(
     monkeypatch.setattr("omnigent.inner.codex_worker.resolve_sandbox", lambda *_: policy)
     monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", lambda *_: backend)
     monkeypatch.setattr(
-        "omnigent.inner.codex_worker.create_exec_launcher", lambda *_: str(launcher)
+        "omnigent.inner.codex_worker.create_exec_launcher", lambda *_, **_kwargs: str(launcher)
     )
     monkeypatch.setattr("omnigent.inner.codex_worker.create_private_tmpdir", lambda: egress_dir)
     start_proxy = Mock(return_value=proxy)
@@ -615,7 +603,7 @@ def test_signer_readiness_adds_only_relay_and_public_ca(
     backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
     captured: dict[str, SandboxPolicy] = {}
 
-    def _create_launcher(target: str, policy: SandboxPolicy) -> str:
+    def _create_launcher(target: str, policy: SandboxPolicy, **_kwargs: object) -> str:
         captured["policy"] = policy
         return str(launcher)
 

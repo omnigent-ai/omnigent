@@ -686,3 +686,26 @@ def test_exec_launcher_rejects_an_unnameable_interpreter(monkeypatch) -> None:
     monkeypatch.setattr(sys, "executable", "")
     with pytest.raises(OSError, match=re.escape("sys.executable is empty")):
         create_exec_launcher("/bin/true", _noop_policy())
+
+
+@pytest.mark.parametrize("backend_type", ["linux_bwrap", "darwin_seatbelt"])
+def test_run_launcher_rejects_noop_spawn_wrap(
+    backend_type: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner import sandbox
+
+    policy = dataclasses.replace(_noop_policy(), active=True, backend_type=backend_type)
+    backend = mock.Mock()
+    backend.prepare_launcher_policy.side_effect = lambda policy: policy
+    backend.wrap_launcher_argv.side_effect = lambda argv, *args, **kwargs: argv
+    monkeypatch.setattr(sandbox, "get_backend", lambda name: backend)
+    with (
+        mock.patch.object(os, "execvp") as execute,
+        mock.patch.object(sandbox, "activate_sandbox") as activate,
+        pytest.raises(OSError, match="did not wrap"),
+    ):
+        sandbox.run_launcher(
+            sandbox._encode_json_arg(policy.to_jsonable()), sys.executable, ["-c", "pass"]
+        )
+    execute.assert_not_called()
+    activate.assert_not_called()

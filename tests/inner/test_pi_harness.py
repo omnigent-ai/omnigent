@@ -227,33 +227,12 @@ def test_executor_factory_decodes_os_env_json(
     assert os_env_value.sandbox.read_paths == ["/srv/data"]
 
 
-def test_executor_factory_falls_back_on_malformed_os_env_json(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Malformed ``HARNESS_PI_OS_ENV`` falls back to default.
-
-    A malformed payload should NOT crash the wrap — that would
-    bring the whole subprocess down on first turn. The wrap
-    instead logs a warning and defaults to the parity-preserving
-    ``caller_process + sandbox=none``.
-    """
-    monkeypatch.setenv("HARNESS_PI_OS_ENV", "{this-is-not-json")
-    captured: dict[str, Any] = {}
-
-    def _fake_init(self: Any, **kwargs: Any) -> None:
-        captured["os_env"] = kwargs["os_env"]
-
-    with patch(
-        "omnigent.inner.pi_harness.PiExecutor.__init__",
-        _fake_init,
-    ):
-        pi_harness._build_pi_executor()
-
-    os_env_value = captured["os_env"]
-    assert os_env_value is not None
-    assert os_env_value.type == "caller_process"
-    assert os_env_value.sandbox is not None
-    assert os_env_value.sandbox.type == "none"
+def test_executor_factory_rejects_malformed_os_env_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HARNESS_PI_OS_ENV", "{not-json")
+    with patch("omnigent.inner.pi_harness.PiExecutor.__init__") as constructor:
+        with pytest.raises(ValueError, match="HARNESS_PI_OS_ENV"):
+            pi_harness._build_pi_executor()
+    constructor.assert_not_called()
 
 
 @pytest.mark.parametrize(

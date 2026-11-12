@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -161,3 +162,64 @@ def test_harness_rejects_invalid_nested_credential_policy(
     )
     with pytest.raises(ValueError, match=r"credential_proxy\.entries"):
         harness._resolve_os_env()
+
+
+@pytest.mark.parametrize("harness_name", _HARNESSES)
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{not-json",
+        "",
+        "null",
+        "[]",
+        "false",
+        '{"sandbox": false}',
+        '{"sandbox": []}',
+        '{"cwd": []}',
+        '{"fork": "false"}',
+        '{"start_in_scratch": "false"}',
+        '{"sandbox": {"allow_network": "false"}}',
+        '{"sandbox": {"cwd_hidden_scan_overflow": "erorr"}}',
+        '{"sandbox": {"cwd_hidden_scan_max_entries": 0}}',
+        '{"sandbox": {"cwd_hidden_scan_max_entries": -1}}',
+        '{"sandbox": {"allow_netwrok": false}}',
+        '{"sandbox": {"write_paths": [{"path": "/workspace", "copy_on_writ": true}]}}',
+        '{"sandbox": {"credential_proxy": {"entry": []}}}',
+        '{"sandbox": {"credential_proxy": {"entries": [{"host": "api.example.com", '
+        '"source": {"kind": "env", "env": "API_TOKEN", "refresh_interval_second": 60}}]}}}',
+    ],
+)
+def test_harness_rejects_malformed_os_policy(
+    harness_name: str, payload: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = importlib.import_module(f"omnigent.inner.{harness_name}_harness")
+    monkeypatch.setenv(harness._ENV_OS_ENV, payload)
+    with pytest.raises(ValueError):
+        harness._resolve_os_env()
+
+
+@pytest.mark.parametrize("harness_name", _HARNESSES)
+def test_harness_preserves_complete_os_policy(
+    harness_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = importlib.import_module(f"omnigent.inner.{harness_name}_harness")
+    spec = OSEnvSpec(
+        cwd="/workspace",
+        start_in_scratch=True,
+        sandbox=OSEnvSandboxSpec(
+            type="linux_bwrap", read_paths=[], write_paths=[], allow_network=False
+        ),
+    )
+    monkeypatch.setenv(harness._ENV_OS_ENV, _serialize_os_env(spec))
+    assert harness._resolve_os_env() == spec
+
+
+@pytest.mark.parametrize("harness_name", _HARNESSES)
+def test_harness_default_requires_absent_policy(
+    harness_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = importlib.import_module(f"omnigent.inner.{harness_name}_harness")
+    monkeypatch.delenv(harness._ENV_OS_ENV, raising=False)
+    assert harness._resolve_os_env().sandbox == OSEnvSandboxSpec(type="none")
+    monkeypatch.setenv(harness._ENV_OS_ENV, json.dumps({"sandbox": {"type": "none"}}))
+    assert harness._resolve_os_env().sandbox == OSEnvSandboxSpec(type="none")

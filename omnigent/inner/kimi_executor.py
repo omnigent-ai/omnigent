@@ -89,6 +89,8 @@ from omnigent.inner.executor import (
 )
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 
+from .sandbox import validate_harness_sandbox
+
 _logger = logging.getLogger(__name__)
 
 # Per-line cap for the stdout StreamReader. Kimi emits whole messages (not
@@ -469,9 +471,8 @@ class KimiExecutor(Executor):
         call can't touch paths outside the spec's read/write roots — the
         OS-level guarantee kimi's own approval flow can't give.
 
-        Falls back to the bare binary (never blocks startup) when no sandbox
-        is requested, the resolved policy is inactive, or the backend is
-        unavailable on this platform.
+        Uses the bare binary only when no sandbox is requested. Sandbox setup
+        failures prevent startup.
 
         :param spawn_env_names: Env-var names we deliberately set on the
             subprocess ``env=``; baked into the policy so the launcher prunes
@@ -481,36 +482,33 @@ class KimiExecutor(Executor):
         os_env = self._os_env
         if os_env is None:
             return self._binary_path
+        cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+        validate_harness_sandbox(os_env, "Kimi", cwd=cwd)
         sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
         if sandbox_spec.type == "none":
             return self._binary_path
-        try:
-            from .sandbox import (
-                create_exec_launcher,
-                resolve_sandbox,
-                with_additional_read_roots,
-                with_additional_write_roots,
-                with_spawn_env_allowlist,
-            )
+        from .sandbox import (
+            create_exec_launcher,
+            resolve_sandbox,
+            with_additional_read_roots,
+            with_additional_write_roots,
+            with_spawn_env_allowlist,
+        )
 
-            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
-            sandbox = resolve_sandbox(os_env, cwd)
-            if not sandbox.active:
-                return self._binary_path
-            # kimi is a curl-installed single binary: it must read its own
-            # install dir and write its config dir ($KIMI_CODE_HOME, default
-            # ~/.kimi-code), or it can't start inside the jail.
-            from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
+        sandbox = resolve_sandbox(os_env, cwd)
+        if not sandbox.active:
+            raise OSError("Kimi requires an active sandbox for the requested policy")
+        # kimi is a curl-installed single binary: it must read its own
+        # install dir and write its config dir ($KIMI_CODE_HOME, default
+        # ~/.kimi-code), or it can't start inside the jail.
+        from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
 
-            resolved_bin = shutil.which(self._binary_path) or self._binary_path
-            bin_dir = Path(resolved_bin).resolve(strict=False).parent
-            sandbox = with_additional_read_roots(sandbox, [bin_dir])
-            sandbox = with_additional_write_roots(sandbox, [resolve_user_kimi_home()])
-            sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-            return create_exec_launcher(resolved_bin, sandbox)
-        except (OSError, ImportError, NotImplementedError) as exc:
-            _logger.warning("Could not apply sandbox for kimi; running unsandboxed: %s", exc)
-            return self._binary_path
+        resolved_bin = shutil.which(self._binary_path) or self._binary_path
+        bin_dir = Path(resolved_bin).resolve(strict=False).parent
+        sandbox = with_additional_read_roots(sandbox, [bin_dir])
+        sandbox = with_additional_write_roots(sandbox, [resolve_user_kimi_home()])
+        sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
+        return create_exec_launcher(resolved_bin, sandbox, cwd=str(cwd))
 
     def _build_argv(self, *, prompt_text: str) -> list[str]:
         """Assemble the kimi argv for one turn.

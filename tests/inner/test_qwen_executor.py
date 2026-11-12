@@ -404,7 +404,7 @@ def test_sandbox_launch_path_wraps_active_policy(
             allow_network=True,
         )
 
-    def _fake_launcher(target: str, sandbox: SandboxPolicy) -> str:
+    def _fake_launcher(target: str, sandbox: SandboxPolicy, **_kwargs: object) -> str:
         captured["target"] = target
         captured["policy"] = sandbox
         return "/fake/launcher"
@@ -430,10 +430,10 @@ def test_sandbox_launch_path_wraps_active_policy(
     assert "OPENAI_BASE_URL" in policy.spawn_env_allowlist
 
 
-def test_sandbox_launch_path_falls_back_when_backend_unavailable(
+def test_sandbox_launch_path_rejects_unavailable_backend(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """A backend failure degrades to the bare binary, never blocks startup."""
+    """An unavailable requested sandbox must prevent startup."""
     from omnigent.inner import sandbox as sandbox_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
@@ -447,7 +447,8 @@ def test_sandbox_launch_path_falls_back_when_backend_unavailable(
         qwen_path="/usr/bin/qwen",
         os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
     )
-    assert executor._sandbox_launch_path(["PATH"]) == "/usr/bin/qwen"
+    with pytest.raises(NotImplementedError, match="no bwrap"):
+        executor._sandbox_launch_path(["PATH"])
 
 
 @pytest.mark.asyncio

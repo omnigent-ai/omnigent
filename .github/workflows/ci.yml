@@ -117,7 +117,7 @@ jobs:
       # Tests that exercise a real harness CLI skip without it; install the
       # pinned CLI only in the lanes that run them.
       - name: Install Codex CLI
-        if: matrix.group == 'misc' || matrix.group == 'harnesses'
+        if: matrix.group == 'misc' || matrix.group == 'harnesses' || matrix.group == 'inner-rest'
         uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
         with:
           harness: codex
