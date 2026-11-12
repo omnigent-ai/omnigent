@@ -65,6 +65,11 @@ def test_timed_out_readiness_probe_leaves_no_cli_descendants(
             f"{binary}'s child (pid {child_pid}) outlived the timed-out {probe} probe"
         )
     finally:
+        if child_pid is None:
+            # The probe raised or its verdict assertion failed before the pid was
+            # read; reap a child it may have published so it can't outlive the test.
+            with suppress(OSError, ValueError):
+                child_pid = int(child_pid_file.read_text(encoding="utf-8"))
         if child_pid is not None:
             with suppress(ProcessLookupError, PermissionError):
                 os.kill(child_pid, signal.SIGKILL)

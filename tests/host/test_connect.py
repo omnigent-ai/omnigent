@@ -106,6 +106,7 @@ from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.host.session_env import session_env_handoff
+from omnigent.onboarding import harness_install
 from omnigent.onboarding.harness_install import READINESS_CLI_PROBE_TIMEOUT_S
 from omnigent.onboarding.harness_login import CodexDeviceLogin
 from omnigent.runner.identity import (
@@ -1569,14 +1570,14 @@ async def test_handle_launch_does_not_ask_to_install_a_resolvable_pi_that_never_
     monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
     monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
-    original_run = subprocess.run
+    original_run = harness_install.run_isolated
 
     def _unanswered_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if argv[1:] != ["--version"]:
             return original_run(argv, **kwargs)
         raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
 
-    monkeypatch.setattr(subprocess, "run", _unanswered_version)
+    monkeypatch.setattr(harness_install, "run_isolated", _unanswered_version)
     host = _make_host_process()
     proc = Mock(spec=subprocess.Popen, pid=1234)
     proc.poll.return_value = None
@@ -1606,7 +1607,7 @@ async def test_handle_launch_bound_preflight_waits_only_the_readiness_probe_budg
     """A bound launch lets an unanswered CLI through within the readiness probe budget."""
     probe_timeouts: list[object] = []
     original_which = shutil.which
-    original_run = subprocess.run
+    original_run = harness_install.run_isolated
 
     def _resolve_claude(name: str, *args: object, **kwargs: object) -> str | None:
         return "/usr/bin/claude" if name == "claude" else original_which(name, *args, **kwargs)
@@ -1621,7 +1622,7 @@ async def test_handle_launch_bound_preflight_waits_only_the_readiness_probe_budg
     proc = Mock(spec=subprocess.Popen, pid=1234)
     proc.poll.return_value = None
     monkeypatch.setattr(shutil, "which", _resolve_claude)
-    monkeypatch.setattr(subprocess, "run", _unanswered_version)
+    monkeypatch.setattr(harness_install, "run_isolated", _unanswered_version)
     monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
     monkeypatch.setattr(
         host, "_spawn_runner_proc", Mock(return_value=(proc, tmp_path / "runner.log"))
