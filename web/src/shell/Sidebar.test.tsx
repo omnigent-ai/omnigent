@@ -2652,7 +2652,7 @@ describe("Sidebar project sections", () => {
     expect(screen.queryByText("conv_filed")).toBeNull();
   });
 
-  it("auto-expands the project folder holding the selected session", () => {
+  it("holds the selected session under its collapsed project folder", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -2675,10 +2675,9 @@ describe("Sidebar project sections", () => {
       </QueryClientProvider>,
     );
 
-    // No click: the folder opens because its session is selected, and the row
-    // is visible under the project section.
+    // Selecting the session doesn't open the folder; its row stays listed under it.
     const header = screen.getByRole("button", { name: /^Customer X/ });
-    expect(header).toHaveAttribute("aria-expanded", "true");
+    expect(header).toHaveAttribute("aria-expanded", "false");
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_filed")).toBeInTheDocument();
   });
@@ -3223,9 +3222,10 @@ describe("Sidebar project Show more", () => {
   it("lists the open session when it sits past the first five", () => {
     projectsMock.push("Customer X");
     mockConversations(filedSessions(12));
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Customer X"]));
     renderOnSession("conv_filed_7");
 
-    // The folder auto-expands for the open session and grows a whole page to list it.
+    // The expanded folder grows a whole page to list the open session.
     expect(folderRowIds()).toEqual(filedIds(10));
     expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
   });

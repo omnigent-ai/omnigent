@@ -13,21 +13,26 @@ pipeline without subprocesses.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import gzip
 import io
 import tarfile
+import types
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
+from omnigent.server.routes import _host_launch
 from omnigent.server.routes import sessions as _sessions_facade
 from omnigent.server.routes._sessions import common as _sessions_common
 from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.host_store import HostStore
 from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
@@ -295,6 +300,72 @@ async def test_archive_tears_down_host_spawned_runner(
             "a1b2c3d4e5f61234567890abcdef0123",
             "b1b2c3d4e5f61234567890abcdef0123",
         )
+    finally:
+        _sessions_common._session_status_cache.pop(session_id, None)
+        _sessions_common._intentional_stop_sessions.pop(session_id, None)
+
+
+_SHARDED_HOST_ID = "c1b2c3d4e5f61234567890abcdef0123"
+
+
+@pytest.mark.parametrize(
+    ("host_state", "status"),
+    [("on_other_replica", 400), ("on_this_replica", 200), ("offline", 200)],
+)
+async def test_sharded_archive_requires_the_host_replica(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    host_state: str,
+    status: int,
+) -> None:
+    """
+    A sharded archive commits only on the replica that can stop the runner.
+
+    The teardown reaches the host-launched runner over the host's tunnel. On a
+    replica without it, committing ``archived`` would hide a session whose
+    runner keeps running, so a live host elsewhere gets ``wrong_replica``
+    (the client re-addresses with the slice key) and the session is untouched.
+    An offline host has no runner to stop, so its archive still succeeds.
+    """
+    session = await create_test_session(client, name=f"archive-sharded-{host_state}")
+    session_id = session["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_host_id(session_id, _SHARDED_HOST_ID, workspace="/tmp/archive-ws")
+    conv_store.set_runner_id(session_id, "d1b2c3d4e5f61234567890abcdef0123")
+    host_store = HostStore(db_uri)
+    host_store.upsert_on_connect(_SHARDED_HOST_ID, "archive-host", "local")
+    if host_state == "offline":
+        host_store.set_offline(_SHARDED_HOST_ID)
+    monkeypatch.setattr(app.state, "host_store", host_store)
+    monkeypatch.setattr(_host_launch, "_host_sharded", True)
+    tunnel = types.SimpleNamespace(hello=types.SimpleNamespace(version="test"))
+    local_tunnel = (
+        patch.object(app.state.host_registry, "get", lambda _host_id: tunnel)
+        if host_state == "on_this_replica"
+        else contextlib.nullcontext()
+    )
+
+    mock_teardown = AsyncMock(return_value=True)
+    try:
+        with (
+            local_tunnel,
+            patch.object(
+                _sessions_orchestration, "_stop_session_via_runner", AsyncMock(return_value=True)
+            ),
+            patch.object(_sessions_facade, "_stop_session_host_runner", mock_teardown),
+        ):
+            resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            await _drain_detached_stops()
+        assert resp.status_code == status, resp.text
+        archived = (await client.get(f"/v1/sessions/{session_id}")).json()["archived"]
+        if status == 400:
+            assert resp.json()["error"]["code"] == "wrong_replica"
+            assert archived is False
+            mock_teardown.assert_not_awaited()
+        else:
+            assert archived is True
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
         _sessions_common._intentional_stop_sessions.pop(session_id, None)
