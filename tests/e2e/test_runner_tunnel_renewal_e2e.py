@@ -175,11 +175,22 @@ def test_scheduled_renewal_preserves_an_inflight_tool_and_session(
             what="the original tool and turn to finish after renewal",
         )
         assert "TOOL_FINISHED_AFTER_RENEWAL" in _session_blob(client, session_id)
+        # Reply text can be committed before the owning replica retires the turn.
+        _poll_until(
+            lambda: _session_snapshot(client, session_id).get("status") == "idle",
+            timeout=60,
+            what="the original turn to retire before the follow-up",
+        )
         _send_user_message(client, session_id, "Continue in the same session.")
         _poll_until(
             lambda: follow_up in _session_blob(client, session_id),
             timeout=60,
             what="a follow-up turn to complete without restarting the runner",
+        )
+        _poll_until(
+            lambda: _session_snapshot(client, session_id).get("status") == "idle",
+            timeout=60,
+            what="the follow-up turn to retire",
         )
         assert counter.read_text() == "called\n", "renewal repeated the tool's side effect"
         assert stack._runner_proc.pid == runner_pid and stack._runner_proc.poll() is None

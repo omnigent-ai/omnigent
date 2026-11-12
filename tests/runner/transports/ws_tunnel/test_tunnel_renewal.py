@@ -13,6 +13,7 @@ import pytest
 from fastapi import FastAPI
 from websockets.asyncio.server import ServerConnection, serve
 
+from omnigent.runner import _entry
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
@@ -21,6 +22,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from tests._helpers.polling import poll_until_async
 
 
 @dataclass
@@ -79,8 +81,12 @@ def short_renewal(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_renewal_uses_prepared_credential_for_the_next_handshake(
     short_renewal: None,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Only the socket changes; the provider is not called again in the gap."""
+    # A recycle-spread reconnect would show up as a one-second retry below.
+    monkeypatch.setattr(serve_module, "_RECYCLE_RECONNECT_MIN_S", 1.0)
+    monkeypatch.setattr(serve_module, "_RECYCLE_RECONNECT_MAX_S", 1.0)
 
     class Credential:
         calls = 0
@@ -119,6 +125,12 @@ async def test_renewal_uses_prepared_credential_for_the_next_handshake(
             assert disconnected
             assert all(row["disconnect_reason"] == "scheduled_renewal" for row in disconnected)
             assert all(row["recycle"] is True for row in disconnected)
+            base = serve_module._INITIAL_RECONNECT_DELAY_S
+            assert all(row["delay_s"] == base for row in disconnected)
+            assert all(
+                row["retry_in_s"] <= base * (1 + serve_module._RECONNECT_JITTER_FRACTION)
+                for row in disconnected
+            )
             assert "server recycled" not in caplog.text
 
 
@@ -240,6 +252,44 @@ async def test_peer_close_during_refresh_reconnects_without_the_old_renewal(
             release.set()
             await asyncio.wait_for(finished.wait(), timeout=2)
             await second.socket.send(encode_frame(PingFrame(ts=123)))
+            response = decode_frame(await asyncio.wait_for(second.messages.get(), timeout=2))
+            assert isinstance(response, PongFrame)
+            assert second.socket.close_code is None
+            assert accepted.empty()
+    finally:
+        release.set()
+
+
+async def test_stalled_bootstrap_renewal_does_not_hold_up_the_reconnect(
+    short_renewal: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled renewal's credential worker must not block the usable bootstrap."""
+    # Long enough that the replacement's own renewal cannot fire mid-assertion.
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_RENEWAL_S", "1.5")
+    started = threading.Event()
+    release = threading.Event()
+
+    def provider() -> str:
+        started.set()
+        assert release.wait(timeout=5)
+        return "renewed"
+
+    # Credential discovery represents external SDK/OIDC storage, not the factory.
+    monkeypatch.setattr(_entry, "_make_auth_token_factory", lambda *args, **kwargs: provider)
+    factory = _entry._InitialAuthTokenFactory("bootstrap", "https://example.invalid")
+
+    try:
+        async with _running_tunnel(factory) as (accepted, _task):
+            first = await asyncio.wait_for(accepted.get(), timeout=2)
+            await poll_until_async(started.is_set, timeout_s=5)
+            await first.socket.close(code=1001, reason="peer recycle")
+            second = await asyncio.wait_for(accepted.get(), timeout=2)
+            assert second.socket.request.headers["Authorization"] == "Bearer bootstrap"
+            release.set()
+            # The late result switches later lookups but leaves this connection alone.
+            await poll_until_async(lambda: factory() == "renewed", timeout_s=2)
+            await second.socket.send(encode_frame(PingFrame(ts=7)))
             response = decode_frame(await asyncio.wait_for(second.messages.get(), timeout=2))
             assert isinstance(response, PongFrame)
             assert second.socket.close_code is None

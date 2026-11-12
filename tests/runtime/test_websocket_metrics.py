@@ -152,6 +152,18 @@ def test_records_normalized_disconnect_and_close_code() -> None:
     ]
 
 
+def test_records_scheduled_renewal_reason() -> None:
+    """A planned renewal is counted as such, not as a peer close."""
+    meter = _Meter()
+    metrics = ClientWebSocketMetrics(meter)
+
+    metrics.record_disconnected("runner", None, scheduled_renewal=True)
+
+    assert meter.counters[DISCONNECTIONS_METRIC_NAME].records == [
+        _Record(1, {"tunnel.kind": "runner", "disconnect.reason": "scheduled_renewal"})
+    ]
+
+
 def test_public_recorders_respect_telemetry_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
