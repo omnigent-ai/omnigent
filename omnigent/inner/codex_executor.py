@@ -4123,7 +4123,8 @@ class _CodexAppServerSession:
                     continue
 
                 if method == "item/commandExecution/outputDelta":
-                    if _event_turn_matches(params) and params.get("delta"):
+                    # Late output from a previous command must never adopt its turn ID.
+                    if params.get("turnId") == active_turn_id and params.get("delta"):
                         last_progress_at = time.monotonic()
                     continue
 

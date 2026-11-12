@@ -1641,9 +1641,9 @@ class TestCodexExecutor(unittest.TestCase):
                 "method": "account/rateLimits/updated",
                 "params": {"private": "credential-must-not-be-logged"},
             }
-            events = [(float(tick), notification) for tick in range(1, 8)]
+            events = [(float(tick), notification) for tick in range(1, 11)]
             if progress == "reasoning":
-                for index in (0, 2, 4, 6):
+                for index in (0, 2, 4, 6, 8):
                     events[index] = (
                         events[index][0],
                         {
@@ -1652,24 +1652,19 @@ class TestCodexExecutor(unittest.TestCase):
                         },
                     )
             elif progress in ("command", "command_output"):
+                command = {
+                    "id": "command-1",
+                    "type": "commandExecution",
+                    "command": "private-command-must-not-be-logged",
+                    "cwd": "/private-workspace",
+                    "status": "inProgress",
+                }
                 events[0] = (
                     1.0,
-                    {
-                        "method": "item/started",
-                        "params": {
-                            "turnId": "turn-1",
-                            "item": {
-                                "id": "command-1",
-                                "type": "commandExecution",
-                                "command": "private-command-must-not-be-logged",
-                                "cwd": "/private-workspace",
-                                "status": "inProgress",
-                            },
-                        },
-                    },
+                    {"method": "item/started", "params": {"turnId": "turn-1", "item": command}},
                 )
                 if progress == "command_output":
-                    for index in (2, 4, 6):
+                    for index in (2, 4, 6, 8):
                         events[index] = (
                             events[index][0],
                             {
@@ -1677,6 +1672,17 @@ class TestCodexExecutor(unittest.TestCase):
                                 "params": {"turnId": "turn-1", "delta": "private output"},
                             },
                         )
+                else:
+                    events[4] = (
+                        5.0,
+                        {
+                            "method": "item/completed",
+                            "params": {
+                                "turnId": "turn-1",
+                                "item": {**command, "status": "completed", "exitCode": 0},
+                            },
+                        },
+                    )
             elif progress == "tool_result":
                 events[0] = (
                     1.0,
@@ -1686,34 +1692,40 @@ class TestCodexExecutor(unittest.TestCase):
                         "params": {"turnId": "turn-1", "callId": "tool-1", "tool": "read_file"},
                     },
                 )
-            else:
-                events[1] = (
-                    2.0,
+            elif progress == "stale_command_output":
+                # Delivered after startup draining, before any current-turn item.
+                events[0] = (
+                    1.0,
                     {
+                        "method": "item/commandExecution/outputDelta",
+                        "params": {"turnId": "previous-turn", "delta": "private output"},
+                    },
+                )
+            elif progress != "notifications":
+                ignored = {
+                    "user_started": {
+                        "method": "item/started",
+                        "params": {"turnId": "turn-1", "item": {"type": "userMessage"}},
+                    },
+                    "user_completed": {
                         "method": "item/completed",
                         "params": {
                             "turnId": "turn-1",
                             "item": {"type": "userMessage", "text": "private steering"},
                         },
                     },
-                )
-                events[2] = (
-                    3.0,
-                    {
-                        "method": "item/started",
-                        "params": {"turnId": "turn-1", "item": {"type": "userMessage"}},
-                    },
-                )
-                events[3] = (
-                    4.0,
-                    {
+                    "steering_ack": {"id": 42, "result": {"turnId": "turn-1"}},
+                    "unrelated_turn": {
                         "method": "item/reasoning/textDelta",
                         "params": {"turnId": "other-turn", "delta": "unrelated reasoning"},
                     },
-                )
+                }
+                events = [(float(tick), ignored[progress]) for tick in range(1, 11)]
+                # Establish the current turn before testing unrelated-turn traffic.
+                events.insert(0, (0.0, ignored["user_started"]))
             events.append(
                 (
-                    8.0,
+                    11.0,
                     {
                         "method": "item/completed",
                         "params": {
@@ -1730,8 +1742,9 @@ class TestCodexExecutor(unittest.TestCase):
             )
 
             class TimedEvents(asyncio.Queue):
-                async def get(self):
+                async def get(queue_self):
                     await asyncio.sleep(0)
+                    self.assertEqual(session.active_turn_id, "turn-1")
                     clock.now, message = events.pop(0)
                     return message
 
@@ -1742,15 +1755,21 @@ class TestCodexExecutor(unittest.TestCase):
             session._proc = _FakeProcess()
             session.thread_id = "thread-1"
             session._events = TimedEvents()
+            session._recent_stderr.append("private-stderr-must-not-be-logged")
             session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
             session._execute_dynamic_tool = AsyncMock(return_value={"error": "private-tool-error"})
             session._send_response = AsyncMock()
+            warnings = []
+
+            def record_warning(message, *args):
+                warnings.append((clock.now, message % args))
+
             with (
                 patch.object(
                     codex_executor_module, "time", SimpleNamespace(monotonic=lambda: clock.now)
                 ),
                 patch.object(codex_executor_module, "_TURN_EVENT_WARN_SECONDS", 3.0),
-                patch.object(codex_executor_module.logger, "warning") as warning,
+                patch.object(codex_executor_module.logger, "warning", side_effect=record_warning),
             ):
                 output = [
                     event
@@ -1763,23 +1782,49 @@ class TestCodexExecutor(unittest.TestCase):
                         sandbox="workspace-write",
                     )
                 ]
-            self.assertTrue(any(isinstance(event, TurnComplete) for event in output))
+            self.assertEqual(
+                [event.response for event in output if isinstance(event, TurnComplete)], ["done"]
+            )
+            self.assertIsNone(session.active_turn_id)
             if progress in ("reasoning", "command_output"):
-                warning.assert_not_called()
+                self.assertEqual(warnings, [])
             else:
-                self.assertTrue(warning.called, "notification traffic hid the idle turn")
-                diagnostics = str(warning.call_args_list)
+                expected_times = {
+                    "command": [4.0, 8.0],
+                    "tool_result": [4.0, 7.0, 10.0],
+                }.get(progress, [3.0, 6.0, 9.0])
+                self.assertEqual([timestamp for timestamp, _ in warnings], expected_times)
+                diagnostics = str(warnings)
                 for private in (
                     "credential-must-not-be-logged",
                     "private-command-must-not-be-logged",
                     "private steering",
                     "private-tool-error",
+                    "private-stderr-must-not-be-logged",
+                    "private output",
                 ):
                     self.assertNotIn(private, diagnostics)
                 if progress == "command":
-                    self.assertIn("command-1", diagnostics)
+                    self.assertIn("command-1", warnings[0][1])
+                    self.assertNotIn("command-1", warnings[1][1])
+                if progress == "tool_result":
+                    self.assertIn(
+                        "{'call_id': 'tool-1', 'name': 'read_file', 'status': 'error'}",
+                        diagnostics,
+                    )
 
-        for progress in ("notifications", "reasoning", "command", "command_output", "tool_result"):
+        for progress in (
+            "notifications",
+            "user_started",
+            "user_completed",
+            "steering_ack",
+            "unrelated_turn",
+            "reasoning",
+            "command",
+            "command_output",
+            "tool_result",
+            "stale_command_output",
+        ):
             with self.subTest(progress=progress):
                 _run(_scenario(progress))
 
