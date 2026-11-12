@@ -276,8 +276,71 @@ def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str
     return "".join(result), redirected
 
 
-# Unquoted operators, longest first. Quoted and backslash-escaped characters are never operators.
+# Shell syntax beyond simple commands, ``;``, ``&&``, ``||``, ``|``, ``( )``, redirections and
+# quoting. A command containing any of it keeps the flat parse the observer had before.
+_UNMODELED_SHELL = re.compile(
+    r"\b(?:case|esac|function|eval|if|then|else|elif|fi|do|done|while|until|for|select)\b"
+    r"|[{}]|\(\s*\)|\(\s*\(|=\s*\("
+)
+# Operators, longest first. Quoted and backslash-escaped characters are never operators.
 _SHELL_OPERATORS = ("&&", "||", "(", ")", ";", "&", "|", "\n")
+
+
+def _shell_items(command: str) -> list[list[str] | str] | None:
+    """Split *command* at unquoted operators, returning each simple command's words.
+
+    Quotes and backslashes are honored while scanning, so ``"("`` and ``\\(`` stay
+    words. The characters of ``>&``, ``<&``, ``&>`` and ``>|`` are not separators.
+    Returns None when the command cannot be lexed.
+    """
+    items: list[list[str] | str] = []
+    chunk: list[str] = []
+    quote: str | None = None
+    index = 0
+    try:
+        while index < len(command):
+            char = command[index]
+            if quote == "'":
+                quote = None if char == "'" else quote
+                chunk.append(char)
+                index += 1
+            elif char == "\\" and index + 1 < len(command):
+                chunk.append(command[index : index + 2])
+                index += 2
+            elif quote == '"':
+                quote = None if char == '"' else quote
+                chunk.append(char)
+                index += 1
+            elif char in "'\"":
+                quote = char
+                chunk.append(char)
+                index += 1
+            else:
+                operator = next(
+                    (op for op in _SHELL_OPERATORS if command.startswith(op, index)), None
+                )
+                if operator is None:
+                    chunk.append(char)
+                    index += 1
+                    continue
+                # An escaped ``>`` is a literal, so the character after it is a separator.
+                last = chunk[-1] if chunk else ""
+                previous_char = "" if len(last) == 2 and last[0] == "\\" else last[-1:]
+                if (
+                    operator == "&"
+                    and (command.startswith("&>", index) or previous_char in ("<", ">"))
+                ) or (operator == "|" and previous_char == ">"):
+                    chunk.append(char)
+                    index += 1
+                    continue
+                items.append(shlex.split("".join(chunk)))
+                chunk = []
+                items.append(";" if operator == "\n" else operator)
+                index += len(operator)
+        items.append(shlex.split("".join(chunk)))
+    except ValueError:
+        return None
+    return items
 
 
 def _shell_steps(
@@ -287,7 +350,7 @@ def _shell_steps(
 
     Operators are ``"&&"``, ``"||"``, ``"|"``, ``"&"``, ``"("``, ``")"``, and ``";"``
     (also for newlines). A nested shell runs in a child process, so its steps sit
-    between ``"("`` and ``")"``, except for ``eval``, which runs in this shell.
+    between ``"("`` and ``")"``.
 
     Without *or_lists*, a command with ``||`` or one that cannot be lexed returns
     None, since which of its commands ran is unknown.
@@ -318,12 +381,7 @@ def _shell_steps(
         nested = _shell_steps(inner, depth + 1, or_lists=or_lists)
         if nested is None or not any(isinstance(step, ShellSegment) for step in nested):
             output_eligible = False
-        if nested is None:
-            continue
-        if tokens[0].rsplit("/", 1)[-1] == "eval":
-            # ``eval`` runs in this shell, as one operand of the surrounding list.
-            steps.extend(["{", *nested, "}"])
-        else:
+        if nested is not None:
             steps.extend(["(", *nested, ")"])
     if output_eligible:
         return steps
@@ -333,217 +391,62 @@ def _shell_steps(
     ]
 
 
-# A ``case`` header, with or without its first pattern, after any leading keywords.
-_CASE_KEYWORDS = r"(?:(?:if|then|else|elif|do|while|until)\s+)*"
-_CASE_HEADER = re.compile(_CASE_KEYWORDS + r"case\s+\S+\s+in\b")
-# A ``case`` header that ends at a separator, so its patterns follow on later lines.
-_CASE_OPEN = re.compile(_CASE_KEYWORDS + r"case\s+\S+\s+in")
-# A function name before its ``()``.
-_FUNCTION_NAME = re.compile(r"(?:function\s+)?[A-Za-z_][\w.-]*")
-_EMPTY_PARENS = re.compile(r"\(\s*\)")
-# A call splices in a body of at most this many items, and a command at most this many in all.
-_MAX_CALL_ITEMS = 256
-_MAX_SPLICED_ITEMS = 4096
-
-
-def _shell_items(command: str, depth: int = 0) -> list[list[str] | str] | None:
-    """Split *command* at unquoted operators, returning each simple command's words.
-
-    Quotes and backslashes are honored while scanning, so ``"("`` and ``\\(`` stay
-    words. The characters of ``>&``, ``<&``, ``&>`` and ``>|`` are not separators.
-    The words of a ``case`` header or pattern are not commands. ``((…))`` is an
-    arithmetic command, one word. A function body is recorded where it is defined
-    and spliced in only at a later call of its name. A subshell body is wrapped in
-    ``(`` and ``)``, and a brace body or ``eval`` in ``{`` and ``}``, the current
-    shell. Returns None when the command cannot be lexed.
-    """
-    if depth > MAX_SHELL_NESTING:
-        return None
-    items: list[list[str] | str] = []
-    definitions: dict[str, list[list[str] | str]] = {}
-    chunk: list[str] = []
-    quote: str | None = None
-    index = 0
-    paren_depth = 0
-    # Paren depth of each open ``case`` statement.
-    case_depths: list[int] = []
-    # The next ``)`` at the innermost case's level closes a pattern.
-    pattern_expected = False
-
-    def flush() -> None:
-        nonlocal chunk
-        words = shlex.split("".join(chunk))
-        chunk = []
-        body = definitions.get(words[0]) if words else None
-        if (
-            body is not None
-            and len(body) <= _MAX_CALL_ITEMS
-            and len(items) + len(body) <= _MAX_SPLICED_ITEMS
-        ):
-            items.extend(body)
-        else:
-            items.append(words)
-
-    try:
-        while index < len(command):
-            char = command[index]
-            if quote == "'":
-                quote = None if char == "'" else quote
-                chunk.append(char)
-                index += 1
-            elif char == "\\" and index + 1 < len(command):
-                chunk.append(command[index : index + 2])
-                index += 2
-            elif quote == '"':
-                quote = None if char == '"' else quote
-                chunk.append(char)
-                index += 1
-            elif char in "'\"":
-                quote = char
-                chunk.append(char)
-                index += 1
-            elif char == "(" and chunk and chunk[-1][-1:] == "=":
-                # An array literal ``name=(...)`` is one word, not a subshell.
-                end = _balanced_end(command, index)
-                if end is None:
-                    raise ValueError("unterminated array literal")
-                chunk.append(command[index:end])
-                index = end
-            elif command.startswith("((", index) and not chunk:
-                # An arithmetic command is one word; its parentheses are not a subshell.
-                end = _balanced_end(command, index)
-                if end is None:
-                    raise ValueError("unterminated arithmetic command")
-                chunk.append(command[index:end])
-                index = end
-            elif (
-                char == "("
-                and _EMPTY_PARENS.match(command, index)
-                and _FUNCTION_NAME.fullmatch("".join(chunk).strip())
-            ):
-                # ``name()`` and its body: recorded here, run only where ``name`` is called.
-                name = "".join(chunk).split()[-1]
-                parens = _EMPTY_PARENS.match(command, index)
-                if parens is None:
-                    raise ValueError("unreachable: checked by the branch condition")
-                chunk.append("()")
-                index = parens.end()
-                body = index
-                while body < len(command) and command[body] in " \t\r\n":
-                    body += 1
-                if body < len(command) and command[body] in "({":
-                    end = _balanced_end(command, body)
-                    if end is None:
-                        raise ValueError("unterminated function body")
-                    nested = _shell_items(command[body + 1 : end - 1], depth + 1)
-                    if nested is None:
-                        raise ValueError("unsupported function body")
-                    wrapper = ("(", ")") if command[body] == "(" else ("{", "}")
-                    definitions[name] = [wrapper[0], *nested, wrapper[1]]
-                    index = end
-            else:
-                operator = next(
-                    (op for op in _SHELL_OPERATORS if command.startswith(op, index)), None
-                )
-                if operator is None:
-                    chunk.append(char)
-                    index += 1
-                    continue
-                # An escaped ``>`` is a literal, so the character after it is a separator.
-                last = chunk[-1] if chunk else ""
-                previous_char = "" if len(last) == 2 and last[0] == "\\" else last[-1:]
-                if (
-                    operator == "&"
-                    and (command.startswith("&>", index) or previous_char in ("<", ">"))
-                ) or (operator == "|" and previous_char == ">"):
-                    chunk.append(char)
-                    index += 1
-                    continue
-                at_case_level = bool(case_depths) and paren_depth == case_depths[-1]
-                if operator == "|" and (
-                    _CASE_HEADER.match("".join(chunk[:256]).lstrip())
-                    or (at_case_level and pattern_expected)
-                ):
-                    chunk.append(char)
-                    index += 1
-                    continue
-                text = "".join(chunk)
-                if case_depths and text.split()[:1] == ["esac"]:
-                    case_depths.pop()
-                    pattern_expected = False
-                at_case_level = bool(case_depths) and paren_depth == case_depths[-1]
-                if operator == ")" and _CASE_HEADER.match(text.lstrip()):
-                    # The first pattern of a case statement, on the same line as its header.
-                    chunk = []
-                    items.append(";")
-                    case_depths.append(paren_depth)
-                    pattern_expected = False
-                    index += 1
-                    continue
-                if operator == ")" and at_case_level and pattern_expected:
-                    chunk = []
-                    items.append(";")
-                    pattern_expected = False
-                    index += 1
-                    continue
-                if _CASE_OPEN.fullmatch(text.strip()):
-                    # A header ended by a separator: its patterns come next.
-                    chunk = []
-                    case_depths.append(paren_depth)
-                    pattern_expected = True
-                    at_case_level = True
-                else:
-                    flush()
-                items.append(";" if operator == "\n" else operator)
-                if operator == "(":
-                    paren_depth += 1
-                elif operator == ")":
-                    paren_depth = max(0, paren_depth - 1)
-                elif operator == ";" and command.startswith(";;", index) and at_case_level:
-                    pattern_expected = True
-                index += len(operator)
-        flush()
-    except ValueError:
-        return None
-    return items
-
-
-def _balanced_end(command: str, start: int) -> int | None:
-    """Return the index just past the bracket closing the ``(`` or ``{`` at *start*, or None."""
-    closer = ")" if command[start] == "(" else "}"
-    depth = 0
-    quote: str | None = None
-    index = start
-    while index < len(command):
-        char = command[index]
-        if quote == "'":
-            quote = None if char == "'" else quote
-        elif char == "\\":
-            index += 1
-        elif quote == '"':
-            quote = None if char == '"' else quote
-        elif char in "'\"":
-            quote = char
-        elif char == command[start]:
-            depth += 1
-        elif char == closer:
-            depth -= 1
-            if depth == 0:
-                return index + 1
-        index += 1
-    return None
-
-
-def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
+def _shell_segments(command: str) -> list[ShellSegment]:
     """Split a command into simple commands, unwrapping nested shell strings in place.
 
     A command with ``||`` or one that cannot be lexed has no segments, since
-    which of its commands ran is unknown.
+    which of its commands ran is unknown. A command with unmodeled shell syntax
+    gets the flat parse.
     """
-    steps = _shell_steps(command, depth)
+    if _UNMODELED_SHELL.search(command):
+        return _flat_shell_segments(command)
+    steps = _shell_steps(command)
     if steps is None:
         return []
     return [step for step in steps if isinstance(step, ShellSegment)]
+
+
+def _flat_shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
+    """The flat parse for commands with unmodeled shell syntax.
+
+    It splits on ``;``, ``&``, ``|`` and newlines, but not on parentheses, and
+    a ``||`` drops the whole command. This is the parse the observer used before
+    subshell and operator tracking.
+    """
+    if depth > MAX_SHELL_NESTING:
+        return []
+    found: list[ShellSegment] = []
+    joined, redirected = _prepare_shell_text(command)
+    lexer = shlex.shlex(joined, posix=True, punctuation_chars=";&|\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    segments: list[list[str]] = [[]]
+    output_eligible = not redirected
+    try:
+        for token in lexer:
+            if token == "||":
+                return []
+            if token and all(char in ";&|\n" for char in token):
+                if token.strip(";\n") not in {"", "&&"}:
+                    output_eligible = False
+                segments.append([])
+            else:
+                segments[-1].append(token)
+    except ValueError:
+        return []
+    for segment in segments:
+        tokens = real_invocation_tokens(segment)
+        if not tokens:
+            continue
+        inner = unwrap_shell_command(tokens)
+        if inner is not None:
+            nested = _flat_shell_segments(inner, depth + 1)
+            if not nested:
+                output_eligible = False
+            found.extend(nested)
+        else:
+            found.append(ShellSegment(raw_tokens=tuple(segment), invocation_tokens=tuple(tokens)))
+    return found if output_eligible else [replace(item, output_eligible=False) for item in found]
 
 
 def _log_provider_failure(provider_id: str, step: str) -> None:
@@ -806,9 +709,8 @@ class _CheckoutWalker:
     leave with, as a success state and a failure state. A ``cd`` is assumed to
     succeed. ``exit`` and ``return`` are not modeled, so a later command is still
     reported where they ran; that over-reports, but never drops a reachable command.
-    A pipeline stage or a
-    subshell runs in a child shell, so its directory changes do not reach the
-    parent. A background job (``&``) does the same.
+    A pipeline stage or a subshell runs in a child shell, so its directory changes
+    do not reach the parent. A background job (``&``) does the same.
     """
 
     def __init__(self, steps: list[ShellSegment | str]) -> None:
@@ -820,9 +722,11 @@ class _CheckoutWalker:
     def run(self, start: _Directories) -> None:
         directories = start
         while self._position < len(self._steps):
+            before = self._position
             ok, fail = self._list(directories)
             directories = _merge_directories(ok, fail)
-            if self._peek_operator() in {")", "}"}:  # A closer with no opener.
+            # Skip a closer with no opener, or any step that no branch consumed.
+            if self._peek_operator() in {")", "}"} or self._position == before:
                 self._position += 1
 
     def _peek(self) -> ShellSegment | str | None:
@@ -879,13 +783,6 @@ class _CheckoutWalker:
             if self._peek_operator() == ")":
                 self._position += 1
             return directories, directories
-        if step == "{":
-            # A brace group runs in the current shell, so its directory changes carry out.
-            self._position += 1
-            outcome = self._list(directories)
-            if self._peek_operator() == "}":
-                self._position += 1
-            return outcome
         if isinstance(step, ShellSegment):
             self._position += 1
             return self._simple(directories, step)
@@ -909,6 +806,16 @@ class _CheckoutWalker:
         return directories, directories
 
 
+def _checkout_steps(command: str) -> list[ShellSegment | str] | None:
+    """Return the steps the checkout walker runs for *command*."""
+    if _UNMODELED_SHELL.search(command):
+        steps: list[ShellSegment | str] = []
+        for segment in _flat_shell_segments(command):
+            steps.extend([segment, ";"])
+        return steps
+    return _shell_steps(command, or_lists=True)
+
+
 def _git_checkouts(
     tool_name: str, arguments: dict[str, object], result: object, cwd: str | None
 ) -> list[str]:
@@ -917,25 +824,20 @@ def _git_checkouts(
     *cwd* is where the call started, when the caller knows it. ``sys_os_shell``
     may run under a sandbox that hides other directories, so only the directory
     it reports running in counts.
-
-    Tracking gives up past a bounded amount of state. The directories found
-    before that point are returned.
     """
     if tool_name not in SHELL_TOOLS and tool_name not in {"exec_command", "run_command"}:
         return []
     command = arguments.get("command", arguments.get("cmd"))
     if not isinstance(command, str) or len(command) > 100_000:
         return []
-    steps = _shell_steps(command, or_lists=True)
+    if tool_name == "sys_os_shell":
+        segments = _shell_segments(command)
+        reported = result.get("cwd") if isinstance(result, dict) else None
+        runs_git = any(os.path.basename(s.invocation_tokens[0]) == "git" for s in segments)
+        return [reported] if runs_git and isinstance(reported, str) and reported else []
+    steps = _checkout_steps(command)
     if steps is None:
         return []
-    if tool_name == "sys_os_shell":
-        reported = result.get("cwd") if isinstance(result, dict) else None
-        runs_git = any(
-            isinstance(step, ShellSegment) and os.path.basename(step.invocation_tokens[0]) == "git"
-            for step in steps
-        )
-        return [reported] if runs_git and isinstance(reported, str) and reported else []
     workdir = arguments.get("workdir")
     start = _resolve_directory(cwd, workdir) if isinstance(workdir, str) and workdir else cwd
     walker = _CheckoutWalker(steps)
