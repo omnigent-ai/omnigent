@@ -3360,6 +3360,35 @@ def _item_texts(db_uri: str, session_id: str) -> list[str]:
     return texts
 
 
+@pytest.mark.parametrize(
+    ("source_mode", "header", "expected"),
+    [("on", None, None), ("on", "trusted", "trusted"), (None, "on", "on")],
+)
+async def test_source_copy_takes_the_browser_tools_mode_from_the_create_request(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    source_mode: str | None,
+    header: str | None,
+    expected: str | None,
+) -> None:
+    source_id = _session_with_history(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    if source_mode is not None:
+        store.set_labels(source_id, {"omnigent.browser_agent_tools": source_mode})
+    headers = _headers()
+    if header is not None:
+        headers["X-Omnigent-Browser-Agent-Tools"] = header
+
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(source_session_id=source_id), headers=headers
+    )
+
+    assert resp.status_code == 200, resp.text
+    source_copy = store.get_conversation(resp.json()["source_session_id"])
+    assert source_copy is not None
+    assert source_copy.labels.get("omnigent.browser_agent_tools") == expected
+
+
 async def test_create_from_a_session_copies_it_for_the_runs(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

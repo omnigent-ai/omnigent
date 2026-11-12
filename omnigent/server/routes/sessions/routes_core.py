@@ -1934,7 +1934,10 @@ def register_core_routes(
             host_type=parsed_metadata.host_type,
         )
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
-        _reject_server_reserved_label_seed(parsed_metadata.labels)
+        _reject_server_reserved_label_seed(parsed_metadata.labels, at_creation=True)
+        from omnigent.tools.browser_agent_tools import apply_browser_agent_tools_creation_labels
+
+        apply_browser_agent_tools_creation_labels(parsed_metadata.labels, request.headers)
 
         inherited_runner_id: str | None = None
         parent_conv = None
@@ -5120,6 +5123,17 @@ def register_core_routes(
             dropped_label_keys_set.update(
                 key for key in source.labels if key.startswith(MCP_SELECTION_PREFIX)
             )
+        # An independent fork takes its browser-tool labels from the forking
+        # app's request; a continuation of the source (a clear) keeps them.
+        from omnigent.tools.browser_agent_tools import (
+            BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS,
+            browser_agent_tools_creation_labels,
+        )
+
+        if not continue_source:
+            dropped_label_keys_set |= (
+                BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS & source.labels.keys()
+            )
         dropped_label_keys: frozenset[str] = frozenset(dropped_label_keys_set)
 
         # DANGEROUS codex full-bypass. The source's bypass label is always
@@ -5132,6 +5146,9 @@ def register_core_routes(
         extra_labels: dict[str, str] = {
             CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(request.headers)
         }
+        # As on a create (applied after the drop above); a continuation keeps the source's.
+        if not continue_source:
+            extra_labels.update(browser_agent_tools_creation_labels(request.headers))
         if body.codex_bypass_sandbox:
             target_native = await asyncio.to_thread(_native_coding_agent_for_agent, base_agent)
             if target_native is None or target_native.harness != "codex-native":

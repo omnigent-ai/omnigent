@@ -10,6 +10,9 @@ import { SESSION_HOST_PROTOCOL } from "@/lib/nativeBridge";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
+import { writeBrowserAgentToolsEnabled } from "@/components/BrowserPane/agentTools/preferences";
+import { loadTabs } from "@/components/BrowserPane/agentTools/tabStore";
+import { fakeMainTabs } from "@/components/BrowserPane/agentTools/fakeMainTabs";
 import {
   AGENT_BROWSER_TAB_ID,
   browserViewId,
@@ -281,6 +284,32 @@ describe("browser soft tabs", () => {
     });
     expect(outcome).toEqual({ ok: false, error });
     expect(result.current.tabs).toEqual([]);
+  });
+
+  it("reports a failure when the reopened tab can't be recorded, and closes its view", async () => {
+    const main = fakeMainTabs();
+    main.otherWindow("session-a", (r) => ({ ...r, tabs: ["kept"], selected: "kept" }));
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, {
+      omnigentDesktop: {
+        browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true }),
+        browserClose,
+        onBrowserTabsChanged: main.onBrowserTabsChanged,
+        browserTabs: async (args: Record<string, unknown>) =>
+          args.op === "update" ? { ok: false, error: "disk full" } : main.browserTabs(args),
+      },
+    });
+    writeBrowserAgentToolsEnabled(true);
+    await loadTabs("session-a");
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    await waitFor(() => expect(result.current.tabs).toEqual(["kept"]));
+    let outcome: { ok: boolean; error?: string } | undefined;
+    await act(async () => {
+      outcome = await result.current.reopen("https://example.com/");
+    });
+    expect(outcome).toEqual({ ok: false, error: "disk full" });
+    expect(browserClose).toHaveBeenCalledTimes(1);
+    expect(result.current.tabs).toEqual(["kept"]);
   });
 
   it("commits the incoming session's selection in its first render after a switch", () => {

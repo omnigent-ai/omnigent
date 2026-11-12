@@ -251,6 +251,26 @@ describe("createScheduledTask", () => {
     expect(JSON.stringify(analytics.mock.calls)).not.toContain("private");
   });
 
+  it("sends the browser tools mode header so the source copy keeps it", async () => {
+    const win = window as unknown as { omnigentDesktop?: unknown };
+    const before = win.omnigentDesktop;
+    win.omnigentDesktop = { browserTabs: () => undefined };
+    try {
+      fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+      await createScheduledTask({
+        name: "n",
+        prompt: "p",
+        rrule: "FREQ=DAILY",
+        agentId: "agent",
+        sourceSessionId: "conv_1",
+      });
+      const [, init] = fetchMock.mock.calls[0];
+      expect(new Headers(init.headers).get("X-Omnigent-Browser-Agent-Tools")).toBe("on");
+    } finally {
+      win.omnigentDesktop = before;
+    }
+  });
+
   it("includes the host/workspace pair and timezone when provided", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     await createScheduledTask({

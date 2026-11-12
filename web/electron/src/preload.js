@@ -385,10 +385,21 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @returns {Promise<{ ok: boolean, dataUrl?: string, error?: string }>}
    */
   browserScreenshot: (conversationId, opts) =>
-    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId, opts }),
+    ipcRenderer.invoke("omnigent:browser-screenshot", {
+      deadlineAt: opts?.deadlineAt,
+      conversationId,
+      opts,
+    }),
   /** Perform a fixed snapshot, click or type action in the conversation's view. */
   browserPerformAction: (conversationId, action, params, opts) =>
     ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params, opts }),
+  // The agent browser tools' per-session tab records, kept in main (browserTabs.js).
+  browserTabs: (args) => ipcRenderer.invoke("omnigent:browser-tabs", args),
+  onBrowserTabsChanged: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("omnigent:browser-tabs-changed", listener);
+    return () => ipcRenderer.removeListener("omnigent:browser-tabs-changed", listener);
+  },
   /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */
   browserExecute: (conversationId, js, opts) =>
     ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js, opts }),
@@ -397,8 +408,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} [reason]
    */
-  browserClose: (conversationId, reason) =>
-    ipcRenderer.invoke("omnigent:browser-close", { conversationId, reason }),
+  browserClose: (conversationId, reason, opts) =>
+    ipcRenderer.invoke("omnigent:browser-close", {
+      conversationId,
+      reason,
+      deadlineAt: opts?.deadlineAt,
+      expectedNavs: opts?.expectedNavs,
+    }), // deadlineAt, expectedNavs
   /**
    * Subscribe to which conversation's browser view is currently attached to the
    * host window (`{conversationId}` or `{conversationId: null}` when detached).

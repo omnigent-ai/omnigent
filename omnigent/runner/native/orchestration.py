@@ -2923,9 +2923,13 @@ async def _auto_create_pi_terminal(
     pi_tools: list[_JsonObject] = []
     try:
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+        from omnigent.tools.browser_agent_tools import filter_native_relay_browser_tools
 
         spec_for_tools = _unwrap_resolved_spec(agent_spec)
-        pi_tools = build_native_relay_tool_schemas(spec_for_tools)
+        relay_tools = build_native_relay_tool_schemas(spec_for_tools)
+        pi_tools = await filter_native_relay_browser_tools(
+            relay_tools, session_id=session_id, server_client=server_client
+        )
     except Exception:  # tool registration is additive
         _logger.warning(
             "Failed to build pi-native tool schemas for session %s; "
