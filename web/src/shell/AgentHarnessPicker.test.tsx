@@ -423,6 +423,40 @@ describe("a curated New Chat picker", () => {
       expect(await screen.findByRole("button", { name: "Configured model" })).toBeVisible();
     });
 
+    it("opens an unavailable selected entry's settings page on mobile", async () => {
+      // useIsMobileViewport reads a max-width media query.
+      const realMatchMedia = window.matchMedia;
+      window.matchMedia = ((query: string) => ({
+        matches: /max-width/.test(query),
+        media: query,
+        onchange: null,
+        addListener: () => {},
+        removeListener: () => {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        dispatchEvent: () => false,
+      })) as typeof window.matchMedia;
+      try {
+        const onSelectAgent = vi.fn();
+        renderPicker({
+          harnessEntries: [claude, codex],
+          effectiveAgentId: codex.id,
+          host: codexMissing,
+          selectedConfigContent: config,
+          configurableWhenUnavailable: true,
+          onSelectAgent,
+        });
+        await openPicker();
+
+        await userEvent.click(screen.getByTestId(`new-chat-landing-agent-${codex.id}`));
+        expect(screen.queryByRole("button", { name: "Configured model" })).not.toBeInTheDocument();
+        await userEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${codex.id}`));
+        expect(await screen.findByRole("button", { name: "Configured model" })).toBeVisible();
+      } finally {
+        window.matchMedia = realMatchMedia;
+      }
+    });
+
     it("opens an unavailable selected entry's settings from the keyboard without selecting it", async () => {
       const onSelectAgent = vi.fn();
       renderPicker({
