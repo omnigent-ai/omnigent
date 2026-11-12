@@ -102,6 +102,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_workflow_request_input",
         "sys_workflow_save",
         "sys_workflow_load",
+        "sys_workflow_list",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.

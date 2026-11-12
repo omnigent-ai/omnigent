@@ -51,7 +51,7 @@ stored entry is at most 16,383 bytes after compression.
 
 ## Agent tools
 
-The seven tools make up the `journal` tool group, which every agent has. An agent
+The eight tools make up the `journal` tool group, which every agent has. An agent
 spec can drop it with `tool_groups.journal: false` (see
 [Tool groups](AGENT_YAML_SPEC.md#tool-groups)).
 
@@ -64,6 +64,7 @@ spec can drop it with `tool_groups.journal: false` (see
 | `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`.                           |
 | `sys_workflow_save(name, description, steps)` | Saves a reusable workflow for the session's owner through `POST /v1/workflows`, and returns `{id, name}`, or `name_taken`. The `save-workflow` skill says how to make the steps generic. A save from a session shared with edit access is refused. |
 | `sys_workflow_load(workflow)` | Loads one of the owner's saved workflows by ID or name, with its steps. A name with no exact match returns `workflow_not_found` with the closest names. |
+| `sys_workflow_list(cursor?, limit?)` | Lists the owner's saved workflows by name, 20 at a time unless `limit` says otherwise (at most 50): each one's ID, name and the start of its description, without steps. `next_cursor` pages to the rest. |
 
 Errors come back as `{"error": …}`: `invalid_entry` (a field failed
 validation), `invalid_input` (a question or its task failed validation; a

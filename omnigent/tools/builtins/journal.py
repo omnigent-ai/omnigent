@@ -8,8 +8,9 @@
   answer, marking the task ``needs_input`` meanwhile.
 * ``sys_workflow_save`` saves a reusable workflow for the user.
 * ``sys_workflow_load`` loads one of the user's saved workflows.
+* ``sys_workflow_list`` lists the user's saved workflows.
 
-All seven are schema-only: the runner sends the journal tools to the server's
+All eight are schema-only: the runner sends the journal tools to the server's
 ``/v1/sessions/{id}/journal`` routes and the workflow tools to
 ``/v1/workflows``. They make up the ``journal`` tool group, which every agent
 has unless its spec sets ``tool_groups.journal: false``.
@@ -44,6 +45,8 @@ from omnigent.tools.base import Tool
 
 # The most entries one sys_journal_read returns.
 JOURNAL_READ_PAGE_MAX = 100
+# The most workflows one sys_workflow_list returns.
+WORKFLOW_LIST_PAGE_MAX = 50
 
 _STEP_ID_PATTERN = "^[a-z0-9][a-z0-9_-]{0,63}$"
 _STEP_DESC = (
@@ -442,7 +445,8 @@ class SysWorkflowLoadTool(Tool):
             "(what a run needs), and its steps. To run it, follow the workflow skill: write "
             "its steps as your plan with sys_journal_write_plan, keeping their IDs and "
             "dependencies, and fill the run's details into step names and goals. A name with "
-            "no exact match returns workflow_not_found with the user's closest workflow names."
+            "no exact match returns workflow_not_found with the user's closest workflow names; "
+            "to pick one by what it does instead, list them with sys_workflow_list."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -462,6 +466,48 @@ class SysWorkflowLoadTool(Tool):
         )
 
 
+class SysWorkflowListTool(Tool):
+    """List saved workflows. Runner-dispatched to ``GET /v1/workflows``."""
+
+    @classmethod
+    def name(cls) -> str:
+        """:returns: ``"sys_workflow_list"``."""
+        return "sys_workflow_list"
+
+    @classmethod
+    def description(cls) -> str:
+        """:returns: Human-readable description of the tool."""
+        return (
+            "List the user's saved workflows by name: each one's ID, name and the start of its "
+            "description, without its steps. Use it when the user asks what workflows they "
+            "have, or asks for a saved workflow without its exact name: pick by description, "
+            "and ask which they mean if more than one fits. Then load the one you pick with "
+            "sys_workflow_load for its whole description and its steps. next_cursor, when "
+            "set, pages to the rest."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        """:returns: The OpenAI-format tool schema."""
+        return _schema(
+            self.name(),
+            self.description(),
+            {
+                "cursor": {
+                    "type": "string",
+                    "maxLength": 64,
+                    "description": "next_cursor from an earlier sys_workflow_list call.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": WORKFLOW_LIST_PAGE_MAX,
+                    "description": "The most workflows to return.",
+                },
+            },
+            [],
+        )
+
+
 JOURNAL_TOOLS: tuple[type[Tool], ...] = (
     SysJournalReadTool,
     SysJournalWritePlanTool,
@@ -470,4 +516,5 @@ JOURNAL_TOOLS: tuple[type[Tool], ...] = (
     SysWorkflowRequestInputTool,
     SysWorkflowSaveTool,
     SysWorkflowLoadTool,
+    SysWorkflowListTool,
 )

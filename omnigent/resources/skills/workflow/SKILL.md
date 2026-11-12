@@ -12,8 +12,8 @@ the plan's steps as tasks in the session's Tasks tab and can steer or stop you
 in chat at any time.
 
 You need the `sys_journal_*` tools and `sys_workflow_request_input`, and
-`sys_workflow_load` for a saved workflow. If you don't have them, tell the user
-this agent can't run workflows and stop.
+`sys_workflow_load` and `sys_workflow_list` for a saved workflow. If you don't
+have them, tell the user this agent can't run workflows and stop.
 
 ## When another workflow started you
 
@@ -68,8 +68,10 @@ tests" (ID …)", or "run my triage workflow" in chat):
 
 - Do the plan's step 1 first: ask before you replace a plan with steps left.
 - Load it with `sys_workflow_load`, by its ID when you have one, otherwise by
-  name. On `workflow_not_found`, ask the user which of the similar names they
-  meant, or whether to describe the work instead.
+  name. If they describe it without its exact name, or the load returns
+  `workflow_not_found`, list their workflows with `sys_workflow_list` and pick
+  the one whose description fits. If more than one fits, or none does, ask
+  the user which they meant, or whether to describe the work instead.
 - Its steps are your plan: write them with `sys_journal_write_plan`, named
   after the workflow, keeping their IDs and dependencies. Rename an ID only if
   this session's journal already used it. Fill the run's details into the step

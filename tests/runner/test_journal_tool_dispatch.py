@@ -44,6 +44,7 @@ def test_every_agent_gets_the_journal_tools_unless_its_spec_opts_out() -> None:
         "sys_workflow_request_input",
         "sys_workflow_save",
         "sys_workflow_load",
+        "sys_workflow_list",
     }
     assert names == JOURNAL_TOOL_NAMES
     assert names <= _ALL_LOCAL_TOOLS and names <= _NATIVE_RELAY_BUILTIN_TOOLS
@@ -157,6 +158,12 @@ async def test_invalid_arguments_never_reach_the_server() -> None:
         )
         assert (await _run(client, "sys_journal_read", {"cursor": "!!"}))["error"].startswith(
             "invalid_entry"
+        )
+        assert (await _run(client, "sys_workflow_list", {"limit": 51}))["error"].startswith(
+            "invalid_input: limit"
+        )
+        assert (await _run(client, "sys_workflow_list", {"cursor": "!!"}))["error"].startswith(
+            "invalid_input: cursor"
         )
         no_options = {"step": "a", "questions": [{"question": "Go?", "header": "Go"}]}
         assert (await _run(client, "sys_workflow_request_input", no_options))["error"].startswith(
@@ -389,11 +396,56 @@ async def test_a_load_of_an_unknown_name_suggests_the_closest_ones() -> None:
     assert "Release notes" not in result["similar"]
 
 
+async def test_a_list_pages_the_workflows_with_the_start_of_each_description() -> None:
+    long = "Finds and fixes flaky tests. " * 20
+    pages = {
+        None: {
+            "data": [
+                {"id": "1" * 32, "name": "Release notes", "description": "Drafts\nthe notes."},
+                {"id": "2" * 32, "name": "Triage flaky tests", "description": long},
+            ],
+            "last_id": "2" * 32,
+            "has_more": True,
+        },
+        "2" * 32: {
+            "data": [{"id": "3" * 32, "name": "Upgrade a package", "description": "Bumps one."}],
+            "last_id": "3" * 32,
+            "has_more": False,
+        },
+    }
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url).removeprefix("http://server.test"))
+        assert request.headers[ORCHESTRATION_SOURCE_HEADER] == SESSION
+        return httpx.Response(200, json=pages[request.url.params.get("after")])
+
+    async with _client(handler) as client:
+        first = await _run(client, "sys_workflow_list", {"limit": 2})
+        rest = await _run(client, "sys_workflow_list", {"cursor": first["next_cursor"]})
+    assert seen == ["/v1/workflows?limit=2", f"/v1/workflows?limit=20&after={'2' * 32}"]
+    assert first["workflows"][0] == {
+        "id": "1" * 32,
+        "name": "Release notes",
+        "description": "Drafts the notes.",
+    }
+    preview = first["workflows"][1]["description"]
+    assert len(preview) <= 200 and preview.endswith("…")
+    assert long.startswith(preview.removesuffix("…"))
+    assert first["next_cursor"] == "2" * 32
+    assert rest == {
+        "workflows": [{"id": "3" * 32, "name": "Upgrade a package", "description": "Bumps one."}],
+        "next_cursor": None,
+    }
+
+
 async def test_an_older_server_without_workflows_says_so() -> None:
     async with _client(
         lambda request: httpx.Response(404, json={"detail": "Not Found"})
     ) as client:
         save = await _run(client, "sys_workflow_save", _SAVE_ARGS)
         load = await _run(client, "sys_workflow_load", {"workflow": "Triage flaky tests"})
+        listed = await _run(client, "sys_workflow_list", {})
     assert save["error"] == "sys_workflow_save: this Omnigent server has no saved workflows"
     assert load["error"] == "sys_workflow_load: this Omnigent server has no saved workflows"
+    assert listed["error"] == "sys_workflow_list: this Omnigent server has no saved workflows"
