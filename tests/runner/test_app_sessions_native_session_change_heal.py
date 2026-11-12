@@ -855,6 +855,27 @@ async def _open_claude_native_session_before_sign_in(
     return app, closes, relaunched, statuses
 
 
+def _hold_restart_attach_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[threading.Event, threading.Event]:
+    """Make a restart wait in its host-attach check; returns ``(checking, release)``.
+
+    Only a restart asks this, never a message. The runner binds the check when its
+    app is built, so call this before opening the session.
+    """
+    checking, release = threading.Event(), threading.Event()
+
+    def _held_attach_check(_socket: str, _target: str) -> float | None:
+        checking.set()
+        release.wait(5)
+        return None
+
+    monkeypatch.setattr(
+        "omnigent.native.native_cost_popup._tmux_last_client_input_at", _held_attach_check
+    )
+    return checking, release
+
+
 class _PaneAtDeliveryHarnessClient(_ScriptedHarnessClient):
     """Record the session's Claude pane at the moment each turn is forwarded."""
 
@@ -898,15 +919,23 @@ async def test_mcp_status_names_a_claude_server_signed_in_since_the_pane_started
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("released_sign_in_hold", [False, True], ids=["no-hold", "released-hold"])
 async def test_mcp_reconnect_restarts_an_idle_claude_pane(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, released_sign_in_hold: bool
 ) -> None:
-    """Reconnect relaunches Claude Code, which connects every server as it starts."""
+    """Reconnect relaunches Claude Code, which connects every server as it starts.
+
+    A launcher sign-in hold that no longer waits does not stand in its way.
+    """
     conv_id = "b1b2c3d4e5f60718293a4b5c6d7e8f90"
     app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
         monkeypatch, tmp_path, conv_id
     )
     statuses["linear"] = "connected"
+    if released_sign_in_hold:
+        app.state.sign_in_holds[conv_id] = runner_app._SignInHold(
+            deadline=time.monotonic() + 60, waiting=False
+        )
 
     async with _runner_client(app) as client:
         resp = await client.post(
@@ -1230,17 +1259,7 @@ async def test_a_message_waits_for_a_reconnect_and_reaches_the_relaunched_pane(
     pane it is about to close.
     """
     conv_id = "a3b2c3d4e5f60718293a4b5c6d7e8f90"
-    checking, release = threading.Event(), threading.Event()
-
-    def _held_attach_check(_socket: str, _target: str) -> float | None:
-        # Only a restart asks this; a message never does.
-        checking.set()
-        release.wait(5)
-        return None
-
-    monkeypatch.setattr(
-        "omnigent.native.native_cost_popup._tmux_last_client_input_at", _held_attach_check
-    )
+    checking, release = _hold_restart_attach_check(monkeypatch)
     harness = _PaneAtDeliveryHarnessClient(conv_id)
     app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
         monkeypatch, tmp_path, conv_id, harness_client=harness
@@ -1276,16 +1295,7 @@ async def test_a_message_queued_behind_a_reconnect_is_answered_when_the_session_
 ) -> None:
     """Deleting the session frees a message waiting in its line instead of leaving it hanging."""
     conv_id = "a8b2c3d4e5f60718293a4b5c6d7e8f90"
-    checking, release = threading.Event(), threading.Event()
-
-    def _held_attach_check(_socket: str, _target: str) -> float | None:
-        checking.set()
-        release.wait(5)
-        return None
-
-    monkeypatch.setattr(
-        "omnigent.native.native_cost_popup._tmux_last_client_input_at", _held_attach_check
-    )
+    checking, release = _hold_restart_attach_check(monkeypatch)
     app, _closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
         monkeypatch, tmp_path, conv_id
     )
@@ -1322,16 +1332,7 @@ async def test_a_message_whose_restart_outlives_its_session_starts_no_turn(
 ) -> None:
     """Deleting the session while a message restarts Claude Code answers that message 410."""
     conv_id = "aab2c3d4e5f60718293a4b5c6d7e8f90"
-    checking, release = threading.Event(), threading.Event()
-
-    def _held_attach_check(_socket: str, _target: str) -> float | None:
-        checking.set()
-        release.wait(5)
-        return None
-
-    monkeypatch.setattr(
-        "omnigent.native.native_cost_popup._tmux_last_client_input_at", _held_attach_check
-    )
+    checking, release = _hold_restart_attach_check(monkeypatch)
     harness = _ScriptedHarnessClient([])
     app, _closes, _relaunched, statuses = await _open_claude_native_session_before_sign_in(
         monkeypatch, tmp_path, conv_id, harness_client=harness
@@ -1356,17 +1357,7 @@ async def test_a_queued_drain_behind_a_reconnect_starts_no_turn_once_the_session
 ) -> None:
     """The next queued message, waiting behind Reconnect, ends quietly when its session goes."""
     conv_id = "abb2c3d4e5f60718293a4b5c6d7e8f90"
-    checking, release = threading.Event(), threading.Event()
-
-    def _held_attach_check(_socket: str, _target: str) -> float | None:
-        checking.set()
-        release.wait(5)
-        return None
-
-    # Bound when the runner app is built.
-    monkeypatch.setattr(
-        "omnigent.native.native_cost_popup._tmux_last_client_input_at", _held_attach_check
-    )
+    checking, release = _hold_restart_attach_check(monkeypatch)
     harness = _ScriptedHarnessClient([])
     app, _closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
         monkeypatch, tmp_path, conv_id, harness_client=harness
@@ -1407,6 +1398,51 @@ async def test_a_queued_drain_behind_a_reconnect_starts_no_turn_once_the_session
     assert harness.posted_bodies == []
     assert conv_id not in app.state.active_turns
     assert relaunched == []
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_sent_while_the_session_is_being_deleted_restarts_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A Reconnect arriving after delete's cancellation sweep is refused, not run late."""
+    conv_id = "adb2c3d4e5f60718293a4b5c6d7e8f90"
+    app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id
+    )
+    resources = app.state.session_resource_registry
+    terminals = resources.terminal_registry
+    # Hold delete just before its resource cleanup, after it swept in-flight Reconnects.
+    cleaning, release = asyncio.Event(), asyncio.Event()
+    cleanup_session = resources.cleanup_session
+
+    async def _held_cleanup(session_id: str) -> None:
+        cleaning.set()
+        await release.wait()
+        await cleanup_session(session_id)
+
+    monkeypatch.setattr(resources, "cleanup_session", _held_cleanup)
+
+    async with _runner_client(app) as client:
+        deleting = asyncio.create_task(client.delete(f"/v1/sessions/{conv_id}"))
+        await asyncio.wait_for(cleaning.wait(), timeout=5)
+        # The pane is still up: a status read records it again, then sign-in completes.
+        statuses["linear"] = "sign_in_required"
+        await client.get(f"/v1/sessions/{conv_id}/live-mcp-servers")
+        statuses["linear"] = "connected"
+        reconnected = await asyncio.wait_for(
+            client.post(
+                f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": "linear"}
+            ),
+            timeout=5,
+        )
+        release.set()
+        deleted = await asyncio.wait_for(deleting, timeout=10)
+
+    assert deleted.status_code < 300, deleted.text
+    assert reconnected.json()["reconnect_error"] == "This session was deleted."
+    # Only delete's own cleanup closed the pane; nothing relaunched it.
+    assert (closes, relaunched) == ([conv_id], [])
+    assert terminals.get(conv_id, "claude", "main") is None
 
 
 @pytest.mark.asyncio
@@ -1562,25 +1598,3 @@ async def test_a_message_never_restarts_a_claude_pane_left_from_another_harness(
         await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=5)
 
     assert (closes, relaunched) == ([], [])
-
-
-@pytest.mark.asyncio
-async def test_a_released_sign_in_hold_does_not_block_a_reconnect(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    conv_id = "a7b2c3d4e5f60718293a4b5c6d7e8f90"
-    app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
-        monkeypatch, tmp_path, conv_id
-    )
-    statuses["linear"] = "connected"
-    app.state.sign_in_holds[conv_id] = runner_app._SignInHold(
-        deadline=time.monotonic() + 60, waiting=False
-    )
-
-    async with _runner_client(app) as client:
-        resp = await client.post(
-            f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": "linear"}
-        )
-
-    assert "reconnect_error" not in resp.json(), resp.text
-    assert (closes, relaunched) == ([conv_id], [conv_id])
