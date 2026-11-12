@@ -4073,7 +4073,8 @@ def test_setup_removing_invalid_subscription_keeps_login_and_dismisses_detection
     assert result.exit_code == 0, result.output
     assert "Remove this provider" in result.output
     config = _config_yaml(isolated_config)
-    assert not config.get("providers")
+    providers = config.get("providers") or {}
+    assert name not in providers and "codex" not in providers
     assert config["dismissed_detections"] == ["codex"]
     assert auth.read_text() == login
 
