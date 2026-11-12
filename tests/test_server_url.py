@@ -173,8 +173,8 @@ def test_org_id_from_url(url: str, expected: str | None) -> None:
     [
         # Databricks workspace API mount → the recognizable /omnigent SPA URL.
         (
-            "https://e2-dogfood.staging.cloud.databricks.com/api/2.0/omnigent",
-            "https://e2-dogfood.staging.cloud.databricks.com/omnigent",
+            "https://example.staging.cloud.databricks.com/api/2.0/omnigent",
+            "https://example.staging.cloud.databricks.com/omnigent",
         ),
         # A trailing ``?o=<org>`` selector on the API base is kept on the
         # display URL so a copy-paste still routes to the right workspace.

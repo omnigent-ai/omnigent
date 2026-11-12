@@ -16,6 +16,7 @@ import {
   listScheduledTaskRuns,
   listScheduledTasks,
   listAutomationFailures,
+  runScheduledTaskNow,
   updateScheduledTask,
 } from "./scheduledTasksApi";
 
@@ -61,6 +62,20 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   setOmnigentHostConfig({});
+});
+
+describe("runScheduledTaskNow", () => {
+  it.each([
+    [{ triggered: true, id: "st_1", run_id: "run_1" }, "run_1"],
+    [{ triggered: true, id: "st_1" }, null],
+  ])("returns the run ID when the server provides one: %j", async (body, expected) => {
+    fetchMock.mockResolvedValueOnce(mockResponse(body, { status: 202 }));
+    expect(await runScheduledTaskNow("st_1")).toBe(expected);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/scheduled-tasks/st_1/run",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
 });
 
 describe("listScheduledTasks", () => {
@@ -140,6 +155,7 @@ describe("listScheduledTaskRuns", () => {
       viewerLastSeen: null,
       viewerUnread: null,
       sessionCostUsd: null,
+      conversationPendingApprovals: 0,
     });
   });
 
@@ -161,6 +177,7 @@ describe("listScheduledTaskRuns", () => {
             viewer_last_seen: 1_700_000_055,
             viewer_unread: false,
             session_cost_usd: 0,
+            conversation_pending_approvals: 2,
           },
         ],
       }),
@@ -172,6 +189,7 @@ describe("listScheduledTaskRuns", () => {
       viewerLastSeen: 1_700_000_055,
       viewerUnread: false,
       sessionCostUsd: 0,
+      conversationPendingApprovals: 2,
     });
   });
 });

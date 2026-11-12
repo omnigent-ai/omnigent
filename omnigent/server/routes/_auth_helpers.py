@@ -31,6 +31,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     AuthProvider,
+    effective_admin,
     local_single_user_enabled,
 )
 from omnigent.server.permissions import (
@@ -79,6 +80,33 @@ def attribution_user(user_id: str | None) -> str | None:
     if user_id == RESERVED_USER_LOCAL:
         return None
     return user_id
+
+
+def is_session_owner(
+    user_id: str | None,
+    conversation: Conversation,
+    *,
+    auth_provider: AuthProvider | None,
+    permission_store: PermissionStore | None,
+) -> bool:
+    """Whether *user_id* holds the owner grant on *conversation*'s root session.
+
+    Unlike :func:`check_session_access` there is no admin bypass; a sub-agent
+    belongs to its root's owner, as it does there. With auth or permissions
+    off, every caller is the owner.
+
+    :param user_id: The caller, e.g. ``"alice@example.com"``, or ``None``.
+    :param conversation: The session to check, e.g. a side chat's parent.
+    :param auth_provider: The server's auth provider, ``None`` when auth is off.
+    :param permission_store: Store for grant lookups, or ``None``.
+    :returns: ``True`` for the owner of the session's root.
+    """
+    if auth_provider is None or permission_store is None:
+        return True
+    if user_id is None:
+        return False
+    grant = permission_store.get(user_id, conversation.root_conversation_id)
+    return grant is not None and grant.level >= LEVEL_OWNER
 
 
 def require_user(
@@ -316,7 +344,7 @@ def _require_access_and_level_sync(
         # check_session_access's admin short-circuit, which never reads the
         # conversation). A missing conversation is left for the snapshot builder
         # to 404 on, exactly as today.
-        if access.is_admin:
+        if effective_admin(access.is_admin):
             return SessionAccess(level=level, conversation=None)
 
         conv = conversation_store.get_conversation(conversation_id)
@@ -427,7 +455,7 @@ def _can_mutate_agent(
     """Whether the caller satisfies the agent-ownership mutation gate."""
     if permission_store is None or local_single_user_enabled():
         return True
-    if user_id is not None and permission_store.is_admin(user_id):
+    if user_id is not None and effective_admin(permission_store.is_admin(user_id)):
         return True
     return agent.created_by is not None and user_id == agent.created_by
 
