@@ -136,6 +136,8 @@ describe("WorkflowDetailPage", () => {
     expect(screen.getByTestId("workflow-detail-description").textContent).toBe(
       WORKFLOW.description,
     );
+    // It fits in three lines, so there's nothing to expand.
+    expect(screen.queryByTestId("workflow-detail-description-toggle")).toBeNull();
     expect(screen.getByTestId("workflow-steps-graph")).toHaveTextContent(
       "Explore the failures, Fix the test",
     );
@@ -145,6 +147,29 @@ describe("WorkflowDetailPage", () => {
     expect(within(waiting!).getByTestId("workflow-run-state")).toHaveTextContent("Waiting for you");
     expect(within(done!).getByText("Untitled session")).toBeInTheDocument();
     expect(done).toHaveAttribute("data-run-state", "done");
+  });
+
+  it("shows three lines of a long description, and the rest on request", () => {
+    // jsdom lays nothing out: report a paragraph taller than its three lines.
+    const scroll = vi.spyOn(Element.prototype, "scrollHeight", "get").mockReturnValue(120);
+    const client = vi.spyOn(Element.prototype, "clientHeight", "get").mockReturnValue(60);
+    try {
+      mockWorkflow({});
+      mockRuns([]);
+      renderPage();
+      const description = screen.getByTestId("workflow-detail-description");
+      expect(description).toHaveClass("line-clamp-3");
+
+      fireEvent.click(screen.getByRole("button", { name: "Description" }));
+      expect(description).not.toHaveClass("line-clamp-3");
+      expect(screen.getByRole("button", { name: "Description" })).toHaveAttribute(
+        "aria-expanded",
+        "true",
+      );
+    } finally {
+      scroll.mockRestore();
+      client.mockRestore();
+    }
   });
 
   it("says when nothing ran it yet, and loads older runs on request", () => {

@@ -4,9 +4,10 @@
  * its steps as a graph, and the sessions that ran it, newest first.
  */
 
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import {
   CheckIcon,
+  ChevronDownIcon,
   ChevronLeftIcon,
   ClockIcon,
   Loader2Icon,
@@ -142,12 +143,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
           </Button>
         </div>
       </div>
-      <p
-        className="mt-2 whitespace-pre-wrap text-sm text-muted-foreground"
-        data-testid="workflow-detail-description"
-      >
-        {workflow.description}
-      </p>
+      <WorkflowDescription text={workflow.description} />
 
       <section className="mt-6">
         <h2 className="mb-2 text-sm font-medium text-muted-foreground">Steps</h2>
@@ -208,6 +204,62 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
         }}
       />
     </PageScroll>
+  );
+}
+
+/**
+ * The description, in a section like an automation's prompt: three lines and
+ * an ellipsis, with a chevron to show the rest when there is more.
+ */
+function WorkflowDescription({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const [clamped, setClamped] = useState(false);
+  const bodyRef = useRef<HTMLParagraphElement>(null);
+
+  // Whether three lines cut the text off, measured again as the page resizes.
+  useLayoutEffect(() => {
+    const body = bodyRef.current;
+    if (!body || expanded) return;
+    const measure = () => setClamped(body.scrollHeight > body.clientHeight + 1);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(body);
+    return () => observer.disconnect();
+  }, [text, expanded]);
+
+  return (
+    <section className="mt-6">
+      <h2 className="mb-2 text-sm font-medium text-muted-foreground">
+        {clamped || expanded ? (
+          <button
+            type="button"
+            aria-expanded={expanded}
+            data-testid="workflow-detail-description-toggle"
+            onClick={() => setExpanded(!expanded)}
+            className="flex cursor-pointer items-center gap-1 rounded-sm text-left transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <ChevronDownIcon
+              aria-hidden="true"
+              className={cn("size-4 transition-transform", !expanded && "-rotate-90")}
+            />
+            Description
+          </button>
+        ) : (
+          "Description"
+        )}
+      </h2>
+      <p
+        ref={bodyRef}
+        className={cn(
+          "whitespace-pre-wrap text-sm text-foreground/90",
+          !expanded && "line-clamp-3",
+        )}
+        data-testid="workflow-detail-description"
+      >
+        {text}
+      </p>
+    </section>
   );
 }
 
