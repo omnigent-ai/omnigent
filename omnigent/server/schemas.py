@@ -47,7 +47,10 @@ from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
 
 # ── Shared ──────────────────────────────────────────────────────
 
-McpRegistryServiceId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")]
+MCP_REGISTRY_SERVICE_ID_PATTERN = r"^[a-z][a-z0-9_-]{0,39}$"
+# Most registry services one session (or automation) can select.
+MAX_MCP_REGISTRY_SERVICES = 40
+McpRegistryServiceId = Annotated[str, Field(pattern=MCP_REGISTRY_SERVICE_ID_PATTERN)]
 
 
 class PaginatedList(BaseModel):
@@ -1774,7 +1777,9 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
     initial_input: SessionStartupInput | None = None
-    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
+    mcp_registry_services: list[McpRegistryServiceId] = Field(
+        default_factory=list, max_length=MAX_MCP_REGISTRY_SERVICES
+    )
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     sibling_source_id: str | None = None
@@ -2023,7 +2028,9 @@ class SessionCreateMetadata(_SandboxProfileSelection):
 
     inference_configuration_revision: str | None = None
 
-    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
+    mcp_registry_services: list[McpRegistryServiceId] = Field(
+        default_factory=list, max_length=MAX_MCP_REGISTRY_SERVICES
+    )
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None

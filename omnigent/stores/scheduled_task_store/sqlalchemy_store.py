@@ -60,6 +60,8 @@ from omnigent.stores.scheduled_task_store import (
     AdoptOutcome,
     AutomationFailure,
     ScheduledTaskStore,
+    decode_mcp_services,
+    encode_mcp_services,
 )
 from omnigent.stores.scheduled_task_store.dispatch import (
     DeletedTaskCursor,
@@ -134,6 +136,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         model_override=row.model_override,
         reasoning_effort=row.reasoning_effort,
         permission_mode=row.permission_mode,
+        mcp_services=decode_mcp_services(row.mcp_services),
         max_cost_usd=row.max_cost_usd,
         session_mode=decode_scheduled_task_session_mode(row.session_mode),
         session_id=row.session_id,
@@ -164,6 +167,7 @@ _SESSION_CREATION_FIELDS = (
     "model_override",
     "reasoning_effort",
     "permission_mode",
+    "mcp_services",
     "project_id",
     "updated_at",
 )
@@ -245,6 +249,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         permission_mode: str | None = None,
+        mcp_services: tuple[str, ...] = (),
         max_cost_usd: float | None = None,
         session_mode: str = "new",
         session_id: str | None = None,
@@ -274,6 +279,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 model_override=model_override,
                 reasoning_effort=reasoning_effort,
                 permission_mode=permission_mode,
+                mcp_services=encode_mcp_services(mcp_services),
                 max_cost_usd=max_cost_usd,
                 session_mode=encode_scheduled_task_session_mode(session_mode),
                 session_id=session_id,
@@ -389,6 +395,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         model_override: str | None = _UNSET,
         reasoning_effort: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
+        mcp_services: tuple[str, ...] | None = None,
         max_cost_usd: float | None = _UNSET,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
@@ -429,10 +436,18 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 current = _to_entity(row)
                 if any(
                     getattr(current, field) != getattr(expected_schedule, field)
-                    for field in ("rrule", "session_mode", "execution_target")
+                    # The agent and MCP services are validated together, so an
+                    # edit to either since the snapshot invalidates the other.
+                    for field in (
+                        "rrule",
+                        "session_mode",
+                        "execution_target",
+                        "agent_id",
+                        "mcp_services",
+                    )
                 ):
                     raise OmnigentError(
-                        "The automation's schedule or execution settings changed. "
+                        "The automation's schedule, execution, agent or MCP settings changed. "
                         "Reload and try again.",
                         code=ErrorCode.CONFLICT,
                     )
@@ -465,6 +480,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if permission_mode is not _UNSET and row.permission_mode != permission_mode:
                 row.permission_mode = permission_mode
                 changed = True
+            if mcp_services is not None:
+                encoded_services = encode_mcp_services(mcp_services)
+                if row.mcp_services != encoded_services:
+                    row.mcp_services = encoded_services
+                    changed = True
             if max_cost_usd is not _UNSET and row.max_cost_usd != max_cost_usd:
                 row.max_cost_usd = max_cost_usd
                 changed = True

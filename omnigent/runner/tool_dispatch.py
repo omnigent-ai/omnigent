@@ -5044,6 +5044,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "reasoning_effort",
     "permission_mode",
     "max_cost_usd",
+    "mcp_services",
     "session_mode",
     "session_id",
     "workspace",
@@ -5061,6 +5062,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "model_override",
     "reasoning_effort",
     "permission_mode",
+    "mcp_services",
     "max_cost_usd",
     "session_mode",
     "session_id",
@@ -5071,30 +5073,45 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "project_id",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
-# Fields a server accepts only once it advertises ``scheduled_task_session_modes``.
-_SCHEDULED_TASK_SESSION_FIELDS = ("session_mode", "session_id")
+# Optional fields an older server forbids, the ``/v1/info`` flag that admits
+# them, and how to retry without them.
+_SCHEDULED_TASK_GATED_FIELDS = (
+    (
+        ("session_mode", "session_id"),
+        "scheduled_task_session_modes",
+        "does not support session_mode or session_id; omit them to start a new "
+        "session on every run",
+    ),
+    (
+        ("mcp_services",),
+        "scheduled_task_mcp_services",
+        "does not support mcp_services; omit it to start runs without MCP services",
+    ),
+)
 
 
 async def _scheduled_task_session_fields_refusal(
     server_client: httpx.AsyncClient, tool_name: str, payload: _JsonObject
 ) -> str | None:
-    """An error for session fields this server would reject, or ``None`` to send them.
+    """An error for optional fields this server would reject, or ``None`` to send them.
 
     An older server forbids unknown fields, so the payload would fail with a 422
     that does not say why. Asked only when the call carries one of the fields; an
     unreadable ``/v1/info`` counts as unsupported, as for task projects.
     """
-    if not any(field in payload for field in _SCHEDULED_TASK_SESSION_FIELDS):
+    gated = [
+        (capability, reason)
+        for fields, capability, reason in _SCHEDULED_TASK_GATED_FIELDS
+        if any(field in payload for field in fields)
+    ]
+    if not gated:
         return None
     info = await server_client.get("/v1/info", timeout=30.0)
-    if info.status_code < 400 and info.json().get("scheduled_task_session_modes") is True:
-        return None
-    return json.dumps(
-        {
-            "error": f"{tool_name}: this Omnigent server does not support session_mode or "
-            "session_id; omit them to start a new session on every run"
-        }
-    )
+    advertised = info.json() if info.status_code < 400 else {}
+    for capability, reason in gated:
+        if advertised.get(capability) is not True:
+            return json.dumps({"error": f"{tool_name}: this Omnigent server {reason}"})
+    return None
 
 
 def _scheduled_task_url(task_id: object) -> str | None:

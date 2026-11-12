@@ -18,7 +18,9 @@ unit-tested without a live host/runner.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -598,6 +600,7 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         startup_inputs=overrides.get("startup_inputs"),
         project_store=overrides.get("project_store"),
         single_user_owner=overrides.get("single_user_owner", RESERVED_USER_LOCAL),
+        app_state=overrides.get("app_state"),
     )
 
 
@@ -739,6 +742,10 @@ async def test_active_creates_session_grant_and_run(session_mode: str, trigger: 
     # A conversation was created bound to the task's agent.
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["agent_id"] == "ag_1"
+    # A task without MCP services adds no selection labels.
+    assert not [
+        k for k in conv_store.created[0]["labels"] if k.startswith("omnigent.mcp_service.")
+    ]
     assert conv_store.created[0]["title"] == (
         "[automation job] nightly" if trigger and session_mode == "continue" else "nightly"
     )
@@ -752,6 +759,57 @@ async def test_active_creates_session_grant_and_run(session_mode: str, trigger: 
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+class _ListLabelSelection:
+    """A deployment that records the whole selection in one JSON label."""
+
+    def validate(self, request, services, *, spec, user_id):
+        return tuple(services)
+
+    def session_labels(self, services):
+        return {"deployment.mcp_services": json.dumps(list(services))} if services else {}
+
+    def selected_services(self, labels):
+        return tuple(json.loads(labels.get("deployment.mcp_services", "[]")))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("app_state", "expected"),
+    [
+        (
+            None,
+            {"omnigent.mcp_service.github": "1", "omnigent.mcp_service.linear": "1"},
+        ),
+        (
+            SimpleNamespace(session_mcp_selection=_ListLabelSelection()),
+            {"deployment.mcp_services": '["github", "linear"]'},
+        ),
+    ],
+    ids=["registry-default", "deployment-override"],
+)
+async def test_every_fired_session_starts_with_the_task_mcp_services(
+    app_state: Any, expected: dict[str, str]
+) -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(mcp_services=("github", "linear"))})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, app_state=app_state),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 2
+    for created in conv_store.created:
+        assert expected.items() <= created["labels"].items()
 
 
 class FakeProjectStore:
@@ -4180,6 +4238,89 @@ async def test_a_run_starts_from_a_copy_of_the_source_session() -> None:
     assert conv_store.host_bindings == [("conv_1", "host_1", "/repo", None)]
     assert [conv.id for conv in launched] == ["conv_1"]
     assert [run["status"] for run in store.runs] == ["running"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_services", "dropped", "added"),
+    [
+        (("github",), {"omnigent.mcp_service.slack"}, {"omnigent.mcp_service.github": "1"}),
+        ((), set(), {}),
+    ],
+    ids=["task-selection-replaces", "no-task-selection-keeps-the-copy"],
+)
+async def test_a_copied_run_uses_the_task_mcp_services_instead_of_the_source(
+    task_services: tuple[str, ...], dropped: set[str], added: dict[str, str]
+) -> None:
+    conv_store = FakeConversationStore()
+    conv_store.get_conversation = lambda conversation_id: _FakeConversation(  # type: ignore[method-assign]
+        id=conversation_id, agent_id="ag_1", labels={"omnigent.mcp_service.slack": "1"}
+    )
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(source_session_id="conv_source", mcp_services=task_services)}
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    await build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)(
+        0, "task_1"
+    )
+    await _drain()
+
+    (fork,) = conv_store.forked
+    assert ("omnigent.mcp_service.slack" in fork["dropped_label_keys"]) == bool(dropped)
+    assert added.items() <= fork["extra_labels"].items()
+
+
+class _ListLabelSelection:
+    """A deployment that keeps the whole selection, even an empty one, in one label."""
+
+    key = "deployment.mcp_services"
+
+    async def validate(self, *args: Any, **kwargs: Any) -> tuple[str, ...]:
+        raise AssertionError("firing does not revalidate")
+
+    def session_labels(self, services: Sequence[str]) -> dict[str, str]:
+        return {self.key: json.dumps(list(services))}
+
+    def selected_services(self, labels: Mapping[str, str]) -> tuple[str, ...]:
+        return tuple(json.loads(labels.get(self.key, "[]")))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_services", "written"),
+    [(("github",), '["github"]'), ((), None)],
+    ids=["task-selection-replaces", "no-task-selection-keeps-the-copy"],
+)
+async def test_a_copied_run_keeps_a_one_label_selection_unless_the_task_has_one(
+    task_services: tuple[str, ...], written: str | None
+) -> None:
+    selection = _ListLabelSelection()
+    conv_store = FakeConversationStore()
+    conv_store.get_conversation = lambda conversation_id: _FakeConversation(  # type: ignore[method-assign]
+        id=conversation_id, agent_id="ag_1", labels={selection.key: '["slack"]'}
+    )
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(source_session_id="conv_source", mcp_services=task_services)}
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        app_state=SimpleNamespace(session_mcp_selection=selection),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (fork,) = conv_store.forked
+    # The copy's own label survives unless the task writes its selection over it.
+    assert (selection.key in fork["dropped_label_keys"]) == (written is not None)
+    assert fork["extra_labels"].get(selection.key) == written
 
 
 @pytest.mark.asyncio

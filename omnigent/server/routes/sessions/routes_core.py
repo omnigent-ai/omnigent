@@ -1669,6 +1669,7 @@ def register_core_routes(
             created_by_scheduled_task_id=(
                 source.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) if source is not None else None
             ),
+            created_by_labels=source.labels if source is not None else None,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
