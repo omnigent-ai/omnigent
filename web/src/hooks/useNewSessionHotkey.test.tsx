@@ -4,7 +4,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { setEmbedRoot } from "@/lib/host";
 
-import { isNewSessionHotkey, useNewSessionHotkey } from "./useNewSessionHotkey";
+import {
+  NEW_SESSION_COMPOSER_FOCUS_STATE,
+  isNewSessionHotkey,
+  useNewSessionHotkey,
+} from "./useNewSessionHotkey";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
@@ -116,7 +120,7 @@ describe("useNewSessionHotkey", () => {
 
     const e = press({ key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
 
-    expect(navigate).toHaveBeenCalledWith("/");
+    expect(navigate).toHaveBeenCalledWith("/", { state: NEW_SESSION_COMPOSER_FOCUS_STATE });
     expect(e.defaultPrevented).toBe(true);
   });
 
@@ -126,7 +130,9 @@ describe("useNewSessionHotkey", () => {
     const e = press({ key: "O", code: "KeyS", ctrlKey: true, shiftKey: true });
 
     expect(e.defaultPrevented).toBe(true);
-    expect(navigate).toHaveBeenCalledExactlyOnceWith("/");
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/", {
+      state: NEW_SESSION_COMPOSER_FOCUS_STATE,
+    });
   });
 
   it("works from editable fields so the global action is focus-independent", () => {
@@ -137,7 +143,7 @@ describe("useNewSessionHotkey", () => {
 
     press({ key: "O", code: "KeyO", ctrlKey: true, shiftKey: true }, input);
 
-    expect(navigate).toHaveBeenCalledWith("/");
+    expect(navigate).toHaveBeenCalledWith("/", { state: NEW_SESSION_COMPOSER_FOCUS_STATE });
   });
 
   it("handles embedded input without claiming shortcuts in the host page", () => {
@@ -154,7 +160,9 @@ describe("useNewSessionHotkey", () => {
 
     const inside = press({ key: "O", code: "KeyO", ctrlKey: true, shiftKey: true }, input);
     expect(inside.defaultPrevented).toBe(true);
-    expect(navigate).toHaveBeenCalledExactlyOnceWith("/");
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/", {
+      state: NEW_SESSION_COMPOSER_FOCUS_STATE,
+    });
   });
 
   it("ignores auto-repeat", () => {
