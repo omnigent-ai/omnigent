@@ -280,7 +280,7 @@ def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str
 # quoting. A command containing any of it keeps the flat parse the observer had before.
 _UNMODELED_SHELL = re.compile(
     r"\b(?:case|esac|function|eval|if|then|else|elif|fi|do|done|while|until|for|select)\b"
-    r"|[{}]|\(\s*\)|\(\s*\(|=\s*\("
+    r"|[{}]|\(\s*\)|\(\s*\(|=\s*\(|\[\[|[@?*+!]\("
 )
 
 
@@ -330,6 +330,15 @@ def _shell_items(command: str) -> list[list[str] | str] | None:
                 )
                 if operator is None:
                     chunk.append(char)
+                    index += 1
+                    continue
+                if (
+                    operator == "\n"
+                    and items
+                    and items[-1] in {"&&", "||", "|"}
+                    and not "".join(chunk).strip()
+                ):
+                    # A newline after an operator continues the command.
                     index += 1
                     continue
                 # An escaped ``>`` is a literal, so the character after it is a separator.
@@ -387,6 +396,9 @@ def _shell_steps(
         if inner is None:
             steps.append(ShellSegment(raw_tokens=tuple(item), invocation_tokens=tuple(tokens)))
             continue
+        # Escaping can hide unmodeled syntax from the outer check, so check each decoded layer.
+        if _has_unmodeled_shell(inner):
+            return None
         nested = _shell_steps(inner, depth + 1, or_lists=or_lists)
         if nested is None:
             return None

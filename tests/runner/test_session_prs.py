@@ -1609,6 +1609,16 @@ def test_an_uncalled_function_body_is_not_a_command_for_pr_attribution() -> None
     )
     assert refs == []
     assert was_created is False
+    # Escaping hides the definition from the outer text, but the decoded shell still defines it.
+    refs, was_created = extract_prs(
+        "Bash",
+        {
+            "command": "bash -c f\\(\\)\\ \\(gh\\ pr\\ create\\); echo https://github.com/example/one/pull/41"
+        },
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
 
 
 def test_a_function_called_before_its_definition_is_not_run() -> None:
@@ -1616,6 +1626,35 @@ def test_a_function_called_before_its_definition_is_not_run() -> None:
         "Bash",
         {
             "command": "f; f() { gh pr create --fill; }; "
+            "echo https://github.com/example/one/pull/41"
+        },
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+
+
+@pytest.mark.parametrize("operator", ["&&", "||", "|"])
+def test_a_newline_after_an_operator_continues_the_command(operator: str) -> None:
+    # A newline after an operator gives the same checkouts as a space.
+    inline = f"true {operator} cd b; git status"
+    continued = f"true {operator}\n  cd b\ngit status"
+    expected = pr_observer._git_checkouts("Bash", {"command": inline}, {}, "/repo")
+    assert pr_observer._git_checkouts("Bash", {"command": continued}, {}, "/repo") == expected
+
+
+def test_a_pipeline_stage_cd_does_not_affect_the_parent_when_continued() -> None:
+    assert pr_observer._git_checkouts("Bash", {"command": "cd b |\n git push"}, {}, "/repo") == [
+        "/repo"
+    ]
+
+
+def test_a_pattern_with_parentheses_is_not_a_command_for_pr_attribution() -> None:
+    # An extended glob is a pattern for printf, not a command that runs.
+    refs, was_created = extract_prs(
+        "Bash",
+        {
+            "command": "bash -O extglob -c \"printf '%s\\n' @(gh pr create)\"; "
             "echo https://github.com/example/one/pull/41"
         },
         "https://github.com/example/one/pull/41\n",
@@ -1915,6 +1954,14 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
             {},
             ["/"],
             id="literal-hash-after-a-substitution-does-not-end-the-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "[[ git =~ (git) ]]"},
+            "/repo",
+            {},
+            [],
+            id="double-bracket-pattern-parentheses-are-not-a-subshell",
         ),
         pytest.param(
             "Bash",
