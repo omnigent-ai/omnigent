@@ -4147,21 +4147,23 @@ def register_core_routes(
             # Stop asynchronously after the archive commits and Undo grace elapses.
             # The deferred archived-flag check keeps an undone session's runner alive.
             # A session that archives itself is still mid-turn, so its teardown also
-            # waits for that turn to end.
+            # waits for that turn to end. The canonical id keys the pending stop and
+            # the store and status reads, whatever spelling the path used.
+            lifecycle_id = normalize_uuid(session_id) or session_id
             _spawn_archive_stop(
-                session_id,
+                lifecycle_id,
                 conversation_store,
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
                 delete_worktree=body.delete_worktree,
                 host_store=getattr(request.app.state, "host_store", None),
                 after_turn=normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER))
-                == normalize_uuid(session_id),
+                == lifecycle_id,
             )
         elif body.archived is False:
             # Cancel local teardown immediately; the deferred flag check handles
             # Undo arriving on another replica.
-            _cancel_pending_archive_stop(session_id)
+            _cancel_pending_archive_stop(normalize_uuid(session_id) or session_id)
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before

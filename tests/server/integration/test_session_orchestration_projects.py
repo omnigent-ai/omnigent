@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
 
 import pytest
@@ -771,9 +772,10 @@ async def test_project_update_promotes_a_label_only_folder(auth_client, peers, d
 
 
 @_ONE_ENVIRONMENT
+@pytest.mark.parametrize("via", ["tool", "dashed-path"])
 @pytest.mark.parametrize("undone", [False, True], ids=["turn-ends", "undone"])
 async def test_a_session_archives_itself_and_stops_once_its_turn_ends(
-    auth_client, peers, db_uri, monkeypatch, undone
+    auth_client, peers, db_uri, monkeypatch, undone, via
 ):
     source, _, _ = peers
     store = SqlAlchemyConversationStore(db_uri)
@@ -804,10 +806,20 @@ async def test_a_session_archives_itself_and_stops_once_its_turn_ends(
     monkeypatch.setattr(orchestration, "_session_status_from_cache", counted_status)
     # The tool call happens mid-turn.
     monkeypatch.setitem(sessions_common._session_status_cache, source["id"], "running")
-    result = await _project_tool(
-        auth_client, source, "sys_session_update", session_id=source["id"], archived=True
-    )
-    assert result["status"] == "updated" and result["archived"] is True, result
+    if via == "tool":
+        result = await _project_tool(
+            auth_client, source, "sys_session_update", session_id=source["id"], archived=True
+        )
+        assert result["status"] == "updated" and result["archived"] is True, result
+    else:
+        # The path may spell the id with dashes; the wait and the pending stop
+        # still key it by the canonical id.
+        response = await auth_client.patch(
+            f"/v1/sessions/{uuid.UUID(source['id'])}",
+            headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+            json={"archived": True},
+        )
+        assert response.status_code == 200, response.text
     assert store.get_conversation(source["id"]).archived is True
 
     await asyncio.wait_for(seen_running_twice.wait(), 5)
