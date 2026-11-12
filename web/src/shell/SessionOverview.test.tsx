@@ -131,7 +131,7 @@ describe("Session overview", () => {
   });
 
   it("reveals every subagent cost and loads nested breakdowns only while expanded", () => {
-    const children = Array.from({ length: 6 }, (_, index) => ({
+    const children = Array.from({ length: 21 }, (_, index) => ({
       id: `child-${index + 1}`,
       task_summary: `Agent ${index + 1}`,
       own_cost_usd: index + 1,
@@ -145,12 +145,12 @@ describe("Session overview", () => {
       isLoading: false,
       error: null,
     }));
-    useChatStore.setState({ sessionCostUsd: 21.5 });
+    useChatStore.setState({ sessionCostUsd: 231.5 });
     const view = render(<SessionOverview {...props} />, { wrapper: Wrapper });
-    expect(screen.queryByText("Agent 6")).toBeNull();
+    expect(screen.queryByText("Agent 21")).toBeNull();
     expect(useChildSessionsMock.mock.calls.map(([id]) => id)).not.toContain("child-1");
-    fireEvent.click(screen.getByRole("button", { name: "Show all 6 subagents" }));
-    expect(screen.getByText("$6.00")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show all 21 subagents" }));
+    expect(screen.getByText("$21.00")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Show nested costs for Agent 1" }));
     expect(useChildSessionsMock).toHaveBeenCalledWith("child-1", 10_000);
@@ -160,7 +160,7 @@ describe("Session overview", () => {
     );
     expect(screen.getByText("$0.50")).toBeInTheDocument();
     expect(
-      within(screen.getByRole("link", { name: /Agent 1/ })).getByText("$1.00"),
+      within(screen.getByRole("link", { name: /^Agent 1(?!\d)/ })).getByText("$1.00"),
     ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Hide nested costs for Agent 1" }));

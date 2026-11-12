@@ -90,6 +90,8 @@ interface ChildSessionWire {
 interface ChildSessionsResponse {
   object: "list";
   data: ChildSessionWire[];
+  has_more?: boolean;
+  last_id?: string | null;
 }
 
 /**
@@ -206,17 +208,36 @@ interface UseChildSessionsResult {
  * Exported for unit testing of the HTTP-shape contract; production
  * code should call ``useChildSessions``.
  */
-export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions`,
-  );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as ChildSessionsResponse;
+export async function fetchChildSessions(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<ChildSessionInfo[]> {
+  const rows: ChildSessionWire[] = [];
+  const params = new URLSearchParams({ limit: "100" });
+  const cursors = new Set<string>();
+  // Keep the shared cache flat for live updates; page reads are sequential.
+  /* oxlint-disable no-await-in-loop */
+  while (true) {
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions?${params}`,
+      { signal },
+    );
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const page = (await res.json()) as ChildSessionsResponse;
+    rows.push(...page.data);
+    if (!page.has_more) break;
+    if (!page.data.length || !page.last_id || cursors.has(page.last_id)) {
+      throw new Error("Child-session pagination did not advance");
+    }
+    cursors.add(page.last_id);
+    params.set("after", page.last_id);
+  }
+  /* oxlint-enable no-await-in-loop */
   // Children run on this session's runner: record the link so their
   // session-scoped requests key by this session's host before their own
   // snapshot loads.
-  for (const row of json.data) setSessionParent(row.id, sessionId);
-  return json.data.map((row) => ({
+  for (const row of rows) setSessionParent(row.id, sessionId);
+  return rows.map((row) => ({
     own_cost_usd: row.own_cost_usd ?? null,
     id: row.id,
     title: row.title,
@@ -259,7 +280,7 @@ export function useChildSessions(
       sessionId === null
         ? ["conversation", null, "child_sessions"]
         : childSessionsQueryKey(sessionId),
-    queryFn: () => fetchChildSessions(sessionId as string),
+    queryFn: ({ signal }) => fetchChildSessions(sessionId as string, signal),
     enabled: sessionId !== null,
     staleTime: 60_000,
     retry: false,

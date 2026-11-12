@@ -641,7 +641,8 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/sessions/test_mcp_registry_connections.py::test_managed_mcp_selection_is_sent_with_launch`
   covers desktop sandbox and mobile local-host launches, including a long catalog
   in a short viewport with a reachable last row and visible heading and footer.
-  After launch, the same cases use desktop agent info and mobile **Agent info** to select managed
+  After launch, the same cases use desktop agent info and mobile **Agent info**
+  (**Agent details** when `session_overview` is enabled) to select managed
   services on a builtin agent and remove unavailable references after registry
   disablement, while custom MCP controls remain read-only. The module has four
   browser cases: these two launches, settings sign-in routing, and the
