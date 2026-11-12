@@ -77,10 +77,6 @@ def test_non_sqlite_engine_has_pool_settings(
         "omnigent.db.utils.create_engine",
         _capturing_create_engine,
     )
-    # The mock engine cannot carry pool event listeners.
-    monkeypatch.setattr(
-        "omnigent.db.utils.install_transaction_aware_pool_reset", lambda engine: None
-    )
     # Skip migrations -- we only care about engine creation kwargs.
     monkeypatch.setattr(
         "omnigent.db.utils._run_migrations",
@@ -98,43 +94,6 @@ def test_non_sqlite_engine_has_pool_settings(
     # the database server restarts or closes idle connections.
     # Failure means connections could persist indefinitely and break.
     assert captured_kwargs.get("pool_recycle") == 1800
-
-    # The transaction-aware reset listener replaces the unconditional
-    # rollback-on-return.
-    assert "pool_reset_on_return" in captured_kwargs
-    assert captured_kwargs["pool_reset_on_return"] is None
-
-
-@pytest.mark.parametrize(
-    "db_uri",
-    [
-        "postgresql://localhost/testdb",
-        "cockroachdb://root@localhost/defaultdb",
-        "mysql+pymysql://localhost/testdb",
-    ],
-)
-def test_server_engines_install_transaction_aware_reset(
-    monkeypatch: pytest.MonkeyPatch, db_uri: str
-) -> None:
-    """Server engines disable the default reset only alongside the listener
-    that replaces it; otherwise returned connections would keep open
-    transactions."""
-    from omnigent.db import utils
-
-    captured_kwargs: dict[str, Any] = {}
-    created_engine = MagicMock()
-    installed_on: list[object] = []
-
-    def _capturing_create_engine(_uri: str, **kwargs: Any) -> MagicMock:
-        captured_kwargs.update(kwargs)
-        return created_engine
-
-    monkeypatch.setattr(utils, "create_engine", _capturing_create_engine)
-    monkeypatch.setattr(utils, "install_transaction_aware_pool_reset", installed_on.append)
-
-    assert utils._create_engine(db_uri) is created_engine
-    assert captured_kwargs["pool_reset_on_return"] is None
-    assert installed_on == [created_engine]
 
 
 def test_cockroachdb_dialect_helpers_and_url() -> None:
@@ -159,7 +118,6 @@ def test_cockroachdb_engine_settings(monkeypatch: pytest.MonkeyPatch) -> None:
         return mock_engine
 
     monkeypatch.setattr(utils, "create_engine", capture)
-    monkeypatch.setattr(utils, "install_transaction_aware_pool_reset", lambda engine: None)
     engine = utils._create_engine("cockroachdb://root@host/db")
 
     assert engine is mock_engine
@@ -370,7 +328,6 @@ def test_paas_postgres_scheme_is_normalized_by_the_engine_factory(
         return MagicMock()
 
     monkeypatch.setattr(utils, "create_engine", capture)
-    monkeypatch.setattr(utils, "install_transaction_aware_pool_reset", lambda engine: None)
     utils._create_engine("postgres://user:secret@host:5432/db")
 
     assert captured["uri"] == "postgresql+psycopg://user:secret@host:5432/db"
