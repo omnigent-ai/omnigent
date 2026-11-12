@@ -5843,12 +5843,13 @@ describe("CreateScheduledTaskDialog workflow", () => {
 
   it("runs a saved workflow, with the instructions as each run's details", async () => {
     renderDialog();
-    expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("Choose a workflow");
+    expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("No workflow");
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
     chooseWorkflow();
 
     expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("Triage flaky tests");
-    expect(screen.getByTestId("task-workflow-description")).toHaveClass("line-clamp-3");
+    // Once chosen, the field shows the workflow's name only.
+    expect(screen.queryByText(/Give it: the test suite/)).toBeNull();
     expect(screen.getByLabelText("Additional instructions")).toBe(
       screen.getByTestId("task-prompt-input"),
     );
@@ -5873,9 +5874,6 @@ describe("CreateScheduledTaskDialog workflow", () => {
       />,
     );
     expect(screen.getByTestId("task-workflow-trigger")).toHaveTextContent("Triage flaky tests");
-    expect(screen.getByTestId("task-workflow-description")).toHaveTextContent(
-      "Give it: the test suite.",
-    );
     expect(screen.getByTestId("task-prompt-input")).toHaveValue("The upload tests");
   });
 

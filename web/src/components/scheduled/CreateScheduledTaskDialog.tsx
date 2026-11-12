@@ -1436,7 +1436,7 @@ export function CreateScheduledTaskDialog({
                       rows={5}
                       placeholder={
                         workflowChoice
-                          ? "Anything specific to each run"
+                          ? "Optional. Instructions to customize the workflow."
                           : startsFromSession
                             ? "Optional. For example: Use this week's data."
                             : "What should the agent do each run?"
