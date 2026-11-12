@@ -389,7 +389,10 @@ function openTopLevelPopover(testId: string) {
   }
 }
 
-function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } = {}) {
+function render(
+  ui: Parameters<typeof renderBase>[0],
+  { expandAdvanced = true, collapseAdvanced = false } = {},
+) {
   const view = renderBase(ui, {
     wrapper: ({ children }) => (
       <CapabilitiesProvider
@@ -406,6 +409,7 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
     ),
   });
   function expand() {
+    if (collapseAdvanced) return;
     const advancedTrigger = screen.queryByTestId("task-advanced-settings-trigger");
     if (advancedTrigger?.getAttribute("aria-expanded") === "false") {
       fireEvent.click(advancedTrigger);
@@ -565,7 +569,7 @@ describe("prompt-first automation setup", () => {
       >
         <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
       </CapabilitiesProvider>,
-      { expandAdvanced: false },
+      { collapseAdvanced: true },
     );
     const instructions = screen.getByRole("textbox", { name: "Instructions" });
     const title = screen.getByLabelText("Automation title");
@@ -575,6 +579,9 @@ describe("prompt-first automation setup", () => {
     expect(screen.getByTestId("task-agent-picker")).toBeVisible();
     const advancedTrigger = screen.getByTestId("task-advanced-settings-trigger");
     expect(advancedTrigger).toHaveAccessibleName("Advanced settings (optional)");
+    expect(advancedTrigger).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("task-session-mode-trigger")).not.toBeInTheDocument();
+    fireEvent.click(advancedTrigger);
     expect(advancedTrigger).toHaveAttribute("aria-expanded", "true");
     expect(
       screen.getByTestId("task-permission-trigger").compareDocumentPosition(advancedTrigger),
@@ -1293,6 +1300,24 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     const { input } = updateMutateAsync.mock.calls[0][0];
     expect(input).not.toHaveProperty("agentId");
     expect(input.permissionMode).toBe("bypassPermissions");
+  });
+
+  it("expands Advanced to explain an unsupported saved rule", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=9,17;BYMINUTE=0" })}
+      />,
+      { collapseAdvanced: true },
+    );
+    expect(screen.getByTestId("task-advanced-settings-trigger")).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
+    expect(screen.getByLabelText("Frequency")).toBeVisible();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
   });
 
   it.each(["Every day", "Every hour", "Custom schedule"])(

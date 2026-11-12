@@ -419,7 +419,9 @@ export function CreateScheduledTaskDialog({
     setEndingMenuOpen(next);
     handleSelectOpenChange(next);
   }
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   function resetMenus() {
+    setAdvancedOpen(false);
     setWorkspaceBrowserOpen(false);
     setProjectMenuOpen(false);
     setAgentMenuOpen(false);
@@ -1165,6 +1167,20 @@ export function CreateScheduledTaskDialog({
     !pollingBlockedReason &&
     !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
     !mutationPending;
+  // Problems that disable Save but whose explanation or fix lives under Advanced settings.
+  const advancedBlocksSubmit =
+    !curationPending &&
+    ((!usesTriggerSchedule &&
+      (endingInvalid ||
+        ((isEdit || fromSession !== null) &&
+          (!recurrenceValid || scheduleUnsupported || unsupportedByScheduler)))) ||
+      workspaceWithoutHost ||
+      Boolean(pollingBlockedReason) ||
+      (workerSettings !== null && Boolean(workerHarnessSettings.blockedReason)) ||
+      (!isEdit && agents !== undefined && effectiveAgentId === null));
+  useEffect(() => {
+    if (open && advancedBlocksSubmit) setAdvancedOpen(true);
+  }, [open, advancedBlocksSubmit]);
 
   function handleTriggerTypeChange(next: AutomationTriggerType) {
     if (isEdit || next === triggerType || (next !== "schedule" && !triggersSupported)) return;
@@ -1868,7 +1884,11 @@ export function CreateScheduledTaskDialog({
                         </SelectContent>
                       </Select>
                     )}
-                    <Collapsible className="sm:col-span-6">
+                    <Collapsible
+                      open={advancedOpen}
+                      onOpenChange={setAdvancedOpen}
+                      className="sm:col-span-6"
+                    >
                       <CollapsibleTrigger
                         className="group flex w-full cursor-pointer items-center justify-start gap-2 rounded-sm text-left text-ui font-medium outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50"
                         data-testid="task-advanced-settings-trigger"
