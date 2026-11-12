@@ -1198,7 +1198,7 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
     page.get_by_test_id("task-trigger-edit-as-prompt").click()
     page.get_by_test_id("task-session-mode-trigger").click()
     page.get_by_role("menuitemradio", name="New session each run", exact=True).click()
-    expect(page.get_by_test_id("task-schedule-trigger")).to_be_visible()
+    expect(page.get_by_test_id("task-schedule-trigger")).to_have_count(0)
     expect(page.get_by_test_id("task-trigger-cadence")).to_have_count(0)
     page.get_by_test_id("create-scheduled-task-submit").click()
     expect(page.get_by_role("dialog")).to_have_count(0)
