@@ -4,7 +4,9 @@ A session's journal is append-only. Its agent writes plans, step statuses and
 notes through its ``sys_journal_*`` tools, which the session's runner sends
 here. Entries are attributed to the automation run the session serves, named
 by its :data:`~omnigent.stores.conversation_store.SCHEDULED_TASK_RUN_LABEL_KEY`
-label. People follow a journal's plan in the session's Tasks tab.
+label. A plan can name the saved workflow it starts a run of; statuses and
+notes written while it is current carry that workflow too. People follow a
+journal's plan in the session's Tasks tab.
 
 Routes, under ``/v1``:
 
@@ -62,6 +64,7 @@ from omnigent.server.schemas import (
     SessionJournalInputRequested,
     SessionJournalPage,
 )
+from omnigent.server.workflows import open_store as open_workflow_store
 from omnigent.stores import ConversationStore
 from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.permission_store import PermissionStore
@@ -120,6 +123,7 @@ def entry_to_response(entry: JournalEntry) -> SessionJournalEntry:
         author=SessionJournalAuthor(type="omnigent" if omnigent else "agent"),
         kind=entry.kind,  # type: ignore[arg-type]
         payload=entry.payload,
+        workflow_id=entry.workflow_id,
     )
 
 
@@ -224,6 +228,7 @@ def create_session_journal_router(
         *,
         idempotency_key: str,
         step: str | None,
+        workflow_id: str | None = None,
     ) -> JournalEntry:
         store = _store()
         try:
@@ -235,6 +240,7 @@ def create_session_journal_router(
                     idempotency_key=idempotency_key,
                     step=step,
                     scheduled_task_run_id=_run_id(session),
+                    workflow_id=workflow_id,
                 )
             )
         except JournalSessionNotFoundError as exc:
@@ -260,14 +266,41 @@ def create_session_journal_router(
                 "invalid_entry: a plan payload has exactly two fields, name and steps",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if body.workflow_id is not None:
+            await _require_workflow(request, body.kind, body.workflow_id)
         entry = await _append(
             session,
             body.kind,
             body.payload,
             idempotency_key=body.idempotency_key,
             step=body.step,
+            workflow_id=body.workflow_id,
         )
         return entry_to_response(entry)
+
+    async def _require_workflow(request: Request, kind: str, workflow_id: str) -> None:
+        """Refuse a workflow on anything but a plan, or one that isn't the caller's."""
+        if kind != "plan":
+            raise OmnigentError(
+                "invalid_entry: only a plan names a workflow", code=ErrorCode.INVALID_INPUT
+            )
+        workflows = open_workflow_store(conversation_store)
+        user_id = get_user_id(request, auth_provider)
+        try:
+            uuid_to_bytes(workflow_id)
+        except InvalidUuidError:
+            workflow = None
+        else:
+            workflow = (
+                await asyncio.to_thread(workflows.get, workflow_id, user_id=user_id)
+                if workflows is not None
+                else None
+            )
+        if workflow is None:
+            raise OmnigentError(
+                f"workflow_not_found: no saved workflow {workflow_id!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
     @router.post(
         "/sessions/{session_id}/journal/input-requests",

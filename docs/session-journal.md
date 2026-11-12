@@ -58,7 +58,7 @@ spec can drop it with `tool_groups.journal: false` (see
 | Tool                                                               | Does                                                                                                                                                                                                                                                                            |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sys_journal_read(conversation_id?, kind?, step?, cursor?, limit?)` | Returns entries as compact lines, oldest first within the page, and `page.next_cursor` for older ones. With no arguments it reads the caller's newest entries. `kind: "plan"` returns plans with their full graphs. Another session's journal needs read access to that session. |
-| `sys_journal_write_plan(name, steps)`                               | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`.                                                                                                                                                                                       |
+| `sys_journal_write_plan(name, steps, workflow_id?)`                | Sets the session's plan: its name and the whole graph; returns `{id, position, version}`. `workflow_id` names the saved workflow the plan starts a run of.                                                                                                                      |
 | `sys_journal_write_status(status, step?, text?)`                    | Records a step's status. `step` may be left out when the plan has one step. `started` and `done` need every step it depends on to be done first; otherwise the write fails with `step_not_ready`, naming them.                                                                  |
 | `sys_journal_write_note(body, step?)`                               | Adds a note.                                                                                                                                                                                                                                                                    |
 | `sys_workflow_request_input(step, questions)`                      | Asks the user about a task in the current plan and waits for the answer. It marks the task `needs_input` with the first question, raises the questions as an elicitation in the Inbox with the options as buttons, and returns `{answered, answers}`.                           |
@@ -129,6 +129,12 @@ details, and choose **Run workflow**: the agent loads the saved workflow with
 The saved steps are a starting point, so the agent can still replan. You can
 also ask for a saved workflow by name in chat ("run my flaky-test triage
 workflow").
+
+Click a workflow on the **Workflows** page to open it: its steps as a graph,
+and its runs, newest first. Each run links to its session and shows how many
+of its tasks are done, or that it's waiting for you. A run is listed once the
+agent writes the saved workflow's steps as its plan, so runs from before this
+release don't appear.
 
 ## Automations
 

@@ -335,3 +335,93 @@ def test_a_truncated_fork_copies_only_what_its_history_wrote(
     )
     assert copied == 2
     assert [e.created_at for e in journal.list_entries(fork.id).entries] == [100, 200]
+
+
+WORKFLOW = "9a3c1e5b7d2f4a6c8e0b1d3f5a7c9e2b"
+OTHER_WORKFLOW = "1f2e3d4c5b6a79881726354453627180"
+
+
+def test_a_plan_names_its_workflow_and_the_entries_under_it_carry_it(
+    journal: SessionJournalStore,
+) -> None:
+    run = journal.append(
+        SESSION, "plan", _plan("tests"), idempotency_key="k0", workflow_id=WORKFLOW.upper()
+    )
+    status = journal.append(
+        SESSION, "status", {"status": "started"}, idempotency_key="k1", step="tests"
+    )
+    note = _note(journal, "k2")
+    replan = journal.append(SESSION, "plan", _plan("tests", "docs"), idempotency_key="k3")
+    after = _note(journal, "k4")
+
+    assert run.entry.workflow_id == WORKFLOW
+    assert [status.entry.workflow_id, note.entry.workflow_id] == [WORKFLOW, WORKFLOW]
+    # A replan names no workflow, so what follows it carries none.
+    assert [replan.entry.workflow_id, after.entry.workflow_id] == [None, None]
+    assert [e.workflow_id for e in journal.list_entries(SESSION).entries] == [
+        WORKFLOW,
+        WORKFLOW,
+        WORKFLOW,
+        None,
+        None,
+    ]
+    with pytest.raises(InvalidJournalEntryError, match="only a plan names a workflow"):
+        journal.append(
+            SESSION,
+            "note",
+            {"body": "x"},
+            idempotency_key="k5",
+            workflow_id=WORKFLOW,
+        )
+    with pytest.raises(InvalidJournalEntryError, match="workflow_id must be a workflow ID"):
+        journal.append(SESSION, "plan", _plan("tests"), idempotency_key="k6", workflow_id="nope")
+
+
+def test_a_workflows_runs_page_newest_first_across_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+    conversations: SqlAlchemyConversationStore,
+    journal: SessionJournalStore,
+) -> None:
+    times = iter((100, 200, 300, 400, 500, 500, 600))
+    monkeypatch.setattr("omnigent.stores.session_journal_store.now_epoch", lambda: next(times))
+    journal.append(SESSION, "plan", _plan("a"), idempotency_key="k0", workflow_id=WORKFLOW)
+    journal.append(OTHER, "plan", _plan("a"), idempotency_key="k1", workflow_id=WORKFLOW)
+    journal.append(SESSION, "plan", _plan("a", "b"), idempotency_key="k2")  # a replan
+    journal.append(OTHER, "plan", _plan("x"), idempotency_key="k3", workflow_id=OTHER_WORKFLOW)
+    # The same second: the session ID, then the position, breaks the tie.
+    journal.append(SESSION, "plan", _plan("c"), idempotency_key="k4", workflow_id=WORKFLOW)
+    journal.append(OTHER, "plan", _plan("c"), idempotency_key="k5", workflow_id=WORKFLOW)
+    journal.append(
+        SESSION, "status", {"status": "done", "text": "ok"}, idempotency_key="k6", step="c"
+    )
+    conversations.fork_conversation(SESSION)  # A copy isn't a run.
+
+    first = journal.list_workflow_runs(WORKFLOW, limit=2)
+    rest = journal.list_workflow_runs(WORKFLOW, limit=2, before=first.next_cursor)
+
+    assert [(p.conversation_id, p.created_at) for p in first.plans] == [
+        (OTHER, 500),
+        (SESSION, 500),
+    ]
+    assert [(p.conversation_id, p.created_at) for p in rest.plans] == [
+        (OTHER, 200),
+        (SESSION, 100),
+    ]
+    assert rest.next_cursor is None
+    assert [p.payload["steps"][0]["id"] for p in rest.plans] == ["a", "a"]
+    assert journal.list_workflow_runs(OTHER_WORKFLOW).plans[0].conversation_id == OTHER
+    with pytest.raises(ValueError, match="cursor"):
+        journal.list_workflow_runs(WORKFLOW, before="100.nope.1")
+    with pytest.raises(ValueError, match="workflow_id"):
+        journal.list_workflow_runs("nope")
+
+
+def test_plan_step_statuses_reads_each_steps_newest_status(journal: SessionJournalStore) -> None:
+    plan = journal.append(SESSION, "plan", _plan("a", "b", "c"), idempotency_key="k0").entry
+    for key, step, status in (("k1", "a", "started"), ("k2", "a", "done"), ("k3", "b", "failed")):
+        journal.append(
+            SESSION, "status", {"status": status, "text": "x"}, idempotency_key=key, step=step
+        )
+    other = journal.append(OTHER, "plan", _plan("a"), idempotency_key="k4").entry
+
+    assert journal.plan_step_statuses([plan, other]) == [{"a": "done", "b": "failed"}, {}]

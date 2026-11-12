@@ -134,11 +134,17 @@ def _write_request(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         payload = normalize_status(args.get("status"), text=args.get("text"))
         return {"kind": "status", "payload": payload, "step": step}
     plan = normalize_plan(args.get("steps"), name=args.get("name"))
-    return {
+    body: dict[str, Any] = {
         "kind": "plan",
         "payload": {"name": plan["name"], "steps": plan["steps"]},
         "step": None,
     }
+    workflow_id = args.get("workflow_id")
+    if workflow_id is not None:
+        if not (isinstance(workflow_id, str) and _WORKFLOW_ID.fullmatch(workflow_id)):
+            raise InvalidJournalEntryError("workflow_id must be a saved workflow's ID")
+        body["workflow_id"] = workflow_id
+    return body
 
 
 async def _post_with_retries(

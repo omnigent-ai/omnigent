@@ -7,6 +7,8 @@ Routes, under ``/v1``, each scoped to the caller:
 * ``GET /workflows/{workflow_id}`` returns one, with its steps.
 * ``PATCH /workflows/{workflow_id}`` changes its name, description or steps.
 * ``DELETE /workflows/{workflow_id}`` deletes it.
+* ``GET /workflows/{workflow_id}/runs`` lists the sessions that ran it, newest
+  first, with where each run's steps stand.
 
 Another user's workflow answers 404. A write from an agent tool whose session
 is shared with edit access is refused, as project writes are.
@@ -17,26 +19,36 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from collections import Counter
+from collections.abc import Sequence
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
 
+from omnigent.entities import Conversation
+from omnigent.entities.session_journal import JournalEntry
 from omnigent.entities.workflow import InvalidWorkflowError, Workflow
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import LEVEL_READ, AuthProvider
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._sessions.helpers import _session_status_from_cache
 from omnigent.server.schemas import (
     CreateWorkflowRequest,
     UpdateWorkflowRequest,
     WorkflowDeleted,
     WorkflowList,
     WorkflowObject,
+    WorkflowRun,
+    WorkflowRunList,
+    WorkflowRunProgress,
     WorkflowStep,
     WorkflowSummary,
 )
 from omnigent.server.session_orchestration import require_named_source_private
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.session_journal_store import SessionJournalStore
 from omnigent.stores.workflow_store import (
     WORKFLOW_PAGE_MAX,
     WorkflowNameTakenError,
@@ -46,6 +58,9 @@ from omnigent.stores.workflow_store import (
 _logger = logging.getLogger(__name__)
 
 _DEFAULT_PAGE = 50
+# Each run on a page costs one status lookup per step, so pages stay small.
+_DEFAULT_RUNS_PAGE = 20
+_RUNS_PAGE_MAX = 50
 
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by database URL; queries scope rows
 _stores: dict[str, WorkflowStore] = {}
@@ -96,6 +111,19 @@ def _steps(steps: list[WorkflowStep] | None) -> list[dict[str, Any]] | None:
 
 def _not_found() -> OmnigentError:
     return OmnigentError("Workflow not found", code=ErrorCode.NOT_FOUND)
+
+
+def _progress(plan: JournalEntry, statuses: dict[str, str]) -> WorkflowRunProgress:
+    """Count the run's starting steps by their current status."""
+    steps = plan.payload.get("steps", [])
+    counts = Counter(statuses.get(step["id"]) for step in steps)
+    return WorkflowRunProgress(
+        total=len(steps),
+        started=counts["started"],
+        done=counts["done"],
+        needs_input=counts["needs_input"],
+        failed=counts["failed"],
+    )
 
 
 def create_workflows_router(
@@ -243,5 +271,82 @@ def create_workflows_router(
         if not deleted:
             raise _not_found()
         return WorkflowDeleted(id=workflow_id)
+
+    def _readable(user_id: str | None, session: Conversation) -> bool:
+        if permission_store is None:
+            return True
+        return check_session_access(
+            user_id, session.id, LEVEL_READ, permission_store, conversation_store, session
+        )
+
+    def _runs(
+        journal: SessionJournalStore, plans: Sequence[JournalEntry], user_id: str | None
+    ) -> list[WorkflowRun]:
+        """The page's runs in sessions the caller can read, with their progress."""
+        session_ids = [plan.conversation_id for plan in plans]
+        sessions = conversation_store.get_conversations(session_ids)
+        readable = [
+            plan
+            for plan in plans
+            if plan.conversation_id in sessions
+            and _readable(user_id, sessions[plan.conversation_id])
+        ]
+        activity = conversation_store.get_session_activity(
+            [plan.conversation_id for plan in readable]
+        )
+        statuses = journal.plan_step_statuses(readable)
+        runs = []
+        for plan, step_statuses in zip(readable, statuses, strict=True):
+            session = sessions[plan.conversation_id]
+            live = activity.get(plan.conversation_id)
+            runs.append(
+                WorkflowRun(
+                    session_id=plan.conversation_id,
+                    title=session.title or "",
+                    started_at=plan.created_at,
+                    session_status=_session_status_from_cache(
+                        plan.conversation_id, live.live_status if live is not None else None
+                    ),
+                    archived=session.archived,
+                    progress=_progress(plan, step_statuses),
+                )
+            )
+        return runs
+
+    @router.get("/workflows/{workflow_id}/runs", response_model=WorkflowRunList)
+    async def list_workflow_runs(
+        request: Request,
+        workflow_id: str,
+        limit: int = Query(default=_DEFAULT_RUNS_PAGE, ge=1, le=_RUNS_PAGE_MAX),
+        before: str | None = None,
+    ) -> WorkflowRunList:
+        """List one of the caller's workflows' runs, newest first.
+
+        A run is the plan that named the workflow, so a session that ran it
+        twice is listed twice. Sessions the caller can't read are left out.
+
+        :param limit: Page size, e.g. ``20``.
+        :param before: The previous page's ``next_cursor``.
+        :raises OmnigentError: 401 if unauthenticated in multi-user mode, 404 if
+            the caller has no such workflow, 400 for an invalid cursor.
+        """
+        # Imported here: the journal router checks workflows through this module.
+        from omnigent.server.session_journal import open_store as open_journal_store
+
+        user_id = require_user(request, auth_provider)
+        workflow = await asyncio.to_thread(_store().get, workflow_id, user_id=user_id)
+        if workflow is None:
+            raise _not_found()
+        journal = open_journal_store(conversation_store)
+        if journal is None:
+            return WorkflowRunList()
+        try:
+            page = await asyncio.to_thread(
+                journal.list_workflow_runs, workflow.id, limit=limit, before=before
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        runs = await asyncio.to_thread(_runs, journal, page.plans, user_id)
+        return WorkflowRunList(data=runs, next_cursor=page.next_cursor)
 
     return router
