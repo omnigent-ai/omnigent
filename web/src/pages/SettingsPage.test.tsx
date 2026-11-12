@@ -60,6 +60,7 @@ const mocks = vi.hoisted(() => ({
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
+  effectiveAdmin: undefined as boolean | undefined,
   conversations: [] as Conversation[],
   conversationQuery: vi.fn(),
   // Optional multi-page dataset (array of per-page row arrays) for pagination
@@ -103,9 +104,7 @@ vi.mock("@/lib/accountsApi", () => ({
 }));
 vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
-  getCurrentIsAdmin: () =>
-    (mocks.me?.is_admin ?? false) &&
-    (mocks.adminViewSupported === false || adminView.isAdminViewEnabled()),
+  getCurrentIsAdmin: () => mocks.effectiveAdmin ?? mocks.me?.is_admin ?? false,
   getCurrentAdminEligibility: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
   subscribeIdentity: () => () => {},
@@ -293,6 +292,7 @@ beforeEach(() => {
   mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
+  mocks.effectiveAdmin = undefined;
   mocks.conversations = [];
   mocks.pages = undefined;
   mocks.projectNames = [];
@@ -388,9 +388,18 @@ describe("SettingsPage", () => {
     expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
   });
 
-  it("keeps the admin-view switch available while admin view is off", () => {
+  it("hides admin view in a workspace while on", () => {
     mocks.me = { id: "admin", is_admin: true };
+    vi.spyOn(host, "isDatabricksWorkspace").mockReturnValue(true);
+    renderPage("/settings/general");
+    expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
+  });
+
+  it.each([false, true])("keeps admin view recoverable while off (workspace=%s)", (workspace) => {
+    mocks.me = { id: "admin", is_admin: true };
+    mocks.effectiveAdmin = false;
     mocks.singleUser = false;
+    vi.spyOn(host, "isDatabricksWorkspace").mockReturnValue(workspace);
     document.cookie = "omnigent_admin_view=off; Path=/";
     const update = vi.spyOn(adminView, "setAdminViewEnabled").mockImplementation(() => {});
     try {
