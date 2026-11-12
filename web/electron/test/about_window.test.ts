@@ -15,6 +15,8 @@ import {
   type AboutWindowOptions,
 } from "../src/about_window.ts";
 import type { UpdateStatus } from "../src/desktop_updater.ts";
+import type { ElectronAboutBridge } from "../src/ipc/bridge.ts";
+import { bundledPreloadSource, runPreload } from "./preloadHarness.ts";
 
 const ABOUT_PAGE = "/app/about/index.html";
 
@@ -245,16 +247,14 @@ describe("resolveAppIconDataUrl", () => {
 });
 
 describe("About window", () => {
-  it("packages the bundled About page with button and Escape close controls", () => {
+  it("packages the bundled About page with button and Escape close controls", async () => {
     const packageConfig: { build: { files: string[] } } = JSON.parse(
       fs.readFileSync(path.join(import.meta.dirname, "../package.json"), "utf8"),
     );
     const html = fs.readFileSync(path.join(import.meta.dirname, "../about/index.html"), "utf8");
     const script = fs.readFileSync(path.join(import.meta.dirname, "../about/index.js"), "utf8");
-    const preload = fs.readFileSync(
-      path.join(import.meta.dirname, "../src/about_preload.js"),
-      "utf8",
-    );
+    const preload = runPreload(await bundledPreloadSource("about_preload"));
+    const about = preload.exposed.get("omnigentAbout") as ElectronAboutBridge;
 
     assert.ok(packageConfig.build.files.includes("about/**/*"));
     assert.match(html, /img-src 'self' data:/);
@@ -268,10 +268,20 @@ describe("About window", () => {
     assert.match(script, /desktopHeading\.textContent = `Omnigent \$\{platformName\} app`/);
     assert.match(script, /event\.key !== "Escape"/);
     assert.match(script, /api\?\.close\(\)/);
-    assert.match(preload, /downloadDesktopUpdate:[\s\S]*about-download-desktop-update/);
-    assert.match(preload, /installDesktopUpdate:[\s\S]*about-install-desktop-update/);
-    assert.match(preload, /onDesktopUpdateStatus:[\s\S]*omnigent:update-status/);
-    assert.match(preload, /close:\s*\(\)\s*=>\s*ipcRenderer\.send\("omnigent:about-close"\)/);
+    await about.downloadDesktopUpdate();
+    await about.installDesktopUpdate();
+    assert.deepEqual(preload.invokes, [
+      { channel: "omnigent:about-download-desktop-update", args: [] },
+      { channel: "omnigent:about-install-desktop-update", args: [] },
+    ]);
+    const statuses: unknown[] = [];
+    const unsubscribe = about.onDesktopUpdateStatus((status) => statuses.push(status));
+    preload.emit("omnigent:update-status", { state: "checking" });
+    unsubscribe();
+    assert.deepEqual(statuses, [{ state: "checking" }]);
+    assert.equal(preload.hasListener("omnigent:update-status"), false);
+    about.close();
+    assert.deepEqual(preload.sends, [{ channel: "omnigent:about-close", args: [] }]);
   });
 
   it("opens a shell-owned modal and reuses it", () => {

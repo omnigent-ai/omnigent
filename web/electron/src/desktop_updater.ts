@@ -22,7 +22,9 @@
 //     freshly-loaded renderer can replay the latest state without a round trip.
 //   - v1 is stable-only and rides electron-updater's default "latest" channel.
 
-export type UpdateMode = "none" | "manual" | "start" | "default";
+import type { UpdateConfig, UpdateMode } from "./ipc/bridge.ts";
+
+export type { UpdateConfig, UpdateMode };
 
 /** Update modes persisted in settings.json under `update_mode`. */
 export const UPDATE_MODES: ReadonlySet<UpdateMode> = new Set<UpdateMode>([
@@ -34,13 +36,6 @@ export const UPDATE_MODES: ReadonlySet<UpdateMode> = new Set<UpdateMode>([
 export const UPDATES_UNAVAILABLE_IN_DEV = "Desktop updates are unavailable in development builds.";
 /** Background re-check cadence for the "default" mode (every 6 hours). */
 const PERIODIC_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
-
-/** The update config the renderer sees. */
-export interface UpdateConfig {
-  mode: UpdateMode;
-  autoInstall: boolean;
-  skippedVersion: string | null;
-}
 
 export type UpdateState =
   "idle" | "checking" | "available" | "none" | "downloading" | "downloaded" | "error-security";

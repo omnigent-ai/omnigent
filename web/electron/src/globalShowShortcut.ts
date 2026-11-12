@@ -1,23 +1,16 @@
 // Optional system-wide shortcut that brings the app to the front from any app.
 // Off by default. The chord stays in settings.json while the shortcut is off.
 
+import type { GlobalShortcutSetting, GlobalShortcutStatus } from "./ipc/bridge.ts";
+
+export type { GlobalShortcutSetting, GlobalShortcutStatus };
+
 /** settings.json key: `{ enabled, accelerator }`. */
 const GLOBAL_SHORTCUT_SETTING = "global_shortcut";
 const DEFAULT_ACCELERATOR = "Alt+Space";
 const UNAVAILABLE_ERROR =
   "Couldn't use that shortcut. It may be invalid or already in use by another app.";
 const SAVE_ERROR = "Couldn't save the shortcut. Try again.";
-
-/** The saved shortcut: whether it is on, and its chord. */
-export interface GlobalShortcutSetting {
-  enabled: boolean;
-  accelerator: string;
-}
-
-/** The saved setting, with an error while it is on but not registered. */
-export interface GlobalShortcutStatus extends GlobalShortcutSetting {
-  error?: string;
-}
 
 export type GlobalShortcutSetResult =
   { ok: true; setting: GlobalShortcutSetting } | { ok: false; error: string };

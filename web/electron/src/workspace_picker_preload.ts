@@ -4,15 +4,17 @@
 // the user's choice back. contextIsolation is on, so the page reaches these only
 // through the exposed `window.workspacePicker` — never Node/ipcRenderer directly.
 
-"use strict";
+import { contextBridge, ipcRenderer } from "electron";
+import type { ElectronWorkspacePickerBridge } from "./ipc/bridge.ts";
+import { createRendererIpc } from "./ipc/renderer.ts";
 
-const { contextBridge, ipcRenderer } = require("electron");
+const ipc = createRendererIpc(ipcRenderer);
 
 contextBridge.exposeInMainWorld("workspacePicker", {
   /** Fetch the workspaces to show: [{ workspaceId, name, fqdn }]. */
-  list: () => ipcRenderer.invoke("workspacePicker:list"),
+  list: () => ipc.invoke("workspacePicker:list"),
   /** Resolve the picker with the chosen workspace id. */
-  choose: (workspaceId) => ipcRenderer.send("workspacePicker:choose", workspaceId),
+  choose: (workspaceId) => ipc.send("workspacePicker:choose", workspaceId),
   /** Dismiss the picker without choosing. */
-  cancel: () => ipcRenderer.send("workspacePicker:cancel"),
-});
+  cancel: () => ipc.send("workspacePicker:cancel"),
+} satisfies ElectronWorkspacePickerBridge);

@@ -24,8 +24,8 @@ export function pagePath(directory: string, file = "index.html"): string {
 }
 
 /**
- * Absolute path to a bundled preload. The bundle keeps the source file name,
- * so src/find_preload.js becomes app/find_preload.js.
+ * Absolute path to a bundled preload: src/find_preload.ts bundles to
+ * app/find_preload.js.
  *
  * @param name Preload file name without the extension.
  */

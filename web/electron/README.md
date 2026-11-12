@@ -379,11 +379,11 @@ electron/
   scripts/build.mjs        # bundles main, preloads and the setup page's URL helpers into app/
   src/main.js              # main process: window, settings, menu, IPC, badge, notify
   src/paths.ts             # page, preload and icon locations
-  src/preload.js           # contextBridge: window.omnigentDesktop + omnigentSetup
+  src/preload.ts           # contextBridge: window.omnigentDesktop + omnigentSetup
   src/about_window.ts      # shell-owned About modal + guarded update IPC
-  src/about_preload.js     # narrow contextBridge for the About modal
+  src/about_preload.ts     # narrow contextBridge for the About modal
   src/managed_preferences.js # read/validate macOS MDM server choices
-  src/find_preload.js      # contextBridge for the find bar: window.omnigentFind
+  src/find_preload.ts      # contextBridge for the find bar: window.omnigentFind
   src/browserViewRegistry.ts  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.ts    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
@@ -411,7 +411,7 @@ dismisses.
   creation, the application menu, permission handling (microphone), and IPC
   handlers for the badge and notifications (`normalize_url`, `change_server`,
   navigate-to-server, New Window).
-- **Preload** (`src/preload.js`) is the only bridge between the remote
+- **Preload** (`src/preload.ts`) is the only bridge between the remote
   (untrusted) SPA and the main process. It runs with `contextIsolation` and
   exposes a tiny, serialization-safe API via `contextBridge` — never raw
   `ipcRenderer` or Node.
@@ -452,7 +452,7 @@ dismisses.
   auth.atlassian.com, login.microsoftonline.com, salesforce.com), or
   hand-listed in `settings.json` under `popup_allowed_origins`. The child
   is hardened (`hardenOauthPopup`): it never gets the shell preload (a
-  no-op `popup_preload.js` instead), runs sandboxed, shows the **current
+  no-op `popup_preload.ts` instead), runs sandboxed, shows the **current
   host in its title** on every navigation (the page can't control the
   prefix), and cannot open popups of its own. It is never entered in the
   shell's window registry, so it gains none of that registry's privileges
@@ -712,7 +712,7 @@ including the address bar, chat links, and agent actions, enforces this policy.
   Chrome profile for the toolbar's **Import cookies from Chrome** action (below).
   Electron-free, so it is unit-tested with a stub session and a synthetic
   `Cookies` DB.
-- `src/preload.js` — adds `browserOpenOrNavigate/SetActive/Resize/Screenshot/`
+- `src/preload.ts` — adds `browserOpenOrNavigate/SetActive/Resize/Screenshot/`
   `Execute/Close` + `browserHasView`, the toolbar methods
   `browserGoBack/GoForward/Reload` + `openBrowserDevTools`, the design-mode
   methods `browserEnableDesignMode/DisableDesignMode/SignalDesignResult`, the

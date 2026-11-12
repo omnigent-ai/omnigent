@@ -317,7 +317,7 @@ const ERR_BLOCKED_BY_CLIENT = -20;
 
 /**
  * No-op preload for OAuth popup windows — children must never inherit the
- * shell preload's IPC bridges. See popup_preload.js.
+ * shell preload's IPC bridges. See popup_preload.ts.
  */
 const POPUP_PRELOAD = preloadPath("popup_preload");
 
@@ -374,8 +374,8 @@ function startArcaHostConnect(serverUrl, deps) {
 const arcaConnectFlow = createArcaConnectFlow({
   BrowserWindow,
   ipcMain,
-  pagePath: path.join(__dirname, "..", "arca-connect", "index.html"),
-  preloadPath: path.join(__dirname, "arca_connect_preload.js"),
+  pagePath: pagePath("arca-connect"),
+  preloadPath: preloadPath("arca_connect_preload"),
   startConnect: (serverUrl, onOutput) => startArcaHostConnect(serverUrl, { onOutput }),
   startLogin: (serverUrl) => arca.startArcaLogin(serverUrl),
   loginCommandLine: (serverUrl) => {
@@ -3013,7 +3013,7 @@ function positionFindBar(target, bar) {
 /**
  * Open the find bar for a shell window (or re-focus the one already open).
  * The bar is a frameless always-on-top-of-parent child window with its own
- * narrow preload (`find_preload.js`); search results stream back to it via
+ * narrow preload (`find_preload.ts`); search results stream back to it via
  * the parent webContents' `found-in-page` event.
  *
  * @param {BrowserWindow} target The shell window to search.
@@ -4146,7 +4146,7 @@ function isPinnedOriginSender(event) {
 //
 // `omnigent:browser-execute` runs JS via executeJavaScript; exposed to preload
 // for the relay's fixed templates only, never a generic agent `evaluate`.
-// See preload.js + README.
+// See preload.ts + README.
 // ---------------------------------------------------------------------------
 
 /** Deny browser permissions except user-approved local network access. */

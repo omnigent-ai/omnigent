@@ -18,7 +18,7 @@
     "start": "electron .",
     "dev": "electron .",
     "test": "node --test",
-    "typecheck": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.preload.json",
     "build": "electron-builder -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev",
     "build:mac": "electron-builder --mac -c.appId=ai.omnigent.desktop-dev -c.productName='Omnigent Dev' -c.directories.output=dist-dev -c.extraMetadata.omnigentBuild=dev",
     "build:mac:release": "OMNIGENT_NOTARIZE_DMG=true electron-builder --mac -c.mac.notarize=true -c.dmg.sign=true",
