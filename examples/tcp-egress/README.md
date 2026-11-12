@@ -10,6 +10,10 @@ Use a build containing named TCP egress on the server, host, and runner.
 needs `bwrap` installed and user namespaces enabled. Neither example needs
 credentials for the destination service.
 
+The commands below use the repository's `.venv` and set `PYTHONPATH` so the CLI,
+server, and runner import this checkout, including when worktrees share a virtual
+environment. Run them from the root of the checkout containing this feature.
+
 ## Local Python HTTP listener
 
 Run these commands from the repository root in terminal A. The UDP socket below
@@ -53,14 +57,16 @@ path printed above, and run:
 ```sh
 # Replace this with the Agent YAML path printed in terminal A.
 export TCP_DEMO_YAML=/tmp/omnigent-tcp-demo.REPLACE/local-http.yaml
+PYTHONPATH="$PWD:$PWD/sdks/python-client:$PWD/sdks/ui" \
 OMNIGENT_DATABASE_URI="sqlite:///$HOME/.omnigent/chat.db" \
-  omnigent run "$TCP_DEMO_YAML" --server local \
+  .venv/bin/python -m omnigent.cli run "$TCP_DEMO_YAML" --server local \
   -p 'Run all three network checks in your instructions and show their results.'
 ```
 
-Use your installation of this branch's CLI (for example, the repository's
-absolute `.venv/bin/omnigent` path). `--server local` overrides a configured
-remote server. Restart an older local server/host before testing this build.
+For an installed build containing this feature, use `omnigent run` in place of
+`.venv/bin/python -m omnigent.cli run`; `PYTHONPATH` is only needed for the source
+checkout. `--server local` overrides a configured remote server. Restart an older
+local server/host before testing this build.
 
 Expected results:
 
@@ -86,8 +92,9 @@ directory from terminal A with `rm -r "$TCP_DEMO_DIR"`.
 From the repository root:
 
 ```sh
+PYTHONPATH="$PWD:$PWD/sdks/python-client:$PWD/sdks/ui" \
 OMNIGENT_DATABASE_URI="sqlite:///$HOME/.omnigent/chat.db" \
-  omnigent run examples/tcp-egress/public-ssh.yaml --server local \
+  .venv/bin/python -m omnigent.cli run examples/tcp-egress/public-ssh.yaml --server local \
   -p 'Read the public SSH banner using the granted connector and report it.'
 ```
 
