@@ -368,10 +368,17 @@ describe("side-chat working indicator", () => {
     expect(screen.getByRole("button", { name: "Send side question" })).toBeEnabled();
   });
 
-  it("starts a typed /side question's fork once under StrictMode", () => {
+  it("starts a typed /side question's fork once under StrictMode, with its quotes", () => {
     const onStart = vi.fn(() => new Promise<void>(() => {}));
     useChatStore.setState({
-      sideChatComposers: { "pending:slash": { text: "why?", files: [], autoStart: true } },
+      sideChatComposers: {
+        "pending:slash": {
+          text: "why?",
+          files: [],
+          quotes: [{ id: "quote", before: "", text: "selected line" }],
+          autoStart: true,
+        },
+      },
     });
 
     renderPane(
@@ -380,7 +387,7 @@ describe("side-chat working indicator", () => {
       </StrictMode>,
     );
 
-    expect(onStart).toHaveBeenCalledExactlyOnceWith("why?");
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("> selected line\n\nwhy?");
     expect(useChatStore.getState().sideChatComposers["pending:slash"]).toMatchObject({
       autoStart: false,
       starting: true,

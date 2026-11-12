@@ -421,7 +421,7 @@ export function SideChatPane({
       ...current,
       autoStart: false,
     }));
-    void startSideChat(composer.text);
+    void startSideChat(serializeReplyDraft({ quotes: composer.quotes ?? [], text: composer.text }));
   });
 
   return (
