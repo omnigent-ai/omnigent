@@ -6,7 +6,8 @@ local file from the UI (the CLI ``omnigent session export`` is the only
 path). The first test pins the Export affordance in the kebab menu; the
 second drives the full journey — click Export, receive a file download
 whose content preserves the transcript: both turns in order, the code
-block, and the link.
+block, and the link — in the ``record_type`` JSONL that every released
+``omnigent session import`` reads, the CLI's default export format too.
 
 Content markers are single-line and quote-free so they survive any export
 format unchanged (a JSONL export JSON-escapes newlines and quotes).
@@ -14,6 +15,7 @@ format unchanged (a JSONL export JSON-escapes newlines and quotes).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -100,7 +102,7 @@ def test_header_export_downloads_transcript(
     page: Page,
     transcript_session: tuple[str, str],
 ) -> None:
-    """Export saves a local file preserving turn order, code, and links."""
+    """Export saves an importable file preserving turn order, code, and links."""
     base_url, session_id = transcript_session
     _open_session_menu(page, base_url, session_id)
 
@@ -109,10 +111,19 @@ def test_header_export_downloads_transcript(
     with page.expect_download() as download_info:
         export_item.click()
     download = download_info.value
-    assert download.suggested_filename
+    assert download.suggested_filename == f"{session_id}.jsonl"
 
     exported = Path(str(download.path())).read_text(encoding="utf-8")
     positions = [exported.find(marker) for marker in _MARKERS_IN_ORDER]
     missing = [m for m, pos in zip(_MARKERS_IN_ORDER, positions, strict=True) if pos == -1]
     assert not missing, f"export is missing transcript content: {missing}"
     assert positions == sorted(positions), f"export lost turn order: {positions}"
+
+    # A session_meta line, then one item line per item; only the seeded messages are pinned.
+    records = [json.loads(line) for line in exported.splitlines() if line]
+    assert records[0]["record_type"] == "session_meta"
+    assert records[0]["id"] == session_id
+    items = records[1:]
+    assert {r["record_type"] for r in items} == {"item"}
+    messages = [r for r in items if r["type"] == "message"]
+    assert [r["role"] for r in messages] == ["user", "assistant", "user", "assistant"]
