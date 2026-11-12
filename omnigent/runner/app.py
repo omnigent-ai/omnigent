@@ -6628,6 +6628,7 @@ def create_runner_app(
                 if _dispatch_tasks:
                     await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
                 if not _owns_live_turn():
+                    _report_held_refusal()
                     return None
                 lifecycle_event: _JsonObject | None = None
                 lifecycle_error: _JsonObject | None = None
@@ -6687,9 +6688,9 @@ def create_runner_app(
                     json=event_body,
                     timeout=None,
                 ) as harness_resp:
-                    if not _owns_live_turn():
-                        return
                     if harness_resp.status_code != 200:
+                        if not _owns_live_turn():
+                            return
                         _logger.error(
                             "harness rejected turn delivery for %s with status %d",
                             conv_id,
@@ -6744,12 +6745,8 @@ def create_runner_app(
                     # call, so a later compaction snapshot already covers them.
                     _text_acc_before_tool = 0
                     async for chunk in harness_resp.aiter_text():
-                        if not _owns_live_turn():
-                            return
                         _buffer += chunk
                         while "\n\n" in _buffer:
-                            if not _owns_live_turn():
-                                return
                             frame, _, _buffer = _buffer.partition("\n\n")
                             raw_sse_bytes = (frame + "\n\n").encode("utf-8")
 
@@ -6770,6 +6767,35 @@ def create_runner_app(
                                     event = None
                             else:
                                 event = None
+
+                            if not _owns_live_turn():
+                                _report_held_refusal()
+                                # Preserve a refused input without settling the successor's turn.
+                                if (
+                                    isinstance(event, dict)
+                                    and event.get("type") == "response.failed"
+                                ):
+                                    response = event.get("response")
+                                    error = event.get("error") or (
+                                        response.get("error")
+                                        if isinstance(response, dict)
+                                        else None
+                                    )
+                                    if (
+                                        harness_name == "claude-native"
+                                        and isinstance(error, dict)
+                                        and error.get("code") == "databricks_sign_in_pending"
+                                        and error.get("undelivered") is True
+                                        and (
+                                            "input_stable_id" in turn_input_identity
+                                            or {"pending_id", "delivery_attempt_id"}
+                                            <= turn_input_identity.keys()
+                                        )
+                                    ):
+                                        event.update(turn_input_identity)
+                                        _publish_event(conv_id, event)
+                                        yield _encode_sse_event(event)
+                                continue
 
                             _defer_publish = False
                             if event is not None:
@@ -7176,6 +7202,7 @@ def create_runner_app(
 
             except _ContextWindowOverflow as overflow:
                 if not _owns_live_turn():
+                    _report_held_refusal()
                     return
                 _report_held_refusal()
                 _error = {
@@ -7202,6 +7229,7 @@ def create_runner_app(
 
             except (httpx.HTTPError, RuntimeError) as exc:
                 if not _owns_live_turn():
+                    _report_held_refusal()
                     _logger.warning(
                         "Retired harness stream failed for %s; preserving the newer turn",
                         conv_id,
