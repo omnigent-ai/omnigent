@@ -16,7 +16,7 @@ import {
   insertOnOwnLine,
   PullRequestDescription,
   PullRequestTitle,
-  rememberUploadedImage,
+  rememberUploadedMedia,
   resetPullRequestDescriptionDrafts,
 } from "./PullRequestDetails";
 
@@ -415,18 +415,20 @@ it("shows this tab's uploads from local copies, before and after saving", async 
   expect(copies.revoked).toEqual([]);
 });
 
-it("keeps no copies of videos and drops the oldest image copies past the cap", () => {
+it("keeps no copies of other files and drops the oldest media copies past the cap", () => {
   const copies = stubObjectUrls();
-  const video = new File(["mp4"], "demo.mp4", { type: "video/mp4" });
-  rememberUploadedImage(`${ASSET_URL}-video`, video);
+  rememberUploadedMedia(`${ASSET_URL}-text`, new File(["x"], "notes.txt", { type: "text/plain" }));
   expect(copies.created).toEqual([]);
 
-  for (let index = 0; index <= 50; index += 1) {
-    rememberUploadedImage(
+  const video = new File(["mp4"], "demo.mp4", { type: "video/mp4" });
+  rememberUploadedMedia(`${ASSET_URL}-video`, video);
+  for (let index = 0; index < 50; index += 1) {
+    rememberUploadedMedia(
       `${ASSET_URL}-${index}`,
       new File(["png"], "a.png", { type: "image/png" }),
     );
   }
+  expect(copies.created[0]).toBe(video);
   expect(copies.revoked).toEqual(["blob:copy-1"]);
 });
 
@@ -449,8 +451,52 @@ it("falls back to GitHub, and says so when GitHub can't serve the image", () => 
   expect(screen.getByText("Image not available")).toBeInTheDocument();
 });
 
+it("plays a bare attachment URL as a video, and links to it when it won't play", async () => {
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <PullRequestDescription
+        conversationId="conv_1"
+        prUrl={PR_URL}
+        body={`Demo:\n\n${ASSET_URL}`}
+        editable={false}
+        attachments
+      />
+    </QueryClientProvider>,
+  );
+  await screen.findByText("Demo:");
+  const video = document.querySelector("video");
+  expect(video).toHaveAttribute("src", ASSET_URL);
+  expect(video).toHaveAttribute("controls");
+  expect(screen.queryByRole("link", { name: ASSET_URL })).not.toBeInTheDocument();
+
+  fireEvent.error(video!);
+  expect(screen.getByRole("link", { name: ASSET_URL })).toHaveAttribute("href", ASSET_URL);
+  expect(document.querySelector("video")).toBeNull();
+});
+
+it("previews an uploaded video from its local copy", async () => {
+  const { uploads } = stubFetch();
+  const copies = stubObjectUrls();
+  renderDetails();
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+  fireEvent.change(editor(), { target: { value: "" } });
+  const video = new File(["mp4"], "demo.mp4", { type: "video/mp4" });
+  fireEvent.paste(editor(), { clipboardData: { files: [video] } });
+  await waitFor(() => expect(uploads).toHaveLength(1));
+  await act(async () => uploads[0].respond(attachment("video/mp4")));
+  await waitFor(() => expect(editor()).toHaveValue(ASSET_URL));
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Preview" }));
+
+  await waitFor(() =>
+    expect(document.querySelector("video")).toHaveAttribute("src", "blob:copy-1"),
+  );
+  expect(copies.created).toEqual([video]);
+});
+
 it("puts an uploaded video on its own line and drops a failed upload", async () => {
   const { uploads } = stubFetch();
+  stubObjectUrls();
   renderDetails();
 
   fireEvent.click(screen.getByRole("button", { name: "Edit description" }));

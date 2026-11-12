@@ -46,14 +46,15 @@ export const GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehyp
   true,
 );
 
-// An image GitHub hosts for a PR or issue, e.g. a pasted screenshot. Exact shape
-// only, so loading it can reach nothing but GitHub's asset store.
-const GITHUB_ATTACHMENT_IMAGE =
+// An image or video GitHub hosts for a PR or issue, e.g. a pasted screenshot.
+// Exact shape only, so loading it can reach nothing but GitHub's asset store.
+const GITHUB_ATTACHMENT_ASSET =
   /^https:\/\/github\.com\/user-attachments\/assets\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // The only attributes a restored image keeps, so nothing like `srcset` can load elsewhere.
 const GITHUB_IMAGE_ATTRIBUTES = ["src", "alt", "title", "width", "height"];
-// Harden checks only `img` tags, so a parked image passes through it untouched.
+// Harden checks only `img` and `a` tags, so a parked attachment passes through it untouched.
 const PARKED_GITHUB_IMAGE_TAG = "omnigent-github-image";
+const PARKED_GITHUB_VIDEO_TAG = "omnigent-github-video";
 
 // Attribute carrying the workspace path a file link names, percent-decoded
 // from its (unhardened) href so it matches the real filename on disk.
@@ -171,6 +172,7 @@ interface HastElement {
   tagName?: string;
   properties?: Record<string, unknown>;
   children?: HastElement[];
+  value?: string;
 }
 
 // Streamdown enables a link-safety confirmation modal by default: clicking any
@@ -299,29 +301,83 @@ function decodeFilePath(path: string): string {
   return splitWorkspaceFileCitation(decoded).hasPosition ? path : decoded;
 }
 
-/** Hides GitHub attachment images from harden, which blocks every remote image. */
-function parkGitHubAttachmentImages() {
+/**
+ * Hides GitHub attachments from harden, which blocks every remote image. A bare
+ * attachment URL on a line of its own is the one GitHub plays as a video.
+ */
+function parkGitHubAttachments() {
   return (tree: HastElement) => {
     visitElements(tree, (node) => {
       const src = node.properties?.src;
-      if (node.tagName === "img" && typeof src === "string" && GITHUB_ATTACHMENT_IMAGE.test(src)) {
+      if (node.tagName === "img" && typeof src === "string" && GITHUB_ATTACHMENT_ASSET.test(src)) {
         node.tagName = PARKED_GITHUB_IMAGE_TAG;
+      } else if (node.tagName === "p" && node.children) {
+        node.children = node.children.map((child, index, siblings) =>
+          isBareGitHubAttachmentLink(child) &&
+          startsLine(siblings[index - 1]) &&
+          endsLine(siblings[index + 1])
+            ? {
+                type: "element",
+                tagName: PARKED_GITHUB_VIDEO_TAG,
+                properties: { src: child.properties?.href },
+                children: [],
+              }
+            : child,
+        );
       }
     });
   };
 }
 
-/** Restores the images {@link parkGitHubAttachmentImages} parked, sent without a referrer. */
-function restoreGitHubAttachmentImages() {
+/** An attachment URL autolinked as itself; a titled link stays a link, as on GitHub. */
+function isBareGitHubAttachmentLink(node: HastElement): boolean {
+  const href = node.properties?.href;
+  const [text, ...rest] = node.children ?? [];
+  return (
+    node.tagName === "a" &&
+    typeof href === "string" &&
+    GITHUB_ATTACHMENT_ASSET.test(href) &&
+    rest.length === 0 &&
+    text?.type === "text" &&
+    text.value === href
+  );
+}
+
+function startsLine(previous: HastElement | undefined): boolean {
+  return (
+    !previous ||
+    previous.tagName === "br" ||
+    (previous.type === "text" && /\n[ \t]*$/.test(previous.value ?? ""))
+  );
+}
+
+function endsLine(next: HastElement | undefined): boolean {
+  return (
+    !next || next.tagName === "br" || (next.type === "text" && /^[ \t]*\n/.test(next.value ?? ""))
+  );
+}
+
+/**
+ * Restores the attachments {@link parkGitHubAttachments} parked: images sent
+ * without a referrer, and videos as players that load only their metadata.
+ */
+function restoreGitHubAttachments() {
   return (tree: HastElement) => {
     visitElements(tree, (node) => {
-      if (node.tagName !== PARKED_GITHUB_IMAGE_TAG) return;
-      node.tagName = "img";
-      const kept = GITHUB_IMAGE_ATTRIBUTES.filter((name) => node.properties?.[name] !== undefined);
-      node.properties = {
-        ...Object.fromEntries(kept.map((name) => [name, node.properties?.[name]])),
-        referrerPolicy: "no-referrer",
-      };
+      if (node.tagName === PARKED_GITHUB_IMAGE_TAG) {
+        node.tagName = "img";
+        const kept = GITHUB_IMAGE_ATTRIBUTES.filter(
+          (name) => node.properties?.[name] !== undefined,
+        );
+        node.properties = {
+          ...Object.fromEntries(kept.map((name) => [name, node.properties?.[name]])),
+          referrerPolicy: "no-referrer",
+        };
+      } else if (node.tagName === PARKED_GITHUB_VIDEO_TAG) {
+        // Media elements take no referrer policy, so the page's default applies.
+        node.tagName = "video";
+        node.properties = { src: node.properties?.src, controls: true, preload: "metadata" };
+      }
     });
   };
 }
@@ -441,7 +497,7 @@ function createStreamdownRehypePlugins(
     if (markFileLinks) {
       plugins.push(markWorkspaceFileLinks);
     }
-    if (allowGitHubAttachmentImages) plugins.push(parkGitHubAttachmentImages);
+    if (allowGitHubAttachmentImages) plugins.push(parkGitHubAttachments);
     if (allowWorkspaceImages) plugins.push(parkWorkspaceImages);
 
     if (!isStreamdownHardenPlugin(plugin)) {
@@ -452,11 +508,11 @@ function createStreamdownRehypePlugins(
       plugin[0],
       { ...plugin[1], allowedImagePrefixes: [] },
     ] satisfies StreamdownPluginTuple);
-    if (allowGitHubAttachmentImages) plugins.push(restoreGitHubAttachmentImages);
+    if (allowGitHubAttachmentImages) plugins.push(restoreGitHubAttachments);
     if (allowWorkspaceImages) plugins.push(restoreWorkspaceImages);
   }
 
-  // Sanitize must run first: it drops raw HTML that could forge a parked image.
+  // Sanitize must run first: it drops raw HTML that could forge a parked attachment.
   if ((markFileLinks || allowGitHubAttachmentImages || allowWorkspaceImages) && !sawSanitize) {
     throw new Error("Streamdown default rehype plugins carry no sanitize step");
   }
