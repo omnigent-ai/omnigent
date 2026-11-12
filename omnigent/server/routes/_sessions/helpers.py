@@ -5049,12 +5049,11 @@ def _require_codex_approval_mode_forward(
     runner_result: _RunnerForwardResult | None,
 ) -> None:
     """
-    Fail when a live codex approval-mode switch wasn't applied by the runner.
+    Fail when a live codex approval-mode switch wasn't applied or queued.
 
     The runner applies the mode by driving Codex's own ``/permissions`` popup
-    and only returns 2xx once it confirms Codex echoed the switch. Persisting the
-    label without a confirmed forward would let the picker claim a mode the TUI
-    isn't in, so an explicit switch requires a reachable runner that confirmed it.
+    when idle, or queues it behind the active turn. An explicit switch requires
+    a reachable runner that accepted one of those outcomes.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param mode: Requested approval mode, e.g. ``"read-only"``.

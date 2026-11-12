@@ -11848,12 +11848,14 @@ async def test_patch_collaboration_mode_rejects_non_codex_session(
     assert "collaboration_mode is only supported" in resp.text
 
 
+@pytest.mark.parametrize("queued", [False, True], ids=["applied", "queued"])
 async def test_patch_approval_mode_forwards_and_persists_label(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    queued: bool,
 ) -> None:
     """
-    PATCH ``approval_mode`` drives the Codex ``/permissions`` popup and records it.
+    PATCH ``approval_mode`` applies or queues the Codex preset and records it.
 
     The web picker writes through the sessions PATCH route. The server forwards a
     harness-agnostic ``codex_approval_mode_change`` event so the runner keys the
@@ -11874,7 +11876,10 @@ async def test_patch_approval_mode_forwards_and_persists_label(
         if request.content:
             body = json.loads(request.content)
         captured.append(_ForwardedEffort(url=str(request.url), body=body))
-        return httpx.Response(200, json={"approval_mode": "full-access"})
+        return httpx.Response(
+            202 if queued else 200,
+            json={"approval_mode": "full-access", **({"queued": True} if queued else {})},
+        )
 
     async with _runtime_runner(_handler):
         agent = await create_test_agent(client)

@@ -4411,15 +4411,13 @@ def register_core_routes(
                     "type": "codex_approval_mode_change",
                     "approval_mode": requested_codex_approval_mode,
                 },
-                # The runner drives Codex's /permissions popup — reading the rows,
-                # pressing the preset's digit, then confirming the echo — which
-                # outlasts the default forward budget.
+                # Idle switches confirm Codex's /permissions echo. A busy
+                # session acknowledges immediately and applies the pick later.
                 timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
-            # Raises unless the runner drove the /permissions popup, so the label
-            # can never claim a preset the Codex TUI wasn't switched to. Codex owns
-            # the durable approval state (its own session config); the label is the
-            # web read-back only, so there is no terminal_launch_args coupling here.
+            # Raises unless the runner applied or queued the /permissions switch.
+            # Codex owns the durable approval state; the label is the web read-back
+            # only, so there is no terminal_launch_args coupling here.
             _require_codex_approval_mode_forward(
                 session_id,
                 requested_codex_approval_mode,
