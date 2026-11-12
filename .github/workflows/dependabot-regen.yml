@@ -1,0 +1,113 @@
+# Repair a Dependabot PR's lockfiles automatically. Dependabot regenerates the
+# lockfile of the ecosystem it bumps, but not always completely: an npm bump can
+# arrive with only `web/package.json` changed, so `pnpm install
+# --frozen-lockfile` fails in CI and the auto-merge policy cannot classify the
+# PR. This runs the repair a maintainer's `/regen` comment performs
+# (oss-regen-on-comment.yml) on every Dependabot push, without the comment:
+# check both lockfiles and regenerate only what is inconsistent.
+#
+# Split at the trust boundary into two workflows:
+#   - This one runs `uv lock` and `pnpm install --lockfile-only`, which can
+#     execute code from the updated dependencies (a build backend), and the
+#     PR's own setup actions. It runs on `pull_request`, so a Dependabot-
+#     triggered run gets a read-only token, no Actions secrets and a cache
+#     scoped to the PR ref; it references no secrets either, so an App-identity
+#     push (the auto-merge base refresh) cannot widen it. Its only output is an
+#     artifact holding the regenerated lockfiles.
+#   - dependabot-regen-publish.yml runs on `workflow_run` from main on a fresh
+#     runner, executes no PR code, accepts nothing from the artifact but those
+#     two files, and is the only place the push token exists.
+# A consistent PR uploads nothing, so the push the publisher makes re-triggers
+# this once and it exits clean.
+#
+# A pushed repair commit stops Dependabot from rebasing the PR itself; the
+# auto-merge sweep refreshes the base through the API, so that is not relied on.
+name: Dependabot lockfile regen
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+# A newer push supersedes an older regen; the publisher also drops a result
+# whose commit is no longer the PR head.
+concurrency:
+  group: dependabot-regen-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  regen:
+    name: Regenerate lockfiles (no token)
+    # Same-repo Dependabot PRs only: the publisher pushes to the head branch.
+    if: >-
+      github.repository == 'omnigent-ai/omnigent'
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout the PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      # Pinned to a known main commit rather than the checked-out tree, since
+      # the tree is the PR head (same pattern as the `/regen` workflow).
+      - name: Set up uv (clean public resolution, no proxy cache)
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
+        with:
+          enable-cache: false
+          version: "0.13.4"
+
+      # No pnpm store cache: `--lockfile-only` never fills the store.
+      - name: Set up pnpm
+        uses: ./.github/actions/setup-pnpm
+        with:
+          cache: ""
+
+      # Check-first, per ecosystem, like the scheduled regen job: only a real
+      # manifest/lock desync is regenerated, so a PR whose lockfile is already
+      # consistent uploads nothing. Cooldowns come from uv.toml and
+      # pnpm-workspace.yaml, recorded as relative spans.
+      - name: Regenerate whichever lockfile is inconsistent
+        id: regen
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+          OUT: ${{ runner.temp }}/dependabot-regen
+        run: |
+          if ! uv lock --check; then
+            uv lock
+            python3 scripts/normalize_uv_lock_registry.py uv.lock || true
+            python3 scripts/normalize_uv_lock_registry.py --check uv.lock
+          fi
+          if ! pnpm install --frozen-lockfile --lockfile-only; then
+            pnpm install --lockfile-only --ignore-scripts
+          fi
+          mkdir -p "$OUT"
+          changed=""
+          for lockfile in uv.lock pnpm-lock.yaml; do
+            # --porcelain so a first-time UNTRACKED lockfile counts too.
+            if [ -n "$(git status --porcelain -- "$lockfile")" ]; then
+              cp "$lockfile" "$OUT/"
+              changed="$changed $lockfile"
+            fi
+          done
+          echo "changed=${changed# }" >> "$GITHUB_OUTPUT"
+          if [ -z "$changed" ]; then
+            echo "Lockfiles already consistent — nothing to publish."
+          fi
+
+      - name: Upload the regenerated lockfiles
+        if: steps.regen.outputs.changed != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: dependabot-regen-lockfiles
+          path: ${{ runner.temp }}/dependabot-regen/
+          if-no-files-found: error
+          retention-days: 1

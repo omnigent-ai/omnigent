@@ -255,6 +255,7 @@ describe("resolveServerInfo session_search_scope", () => {
 describe.each([
   "scheduled_task_projects",
   "scheduled_task_harness_settings",
+  "scheduled_task_approval_skipping_modes",
   "scheduled_task_subhour",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
@@ -320,6 +321,32 @@ describe("resolveServerInfo request_managed_sandbox_host_id", () => {
   });
 });
 
+describe("resolveServerInfo session_bundle_workspaces", () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+  ])("requires explicit support for %s", async (value, expected) => {
+    expect((await probe({ session_bundle_workspaces: value })).session_bundle_workspaces).toBe(
+      expected,
+    );
+  });
+});
+
+describe("resolveServerInfo sibling_session_destinations", () => {
+  it.each([
+    ["current_host", "current_host"],
+    ["current_host_or_new_sandbox", "current_host_or_new_sandbox"],
+    ["any_host", "any_host"],
+    [undefined, "any_host"],
+    ["connected_hosts", "current_host"],
+  ])("parses %s as %s", async (advertised, expected) => {
+    const parsed = await probe({ sibling_session_destinations: advertised });
+    expect(parsed.sibling_session_destinations).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo session_fork_workspaces", () => {
   it.each([
     [true, true],
@@ -329,6 +356,18 @@ describe("resolveServerInfo session_fork_workspaces", () => {
   ])("parses %s strictly as %s", async (advertised, expected) => {
     const parsed = await probe({ session_fork_workspaces: advertised });
     expect(parsed.session_fork_workspaces).toBe(expected);
+  });
+});
+
+describe("resolveServerInfo session_claude_sdk_clear", () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ session_claude_sdk_clear: advertised });
+    expect(parsed.session_claude_sdk_clear).toBe(expected);
   });
 });
 
@@ -344,6 +383,17 @@ describe("resolveServerInfo session_event_types", () => {
     expect((await probe({ session_event_types: advertised })).session_event_types).toEqual(
       expected,
     );
+  });
+});
+
+describe("resolveServerInfo move_to_managed_sandbox", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ move_to_managed_sandbox: advertised });
+    expect(parsed.move_to_managed_sandbox).toBe(expected);
   });
 });
 
@@ -436,6 +486,14 @@ describe("custom agents settings capability", () => {
     async (stored) => {
       const parsed = await probe({ session_pull_requests: stored });
       expect(parsed.session_pull_requests).toBe(stored === true);
+    },
+  );
+
+  it.each([undefined, false, "true", true])(
+    "parses session_title_instructions strictly: %s",
+    async (stored) => {
+      const parsed = await probe({ session_title_instructions: stored });
+      expect(parsed.session_title_instructions).toBe(stored === true);
     },
   );
 
