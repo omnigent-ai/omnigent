@@ -354,6 +354,8 @@ def tracked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
         ({"expected_head": None}, "Expected expected_head"),
         ({"expected_head": HEAD_SHA[:7]}, "Expected expected_head"),
         ({"expected_head": f"--{HEAD_SHA[2:]}"}, "Expected expected_head"),
+        ({"account": ""}, "Expected account"),
+        ({"account": ["personal"]}, "Expected account"),
         ({"pr_url": None}, "Select a pull request to merge"),
         ({"pr_url": PR_URL.replace("17", "18")}, "not associated"),
         ({"pr_url": GITLAB_MR_URL}, "Merging a GitLab merge request is not supported"),
@@ -372,6 +374,52 @@ def test_invalid_merges_never_reach_github(
 
     with pytest.raises(ValueError, match=message):
         pr_resource.merge_pr(tracked, session_id="session", **request)  # type: ignore[arg-type]
+
+
+def test_a_merge_as_the_confirmed_account_saves_it_then_runs_as_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The panel may still show an account the host has since replaced.
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(PR_URL)], relationship="created", source="test"
+    )
+    github._config.set_github_account_preference("github.com/acme/widgets", "personal")
+    calls: list[GhCall] = []
+
+    def gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int, str, str]:
+        calls.append((argv, token))
+        if argv[:2] == ["auth", "token"]:
+            return 0, f"token-{argv[3]}\n", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+
+    pr_resource.merge_pr(
+        str(tmp_path),
+        session_id="session",
+        pr_url=PR_URL,
+        merge_method="squash",
+        expected_head=HEAD_SHA,
+        account="work",
+    )
+
+    assert github._config.github_account_preference("github.com/acme/widgets") == "work"
+    assert calls[-1] == (
+        [
+            "pr",
+            "merge",
+            "17",
+            "-R",
+            "github.com/acme/widgets",
+            "--squash",
+            "--match-head-commit",
+            HEAD_SHA,
+        ],
+        "token-work",
+    )
 
 
 @pytest.mark.parametrize("operation", ["pr_merge_options", "disable_pr_auto_merge"])

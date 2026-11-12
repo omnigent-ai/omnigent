@@ -11483,6 +11483,55 @@ def test_github_commit_ops_are_served_on_host(
     assert patch.payload == {"object": "session.github.pr_diff", "patch": "commit-patch"}
 
 
+def test_github_merge_on_host_runs_as_the_confirmed_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tunneled merge keeps the account the dialog showed."""
+    from omnigent.host.frames import HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    calls: list[tuple[list[str], object]] = []
+
+    def gh(argv: list[str], **kwargs: object) -> tuple[int, str, str]:
+        calls.append((argv, kwargs.get("token")))
+        if argv[:2] == ["auth", "token"]:
+            return 0, f"token-{argv[3]}", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+    try:
+        merged = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="merge",
+                op="github_merge",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={
+                    "pr_url": url,
+                    "merge_method": "rebase",
+                    "expected_head": "a" * 40,
+                    "account": "personal",
+                },
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert merged.status == "ok", merged
+    argv, token = calls[-1]
+    assert argv[:2] == ["pr", "merge"]
+    assert token == "token-personal"
+
+
 def test_github_merge_ops_are_served_on_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

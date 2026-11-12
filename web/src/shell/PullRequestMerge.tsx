@@ -27,6 +27,7 @@ import {
   usePullRequestMergeOptions,
   useSetPullRequestPreference,
   type PullRequest,
+  type PullRequestAccount,
   type PullRequestAuth,
   type PullRequestMergeMethod,
 } from "@/hooks/usePullRequests";
@@ -165,26 +166,22 @@ export type MergeAccounts = Pick<PullRequestAuth, "accounts" | "selected_account
  * An account that can read a PR may still be refused the merge (an Enterprise
  * Managed User on a public repository), so the choice is offered here even
  * though the panel hides its account selector once the repository resolves.
- * Renders nothing with fewer than two accounts.
  */
 function MergeAccountPicker({
-  accounts,
+  options,
+  selected,
   setPref,
   prUrl,
   disabled,
   onChange,
 }: {
-  accounts: MergeAccounts;
+  options: PullRequestAccount[];
+  selected: string | undefined;
   setPref: ReturnType<typeof useSetPullRequestPreference>;
   prUrl: string;
   disabled: boolean;
   onChange: () => void;
 }) {
-  const options = accounts.accounts ?? [];
-  if (options.length <= 1) return null;
-  // The host saved (or is saving) this account; the info refetch catches up after.
-  const requested = setPref.isPending || setPref.isSuccess ? setPref.variables?.account : null;
-  const selected = requested ?? accounts.selected_account ?? undefined;
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-center gap-2">
@@ -247,6 +244,16 @@ function PullRequestMergeDialog({
   const options = usePullRequestMergeOptions(conversationId, prUrl, true);
   const merge = useMergePullRequest(conversationId);
   const setPref = useSetPullRequestPreference(conversationId);
+  const accountOptions = accounts?.accounts ?? [];
+  const choosesAccount = !!accounts && accountOptions.length > 1;
+  // The host saved (or is saving) this account; the info refetch catches up after.
+  const requestedAccount =
+    setPref.isPending || setPref.isSuccess ? setPref.variables?.account : undefined;
+  // What "Merge as" shows. The merge sends it, so it runs as the account on screen
+  // even when a failed switch leaves this view of the saved account stale.
+  const mergeAccount = choosesAccount
+    ? (requestedAccount ?? accounts.selected_account ?? undefined)
+    : undefined;
   const [chosen, setChosen] = useState<PullRequestMergeMethod | null>(null);
   const methods = options.data?.methods ?? [];
   const method = chosen && methods.includes(chosen) ? chosen : (options.data?.default ?? null);
@@ -260,7 +267,7 @@ function PullRequestMergeDialog({
     if (!method || unavailable || setPref.isPending || submitting.current) return;
     submitting.current = true;
     merge.mutate(
-      { prUrl, mergeMethod: method, expectedHead: headSha },
+      { prUrl, mergeMethod: method, expectedHead: headSha, account: mergeAccount },
       {
         onSuccess: () => {
           onMerged();
@@ -277,8 +284,7 @@ function PullRequestMergeDialog({
     <Dialog
       open
       // Keep the dialog up while a merge is in flight so its outcome stays visible,
-      // and while an account switch saves: a reopened dialog would show the old
-      // account while the host already merges as the new one.
+      // and while an account switch saves, so a reopened dialog can't race it.
       onOpenChange={(next) => !next && !merge.isPending && !setPref.isPending && onClose()}
     >
       <DialogContent>
@@ -301,9 +307,10 @@ function PullRequestMergeDialog({
           disabled={merge.isPending}
           onChange={setChosen}
         />
-        {accounts && (
+        {choosesAccount && (
           <MergeAccountPicker
-            accounts={accounts}
+            options={accountOptions}
+            selected={mergeAccount}
             setPref={setPref}
             prUrl={prUrl}
             disabled={merge.isPending || unavailable}

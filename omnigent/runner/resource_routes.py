@@ -1677,6 +1677,7 @@ def register_resource_routes(
             **_server_tracking_fields(body),
             merge_method=body.get("merge_method"),
             expected_head=body.get("expected_head"),
+            account=body.get("account"),
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/disable-auto-merge")

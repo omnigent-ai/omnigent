@@ -3980,7 +3980,8 @@ def register_resources_routes(
         the runner when it's online, else by the host over its tunnel.
 
         :param request: JSON body with ``pr_url``, ``merge_method`` (``merge``,
-            ``squash``, or ``rebase``), and ``expected_head``, a full commit SHA.
+            ``squash``, or ``rebase``), ``expected_head``, a full commit SHA, and
+            an optional ``account``, the login the merge dialog showed.
         :param session_id: Session/conversation identifier.
         :returns: A ``session.github.pr_merge``.
         """
@@ -3997,6 +3998,7 @@ def register_resources_routes(
                 "pr_url": body["pr_url"],
                 "merge_method": body.get("merge_method"),
                 "expected_head": body.get("expected_head"),
+                "account": body.get("account"),
             },
             failure_detail="Cannot merge the pull request",
         )

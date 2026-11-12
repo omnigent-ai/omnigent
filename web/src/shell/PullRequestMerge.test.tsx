@@ -317,6 +317,7 @@ describe("merging as another account", () => {
     const dialog = screen.getByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: "Squash and merge" }));
     await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0].body).toMatchObject({ account: "work" });
     const refusal = "The GitHub account on the host cannot merge this pull request.";
     await act(async () => {
       posts[0].respond(json({ detail: refusal }, 400));
@@ -353,7 +354,7 @@ describe("merging as another account", () => {
     await waitFor(() => expect(posts).toHaveLength(3));
     expect(posts[2]).toMatchObject({
       path: MERGE_PATH,
-      body: { pr_url: PR_URL, merge_method: "rebase", expected_head: HEAD },
+      body: { pr_url: PR_URL, merge_method: "rebase", expected_head: HEAD, account: "personal" },
     });
   });
 
@@ -367,7 +368,7 @@ describe("merging as another account", () => {
     fireEvent.click(screen.getByRole("option", { name: "personal" }));
     await waitFor(() => expect(posts).toHaveLength(1));
 
-    // Reopening would show the old account while the host merges as the new one.
+    // A reopened dialog would race the switch.
     const cancel = within(dialog).getByRole("button", { name: "Cancel" });
     expect(cancel).toBeDisabled();
     fireEvent.keyDown(dialog, { key: "Escape" });
@@ -383,15 +384,17 @@ describe("merging as another account", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   });
 
-  it("says when the account can't be switched", async () => {
+  it("merges as the account it shows after a switch fails", async () => {
     const { posts } = stubFetch(allMethods);
     renderMerge(pullRequest(), false, twoAccounts);
 
     await openDialog();
-    const picker = within(screen.getByRole("dialog")).getByRole("combobox", { name: "Merge as" });
+    const dialog = screen.getByRole("dialog");
+    const picker = within(dialog).getByRole("combobox", { name: "Merge as" });
     fireEvent.click(picker);
     fireEvent.click(screen.getByRole("option", { name: "personal" }));
     await waitFor(() => expect(posts).toHaveLength(1));
+    // The host may have saved the new account before the reply failed.
     await act(async () => {
       posts[0].respond(json({ detail: "Host offline" }, 400));
     });
@@ -400,10 +403,17 @@ describe("merging as another account", () => {
       "Couldn’t switch accounts: Host offline",
     );
     expect(picker).toHaveTextContent("work");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Squash and merge" }));
+    await waitFor(() => expect(posts).toHaveLength(2));
+    // The merge carries the shown account, so the host runs it as that one.
+    expect(posts[1]).toMatchObject({
+      path: MERGE_PATH,
+      body: { pr_url: PR_URL, merge_method: "squash", expected_head: HEAD, account: "work" },
+    });
   });
 
   it("offers no account choice with one signed-in account", async () => {
-    stubFetch(allMethods);
+    const { posts } = stubFetch(allMethods);
     renderMerge(pullRequest(), false, {
       accounts: [twoAccounts.accounts![0]],
       selected_account: "work",
@@ -411,6 +421,12 @@ describe("merging as another account", () => {
 
     await openDialog();
     expect(screen.queryByRole("combobox", { name: "Merge as" })).not.toBeInTheDocument();
+    fireEvent.click(
+      within(screen.getByRole("dialog")).getByRole("button", { name: "Squash and merge" }),
+    );
+    await waitFor(() => expect(posts).toHaveLength(1));
+    // Nothing to choose, so the host keeps its own account.
+    expect(posts[0].body).not.toHaveProperty("account");
   });
 });
 

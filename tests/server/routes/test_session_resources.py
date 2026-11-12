@@ -3847,7 +3847,7 @@ async def test_github_merge_relays_the_runner_refusal(client: httpx.AsyncClient)
     assert resp.json()["detail"] == detail
     assert timeouts == [routes_resources._PR_EDIT_PROXY_TIMEOUT_S]
     # Only the known fields are forwarded.
-    assert fake_runner.post_json_calls == [(path, body)]
+    assert fake_runner.post_json_calls == [(path, {**body, "account": None})]
 
 
 @pytest.mark.asyncio
@@ -10959,7 +10959,13 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
             "/merge",
             {"merge_method": "squash", "expected_head": "a" * 40},
             "github_merge",
-            {"merge_method": "squash", "expected_head": "a" * 40},
+            {"merge_method": "squash", "expected_head": "a" * 40, "account": None},
+        ),
+        (
+            "/merge",
+            {"merge_method": "squash", "expected_head": "a" * 40, "account": "personal"},
+            "github_merge",
+            {"merge_method": "squash", "expected_head": "a" * 40, "account": "personal"},
         ),
         ("/disable-auto-merge", {"extra": True}, "github_disable_auto_merge", {}),
     ],

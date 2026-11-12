@@ -808,20 +808,28 @@ def merge_pr(
     pr_url: str | None = None,
     merge_method: object = None,
     expected_head: object = None,
+    account: object = None,
 ) -> dict[str, Any]:
     """Merge the selected PR, only while its head is still ``expected_head``.
 
     :param merge_method: ``merge``, ``squash``, or ``rebase``.
     :param expected_head: The full head commit SHA the user reviewed.
+    :param account: The account the user confirmed the merge as. It becomes the
+        PR's account first, so the merge runs as it even when the panel's view of
+        the saved account is stale. ``None`` merges as the saved account.
     :returns: A ``session.github.pr_merge``.
-    :raises ValueError: On an unknown method or malformed SHA, without a
+    :raises ValueError: On an unknown method, malformed SHA or account, without a
         selected tracked PR, or when the provider refuses the merge.
     """
     if not isinstance(merge_method, str) or merge_method not in _MERGE_METHODS:
         raise ValueError("Expected merge_method to be merge, squash, or rebase")
     if not isinstance(expected_head, str) or not _COMMIT_SHA.fullmatch(expected_head):
         raise ValueError("Expected expected_head to be the pull request's head commit SHA")
+    if account is not None and (not isinstance(account, str) or not account.strip()):
+        raise ValueError("Expected account to be an account login")
     facet, reference = _merge_target(session_id, pr_url)
+    if isinstance(account, str) and facet.capabilities.account_switching:
+        facet.set_preference(root, reference, account=account, remote=None)
     return facet.merge(root, reference, merge_method=merge_method, expected_head=expected_head)
 
 

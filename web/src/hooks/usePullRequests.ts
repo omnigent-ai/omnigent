@@ -1159,6 +1159,8 @@ export interface PullRequestMergeRequest {
   mergeMethod: PullRequestMergeMethod;
   /** The head commit the panel showed; GitHub refuses the merge if the branch moved. */
   expectedHead: string;
+  /** The account the dialog showed; the host saves it as the PR's account, then merges as it. */
+  account?: string;
 }
 
 /**
@@ -1176,6 +1178,7 @@ export function useMergePullRequest(conversationId: string) {
           pr_url: request.prUrl,
           merge_method: request.mergeMethod,
           expected_head: request.expectedHead,
+          account: request.account,
         },
       }),
     onSettled: () => queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] }),
