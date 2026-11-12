@@ -332,44 +332,30 @@ def _shell_steps(
     ]
 
 
-def _array_literal_end(command: str, start: int) -> int | None:
-    """Return the index just past the ``)`` closing the ``(`` at *start*, or None."""
-    depth = 0
-    quote: str | None = None
-    index = start
-    while index < len(command):
-        char = command[index]
-        if quote == "'":
-            quote = None if char == "'" else quote
-        elif char == "\\":
-            index += 1
-        elif quote == '"':
-            quote = None if char == '"' else quote
-        elif char in "'\"":
-            quote = char
-        elif char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth == 0:
-                return index + 1
-        index += 1
-    return None
+# A ``case`` header, with or without its first pattern.
+_CASE_HEADER = re.compile(r"case\s+\S+\s+in\b")
+# A ``case`` header that ends at a separator, so its patterns follow on later lines.
+_CASE_OPEN = re.compile(r"case\s+\S+\s+in")
+# A function name before its ``()``.
+_FUNCTION_NAME = re.compile(r"(?:function\s+)?[A-Za-z_][\w.-]*")
+_EMPTY_PARENS = re.compile(r"\(\s*\)")
 
 
-# A ``case`` header up to its first pattern. The ``)`` that ends it is not a subshell closer.
-_CASE_HEADER = re.compile(r"\s*case\s+\S+\s+in\b")
-
-
-def _shell_items(command: str) -> list[list[str] | str] | None:
+def _shell_items(command: str, depth: int = 0) -> list[list[str] | str] | None:
     """Split *command* at unquoted operators, returning each simple command's words.
 
     Quotes and backslashes are honored while scanning, so ``"("`` and ``\\(`` stay
     words. The characters of ``>&``, ``<&``, ``&>`` and ``>|`` are not separators.
     The ``)`` and ``|`` of a ``case`` pattern are words, so the pattern does not
-    open or close a group. Returns None when the command cannot be lexed.
+    open or close a group. A function body (``f() ( … )`` or ``f() { … }``) is
+    skipped, since defining a function runs nothing. Returns None when the command
+    cannot be lexed. A body whose name is called in the same command is spliced in
+    at the call. A function runs in the current shell, so its effects are kept.
     """
+    if depth > MAX_SHELL_NESTING:
+        return None
     items: list[list[str] | str] = []
+    definitions: dict[str, list[list[str] | str]] = {}
     chunk: list[str] = []
     quote: str | None = None
     index = 0
@@ -404,42 +390,68 @@ def _shell_items(command: str) -> list[list[str] | str] | None:
                 index += 1
             elif char == "(" and chunk and chunk[-1][-1:] == "=":
                 # An array literal ``name=(...)`` is one word, not a subshell.
-                end = _array_literal_end(command, index)
+                end = _balanced_end(command, index)
                 if end is None:
                     raise ValueError("unterminated array literal")
                 chunk.append(command[index:end])
                 index = end
+            elif (
+                char == "("
+                and _EMPTY_PARENS.match(command, index)
+                and _FUNCTION_NAME.fullmatch("".join(chunk).strip())
+            ):
+                # ``name()`` followed by a body: the body runs only where ``name`` is called.
+                name = "".join(chunk).split()[-1]
+                chunk.append("()")
+                parens = _EMPTY_PARENS.match(command, index)
+                if parens is None:
+                    raise ValueError("unreachable: checked by the branch condition")
+                index = parens.end()
+                body = index
+                while body < len(command) and command[body] in " \t\r\n":
+                    body += 1
+                if body < len(command) and command[body] in "({":
+                    end = _balanced_end(command, body)
+                    if end is None:
+                        raise ValueError("unterminated function body")
+                    nested = _shell_items(command[body + 1 : end - 1], depth + 1)
+                    if nested is None:
+                        raise ValueError("unsupported function body")
+                    definitions[name] = nested
+                    index = end
             else:
-                # An escaped ``>`` is a literal, so the character after it is a separator.
-                last = chunk[-1] if chunk else ""
-                previous_char = "" if len(last) == 2 and last[0] == "\\" else last[-1:]
-                text = "".join(chunk)
                 operator = next(
                     (op for op in _SHELL_OPERATORS if command.startswith(op, index)), None
                 )
-                if operator is not None and case_depths and text.split()[:1] == ["esac"]:
+                if operator is None:
+                    chunk.append(char)
+                    index += 1
+                    continue
+                # An escaped ``>`` is a literal, so the character after it is a separator.
+                last = chunk[-1] if chunk else ""
+                previous_char = "" if len(last) == 2 and last[0] == "\\" else last[-1:]
+                if (
+                    operator == "&"
+                    and (command.startswith("&>", index) or previous_char in ("<", ">"))
+                ) or (operator == "|" and previous_char == ">"):
+                    chunk.append(char)
+                    index += 1
+                    continue
+                at_case_level = bool(case_depths) and paren_depth == case_depths[-1]
+                if operator == "|" and (
+                    _CASE_HEADER.match("".join(chunk[:256]).lstrip())
+                    or (at_case_level and pattern_expected)
+                ):
+                    chunk.append(char)
+                    index += 1
+                    continue
+                text = "".join(chunk)
+                if case_depths and text.split()[:1] == ["esac"]:
                     case_depths.pop()
                     pattern_expected = False
                 at_case_level = bool(case_depths) and paren_depth == case_depths[-1]
-                if (
-                    operator is None
-                    or (
-                        operator == "&"
-                        and (command.startswith("&>", index) or previous_char in ("<", ">"))
-                    )
-                    or (operator == "|" and previous_char == ">")
-                ):
-                    chunk.append(char)
-                    index += 1
-                    continue
-                if operator == "|" and (
-                    _CASE_HEADER.match(text) or (at_case_level and pattern_expected)
-                ):
-                    chunk.append(char)
-                    index += 1
-                    continue
-                if operator == ")" and _CASE_HEADER.match(text):
-                    # The first pattern of a case statement.
+                if operator == ")" and _CASE_HEADER.match(text.lstrip()):
+                    # The first pattern of a case statement, on the same line as its header.
                     flush()
                     items.append(";")
                     case_depths.append(paren_depth)
@@ -452,6 +464,11 @@ def _shell_items(command: str) -> list[list[str] | str] | None:
                     pattern_expected = False
                     index += 1
                     continue
+                if _CASE_OPEN.fullmatch(text.strip()):
+                    # A header ended by a separator: its patterns come next.
+                    case_depths.append(paren_depth)
+                    pattern_expected = True
+                    at_case_level = True
                 flush()
                 items.append(";" if operator == "\n" else operator)
                 if operator == "(":
@@ -464,7 +481,51 @@ def _shell_items(command: str) -> list[list[str] | str] | None:
         flush()
     except ValueError:
         return None
-    return items
+    return _splice_function_calls(items, definitions, depth)
+
+
+def _splice_function_calls(
+    items: list[list[str] | str], definitions: dict[str, list[list[str] | str]], depth: int
+) -> list[list[str] | str]:
+    """Replace each call of a defined function with that function's body."""
+    spliced: list[list[str] | str] = []
+    for item in items:
+        if (
+            isinstance(item, list)
+            and item
+            and item[0] in definitions
+            and depth < MAX_SHELL_NESTING
+        ):
+            spliced.extend(_splice_function_calls(definitions[item[0]], definitions, depth + 1))
+        else:
+            spliced.append(item)
+    return spliced
+
+
+def _balanced_end(command: str, start: int) -> int | None:
+    """Return the index just past the bracket closing the ``(`` or ``{`` at *start*, or None."""
+    closer = ")" if command[start] == "(" else "}"
+    depth = 0
+    quote: str | None = None
+    index = start
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            quote = None if char == "'" else quote
+        elif char == "\\":
+            index += 1
+        elif quote == '"':
+            quote = None if char == '"' else quote
+        elif char in "'\"":
+            quote = char
+        elif char == command[start]:
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return None
 
 
 def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:

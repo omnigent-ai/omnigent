@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -1586,6 +1587,25 @@ def test_an_array_literal_is_not_a_command_for_pr_attribution() -> None:
     assert [segment.invocation_tokens for segment in segments] == [("gh", "pr", "view", "41")]
 
 
+def test_an_uncalled_function_body_is_not_a_command_for_pr_attribution() -> None:
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "f() (gh pr create --fill)\necho https://github.com/example/one/pull/41"},
+        "https://github.com/example/one/pull/41\n",
+    )
+    assert refs == []
+    assert was_created is False
+
+
+def test_a_long_operator_free_command_lexes_in_bounded_time() -> None:
+    # The lexer rebuilt its prefix per character before, which took about 20 seconds here.
+    command = "echo " * 19_999 + "x"
+    start = time.perf_counter()
+    items = pr_observer._shell_items(command)
+    assert items is not None and len(items) == 1
+    assert time.perf_counter() - start < 5
+
+
 def test_redirect_ampersand_stays_in_its_word_and_the_pipeline_still_splits() -> None:
     segments = _shell_segments("gh pr create --title x 2>&1 | tail -2")
     assert [segment.invocation_tokens for segment in segments] == [
@@ -1860,6 +1880,30 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
             {},
             ["/b"],
             id="escaped-greater-then-pipe-is-a-separator",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "(case x in\n x) cd /a ;;\nesac\n); git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="multiline-case-pattern-paren-does-not-close-the-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "f() (cd /other && git status); git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="uncalled-function-body-runs-nothing",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "f() { cd /other && git status; }; git status"},
+            "/start",
+            {},
+            ["/start"],
+            id="uncalled-brace-function-body-runs-nothing",
         ),
         pytest.param(
             "Bash",
