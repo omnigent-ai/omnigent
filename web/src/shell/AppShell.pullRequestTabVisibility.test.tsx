@@ -4,6 +4,7 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // rather than hiding the tab entirely.
 
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
@@ -32,7 +33,8 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
 }));
-vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseWorkspaceChangedFilesModule>()),
   useWorkspaceEnvironment: vi.fn(() => ({
     data: { available: true, root: null },
     isLoading: false,
