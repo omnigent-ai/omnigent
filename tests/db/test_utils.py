@@ -1320,19 +1320,26 @@ def test_shared_read_scope_closes_session_when_init_fails(
     )
 
 
-def test_rollback_shared_reads_recovers_the_scope_after_a_failed_read(db_uri: str) -> None:
+def test_rollback_shared_reads_recovers_the_scope_after_a_failed_read(
+    db_uri: str, record_terminators: Callable[[Engine], list[str]]
+) -> None:
     """A caught statement failure must not poison the reads that follow it in the scope."""
     from sqlalchemy.exc import SQLAlchemyError
 
     engine = get_or_create_engine(db_uri)
     maker = make_managed_session_maker(engine)
+    terminators = record_terminators(engine)
     with shared_read_scope():
         with maker() as session:
             session.execute(text("SELECT 1"))
         with pytest.raises(SQLAlchemyError):
             with maker() as session:
                 session.execute(text("SELECT * FROM table_that_does_not_exist"))
+        before_recovery = len(terminators)
         rollback_shared_reads()
+        # SQLite keeps the transaction usable after a failed statement, so the read
+        # below passes there either way; the terminator makes the recovery visible.
+        assert terminators[before_recovery:] == ["ROLLBACK"]
         with maker() as session:
             assert session.execute(text("SELECT 1")).scalar() == 1
     assert _shared_read_sessions.get() is None

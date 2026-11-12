@@ -14378,11 +14378,9 @@ def _read_session_snapshot_inputs(
 ) -> tuple[SessionAccess, Conversation, Agent | None]:
     """Authorize a snapshot read and fetch its store inputs over one checkout.
 
-    The access check, the conversation row and the bound agent row are every
-    store read ``GET /sessions/{id}`` needs before it consults a runner, so one
-    :func:`shared_read_scope` costs a single pool checkout (and ``pool_pre_ping``)
-    instead of one per store call. Synchronous for :func:`asyncio.to_thread`; the
-    scope closes before any of the snapshot's network lookups.
+    Read authorization and snapshot inputs synchronously (for
+    :func:`asyncio.to_thread`) in one :func:`shared_read_scope`; the scope is
+    released before the snapshot's network lookups.
 
     :returns: The access result, the conversation (read here when the access
         check did not), and the bound agent row, or ``None`` when the session
@@ -14404,7 +14402,7 @@ def _read_session_snapshot_inputs(
             try:
                 agent = agent_store.get(conv.agent_id)
             except Exception:  # noqa: BLE001 - enrichment only; the snapshot retries best-effort
-                # Roll the shared session back so the reads above still commit cleanly.
+                # Clear the failed transaction before subsequent shared reads.
                 rollback_shared_reads()
                 _logger.warning(
                     "Agent row read failed on snapshot build for session=%s",
