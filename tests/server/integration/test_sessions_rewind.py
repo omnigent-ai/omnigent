@@ -176,6 +176,59 @@ async def test_rewind_continues_on_a_truncated_fork_of_the_same_placement(
     assert new_id in live_runner.announced
 
 
+async def test_rewind_does_not_resume_a_retained_unanswered_prompt(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    live_runner: LiveRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained user item is context, not a pending turn in the rewound session."""
+    resolve_harness_as(monkeypatch, "claude-sdk")
+    store = SqlAlchemyConversationStore(db_uri)
+    source_id = await create_placed_session(client, store, turns=0)
+    store.append(
+        source_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "Q1"}]),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_2",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "Q2"}]),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "A1"}],
+                    agent="test-agent",
+                ),
+            ),
+        ],
+    )
+    prompts = [
+        item
+        for item in store.list_items(source_id).data
+        if isinstance(item.data, MessageData) and item.data.role == "user"
+    ]
+
+    resp = await client.post(f"/v1/sessions/{source_id}/rewind", json={"item_id": prompts[1].id})
+
+    assert resp.status_code == 200, resp.text
+    new_id = resp.json()["session_id"]
+    assert message_texts(store, new_id) == ["Q1"]
+    init_body = next(
+        body
+        for path, body in live_runner.posts
+        if path == "/v1/sessions" and body.get("session_id") == new_id
+    )
+    assert init_body["session_init"]["suppress_recovery_turn"] is True
+
+
 @pytest.mark.parametrize("item_index", [0, 2], ids=["first-prompt", "later-prompt"])
 @pytest.mark.parametrize(
     "session_id_args",

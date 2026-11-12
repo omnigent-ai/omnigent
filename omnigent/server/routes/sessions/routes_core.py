@@ -3583,6 +3583,8 @@ def register_core_routes(
         body: UpdateSessionRequest,
         include_usage: bool,
         live_change: _LiveSettingsChange | None = None,
+        *,
+        suppress_recovery_turn: bool = False,
     ) -> SessionResponse:
         """Apply the PATCH that :func:`update_session` documents."""
         began = live_change.position() if live_change is not None else 0
@@ -4121,7 +4123,10 @@ def register_core_routes(
                             json=build_runner_session_init_payload(
                                 conv,
                                 server_version=VERSION,
-                                suppress_recovery_turn=conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1",
+                                suppress_recovery_turn=(
+                                    suppress_recovery_turn
+                                    or conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1"
+                                ),
                             ),
                             timeout=10.0,
                         )
@@ -5992,6 +5997,9 @@ def register_core_routes(
                                 fork.id,
                                 UpdateSessionRequest(runner_id=source.runner_id),
                                 include_usage=False,
+                                # Copied history is context, even when its last item
+                                # looks like an interrupted turn to crash recovery.
+                                suppress_recovery_turn=True,
                             )
                         except Exception:
                             if runner_router.runner_is_online(source.runner_id):
