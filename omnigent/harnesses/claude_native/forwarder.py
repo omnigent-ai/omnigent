@@ -897,13 +897,14 @@ class _ForwardDedupeState:
     # statusLine total ``S`` verbatim (matches /cost in the Claude TUI).
     # Kept to suppress duplicate posts when S hasn't advanced.
     posted_cost: float | None = None
+    # Last attributed cost per child; permanent rejections stop only that child.
+    attributed_costs: dict[str, float] = field(default_factory=dict)
+    attribution_disabled_children: set[str] = field(default_factory=set)
+    attribution_retry_at: float = 0.0
     # Last POLICY/budget cost (USD) POSTed as ``policy_cost_usd`` —
     # ``max(S, forwarder transcript estimate)``, which reflects in-flight
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
-    attributed_costs: dict[str, float] = field(default_factory=dict)
-    attribution_disabled: bool = False
-    attribution_retry_at: float = 0.0
     posted_policy_cost: float | None = None
     # Last permission mode POSTed as ``external_permission_mode_change`` —
     # mirrors the launch mode and any in-pane shift+tab switch, neither of
@@ -3170,12 +3171,12 @@ async def _forward_child_costs(
     cost_cache: dict[Path, _TranscriptCostCacheEntry],
 ) -> None:
     """Backfill display-only child attribution, independently of transcript delivery."""
-    if dedupe.attribution_disabled or time.monotonic() < dedupe.attribution_retry_at:
+    if time.monotonic() < dedupe.attribution_retry_at:
         return
     directory = _subagents_dir_for_transcript(parent_transcript_path)
     for entry in subagent_state.subagents.values():
         child_id = entry.child_conversation_id
-        if not child_id:
+        if not child_id or child_id in dedupe.attribution_disabled_children:
             continue
         cost = await asyncio.to_thread(
             _transcript_cost_size_cached,
@@ -3197,9 +3198,9 @@ async def _forward_child_costs(
                 and 400 <= exc.response.status_code < 500
                 and exc.response.status_code not in (408, 429)
             ):
-                dedupe.attribution_disabled = True
-            else:
-                dedupe.attribution_retry_at = time.monotonic() + 30
+                dedupe.attribution_disabled_children.add(child_id)
+                continue
+            dedupe.attribution_retry_at = time.monotonic() + 30
             return
         dedupe.attributed_costs[child_id] = cost
 

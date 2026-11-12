@@ -760,3 +760,39 @@ async def test_child_attribution_backfills_dedupes_and_retries_without_health_fa
             await run()
             assert dedupe.attributed_costs["conv_child"] == 0.5
         assert all(post == {"attributed_cost_usd": 0.5} for post in posts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejection", [400, 404, 422])
+async def test_child_attribution_rejection_does_not_suppress_siblings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rejection: int
+) -> None:
+    monkeypatch.setattr(forwarder, "_transcript_cost_size_cached", lambda *args, **kwargs: 0.5)
+    posts: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        child = request.url.path.split("/")[-2]
+        posts.append(child)
+        return httpx.Response(rejection if child == "rejected" else 202)
+
+    state = forwarder.SubagentForwardState(
+        subagents={
+            child: forwarder.SubagentEntry(subagent_id=child, child_conversation_id=child)
+            for child in ("rejected", "valid")
+        }
+    )
+    dedupe = forwarder._ForwardDedupeState()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="https://example.test"
+    ) as client:
+        for _ in range(2):
+            await forwarder._forward_child_costs(
+                client=client,
+                parent_transcript_path=tmp_path / "parent.jsonl",
+                subagent_state=state,
+                dedupe=dedupe,
+                cost_cache={},
+            )
+    assert posts == ["rejected", "valid"]
+    assert dedupe.attributed_costs == {"valid": 0.5}
+    assert dedupe.attribution_disabled_children == {"rejected"}

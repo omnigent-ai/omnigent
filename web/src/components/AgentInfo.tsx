@@ -1,3 +1,4 @@
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { McpRegistryPicker } from "@/components/McpRegistry";
 // Agent info surface: the MCP-server and policy badges, and the
 // header info-icon popover that displays them.
@@ -1456,7 +1457,7 @@ export function AgentInfoContent({
         </div>
       )}
       {sessionId &&
-        !(serverInfo !== "loading" && serverInfo.features.session_overview === true) &&
+        !isFeatureEnabled(serverInfo, "session_overview") &&
         (sessionCostUsd != null ||
           (usageByModel != null && Object.keys(usageByModel).length > 0)) && (
           <div className="flex flex-col gap-2 py-3">

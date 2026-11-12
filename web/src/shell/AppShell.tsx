@@ -1742,20 +1742,21 @@ function AppShellImpl() {
     // The rail is still sliding in from past the window edge; scrolling to it would shift the page.
     (visibleSelectedTab ?? tabList)?.focus({ preventScroll: true });
   }, []);
-  const revealRightPanel = useCallback(() => {
-    if (!conversationId) return;
-    if (!terminalFirst) setPanelInitialKey(null);
-    setExecutionLogsKey(null);
-    setFilesPanelOpen(false);
-    if (rightPanelOpen) return;
-    setRightPanelOpenAnimated(true);
-  }, [
-    conversationId,
-    rightPanelOpen,
-    setPanelInitialKey,
-    setRightPanelOpenAnimated,
-    terminalFirst,
-  ]);
+  const revealRightPanel = useCallback(
+    (remember = true) => {
+      if (!conversationId) return;
+      if (!terminalFirst) setPanelInitialKey(null);
+      setExecutionLogsKey(null);
+      setFilesPanelOpen(false);
+      if (remember) {
+        writeSessionWorkspaceState(conversationId, { open: true });
+        writeDefaultWorkspacePanelOpen(true);
+      }
+      if (rightPanelOpen) return;
+      setRightPanelOpenAnimated(true);
+    },
+    [conversationId, rightPanelOpen, setPanelInitialKey, setRightPanelOpenAnimated, terminalFirst],
+  );
   // One press toggles: a rail on screen closes, a closed or covered one opens
   // with focus on its tabs.
   const toggleRightPanelFromHotkey = useCallback(() => {
@@ -2994,11 +2995,7 @@ function AppShellImpl() {
                           handleRightRailTabChange("subagents");
                           revealRightPanel();
                         }
-                        setOverviewState({
-                          sessionId: serverConversationId!,
-                          requested: false,
-                          dismissed: true,
-                        });
+                        setOverviewVisible(false);
                       }}
                       onOpenChanges={() => {
                         if (isMobileViewport()) openChangesPanel();
@@ -3006,11 +3003,7 @@ function AppShellImpl() {
                           handleRightRailTabChange("changes");
                           revealRightPanel();
                         }
-                        setOverviewState({
-                          sessionId: serverConversationId!,
-                          requested: false,
-                          dismissed: true,
-                        });
+                        setOverviewVisible(false);
                       }}
                       requested={overviewRequested}
                       sessionId={serverConversationId!}
@@ -3066,7 +3059,7 @@ function AppShellImpl() {
                     showBrowserTab={railTabsAvailable.browser}
                     onReveal={revealRightPanel}
                     onRevealSideChat={() => {
-                      revealRightPanel();
+                      revealRightPanel(false);
                       if (isMobileViewport()) openSideChatsPanel();
                     }}
                     onHide={rightPanelOpen ? toggleRightPanel : undefined}

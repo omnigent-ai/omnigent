@@ -167,11 +167,12 @@ function OverviewChild({
   const { children, isLoading, error } = useChildSessions(expanded && canExpand ? child.id : null);
   const navigate = useNavigate();
   const search = sessionNavigationSearch(useLocation().search);
+  const destination = { pathname: `/c/${encodeURIComponent(child.id)}`, search };
   const label = child.task_summary ?? child.tool ?? child.title ?? "Agent";
   return (
     <li>
       <Link
-        to={{ pathname: `/c/${encodeURIComponent(child.id)}`, search }}
+        to={destination}
         className="flex items-center justify-between gap-2 hover:underline"
         onClick={(event) => {
           if (
@@ -183,7 +184,6 @@ function OverviewChild({
           )
             return;
           event.preventDefault();
-          const destination = event.currentTarget.getAttribute("href")!;
           guard(null, undefined, () => {
             navigate(destination);
           });

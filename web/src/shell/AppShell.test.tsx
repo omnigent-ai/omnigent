@@ -43,7 +43,10 @@ import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTi
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
-import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
+import {
+  readDefaultWorkspacePanelOpen,
+  writeWorkspacePanelDefault,
+} from "@/lib/workspacePanelPreferences";
 import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
@@ -3213,6 +3216,38 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
   });
 
+  it("keeps automatic side-chat reveals out of the saved Workspace preference", () => {
+    writeWorkspacePanelDefault("collapsed");
+    writeSessionWorkspaceState("conv_auto", { open: false });
+    mockConversations([{ id: "conv_auto", permission_level: null }]);
+    renderShell("/c/conv_auto");
+    act(() =>
+      useChatStore.setState({
+        sideChatToOpen: { childId: "pending:auto", parentId: "conv_auto" },
+      }),
+    );
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_auto").open).toBe(false);
+    expect(readDefaultWorkspacePanelOpen()).toBe(false);
+  });
+
+  it("remembers overview dismissal when opening the Agents workspace", () => {
+    const baseMatchMedia = window.matchMedia;
+    const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...baseMatchMedia(query),
+      matches: query === "(min-width: 768px)" || baseMatchMedia(query).matches,
+    }));
+    onTestFinished(() => viewport.mockRestore());
+    writeWorkspacePanelDefault("collapsed");
+    mockConversations([{ id: "conv_overview", permission_level: null }]);
+    renderShell("/c/conv_overview", serverInfo({ features: { session_overview: true } }));
+    fireEvent.click(screen.getByRole("button", { name: "View all agents" }));
+    expect(readSessionWorkspaceState("conv_overview").overviewDismissed).toBe(true);
+    expect(readSessionWorkspaceState("conv_overview").open).toBe(true);
+    expect(readDefaultWorkspacePanelOpen()).toBe(true);
+    expect(screen.queryByRole("region", { name: "Session overview" })).toBeNull();
+  });
+
   it("reveals a collapsed workspace when New Browser Tab opens a tab", async () => {
     writeWorkspacePanelDefault("collapsed");
     let sendCommand: (event: {
@@ -3249,6 +3284,8 @@ describe("Right workspace card visibility", () => {
         "true",
       );
       expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+      expect(readSessionWorkspaceState("conv_browser_hotkey").open).toBe(true);
+      expect(readDefaultWorkspacePanelOpen()).toBe(true);
     } finally {
       cleanup();
       vi.unstubAllGlobals();

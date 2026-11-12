@@ -56,12 +56,13 @@ export interface ChildSessionInfo {
    * the Agents rail renders an "awaiting input" badge for it.
    */
   pending_elicitations_count: number;
+  /** Own-agent cost, excluding descendants. */
+  own_cost_usd?: number | null;
   /**
    * Model the intelligent router picked for this sub-agent, e.g.
    * ``"databricks-claude-sonnet-5"``. ``null``/absent when the child was
    * not routed (routing off, or a server that predates the field).
    */
-  own_cost_usd?: number | null;
   routed_model?: string | null;
 }
 
@@ -231,7 +232,8 @@ export async function fetchChildSessions(
     hasMore = page.has_more === true;
     if (!hasMore) break;
     after = page.last_id ?? page.data.at(-1)?.id ?? null;
-    if (after === null || cursors.has(after)) throw new Error("Repeated child-session cursor");
+    if (after === null) throw new Error("Missing child-session cursor");
+    if (cursors.has(after)) throw new Error("Repeated child-session cursor");
     cursors.add(after);
   }
   const json = { data: [...rows.values()] };

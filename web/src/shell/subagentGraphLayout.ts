@@ -186,7 +186,7 @@ export function buildTree(
                   depth + 1,
                   visited,
                 ),
-                ownCostUsd: child.own_cost_usd,
+                ownCostUsd: child.own_cost_usd ?? null,
               };
             }),
   };

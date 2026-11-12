@@ -76,10 +76,12 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
           <span className="flex-1" />
           <NodeStatusDot activity={activity} />
         </div>
-        <p className="text-[10px] text-muted-foreground">
-          Own cost:{" "}
-          {data.ownCostUsd == null ? "Unavailable" : formatSessionCostUsd(data.ownCostUsd)}
-        </p>
+        {data.ownCostUsd !== undefined && (
+          <p className="text-[10px] text-muted-foreground">
+            Own cost:{" "}
+            {data.ownCostUsd === null ? "Unavailable" : formatSessionCostUsd(data.ownCostUsd)}
+          </p>
+        )}
         {preview && (
           <p className="mt-1 truncate text-[10px] leading-tight text-muted-foreground">{preview}</p>
         )}

@@ -712,8 +712,9 @@ interface WorkspacePanelProps {
    * Switch rail tabs. AppShell owns the side effects (clearing any open
    * file + its comments + URL) so they can't drift from the tab state.
    */
-  onRevealSideChat?: () => void;
   onRightRailTabChange: (next: RightRailTab | null) => void;
+  /** Reveal an automatically queued side chat without changing the Workspace preference. */
+  onRevealSideChat?: () => void;
   /** Unpinned built-in pages opened as closable tabs for this session. */
   openPanels: DefaultWorkspaceTab[];
   onClosePanel: (tab: DefaultWorkspaceTab) => void;

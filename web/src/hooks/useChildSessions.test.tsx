@@ -91,6 +91,8 @@ it("loads every bounded page and rejects a repeated cursor", async () => {
   );
   fetch.mockResolvedValueOnce(page("first", true)).mockResolvedValueOnce(page("first", true));
   await expect(fetchChildSessions("parent")).rejects.toThrow("Repeated child-session cursor");
+  fetch.mockResolvedValueOnce(new Response(JSON.stringify({ data: [], has_more: true })));
+  await expect(fetchChildSessions("parent")).rejects.toThrow("Missing child-session cursor");
 });
 
 it("fetches the complete list when SSE seeded only a partial cold cache", async () => {

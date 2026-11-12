@@ -507,7 +507,13 @@ describe("buildTree", () => {
   it("builds nested tree from children map", () => {
     const map = new Map<string, ChildSessionInfo[]>();
     map.set("root", [
-      childInfo({ id: "c1", session_name: "auth", tool: "researcher", busy: true }),
+      childInfo({
+        id: "c1",
+        session_name: "auth",
+        tool: "researcher",
+        busy: true,
+        own_cost_usd: 0,
+      }),
       childInfo({
         id: "c2",
         session_name: "docs",
@@ -519,6 +525,9 @@ describe("buildTree", () => {
 
     const tree = buildTree("root", "main", "working", "Working", null, map, 0);
 
+    expect(tree.ownCostUsd).toBeUndefined();
+    expect(tree.children[0].ownCostUsd).toBe(0);
+    expect(tree.children[1].ownCostUsd).toBeNull();
     expect(tree.children).toHaveLength(2);
     expect(tree.children[0].id).toBe("c1");
     expect(tree.children[0].label).toBe("auth");

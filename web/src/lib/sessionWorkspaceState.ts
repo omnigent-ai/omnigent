@@ -25,8 +25,9 @@ const RAIL_TABS: readonly RightRailTab[] = [
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
-  overviewDismissed?: boolean;
   open?: boolean;
+  /** Whether the user explicitly dismissed the session overview. */
+  overviewDismissed?: boolean;
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
   /** Selected Workspace page, or null when no pinned or opened page is available. */

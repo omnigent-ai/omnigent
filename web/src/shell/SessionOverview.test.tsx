@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
+import { basenamedRouting, RoutingProvider, reactRouterRouting } from "@/lib/routing";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { beforeEach, expect, it, vi } from "vitest";
 import { useChildSessions } from "@/hooks/useChildSessions";
@@ -53,76 +54,86 @@ it("shows loading, true absence, zero, and never another session's known cost", 
   expect(screen.getByRole("status")).toBeInTheDocument();
 });
 
-it("exposes all children, cumulative tokens and line counts, and guards the actual link URL", () => {
-  useChatStore.setState({
-    sessionCostUsd: 1,
-    sessionUsageLoading: false,
-    sessionUsageByModel: {
-      model: {
-        totalTokens: 0,
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheReadInputTokens: null,
-        cacheCreationInputTokens: null,
-        totalCostUsd: 1,
+it.each(["", "/embed"])(
+  "exposes all children and guards the original destination under %s",
+  (mount) => {
+    useChatStore.setState({
+      sessionCostUsd: 1,
+      sessionUsageLoading: false,
+      sessionUsageByModel: {
+        model: {
+          totalTokens: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: 1,
+        },
       },
-    },
-  });
-  let accept: (() => void) | undefined;
-  const guard: FileNavigationGuard = vi.fn((_path, _options, commit) => {
-    accept = commit;
-  });
-  function Location() {
-    return (
-      <output data-testid="location">
-        {useLocation().pathname}
-        {useLocation().search}
-      </output>
+    });
+    let accept: (() => void) | undefined;
+    const guard: FileNavigationGuard = vi.fn((_path, _options, commit) => {
+      accept = commit;
+    });
+    function Location() {
+      return (
+        <output data-testid="location">
+          {useLocation().pathname}
+          {useLocation().search}
+        </output>
+      );
+    }
+    const dismiss = vi.fn();
+    const openAgents = vi.fn();
+    const openChanges = vi.fn();
+    render(
+      <MemoryRouter
+        basename="/host"
+        initialEntries={[`/host${mount}/c/parent?debug=1&file=notes.md`]}
+      >
+        <RoutingProvider value={mount ? basenamedRouting(mount) : reactRouterRouting}>
+          <SessionOverview
+            sessionId="parent"
+            canBrowseFiles
+            guard={guard}
+            onDismiss={dismiss}
+            onOpenAgents={openAgents}
+            onOpenChanges={openChanges}
+          />
+          <Location />
+        </RoutingProvider>
+      </MemoryRouter>,
     );
-  }
-  const dismiss = vi.fn();
-  const openAgents = vi.fn();
-  const openChanges = vi.fn();
-  render(
-    <MemoryRouter initialEntries={["/c/parent?debug=1&file=notes.md"]}>
-      <SessionOverview
-        sessionId="parent"
-        canBrowseFiles
-        guard={guard}
-        onDismiss={dismiss}
-        onOpenAgents={openAgents}
-        onOpenChanges={openChanges}
-      />
-      <Location />
-    </MemoryRouter>,
-  );
-  expect(screen.getByText("+3 −1")).toBeInTheDocument();
-  expect(screen.getByText("0")).toBeInTheDocument();
-  expect(screen.getAllByRole("link")).toHaveLength(5);
-  fireEvent.click(screen.getByRole("button", { name: "Show all 25" }));
-  expect(screen.getAllByRole("link")).toHaveLength(25);
-  const child = screen.getByRole("link", { name: "Agent 0$0.00" });
-  expect(child).toHaveAttribute("href", "/c/child%200?debug=1");
-  fireEvent.click(child, { ctrlKey: true });
-  expect(guard).not.toHaveBeenCalled();
-  fireEvent.click(child);
-  expect(screen.getByTestId("location")).toHaveTextContent("/c/parent?debug=1&file=notes.md");
-  expect(screen.getByRole("region", { name: "Session overview" })).toBeInTheDocument();
-  act(() => accept?.());
-  expect(screen.getByTestId("location")).toHaveTextContent("/c/child%200?debug=1");
-  for (const [name, callback] of [
-    ["View all agents", openAgents],
-    ["View changes", openChanges],
-  ] as const) {
-    fireEvent.click(screen.getByRole("button", { name }));
-    expect(callback).not.toHaveBeenCalled();
+    expect(screen.getByText("+3 −1")).toBeInTheDocument();
+    expect(screen.getByText("0")).toBeInTheDocument();
+    expect(screen.getAllByRole("link")).toHaveLength(5);
+    fireEvent.click(screen.getByRole("button", { name: "Show all 25" }));
+    expect(screen.getAllByRole("link")).toHaveLength(25);
+    const child = screen.getByRole("link", { name: "Agent 0$0.00" });
+    expect(child).toHaveAttribute("href", `/host${mount}/c/child%200?debug=1`);
+    fireEvent.click(child, { ctrlKey: true });
+    expect(guard).not.toHaveBeenCalled();
+    fireEvent.click(child);
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      `${mount}/c/parent?debug=1&file=notes.md`,
+    );
     expect(screen.getByRole("region", { name: "Session overview" })).toBeInTheDocument();
     act(() => accept?.());
-    expect(callback).toHaveBeenCalledOnce();
-  }
-  fireEvent.click(screen.getByRole("button", { name: "Hide session overview" }));
-  expect(dismiss).toHaveBeenCalledOnce();
-});
+    expect(screen.getByTestId("location")).toHaveTextContent(`${mount}/c/child%200?debug=1`);
+    for (const [name, callback] of [
+      ["View all agents", openAgents],
+      ["View changes", openChanges],
+    ] as const) {
+      fireEvent.click(screen.getByRole("button", { name }));
+      expect(callback).not.toHaveBeenCalled();
+      expect(screen.getByRole("region", { name: "Session overview" })).toBeInTheDocument();
+      act(() => accept?.());
+      expect(callback).toHaveBeenCalledOnce();
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Hide session overview" }));
+    expect(dismiss).toHaveBeenCalledOnce();
+  },
+);
 
 it("fetches nested agents only when expanded and stops at the shared depth boundary", () => {
   vi.mocked(useChildSessions).mockClear();
