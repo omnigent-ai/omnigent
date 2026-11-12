@@ -923,7 +923,7 @@ export function CreateScheduledTaskDialog({
   const workflowPrefix = skillInvocationPrefix(harnessSettings.harness);
   const withWorkflow = (text: string) =>
     workflowChoice ? savedWorkflowMessage(workflowPrefix, workflowChoice, text, false) : text;
-  // Shown with its description once the saved list has it, e.g. when editing.
+  // When editing, the saved list's copy, once loaded, has the workflow's current name.
   const workflowShown =
     workflowChoice &&
     (savedWorkflows.workflows.find((workflow) => workflow.id === workflowChoice.id) ??
