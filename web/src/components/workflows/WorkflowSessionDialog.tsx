@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { MonitorCloudIcon, WorkflowIcon } from "lucide-react";
 
@@ -149,6 +149,66 @@ function pinnedValue(value: string | undefined): string | undefined {
   return value && value !== "default" ? value : undefined;
 }
 
+// What the dialog last started a session with, so the next one starts there.
+const DEFAULTS_KEY = "omnigent:workflow-session-defaults";
+
+interface SessionDefaults {
+  /** A host ID, or a sandbox row's `sandboxHostChoice` value. */
+  target: string | null;
+  /** The directory last used on `target`, when it's a host. */
+  workspace: string | null;
+  agentId: string | null;
+  /** Each agent's last model, effort and permission settings, by agent ID. */
+  settings: Record<string, ForkRunConfigValue>;
+}
+
+const asString = (value: unknown): string | undefined =>
+  typeof value === "string" ? value : undefined;
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+/** One agent's stored settings, keeping only well-formed fields. */
+function storedSettings(value: unknown): ForkRunConfigValue {
+  if (!isRecord(value)) return {};
+  const args = value.terminalLaunchArgs;
+  return {
+    modelOverride: asString(value.modelOverride),
+    reasoningEffort: asString(value.reasoningEffort),
+    terminalLaunchArgs:
+      Array.isArray(args) && args.every((arg) => typeof arg === "string") ? args : undefined,
+    codexBypassSandbox: value.codexBypassSandbox === true ? true : undefined,
+  };
+}
+
+/** The last session's choices; empty when nothing (or nothing readable) is stored. */
+function readSessionDefaults(): SessionDefaults {
+  let stored: unknown = null;
+  try {
+    stored = JSON.parse(window.localStorage.getItem(DEFAULTS_KEY) ?? "null");
+  } catch {
+    // Unreadable storage only costs the dialog its defaults.
+  }
+  const record = isRecord(stored) ? stored : {};
+  return {
+    target: asString(record.target) ?? null,
+    workspace: asString(record.workspace) ?? null,
+    agentId: asString(record.agentId) ?? null,
+    settings: isRecord(record.settings)
+      ? Object.fromEntries(
+          Object.entries(record.settings).map(([id, value]) => [id, storedSettings(value)]),
+        )
+      : {},
+  };
+}
+
+function writeSessionDefaults(defaults: SessionDefaults): void {
+  try {
+    window.localStorage.setItem(DEFAULTS_KEY, JSON.stringify(defaults));
+  } catch {
+    // A full or blocked storage only costs the next dialog its defaults.
+  }
+}
+
 function WorkflowSessionForm({
   request,
   onClose,
@@ -186,6 +246,8 @@ function WorkflowSessionForm({
     ? (sandboxRow ?? (info !== "loading" ? info.sandbox_provider : null))
     : null;
 
+  // The last session's choices, read once as the dialog opens.
+  const [defaults] = useState(readSessionDefaults);
   const [workspace, setWorkspace] = useState("");
   const [browsing, setBrowsing] = useState(false);
   const { recent, addRecent } = useRecentWorkspaces(hostId);
@@ -197,18 +259,27 @@ function WorkflowSessionForm({
     typedWorkspace !== "" && workspacePath === null && !typedWorkspace.startsWith("~");
   const hostOnline = onlineHosts.some((h) => h.host_id === hostId);
 
-  // A host starts in its most recent directory.
+  // A host starts in the directory this dialog last used there, else its most recent one.
+  const startingWorkspace = useCallback(
+    (id: string) =>
+      (id === defaults.target ? defaults.workspace : null) ?? readRecentWorkspaces(id)[0] ?? "",
+    [defaults],
+  );
   const selectTarget = (value: string) => {
     setTarget(value);
     setBrowsing(false);
-    if (sandboxHostChoiceProvider(value) === undefined) {
-      setWorkspace(readRecentWorkspaces(value)[0] ?? "");
-    }
+    if (sandboxHostChoiceProvider(value) === undefined) setWorkspace(startingWorkspace(value));
   };
-  // Start where the new-session page last ran, a sandbox or an online host, when
-  // that's still offered; else on a sandbox, as that page does, or the first online host.
+  // Start where this dialog last ran a session, if it's still offered; else where
+  // the new-session page last ran, a sandbox or an online host; else on a sandbox,
+  // as that page does, or the first online host.
   useEffect(() => {
     if (target !== null || hosts === undefined || info === "loading") return;
+    const remembered = defaults.target;
+    const rememberedOffered =
+      remembered !== null &&
+      (sandboxRows.some((row) => sandboxHostChoice(row) === remembered) ||
+        onlineHosts.some((h) => h.host_id === remembered));
     const lastChoice = readLastHostChoice();
     const lastProvider = readLastSandboxProvider();
     const sandbox =
@@ -218,6 +289,7 @@ function WorkflowSessionForm({
           )
         : null;
     const next =
+      (rememberedOffered ? remembered : null) ??
       (lastChoice === SANDBOX_HOST_CHOICE ? sandbox : null) ??
       onlineHosts.find((h) => h.host_id === lastChoice)?.host_id ??
       sandbox ??
@@ -225,10 +297,8 @@ function WorkflowSessionForm({
       null;
     if (next === null) return;
     setTarget(next);
-    if (sandboxHostChoiceProvider(next) === undefined) {
-      setWorkspace(readRecentWorkspaces(next)[0] ?? "");
-    }
-  }, [target, hosts, info, onlineHosts, sandboxRows]);
+    if (sandboxHostChoiceProvider(next) === undefined) setWorkspace(startingWorkspace(next));
+  }, [target, hosts, info, onlineHosts, sandboxRows, defaults, startingWorkspace]);
 
   // Repositories the sandbox clones, starting on the new-session page's last ones.
   const [sandboxRepos, setSandboxRepos] = useState<LastSandboxRepo[]>(readLastSandboxRepos);
@@ -269,13 +339,19 @@ function WorkflowSessionForm({
   );
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
   const [lastAgentId] = useState(readLastAgentId);
-  // The user's pick, else the agent the new-session page last used, else the default.
+  // The user's pick, else this dialog's last agent, else the new-session page's, else the default.
   const agent =
     agentList.find((a) => a.id === pickedAgentId) ??
+    agentList.find((a) => a.id === defaults.agentId) ??
     agentList.find((a) => a.id === lastAgentId) ??
     agentList.find((a) => a.name === curation.defaultAgentName) ??
     agentList[0];
   const [runConfig, setRunConfig] = useState<ForkRunConfigValue>({});
+  // The agent's model, effort and permission settings from this dialog's last session.
+  const rememberedSettings = useMemo(
+    () => (agent ? (defaults.settings[agent.id] ?? {}) : {}),
+    [agent, defaults],
+  );
 
   // A sandbox's models come from its provider; a host lists its own.
   const harness = agent
@@ -360,6 +436,12 @@ function WorkflowSessionForm({
       });
       // Otherwise the session page sends it as the first message once the session is ready.
       if (!serverSendsText) setPendingInitialPrompt(session.id, { text, skill: null, files: [] });
+      writeSessionDefaults({
+        target,
+        workspace: sandboxSelected ? null : workspacePath,
+        agentId: agent.id,
+        settings: { ...defaults.settings, [agent.id]: runConfig },
+      });
       if (sandboxSelected) {
         writeLastSandboxRepos(sandboxRepos);
         // The session page drops a picked model or effort the new sandbox doesn't offer.
@@ -554,6 +636,7 @@ function WorkflowSessionForm({
             sameFamilyAsSource={false}
             sameAgentAsSource={false}
             selectedHostId={hostOnline ? hostId : null}
+            remembered={rememberedSettings}
             modelCatalog={
               sandboxSelected
                 ? { options: sandboxModels.data?.models ?? [], loading: sandboxModels.isLoading }

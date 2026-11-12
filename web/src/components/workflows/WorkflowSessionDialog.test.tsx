@@ -107,6 +107,8 @@ const startedSession = () =>
 describe("WorkflowSessionDialog", () => {
   beforeEach(() => {
     localStorage.clear();
+    // A first message queued by an earlier test.
+    consumePendingInitialPrompt("conv_run");
     navigate.mockClear();
     vi.mocked(createSession).mockReset();
     vi.mocked(useAvailableAgents).mockReturnValue({
@@ -172,6 +174,64 @@ describe("WorkflowSessionDialog", () => {
       files: [],
     });
     expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("starts on the host, directory, agent and settings it last ran a session with", async () => {
+    setHosts([
+      { host_id: "host_1", name: "desk" },
+      { host_id: "host_2", name: "laptop" },
+    ]);
+    // The new-session page last ran elsewhere; this dialog's own last session wins.
+    localStorage.setItem("omnigent:last-host-choice", "host_1");
+    localStorage.setItem("omnigent:last-agent-id", CODEX.id);
+    localStorage.setItem(
+      "omnigent:recent-workspaces",
+      JSON.stringify({ host_2: ["/home/you/app", "/home/you/other"] }),
+    );
+    const settings = {
+      modelOverride: "opus",
+      reasoningEffort: "high",
+      terminalLaunchArgs: ["--permission-mode", "acceptEdits"],
+    };
+    localStorage.setItem(
+      "omnigent:workflow-session-defaults",
+      JSON.stringify({
+        target: "host_2",
+        workspace: "/home/you/other",
+        agentId: CLAUDE_CODE.id,
+        settings: { [CLAUDE_CODE.id]: settings },
+      }),
+    );
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        { id: "opus", displayName: "Opus" },
+        { id: "sonnet", displayName: "Sonnet", isDefault: true },
+      ],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    startedSession();
+    renderDialog();
+
+    expect(screen.getByTestId("workflow-session-host")).toHaveTextContent("laptop");
+    expect(screen.getByPlaceholderText("Type a path or browse…")).toHaveValue("/home/you/other");
+    expect(screen.getByTestId("workflow-session-agent")).toHaveTextContent("Claude Code");
+    expect(screen.getByTestId("fork-session-config-model")).toHaveTextContent("Opus");
+    fireEvent.click(submit());
+
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith("/c/conv_run"));
+    expect(vi.mocked(createSession).mock.calls[0]![2]).toMatchObject({
+      hostId: "host_2",
+      workspace: "/home/you/other",
+      ...settings,
+    });
+    expect(consumePendingInitialPrompt("conv_run")?.text).toBe(runSavedWorkflowPrompt(WORKFLOW));
+    // What this session started with becomes the next dialog's defaults.
+    expect(JSON.parse(localStorage.getItem("omnigent:workflow-session-defaults")!)).toEqual({
+      target: "host_2",
+      workspace: "/home/you/other",
+      agentId: CLAUDE_CODE.id,
+      settings: { [CLAUDE_CODE.id]: settings },
+    });
   });
 
   it("keeps the dialog open with the server's reason when the session can't start", async () => {
