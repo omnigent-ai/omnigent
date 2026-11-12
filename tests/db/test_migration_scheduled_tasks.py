@@ -1029,7 +1029,7 @@ def test_event_receipts_table(db_engine: Engine) -> None:
         "run_id",
         "created_at",
     }
-    assert [name for name, c in columns.items() if c["nullable"]] == ["run_id"]
+    assert [name for name, c in columns.items() if c["nullable"]] == []
     # A new table: writers supply the workspace, so the database has no default.
     assert columns["workspace_id"]["default"] is None
     assert insp.get_pk_constraint("scheduled_task_event_receipts")["constrained_columns"] == [
@@ -1062,7 +1062,12 @@ def test_event_receipts_table(db_engine: Engine) -> None:
 def test_receipt_keys_are_bounded_on_sqlite(db_engine: Engine) -> None:
     """SQLite ignores VARCHAR lengths, so a CHECK bounds the key at 1,024 bytes."""
     receipts = sa.Table("scheduled_task_event_receipts", sa.MetaData(), autoload_with=db_engine)
-    values = {"workspace_id": 0, "scheduled_task_id": b"t" * 16, "created_at": 1}
+    values = {
+        "workspace_id": 0,
+        "scheduled_task_id": b"t" * 16,
+        "run_id": b"r" * 16,
+        "created_at": 1,
+    }
     with db_engine.begin() as conn:
         # 256 four-byte characters fit exactly.
         conn.execute(
@@ -1210,6 +1215,7 @@ def test_trigger_config_migration_keeps_tasks_and_refuses_ruleless_downgrade(
             "workspace_id": 0,
             "scheduled_task_id": b"b" * 16,
             "trigger_key": "event:x:1",
+            "run_id": b"r" * 16,
             "created_at": 1,
         }
         conn.execute(receipts.insert().values(id=b"c" * 16, **receipt))
