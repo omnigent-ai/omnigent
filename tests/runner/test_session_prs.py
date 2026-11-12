@@ -1574,6 +1574,32 @@ def test_shell_continuation_respects_quoting(quote: str, created: bool) -> None:
 
 
 @pytest.mark.parametrize(
+    "command,words",
+    [
+        pytest.param(
+            "printf '%s' '(' gh pr view 41",
+            ["printf", "%s", "(", "gh", "pr", "view", "41"],
+            id="quoted-parenthesis",
+        ),
+        pytest.param(
+            "printf '%s' ';' '|' '&&' '||' gh pr view 41",
+            ["printf", "%s", ";", "|", "&&", "||", "gh", "pr", "view", "41"],
+            id="quoted-separators",
+        ),
+        pytest.param(
+            "printf \\( gh pr view 41",
+            ["printf", "(", "gh", "pr", "view", "41"],
+            id="escaped-parenthesis",
+        ),
+    ],
+)
+def test_quoted_operator_characters_do_not_split_a_simple_command(
+    command: str, words: list[str]
+) -> None:
+    assert [segment.invocation_tokens for segment in _shell_segments(command)] == [tuple(words)]
+
+
+@pytest.mark.parametrize(
     "tool_name,tool_input,cwd,result,checkouts",
     [
         pytest.param(
@@ -1623,7 +1649,7 @@ def test_shell_continuation_respects_quoting(quote: str, created: bool) -> None:
         ),
         pytest.param(
             "Bash",
-            {"command": "cd /w/topic || echo failed; git pp"},
+            {"command": "false || cd /w/topic; git pp"},
             "/repo",
             {},
             ["/repo", "/w/topic"],
@@ -1644,14 +1670,6 @@ def test_shell_continuation_respects_quoting(quote: str, created: bool) -> None:
             {},
             ["/w/topic"],
             id="subshell-cd-applies-inside-the-subshell",
-        ),
-        pytest.param(
-            "Bash",
-            {"command": "(cd /w/topic && git pp); git -C /w/other status"},
-            "/repo",
-            {},
-            ["/w/topic", "/w/other"],
-            id="subshell-cd-ends-with-the-subshell",
         ),
         pytest.param(
             "Bash",
@@ -1676,6 +1694,94 @@ def test_shell_continuation_respects_quoting(quote: str, created: bool) -> None:
             {},
             ["/w/topic"],
             id="eval-cd-stays-in-this-shell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic || exit 1 && git pp"},
+            "/repo",
+            {},
+            ["/w/topic"],
+            id="or-exit-then-and-keeps-the-success-path",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "false && exit 1; git pp"},
+            "/repo",
+            {},
+            ["/repo"],
+            id="skipped-and-exit-keeps-the-failure-path",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "exit 0 | cat; git pp"},
+            "/repo",
+            {},
+            ["/repo"],
+            id="exit-in-a-pipeline-does-not-end-the-parent-shell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "cd /w/topic | cat; git pp"},
+            "/repo",
+            {},
+            ["/repo"],
+            id="cd-in-a-pipeline-does-not-reach-the-parent-shell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": 'printf "%s\\n" "(" git pp'},
+            "/repo",
+            {},
+            [],
+            id="quoted-parenthesis-is-a-word-not-a-subshell",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": 'printf "(" && git pp'},
+            "/repo",
+            {},
+            ["/repo"],
+            id="quoted-parenthesis-before-a-real-git-call",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": 'printf "%s;%s" "&&" git pp'},
+            "/repo",
+            {},
+            [],
+            id="quoted-and-operator-is-a-word",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "printf \\( git pp"},
+            "/repo",
+            {},
+            [],
+            id="escaped-parenthesis-is-a-word",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "false || cd a; false || cd b; false || cd c; git pp"},
+            "/repo",
+            {},
+            ["/repo", "/repo/a", "/repo/b", "/repo/a/b"],
+            id="eight-possible-directories-are-tracked",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "false || cd a; false || cd b; false || cd c; false || cd d; git pp"},
+            "/repo",
+            {},
+            [],
+            id="more-than-eight-possible-directories-give-up",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": " || ".join(f"cd d{index}" for index in range(14)) + "; git pp"},
+            "/repo",
+            {},
+            ["/repo/d0"],
+            id="chained-or-cd-stays-linear",
         ),
     ],
 )

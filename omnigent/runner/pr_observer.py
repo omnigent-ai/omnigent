@@ -6,6 +6,7 @@ request facet recognizes its own shell commands, output objects, and MCP tools.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -275,8 +276,8 @@ def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str
     return "".join(result), redirected
 
 
-# Operator runs as shlex returns them: ``&&``, ``||``, a parenthesis, or one separator character.
-_SHELL_OPERATOR = re.compile(r"&&|\|\||[();&|\n]")
+# Unquoted operators, longest first. Quoted and backslash-escaped characters are never operators.
+_SHELL_OPERATORS = ("&&", "||", "(", ")", ";", "&", "|", "\n")
 
 
 def _shell_steps(
@@ -284,9 +285,9 @@ def _shell_steps(
 ) -> list[ShellSegment | str] | None:
     """Split a command into simple commands and operators, unwrapping nested shell strings.
 
-    Operators are ``"&&"``, ``"||"``, ``"("``, ``")"``, and ``";"`` for any other
-    separator. A nested shell runs in a child process, so its steps sit between
-    ``"("`` and ``")"``, except for ``eval``, which runs in this shell.
+    Operators are ``"&&"``, ``"||"``, ``"|"``, ``"&"``, ``"("``, ``")"``, and ``";"``
+    (also for newlines). A nested shell runs in a child process, so its steps sit
+    between ``"("`` and ``")"``, except for ``eval``, which runs in this shell.
 
     Without *or_lists*, a command with ``||`` or one that cannot be lexed returns
     None, since which of its commands ran is unknown.
@@ -294,31 +295,17 @@ def _shell_steps(
     if depth > MAX_SHELL_NESTING:
         return None
     joined, redirected = _prepare_shell_text(command)
-    lexer = shlex.shlex(joined, posix=True, punctuation_chars=";&|\n()")
-    lexer.whitespace = " \t\r"
-    lexer.whitespace_split = True
-    items: list[list[str] | str] = []
-    words: list[str] = []
-    output_eligible = not redirected
-    try:
-        for token in lexer:
-            if token and all(char in ";&|\n()" for char in token):
-                for operator in _SHELL_OPERATOR.findall(token):
-                    if operator == "||" and not or_lists:
-                        return None
-                    if operator in {"&", "|"}:
-                        output_eligible = False
-                    items.append(words)
-                    words = []
-                    items.append(";" if operator in {"&", "|", ";", "\n"} else operator)
-            else:
-                words.append(token)
-    except ValueError:
+    items = _shell_items(joined)
+    if items is None:
         return None
-    items.append(words)
+    output_eligible = not redirected
     steps: list[ShellSegment | str] = []
     for item in items:
         if isinstance(item, str):
+            if item == "||" and not or_lists:
+                return None
+            if item in {"&", "|", "||"}:
+                output_eligible = False
             steps.append(item)
             continue
         tokens = real_invocation_tokens(item)
@@ -343,6 +330,52 @@ def _shell_steps(
         replace(step, output_eligible=False) if isinstance(step, ShellSegment) else step
         for step in steps
     ]
+
+
+def _shell_items(command: str) -> list[list[str] | str] | None:
+    """Split *command* at unquoted operators, returning each simple command's words.
+
+    Quotes and backslashes are honored while scanning, so ``"("`` and ``\\(`` stay
+    words. Returns None when the command cannot be lexed.
+    """
+    items: list[list[str] | str] = []
+    chunk: list[str] = []
+    quote: str | None = None
+    index = 0
+    try:
+        while index < len(command):
+            char = command[index]
+            if quote == "'":
+                quote = None if char == "'" else quote
+                chunk.append(char)
+                index += 1
+            elif char == "\\" and index + 1 < len(command):
+                chunk.append(command[index : index + 2])
+                index += 2
+            elif quote == '"':
+                quote = None if char == '"' else quote
+                chunk.append(char)
+                index += 1
+            elif char in "'\"":
+                quote = char
+                chunk.append(char)
+                index += 1
+            else:
+                operator = next(
+                    (op for op in _SHELL_OPERATORS if command.startswith(op, index)), None
+                )
+                if operator is None:
+                    chunk.append(char)
+                    index += 1
+                    continue
+                items.append(shlex.split("".join(chunk)))
+                chunk = []
+                items.append(";" if operator == "\n" else operator)
+                index += len(operator)
+        items.append(shlex.split("".join(chunk)))
+    except ValueError:
+        return None
+    return items
 
 
 def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
@@ -590,9 +623,127 @@ def _resolve_directory(current: str | None, argument: str) -> str | None:
     return os.path.normpath(path)
 
 
-def _merge_directories(*groups: tuple[str | None, ...]) -> tuple[str | None, ...]:
+# A directory state is the directories a shell may be in at one point, in first-seen order.
+_Directories = tuple[str | None, ...]
+# Most directories tracked at one point. Beyond this, tracking gives up.
+_MAX_CHECKOUT_DIRECTORIES = 8
+# Deepest subshell nesting tracked before giving up.
+_MAX_SUBSHELL_DEPTH = 16
+
+
+class _TooComplex(Exception):
+    """Directory tracking needs more state than it keeps."""
+
+
+def _merge_directories(*groups: _Directories) -> _Directories:
     """Return the distinct directories in *groups*, in first-seen order."""
-    return tuple(dict.fromkeys(directory for group in groups for directory in group))
+    merged = tuple(dict.fromkeys(directory for group in groups for directory in group))
+    if len(merged) > _MAX_CHECKOUT_DIRECTORIES:
+        raise _TooComplex()
+    return merged
+
+
+class _CheckoutWalker:
+    """Walk shell steps, recording the directories each ``git`` call may run in.
+
+    Each command maps the directories it may start in to the directories it may
+    leave with, as a success state and a failure state. A ``cd`` is assumed to
+    succeed. ``exit`` and ``return`` leave no state. A pipeline stage or a
+    subshell runs in a child shell, so its directory changes do not reach the
+    parent. A background job (``&``) does the same.
+    """
+
+    def __init__(self, steps: list[ShellSegment | str]) -> None:
+        self._steps = steps
+        self._position = 0
+        self._depth = 0
+        self.found: dict[str, None] = {}
+
+    def run(self, start: _Directories) -> None:
+        directories = start
+        while self._position < len(self._steps):
+            ok, fail = self._list(directories)
+            directories = _merge_directories(ok, fail)
+            if self._peek_operator() == ")":  # A closer with no opener, e.g. from a case pattern.
+                self._position += 1
+
+    def _peek(self) -> ShellSegment | str | None:
+        return self._steps[self._position] if self._position < len(self._steps) else None
+
+    def _peek_operator(self) -> str | None:
+        step = self._peek()
+        return step if isinstance(step, str) else None
+
+    def _list(self, directories: _Directories) -> tuple[_Directories, _Directories]:
+        current = directories
+        while True:
+            ok, fail = self._and_or(current)
+            separator = self._peek_operator()
+            if separator not in {";", "&"}:
+                return ok, fail
+            self._position += 1
+            if separator == "&":
+                # A background job leaves the directory unchanged.
+                ok = fail = current
+            else:
+                current = _merge_directories(ok, fail)
+
+    def _and_or(self, directories: _Directories) -> tuple[_Directories, _Directories]:
+        ok, fail = self._pipeline(directories)
+        while (operator := self._peek_operator()) in {"&&", "||"}:
+            self._position += 1
+            if operator == "&&":
+                right_ok, right_fail = self._pipeline(ok)
+                ok, fail = right_ok, _merge_directories(fail, right_fail)
+            else:
+                right_ok, right_fail = self._pipeline(fail)
+                ok, fail = _merge_directories(ok, right_ok), right_fail
+        return ok, fail
+
+    def _pipeline(self, directories: _Directories) -> tuple[_Directories, _Directories]:
+        outcome = self._stage(directories)
+        if self._peek_operator() != "|":
+            return outcome
+        while self._peek_operator() == "|":
+            self._position += 1
+            self._stage(directories)
+        return directories, directories
+
+    def _stage(self, directories: _Directories) -> tuple[_Directories, _Directories]:
+        step = self._peek()
+        if step == "(":
+            self._position += 1
+            self._depth += 1
+            if self._depth > _MAX_SUBSHELL_DEPTH:
+                raise _TooComplex()
+            self._list(directories)
+            self._depth -= 1
+            if self._peek_operator() == ")":
+                self._position += 1
+            return directories, directories
+        if isinstance(step, ShellSegment):
+            self._position += 1
+            return self._simple(directories, step)
+        return directories, directories
+
+    def _simple(
+        self, directories: _Directories, segment: ShellSegment
+    ) -> tuple[_Directories, _Directories]:
+        tokens = segment.invocation_tokens
+        if tokens[0] in {"cd", "pushd"}:
+            target = tokens[1] if len(tokens) > 1 else "~"
+            resolved = [_resolve_directory(directory, target) for directory in directories]
+            return _merge_directories(tuple(resolved)), ()
+        if tokens[0] in {"exit", "return"}:
+            return (), ()
+        if os.path.basename(tokens[0]) == "git":
+            for directory in directories:
+                git_directory = directory
+                if len(tokens) > 2 and tokens[1] == "-C":
+                    git_directory = _resolve_directory(directory, tokens[2])
+                if git_directory is not None:
+                    self.found[git_directory] = None
+        return directories, directories
 
 
 def _git_checkouts(
@@ -604,8 +755,8 @@ def _git_checkouts(
     may run under a sandbox that hides other directories, so only the directory
     it reports running in counts.
 
-    Each step has a set of possible directories, because ``a || b`` runs ``b``
-    whether or not ``a`` changed directory. A subshell's ``cd`` ends with it.
+    Tracking gives up past a bounded amount of state. The directories found
+    before that point are returned.
     """
     if tool_name not in SHELL_TOOLS and tool_name not in {"exec_command", "run_command"}:
         return []
@@ -624,56 +775,10 @@ def _git_checkouts(
         return [reported] if runs_git and isinstance(reported, str) and reported else []
     workdir = arguments.get("workdir")
     start = _resolve_directory(cwd, workdir) if isinstance(workdir, str) and workdir else cwd
-    found: dict[str, None] = {}
-    # Directories the next step may run in, and those the previous step may have run in.
-    here: tuple[str | None, ...] = (start,)
-    before: tuple[str | None, ...] = (start,)
-    # Directories from which an ``||`` left side succeeded, skipping the rest of its chain.
-    skipped: tuple[str | None, ...] = ()
-    after_or = False
-    # Per open subshell: the directories it was entered in, and ``skipped`` outside it.
-    subshells: list[tuple[tuple[str | None, ...], tuple[str | None, ...]]] = []
-    for step in steps:
-        if isinstance(step, str):
-            if step == "(":
-                entry = _merge_directories(before, here) if after_or else here
-                after_or = False
-                subshells.append((entry, skipped))
-                here = before = entry
-                skipped = ()
-            elif step == ")":
-                if subshells:
-                    entry, skipped = subshells.pop()
-                    here = before = entry
-            elif step == "||":
-                skipped = _merge_directories(skipped, here)
-                after_or = True
-            elif step == ";":
-                here = _merge_directories(here, skipped)
-                skipped = ()
-                after_or = False
-            continue
-        tokens = step.invocation_tokens
-        pre = _merge_directories(before, here) if after_or else here
-        after_or = False
-        if tokens[0] in {"cd", "pushd"}:
-            target = tokens[1] if len(tokens) > 1 else "~"
-            post = _merge_directories(
-                *((_resolve_directory(directory, target),) for directory in pre)
-            )
-        elif tokens[0] in {"exit", "return"}:
-            post = ()
-        else:
-            post = pre
-            if os.path.basename(tokens[0]) == "git":
-                for directory in pre:
-                    git_directory = directory
-                    if len(tokens) > 2 and tokens[1] == "-C":
-                        git_directory = _resolve_directory(directory, tokens[2])
-                    if git_directory is not None:
-                        found[git_directory] = None
-        before, here = pre, post
-    return list(found)[:4]
+    walker = _CheckoutWalker(steps)
+    with contextlib.suppress(_TooComplex):
+        walker.run((start,))
+    return list(walker.found)[:4]
 
 
 def observe_tool_completion(
