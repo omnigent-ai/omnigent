@@ -1,7 +1,8 @@
 """E2E: live agent replies appear in the Inbox as unread rows.
 
-Verifies the tabs filter them, the selected tab persists across reloads, and
-"Mark as read" and "Open session" both clear the row.
+Verifies the tabs filter them, the selected tab persists across reloads, a
+reply typed into the row reaches the agent and its answer re-lights the row,
+and "Mark as read" and "Open session" both clear the row.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from tests.e2e_ui.conftest import configure_mock_llm
 _UNREAD_ROW = '[data-testid="inbox-unread"]'
 _FIRST_REPLY = "Refactor finished: 3 files changed, all tests green."
 _SECOND_REPLY = "Follow-up done: added the missing migration."
+_ANSWER_TO_INBOX_REPLY = "Re-ran the suite: 214 passed."
 _TURN_TIMEOUT_MS = 60_000
 
 
@@ -52,10 +54,14 @@ def test_unseen_reply_surfaces_in_inbox_until_read(
     base_url, session_id = seeded_session
     first_marker = f"inbox-unread-{uuid.uuid4().hex[:8]}"
     second_marker = f"inbox-unread-{uuid.uuid4().hex[:8]}"
+    reply_marker = f"inbox-unread-{uuid.uuid4().hex[:8]}"
     # Several copies per marker so a title-generation call matching the same
     # prompt can't drain the queue before the agent's turn.
     configure_mock_llm(mock_llm_server_url, [{"text": _FIRST_REPLY}] * 3, match=first_marker)
     configure_mock_llm(mock_llm_server_url, [{"text": _SECOND_REPLY}] * 3, match=second_marker)
+    configure_mock_llm(
+        mock_llm_server_url, [{"text": _ANSWER_TO_INBOX_REPLY}] * 3, match=reply_marker
+    )
 
     page.goto(f"{base_url}/inbox")
     expect(page.get_by_text("Nothing waiting on you")).to_be_visible(timeout=30_000)
@@ -90,17 +96,28 @@ def test_unseen_reply_surfaces_in_inbox_until_read(
     expect(page.get_by_text("You’re all caught up")).to_be_visible(timeout=30_000)
     expect(row).to_have_count(0)
 
-    # A new reply re-lights the row; opening the session is reading it.
+    # A new reply re-lights the row.
     _wait_for_next_second()
     _send_user_message(base_url, session_id, f"Add the migration too. Marker: {second_marker}")
     expect(row).to_be_visible(timeout=_TURN_TIMEOUT_MS)
     expect(row).to_contain_text(_SECOND_REPLY, timeout=15_000)
+
+    # Answering from the row runs a turn, and its answer re-lights the row.
     row.locator("button[aria-expanded]").click()
+    inbox_reply = f"Re-run the suite. Marker: {reply_marker}"
+    row.get_by_role("textbox", name=re.compile(r"^Reply to ")).fill(inbox_reply)
+    row.get_by_role("button", name="Send").click()
+    expect(page.get_by_test_id("toast").filter(has_text="Reply sent to")).to_be_visible()
+    expect(row).to_contain_text(_ANSWER_TO_INBOX_REPLY, timeout=_TURN_TIMEOUT_MS)
+
+    # Opening the session is reading it.
     row.get_by_role("link", name="Open session").click()
     expect(page).to_have_url(re.compile(rf"/c/{re.escape(session_id)}"))
+    bubbles = page.locator('[data-testid="message-bubble"]')
+    expect(bubbles.filter(has_text=inbox_reply)).to_be_visible(timeout=30_000)
     expect(
         page.locator('[data-testid="message-bubble"][data-role="assistant"]').filter(
-            has_text=_SECOND_REPLY
+            has_text=_ANSWER_TO_INBOX_REPLY
         )
     ).to_be_visible(timeout=30_000)
 

@@ -45,6 +45,7 @@ export type SettingsSectionId =
   | "shortcuts"
   | "import"
   | "account"
+  | "admin"
   | "members"
   | "policies"
   | "sharing"
@@ -63,6 +64,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "shortcuts",
   "import",
   "account",
+  "admin",
   "members",
   "policies",
   "sharing",
@@ -101,6 +103,7 @@ export function settingsNavGroups(
   integrationsEnabled = false,
   customAgentsEnabled = false,
   mcpEnabled = false,
+  nestedAgentsEnabled = false,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
     id: "harnesses",
@@ -148,24 +151,21 @@ export function settingsNavGroups(
       ],
     });
   }
-  // Admin: server-wide management, admin-only. Nested here as sub-categories
-  // (rather than links out of the Account section) so entering them stays
-  // inside /settings — the sidebar keeps the settings nav instead of snapping
-  // back to the conversation list. Gated on `isAdmin` alone (not
-  // `accountsEnabled`) so the surface also appears under OIDC/SSO, the one
-  // mode where there's otherwise no admin chrome at all. Members runs
-  // read-only under OIDC (no password actions); Policies is identical.
+  // Single-user servers permit destination settings without an admin identity.
+  const adminItems: SettingsNavItem[] = [];
+  if ((isAdmin || isSingleUser) && nestedAgentsEnabled) {
+    adminItems.push({ id: "admin", label: "General", icon: SettingsIcon });
+  }
   if (isAdmin) {
     // Members (manage other accounts) and Sharing (grant sessions to other
     // users) have no meaning in single-user mode — there are no other users —
     // so drop both from the nav there. Policies stays: global policies apply
     // to a solo user's own sessions too.
-    const adminItems: SettingsNavItem[] = [];
     if (!isSingleUser) adminItems.push({ id: "members", label: "Members", icon: UsersIcon });
     adminItems.push({ id: "policies", label: "Policies", icon: ShieldCheckIcon });
     if (!isSingleUser) adminItems.push({ id: "sharing", label: "Sharing", icon: Share2Icon });
-    groups.push({ title: "Admin", items: adminItems });
   }
+  if (adminItems.length > 0) groups.push({ title: "Admin", items: adminItems });
   groups.push({
     title: "Archived",
     items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
@@ -203,6 +203,7 @@ export function useSettingsRoute(): {
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
     !(singleUser && (next === "members" || next === "sharing")) &&
+    !(next === "admin" && (info === "loading" || info.sibling_sessions !== true)) &&
     !(next === "custom-agents" && !customAgentsSettingsEnabled(info));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
@@ -266,6 +267,7 @@ export function SettingsSidebarBody({
     integrationsEnabled,
     customAgentsSettingsEnabled(info),
     mcpEnabled,
+    info !== "loading" && info.sibling_sessions === true,
   );
 
   return (

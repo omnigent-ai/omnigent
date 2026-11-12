@@ -46,10 +46,10 @@ import { useSession } from "@/hooks/useSession";
 import { usePublicSharingMaxLevel } from "@/hooks/useSharing";
 import { useUserSearch } from "@/hooks/useUserSearch";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { withBasePath } from "@/lib/basePath";
 import { copyText } from "@/lib/clipboard";
 import { updateSession } from "@/lib/sessionsApi";
-import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
+import { getOmnigentUserSearch } from "@/lib/host";
+import { getShareableSessionLink } from "@/lib/shareLink";
 import { workspaceSharingBlocked } from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
@@ -576,29 +576,15 @@ function AddUserCombobox({ value, onChange, disabled }: AddUserFieldProps) {
 }
 
 /**
- * The basename-rebased session path turned into an absolute URL. In the embed
- * the host transform returns the full URL (origin included); standalone has no
- * transform, so we prepend the origin ourselves.
- */
-function getShareableLink(sessionId: string, rebasePath: (path: string) => string): string {
-  const path = rebasePath(`/c/${sessionId}`);
-  const transform = getOmnigentTransformShareLink();
-  // Standalone: `rebasePath` is identity, so apply the deployment base path
-  // (e.g. `/proxy/6767`) before prepending the origin. The embed supplies its
-  // own `transform`, which already includes the host mount path.
-  return transform ? transform(path) : `${window.location.origin}${withBasePath(path)}`;
-}
-
-/**
  * The `omnigent://<host>/c/<session_id>` deep link encoded into the share QR
  * code. The host (with port when non-default) is parsed from the same shareable
- * URL `getShareableLink` resolves — so standalone and embedded (host-transformed)
+ * URL `getShareableSessionLink` resolves — so standalone and embedded (host-transformed)
  * origins agree on the same server the desktop shell's deep-link handler keys
  * off of (see `electron/src/deepLink.js`). The path is always basename-less
  * `/c/<id>`; the workspace mount is server-determined and intentionally absent.
  */
 function getDeepLink(sessionId: string, rebasePath: (path: string) => string): string {
-  const url = getShareableLink(sessionId, rebasePath);
+  const url = getShareableSessionLink(sessionId, rebasePath);
   try {
     const { host } = new URL(url);
     return `omnigent://${host}/c/${sessionId}`;
@@ -619,7 +605,7 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
   }, [copied]);
 
   const handleCopy = useCallback(() => {
-    const url = getShareableLink(sessionId, rebasePath);
+    const url = getShareableSessionLink(sessionId, rebasePath);
     copyText(url).then(
       () => setCopied(true),
       (err) => {

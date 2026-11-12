@@ -42,6 +42,7 @@ permissions:
   security-events: write # dismiss CodeQL code-scanning alerts
 
 env:
+  OMNIGENT_CI_PIPELINE: security-triage
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
   PIP_INDEX_URL: https://pypi.org/simple
@@ -58,7 +59,7 @@ env:
 
 jobs:
   triage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Check LLM credentials available
@@ -193,7 +194,7 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.creds.outputs.available == 'true'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
         with:
           harness: claude
 
@@ -225,6 +226,9 @@ jobs:
           mkdir -p "$HOME/.omnigent"
           python3 -c "
           import pathlib, os, json
+          from omnigent.databricks_ai_gateway import ci_gateway_base_url, ci_request_tags
+          if not ci_request_tags(strict=True).get('pipeline'):
+              raise ValueError('CI pipeline is required')
           gw = os.environ['GATEWAY_BASE_URL']
           cfg = {
               'providers': {
@@ -232,7 +236,7 @@ jobs:
                       'kind': 'gateway',
                       'default': ['anthropic'],
                       'anthropic': {
-                          'base_url': gw + '/anthropic',
+                          'base_url': ci_gateway_base_url(gw, 'anthropic'),
                           'api_key_ref': 'env:LLM_API_KEY',
                           'models': {'default': os.environ['OMNIGENT_AGENT_MODEL']},
                       },

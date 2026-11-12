@@ -29,7 +29,9 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
+    CAP_CODEX_PLAN_AT_LAUNCH,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostStatFrame,
@@ -48,7 +50,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests.debug_log_helpers import capture_debug_rows
-from tests.server.helpers import build_agent_bundle
+from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
@@ -72,6 +74,7 @@ def app(
     db_uri: str,
     tmp_path: Path,
     conv_store: SqlAlchemyConversationStore,
+    request: pytest.FixtureRequest,
 ) -> FastAPI:
     """FastAPI app wired WITH ``host_store`` so host launches can run.
 
@@ -85,7 +88,15 @@ def app(
     :returns: A configured FastAPI app with host routes mounted.
     """
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+
+    gate = getattr(request, "param", "off") == "on"
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+
     return create_app(
+        mcp_disabled_servers=gate,
+        feature_flags=FeatureFlags(
+            frozenset({Feature.MCP_DISABLED_SERVERS_CLAUDE, Feature.MCP_DISABLED_SERVERS_CODEX})
+        ),
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
         conversation_store=conv_store,
@@ -213,15 +224,17 @@ async def _multipart_create(
     metadata: dict[str, object],
     *,
     agent_name: str = "bundle-host-agent",
+    executor: dict[str, object] | None = None,
 ) -> httpx.Response:
     """POST a multipart create with the given metadata part.
 
     :param client: The test HTTP client.
     :param metadata: The ``metadata`` JSON part.
     :param agent_name: Name baked into the uploaded bundle.
+    :param executor: Executor block for the bundle, or ``None`` for the default.
     :returns: The raw HTTP response.
     """
-    bundle = build_agent_bundle(name=agent_name)
+    bundle = build_agent_bundle(name=agent_name, executor=executor)
     return await client.post(
         "/v1/sessions",
         data={"metadata": json.dumps(metadata)},
@@ -229,10 +242,12 @@ async def _multipart_create(
     )
 
 
+@pytest.mark.parametrize("app", ["on", "off"], indirect=True)
 async def test_multipart_create_with_host_id_binds_and_launches(
     register_host: RegisterHost,
     client: httpx.AsyncClient,
     conv_store: SqlAlchemyConversationStore,
+    request: pytest.FixtureRequest,
 ) -> None:
     """
     A multipart create carrying ``metadata.host_id`` binds the session
@@ -249,6 +264,7 @@ async def test_multipart_create_with_host_id_binds_and_launches(
     session_id = resp.json()["session_id"]
     accepted = next(row for row in rows if row["event_name"] == "session_creation_accepted")
     assert float(accepted["attributes"]["create_acl_ms"]) >= 0
+    assert float(accepted["attributes"]["create_host_launch_ms"]) >= 0
 
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
@@ -263,6 +279,9 @@ async def test_multipart_create_with_host_id_binds_and_launches(
     assert len(cap.launch) == 1, f"expected one launch frame, got {len(cap.launch)}"
     assert cap.launch[0].session_id == session_id
     assert cap.launch[0].workspace == _WORKSPACE
+    assert cap.launch[0].mcp_disabled_servers_active_harnesses == (
+        ["claude", "codex"] if request.node.callspec.params["app"] == "on" else None
+    )
     # Workspace validation ran against the host (host.stat round-trip).
     assert any(frame.path == _WORKSPACE for frame in cap.stats)
 
@@ -309,6 +328,58 @@ async def test_multipart_create_host_id_requires_workspace(
     )
     assert resp.status_code == 400, resp.text
     assert "workspace required" in resp.text
+
+
+@pytest.mark.parametrize(
+    ("bundle", "capable", "readiness", "expected_status"),
+    [
+        (False, False, None, 409),
+        (True, False, None, 409),
+        (True, True, None, 201),
+        (False, False, {"codex": False}, 412),
+    ],
+)
+async def test_codex_plan_create_checks_host_before_persisting(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    conv_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    bundle: bool,
+    capable: bool,
+    readiness: dict[str, HarnessAvailability] | None,
+    expected_status: int,
+) -> None:
+    cap = register_host()
+    conn = app.state.host_registry.get(_HOST_ID)
+    conn.hello.capabilities = [CAP_CODEX_PLAN_AT_LAUNCH] if capable else []
+    HostStore(db_uri).upsert_on_connect(
+        _HOST_ID, "bundle-host", RESERVED_USER_LOCAL, configured_harnesses=readiness
+    )
+    metadata = {
+        "host_id": _HOST_ID,
+        "workspace": _WORKSPACE,
+        "labels": {"omnigent.codex_native.collaboration_mode": "plan"},
+    }
+    executor = {"type": "omnigent", "config": {"harness": "codex-native"}}
+    if not bundle:
+        agent = await create_test_agent(client, executor=executor)
+        metadata["agent_id"] = agent["id"]
+    existing_ids = {conv.id for conv in conv_store.list_conversations().data}
+    if bundle:
+        resp = await _multipart_create(client, metadata, executor=executor)
+    else:
+        resp = await client.post("/v1/sessions", json=metadata)
+
+    assert resp.status_code == expected_status, resp.text
+    if expected_status == 201:
+        assert len(cap.launch) == 1
+    else:
+        assert resp.json()["error"]["code"] == (
+            "conflict" if expected_status == 409 else "harness_not_configured"
+        )
+        assert {conv.id for conv in conv_store.list_conversations().data} == existing_ids
+        assert not cap.launch
 
 
 async def test_multipart_create_rejects_workspace_missing_on_host(

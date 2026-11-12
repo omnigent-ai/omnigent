@@ -19,6 +19,8 @@ _TEXT_FIELDS = frozenset(
         "forwarder_rejection_reason",
         "detail_source",
         "failure_decision",
+        "failure_context_error_type",
+        "failure_context_error_phase",
         "suppression_reason",
         "native_error_category",
         "transcript_error_context_state",
@@ -48,6 +50,7 @@ _TEXT_FIELDS = frozenset(
         "exception_cause_type",
         "exception_context_type",
         "native_launch_os_errno_name",
+        "native_launch_code_origin",
     }
 )
 _BOOL_FIELDS = frozenset(
@@ -195,3 +198,24 @@ def native_failure_id(source: str, *identity: str | int | float | None) -> str:
     """Derive an observation ID from durable source identity, never a retry timestamp."""
     key = json.dumps([source, *identity], separators=(",", ":"), ensure_ascii=True)
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "omnigent:native-failure:" + key))
+
+
+def exception_code_origin(
+    exc: BaseException | None, *, prefer_module_prefix: str | None = None
+) -> str | None:
+    """Identify code from at most 64 frames without exporting paths or exception text."""
+    traceback = exc.__traceback__ if exc is not None else None
+    preferred: str | None = None
+    fallback: str | None = None
+    for _ in range(64):
+        if traceback is None:
+            break
+        frame = traceback.tb_frame
+        module = frame.f_globals.get("__name__", "")
+        module = module if isinstance(module, str) else ""
+        fallback = f"{module}.{frame.f_code.co_qualname}:{traceback.tb_lineno}"
+        if prefer_module_prefix is None or module.startswith(prefer_module_prefix):
+            preferred = fallback
+        traceback = traceback.tb_next
+    origin = preferred or fallback
+    return redact_log_text(origin, include_whitespace_credentials=True)[:256] if origin else None

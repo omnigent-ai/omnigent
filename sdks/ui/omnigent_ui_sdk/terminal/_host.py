@@ -21,7 +21,7 @@ import os
 import pathlib
 import shlex
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -206,6 +206,10 @@ _SPINNER_FRAMES: tuple[str, ...] = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 # to feel animated (10 fps) and slow enough that the invalidate
 # calls don't dominate the event loop.
 _SPINNER_TICK_SECONDS: float = 0.1
+
+# How often an open overlay (e.g. Ctrl+O) rebuilds its content. Each rebuild
+# runs the overlay's builder, which may make HTTP requests.
+_OVERLAY_REFRESH_SECONDS: float = 1.0
 
 # Debounce window for the "N agents running" badge / spinner only. A
 # sub-agent that just reached a terminal task status keeps counting as
@@ -2035,18 +2039,16 @@ class TerminalHost:
             """
             Periodically rebuild the current target's content.
 
-            500 ms cadence — tight enough that users see turn
-            updates land without manual intervention, loose enough
-            that each tick's HTTP ``list_items`` round-trip doesn't
-            hammer the server. Matches omnigent' overview polling
-            strategy (see ``omnigent/cli.py::_refresh_loop``),
-            with the interval bumped from 50 ms → 500 ms because
-            Omnigent' builder crosses a real HTTP boundary
-            while omnigent' builder just reads in-process state.
+            :data:`_OVERLAY_REFRESH_SECONDS` cadence — tight enough
+            that users see turn updates land without manual
+            intervention, loose enough that each tick's HTTP
+            round-trips don't hammer the server. ``omnigent/cli.py``'s
+            overview refreshes every 50 ms because its builder reads
+            in-process state; this builder crosses a real HTTP boundary.
             """
             try:
                 while True:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(_OVERLAY_REFRESH_SECONDS)
                     await _rebuild_content(reset_scroll=False)
             except asyncio.CancelledError:
                 return
@@ -3194,7 +3196,12 @@ class TerminalHost:
         self._invalidate_prompt()
 
     def seed_subagent_tree(
-        self, root_id: str, nodes: list[dict[str, Any]], *, generation: int | None = None
+        self,
+        root_id: str,
+        nodes: list[dict[str, Any]],
+        *,
+        generation: int | None = None,
+        unexpanded: Collection[str] = (),
     ) -> None:
         """Replace the tree from a recursively-fetched snapshot.
 
@@ -3214,6 +3221,10 @@ class TerminalHost:
         a snapshot whose generation no longer matches (the tree was cleared and
         re-rooted while this fetch was in flight) is dropped wholesale rather
         than resurrecting cleared nodes onto a new root.
+
+        ``unexpanded`` names snapshot nodes whose children the fetch skipped
+        (their subtree had settled). Their known descendants are kept as-is
+        rather than treated as gone from the server.
         """
         if generation is not None and generation != self._subagent_generation:
             return
@@ -3230,8 +3241,11 @@ class TerminalHost:
                 parent_id=parent if isinstance(parent, str) else None,
                 child=row,
             )
+        skipped = set(unexpanded)
         for sid in list(self._subagents):
             if sid in seen:
+                continue
+            if skipped and self._has_ancestor_in(sid, skipped):
                 continue
             node = self._subagents[sid]
             # Unsent (still-active) sub-agents stay searchable in the tree
@@ -3343,6 +3357,38 @@ class TerminalHost:
         running-ness, NOT selector availability; use :meth:`has_any_subagents`
         to gate the ↓ menu so finished children remain reachable."""
         return self.active_subagent_count() > 0
+
+    def _has_ancestor_in(self, session_id: str, ancestors: set[str]) -> bool:
+        """Whether any ancestor of *session_id* in the registry is in *ancestors*."""
+        return not ancestors.isdisjoint(self.subagent_ancestors(session_id))
+
+    def subagent_subtree_settled(self, session_id: str) -> bool:
+        """Whether *session_id*'s known subtree has nothing left to refresh.
+
+        ``True`` when the node is known, isn't running, and no known descendant
+        is running, so a poll can skip re-fetching its children. Unknown nodes
+        return ``False`` so their subtree is discovered at least once.
+        """
+        node = self._subagents.get(session_id)
+        if node is None:
+            return False
+        now = self._monotonic()
+        if self._subagent_active(node, now):
+            return False
+        return not any(
+            self._subagent_active(other, now)
+            and session_id in self.subagent_ancestors(other.session_id)
+            for other in self._subagents.values()
+        )
+
+    def subagent_ancestors(self, session_id: str) -> set[str]:
+        """Return the known ancestors of *session_id* in the registry, excluding itself."""
+        out: set[str] = set()
+        node = self._subagents.get(session_id)
+        while node is not None and node.parent_id is not None and node.parent_id not in out:
+            out.add(node.parent_id)
+            node = self._subagents.get(node.parent_id)
+        return out
 
     def has_any_subagents(self) -> bool:
         """True when ANY sub-agent node exists — active OR finished. Gates the

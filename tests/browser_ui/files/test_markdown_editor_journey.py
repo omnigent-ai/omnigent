@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, Request, expect
+from playwright.sync_api import Locator, Page, Request, Route, expect
 
 from tests.browser_ui.files.test_file_line_navigation import (
     BrowserSession,
@@ -31,6 +31,203 @@ pytestmark = pytest.mark.browser_context_args(
 
 _CONTENT = Path(__file__).with_name("markdown_editor_journey.md").read_text()
 _PATH = "src/markdown-editor-journey.md"
+
+
+def _comment(session: BrowserSession, start: int, end: int, anchor: str) -> dict:
+    return {
+        "id": "boundary-comment",
+        "conversation_id": session.session_id,
+        "path": _PATH,
+        "body": "Boundary regression",
+        "start_index": start,
+        "end_index": end,
+        "anchor_content": anchor,
+        "status": "draft",
+        "created_at": 1,
+        "updated_at": 1,
+        "created_by": None,
+    }
+
+
+def _highlights(editor: Locator) -> list[dict]:
+    return editor.locator('[data-comment-id="boundary-comment"]').evaluate_all(
+        """elements => elements.map(element => ({
+            text: element.textContent,
+            from: element.closest('.tiptap').editor.view.posAtDOM(element, 0),
+        }))"""
+    )
+
+
+@pytest.mark.parametrize(
+    "raw,selection,expected_raw,expected_highlight",
+    [
+        (
+            "alpha\r\nbeta",
+            [1, 7],
+            [0, 7],
+            [{"text": "alpha", "from": 1}, {"text": " ", "from": 6}],
+        ),
+        ("word  \nnext\n\nword\n\n[details](word)", [1, 6], [0, 4], [{"text": "word", "from": 1}]),
+        (
+            "[label](" + "x" * 59 + ") word **word**![alt](image.png)\n\n",
+            [12, 17],
+            [76, 80],
+            [{"text": "word", "from": 12}],
+        ),
+    ],
+    ids=["crlf-soft-break", "hard-break-hidden-url", "image-proportional-collision"],
+)
+def test_markdown_comment_boundary_save_reload(
+    page: Page,
+    seeded_session: BrowserSession,
+    output_path: str,
+    raw: str,
+    selection: list[int],
+    expected_raw: list[int],
+    expected_highlight: list[dict],
+) -> None:
+    _mock_markdown_files(page, seeded_session, {_PATH: raw})
+    seeded_session.contract.json(
+        f"/v1/sessions/{seeded_session.session_id}/resources/environments/default/filesystem/src/image.png",
+        {"error": "Synthetic missing image"},
+        status=404,
+    )
+
+    def save(request: Request) -> dict:
+        data = request.post_data_json
+        saved = _comment(
+            seeded_session, data["start_index"], data["end_index"], data["anchor_content"]
+        )
+        seeded_session.comments.append(saved)
+        return saved
+
+    seeded_session.contract.json(
+        f"/v1/sessions/{seeded_session.session_id}/comments", save, method="POST"
+    )
+    viewer = _open_viewer(
+        page, seeded_session, _PATH, {"diffActive": False, "previewableViewMode": "editor"}
+    )
+    editor = viewer.locator(".tiptap")
+    expect(editor).to_be_visible(timeout=30_000)
+    editor.evaluate(
+        """(element, [from, to]) => {
+        const view = element.editor.view;
+        view.focus();
+        const start = view.domAtPos(from), end = view.domAtPos(to);
+        const range = document.createRange();
+        range.setStart(start.node, start.offset); range.setEnd(end.node, end.offset);
+        const selection = window.getSelection();
+        selection.removeAllRanges(); selection.addRange(range);
+    }""",
+        selection,
+    )
+    page.get_by_role("button", name="Add comment", exact=True).click()
+    viewer.locator("textarea[placeholder='Add a comment…']").fill("Boundary regression")
+    viewer.get_by_role("button", name="Add Comment", exact=True).click()
+    expect(editor.locator('[data-comment-id="boundary-comment"]').first).to_be_visible()
+    saved = seeded_session.comments[0]
+    assert [saved["start_index"], saved["end_index"]] == expected_raw
+    assert _highlights(editor) == expected_highlight
+    page.reload()
+    expect(editor.locator('[data-comment-id="boundary-comment"]').first).to_be_visible(
+        timeout=30_000
+    )
+    assert _highlights(editor) == expected_highlight
+    target = Path(output_path) / "comment-boundary.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"saved": saved, "highlights": _highlights(editor)}, indent=2))
+
+
+def test_markdown_existing_comment_after_autosave(
+    page: Page,
+    seeded_session: BrowserSession,
+) -> None:
+    raw = "word **word** word\n\n[Details](https://example.invalid/" + "x" * 100 + ")"
+    files = {_PATH: raw}
+    _mock_markdown_files(page, seeded_session, files)
+    seeded_session.comments.append(_comment(seeded_session, 7, 11, "word"))
+    writes = []
+
+    def save(request: Request) -> dict:
+        files[_PATH] = request.post_data_json["content"]
+        writes.append(files[_PATH])
+        return {"saved": True}
+
+    seeded_session.contract.json(
+        f"/v1/sessions/{seeded_session.session_id}/resources/environments/default/filesystem/{_PATH}",
+        save,
+        method="PUT",
+    )
+    viewer = _open_viewer(
+        page, seeded_session, _PATH, {"diffActive": False, "previewableViewMode": "editor"}
+    )
+    editor = viewer.locator(".tiptap")
+    expect(editor).to_be_visible(timeout=30_000)
+    assert _highlights(editor) == [{"text": "word", "from": 6}]
+    editor.evaluate(
+        """element => {
+            element.editor.view.focus();
+            element.editor.commands.setTextSelection(element.editor.state.doc.content.size - 1);
+        }"""
+    )
+    page.keyboard.press("Enter")
+    page.keyboard.type("tail " * 80)
+    expect(viewer.get_by_role("button", name="All changes saved")).to_be_visible(timeout=15_000)
+    assert writes and files[_PATH].startswith("word **word** word")
+    assert _highlights(editor) == [{"text": "word", "from": 6}]
+    page.reload()
+    expect(editor.locator('[data-comment-id="boundary-comment"]')).to_be_visible(timeout=30_000)
+    assert _highlights(editor) == [{"text": "word", "from": 6}]
+
+
+@pytest.mark.parametrize(
+    "updated,chunk_failures",
+    [
+        ("prefix say **word** now", 0),
+        ("prefix say word now", 0),
+        ("prefix say word now", 1),
+    ],
+    ids=["formatting-retained", "formatting-removed", "chunk-load-fallback"],
+)
+def test_markdown_source_comment_after_external_edit(
+    page: Page,
+    seeded_session: BrowserSession,
+    updated: str,
+    chunk_failures: int,
+) -> None:
+    original = "say **word** now"
+    files = {_PATH: original}
+    _mock_markdown_files(page, seeded_session, files)
+    seeded_session.comments.append(_comment(seeded_session, 0, len(original), "say word now"))
+    viewer = _open_viewer(
+        page, seeded_session, _PATH, {"diffActive": False, "previewableViewMode": "editor"}
+    )
+    editor = viewer.locator(".tiptap")
+    expect(editor).to_be_visible(timeout=30_000)
+    expect(editor.locator('[data-comment-id="boundary-comment"]').first).to_be_visible()
+    files[_PATH] = updated
+    attempts = []
+    if chunk_failures:
+
+        def load_chunk(route: Route) -> None:
+            attempts.append(route.request.url)
+            if len(attempts) <= chunk_failures:
+                route.abort()
+            else:
+                route.continue_()
+
+        page.route("**/markdownCommentRemap-*.js", load_chunk)
+    page.reload()
+    expect(editor).to_contain_text("prefix say word now", timeout=30_000)
+    viewer.get_by_role("button", name=re.compile(r"^View mode")).click()
+    page.get_by_role("menuitem", name="Source", exact=True).click()
+    line = viewer.locator("[data-line='1']")
+    expect(line).to_contain_text(updated)
+    overlay = line.locator("span[aria-hidden][style*='ch']").first
+    expect(overlay).to_have_attribute("style", re.compile(r"^left: calc\(7ch \+ 0\.75rem\);"))
+    assert overlay.evaluate("element => element.style.width") == f"{len(updated) - 7}ch"
+    if chunk_failures:
+        assert len(attempts) == 1
 
 
 def test_markdown_editor_review_journey(page: Page, seeded_session: BrowserSession) -> None:

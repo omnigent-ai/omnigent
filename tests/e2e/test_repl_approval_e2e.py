@@ -57,6 +57,8 @@ from tests.e2e.conftest import (
 
 pexpect = pytest.importorskip("pexpect")
 
+from tests._helpers.terminal_screen import TerminalScreen  # noqa: E402
+
 _ASK_DEMO_DIR = Path(__file__).resolve().parents[1] / "resources" / "agents" / "ask-demo"
 _FIXTURES_DIR = Path(__file__).resolve().parents[1] / "_fixtures" / "agents"
 _TOOL_GATE_DIR = _FIXTURES_DIR / "e2e-tool-gate"
@@ -381,30 +383,24 @@ def _wait_for_prompt_ready(
     return server_url
 
 
-def _wait_for_turn_complete(child: Any, timeout: float = 45.0) -> None:
+def _wait_for_turn_complete(screen: TerminalScreen, reply: str, timeout: float = 45.0) -> None:
     """
-    Block until the current turn has finished streaming.
+    Block until the current turn has committed *reply* and the REPL is idle.
 
-    The REPL's bottom toolbar is the turn-state oracle: it reads
-    ``state: running`` (animated spinner) while a handler task is
-    in flight and flips back to ``state: sleeping`` (``· ready``)
-    once the turn fully lands. The older tests waited on a
-    ``\\d+\\.\\d+s`` decimal "elapsed" footer, but the current REPL
-    never renders one — the only elapsed readout is the integer
-    ``streaming… Ns`` segment that disappears on completion. Waiting
-    for that stale pattern times out even though the turn finished.
+    The bottom toolbar reads ``state: running`` while a handler task is in
+    flight and ``state: sleeping`` once the turn lands. prompt-toolkit repaints
+    only the toolbar cells that changed (e.g. ``state: sl\\x1b[Ceping``), so the
+    raw PTY stream need not contain the idle text; match the rendered screen.
 
-    A single ``· ready`` expect is enough: every send/approve site
-    leaves the toolbar in ``state: running`` (the turn is dispatched,
-    or an approval is pending), so the next ``· ready`` is the
-    post-turn idle settle — never a stale pre-turn toolbar. Keeping it
-    to one expect also preserves ``child.before`` as the full
-    span of the turn's rendered output, which several callers scan.
-
-    :param child: Active pexpect child.
+    :param screen: Screen attached to the REPL child right after spawning.
+    :param reply: The turn's scripted response, e.g. ``"Hello there!"``.
     :param timeout: Max seconds to wait for the turn to settle.
     """
-    child.expect(r"·\s*ready", timeout=timeout)
+    screen.wait_for(
+        lambda text: f"◆ {reply}" in text and "state: sleeping" in text,
+        timeout=timeout,
+        what=f"the turn replying {reply!r} to finish",
+    )
 
 
 def _read_pending(child: Any, seconds: float = 0.2) -> str:
@@ -744,6 +740,7 @@ def test_repl_approve_always_caches_for_later_turns(
         dimensions=(40, 120),
         timeout=_LAUNCH_TIMEOUT,
     )
+    screen = TerminalScreen(child)
     try:
         _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT)
 
@@ -754,7 +751,7 @@ def test_repl_approve_always_caches_for_later_turns(
         # Echo line confirms the REPL parsed "a" as
         # APPROVE_ALWAYS, not as a generic non-"y" refusal.
         child.expect("approved always", timeout=5)
-        _wait_for_turn_complete(child, timeout=30)
+        _wait_for_turn_complete(screen, "Hello there!", timeout=30)
 
         # Drain between turns so the next buffer is clean.
         _read_pending(child, seconds=1.5)

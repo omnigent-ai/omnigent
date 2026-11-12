@@ -89,6 +89,24 @@ async def test_launch_config_defaults_no_fork(monkeypatch: pytest.MonkeyPatch) -
     assert config.native_usage_baseline is None
 
 
+@pytest.mark.parametrize("cost", [0, 0.25, None, -1, True, "0.25", float("nan"), float("inf")])
+async def test_launch_config_validates_optional_cost(
+    cost: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/repo")
+    baseline = {
+        "cumulative_input_tokens": 100,
+        "cumulative_output_tokens": 20,
+        "cumulative_cache_read_input_tokens": 30,
+    }
+    client = _GetClient({"native_usage_baseline": {**baseline, "cumulative_cost_usd": cost}})
+    config = await _pi_native_launch_config(session_id="conv_1", server_client=client)
+    expected = dict(baseline)
+    if type(cost) in (int, float) and cost in (0, 0.25):
+        expected["cumulative_cost_usd"] = cost
+    assert config.native_usage_baseline == expected
+
+
 # --------------------------------------------------------------------------
 # _resolve_pi_resume_session
 # --------------------------------------------------------------------------
