@@ -3952,6 +3952,7 @@ def test_run_turn_error_after_submit_is_not_marked_undelivered(
         "turn/steer",
         "live-steer",
         "before-send",
+        "initialize-rejected",
         "binding-change",
         "settings-rejected",
         "settings-disconnected",
@@ -3975,17 +3976,37 @@ async def test_transport_failure_keeps_native_work_running(
     )
     requests: list[str] = []
     native_running = submission == "before-send"
+    initialization_rejected = False
     if settings_failure:
         monkeypatch.setattr(codex_native_executor, "_DELIVERY_RPC_TIMEOUT_SECONDS", 1.0)
 
     async def handle(websocket: ServerConnection) -> None:
-        nonlocal native_running
+        nonlocal native_running, initialization_rejected
         async for raw in websocket:
             request = json.loads(raw)
             rpc_method = request["method"]
             if "id" not in request:
                 continue
             requests.append(rpc_method)
+            if (
+                submission == "initialize-rejected"
+                and rpc_method == "initialize"
+                and not initialization_rejected
+            ):
+                initialization_rejected = True
+                native_running = True
+                state = read_bridge_state(tmp_path)
+                assert state is not None
+                write_bridge_state(tmp_path, replace(state, active_turn_id="turn_accepted"))
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "id": request["id"],
+                            "error": {"code": -32600, "message": "failed to load configuration"},
+                        }
+                    )
+                )
+                continue
             if rpc_method == "thread/settings/update":
                 native_running = True
                 state = read_bridge_state(tmp_path)
@@ -4081,6 +4102,10 @@ async def test_transport_failure_keeps_native_work_running(
             elif submission == "binding-change":
                 assert "changed" in str(caught.value)
                 assert caught.value.undelivered is True
+            elif submission == "initialize-rejected":
+                assert "failed to load configuration" in str(caught.value)
+                assert caught.value.undelivered is True
+                assert caught.value.code == "codex_initialization_failed"
             elif settings_failure:
                 assert caught.value.undelivered is True
                 assert caught.value.code == "codex_settings_update_failed"
@@ -4090,7 +4115,10 @@ async def test_transport_failure_keeps_native_work_running(
                 assert "may already be running" in str(caught.value)
 
         assert requests.count(method) == (
-            0 if submission in {"before-send", "binding-change"} or settings_failure else 1
+            0
+            if submission in {"before-send", "binding-change", "initialize-rejected"}
+            or settings_failure
+            else 1
         )
         if settings_failure:
             assert requests.count("thread/settings/update") == 1

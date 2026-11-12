@@ -1283,13 +1283,12 @@ class CodexNativeExecutor(Executor):
                 elif not _session_is_active(state.session_id, self._request_session_id):
                     error_msg = "Codex native session is no longer active"
                     undelivered = True
-                elif (client := await _connect_to_app_server(state)) is None:
-                    # Nothing reached the app-server, so the sender's copy is the only record.
-                    startup_failure = CODEX_APP_SERVER_STOPPED
-                    error_msg = startup_failure.message
-                    undelivered = True
                 else:
+                    client = None
                     try:
+                        client = await _connect_to_app_server(state)
+                        if client is None:
+                            raise _CodexNativeInputUndelivered(CODEX_APP_SERVER_STOPPED)
                         _require_codex_binding(self._bridge_dir, state)
                         if shell_command is not None:
                             await _run_codex_shell_command(
@@ -1322,6 +1321,10 @@ class CodexNativeExecutor(Executor):
                                 settings_overrides=settings_overrides,
                             )
                     except Exception as exc:
+                        if client is None and not isinstance(
+                            exc, (CodexAppServerResponseError, _CodexNativeInputUndelivered)
+                        ):
+                            raise
                         settings_update_failed = isinstance(exc, _CodexNativeSettingsUpdateFailed)
                         if isinstance(exc, _CodexNativeSettingsUpdateFailed):
                             exc = exc.error
@@ -1333,7 +1336,18 @@ class CodexNativeExecutor(Executor):
                                 )
                             undelivered = True
                             preserve_session = True
-                        if isinstance(exc, InjectionDeliveryAmbiguous):
+                        if client is None and isinstance(exc, CodexAppServerResponseError):
+                            startup_failure = CodexStartupFailure(
+                                message="Codex rejected connection initialization, so this "
+                                f"message was not delivered.\n\n{exc.message or str(exc)}",
+                                code="codex_initialization_failed",
+                                title="Codex initialization failed",
+                                remediation="Check the Codex configuration in the native "
+                                "terminal, then retry this message.",
+                            )
+                            undelivered = True
+                            preserve_session = True
+                        elif isinstance(exc, InjectionDeliveryAmbiguous):
                             startup_failure = _CODEX_DELIVERY_UNCONFIRMED_FAILURE
                             delivery_unconfirmed = True
                         elif isinstance(exc, _CodexNativeInputUndelivered):
@@ -1382,7 +1396,9 @@ class CodexNativeExecutor(Executor):
                                         if isinstance(exc, CodexAppServerResponseError)
                                         else None
                                     ),
-                                    stage="settings_update"
+                                    stage="initialize"
+                                    if client is None
+                                    else "settings_update"
                                     if settings_update_failed
                                     else "native_rpc",
                                     outcome="undelivered" if undelivered else "error",
@@ -1401,7 +1417,8 @@ class CodexNativeExecutor(Executor):
                         if waiting and not undelivered:
                             error_msg = f"{error_msg} ({waiting})"
                     finally:
-                        await client.close()
+                        if client is not None:
+                            await client.close()
             break
         if error_msg is not None:
             yield ExecutorError(
