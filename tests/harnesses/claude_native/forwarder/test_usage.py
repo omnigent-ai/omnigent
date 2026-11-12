@@ -763,11 +763,16 @@ async def test_child_attribution_backfills_dedupes_and_retries_without_health_fa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rejection", [400, 404, 422])
+@pytest.mark.parametrize("rejection", [400, 404, 422, 429, 503])
 async def test_child_attribution_rejection_does_not_suppress_siblings(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rejection: int
 ) -> None:
-    monkeypatch.setattr(forwarder, "_transcript_cost_size_cached", lambda *args, **kwargs: 0.5)
+    clock = [100.0]
+    price = [0.5]
+    monkeypatch.setattr(forwarder.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        forwarder, "_transcript_cost_size_cached", lambda *args, **kwargs: price[0]
+    )
     posts: list[str] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -785,7 +790,8 @@ async def test_child_attribution_rejection_does_not_suppress_siblings(
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(respond), base_url="https://example.test"
     ) as client:
-        for _ in range(2):
+
+        async def run() -> None:
             await forwarder._forward_child_costs(
                 client=client,
                 parent_transcript_path=tmp_path / "parent.jsonl",
@@ -793,6 +799,17 @@ async def test_child_attribution_rejection_does_not_suppress_siblings(
                 dedupe=dedupe,
                 cost_cache={},
             )
-    assert posts == ["rejected", "valid"]
-    assert dedupe.attributed_costs == {"valid": 0.5}
-    assert dedupe.attribution_disabled_children == {"rejected"}
+
+        await run()
+        price[0] = 1.0
+        await run()
+        assert posts == ["rejected", "valid", "valid"]
+        clock[0] += 31
+        await run()
+    assert dedupe.attributed_costs == {"valid": 1.0}
+    if rejection in (429, 503):
+        assert posts == ["rejected", "valid", "valid", "rejected"]
+        assert dedupe.attribution_disabled_children == set()
+    else:
+        assert posts == ["rejected", "valid", "valid"]
+        assert dedupe.attribution_disabled_children == {"rejected"}

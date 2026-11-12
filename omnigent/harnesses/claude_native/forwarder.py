@@ -900,7 +900,7 @@ class _ForwardDedupeState:
     # Last attributed cost per child; permanent rejections stop only that child.
     attributed_costs: dict[str, float] = field(default_factory=dict)
     attribution_disabled_children: set[str] = field(default_factory=set)
-    attribution_retry_at: float = 0.0
+    attribution_retry_at: dict[str, float] = field(default_factory=dict)
     # Last POLICY/budget cost (USD) POSTed as ``policy_cost_usd`` —
     # ``max(S, forwarder transcript estimate)``, which reflects in-flight
     # sub-agent spend so the gate can block mid-turn. Separate baseline
@@ -1628,8 +1628,10 @@ async def forward_claude_transcript_to_session(
                                 bridge_dir=bridge_dir,
                                 seq=dismiss_seq,
                             )
-                        # Cost uses the latest completed child scan. A running
-                        # history scan checkpoints its cursor independently.
+                        # Policy uses durable children even while their optional costs are pending.
+                        subagent_state = await asyncio.to_thread(
+                            _read_subagent_forward_state, bridge_dir
+                        )
                         await _forward_session_cost(
                             client=client,
                             session_id=current_session_id,
@@ -1642,9 +1644,6 @@ async def forward_claude_transcript_to_session(
                         # Child history is an independent lane: a large backlog
                         # must never delay the next parent delta/transcript poll.
                         if subagent_task is None:
-                            subagent_state = await asyncio.to_thread(
-                                _read_subagent_forward_state, bridge_dir
-                            )
                             subagent_task = asyncio.create_task(
                                 asyncio.wait_for(
                                     _forward_available_subagents(
@@ -3185,12 +3184,14 @@ async def _forward_child_costs(
     cost_cache: dict[Path, _TranscriptCostCacheEntry],
 ) -> None:
     """Backfill display-only child attribution, independently of transcript delivery."""
-    if time.monotonic() < dedupe.attribution_retry_at:
-        return
     directory = _subagents_dir_for_transcript(parent_transcript_path)
     for entry in subagent_state.subagents.values():
         child_id = entry.child_conversation_id
-        if not child_id or child_id in dedupe.attribution_disabled_children:
+        if (
+            not child_id
+            or child_id in dedupe.attribution_disabled_children
+            or time.monotonic() < dedupe.attribution_retry_at.get(child_id, 0.0)
+        ):
             continue
         cost = await asyncio.to_thread(
             _transcript_cost_size_cached,
@@ -3224,14 +3225,15 @@ async def _forward_child_costs(
                 retry_after = exc.response.headers.get("retry-after")
                 with contextlib.suppress(ValueError):
                     delay = max(delay, float(retry_after)) if retry_after else delay
-            dedupe.attribution_retry_at = time.monotonic() + delay
+            dedupe.attribution_retry_at[child_id] = time.monotonic() + delay
             _logger.warning(
                 "Failed to forward Claude child cost; child=%s http_status=%s retry_in=%.1fs",
                 child_id,
                 _http_status_for_log(exc),
                 delay,
             )
-            return
+            continue
+        dedupe.attribution_retry_at.pop(child_id, None)
         dedupe.attributed_costs[child_id] = cost
 
 

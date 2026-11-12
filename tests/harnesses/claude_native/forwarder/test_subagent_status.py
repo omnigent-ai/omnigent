@@ -1063,17 +1063,6 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
             }
         ],
     )
-    forwarder._write_subagent_forward_state(
-        bridge_dir,
-        forwarder.SubagentForwardState(
-            subagents={
-                "blocked-child": forwarder.SubagentEntry(
-                    subagent_id="blocked-child",
-                    child_conversation_id="conv_blocked_child",
-                )
-            }
-        ),
-    )
     record_hook_event(
         bridge_dir,
         {
@@ -1087,6 +1076,15 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
         forwarder, "read_claude_context_state", lambda *_: {"total_cost_usd": cost[0]}
     )
     monkeypatch.setattr(forwarder, "_transcript_cost_size_cached", lambda *args, **kwargs: 0.5)
+    estimated_children: list[list[str]] = []
+
+    def estimate(**kwargs: Any) -> float:
+        estimated_children.append(
+            [entry.child_conversation_id for entry in kwargs["active_subagents"]]
+        )
+        return cost[0]
+
+    monkeypatch.setattr(forwarder, "_session_cost_estimate", estimate)
     parent_cost_forwarded = asyncio.Event()
     child_request_started = asyncio.Event()
     release_child = asyncio.Event()
@@ -1094,6 +1092,8 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
 
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8")) if request.content else {}
+        if isinstance(body, dict) and body.get("type") == "external_subagent_start":
+            return httpx.Response(202, json={"child_session_id": "conv_blocked_child"})
         if isinstance(body, list):
             if blocked_lane == "history":
                 child_request_started.set()
@@ -1162,6 +1162,7 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
             )
         await asyncio.wait_for(parent_item_forwarded.wait(), timeout=1.0)
         await asyncio.wait_for(parent_cost_forwarded.wait(), timeout=1.0)
+        assert ["conv_blocked_child"] in estimated_children
     finally:
         release_child.set()
         task.cancel()
