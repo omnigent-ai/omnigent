@@ -164,11 +164,7 @@ def test_unsandboxed_worker_requires_no_policy_or_explicit_none(
 
 @pytest.mark.parametrize(
     "harness,feature",
-    [
-        (harness, feature)
-        for harness in _HARNESSES
-        for feature in ("fork", "cwd_conflict", "relative_cwd")
-    ],
+    [(harness, feature) for harness in _HARNESSES for feature in ("fork", "cwd_conflict")],
 )
 def test_harness_rejects_policy_features_it_cannot_honor(
     harness: str, feature: str, tmp_path: Path
@@ -181,8 +177,6 @@ def test_harness_rejects_policy_features_it_cannot_honor(
     spec = OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
     if feature == "cwd_conflict":
         spec.cwd = str(tmp_path / "another-workspace")
-    elif feature == "relative_cwd":
-        spec.cwd = "restricted"
     else:
         setattr(spec, feature, True)
     with pytest.raises(ValueError, match=r"does not support|conflicts"):

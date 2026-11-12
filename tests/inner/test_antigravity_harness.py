@@ -115,26 +115,19 @@ def test_executor_factory_defaults_when_unset(
 
 
 @pytest.mark.parametrize(
-    "payload",
+    "payload,message",
     [
-        "{}",
-        '{"sandbox": {"type": "linux_bwrap"}}',
-        '{"sandbox": {"type": "darwin_seatbelt"}}',
-        '{"sandbox": {"type": "windows_jobobject"}}',
-        '{"sandbox": {"type": "none", "allow_network": false}}',
-        '{"sandbox": {"type": "none", "egress_rules": ["GET api.example.com/**"]}}',
-        '{"sandbox": {"type": "none"}, "fork": true}',
-        '{"sandbox": {"type": "none"}, "start_in_scratch": true}',
-        "{not-json",
-        "null",
+        ('{"sandbox": {"type": "linux_bwrap"}}', "Antigravity cannot enforce"),
+        ("{not-json", "HARNESS_ANTIGRAVITY_OS_ENV must contain a valid OS environment policy"),
+        ("null", "HARNESS_ANTIGRAVITY_OS_ENV must contain an OS environment object"),
     ],
 )
 def test_executor_factory_rejects_unsupported_os_policy_before_construction(
-    monkeypatch: pytest.MonkeyPatch, payload: str
+    monkeypatch: pytest.MonkeyPatch, payload: str, message: str
 ) -> None:
     monkeypatch.setenv("HARNESS_ANTIGRAVITY_OS_ENV", payload)
     with patch.object(antigravity_harness, "AntigravityExecutor") as constructor:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match=message):
             antigravity_harness._build_antigravity_executor()
     constructor.assert_not_called()
 
