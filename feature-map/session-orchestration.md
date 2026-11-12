@@ -45,6 +45,9 @@ MCP independent creation.
   accepted work continue; session creation keeps its separate orchestration gate.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
+  An optional `permission_mode` starts the session in a mode of its harness;
+  modes that skip approval are refused, and on a server that doesn't advertise
+  `session_create_permission_modes` the tool refuses the call before creating anything.
   With `sibling_sessions` enabled they share one sidebar family and do not appear
   as child agents; with it disabled they remain standalone.
   Managed creation uses the server's configured default sandbox provider. A

@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
@@ -818,6 +819,117 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
         .labels[CREATED_BY_SESSION_LABEL_KEY]
         == manager["id"]
     )
+
+
+async def _upload_codex_worker(auth_client, sub_agents=None, **config) -> str:
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle(
+        "codex-worker",
+        executor={"config": {"harness": "codex-native", **config}},
+        sub_agents=sub_agents,
+    )
+    uploaded = await post_session_bundle(auth_client.post, "/v1/sessions", bundle)
+    assert uploaded.status_code == 201, uploaded.text
+    return uploaded.json()["agent_id"]
+
+
+@pytest.mark.parametrize(
+    ("placement", "permission_mode", "spec_config", "expected"),
+    [
+        pytest.param(
+            "managed",
+            "approve-for-me",
+            {},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="worker",
+        ),
+        pytest.param(
+            "child",
+            "approve-for-me",
+            {},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="child",
+        ),
+        # The request replaces the spec's own bypass opt-in, even with the harness default.
+        pytest.param("child", "default", {"yolo": True}, None, id="request-over-spec"),
+        pytest.param(
+            "child",
+            None,
+            {"yolo": True},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            id="spec-without-request",
+        ),
+    ],
+)
+async def test_created_session_launches_in_the_requested_permission_mode(
+    auth_client,
+    auth_app,
+    peers,
+    db_uri,
+    monkeypatch,
+    placement,
+    permission_mode,
+    spec_config,
+    expected,
+):
+    from omnigent.server.routes.sessions import routes_core
+
+    source, _, _ = peers
+    worker_agent_id = await _upload_codex_worker(auth_client, **spec_config)
+
+    async def launch(**kwargs):
+        pass
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    arguments = {"agent_id": worker_agent_id, "placement": placement}
+    if permission_mode is not None:
+        arguments["permission_mode"] = permission_mode
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    assert result.get("conversation_id"), result
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
+    assert worker.terminal_launch_args == expected
+
+
+@pytest.mark.parametrize(
+    ("fields", "error"),
+    [
+        # An agent reading a ticket could be steered into asking for one.
+        ({"permission_mode": "full-access"}, "skips approval"),
+        ({"permission_mode": "auto"}, "is not a mode of 'codex-native'"),
+        (
+            {"permission_mode": "approve-for-me", "terminal_launch_args": []},
+            "can't be combined with terminal_launch_args",
+        ),
+        # A named sub-agent takes its launch settings from the trusted sub-spec only.
+        (
+            {"permission_mode": "approve-for-me", "sub_agent_name": "helper"},
+            "can't be combined with terminal_launch_args or sub_agent_name",
+        ),
+    ],
+)
+async def test_created_session_refuses_an_unusable_permission_mode(
+    auth_client, peers, db_uri, fields, error
+):
+    source, _, _ = peers
+    worker_agent_id = await _upload_codex_worker(auth_client, sub_agents=[{"name": "helper"}])
+    store = SqlAlchemyConversationStore(db_uri)
+    before = {conversation.id for conversation in store.list_conversations().data}
+    response = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": worker_agent_id, "parent_session_id": source["id"], **fields},
+    )
+    assert response.status_code == 400, response.text
+    assert error in response.text
+    assert {conversation.id for conversation in store.list_conversations().data} == before
 
 
 @pytest.mark.parametrize("shape", ["parent", "multipart", "initial_items", "skill"])
