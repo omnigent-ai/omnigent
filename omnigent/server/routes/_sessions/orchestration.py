@@ -28,7 +28,12 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.db.utils import generate_agent_id, generate_task_id
+from omnigent.db.utils import (
+    generate_agent_id,
+    generate_task_id,
+    rollback_shared_reads,
+    shared_read_scope,
+)
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
@@ -171,6 +176,10 @@ from omnigent.server.managed_hosts import (
     read_managed_repo_workspaces,
 )
 from omnigent.server.permissions import check_session_access
+from omnigent.server.routes._auth_helpers import (
+    SessionAccess,
+    require_access_and_level_sync,
+)
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -1486,6 +1495,7 @@ def _build_session_response(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     side_chat_sealed: bool = False,
+    agent: Agent | None = None,
     background_agents: list[BackgroundTaskInfo] | None = None,
 ) -> SessionResponse:
     """
@@ -1557,6 +1567,8 @@ def _build_session_response(
         ``None`` is treated as ``[]``.
     :param agent_store: Optional store used to resolve the session harness.
     :param agent_cache: Optional cache used to load the session harness spec.
+    :param agent: The bound agent row when the caller already read it, so the
+        harness resolution does not read it again.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -1570,7 +1582,7 @@ def _build_session_response(
     # usage. Shared by the cost indicator and the per-model breakdown so
     # both read the same numbers.
     display_usage = subtree_usage if subtree_usage is not None else (conv.session_usage or {})
-    harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+    harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent)
     native_usage_baseline = None
     if harness == "pi-native":
         own_usage = conv.session_usage or {}
@@ -13533,6 +13545,7 @@ async def _fetch_model_options(
     session_id: str,
     conv: Conversation,
     agent_store: AgentStore | None = None,
+    agent: Agent | None = None,
 ) -> list[dict[str, Any]]:
     """
     Resolve the Web UI model-picker options for a native session.
@@ -13565,6 +13578,8 @@ async def _fetch_model_options(
     :param conv: Conversation row whose labels identify the wrapper.
     :param agent_store: Optional store for the ACP spec lookup; resolves
         from the runtime globals when ``None``.
+    :param agent: The bound agent row when the caller already read it, so the
+        harness check does not read it again.
     :returns: Model options, or ``[]`` when the session has no model picker or
         the runner-owned options are not yet available.
     """
@@ -13582,8 +13597,8 @@ async def _fetch_model_options(
         # Generic ACP sessions carry no native wrapper label; their picker
         # serves the deployment's curated provider ``models:`` shortlist
         # resolved from the spec instead of a runner-owned catalog.
-        if _resolve_harness_impl_is_acp(conv, agent_store):
-            return await _load_acp_model_options(session_id, conv, agent_store)
+        if _resolve_harness_impl_is_acp(conv, agent_store, agent=agent):
+            return await _load_acp_model_options(session_id, conv, agent_store, agent=agent)
         return []
     cached = _model_options_cache.get(session_id)
     if runner_client is None:
@@ -13684,7 +13699,9 @@ async def _codex_side_chat_fork_lost(
     return status in {"dead", "unknown"}
 
 
-def _resolve_harness_impl_is_acp(conv: Conversation, agent_store: AgentStore | None) -> bool:
+def _resolve_harness_impl_is_acp(
+    conv: Conversation, agent_store: AgentStore | None, agent: Agent | None = None
+) -> bool:
     """Return whether *conv* runs a generic ``acp`` harness.
 
     ``canonicalize_harness`` folds ``acp:<slug>`` ids to ``"acp"``, so any
@@ -13693,11 +13710,13 @@ def _resolve_harness_impl_is_acp(conv: Conversation, agent_store: AgentStore | N
     :param conv: Conversation row the session snapshot was built from.
     :param agent_store: Optional store for the harness lookup; ``None`` lets
         :func:`_resolve_harness` fall back to the runtime global.
+    :param agent: The bound agent row when the caller already read it.
     :returns: ``True`` when the session's resolved harness is ``"acp"``.
     """
     from omnigent.harness_aliases import canonicalize_harness
 
-    return canonicalize_harness(_resolve_harness(conv, agent_store=agent_store)) == "acp"
+    harness = _resolve_harness(conv, agent_store=agent_store, agent=agent)
+    return canonicalize_harness(harness) == "acp"
 
 
 def _validate_acp_spec_models(
@@ -13788,6 +13807,7 @@ async def _load_acp_model_options(
     session_id: str,
     conv: Conversation,
     agent_store: AgentStore | None,
+    agent: Agent | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve the curated picker options for a generic ACP session.
 
@@ -13803,6 +13823,8 @@ async def _load_acp_model_options(
     :param conv: Conversation row the options are resolved for.
     :param agent_store: Store for the bound-agent spec load; ``None`` falls
         back to the runtime global store.
+    :param agent: The bound agent row when the caller already read it, so the
+        spec load does not read it again.
     :returns: Option dicts (``id`` / ``displayName`` / ``isDefault``), or
         ``[]`` when nothing was curated.
     """
@@ -13815,7 +13837,11 @@ async def _load_acp_model_options(
         agent_store = _agent_store
     if agent_store is None:
         return []
-    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+    # Callers without a prefetched row keep the loader's two-argument call shape.
+    loader_kwargs = {"agent": agent} if agent is not None else {}
+    spec = await asyncio.to_thread(
+        _load_agent_spec_for_session, conv, agent_store, **loader_kwargs
+    )
     if spec is None:
         return []
     from omnigent.models.model_catalog import _acp_launch_model, acp_curated_models
@@ -13997,6 +14023,7 @@ async def _get_session_snapshot(
     viewer_id: str | None = None,
     request: Request | None = None,
     include_usage: bool = True,
+    agent: Agent | None = None,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -14042,6 +14069,9 @@ async def _get_session_snapshot(
         overlays for this session before building the response. Browser
         reloads use this so a refresh re-reads current live-session
         capabilities instead of serving stale AP-process caches.
+    :param agent: The already-fetched bound agent row to reuse, skipping the
+        ``agent_store.get`` read here and in the harness resolutions below.
+        ``None`` reads it here as before.
     :returns: The fully populated :class:`SessionResponse`.
     :raises OmnigentError: 404 if no session exists, 500 if the
         underlying conversation has no agent binding
@@ -14167,7 +14197,8 @@ async def _get_session_snapshot(
     harness_owns_model = False
     if agent_store is not None and agent_cache is not None and conv.agent_id is not None:
         try:
-            agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
+            if agent is None or agent.id != conv.agent_id:
+                agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
             if agent is not None:
                 agent_name = agent.name
                 if agent.bundle_location is not None:
@@ -14249,7 +14280,9 @@ async def _get_session_snapshot(
         if not conv.reported_model:
             llm_model = conv.model_override or catalog.get("default_model")
     else:
-        model_options = await _fetch_model_options(runner_client, session_id, conv, agent_store)
+        model_options = await _fetch_model_options(
+            runner_client, session_id, conv, agent_store, agent=agent
+        )
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.
@@ -14329,6 +14362,7 @@ async def _get_session_snapshot(
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        agent=agent,
     )
     if request is not None:
         from omnigent.server.session_families import project_families
@@ -14359,6 +14393,50 @@ async def _get_session_snapshot(
         known = {item["pending_id"] for item in response.pending_inputs}
         response.pending_inputs.extend(item for item in queued if item["pending_id"] not in known)
     return response
+
+
+def _read_session_snapshot_inputs(
+    user_id: str | None,
+    session_id: str,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+) -> tuple[SessionAccess, Conversation, Agent | None]:
+    """Authorize a snapshot read and fetch its store inputs over one checkout.
+
+    Read authorization and snapshot inputs synchronously (for
+    :func:`asyncio.to_thread`) in one :func:`shared_read_scope`; the scope is
+    released before the snapshot's network lookups.
+
+    :returns: The access result, the conversation (read here when the access
+        check did not), and the bound agent row, or ``None`` when the session
+        has no agent binding, the row is gone, or its read failed.
+    :raises OmnigentError: 401 / 403 / 404 from the access check, or 404 when
+        the conversation does not exist.
+    """
+    with shared_read_scope():
+        access = require_access_and_level_sync(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = conversation_store.get_conversation(session_id)
+        if conv is None:
+            raise _session_not_found()
+        agent: Agent | None = None
+        if conv.agent_id is not None:
+            try:
+                agent = agent_store.get(conv.agent_id)
+            except Exception:  # noqa: BLE001 - enrichment only; the snapshot retries best-effort
+                # Clear the failed transaction before subsequent shared reads.
+                rollback_shared_reads()
+                _logger.warning(
+                    "Agent row read failed on snapshot build for session=%s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+    return access, conv, agent
 
 
 __all__ = [
@@ -14416,6 +14494,7 @@ __all__ = [
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",
     "_publish_subtree_cost_to_ancestors",
+    "_read_session_snapshot_inputs",
     "_recover_subagent_status_forward_via_parent",
     "_register_policy_elicitation",
     "_relay_runner_stream",
