@@ -821,17 +821,16 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     )
 
 
-async def _upload_codex_worker(auth_client, **config) -> str:
+async def _upload_codex_worker(auth_client, sub_agents=None, **config) -> str:
+    from tests._helpers.session import post_session_bundle
     from tests.server.helpers import build_agent_bundle
 
     bundle = build_agent_bundle(
-        "codex-worker", executor={"config": {"harness": "codex-native", **config}}
+        "codex-worker",
+        executor={"config": {"harness": "codex-native", **config}},
+        sub_agents=sub_agents,
     )
-    uploaded = await auth_client.post(
-        "/v1/sessions",
-        data={"metadata": "{}"},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-    )
+    uploaded = await post_session_bundle(auth_client.post, "/v1/sessions", bundle)
     assert uploaded.status_code == 201, uploaded.text
     return uploaded.json()["agent_id"]
 
@@ -910,13 +909,18 @@ async def test_created_session_launches_in_the_requested_permission_mode(
             {"permission_mode": "approve-for-me", "terminal_launch_args": []},
             "can't be combined with terminal_launch_args",
         ),
+        # A named sub-agent takes its launch settings from the trusted sub-spec only.
+        (
+            {"permission_mode": "approve-for-me", "sub_agent_name": "helper"},
+            "can't be combined with terminal_launch_args or sub_agent_name",
+        ),
     ],
 )
 async def test_created_session_refuses_an_unusable_permission_mode(
     auth_client, peers, db_uri, fields, error
 ):
     source, _, _ = peers
-    worker_agent_id = await _upload_codex_worker(auth_client)
+    worker_agent_id = await _upload_codex_worker(auth_client, sub_agents=[{"name": "helper"}])
     store = SqlAlchemyConversationStore(db_uri)
     before = {conversation.id for conversation in store.list_conversations().data}
     response = await auth_client.post(

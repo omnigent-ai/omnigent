@@ -6896,6 +6896,11 @@
             "title": "Session Claude Sdk Clear",
             "type": "boolean"
           },
+          "session_create_permission_modes": {
+            "default": true,
+            "title": "Session Create Permission Modes",
+            "type": "boolean"
+          },
           "session_event_types": {
             "default": [],
             "items": {

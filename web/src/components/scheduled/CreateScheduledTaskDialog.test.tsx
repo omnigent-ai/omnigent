@@ -3077,7 +3077,10 @@ describe("CreateScheduledTaskDialog session mode", () => {
 });
 
 describe("automation trigger type", () => {
-  function dialog(props: Partial<React.ComponentProps<typeof CreateScheduledTaskDialog>> = {}) {
+  function dialog(
+    props: Partial<React.ComponentProps<typeof CreateScheduledTaskDialog>> = {},
+    info: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> = {},
+  ) {
     return (
       <CapabilitiesProvider
         info={{
@@ -3086,6 +3089,7 @@ describe("automation trigger type", () => {
           scheduled_task_subhour: true,
           automation_trigger_poll_minutes: 30,
           features: { automations_v2: true, session_orchestration: true },
+          ...info,
         }}
       >
         <CreateScheduledTaskDialog open onOpenChange={vi.fn()} {...props} />
@@ -3437,6 +3441,26 @@ describe("automation trigger type", () => {
       expect(readTriggerWorkerSettings(input.prompt)).toMatchObject({ agentId: "ag_1" });
       expect(splitTriggerPrompt(input.prompt).userPrompt).toBe("Answer the question.");
       expect(input).not.toHaveProperty("sessionId");
+    });
+
+    it("keeps a worker permission mode chosen while switched when switching back", async () => {
+      render(dialog({ editingTask: slackTask }, { session_create_permission_modes: true }));
+      await choose("Jira");
+      await choose("Auto", "task-permission-trigger");
+      await choose("Slack");
+      expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Auto");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(triggerPromptSource(input.prompt)).toBe("slack");
+      // Only the mode changed, so the restored prompt must still pick it up.
+      expect(readTriggerWorkerSettings(input.prompt)).toEqual({
+        agentId: "ag_claude_native",
+        model: "opus",
+        effort: "",
+        permissionMode: "auto",
+      });
+      expect(input).not.toHaveProperty("permissionMode");
     });
 
     it("keeps sandboxed workers beside a host poller on the new source", async () => {
