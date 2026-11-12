@@ -415,15 +415,23 @@ async def test_executor_error_terminates_with_response_failed(
 
 
 @pytest.mark.parametrize(
-    ("policy", "message"),
+    ("policy", "message", "error_code"),
     [
-        ("{not-json", "HARNESS_ANTIGRAVITY_OS_ENV must contain a valid OS environment policy"),
-        ('{"sandbox": {"type": "linux_bwrap"}}', "Antigravity cannot enforce"),
+        (
+            "{not-json",
+            "HARNESS_ANTIGRAVITY_OS_ENV must contain a valid OS environment policy",
+            "ValueError",
+        ),
+        (
+            '{"sandbox": {"type": "linux_bwrap"}}',
+            "Antigravity cannot enforce",
+            "UnsupportedHarnessSandboxError",
+        ),
     ],
     ids=["invalid-policy", "unsupported-policy"],
 )
 async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry(
-    monkeypatch: pytest.MonkeyPatch, policy: str, message: str
+    monkeypatch: pytest.MonkeyPatch, policy: str, message: str, error_code: str
 ) -> None:
     """Child-side policy rejection terminates the turn and permits a same-session retry."""
     import asyncio
@@ -467,7 +475,7 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
             ]
             failed = failed_events[-1].data["response"]
             assert failed["status"] == "failed"
-            assert failed["error"]["code"] == "ValueError"
+            assert failed["error"]["code"] == error_code
             assert message in failed["error"]["message"]
             factory.assert_called_once_with()
             constructor.assert_not_called()

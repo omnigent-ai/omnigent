@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import dataclasses
 import functools
 import itertools
@@ -2860,10 +2861,10 @@ def create_runner_app(
         resource_registry.set_client_surface(
             session_id, surface_labels.get(CLIENT_SURFACE_LABEL_KEY)
         )
-        if init_context.envelope is not None:
-            _note_session_harness_override(
-                session_id, init_context.envelope.snapshot.harness_override
-            )
+        if init_context.envelope is not None and _note_session_harness_override(
+            session_id, init_context.envelope.snapshot.harness_override
+        ):
+            spec_cache_generation += 1
 
         spec: AgentSpec | None = None
         spec_entry: _SpecEntry | None = None
@@ -2918,7 +2919,7 @@ def create_runner_app(
             from omnigent.runner.policy import AgentStartPolicyError
 
             try:
-                _start_data = await _evaluate_agent_start_gate(spec, harness_name)
+                spec = await _apply_agent_start_gate(spec, harness_name)
             except AgentStartPolicyError as exc:
                 # The gate raises without logging; this is the single record of
                 # the failure. exc_info keeps any underlying policy traceback.
@@ -2941,9 +2942,7 @@ def create_runner_app(
                         "detail": str(exc),
                     },
                 )
-            if _start_data is not None:
-                _apply_sandbox_override_from_start_data(spec, _start_data)
-
+            spec_entry = _rewrap_like(spec_entry, spec, _resolved_spec_workdir(spec_entry))
             await _ensure_session_subagent_router(
                 session_id,
                 harness_name,
@@ -3931,7 +3930,7 @@ def create_runner_app(
                     extra={"session_id": conv_id},
                 )
 
-    def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
+    def _note_session_harness_override(conv_id: str, harness_override: str | None) -> bool:
         """Record the harness a session was forwarded, so reads match the run.
 
         A routed child arrives with ``harness_override`` naming a harness its
@@ -3940,11 +3939,16 @@ def create_runner_app(
 
         :param conv_id: Session/conversation id, e.g. ``"conv_child456"``.
         :param harness_override: The forwarded override, e.g. ``"codex"``.
-        :returns: None.
+        :returns: Whether changing the target retired the effective spec cache.
         """
         if not harness_override or harness_override == "auto":
-            return
+            return False
+        if _session_harness_overrides.get(conv_id) == harness_override:
+            return False
+        _session_spec_cache.pop(conv_id, None)
+        _session_cache_generations[conv_id] = _session_cache_generation(conv_id) + 1
         _session_harness_overrides[conv_id] = harness_override
+        return True
 
     def _session_harness_name(conv_id: str) -> str | None:
         # The override wins: a routed session runs the harness the server
@@ -5780,14 +5784,19 @@ def create_runner_app(
         conv: str,
         handed_off: list[bool],
     ) -> None:
-        _dispatched_agent_id = cast(str | None, msg_body.get("agent_id"))
+        _dispatched_agent_id = cast(
+            str | None, msg_body.get("agent_id")
+        ) or _session_agent_ids.get(conv)
         await _sync_session_agent(
             conv, _dispatched_agent_id, cast(str | None, msg_body.get("agent_revision"))
         )
+        _note_session_harness_override(conv, cast(str | None, msg_body.get("harness_override")))
+        spec_cache_generation = _session_cache_generation(conv)
 
         cached_spec_entry = _session_spec_cache.get(conv)
         cached_spec = _unwrap_resolved_spec(cached_spec_entry)
         cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
+        needs_start_gate = False
         if cached_spec is None and spec_resolver is not None:
             _aid = _dispatched_agent_id
             if _aid:
@@ -5796,10 +5805,12 @@ def create_runner_app(
                     if isinstance(resolved, ResolvedSpec):
                         cached_spec = _unwrap_resolved_spec(resolved)
                         cached_spec_workdir = _resolved_spec_workdir(resolved)
-                        _session_spec_cache[conv] = resolved
+                        cached_spec_entry = resolved
+                        needs_start_gate = True
                     elif resolved is not None:
                         cached_spec = resolved
-                        _session_spec_cache[conv] = resolved
+                        cached_spec_entry = resolved
+                        needs_start_gate = True
                 except (httpx.HTTPError, RuntimeError):
                     _logger.warning(
                         "Spec resolution failed for %s",
@@ -5810,7 +5821,8 @@ def create_runner_app(
             else:
                 try:
                     cached_spec = await _resolve_session_agent_spec(conv)
-                    cached_spec_workdir = _resolved_spec_workdir(_session_spec_cache.get(conv))
+                    cached_spec_entry = _session_spec_cache.get(conv)
+                    cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
                 except (OmnigentError, httpx.HTTPError, RuntimeError):
                     _logger.warning(
                         "On-demand agent resolution failed for %s",
@@ -5818,10 +5830,6 @@ def create_runner_app(
                         exc_info=True,
                         extra={"session_id": conv},
                     )
-
-        # The resolver branches above write straight into the cache, so the
-        # entry read at the top of this block can already be stale.
-        cached_spec_entry = _session_spec_cache.get(conv, cached_spec_entry)
 
         _sa_name = await _recover_sub_agent_name(conv)
         # The child's workdir is rooted before _spec_with_workdir_paths below,
@@ -5834,20 +5842,17 @@ def create_runner_app(
                     _warn_unresolved_sub_agent(conv, _sa_name)
             else:
                 cached_spec_entry = sub_entry
-                cached_spec = _unwrap_resolved_spec(sub_entry)
+                sub_spec = _unwrap_resolved_spec(sub_entry)
+                needs_start_gate = needs_start_gate or sub_spec is not cached_spec
+                cached_spec = sub_spec
                 cached_spec_workdir = _resolved_spec_workdir(sub_entry)
-                _session_spec_cache[conv] = sub_entry
 
         cached_spec = _spec_with_workdir_paths(cached_spec, cached_spec_workdir)
-        if cached_spec is not None:
-            cached_spec_entry = _rewrap_like(cached_spec_entry, cached_spec, cached_spec_workdir)
-            _session_spec_cache[conv] = cached_spec_entry
 
         harness_name: str | None = None
         raw_harness: str | None = None
         spawn_env: dict[str, str] | None = None
         instructions: str | None = None
-        _note_session_harness_override(conv, cast(str | None, msg_body.get("harness_override")))
         if cached_spec is not None:
             # The session's recorded override outranks the spec (mirrors
             # _initialize_session): the native terminal forward carries no
@@ -5861,6 +5866,11 @@ def create_runner_app(
                 or cached_spec.executor.type
             )
             harness_name = canonicalize_harness(raw_harness) or raw_harness
+            if needs_start_gate:
+                cached_spec = await _apply_agent_start_gate(cached_spec, harness_name)
+            cached_spec_entry = _rewrap_like(cached_spec_entry, cached_spec, cached_spec_workdir)
+            if _session_cache_generation_is_current(conv, spec_cache_generation):
+                _session_spec_cache[conv] = cached_spec_entry
 
         if conv not in _session_histories:
             _session_histories[conv] = (
@@ -6254,7 +6264,11 @@ def create_runner_app(
         )
         _note_session_harness_override(conv_id, cast(str | None, body.get("harness_override")))
         # Shared agent-change invalidation for both dispatch paths.
-        _ds_agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
+        _ds_agent_id = (
+            dispatch.agent_id
+            if dispatch
+            else cast(str | None, body.get("agent_id")) or _session_agent_ids.get(conv_id)
+        )
         await _sync_session_agent(
             conv_id,
             _ds_agent_id,
@@ -6262,8 +6276,8 @@ def create_runner_app(
         )
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
-        if not harness_name:
-            _agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
+        if not harness_name or (dispatch is None and spec_resolver is not None):
+            _agent_id = _ds_agent_id
             _sub_agent_name = await _recover_sub_agent_name(conv_id)
             try:
                 harness_name, spawn_env = await _resolve_harness_config(
@@ -6281,6 +6295,7 @@ def create_runner_app(
                     ),
                     sub_agent_name=_sub_agent_name,
                     cwd=await _session_runtime_cwd(conv_id),
+                    effective_spec_entry=_session_spec_cache.get(conv_id),
                 )
             except SessionAgentMissingError:
                 return JSONResponse(
@@ -8331,6 +8346,16 @@ def create_runner_app(
                     else:
                         spec_entry = sub_entry
                         _session_sub_agent_resolved[session_id] = True
+            spec = _unwrap_resolved_spec(spec_entry)
+            if spec is not None:
+                raw_harness = (
+                    _session_harness_overrides.get(session_id)
+                    or spec.executor.config.get("harness")
+                    or spec.executor.type
+                )
+                harness = canonicalize_harness(raw_harness) or raw_harness
+                spec = await _apply_agent_start_gate(spec, harness)
+                spec_entry = _rewrap_like(spec_entry, spec, _resolved_spec_workdir(spec_entry))
             if _session_cache_generation_is_current(session_id, generation):
                 _session_spec_cache[session_id] = spec_entry
             return spec_entry
@@ -9141,6 +9166,7 @@ async def _resolve_harness_config(
     sub_agent_name: str | None = None,
     cwd: Path | None = None,
     resource_registry: SessionResourceRegistry | None = None,
+    effective_spec_entry: _SpecEntry | None = None,
 ) -> tuple[str, dict[str, str] | None]:
     """Resolve harness type + spawn-env from the agent spec.
 
@@ -9163,13 +9189,19 @@ async def _resolve_harness_config(
         so the spawn-env advertises the child's bundle rather than the
         parent's. ``None`` for top-level sessions.
     :param cwd: Runtime working directory for harnesses that need it.
+    :param effective_spec_entry: Trusted cached spec with launch transforms applied.
     :returns: ``(harness, spawn_env)`` derived from the resolved spec.
     :raises RuntimeError: When a spec_resolver is configured but the spec
         cannot be resolved. Callers catch this to surface a clean error
         rather than spawning an invalid harness subprocess.
     """
     if agent_id and spec_resolver:
-        spec_entry = await spec_resolver(agent_id, session_id)
+        spec_entry = (
+            effective_spec_entry
+            if effective_spec_entry is not None
+            else await spec_resolver(agent_id, session_id)
+        )
+        needs_start_gate = effective_spec_entry is None
         spec = _unwrap_resolved_spec(spec_entry)
         workdir = _resolved_spec_workdir(spec_entry)
         if spec is not None:
@@ -9188,12 +9220,16 @@ async def _resolve_harness_config(
                 if sub_entry is None:
                     _warn_unresolved_sub_agent(session_id, sub_agent_name)
                 else:
-                    spec = _unwrap_resolved_spec(sub_entry)
+                    sub_spec = _unwrap_resolved_spec(sub_entry)
+                    needs_start_gate = needs_start_gate or sub_spec is not spec
+                    spec = sub_spec
                     workdir = _resolved_spec_workdir(sub_entry)
             raw_harness = (
                 harness_override or spec.executor.config.get("harness") or spec.executor.type
             )
             harness = canonicalize_harness(raw_harness) or raw_harness
+            if needs_start_gate:
+                spec = await _apply_agent_start_gate(spec, harness)
             spawn_env = _build_spawn_env_from_spec(
                 spec,
                 raw_harness,
@@ -9557,21 +9593,21 @@ def _build_spawn_env_from_spec(
 # ── Agent-start policy gate ────────────────────────────────────────────
 
 
-async def _evaluate_agent_start_gate(
+async def _apply_agent_start_gate(
     spec: AgentSpec,
     harness: str,
-) -> Mapping[str, object] | None:
-    """Collect the policies' launch transforms for the synthetic start probe.
+) -> AgentSpec:
+    """Apply launch-policy transforms before deriving a worker's spawn environment.
 
-    Returns the composed replacement payload (``enforce_sandbox`` forcing a
-    sandbox) or ``None``. DENY/ASK verdicts never gate agent start; see
+    Preserve the declared spec so non-idempotent transforms apply once per
+    resolution. DENY/ASK verdicts never gate agent start; see
     :meth:`RunnerToolPolicyGate.evaluate_agent_start`.
     """
     from omnigent.runner.policy import RunnerToolPolicyGate
 
     gate = RunnerToolPolicyGate.from_spec(spec)
     if gate.is_empty:
-        return None
+        return spec
 
     sandbox_dict: _JsonObject | None = None
     if spec.os_env is not None and spec.os_env.sandbox is not None:
@@ -9579,13 +9615,17 @@ async def _evaluate_agent_start_gate(
 
         sandbox_dict = cast(_JsonObject, encode_sandbox_spec(spec.os_env.sandbox))
 
-    return await gate.evaluate_agent_start(
+    start_data = await gate.evaluate_agent_start(
         {
             "agent_name": getattr(spec, "name", None) or "",
             "harness": harness,
             "sandbox": sandbox_dict,
         },
     )
+    if start_data is not None:
+        spec = dataclasses.replace(spec, os_env=copy.deepcopy(spec.os_env))
+        _apply_sandbox_override_from_start_data(spec, start_data)
+    return spec
 
 
 def _apply_sandbox_override_from_start_data(
