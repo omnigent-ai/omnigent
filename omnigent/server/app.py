@@ -200,7 +200,7 @@ from omnigent.stores.user_settings_store import (
 from omnigent.util.event_loop_watchdog import monitor_event_loop
 
 if TYPE_CHECKING:
-    from omnigent.entities import Conversation
+    from omnigent.entities import Agent, Conversation
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
     from omnigent.onboarding.acp_auth import AcpAgentEntry
 
@@ -1171,14 +1171,19 @@ def _warn_on_empty_picker_restriction(
         )
 
 
-def _retired_builtin_agent_names(agent_store: AgentStore, owned: frozenset[str]) -> frozenset[str]:
+def _retired_builtin_agent_names(
+    agent_store: AgentStore, agent_cache: Any, owned: frozenset[str]
+) -> frozenset[str]:
     """
     Name the built-in rows an earlier version seeded that no current seeding owns.
 
     A built-in row has a server-scope id derived from its name
     (:func:`~omnigent.db.utils.builtin_agent_id`), which no other agent gets.
+    An operator's ``acp:`` agent is never one, even while its config can't be
+    read, and neither is a row whose bundle can't be read.
 
     :param agent_store: Store for agent metadata.
+    :param agent_cache: Cache for loaded agent specs.
     :param owned: Names this boot's seeding owns, e.g. ``{"polly", "devin-acp"}``.
     :returns: The retired names, e.g. ``{"devin"}``.
     """
@@ -1194,10 +1199,32 @@ def _retired_builtin_agent_names(agent_store: AgentStore, owned: frozenset[str])
             if agent.session_id is None
             and agent.id == builtin_agent_id(agent.name)
             and agent.name not in owned
+            and not _may_be_operator_acp_agent(agent, agent_cache)
         )
         if not page.has_more or page.last_id is None:
             return frozenset(retired)
         after = page.last_id
+
+
+def _may_be_operator_acp_agent(agent: "Agent", agent_cache: Any) -> bool:
+    """
+    Whether a stored built-in row is an operator's ``acp:<slug>`` agent, or might be.
+
+    Packaged ACP rows run on their catalog id (e.g. ``devin``); configured ones
+    run on ``acp:<slug>``. A bundle that can't be read can't be told apart.
+
+    :param agent: The stored row.
+    :param agent_cache: Cache for loaded agent specs.
+    :returns: ``True`` unless its bundle loads and runs on another harness.
+    """
+    try:
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+    except Exception:
+        _logger.debug("could not read the bundle of built-in row %r", agent.name, exc_info=True)
+        return True
+    return loaded.spec.executor.harness_kind.startswith("acp:")
 
 
 def _ensure_default_agents(
@@ -1246,8 +1273,9 @@ def _ensure_default_agents(
     # operator-owned, even when an extra fails to seed.
     operator_owned = frozenset(agent.slug for agent in _configured_acp_agents()[0])
     operator_owned |= _listed_extra_builtin_agent_names()
-    retired = _retired_builtin_agent_names(agent_store, packaged | extras | operator_owned)
-    packaged |= retired
+    packaged |= _retired_builtin_agent_names(
+        agent_store, agent_cache, packaged | extras | operator_owned
+    )
     unknown = allowlist - packaged
     if unknown:
         _logger.warning(

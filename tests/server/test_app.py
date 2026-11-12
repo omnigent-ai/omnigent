@@ -1648,6 +1648,24 @@ def test_ensure_default_acp_agents_survives_unreadable_config(
         seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
     )
 
+    # Nor does it hide the operator's agent an earlier boot seeded under a built-in id.
+
+    server_app._ensure_builtin_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+        name="my-acp",
+        bundle_bytes=server_app._build_acp_bundle(harness="acp:my-acp", name="my-acp"),
+    )
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "claude-native-ui")
+    suppressed = server_app._ensure_default_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+    assert "my-acp" not in suppressed
+    assert seed_stores.agent_store.get_by_name("my-acp") is not None
+    # Packaged built-ins the allowlist leaves out are still hidden.
+    assert server_app._DEBBY_AGENT_NAME in suppressed
+
 
 def test_build_acp_bundle_carries_the_harness_id(tmp_path: Path) -> None:
     """The seeded bundle's spec runs on ``acp:<slug>`` — resolved at spawn.
@@ -2282,16 +2300,26 @@ def test_ensure_default_agents_hides_a_built_in_row_an_earlier_version_seeded(
     seed_stores.agent_store.create(generate_agent_id(), "house-agent", "house/bundle")
     for index in range(100):
         seed_stores.agent_store.create(generate_agent_id(), f"filler-{index}", "filler/bundle")
+    stores = (seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
     # A server-owned row outside the current seed roster.
-    seed_stores.agent_store.create(builtin_agent_id("devin"), "devin", "old/bundle")
+    server_app._ensure_builtin_agent(
+        *stores,
+        name="devin",
+        bundle_bytes=server_app._build_acp_bundle(harness="devin", name="devin"),
+    )
+    # An operator's acp: agent no longer configured, and a row whose bundle is gone.
+    server_app._ensure_builtin_agent(
+        *stores,
+        name="old-acp",
+        bundle_bytes=server_app._build_acp_bundle(harness="acp:old-acp", name="old-acp"),
+    )
+    seed_stores.agent_store.create(builtin_agent_id("unreadable"), "unreadable", "gone/bundle")
     monkeypatch.setenv(SEEDED_AGENTS_ENV, allowlist)
 
-    suppressed = server_app._ensure_default_agents(
-        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
-    )
+    suppressed = server_app._ensure_default_agents(*stores)
 
     assert ("devin" in suppressed) is devin_hidden
-    assert "house-agent" not in suppressed
+    assert not {"house-agent", "old-acp", "unreadable"} & suppressed
     # Hidden, not deleted: sessions bound to the old row still find it.
     assert seed_stores.agent_store.get_by_name("devin") is not None
 

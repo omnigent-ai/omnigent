@@ -1776,7 +1776,14 @@ describe("fetchUserAgents", () => {
     ["49 names, then the end", [[49, false]], false],
     ["exactly 50 names, then the end", [[50, false]], false],
     ["the 50-name cap", [[50, true]], true],
-    ["names skipped on the last page", [[51, false]], true],
+    [
+      "names skipped on the last page",
+      [
+        [49, true],
+        [2, false],
+      ],
+      true,
+    ],
     [
       "5 pages the server trimmed to copies",
       [
@@ -1839,10 +1846,10 @@ describe("useCuratedOutHarnesses", () => {
     has_more: false,
   });
 
-  function renderCuration(agentInstall: boolean) {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const view = renderHook(() => useCuratedOutHarnesses(), {
-      wrapper: ({ children }: { children: ReactNode }) => (
+  /** The providers Settings renders a hook under: queries, capabilities and the sidebar. */
+  function settingsProviders(client: QueryClient, agentInstall: boolean) {
+    return function SettingsProviders({ children }: { children: ReactNode }) {
+      return (
         <QueryClientProvider client={client}>
           <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: agentInstall }}>
             <SidebarDataProvider config={{ ...sidebarConfig, sharedAvailable: false }}>
@@ -1850,7 +1857,14 @@ describe("useCuratedOutHarnesses", () => {
             </SidebarDataProvider>
           </CapabilitiesProvider>
         </QueryClientProvider>
-      ),
+      );
+    };
+  }
+
+  function renderCuration(agentInstall: boolean) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = renderHook(() => useCuratedOutHarnesses(), {
+      wrapper: settingsProviders(client, agentInstall),
     });
     return { client, result: view.result };
   }
@@ -1925,17 +1939,7 @@ describe("useCuratedOutHarnesses", () => {
       const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       const { result } = renderHook(
         () => ({ curated: useCuratedOutHarnesses(), picker: useAvailableAgents() }),
-        {
-          wrapper: ({ children }: { children: ReactNode }) => (
-            <QueryClientProvider client={client}>
-              <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: true }}>
-                <SidebarDataProvider config={{ ...sidebarConfig, sharedAvailable: false }}>
-                  {children}
-                </SidebarDataProvider>
-              </CapabilitiesProvider>
-            </QueryClientProvider>
-          ),
-        },
+        { wrapper: settingsProviders(client, true) },
       );
 
       // New Chat still offers the agent.
@@ -1961,15 +1965,7 @@ describe("useCuratedOutHarnesses", () => {
     };
     routeFetch(routes);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const settingsWrapper = ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: true }}>
-          <SidebarDataProvider config={{ ...sidebarConfig, sharedAvailable: false }}>
-            {children}
-          </SidebarDataProvider>
-        </CapabilitiesProvider>
-      </QueryClientProvider>
-    );
+    const settingsWrapper = settingsProviders(client, true);
     const first = renderHook(() => useCuratedOutHarnesses(), { wrapper: settingsWrapper });
     await waitFor(() =>
       expect(client.getQueryState(["session-agent-harness", "ag_one_off"])?.status).toBe("error"),
