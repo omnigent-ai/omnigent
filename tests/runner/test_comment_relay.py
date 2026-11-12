@@ -1465,6 +1465,66 @@ async def _reset_state(client: httpx.AsyncClient, session_id: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["ready", "cancelled", "deleted"])
+async def test_slow_relay_schema_discovery_preserves_runner_progress(
+    relay_env: _RelayEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """A blocked schema scan must not stop the loop or publish after teardown."""
+    from omnigent.runner import tool_dispatch
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    build = tool_dispatch.build_native_relay_tool_schemas
+
+    def slow_build(spec: AgentSpec | None) -> list[dict[str, Any]]:
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            assert release.wait(5), "schema scan was never released"
+            return build(spec)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(tool_dispatch, "build_native_relay_tool_schemas", slow_build)
+    # Release even when the old synchronous implementation blocks this loop.
+    fail_safe = threading.Timer(3, release.set)
+    fail_safe.start()
+    launch = asyncio.create_task(
+        _launch_terminal(relay_env.client, relay_env.session_id, bridge_inject_dir=True)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert not release.is_set(), "schema discovery blocked the runner event loop"
+        health = await relay_env.client.get("/health")
+        assert health.status_code == 200
+        assert not launch.done()
+        if outcome == "cancelled":
+            launch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await launch
+        elif outcome == "deleted":
+            response = await relay_env.client.delete(f"/v1/sessions/{relay_env.session_id}")
+            assert response.status_code == 200
+    finally:
+        release.set()
+        fail_safe.cancel()
+        fail_safe.join()
+        assert await asyncio.to_thread(finished.wait, 5)
+        if not launch.cancelled():
+            response = await asyncio.wait_for(launch, timeout=5)
+            assert response.status_code == 200, response.text
+
+    relay_file = relay_env.bridge_dir / _TOOL_RELAY_FILE
+    if outcome == "ready":
+        assert "list_comments" in _relay_tool_names(relay_file)
+    else:
+        assert not relay_file.exists(), "a retired schema scan published a relay"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["registry", "http"])
 @pytest.mark.parametrize("fail_once", [False, True])
 async def test_native_relay_discovers_session_mcp_tools_through_gateway(
