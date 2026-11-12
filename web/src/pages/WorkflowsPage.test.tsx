@@ -66,6 +66,27 @@ describe("WorkflowsPage", () => {
     );
   });
 
+  it("says the row actions aren't connected yet", () => {
+    mockWorkflows({ data: WORKFLOWS });
+    render(<WorkflowsPage />);
+    const openFirstMenu = () =>
+      fireEvent.pointerDown(within(rows()[0]!).getByTestId("workflow-row-menu"), { button: 0 });
+
+    openFirstMenu();
+    fireEvent.click(screen.getByTestId("workflow-run"));
+    expect(showToast).toHaveBeenLastCalledWith("Running workflows isn’t connected yet.");
+
+    openFirstMenu();
+    fireEvent.click(screen.getByTestId("workflow-edit"));
+    expect(showToast).toHaveBeenLastCalledWith("Editing workflows isn’t connected yet.");
+
+    openFirstMenu();
+    fireEvent.click(screen.getByTestId("workflow-create-automation"));
+    expect(showToast).toHaveBeenLastCalledWith(
+      "Creating automations from workflows isn’t connected yet.",
+    );
+  });
+
   it("searches names and descriptions", () => {
     mockWorkflows({ data: WORKFLOWS });
     render(<WorkflowsPage />);

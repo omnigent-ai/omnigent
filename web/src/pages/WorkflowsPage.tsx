@@ -3,7 +3,7 @@
  * "New workflow" button. Laid out like the Automations page.
  *
  * Data comes from `useWorkflows`. Creating a workflow will start a session
- * where the agent drafts it; that isn't connected yet.
+ * where the agent drafts it; that and the rows' actions aren't connected yet.
  */
 
 import { useMemo, useState } from "react";
@@ -14,9 +14,9 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { showToast } from "@/components/ui/toast";
 import { NewWorkflowDialog } from "@/components/workflows/NewWorkflowDialog";
+import { WorkflowRow } from "@/components/workflows/WorkflowRow";
 import { useNow } from "@/hooks/useNow";
-import { type WorkflowSummary, useWorkflows } from "@/hooks/useWorkflows";
-import { absoluteTime, relativeTime } from "@/lib/relativeTime";
+import { useWorkflows } from "@/hooks/useWorkflows";
 
 export function WorkflowsPage() {
   const { data: workflows, isLoading, isError, refetch } = useWorkflows();
@@ -92,7 +92,16 @@ export function WorkflowsPage() {
       ) : (
         <div className="flex flex-col gap-2" data-testid="workflows-list">
           {filtered.map((workflow) => (
-            <WorkflowRow key={workflow.id} workflow={workflow} now={now} />
+            <WorkflowRow
+              key={workflow.id}
+              workflow={workflow}
+              now={now}
+              onRun={() => showToast("Running workflows isn’t connected yet.")}
+              onEdit={() => showToast("Editing workflows isn’t connected yet.")}
+              onCreateAutomation={() =>
+                showToast("Creating automations from workflows isn’t connected yet.")
+              }
+            />
           ))}
         </div>
       )}
@@ -104,32 +113,6 @@ export function WorkflowsPage() {
         takenNames={takenNames}
       />
     </PageScroll>
-  );
-}
-
-function WorkflowRow({ workflow, now }: { workflow: WorkflowSummary; now: Date }) {
-  const updatedMs = workflow.updated_at * 1000;
-  const ago = relativeTime(updatedMs, now.getTime());
-  return (
-    <div
-      data-testid="workflow-row"
-      className="flex items-baseline gap-4 rounded-xl border border-border bg-card px-4 py-3"
-    >
-      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="truncate text-[15px] font-semibold">{workflow.name}</span>
-        <span className="line-clamp-2 text-ui text-muted-foreground/80">
-          {workflow.description}
-        </span>
-      </div>
-      <time
-        dateTime={new Date(updatedMs).toISOString()}
-        title={absoluteTime(updatedMs)}
-        className="shrink-0 text-sm text-muted-foreground"
-        data-testid="workflow-row-updated"
-      >
-        {ago === "now" ? "Updated just now" : `Updated ${ago} ago`}
-      </time>
-    </div>
   );
 }
 

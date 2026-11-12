@@ -1,0 +1,154 @@
+import type { ComponentType, ReactNode } from "react";
+import { ClockIcon, MoreHorizontalIcon, PencilIcon, PlayIcon } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import type { WorkflowSummary } from "@/hooks/useWorkflows";
+import { useOmnigentAnalytics } from "@/lib/analytics";
+import { absoluteTime, relativeTime } from "@/lib/relativeTime";
+import { cn } from "@/lib/utils";
+
+export interface WorkflowRowProps {
+  workflow: WorkflowSummary;
+  /** The shared clock, for "Updated 2h ago". */
+  now: Date;
+  onRun: (workflow: WorkflowSummary) => void;
+  onEdit: (workflow: WorkflowSummary) => void;
+  onCreateAutomation: (workflow: WorkflowSummary) => void;
+}
+
+/**
+ * One saved workflow: its name, description and last update, with Run, Edit and
+ * Create automation in a ⋯ menu and on right-click, like an automation's row.
+ */
+export function WorkflowRow({
+  workflow,
+  now,
+  onRun,
+  onEdit,
+  onCreateAutomation,
+}: WorkflowRowProps) {
+  const updatedMs = workflow.updated_at * 1000;
+  const ago = relativeTime(updatedMs, now.getTime());
+  const actions = { workflow, onRun, onEdit, onCreateAutomation };
+
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
+        <div
+          data-testid="workflow-row"
+          className="group relative flex items-baseline gap-4 rounded-xl border border-border bg-card py-3 pr-12 pl-4"
+        >
+          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+            <span className="truncate text-[15px] font-semibold">{workflow.name}</span>
+            <span className="line-clamp-2 text-ui text-muted-foreground/80">
+              {workflow.description}
+            </span>
+          </div>
+          <time
+            dateTime={new Date(updatedMs).toISOString()}
+            title={absoluteTime(updatedMs)}
+            className="shrink-0 text-sm text-muted-foreground"
+            data-testid="workflow-row-updated"
+          >
+            {ago === "now" ? "Updated just now" : `Updated ${ago} ago`}
+          </time>
+          {/* Hidden until the row is hovered or focused on desktop, as on automation rows. */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label={`Actions for ${workflow.name}`}
+                data-testid="workflow-row-menu"
+                className={cn(
+                  "-translate-y-1/2 absolute top-1/2 right-3 transition-opacity",
+                  "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
+                  "md:aria-expanded:opacity-100",
+                )}
+              >
+                <MoreHorizontalIcon className="size-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <WorkflowMenuItems Item={DropdownMenuItem} {...actions} />
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent className="min-w-40">
+        <WorkflowMenuItems Item={ContextMenuItem} {...actions} />
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+}
+
+// Item props shared by the dropdown and context-menu item primitives.
+interface MenuItemProps {
+  children?: ReactNode;
+  onSelect?: (event: Event) => void;
+  "data-testid"?: string;
+}
+
+// The actions, written once for both the ⋯ menu and the right-click menu.
+function WorkflowMenuItems({
+  Item,
+  workflow,
+  onRun,
+  onEdit,
+  onCreateAutomation,
+}: {
+  Item: ComponentType<MenuItemProps>;
+  workflow: WorkflowSummary;
+  onRun: (workflow: WorkflowSummary) => void;
+  onEdit: (workflow: WorkflowSummary) => void;
+  onCreateAutomation: (workflow: WorkflowSummary) => void;
+}) {
+  const { trackClick } = useOmnigentAnalytics();
+  return (
+    <>
+      <Item
+        onSelect={() => {
+          trackClick("workflows.row.run", "button");
+          onRun(workflow);
+        }}
+        data-testid="workflow-run"
+      >
+        <PlayIcon className="size-4" />
+        Run
+      </Item>
+      <Item
+        onSelect={() => {
+          trackClick("workflows.row.edit", "button");
+          onEdit(workflow);
+        }}
+        data-testid="workflow-edit"
+      >
+        <PencilIcon className="size-4" />
+        Edit
+      </Item>
+      <Item
+        onSelect={() => {
+          trackClick("workflows.row.create_automation", "button");
+          onCreateAutomation(workflow);
+        }}
+        data-testid="workflow-create-automation"
+      >
+        <ClockIcon className="size-4" />
+        Create automation
+      </Item>
+    </>
+  );
+}
