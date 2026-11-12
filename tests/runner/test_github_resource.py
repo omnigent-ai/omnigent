@@ -1065,7 +1065,7 @@ def test_github_pr_commits_listing_failures_are_not_empty_successes(
 def _stub_commits_with_heads(
     monkeypatch: pytest.MonkeyPatch, graphql: tuple[int, str, str]
 ) -> list[list[str]]:
-    """Answer a fork PR, two commits, and the associated-PR query with ``graphql``."""
+    """Answer a PR by ``ada``, two commits, and the author-PR search with ``graphql``."""
     calls: list[list[str]] = []
 
     def fake_gh(
@@ -1073,8 +1073,8 @@ def _stub_commits_with_heads(
     ) -> tuple[int, str, str]:
         calls.append(list(argv))
         if argv[-1] == "repos/example/two/pulls/42":
-            head = {"sha": _HEAD, "repo": {"full_name": "fork/two"}}
-            return 0, json.dumps({"head": head, "base": {"sha": _BASE}, "commits": 2}), ""
+            pr = {"head": {"sha": _HEAD}, "base": {"sha": _BASE}, "commits": 2}
+            return 0, json.dumps({**pr, "user": {"login": "ada"}}), ""
         if "graphql" in argv:
             return graphql
         entries = [_commit_entry(_COMMIT_ONE, "Parent work"), _commit_entry(_HEAD, "Own work")]
@@ -1085,40 +1085,31 @@ def _stub_commits_with_heads(
     return calls
 
 
-def test_github_pr_commits_mark_commits_that_head_another_pr(
+def test_github_pr_commits_mark_commits_that_head_another_pr_by_the_author(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pr = {"baseRepository": {"nameWithOwner": "example/two"}, "state": "OPEN"}
-    data = {
-        "c0": {
-            "associatedPullRequests": {
-                "nodes": [
-                    {**pr, "number": 41, "url": "u41", "headRefOid": _COMMIT_ONE},
-                    # A PR this commit is merely part of, and this PR itself, are not marks.
-                    {**pr, "number": 43, "url": "u43", "headRefOid": "f" * 40},
-                    {**pr, "number": 42, "url": "u42", "headRefOid": _HEAD},
-                ]
-            }
-        },
-        "c1": {"associatedPullRequests": {"nodes": [{**pr, "number": 42, "headRefOid": _HEAD}]}},
-    }
+    nodes = [
+        {"number": 41, "url": "u41", "state": "OPEN", "headRefOid": _COMMIT_ONE},
+        # This PR itself and PRs whose heads aren't in this PR are not marks.
+        {"number": 42, "url": "u42", "state": "OPEN", "headRefOid": _HEAD},
+        {"number": 43, "url": "u43", "state": "MERGED", "headRefOid": "f" * 40},
+    ]
     calls = _stub_commits_with_heads(
-        monkeypatch, (0, json.dumps({"data": {"repository": data}}), "")
+        monkeypatch, (0, json.dumps({"data": {"search": {"nodes": nodes}}}), "")
     )
 
     result = github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
 
     assert result["data"][0]["head_of"] == [{"number": 41, "url": "u41", "state": "OPEN"}]
     assert "head_of" not in result["data"][1]
-    # GitHub associates a fork PR's commits with the head repository.
-    query = next(call for call in calls if "graphql" in call)[-1]
-    assert 'repository(owner: "fork", name: "two")' in query
+    search = next(call for call in calls if "graphql" in call)
+    assert "search=repo:example/two is:pr author:ada sort:updated-desc" in search
 
 
 def test_github_pr_commits_list_without_marks_when_the_lookup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _stub_commits_with_heads(monkeypatch, (1, "", "rate limited"))
+    _stub_commits_with_heads(monkeypatch, (1, "", "HTTP 502"))
 
     result = github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
 

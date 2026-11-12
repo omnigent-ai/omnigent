@@ -1641,35 +1641,42 @@ def _pr_commits(root: str, reference: PullRequestRef, *, head_sha: str) -> dict[
     }
 
 
-# Commits looked up in one associated-PR query, newest first; older ones go unmarked.
-_MAX_HEAD_LOOKUPS = 100
+# How many of the author's recently updated PRs one lookup reads for stack parents.
+_AUTHOR_PR_LOOKUPS = 100
+_AUTHOR_PRS_QUERY = """query($search: String!, $first: Int!) {
+  search(query: $search, type: ISSUE, first: $first) {
+    nodes { ... on PullRequest { number url state headRefOid } }
+  }
+}"""
 
 
 def _other_pr_heads(
     root: str, reference: PullRequestRef, pr: dict[str, Any], shas: list[str]
 ) -> dict[str, list[dict[str, Any]]]:
-    """Map each commit that is another PR's head to that PR, best effort.
+    """Map each commit that is the head of another PR by the same author, best effort.
 
-    Marks a stacked PR's parents in its commit list. GitHub associates a fork PR's
-    commits with the head repository, so the lookup goes there. Any failure leaves
-    the commits unmarked.
+    Marks a stacked PR's parents in its commit list with one search over the author's
+    recently updated PRs in the repository; a per-commit lookup is too slow on large
+    repositories. Any failure leaves the commits unmarked.
     """
-    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
-    head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
-    repository = head_repo.get("full_name") or reference.repository
-    owner, _, name = str(repository).partition("/")
-    wanted = shas[-_MAX_HEAD_LOOKUPS:]
-    if not owner or not name or not wanted:
+    user = pr.get("user") if isinstance(pr.get("user"), dict) else {}
+    author = user.get("login")
+    if not isinstance(author, str) or not author or not shas:
         return {}
-    fields = " ".join(
-        f'c{index}: object(oid: "{sha}") {{ ... on Commit {{ associatedPullRequests(first: 10) '
-        "{ nodes { number url state headRefOid baseRepository { nameWithOwner } } } } }"
-        for index, sha in enumerate(wanted)
-    )
-    query = f'query {{ repository(owner: "{owner}", name: "{name}") {{ {fields} }} }}'
+    search = f"repo:{reference.repository} is:pr author:{author} sort:updated-desc"
     try:
         rc, out, _ = _gh(
-            ["api", *_host_args(root, reference), "graphql", "-f", f"query={query}"],
+            [
+                "api",
+                *_host_args(root, reference),
+                "graphql",
+                "-f",
+                f"query={_AUTHOR_PRS_QUERY}",
+                "-f",
+                f"search={search}",
+                "-F",
+                f"first={_AUTHOR_PR_LOOKUPS}",
+            ],
             cwd=root,
             token=_pr_token(root, reference),
         )
@@ -1678,24 +1685,19 @@ def _other_pr_heads(
     if rc != 0:
         return {}
     try:
-        found = (json.loads(out).get("data") or {}).get("repository") or {}
-    except (ValueError, AttributeError):
+        nodes = json.loads(out)["data"]["search"]["nodes"]
+    except (ValueError, KeyError, TypeError):
         return {}
+    wanted = set(shas)
     heads: dict[str, list[dict[str, Any]]] = {}
-    for index, sha in enumerate(wanted):
-        commit = found.get(f"c{index}") or {}
-        nodes = (commit.get("associatedPullRequests") or {}).get("nodes") or []
-        marks = [
-            {"number": node["number"], "url": node.get("url"), "state": node.get("state")}
-            for node in nodes
-            if isinstance(node, dict)
-            and node.get("headRefOid") == sha
-            and node.get("number") != reference.number
-            and str((node.get("baseRepository") or {}).get("nameWithOwner", "")).lower()
-            == reference.repository.lower()
-        ]
-        if marks:
-            heads[sha] = marks
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict) or node.get("number") == reference.number:
+            continue
+        sha = node.get("headRefOid")
+        if sha in wanted:
+            heads.setdefault(sha, []).append(
+                {"number": node.get("number"), "url": node.get("url"), "state": node.get("state")}
+            )
     return heads
 
 
