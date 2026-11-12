@@ -11,7 +11,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   CalendarClockIcon,
+  ChevronRightIcon,
   CircleSlashIcon,
+  CornerDownRightIcon,
+  FolderIcon,
   InboxIcon,
   type LucideIcon,
   PanelLeftIcon,
@@ -23,8 +26,9 @@ import {
 import { useNavigate } from "@/lib/routing";
 import {
   type ConversationsPage,
-  useConversations,
+  type ProjectSummary,
   useProjects,
+  useConversations,
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -33,6 +37,7 @@ import {
   useLeaveProjectPickerWithoutProjects,
 } from "@/hooks/useNewChatProjectPrompt";
 import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
@@ -126,6 +131,7 @@ const SESSION_SEARCH_RESULT_LIMIT = 50;
 const SEARCH_GROUP_PAGE_SIZE = 8;
 /** Keys that move cmdk's selection; see `userMovedSelection`. */
 const SELECTION_KEYS = new Set(["ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
+const EMPTY_PROJECTS: readonly ProjectSummary[] = [];
 
 interface PaletteSession {
   id: string;
@@ -133,6 +139,8 @@ interface PaletteSession {
   agent: string;
   archived: boolean;
   snippet: string | null;
+  parent: string | null;
+  project: string | null;
 }
 
 /** Flatten list pages into palette rows, dropping repeated ids and, unless
@@ -144,7 +152,15 @@ function paletteSessions(
     includeArchived = false,
     excludeIds = new Set(),
     newestFirst = false,
-  }: { includeArchived?: boolean; excludeIds?: ReadonlySet<string>; newestFirst?: boolean } = {},
+    projects = EMPTY_PROJECTS,
+    parentTitles,
+  }: {
+    includeArchived?: boolean;
+    excludeIds?: ReadonlySet<string>;
+    newestFirst?: boolean;
+    projects?: readonly ProjectSummary[];
+    parentTitles?: ReadonlyMap<string, string | null>;
+  } = {},
 ): PaletteSession[] {
   const seen = new Set(excludeIds);
   const out: PaletteSession[] = [];
@@ -162,6 +178,16 @@ function paletteSessions(
       // Present only when the match was in chat content (not the title);
       // the server omits it otherwise. Shown as a dimmed second line.
       snippet: c.search_snippet ?? null,
+      parent:
+        c.family?.representative_id && c.family.representative_id !== c.id
+          ? (c.family.representative_title ??
+            parentTitles?.get(c.family.representative_id) ??
+            "Session group")
+          : null,
+      project:
+        projects.find((project) => project.id !== null && project.id === c.project_id)?.name ??
+        c.labels?.[PROJECT_LABEL_KEY] ??
+        null,
     });
   }
   return out;
@@ -189,6 +215,7 @@ export function CommandPalette({
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
+  const { data: projects = EMPTY_PROJECTS } = useProjects({ enabled: open });
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [pageLimit, setPageLimit] = useState(SESSION_SEARCH_PAGE_BATCH);
@@ -277,7 +304,6 @@ export function CommandPalette({
     );
   }, [actions, query, sessionsOnly, projectStep]);
 
-  const { data: projects = [] } = useProjects();
   // Every typed word must appear in the row label or the group heading, so
   // "new omni", "omni" and "project" all reach "New chat in omnigent". The
   // project step lists every project until the user types, and matches names only.
@@ -347,12 +373,27 @@ export function CommandPalette({
     fetchNextPage,
   ]);
 
+  const parentTitles = useMemo(
+    () =>
+      new Map(
+        [data, titleSearch.data, contentSearch.data]
+          .flatMap((result) => result?.pages ?? [])
+          .flatMap((page) => page.data)
+          .map((row) => [row.id, row.title]),
+      ),
+    [data, titleSearch.data, contentSearch.data],
+  );
   const sessions = useMemo(() => {
     // A disabled query still returns cached pages; the project step lists none.
     if (projectStep) return [];
-    if (searching) return paletteSessions(titleSearch.data?.pages ?? [], { includeArchived: true });
+    if (searching)
+      return paletteSessions(titleSearch.data?.pages ?? [], {
+        includeArchived: true,
+        projects,
+        parentTitles,
+      });
     // Rows archived after they loaded are still cached here, so drop them.
-    const out = paletteSessions(data?.pages ?? [], { newestFirst: true });
+    const out = paletteSessions(data?.pages ?? [], { newestFirst: true, projects, parentTitles });
     if (sessionsOnly) {
       if (!query.trim()) return out;
       return out
@@ -362,7 +403,7 @@ export function CommandPalette({
     }
     // The full first page would push Actions below the fold.
     return out.slice(0, IDLE_SESSION_LIMIT);
-  }, [data, titleSearch.data, query, searching, sessionsOnly, projectStep]);
+  }, [data, titleSearch.data, query, searching, sessionsOnly, projectStep, projects, parentTitles]);
   // Excludes title matches again in case a rename moved a session between the
   // two groups' requests: cmdk needs each item value to be unique.
   const contentSessions = useMemo(
@@ -370,10 +411,12 @@ export function CommandPalette({
       searching
         ? paletteSessions(contentSearch.data?.pages ?? [], {
             includeArchived: true,
+            projects,
+            parentTitles,
             excludeIds: new Set(sessions.map((s) => s.id)),
           })
         : [],
-    [contentSearch.data, searching, sessions],
+    [contentSearch.data, searching, sessions, projects, parentTitles],
   );
   const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
   const searchGroups = [titleSearch, contentSearch];
@@ -465,6 +508,31 @@ export function CommandPalette({
         <span className="truncate text-left">
           <HighlightedText text={s.label} query={sessionsOnly ? query : debouncedQuery} />
         </span>
+        {(s.project || s.parent) && (
+          <span className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+            {s.project && (
+              <>
+                <FolderIcon aria-hidden="true" className="size-3 shrink-0" />
+                <span className="truncate" title={s.project}>
+                  <span className="sr-only">Project: </span>
+                  {s.project}
+                </span>
+              </>
+            )}
+            {s.project && s.parent && (
+              <ChevronRightIcon aria-hidden="true" className="size-3 shrink-0" />
+            )}
+            {s.parent && (
+              <>
+                <CornerDownRightIcon aria-hidden="true" className="size-3 shrink-0" />
+                <span className="truncate" title={s.parent}>
+                  <span className="sr-only">Nested under: </span>
+                  {s.parent}
+                </span>
+              </>
+            )}
+          </span>
+        )}
         {s.snippet && (
           // Where the match was found in the chat body — the session is often
           // unidentifiable from the title alone.

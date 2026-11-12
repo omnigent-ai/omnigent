@@ -207,6 +207,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   arriving (the highlighted row stays put), a file and a session with the same
   name (the later one gets a suffix such as `@README.md (file)`), Attach to
   agent from the file viewer (adds a token at the end).
+- `review-context`: submitting an Agent comment in PR Changes attaches a chip
+  to the session composer. Hover previews the comment, click reveals it in
+  Changes, and X deletes the saved comment. Failed deletion retains the chip.
+  See [local review](pull-request-conversations.md) for all four entry points.
 - `dictation`: the microphone button beside the message box dictates speech
   into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
   terminal or code editor. While a browser or server take is listening, Enter

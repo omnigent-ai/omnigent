@@ -24,13 +24,82 @@ def test_native_message_schema(spec, runner_features, monkeypatch):
     assert schema["parameters"]["required"] == ["session_id", "message"]
 
 
-def test_create_schema_exposes_project_name():
+def test_create_schema_exposes_project_name_and_permission_mode():
     schemas = build_native_relay_tool_schemas(AgentSpec(spec_version=1, spawn=True))
     schema = next(s for s in schemas if s["name"] == "sys_session_create")
-    # The schema forbids unlisted properties, so the project argument must be declared.
+    # The schema forbids unlisted properties, so each argument must be declared.
     assert schema["parameters"]["additionalProperties"] is False
     assert schema["parameters"]["properties"]["project_name"]["type"] == "string"
+    assert schema["parameters"]["properties"]["permission_mode"]["type"] == "string"
     assert "project_id" not in schema["parameters"]["properties"]
+
+
+@pytest.mark.asyncio
+# None is an older server, which omits the field.
+@pytest.mark.parametrize("advertised", [True, False, None])
+async def test_create_sends_permission_mode_only_to_a_server_that_applies_it(advertised):
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            info = {} if advertised is None else {"session_create_permission_modes": advertised}
+            return httpx.Response(200, json=info)
+        return httpx.Response(201, json={"id": "conv_worker", "agent_id": "worker"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": "worker",
+                        "placement": "same_host",
+                        "permission_mode": "approve-for-me",
+                    }
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+
+    posts = [request for request in requests if request.method == "POST"]
+    if advertised:
+        assert result["conversation_id"] == "conv_worker", result
+        assert json.loads(posts[0].content)["permission_mode"] == "approve-for-me"
+    else:
+        # An older server would drop the field and start the session in its default mode.
+        assert "can't set a new session's permission_mode" in result["error"]
+        assert posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "error"),
+    [
+        ({"agent_id": "worker", "permission_mode": ""}, "nonempty string"),
+        ({"agent_id": "worker", "permission_mode": 1}, "nonempty string"),
+        ({"config_path": "agent.yaml", "permission_mode": "auto"}, "requires agent_id"),
+    ],
+)
+async def test_create_refuses_unusable_permission_mode(arguments, error):
+    def unexpected(request):
+        pytest.fail("A refused permission_mode must not reach the server")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unexpected), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(arguments),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert error in result["error"]
 
 
 @pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])

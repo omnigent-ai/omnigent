@@ -743,6 +743,14 @@ function RunRow({
             {failure.reason}
           </span>
         )}
+        {failure && run.errorDetail && (
+          <span
+            className="text-xs break-words text-muted-foreground [overflow-wrap:anywhere]"
+            data-testid="run-failure-detail"
+          >
+            {run.errorDetail}
+          </span>
+        )}
       </span>
     </>
   );

@@ -262,7 +262,7 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     with capture_debug_rows("server") as rows:
         resp = await auth_client.post(
             "/v1/scheduled-tasks",
-            json=_create_body(name="private-name", prompt="private-prompt"),
+            json=_create_body(name="private-name", prompt="private-prompt", max_cost_usd=2.5),
             headers=headers,
         )
     assert resp.status_code == 200, resp.text
@@ -279,6 +279,7 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     assert created["owner_user_id"] == "alice@example.com"
     assert created["workspace"] == "/repo"
     assert created["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
+    assert created["max_cost_usd"] == 2.5
     assert created["base_branch"] is None
     assert created["execution_target"] == "connected_host"
     task_id = created["id"]
@@ -291,6 +292,7 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
     assert got.json()["id"] == task_id
+    assert got.json()["max_cost_usd"] == 2.5
 
 
 @pytest.mark.parametrize(
@@ -1834,6 +1836,7 @@ async def test_list_runs_returns_history_for_owned_task(
         newer_id,
         scheduled_at=2000,
         status="failed",
+        error="the sandbox did not register within 720 seconds — " + "x" * 2000,
         error_code="incomplete",
         finished_at=2002,
         conversation_id=conv_id,
@@ -1849,8 +1852,12 @@ async def test_list_runs_returns_history_for_owned_task(
     assert newest["finished_at"] == 2002
     assert newest["conversation_id"] == conv_id
     assert newest["scheduled_task_id"] == task_id
-    # The free-text error blob is not exposed on the run list.
+    # The free-text error reaches the run list only as a capped detail.
     assert "error" not in newest
+    detail = newest["error_detail"]
+    assert detail.startswith("the sandbox did not register within 720 seconds — ")
+    assert len(detail) == 1000
+    assert runs[1]["error_detail"] is None
     # The run's session doesn't exist, so it carries no session read state.
     assert newest["conversation_updated_at"] is None
     assert newest["conversation_status"] is None
