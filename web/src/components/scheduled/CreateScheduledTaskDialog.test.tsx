@@ -4299,6 +4299,81 @@ describe("editing template prompts", () => {
     },
   );
 
+  it.each([false, true])(
+    "shows the polling session's permission mode and edits it when starting a new session=%s",
+    async (startNewSession) => {
+      const saved = templatePrompt();
+      render(
+        <CapabilitiesProvider info={{ ...serverInfo(true), scheduled_task_session_modes: true }}>
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              prompt: saved,
+              agentId: "ag_claude_native",
+              permissionMode: "acceptEdits",
+              sessionMode: "continue",
+              sessionId: "poller",
+              hostId: "host_1",
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      const field = screen.getByTestId("task-polling-permission-field");
+      const permission = within(field).getByTestId("task-permission-trigger");
+      expect(permission).toHaveTextContent("Accept edits");
+      expect(permission).toBeDisabled();
+      expect(field).toHaveTextContent(
+        "Applies to the polling session, which keeps its current mode.",
+      );
+      expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent("Accept edits");
+      expect(screen.getAllByTestId("task-permission-trigger")).toHaveLength(1);
+      if (startNewSession) {
+        fireEvent.click(screen.getByTestId("task-start-new-session"));
+        expect(permission).toBeEnabled();
+        expect(field).toHaveTextContent("Applies to the polling session the next run starts.");
+        fireEvent.keyDown(permission, { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: "Auto" }));
+        expect(permission).toHaveTextContent("Auto");
+      }
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(readTriggerWorkerSettings(input.prompt)).toEqual(readTriggerWorkerSettings(saved));
+      if (startNewSession) {
+        expect(input.permissionMode).toBe("auto");
+        expect(input.sessionId).toBeNull();
+      } else {
+        expect(input).not.toHaveProperty("permissionMode");
+        expect(input).not.toHaveProperty("sessionId");
+      }
+    },
+  );
+
+  it("omits the new-session hint when the server cannot start a new polling session", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          prompt: templatePrompt(),
+          agentId: "ag_claude_native",
+          permissionMode: "acceptEdits",
+          sessionMode: "continue",
+          sessionId: "poller",
+          hostId: "host_1",
+        })}
+      />,
+    );
+    const field = screen.getByTestId("task-polling-permission-field");
+    expect(within(field).getByTestId("task-permission-trigger")).toBeDisabled();
+    expect(field).toHaveTextContent(
+      "Applies to the polling session, which keeps its current mode.",
+    );
+    expect(field).not.toHaveTextContent("Start a new session on the next run");
+    expect(screen.queryByTestId("task-start-new-session")).not.toBeInTheDocument();
+  });
+
   it.each(["Your prompt", "System prompt"])(
     "keeps polling settings unchanged while clearing and restoring %s",
     async (field) => {
