@@ -465,7 +465,7 @@ async def test_info_includes_server_version(
     # is a frozen build-time snapshot that can drift from VERSION in a stale
     # editable or "source"-placeholder install.
     assert body["server_version"] == VERSION
-    assert body.get("comment_anchor_metadata", False) is False
+    assert body["comment_anchor_metadata"] is True
 
 
 def _branding_png(color: tuple[int, int, int, int]) -> bytes:
@@ -1179,6 +1179,109 @@ async def test_host_route_for_live_host_on_another_replica(
 
     assert resp.status_code == status, resp.text
     assert resp.json()["error"]["code"] == code
+
+
+_LIVE_HOST_ID = "0123456789abcdef0123456789abcdef"
+_SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key"
+_RESEND_KEYED = f"resend with header {_SLICE_KEY_HEADER}: {_LIVE_HOST_ID}"
+_RESEND_KEYLESS = (
+    f"resend without the {_SLICE_KEY_HEADER} header or omnigent_slice_key query parameter"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "params", "resend_slice_key", "remedy"),
+    [
+        ({}, {}, _LIVE_HOST_ID, _RESEND_KEYED),
+        (
+            {_SLICE_KEY_HEADER: "fedcba9876543210fedcba9876543210"},
+            {},
+            _LIVE_HOST_ID,
+            _RESEND_KEYED,
+        ),
+        # Ingress hashes the literal key; the host dials with the bare id.
+        ({_SLICE_KEY_HEADER: f"host_{_LIVE_HOST_ID}"}, {}, _LIVE_HOST_ID, _RESEND_KEYED),
+        ({_SLICE_KEY_HEADER: _LIVE_HOST_ID}, {}, None, _RESEND_KEYLESS),
+        ({}, {"omnigent_slice_key": _LIVE_HOST_ID}, None, _RESEND_KEYLESS),
+        # Like ingress, a non-empty header wins over the query fallback.
+        (
+            {_SLICE_KEY_HEADER: "fedcba9876543210fedcba9876543210"},
+            {"omnigent_slice_key": _LIVE_HOST_ID},
+            _LIVE_HOST_ID,
+            _RESEND_KEYED,
+        ),
+        ({_SLICE_KEY_HEADER: ""}, {"omnigent_slice_key": _LIVE_HOST_ID}, None, _RESEND_KEYLESS),
+    ],
+    ids=[
+        "keyless",
+        "other_key",
+        "legacy_prefixed_key",
+        "host_key",
+        "host_query_key",
+        "other_header_over_host_query",
+        "empty_header_host_query",
+    ],
+)
+async def test_wrong_replica_names_the_slice_key_that_reaches_the_host(
+    db_uri: str,
+    tmp_path: Path,
+    headers: dict[str, str],
+    params: dict[str, str],
+    resend_slice_key: str | None,
+    remedy: str,
+) -> None:
+    """
+    A wrong-replica 400 tells the client which slice key reaches the host.
+
+    A keyless or differently keyed request must be resent keyed to the host; a
+    request already keyed to the host must be resent keyless, because its tunnel
+    dialed the default route.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.server.routes._host_launch import configure_host_sharding
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+    from tests.server.helpers import create_test_agent
+
+    host_store = HostStore(db_uri)
+    # Online and freshly seen, but its tunnel never registered on this replica.
+    host_store.upsert_on_connect(_LIVE_HOST_ID, "laptop", "local")
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    try:
+        app = create_app(
+            agent_store=SqlAlchemyAgentStore(db_uri),
+            file_store=SqlAlchemyFileStore(db_uri),
+            conversation_store=SqlAlchemyConversationStore(db_uri),
+            artifact_store=artifact_store,
+            host_store=host_store,
+            agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+            host_sharded=True,
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            agent = await create_test_agent(c)
+            responses = [
+                await c.get(
+                    f"/v1/hosts/{_LIVE_HOST_ID}/filesystem", headers=headers, params=params
+                ),
+                await c.post(
+                    "/v1/sessions",
+                    headers=headers,
+                    params=params,
+                    json={"agent_id": agent["id"], "host_id": _LIVE_HOST_ID, "workspace": "/work"},
+                ),
+            ]
+    finally:
+        configure_host_sharding(False)
+
+    for resp in responses:
+        assert resp.status_code == 400, resp.text
+        error = resp.json()["error"]
+        assert error["code"] == "wrong_replica"
+        assert error["slice_key_header"] == _SLICE_KEY_HEADER
+        assert error["slice_key"] == resend_slice_key
+        assert error["message"].endswith(remedy), error["message"]
 
 
 @dataclass(frozen=True)

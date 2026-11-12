@@ -1295,6 +1295,38 @@ def test_list_latest_run_status_is_workspace_scoped(
         }
 
 
+# ── has_active_run (workers of a live automation run) ─────────────────────────
+
+
+@pytest.mark.parametrize("status", ["starting", "running"])
+def test_has_active_run_counts_starting_and_running(
+    store: SqlAlchemyScheduledTaskStore, status: str
+) -> None:
+    """A claimed run records its session while still starting, before the prompt is sent."""
+    _seed_running_run(store, "active_other")
+    store.create_run(
+        run_id=_uid(f"run_active_{status}"),
+        scheduled_task_id=_uid("task_active_other"),
+        status=status,
+        scheduled_at=200,
+        conversation_id=_uid(f"conv_active_{status}"),
+    )
+    assert store.has_active_run(_uid("task_active_other"), _uid(f"conv_active_{status}"))
+
+
+def test_has_active_run_false_once_finished_or_for_another_task(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Only this task's live run counts, not a finished one or another task's."""
+    run_id = _seed_running_run(store, "active_fin")
+    _seed_running_run(store, "active_peer")
+    assert store.has_active_run(_uid("task_active_fin"), _uid("conv_active_fin"))
+    assert not store.has_active_run(_uid("task_active_peer"), _uid("conv_active_fin"))
+    assert not store.has_active_run(_uid("task_active_fin"), _uid("conv_absent"))
+    store.update_run(run_id, status="succeeded", finished_at=202)
+    assert not store.has_active_run(_uid("task_active_fin"), _uid("conv_active_fin"))
+
+
 # ── get_running_run_by_conversation (event-hook reverse lookup) ───────────────
 
 
@@ -1361,6 +1393,32 @@ def test_get_running_run_by_conversation_is_workspace_scoped(
     with workspace_scope(11):
         found = store.get_running_run_by_conversation(_uid("conv_ws"))
         assert found is not None and found.id == _uid("run_ws")
+
+
+@pytest.mark.parametrize(("status", "starting"), [("starting", True), ("running", False)])
+def test_has_starting_run_for_conversation_finds_only_its_unsettled_startup(
+    store: SqlAlchemyScheduledTaskStore, status: str, starting: bool
+) -> None:
+    with workspace_scope(11):
+        store.create(
+            scheduled_task_id=_uid("task_startup"),
+            name="startup",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="a",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+        store.create_run(
+            run_id=_uid("run_startup"),
+            scheduled_task_id=_uid("task_startup"),
+            status=status,
+            scheduled_at=100,
+            conversation_id=_uid("conv_startup"),
+        )
+        assert store.has_starting_run_for_conversation(_uid("conv_startup")) is starting
+        assert store.has_starting_run_for_conversation(_uid("conv_other")) is False
+    assert store.has_starting_run_for_conversation(_uid("conv_startup")) is False
 
 
 def _due_task(store: SqlAlchemyScheduledTaskStore, seed: str = "dispatch"):

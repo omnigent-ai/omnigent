@@ -289,6 +289,13 @@ _PLAN_IMPLEMENTATION_CLEAR_CONTEXT_PREFIX = (
     "user intent, re-read files as needed, and carry the work through "
     "implementation and verification."
 )
+# Default-mode ``request_user_input_async`` questions ride on an ``agentMessage``
+# item; the Codex TUI answers them with a tagged user message.
+_CODEX_ASYNC_QUESTION_TOOL = "request_user_input_async"
+_CODEX_ASYNC_QUESTION_REQUEST_PREFIX = "async_question:"
+_CODEX_ASYNC_QUESTION_REPLY_TAG = "send_user_message_question_reply"
+_CODEX_ASYNC_QUESTION_REPLY_OPEN_PATTERN = re.compile(rf"<{_CODEX_ASYNC_QUESTION_REPLY_TAG}>\s*")
+_CODEX_ASYNC_QUESTION_REPLY_CLOSE_PATTERN = re.compile(rf"\s*</{_CODEX_ASYNC_QUESTION_REPLY_TAG}>")
 _CODEX_ELICITATION_REQUEST_METHODS = frozenset(
     {
         _CODEX_MCP_ELICITATION_REQUEST_METHOD,
@@ -2321,6 +2328,10 @@ class _CodexElicitationTaskTracker:
         """
         self._pending: dict[asyncio.Task[None], _PendingCodexElicitation] = {}
         self._posted_resolutions: set[str] = set()
+        self._started_async_questions: set[str] = set()
+        self._unanswered_async_questions: dict[str, asyncio.Task[None]] = {}
+        # Whether ``GET /v1/info`` advertised async question cards; ``None`` until read.
+        self._server_shows_async_question_cards: bool | None = None
 
     def start(
         self,
@@ -2367,6 +2378,100 @@ class _CodexElicitationTaskTracker:
             ),
         )
         task.add_done_callback(self._discard_done)
+
+    def start_async_question(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        params: _JsonObject,
+    ) -> None:
+        """
+        Publish one card per Codex async question and send each answer as a user message.
+
+        The cards mirror the Codex TUI's queued questions: each is answered on
+        its own, and the answer goes through the session's ordinary message
+        path in the TUI's reply format.
+
+        :param client: HTTP client for Omnigent hook and event posts.
+        :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+        :param params: Codex ``item/completed`` params for an ``agentMessage``.
+        :returns: None.
+        """
+        for question in _codex_async_questions(params):
+            if question.key in self._started_async_questions:
+                continue
+            self._started_async_questions.add(question.key)
+            task = asyncio.create_task(
+                self._run_async_question(client, session_id=session_id, question=question),
+                name="codex-native-async-question",
+            )
+            self._pending[task] = _PendingCodexElicitation(
+                thread_id=question.thread_id,
+                turn_id=question.turn_id,
+                request_id=question.request_id,
+                elicitation_id=codex_elicitation_id(
+                    session_id,
+                    _CODEX_TOOL_REQUEST_USER_INPUT_METHOD,
+                    question.request_id,
+                ),
+            )
+            self._unanswered_async_questions[question.key] = task
+            task.add_done_callback(self._discard_done)
+
+    async def close_async_questions_for_user_message(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        params: _JsonObject,
+    ) -> None:
+        """
+        Close the async question cards a Codex user message clears.
+
+        Like the Codex TUI queue: a tagged reply (from the TUI picker or a
+        card) clears the questions it names, and any other user message,
+        typed in the TUI or the web, clears every open question on the thread.
+
+        :param client: HTTP client for Omnigent event posts.
+        :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+        :param params: Codex ``item/completed`` params.
+        :returns: None.
+        """
+        item = params.get("item")
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            return
+        thread_id = _thread_id_from_params(params)
+        keys = _async_question_reply_keys(_user_message_text(item), self._started_async_questions)
+        if not keys:
+            keys = [
+                key
+                for key, task in self._unanswered_async_questions.items()
+                if (pending := self._pending.get(task)) is not None
+                and (thread_id is None or pending.thread_id == thread_id)
+            ]
+        for key in keys:
+            await self._close_async_question(client, session_id, key)
+
+    async def _close_async_question(
+        self, client: httpx.AsyncClient, session_id: str, key: str
+    ) -> None:
+        """
+        Close one async question card without sending an answer.
+
+        :param client: HTTP client for Omnigent event posts.
+        :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+        :param key: Question key, e.g. ``"call_abc:0"``.
+        :returns: None.
+        """
+        task = self._unanswered_async_questions.pop(key, None)
+        pending = self._pending.get(task) if task is not None else None
+        if task is None or pending is None:
+            return
+        # Resolve before dropping the hook wait: a dropped wait alone keeps the
+        # card up for the server's re-park grace.
+        await self._post_resolved_once(client, session_id, pending)
+        task.cancel()
 
     async def resolve_by_server_notification(
         self,
@@ -2420,6 +2525,13 @@ class _CodexElicitationTaskTracker:
         """
         thread_id = _thread_id_from_params(params)
         turn_id = _turn_id_from_payload(params.get("turn")) or _turn_id_from_payload(params)
+        # The Codex TUI drops its queued questions when their turn ends.
+        for key, task in list(self._unanswered_async_questions.items()):
+            pending = self._pending.get(task)
+            if pending is not None and _pending_elicitation_matches_terminal_turn(
+                pending, thread_id=thread_id, turn_id=turn_id
+            ):
+                await self._close_async_question(client, session_id, key)
         for _task, pending in list(self._pending.items()):
             if _pending_elicitation_matches_terminal_turn(
                 pending,
@@ -2445,14 +2557,14 @@ class _CodexElicitationTaskTracker:
 
         :returns: None after all background hook tasks have finished.
         """
-        if not self._pending:
-            return
         tasks = list(self._pending)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._pending.clear()
         self._posted_resolutions.clear()
+        self._started_async_questions.clear()
+        self._unanswered_async_questions.clear()
 
     async def _run_one(
         self,
@@ -2486,6 +2598,73 @@ class _CodexElicitationTaskTracker:
                 event.get("method"),
                 exc_info=True,
             )
+
+    async def _run_async_question(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        question: _CodexAsyncQuestion,
+    ) -> None:
+        """
+        Wait for the Omnigent answer to one async question and send it on.
+
+        :param client: HTTP client for Omnigent hook and event posts.
+        :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+        :param question: Parsed Codex async question.
+        :returns: None.
+        """
+        key = question.key
+        try:
+            if not await self._async_question_cards_supported(client):
+                return
+            result = await _codex_elicitation_hook_result(
+                client, session_id, event=_async_question_request_event(question)
+            )
+            # Absent once a user message or the turn's end cleared it.
+            if self._unanswered_async_questions.pop(key, None) is None:
+                return
+            reply = _async_question_reply_text(question, result)
+            if reply is not None:
+                await _send_async_question_reply(client, session_id, question, reply)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # keep the long-lived forwarder alive.
+            _logger.warning(
+                "Codex forwarder async question task failed: question=%s",
+                key,
+                exc_info=True,
+            )
+        finally:
+            self._unanswered_async_questions.pop(key, None)
+
+    async def _async_question_cards_supported(self, client: httpx.AsyncClient) -> bool:
+        """
+        Report whether the Omnigent server can show async question cards.
+
+        Older servers treat a declined card as an interrupt, so the question
+        stays terminal-only there.
+        An unreadable ``/v1/info`` counts as unsupported and is read again later.
+
+        :param client: HTTP client pointed at the Omnigent server.
+        :returns: ``True`` when ``GET /v1/info`` reports
+            ``codex_nonblocking_decline: true``.
+        """
+        if self._server_shows_async_question_cards is None:
+            try:
+                info = await client.get("/v1/info")
+                info.raise_for_status()
+                payload = info.json()
+            except (httpx.HTTPError, ValueError):
+                _logger.warning(
+                    "Codex forwarder could not read server info; question stays in the terminal",
+                    exc_info=True,
+                )
+                return False
+            self._server_shows_async_question_cards = (
+                isinstance(payload, dict) and payload.get("codex_nonblocking_decline") is True
+            )
+        return self._server_shows_async_question_cards
 
     def _discard_done(self, task: asyncio.Task[None]) -> None:
         """
@@ -2893,7 +3072,27 @@ async def _post_side_chat_failed_notice(
     :param request_key: Stable per-request id for idempotency.
     :returns: None.
     """
-    marker = f"side-chat-error-{request_key}"
+    await _post_assistant_notice(
+        client,
+        session_id,
+        marker=f"side-chat-error-{request_key}",
+        text="Couldn't open a side chat for that /side request. Try again.",
+    )
+
+
+async def _post_assistant_notice(
+    client: httpx.AsyncClient, session_id: str, *, marker: str, text: str
+) -> None:
+    """
+    Post a best-effort assistant notice to an Omnigent session.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param marker: Stable response and source id that makes the notice
+        idempotent, e.g. ``"side-chat-error-req_1"``.
+    :param text: Notice text shown to the user.
+    :returns: None.
+    """
     try:
         await _post_external_item(
             client,
@@ -2902,18 +3101,13 @@ async def _post_side_chat_failed_notice(
             item_data={
                 "role": "assistant",
                 "agent": _AGENT_NAME,
-                "content": [
-                    {
-                        "type": "output_text",
-                        "text": "Couldn't open a side chat for that /side request. Try again.",
-                    }
-                ],
+                "content": [{"type": "output_text", "text": text}],
             },
             response_id=marker,
             source_id=marker,
         )
     except Exception:  # the notice is best-effort.
-        _logger.warning("Codex /side failure notice could not be posted", exc_info=True)
+        _logger.warning("Codex forwarder notice could not be posted: %s", marker, exc_info=True)
 
 
 async def _maybe_rotate_session_on_thread_started(
@@ -3164,6 +3358,9 @@ async def _subscribe_until_ready(
     reconnects keep it so no live turn replaces the bridge's recovery cursor
     before the replay lands.
 
+    If Codex cannot list turns, retry without history so live notifications
+    can still be mirrored. Items preceding that subscription remain unreplayed.
+
     :param client: Codex app-server client.
     :param ap_client: Omnigent HTTP client used for replayed items.
     :param session_id: Omnigent conversation id.
@@ -3193,6 +3390,7 @@ async def _subscribe_until_ready(
         and bridge_state.pending_shell_command_id is not None
     )
     saw_not_ready = False
+    history_unavailable = False
     resume_timeout = _SUBSCRIBE_RESUME_TIMEOUT_SECONDS
     replay_owed = replay_from_turn_id is not None or shell_pending
     async with (
@@ -3202,7 +3400,9 @@ async def _subscribe_until_ready(
             async with _conversation_item_delivery_scope(session_id):
                 received_live_items = client.is_subscribed_to_thread(thread_id)
                 params: _JsonObject = {"threadId": thread_id}
-                if not saw_not_ready and replay_from_turn_id is None and not shell_pending:
+                if history_unavailable or (
+                    not saw_not_ready and replay_from_turn_id is None and not shell_pending
+                ):
                     params["excludeTurns"] = True
                 timed_out = False
                 try:
@@ -3217,6 +3417,19 @@ async def _subscribe_until_ready(
                     raise
                 # App-server error envelopes are surfaced as RuntimeError.
                 except Exception as exc:
+                    if (
+                        not params.get("excludeTurns")
+                        and isinstance(exc, CodexAppServerResponseError)
+                        and exc.code == -32601
+                        and exc.message == "list_turns is not supported yet"
+                    ):
+                        history_unavailable = True
+                        _logger.warning(
+                            "Codex cannot list turns for thread %s; subscribing without history. "
+                            "Items before this subscription cannot be replayed.",
+                            thread_id,
+                        )
+                        continue
                     if not _is_thread_not_ready_error(exc):
                         _logger.warning(
                             "failed to subscribe to Codex thread %s", thread_id, exc_info=True
@@ -3237,6 +3450,7 @@ async def _subscribe_until_ready(
                         forwarder_state=forwarder_state,
                         received_live_items=received_live_items,
                         replay_from_turn_id=replay_from_turn_id,
+                        replay_history=not history_unavailable,
                     )
                     return
             if timed_out:
@@ -3279,6 +3493,7 @@ async def _finish_subscription(
     forwarder_state: _CodexForwarderState | None,
     received_live_items: bool,
     replay_from_turn_id: str | None,
+    replay_history: bool,
 ) -> None:
     """
     Sync thread metadata from a successful resume and replay its snapshot.
@@ -3299,6 +3514,7 @@ async def _finish_subscription(
     :param received_live_items: Whether this connection was already
         subscribed (and so received live items) before the resume.
     :param replay_from_turn_id: Interrupted turn to replay from, if any.
+    :param replay_history: Whether Codex returned history for reconciliation.
     :returns: None.
     """
     if forwarder_state is not None:
@@ -3335,6 +3551,10 @@ async def _finish_subscription(
             thread_id=thread_id,
             forwarder_state=forwarder_state,
         )
+    # An excluded history is not evidence that a saved turn or shell finished.
+    # Keep its recovery cursor until an authoritative lifecycle event arrives.
+    if not replay_history:
+        return
     if forwarder_state is not None and received_live_items:
         forwarder_state.resume_echo_thread_ids.add(thread_id)
     try:
@@ -3484,6 +3704,7 @@ async def _replay_resume_response(
             thread_id=thread_id,
             turns=turns,
             forwarder_state=forwarder_state,
+            replay_from_turn_id=replay_from_turn_id,
         )
 
 
@@ -3509,6 +3730,7 @@ async def _post_resume_turn_status(
     thread_id: str | None,
     turns: list[object],
     forwarder_state: _CodexForwarderState | None = None,
+    replay_from_turn_id: str | None = None,
 ) -> None:
     """
     Publish a missed lifecycle edge from explicit ``thread/resume`` turn state.
@@ -3526,11 +3748,14 @@ async def _post_resume_turn_status(
     :param turns: Raw Codex resume turn list.
     :param forwarder_state: Mutable forwarder state holding the turns whose
         failure was already posted, or ``None``.
+    :param replay_from_turn_id: Persisted turn this subscription is recovering.
     :returns: None.
     """
     if thread_id is None:
         return
-    edge = _resume_turn_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
+    edge = _resume_turn_status_edge_for_latest_turn(
+        bridge_dir, thread_id, turns, replay_from_turn_id=replay_from_turn_id
+    )
     if (
         edge is not None
         and _turn_failure_already_posted(forwarder_state, edge.turn_id)
@@ -3548,6 +3773,8 @@ def _resume_turn_status_edge_for_latest_turn(
     bridge_dir: Path,
     thread_id: str,
     turns: list[object],
+    *,
+    replay_from_turn_id: str | None = None,
 ) -> _CodexTurnStatusEdge | None:
     """
     Return the Omnigent status represented by the latest resume turn.
@@ -3556,6 +3783,7 @@ def _resume_turn_status_edge_for_latest_turn(
     :param thread_id: Codex thread id from the resume payload, e.g.
         ``"thread_123"``.
     :param turns: Raw Codex resume turn list.
+    :param replay_from_turn_id: Persisted turn eligible for terminal idle backfill.
     :returns: Status edge when the latest turn has explicit lifecycle state and
         belongs to the bridge's current thread; otherwise ``None``.
     """
@@ -3572,6 +3800,10 @@ def _resume_turn_status_edge_for_latest_turn(
             return None
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
+            return None
+        # Fresh resume snapshots can report a just-started turn as terminal.
+        # Only the matching recovery turn can settle through idle backfill.
+        if status == "idle" and turn_id != replay_from_turn_id:
             return None
         update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
@@ -3877,6 +4109,13 @@ async def _handle_event(
             bridge_dir=event_bridge_dir,
             file_observer_bridge_dir=bridge_dir,
         )
+        if codex_client is not None:
+            elicitation_tracker.start_async_question(
+                client, session_id=route_session_id, params=params
+            )
+            await elicitation_tracker.close_async_questions_for_user_message(
+                client, session_id=route_session_id, params=params
+            )
 
 
 def _resolve_event_session(
@@ -6211,6 +6450,315 @@ def _default_collaboration_mode(
             "developer_instructions": forwarder_state.developer_instructions,
         },
     }
+
+
+@dataclass(frozen=True)
+class _CodexAsyncQuestion:
+    """
+    One question from a Codex ``request_user_input_async`` call.
+
+    The Codex TUI answers each question of a call on its own, so each gets
+    its own card.
+
+    :param item_id: Codex ``agentMessage`` item id, e.g. ``"call_abc"``.
+    :param index: Position of the question in the call, e.g. ``0``. Codex
+        identifies an answer by item id and index.
+    :param title: Question text, e.g. ``"Pick one"``.
+    :param options: Option labels, e.g. ``("Alpha", "Beta")``.
+    :param thread_id: Asking Codex thread id, e.g. ``"thread_abc"``.
+    :param turn_id: Asking Codex turn id, e.g. ``"turn_abc"``, or ``None``.
+    """
+
+    item_id: str
+    index: int
+    title: str
+    options: tuple[str, ...]
+    thread_id: str
+    turn_id: str | None
+
+    @property
+    def key(self) -> str:
+        """
+        Identify the question within the session.
+
+        :returns: Key, e.g. ``"call_abc:0"``.
+        """
+        return _async_question_key(self.item_id, self.index)
+
+    @property
+    def request_id(self) -> str:
+        """
+        Synthetic ``requestUserInput`` request id for the question card.
+
+        :returns: Request id, e.g. ``"async_question:call_abc:0"``.
+        """
+        return f"{_CODEX_ASYNC_QUESTION_REQUEST_PREFIX}{self.key}"
+
+
+def _async_question_key(item_id: str, index: int) -> str:
+    """
+    Build the key of one async question.
+
+    :param item_id: Codex ``agentMessage`` item id, e.g. ``"call_abc"``.
+    :param index: Position of the question in the call, e.g. ``0``.
+    :returns: Key, e.g. ``"call_abc:0"``.
+    """
+    return f"{item_id}:{index}"
+
+
+def _codex_async_questions(params: _JsonObject) -> list[_CodexAsyncQuestion]:
+    """
+    Parse the questions of a Codex async question from ``item/completed`` params.
+
+    :param params: Codex ``item/completed`` params whose ``agentMessage``
+        item carries ``delivery: "async"`` and ``questions``, e.g.
+        ``[{"title": "Pick one", "options": ["Alpha", "Beta"]}]``.
+    :returns: Parsed questions in asking order; empty for any other item.
+    """
+    item = params.get("item")
+    if not isinstance(item, dict) or item.get("type") != "agentMessage":
+        return []
+    item_id = item.get("id")
+    thread_id = params.get("threadId")
+    turn_id = params.get("turnId")
+    raw_questions = item.get("questions")
+    if item.get("delivery") != "async" or not isinstance(raw_questions, list):
+        return []
+    if not isinstance(item_id, str) or not item_id:
+        return []
+    if not isinstance(thread_id, str) or not thread_id:
+        return []
+    questions: list[_CodexAsyncQuestion] = []
+    for index, raw_question in enumerate(raw_questions):
+        if not isinstance(raw_question, dict):
+            continue
+        title = raw_question.get("title")
+        options = raw_question.get("options")
+        if not isinstance(title, str) or not title:
+            continue
+        labels = tuple(
+            option
+            for option in (options if isinstance(options, list) else [])
+            if isinstance(option, str) and option
+        )
+        questions.append(
+            _CodexAsyncQuestion(
+                item_id=item_id,
+                index=index,
+                title=title,
+                options=labels,
+                thread_id=thread_id,
+                turn_id=turn_id if isinstance(turn_id, str) and turn_id else None,
+            )
+        )
+    return questions
+
+
+def _async_question_request_event(question: _CodexAsyncQuestion) -> CodexMessage:
+    """
+    Build the ``requestUserInput`` request that shows an async question card.
+
+    :param question: Parsed Codex async question.
+    :returns: Codex JSON-RPC request envelope.
+    """
+    # Like the Codex TUI picker: the options, then a free-text "Other" row.
+    params: _JsonObject = {
+        "threadId": question.thread_id,
+        "turnId": question.turn_id,
+        "itemId": question.item_id,
+        "isBlocking": False,
+        "questions": [
+            {
+                "id": str(question.index),
+                "question": question.title,
+                "isOther": True,
+                "isSecret": False,
+                "options": [{"label": label} for label in question.options],
+            }
+        ],
+    }
+    return {
+        "id": question.request_id,
+        "method": _CODEX_TOOL_REQUEST_USER_INPUT_METHOD,
+        "params": params,
+    }
+
+
+def _async_question_reply_text(
+    question: _CodexAsyncQuestion,
+    result: _JsonObject | None,
+) -> str | None:
+    """
+    Format Omnigent answers as the Codex TUI's async question reply message.
+
+    :param question: Parsed Codex async question.
+    :param result: Codex ``requestUserInput`` result, e.g.
+        ``{"answers": {"0": {"answers": ["Alpha"]}}}``.
+    :returns: Tagged user message text with one entry, as the TUI sends for
+        each answered question, or ``None`` when nothing was answered.
+    """
+    answers = result.get("answers") if result is not None else None
+    answer = answers.get(str(question.index)) if isinstance(answers, dict) else None
+    values = answer.get("answers") if isinstance(answer, dict) else None
+    texts = [
+        value
+        for value in (values if isinstance(values, list) else [])
+        if isinstance(value, str) and value
+    ]
+    if not texts:
+        return None
+    question_item_id = [_CODEX_ASYNC_QUESTION_TOOL, question.item_id, question.index]
+    entry = {
+        "answer": ", ".join(texts),
+        "question": question.title,
+        "questionItemId": json.dumps(question_item_id, separators=(",", ":")),
+    }
+    body = json.dumps([entry], ensure_ascii=False, separators=(",", ":"))
+    tag = _CODEX_ASYNC_QUESTION_REPLY_TAG
+    return f"<{tag}>\n{body}\n</{tag}>"
+
+
+def _async_question_replies(
+    text: str, question_keys: Collection[str]
+) -> Iterator[tuple[int, int, list[_JsonObject]]]:
+    """
+    Find the tagged replies to known async questions in a Codex user message.
+
+    A tagged block counts only when every entry names one of
+    ``question_keys`` and some entry has answer text, so a quoted,
+    partial, empty or malformed example stays ordinary text.
+
+    :param text: Codex ``userMessage`` text.
+    :param question_keys: Keys of the async questions Codex asked,
+        e.g. ``{"call_abc:0"}``.
+    :returns: Iterator of ``(start, end, entries)`` for each reply, where
+        ``text[start:end]`` spans its tags.
+    """
+    decoder = json.JSONDecoder()
+    position = 0
+    while opening := _CODEX_ASYNC_QUESTION_REPLY_OPEN_PATTERN.search(text, position):
+        position = opening.end()
+        # Decode before finding the closing tag, which an answer string may contain.
+        try:
+            entries, end = decoder.raw_decode(text, position)
+        except ValueError:
+            continue
+        closing = _CODEX_ASYNC_QUESTION_REPLY_CLOSE_PATTERN.match(text, end)
+        if closing is None or not isinstance(entries, list):
+            continue
+        position = closing.end()
+        keys = [_async_question_reply_entry_key(entry) for entry in entries]
+        if (
+            keys
+            and all(key is not None and key in question_keys for key in keys)
+            and _async_question_reply_answers(entries)
+        ):
+            yield opening.start(), closing.end(), entries
+
+
+def _async_question_reply_answers(entries: list[_JsonObject]) -> list[str]:
+    """
+    Return the answer texts of a tagged async question reply.
+
+    :param entries: Decoded reply entries, each naming an asked question.
+    :returns: Nonempty ``answer`` strings, e.g. ``["Alpha"]``.
+    """
+    answers = [entry.get("answer") for entry in entries]
+    return [answer for answer in answers if isinstance(answer, str) and answer]
+
+
+def _async_question_reply_entry_key(entry: object) -> str | None:
+    """
+    Return the key of the async question one reply entry answers.
+
+    :param entry: Decoded reply entry whose ``questionItemId`` is a JSON
+        string, e.g. ``'["request_user_input_async","call_abc",0]'``.
+    :returns: The question key, e.g. ``"call_abc:0"``, or ``None`` when the
+        entry does not name an async question.
+    """
+    question_item_id = entry.get("questionItemId") if isinstance(entry, dict) else None
+    try:
+        parts = json.loads(question_item_id) if isinstance(question_item_id, str) else None
+    except ValueError:
+        return None
+    if (
+        isinstance(parts, list)
+        and len(parts) == 3
+        and parts[0] == _CODEX_ASYNC_QUESTION_TOOL
+        and isinstance(parts[1], str)
+        and parts[1]
+        and type(parts[2]) is int
+    ):
+        return _async_question_key(parts[1], parts[2])
+    return None
+
+
+def _async_question_reply_keys(text: str, question_keys: Collection[str]) -> list[str]:
+    """
+    Return the keys of the async questions a Codex user message answers.
+
+    Only a message that is wholly one tagged reply answers questions, as the
+    TUI picker and the cards send it; a reply quoted inside other text is an
+    ordinary message.
+
+    :param text: Codex ``userMessage`` text.
+    :param question_keys: Keys of the async questions Codex asked.
+    :returns: Answered question keys, e.g. ``["call_abc:0"]``, or ``[]``.
+    """
+    replies = list(_async_question_replies(text, question_keys))
+    if len(replies) != 1:
+        return []
+    start, end, entries = replies[0]
+    if text[:start].strip() or text[end:].strip():
+        return []
+    keys: list[str] = []
+    for entry in entries:
+        key = _async_question_reply_entry_key(entry)
+        if key is not None and key not in keys:
+            keys.append(key)
+    return keys
+
+
+async def _send_async_question_reply(
+    client: httpx.AsyncClient,
+    session_id: str,
+    question: _CodexAsyncQuestion,
+    reply: str,
+) -> None:
+    """
+    Send an async question answer as an ordinary user message on the session.
+
+    The server delivers it like composer input, steering the running turn or
+    starting one, as the Codex TUI does with its own reply.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param question: Answered Codex async question.
+    :param reply: Tagged reply from :func:`_async_question_reply_text`.
+    :returns: None.
+    """
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": reply}]},
+            },
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Codex async question answer could not be sent: question=%s",
+            question.key,
+            exc_info=True,
+        )
+        await _post_assistant_notice(
+            client,
+            session_id,
+            marker=f"async-question-undelivered-{question.item_id}-{question.index}",
+            text=f'Couldn\'t send your answer to "{question.title}" to Codex. '
+            "Answer it again in the terminal.",
+        )
 
 
 async def _handle_turn_started(
