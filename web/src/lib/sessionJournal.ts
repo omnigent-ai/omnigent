@@ -35,6 +35,8 @@ export interface JournalEntry {
   author: { type: "agent" | "omnigent" };
   kind: JournalEntryKind;
   payload: Record<string, unknown>;
+  /** The saved workflow a plan runs or was saved as, and the entries written under it; absent from older servers. */
+  workflow_id?: string | null;
 }
 
 export interface JournalPage {
