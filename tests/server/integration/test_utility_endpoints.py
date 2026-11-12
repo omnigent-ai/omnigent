@@ -103,6 +103,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "workflows": False,
         "session_overview": False,
         "project_repository_creation": True,
+        "quick_pick_palette": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
