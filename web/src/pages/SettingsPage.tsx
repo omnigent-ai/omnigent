@@ -1976,7 +1976,14 @@ function TerminalClipboardControl() {
 function AdminViewControl() {
   const eligible = useSyncExternalStore(subscribeIdentity, getCurrentAdminEligibility, () => false);
   const info = useServerInfo();
-  if (!eligible || info === "loading" || info.single_user || isDatabricksWorkspace()) return null;
+  if (
+    !eligible ||
+    info === "loading" ||
+    !info.admin_view ||
+    info.single_user ||
+    isDatabricksWorkspace()
+  )
+    return null;
   return (
     <SettingsGroup title="Administration">
       <div className="flex items-center justify-between gap-4">

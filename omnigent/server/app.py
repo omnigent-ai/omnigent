@@ -342,6 +342,7 @@ class ServerInfoResponse(BaseModel):
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
+    admin_view: bool = False
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
@@ -2660,7 +2661,10 @@ def create_app(
     # outermost WS middleware — a forbidden origin is closed without even
     # reaching the metrics counter (which only counts on accept anyway).
     app.add_middleware(WebSocketOriginMiddleware)
-    if authentication_requires_identity(auth_provider) and permission_store is not None:
+    admin_view_supported = (
+        authentication_requires_identity(auth_provider) and permission_store is not None
+    )
+    if admin_view_supported:
         app.add_middleware(AdminViewMiddleware)
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
@@ -3749,6 +3753,7 @@ def create_app(
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
                 "session_title_instructions": user_settings_store is not None,
+                "admin_view": admin_view_supported,
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,

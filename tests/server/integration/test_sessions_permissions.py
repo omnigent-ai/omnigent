@@ -1160,6 +1160,7 @@ async def test_single_user_local_can_access_own_session(
     identity, which gets an owner auto-grant on sessions it creates
     — the bare `omnigent run` / local web UI flow.
     """
+    assert (await local_auth_client.get("/v1/info")).json()["admin_view"] is False
     agent = await create_test_agent(local_auth_client, user="bryan")
 
     # Omit X-Forwarded-Email to trigger the "local" fallback —
@@ -1193,6 +1194,7 @@ async def test_admin_user_bypasses_permission_checks(
     server startup behavior (the CLI calls
     ``ensure_user("local", is_admin=True)``).
     """
+    assert (await auth_client.get("/v1/info")).json()["admin_view"] is True
     agent = await create_test_agent(auth_client, user="bryan")
     s1 = await _create_session_as(auth_client, agent["id"], "user-a")
     session_id = s1["id"]

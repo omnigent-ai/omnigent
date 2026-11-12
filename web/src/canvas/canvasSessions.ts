@@ -84,7 +84,7 @@ function hasStoredSessionsForServer(): boolean {
     const prefix = `${sessionCachePrefix()}:`;
     return Array.from({ length: window.sessionStorage.length }, (_, index) =>
       window.sessionStorage.key(index),
-    ).some((key) => key?.startsWith(prefix));
+    ).some((key) => key?.startsWith(prefix) && key.endsWith(`:${isAdminViewEnabled()}`));
   } catch {
     return false;
   }

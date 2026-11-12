@@ -33,15 +33,25 @@ afterEach(() => {
 });
 
 describe("resolveIdentity", () => {
-  it.each([true, false])(
-    "preserves admin eligibility=%s while admin view is off",
-    async (eligible) => {
+  it.each([
+    [true, true],
+    [false, true],
+    [true, false],
+    [false, false],
+    [true, undefined],
+    [false, undefined],
+  ])(
+    "preserves admin eligibility=%s with admin-view support=%s while off",
+    async (eligible, supported) => {
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({ admin_view: supported }));
+      const { resolveServerInfo } = await import("./capabilities");
+      await resolveServerInfo();
       fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice", is_admin: eligible }));
       const identity = await import("./identity");
       await identity.resolveIdentity();
       document.cookie = "omnigent_admin_view=off; Path=/";
       try {
-        expect(identity.getCurrentIsAdmin()).toBe(false);
+        expect(identity.getCurrentIsAdmin()).toBe(supported ? false : eligible);
         expect(identity.getCurrentAdminEligibility()).toBe(eligible);
       } finally {
         document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";

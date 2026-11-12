@@ -517,7 +517,7 @@ export function getCurrentUserId(): string | null {
  * AND OIDC. Returns false before `resolveIdentity` completes.
  */
 export function getCurrentIsAdmin(): boolean {
-  return currentIsAdmin && isAdminViewEnabled();
+  return currentIsAdmin && (getCachedServerInfo()?.admin_view !== true || isAdminViewEnabled());
 }
 
 /** The account's role, used to keep the admin-view switch available while off. */

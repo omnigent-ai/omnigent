@@ -54,6 +54,7 @@ const mocks = vi.hoisted(() => ({
   // single_user: explicit single-user marker; false for accounts/OIDC/
   // multi-user-header. Gates the settings-route single-user redirect.
   singleUser: false,
+  adminViewSupported: true as boolean | undefined,
   sessionTitleInstructions: false,
   nestedAgents: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
@@ -84,6 +85,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    admin_view: mocks.adminViewSupported,
     sibling_sessions: mocks.nestedAgents,
     enabled_connections: mocks.enabledConnections,
     session_title_instructions: mocks.sessionTitleInstructions,
@@ -101,7 +103,9 @@ vi.mock("@/lib/accountsApi", () => ({
 }));
 vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
-  getCurrentIsAdmin: () => mocks.me?.is_admin ?? false,
+  getCurrentIsAdmin: () =>
+    (mocks.me?.is_admin ?? false) &&
+    (mocks.adminViewSupported !== true || adminView.isAdminViewEnabled()),
   getCurrentAdminEligibility: () => mocks.me?.is_admin ?? false,
   getCurrentUserId: () => mocks.me?.id ?? null,
   subscribeIdentity: () => () => {},
@@ -282,6 +286,7 @@ beforeEach(() => {
   mocks.theme = "system";
   mocks.isEmbedded = false;
   mocks.accountsEnabled = true;
+  mocks.adminViewSupported = true;
   mocks.sessionTitleInstructions = false;
   mocks.nestedAgents = false;
   mocks.importSessionsPanel.mockClear();
@@ -376,6 +381,13 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 }
 
 describe("SettingsPage", () => {
+  it.each([false, undefined])("hides admin view when server support is %s", (supported) => {
+    mocks.me = { id: "admin", is_admin: true };
+    mocks.adminViewSupported = supported;
+    renderPage("/settings/general");
+    expect(screen.queryByRole("switch", { name: "Admin view" })).toBeNull();
+  });
+
   it("keeps the admin-view switch available while admin view is off", () => {
     mocks.me = { id: "admin", is_admin: true };
     mocks.singleUser = false;
