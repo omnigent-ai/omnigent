@@ -18,6 +18,7 @@ from collections.abc import Iterator
 import pytest
 from playwright.sync_api import Page, Request, expect
 
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.auth._accounts_server import (
     ADMIN_PASSWORD,
     ADMIN_USERNAME,
@@ -74,7 +75,11 @@ def test_api_requests_report_idle_time_and_interaction_resets_it(
     page.clock.fast_forward("05:00")
     with page.expect_request(lambda r: "/v1/" in r.url, timeout=30_000):
         page.clock.fast_forward("05:00")
-    page.wait_for_timeout(1_000)
+    poll_until(
+        lambda: bool(_api_ages(seen)) and max(_api_ages(seen)) >= 600,
+        timeout_s=5,
+        interval_s=0.05,
+    )
     idle_ages = _api_ages(seen)
     assert idle_ages and max(idle_ages) >= 600, idle_ages
 
@@ -83,6 +88,10 @@ def test_api_requests_report_idle_time_and_interaction_resets_it(
     page.keyboard.press("Shift")
     with page.expect_request(lambda r: "/v1/" in r.url, timeout=30_000):
         page.clock.fast_forward("01:30")
-    page.wait_for_timeout(1_000)
+    poll_until(
+        lambda: bool(_api_ages(seen)) and max(_api_ages(seen)) <= 95,
+        timeout_s=5,
+        interval_s=0.05,
+    )
     active_ages = _api_ages(seen)
     assert active_ages and max(active_ages) <= 95, active_ages
