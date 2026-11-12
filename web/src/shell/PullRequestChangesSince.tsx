@@ -13,10 +13,10 @@ import type { PullRequestCommit } from "@/hooks/usePullRequests";
 
 const PR_BASE = "base";
 
-/** "head of #41" for a commit that is another PR's head, else null. */
+/** "Head of #41" for a commit that is another PR's head, else null. */
 export function headOfLabel(commit: PullRequestCommit): string | null {
   const numbers = (commit.head_of ?? []).map((pr) => `#${pr.number}`);
-  return numbers.length > 0 ? `head of ${numbers.join(", ")}` : null;
+  return numbers.length > 0 ? `Head of ${numbers.join(", ")}` : null;
 }
 
 export function PullRequestChangesSince({
@@ -53,7 +53,13 @@ export function PullRequestChangesSince({
               : "Since PR base"}
         </SelectValue>
       </SelectTrigger>
-      <SelectContent position="popper" align="start" className="max-h-80 max-w-sm">
+      <SelectContent
+        position="popper"
+        align="start"
+        // Fits a narrow rail; each row truncates its title instead of widening the list.
+        collisionPadding={8}
+        className="max-h-80 w-md max-w-(--radix-select-content-available-width)"
+      >
         <SelectItem value={PR_BASE}>PR base (all changes)</SelectItem>
         {loading && commits.length === 0 && (
           <div className="flex items-center gap-2 px-2 py-1.5 text-xs text-muted-foreground">
@@ -64,14 +70,21 @@ export function PullRequestChangesSince({
         {options.map((commit) => {
           const headOf = headOfLabel(commit);
           return (
-            <SelectItem key={commit.sha} value={commit.sha}>
+            <SelectItem
+              key={commit.sha}
+              value={commit.sha}
+              // The row's text box must shrink, or long titles push past the checkmark.
+              className="*:[span]:last:min-w-0 *:[span]:last:flex-1"
+            >
+              {headOf && (
+                <span className="shrink-0 rounded bg-primary px-1.5 text-xs font-medium text-primary-foreground">
+                  {headOf}
+                </span>
+              )}
               <span className="shrink-0 font-mono text-xs text-muted-foreground">
                 {commit.sha.slice(0, 7)}
               </span>
-              <span className="min-w-0 truncate">{commit.title || commit.sha}</span>
-              {headOf && (
-                <span className="shrink-0 rounded bg-muted px-1 text-xs font-medium">{headOf}</span>
-              )}
+              <span className="min-w-0 flex-1 truncate">{commit.title || commit.sha}</span>
             </SelectItem>
           );
         })}

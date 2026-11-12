@@ -1624,7 +1624,7 @@ describe("PullRequestChangesTab commits", () => {
     fireEvent.click(screen.getByRole("combobox", { name: "Changes since" }));
     // The newest commit is the head, so nothing comes after it and it isn't offered.
     expect(screen.queryByRole("option", { name: /Own work/ })).toBeNull();
-    fireEvent.click(screen.getByRole("option", { name: /Parent work.*head of #41/ }));
+    fireEvent.click(screen.getByRole("option", { name: /Head of #41.*Parent work/ }));
 
     expect(mocks.commitDiffReads.at(-1)).toEqual([SHA_A, "head"]);
     expect(isListed("b.ts")).toBe(true);
