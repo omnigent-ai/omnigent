@@ -91,6 +91,9 @@ from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
+    SessionAccess,
+)
+from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -1292,11 +1295,22 @@ def register_core_routes(
         return runner_id, launch_failed
 
     async def side_chat_allowed(
-        user_id: str | None, session_id: str, conversation: Conversation | None = None
+        user_id: str | None,
+        session_id: str,
+        conversation: Conversation | None = None,
+        access: SessionAccess | None = None,
     ) -> bool:
-        """Whether *user_id* may start side chats in a session: its root's owner only."""
+        """Whether *user_id* may start side chats in a session: its root's owner only.
+
+        *access* from this request's authorization answers a top-level session
+        without another grant read.
+        """
         if auth_provider is None or permission_store is None:
             return True
+        if user_id is not None and access is not None:
+            owner = access.owns_top_level_session(session_id)
+            if owner is not None:
+                return owner
         conv = conversation or await asyncio.to_thread(
             conversation_store.get_conversation, session_id
         )
@@ -2286,7 +2300,7 @@ def register_core_routes(
             request=request,
         )
         snapshot.side_chat_allowed = await side_chat_allowed(
-            user_id, session_id, access.conversation
+            user_id, session_id, access.conversation, access
         )
         return snapshot
 

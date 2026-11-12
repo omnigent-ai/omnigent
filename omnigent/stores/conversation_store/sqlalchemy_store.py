@@ -1355,25 +1355,46 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Fetch a conversation by its unique ID.
 
-        Issues three queries: the conversation row (which carries the agent
-        binding + per-session override blob), the Omnigent-DB metadata row, and
-        a label fetch on ``conversation_labels``. They run inside a
-        :func:`shared_read_scope` so the whole read costs one pool checkout per
-        engine — one in single-DB mode, where the metadata table would otherwise
-        force a second checkout (and, with ``pool_pre_ping``, a second network
-        round trip) for every session read in the product.
+        Issues two queries: the conversation row (which carries the agent
+        binding + per-session override blob) outer-joined to its
+        ``conversation_labels`` rows, and the Omnigent-DB metadata row. The
+        metadata may live in another database, so it is read separately rather
+        than joined. Both run inside a :func:`shared_read_scope` so the whole
+        read costs one pool checkout per engine — one in single-DB mode, where
+        the metadata table would otherwise force a second checkout (and, with
+        ``pool_pre_ping``, a second network round trip) for every session read
+        in the product.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :returns: The :class:`Conversation` if found, otherwise
             ``None``.
         """
-        with shared_read_scope(), self._conv_session("select_conversation_by_id") as session:
-            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if row is None:
+        workspace_id = current_workspace_id()
+        statement = (
+            select(SqlConversation, SqlConversationLabel.key, SqlConversationLabel.value)
+            .outerjoin(
+                SqlConversationLabel,
+                and_(
+                    SqlConversationLabel.workspace_id == SqlConversation.workspace_id,
+                    SqlConversationLabel.conversation_id == SqlConversation.id,
+                ),
+            )
+            .where(
+                SqlConversation.workspace_id == workspace_id,
+                SqlConversation.id == conversation_id,
+            )
+        )
+        with (
+            shared_read_scope(),
+            self._conv_session("select_conversation_with_labels_by_id") as session,
+        ):
+            rows = session.execute(statement).all()
+            if not rows:
                 return None
+            labels = {key: value for _, key, value in rows if key is not None}
             meta = self._get_meta(conversation_id)
-            return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
+            return _to_conversation(rows[0][0], meta, labels)
 
     def find_conversation_by_external_session_id(
         self,

@@ -9491,7 +9491,7 @@ def test_get_conversation_costs_one_checkout(
 def test_get_conversation_keeps_distinct_query_names(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """Sharing one checkout must not collapse the three reads' semantic names."""
+    """Sharing one checkout must not collapse the two reads' semantic names."""
     from omnigent.db import current_query_name
 
     created = conversation_store.create_conversation(title="named")
@@ -9518,9 +9518,8 @@ def test_get_conversation_keeps_distinct_query_names(
         event.remove(engine, "before_cursor_execute", _capture)
 
     assert names == [
-        "omnigent.conversation_store.select_conversation_by_id",
+        "omnigent.conversation_store.select_conversation_with_labels_by_id",
         "omnigent.conversation_store.select_conversation_metadata_by_id",
-        "omnigent.conversation_store.select_conversation_labels",
     ], names
 
 
