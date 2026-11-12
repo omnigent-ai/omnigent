@@ -501,7 +501,18 @@ def _plugin_install_paths(
                 continue
             # Python 3.13+ returns a dead path for a symlink loop instead of
             # raising; only an existing directory can be the plugin's install.
-            if not resolved.is_dir():
+            # On 3.12, ``is_dir`` raises for an unsearchable parent directory.
+            try:
+                is_dir = resolved.is_dir()
+            except OSError as exc:
+                _log.warning(
+                    "Skipping entry for plugin %r: installPath %r is unreadable: %s",
+                    key,
+                    path,
+                    exc,
+                )
+                continue
+            if not is_dir:
                 _log.warning(
                     "Skipping entry for plugin %r: installPath %r is not a directory", key, path
                 )
