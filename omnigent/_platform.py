@@ -28,7 +28,7 @@ from pathlib import Path
 _logger = logging.getLogger(__name__)
 
 
-# Common global install dirs for npm/homebrew CLIs, probed when a binary isn't
+# Common global install dirs for npm/Bun/homebrew CLIs, probed when a binary isn't
 # on ``PATH``. The host daemon snapshots ``PATH`` at spawn and never refreshes
 # it, so a CLI installed into an nvm/npm/homebrew bin dir that only interactive
 # shell init puts on ``PATH`` is invisible to ``shutil.which``.
@@ -38,6 +38,7 @@ def _cli_fallback_dirs() -> tuple[Path, ...]:
     Includes nvm's version-specific bin dirs (``~/.nvm/versions/node/*/bin``),
     where npm global installs land under nvm — the common driver of a CLI that
     a foreground shell sees but the daemon's frozen ``PATH`` doesn't.
+    Also probes Bun's ``$BUN_INSTALL/bin`` (``~/.bun/bin`` by default).
     """
     home = Path.home()
     dirs = [
@@ -54,6 +55,8 @@ def _cli_fallback_dirs() -> tuple[Path, ...]:
         version_dirs = [p for p in nvm_versions.iterdir() if p.is_dir()]
         version_dirs.sort(key=lambda p: _parse_node_version(p.name), reverse=True)
         dirs.extend(p / "bin" for p in version_dirs)
+    bun_install = os.environ.get("BUN_INSTALL", "").strip()
+    dirs.append((Path(bun_install).expanduser() if bun_install else home / ".bun") / "bin")
     return tuple(dirs)
 
 
