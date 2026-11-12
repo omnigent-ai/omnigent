@@ -142,6 +142,36 @@ def test_fork_drops_the_automation_source_label(
     assert SCHEDULED_TASK_SOURCE_LABEL_KEY not in fork.labels
 
 
+@pytest.mark.parametrize("closed_by", ["label", "legacy_title"])
+def test_fork_of_a_closed_child_is_open(
+    conversation_store: SqlAlchemyConversationStore,
+    closed_by: str,
+) -> None:
+    """Forking a closed child (a stopped side chat, a closed sub-agent) is how
+    the user continues it, so the fork must not inherit the seal."""
+    from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, is_session_closed
+
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title="researcher:auth"
+    )
+    if closed_by == "label":
+        conversation_store.set_labels(child.id, {CLOSED_LABEL_KEY: "true", "kept": "yes"})
+    else:
+        conversation_store.set_labels(child.id, {"kept": "yes"})
+        conversation_store.update_conversation(
+            child.id, title=f"researcher:auth:closed:{child.id}"
+        )
+
+    fork = conversation_store.fork_conversation(child.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert not is_session_closed(fork.labels, fork.title)
+    assert fork.title == "Fork of researcher:auth"
+    saved = conversation_store.get_conversation(child.id)
+    assert saved is not None and is_session_closed(saved.labels, saved.title)
+
+
 def test_fork_drops_per_repo_sandbox_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -425,6 +455,7 @@ def test_get_session_activity(
         kind="sub_agent", title="child", parent_conversation_id=a.id
     )
     conversation_store.set_session_usage(child.id, {"total_cost_usd": 5.0})
+    conversation_store.update_conversation(b.id, archived=True)
 
     statements: list[str] = []
 
@@ -454,6 +485,8 @@ def test_get_session_activity(
     assert result[b.id].live_status is None
     assert result[b.id].runner_id is None
     assert result[b.id].total_cost_usd is None
+    assert result[a.id].archived is False
+    assert result[b.id].archived is True
     assert conversation_store.get_session_activity([]) == {}
 
 
@@ -3521,6 +3554,44 @@ def test_list_conversations_filtered_by_agent_id_returns_matching_only(
     # Exactly two conversations, both owned by alpha — beta's
     # conversation must be excluded.
     assert returned_ids == {conv1.id, conv2.id}
+
+
+def test_list_conversations_agent_name_holds_one_connection_at_a_time(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+    db_uri: str,
+) -> None:
+    """
+    Filtering by agent name resolves the agent ids in their own session before
+    the listing session opens. Holding both at once would take two pooled
+    connections per request and can exhaust the pool under concurrency.
+
+    :param conversation_store: The conversation store fixture.
+    :param agent_store: The agent store fixture.
+    :param db_uri: The shared single-DB URI behind both stores.
+    """
+    gamma = agent_store.create(
+        agent_id="3c1f0e9b2a7d4c6e8f0a1b2c3d4e5f60",
+        name="gamma",
+        bundle_location="3c1f0e9b2a7d4c6e8f0a1b2c3d4e5f60/h",
+    )
+    conv = conversation_store.create_conversation(agent_id=gamma.id)
+    conversation_store.create_conversation()
+    engine = get_or_create_engine(db_uri)
+    peak_checked_out: list[int] = []
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        peak_checked_out.append(engine.pool.checkedout())
+
+    event.listen(engine, "checkout", _on_checkout)
+    try:
+        page = conversation_store.list_conversations(agent_name="gamma")
+    finally:
+        event.remove(engine, "checkout", _on_checkout)
+
+    assert {c.id for c in page.data} == {conv.id}
+    assert peak_checked_out, "the listing must check out a connection"
+    assert max(peak_checked_out) == 1
 
 
 def test_list_conversations_agent_id_none_disables_filter(

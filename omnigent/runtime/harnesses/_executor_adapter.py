@@ -33,7 +33,10 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorWait,
     InjectionDeliveryAmbiguous,
+    LiveMcpHarnessNotRunning,
+    LiveMcpServerStatus,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -1063,6 +1066,26 @@ class ExecutorAdapter(HarnessApp):
         evaluation_id = f"poleval_{secrets.token_hex(16)}"
         return await ctx.evaluate_policy(evaluation_id, phase, data)
 
+    def supports_live_mcp_control(self) -> bool:
+        """Whether the inner executor reports its MCP connections.
+
+        Before the first turn builds the executor, nothing is connected yet, so
+        the harness answers as not running rather than unsupported.
+        """
+        return self._executor is None or self._executor.supports_live_mcp_control()
+
+    async def live_mcp_statuses(self) -> list[LiveMcpServerStatus] | None:
+        """The inner executor's MCP connections for this conversation."""
+        if self._executor is None:
+            return None
+        return await self._executor.live_mcp_statuses(self._session_key)
+
+    async def reconnect_live_mcp_server(self, name: str) -> None:
+        """Reconnect one of the inner executor's MCP servers for this conversation."""
+        if self._executor is None:
+            raise LiveMcpHarnessNotRunning
+        await self._executor.reconnect_live_mcp_server(self._session_key, name)
+
     def _ensure_executor(self) -> Executor:
         """
         Construct the inner executor on first use; return cached
@@ -1076,7 +1099,10 @@ class ExecutorAdapter(HarnessApp):
 
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
         """Translate one inner ExecutorEvent into Omnigent SSE events via ``ctx.emit``."""
-        if isinstance(event, TextChunk):
+        if isinstance(event, ExecutorWait):
+            if ctx._hold_idle_watchdog is not None:
+                ctx._hold_idle_watchdog()
+        elif isinstance(event, TextChunk):
             ctx.emit(
                 OutputTextDeltaEvent(
                     type="response.output_text.delta",

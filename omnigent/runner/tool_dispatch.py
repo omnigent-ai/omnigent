@@ -91,7 +91,12 @@ from omnigent.tools.builtins.session_message import (
     SysSessionMessageTool,
     peer_session_messaging_enabled,
 )
-from omnigent.tools.builtins.session_projects import SysProjectListTool, SysSessionUpdateTool
+from omnigent.tools.builtins.session_projects import (
+    SysProjectListTool,
+    SysProjectUpdateTool,
+    SysSessionLinkPrTool,
+    SysSessionUpdateTool,
+)
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -331,8 +336,15 @@ _SESSION_QUERY_TOOLS = frozenset(
 )
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
-# Project listing and moves proxy the sidebar's owner-gated REST endpoints.
-_PROJECT_TOOLS = frozenset({SysProjectListTool.name(), SysSessionUpdateTool.name()})
+# Project and session organizing proxy the sidebar's owner-gated REST endpoints.
+_PROJECT_TOOLS = frozenset(
+    {
+        SysProjectListTool.name(),
+        SysSessionLinkPrTool.name(),
+        SysSessionUpdateTool.name(),
+        SysProjectUpdateTool.name(),
+    }
+)
 _UI_TOOLS = frozenset({UiOpenFileTool.name()})
 
 # The title bound the rename tool advertises to the LLM — read once from the
@@ -617,7 +629,9 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionRenameTool,
             SysSessionMessageTool,
             SysProjectListTool,
+            SysSessionLinkPrTool,
             SysSessionUpdateTool,
+            SysProjectUpdateTool,
             UiOpenFileTool,
             SysAgentGetTool,
             SysAgentListTool,
@@ -662,6 +676,8 @@ _RUNNER_STATUS_CONCURRENCY = 8
 # ``visibility``. The default matches the UI sidebar: an agent reasoning over
 # "its" sessions must not pick up sessions other users shared with the caller.
 _SESSION_LIST_DEFAULT_VISIBILITY = "mine"
+# Newest sessions ``sys_session_list`` returns when the agent passes no ``limit``.
+_SESSION_LIST_DEFAULT_LIMIT = 50
 _SESSION_LIST_VISIBILITIES = ("mine", "shared", "all")
 
 _DISCOVERY_LIST_MAX_LIMIT = 100
@@ -803,22 +819,27 @@ def _bounded_discovery_result(
     continued: bool,
     source_pages: dict[str, _DiscoveryPage],
     page_sections: tuple[str, ...] | None = None,
+    default_limit: int | None = None,
     tool_name: str,
     filters: _JsonObject,
 ) -> str:
-    """Keep a small legacy result intact, otherwise return a fitting page."""
+    """Keep a small legacy result intact, otherwise return a fitting page.
+
+    ``default_limit`` caps paged rows when the caller passes no ``limit``.
+    """
+    paged = page_sections or tuple(sections)
     complete = json.dumps(sections)
     if (
         limit is None
         and not continued
         and not any(page.failed for page in source_pages.values())
         and not any(page.has_more for page in source_pages.values())
+        and (default_limit is None or all(len(sections[name]) <= default_limit for name in paged))
         and len(complete) <= _DISCOVERY_LIST_OUTPUT_MAX_CHARS
     ):
         return complete
 
-    requested_limit = limit or _DISCOVERY_LIST_MAX_LIMIT
-    paged = page_sections or tuple(sections)
+    requested_limit = limit or default_limit or _DISCOVERY_LIST_MAX_LIMIT
 
     def _candidate(candidate_limit: int) -> str | None:
         page = dict(sections)
@@ -3332,6 +3353,7 @@ _SESSION_CREATE_FIELDS = (
     ("title", "title"),
     ("model", "model_override"),
     ("reasoning_effort", "reasoning_effort"),
+    ("permission_mode", "permission_mode"),
 )
 
 
@@ -3357,6 +3379,7 @@ def _build_session_create_body(
     title: object,
     model: object = None,
     reasoning_effort: object = None,
+    permission_mode: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -3381,15 +3404,94 @@ def _build_session_create_body(
         written as ``model_override`` on the session.
     :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
         written as ``reasoning_effort`` on the session.
+    :param permission_mode: Optional native permission mode, e.g.
+        ``"approve-for-me"``; the server maps it to the harness's launch args.
     :returns: The JSON request body.
     """
     return {
         "agent_id": agent_id,
         "parent_session_id": conversation_id,
         **_session_create_fields(
-            {"title": title, "model": model, "reasoning_effort": reasoning_effort}
+            {
+                "title": title,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "permission_mode": permission_mode,
+            }
         ),
     }
+
+
+def _project_argument_error(args: _JsonObject, placement: str) -> str | None:
+    """
+    Check the project a ``sys_session_create`` call names, before any request.
+
+    :param args: Parsed tool arguments; a null ``project_name`` or ``project_id`` is absent.
+    :param placement: The requested placement, e.g. ``"same_host"``.
+    :returns: A JSON error, or ``None`` when the arguments are usable.
+    """
+    project_name = args.get("project_name")
+    project_id = args.get("project_id")
+    if project_name is not None and project_id is not None:
+        return json.dumps({"error": "Provide only one of project_name or project_id"})
+    for name, value in (("project_name", project_name), ("project_id", project_id)):
+        if value is None:
+            continue
+        if placement == "child":
+            return json.dumps({"error": f"{name} requires an independent placement"})
+        if not isinstance(value, str) or not value.strip():
+            return json.dumps({"error": f"{name} must be a nonempty string"})
+    return None
+
+
+async def _add_named_project(
+    body: _JsonObject,
+    args: _JsonObject,
+    server_client: httpx.AsyncClient,
+    server_info: _JsonObject,
+    headers: dict[str, str],
+) -> str | None:
+    """
+    Add the requested project ID or resolve its name for an independent create.
+
+    Preserve explicit placement options; otherwise null out workspace and git
+    so project defaults do not change the requested placement.
+
+    :param body: The orchestrated create body to update.
+    :param args: Arguments that passed :func:`_project_argument_error`.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param server_info: The server's ``GET /v1/info`` payload.
+    :param headers: The create's headers, sent on a project create so the server checks the caller.
+    :returns: A JSON error when the project name can't be used, else ``None``.
+    """
+    project_name = args.get("project_name")
+    project_id = args.get("project_id")
+    if project_name is None and project_id is None:
+        return None
+    # An older nested server refuses another project; refuse before a project is created.
+    if (
+        server_info.get("sibling_sessions") is True
+        and server_info.get("sibling_other_project_standalone") is not True
+    ):
+        return json.dumps(
+            {
+                "error": "This server keeps nested agents in this session's project, so it "
+                "does not accept project_name; omit it. No session was created."
+            }
+        )
+    try:
+        if project_id is None:
+            project_id = await _project_id_for_name(
+                server_client, str(project_name), headers=headers
+            )
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps(
+            {"error": f"Could not resolve project_name: {type(exc).__name__}: {exc}"}
+        )
+    body["project_id"] = project_id
+    body.setdefault("workspace", None)
+    body.setdefault("git", None)
+    return None
 
 
 async def _finalize_created_session(
@@ -3567,10 +3669,36 @@ async def _execute_session_create(
             }
         )
     placement = args.get("placement", "child")
-    if placement not in ("child", "same_host", "managed"):
-        return json.dumps({"error": "placement must be child, same_host or managed"})
+    if placement not in ("child", "same_host", "host", "managed"):
+        return json.dumps({"error": "placement must be child, same_host, host or managed"})
     if placement != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
+    explicit_placement = {
+        key: args[key] for key in ("host_id", "workspace", "git") if args.get(key) is not None
+    }
+    if explicit_placement and placement != "host":
+        return json.dumps({"error": "host_id, workspace and git require placement='host'"})
+    if placement == "host":
+        if any(
+            not isinstance(args.get(key), str) or not str(args[key]).strip()
+            for key in ("host_id", "workspace")
+        ):
+            return json.dumps({"error": "placement='host' requires host_id and workspace"})
+        git = args.get("git")
+        if git is not None and (
+            not isinstance(git, dict)
+            or not isinstance(git.get("branch_name"), str)
+            or not git["branch_name"].strip()
+            or set(git) - {"branch_name", "base_branch"}
+            or (
+                "base_branch" in git
+                and (not isinstance(git["base_branch"], str) or not git["base_branch"].strip())
+            )
+        ):
+            return json.dumps({"error": "git requires branch_name and an optional base_branch"})
+    project_error = _project_argument_error(args, placement)
+    if project_error is not None:
+        return project_error
     message = args.get("message")
     profile_fields = ("sandbox_provider", "sandbox_profile_id", "sandbox_profile_revision")
     selection = {key: args[key] for key in profile_fields if args.get(key) is not None}
@@ -3583,6 +3711,13 @@ async def _execute_session_create(
     if placement != "child" and message is not None:
         if not isinstance(message, str) or not message.strip() or len(message) > 8000:
             return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
+    permission_mode = args.get("permission_mode")
+    if permission_mode is not None:
+        if not isinstance(permission_mode, str) or not permission_mode.strip():
+            return json.dumps({"error": "permission_mode must be a nonempty string"})
+        if has_config_path:
+            # A new agent's own config sets its permission mode.
+            return json.dumps({"error": "permission_mode requires agent_id"})
     if has_config_path:
         return await _session_create_from_config_path(
             str(config_path),
@@ -3599,13 +3734,15 @@ async def _execute_session_create(
         args.get("title"),
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
+        permission_mode=permission_mode,
     )
     headers: dict[str, str] = {}
     if placement != "child":
         from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 
         body.pop("parent_session_id")
-        # The server derives the same host/workspace from this bound source.
+        body.update(explicit_placement)
+        # The server validates placement against this bound source.
         headers[ORCHESTRATION_SOURCE_HEADER] = conversation_id
         if placement == "managed":
             body["host_type"] = "managed"
@@ -3629,12 +3766,44 @@ async def _execute_session_create(
     create_requested = False
     try:
         endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
-        if placement == "managed":
-            from omnigent.runner.session_requests import post_on_host
-
-            info = await server_client.get("/v1/info")
+        if placement == "host":
+            endpoint += "/host"
+        host_id = None
+        info_data: _JsonObject = {}
+        if (
+            placement in ("managed", "host")
+            or args.get("project_id") is not None
+            or args.get("project_name") is not None
+            or permission_mode is not None
+        ):
+            info = await server_client.get("/v1/info", timeout=30.0)
             info.raise_for_status()
             info_data = info.json()
+        if (placement == "host" or args.get("project_id") is not None) and info_data.get(
+            "scripted_sessions"
+        ) is not True:
+            return json.dumps(
+                {
+                    "error": "Scripted session options are unavailable on this server; "
+                    "no session was created"
+                }
+            )
+        if placement == "host":
+            host_id = str(args["host_id"])
+            unconfirmed_creation["host_id"] = host_id
+        # An older server ignores the field, so the session would quietly start in
+        # its agent's default mode instead.
+        if (
+            permission_mode is not None
+            and info_data.get("session_create_permission_modes") is not True
+        ):
+            return json.dumps(
+                {
+                    "error": "This Omnigent server can't set a new session's permission_mode; "
+                    "no session was created. Omit permission_mode to use the agent's default."
+                }
+            )
+        if placement == "managed":
             if (
                 info_data.get("sibling_sessions") is True
                 and info_data.get("sibling_session_destinations") == "current_host"
@@ -3660,12 +3829,17 @@ async def _execute_session_create(
             if host_id is not None:
                 body["host_id"] = host_id
                 unconfirmed_creation["host_id"] = host_id
-            create_requested = True
+        project_error = await _add_named_project(body, args, server_client, info_data, headers)
+        if project_error is not None:
+            return project_error
+        create_requested = True
+        if placement in ("managed", "host"):
+            from omnigent.runner.session_requests import post_on_host
+
             resp = await post_on_host(
                 server_client, endpoint, host_id=host_id, json=body, headers=headers, timeout=30.0
             )
         else:
-            create_requested = True
             resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         if placement != "child" and create_requested:
@@ -3673,7 +3847,7 @@ async def _execute_session_create(
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
     if placement != "child" and (resp.status_code >= 500 or resp.status_code in (408, 429)):
         return json.dumps(unconfirmed_creation)
-    if placement == "same_host":
+    if placement in ("same_host", "host"):
         from omnigent.runner.session_requests import is_wrong_replica
 
         # Host loss can be reported before persistence or during the later launch.
@@ -3717,8 +3891,12 @@ async def _execute_session_create(
             "status": data.get("status") or "created",
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
+            "project_id": data.get("project_id"),
+            "project_name": await _project_name_or_none(
+                _optional_string(data.get("project_id")), server_client
+            ),
         }
-        if placement == "same_host" and args.get("message"):
+        if placement in ("same_host", "host") and args.get("message"):
             from omnigent.runner.session_message import execute_message_tool
 
             initial_message = json.loads(
@@ -4865,6 +5043,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "model_override",
     "reasoning_effort",
     "permission_mode",
+    "max_cost_usd",
     "session_mode",
     "session_id",
     "workspace",
@@ -4925,18 +5104,21 @@ def _scheduled_task_url(task_id: object) -> str | None:
     return f"/v1/scheduled-tasks/{task_id.lower()}"
 
 
-async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> str:
+async def _project_id_for_name(
+    server_client: httpx.AsyncClient, name: str, *, headers: dict[str, str] | None = None
+) -> str:
     """
     Return the id of the caller's project named *name*, creating it if missing.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param name: The project name, e.g. ``"nightly triage"``.
+    :param headers: Extra headers for the create request, e.g. the orchestration source.
     :returns: The project id.
     :raises ValueError: If the name is blank or the project can't be resolved.
     """
     from omnigent.runner.session_projects import resolve_project_id
 
-    project_id, _created = await resolve_project_id(server_client, name)
+    project_id, _created = await resolve_project_id(server_client, name, headers=headers)
     return project_id
 
 
@@ -5261,6 +5443,9 @@ async def _execute_session_query_tool(
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
 
     if tool_name == "sys_session_list":
+        project = args.get("project")
+        if project is not None and not isinstance(project, str):
+            return json.dumps({"error": "project must be a project name string"})
         agent_name = args.get("agent_name")
         include_archived = args.get("include_archived") is True
         visibility = args.get("visibility", _SESSION_LIST_DEFAULT_VISIBILITY)
@@ -5277,7 +5462,7 @@ async def _execute_session_query_tool(
             args,
             tool_name,
             ("sessions",),
-            _session_list_filters(agent_name, include_archived, visibility),
+            _session_list_filters(agent_name, include_archived, visibility, project),
         )
         if isinstance(window, str):
             return window
@@ -5288,6 +5473,7 @@ async def _execute_session_query_tool(
             agent_name,
             include_archived=include_archived,
             visibility=visibility,
+            project=project,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -5346,6 +5532,26 @@ async def _host_harnesses_or_none(
     return readiness if isinstance(readiness, dict) else None
 
 
+async def _project_name_or_none(
+    project_id: str | None,
+    server_client: httpx.AsyncClient,
+) -> str | None:
+    """Return the name of the caller's project ``project_id``, best-effort."""
+    if not project_id:
+        return None
+    try:
+        resp = await server_client.get(
+            f"/v1/projects/{_route_identifier(project_id, 'Project')}", timeout=30.0
+        )
+        if resp.status_code != 200:
+            _logger.debug("Project %s name read returned HTTP %s", project_id, resp.status_code)
+            return None
+        return _optional_string(resp.json().get("name"))
+    except Exception:
+        _logger.debug("Project %s name read failed", project_id, exc_info=True)
+        return None
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
@@ -5359,13 +5565,14 @@ async def _session_get_info_via_rest(
     snapshot, and projects the metadata fields — status, title, agent
     binding, runner binding, host and its reported harness readiness,
     reasoning effort, effective model,
-    parent linkage, workspace / git branch, persisted last-activity time,
-    and the outstanding approval prompts (the prompts themselves plus a
+    parent linkage, workspace / git branch, project, persisted last-activity
+    time, and the outstanding approval prompts (the prompts themselves plus a
     count). Runner connectivity
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
     the lookup fails or no runner is bound); host readiness is likewise
-    best-effort via ``GET /v1/hosts/{id}``. The full transcript is
+    best-effort via ``GET /v1/hosts/{id}``, and the project name via
+    ``GET /v1/projects/{id}``. The full transcript is
     intentionally omitted — that is what ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
@@ -5403,9 +5610,10 @@ async def _session_get_info_via_rest(
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
     snap_host_id = _optional_string(snap.get("host_id"))
-    runner_online, configured_harnesses = await asyncio.gather(
+    runner_online, configured_harnesses, project_name = await asyncio.gather(
         _runner_online_or_none(snap_runner_id, server_client),
         _host_harnesses_or_none(snap_host_id, server_client),
+        _project_name_or_none(_optional_string(snap.get("project_id")), server_client),
     )
     return json.dumps(
         {
@@ -5439,6 +5647,8 @@ async def _session_get_info_via_rest(
             "model": snap.get("model_override") or snap.get("llm_model"),
             "workspace": snap.get("workspace"),
             "git_branch": snap.get("git_branch"),
+            "project_id": snap.get("project_id"),
+            "project_name": project_name,
             # The outstanding approval prompts themselves (original
             # elicitation-request event dicts), plus a count for quick
             # status checks. Surfacing the prompts — not just a tally —
@@ -6217,6 +6427,7 @@ def _session_list_filters(
     agent_name: object,
     include_archived: bool,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
+    project: str | None = None,
 ) -> _JsonObject:
     """
     The ``sys_session_list`` filters a continuation cursor is bound to.
@@ -6237,6 +6448,8 @@ def _session_list_filters(
         filters["include_archived"] = True
     if visibility != _SESSION_LIST_DEFAULT_VISIBILITY:
         filters["visibility"] = visibility
+    if project is not None:
+        filters["project"] = project
     return filters
 
 
@@ -6247,6 +6460,7 @@ async def _session_list_via_rest(
     *,
     include_archived: bool = False,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
+    project: str | None = None,
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -6271,11 +6485,12 @@ async def _session_list_via_rest(
     :param include_archived: Also list archived sessions in the global view.
     :param visibility: ``"mine"``, ``"shared"`` or ``"all"`` — the server's
         ownership filter for the global view.
-    :param limit: Optional maximum rows returned from the global sessions view. When
-        omitted, the complete legacy result is preserved while it fits.
+    :param limit: Optional maximum rows returned from the global sessions view;
+        :data:`_SESSION_LIST_DEFAULT_LIMIT` when omitted.
     :param cursor_state: Opaque continuation position for the global sessions view.
-    :returns: The legacy complete JSON result while it fits, otherwise a
-        bounded page with continuation metadata.
+    :returns: The complete JSON result when no ``limit`` was given and at most
+        :data:`_SESSION_LIST_DEFAULT_LIMIT` sessions exist, otherwise a bounded
+        page with continuation metadata.
     """
     sub_agents = await _collect_sub_agents(conversation_id, server_client)
     sessions_page = (
@@ -6286,8 +6501,9 @@ async def _session_list_via_rest(
             agent_name,
             include_archived=include_archived,
             visibility=visibility,
+            project=project,
             after=cursor_state["sessions"][1],
-            limit=limit or _AGENT_LIST_PAGE_LIMIT,
+            limit=limit or _SESSION_LIST_DEFAULT_LIMIT,
         )
     )
     result = _bounded_discovery_result(
@@ -6296,9 +6512,10 @@ async def _session_list_via_rest(
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters=_session_list_filters(agent_name, include_archived, visibility),
+        filters=_session_list_filters(agent_name, include_archived, visibility, project),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
+        default_limit=_SESSION_LIST_DEFAULT_LIMIT,
     )
     return await _fill_returned_runner_online(result, server_client)
 
@@ -6307,11 +6524,12 @@ async def _fill_returned_runner_online(result: str, server_client: httpx.AsyncCl
     """
     Resolve ``runner_online`` for the session rows the tool actually returns.
 
-    The global view fetches up to :data:`_AGENT_LIST_PAGE_LIMIT` sessions but
-    the output budget usually keeps far fewer, so resolving before paging
-    fired one status call per runner across the whole fetch. Rows are sized
-    with the :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER`, the widest value, so
-    the chosen page stays within the budget once real values replace it.
+    The global view can fetch more sessions than the output budget keeps
+    (an older server's archive fallback fetches :data:`_AGENT_LIST_PAGE_LIMIT`),
+    so resolving before paging fired one status call per runner across the
+    whole fetch. Rows are sized with the :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER`,
+    the widest value, so the chosen page stays within the budget once real
+    values replace it.
 
     :param result: Serialized ``sys_session_list`` result from
         :func:`_bounded_discovery_result`.
@@ -6550,6 +6768,7 @@ async def _collect_global_sessions(
     *,
     include_archived: bool = False,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
+    project: str | None = None,
     after: str | None,
     limit: int,
 ) -> _DiscoveryPage:
@@ -6604,6 +6823,8 @@ async def _collect_global_sessions(
         "order": "desc",
         "visibility": server_visibility,
     }
+    if project is not None:
+        params["project"] = project
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if include_archived:
@@ -7252,17 +7473,22 @@ async def execute_tool(
             from omnigent.runner.session_message import execute_message_tool
 
             output = await execute_message_tool(args, server_client, conversation_id)
+        elif tool_name == SysSessionLinkPrTool.name():
+            from omnigent.runner.session_link_pr import execute_link_pr_tool
+
+            output = await execute_link_pr_tool(args, server_client, conversation_id)
         elif tool_name in _PROJECT_TOOLS:
             from omnigent.runner.session_projects import (
                 execute_project_list,
+                execute_project_update,
                 execute_session_update,
             )
 
-            execute = (
-                execute_project_list
-                if tool_name == SysProjectListTool.name()
-                else execute_session_update
-            )
+            execute = {
+                SysProjectListTool.name(): execute_project_list,
+                SysSessionUpdateTool.name(): execute_session_update,
+                SysProjectUpdateTool.name(): execute_project_update,
+            }[tool_name]
             output = await execute(args, server_client, conversation_id)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(

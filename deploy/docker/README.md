@@ -320,7 +320,9 @@ If your trusted enterprise directory omits `email_verified`, the existing
 these compatibility options never enable it automatically. Likewise, if CLI or
 device sign-in fails with "IdP did not confirm re-authentication" because the
 IdP omits `auth_time` (for example, Cloudflare Access), opt out with
-`OMNIGENT_OIDC_REQUIRE_REAUTH=0`; see `.env.example` for the trade-off.
+`OMNIGENT_OIDC_REQUIRE_REAUTH=0`; see `.env.example` for the trade-off. If the
+IdP fails the sign-in itself when asked to re-authenticate (for example,
+self-managed GitLab), also set `OMNIGENT_OIDC_REAUTH_PROMPT=0`.
 
 ### Forced re-authentication window
 

@@ -27,6 +27,7 @@ beforeEach(() => {
   vi.mocked(getCurrentUserId).mockReturnValue("alice");
 });
 afterEach(() => {
+  document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
@@ -47,12 +48,13 @@ it("does not restore Fusion configurations as selectable model IDs", () => {
   expect(readModelCatalogCache(key())?.models).toEqual(models);
 });
 
-it.each(["server", "user", "target", "kind", "harness", "agent"])(
+it.each(["server", "user", "target", "kind", "harness", "agent", "view"])(
   "isolates catalogs by %s",
   (dimension) => {
     writeModelCatalogCache(key(), models, true);
     if (dimension === "server") vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-b");
     if (dimension === "user") vi.mocked(getCurrentUserId).mockReturnValue("bob");
+    if (dimension === "view") document.cookie = "omnigent_admin_view=off; Path=/";
     const other = modelCatalogCacheKey(
       dimension === "kind" ? "host" : "sandbox",
       dimension === "target" ? "other-provider" : "company",
@@ -150,6 +152,11 @@ it("keeps session catalogs apart from previews and other agents, for a week", ()
   const now = Date.now();
   const sessionKey = sandboxSessionCatalogKey("company", "codex-native", "ag_1");
   writeModelCatalogCache(sessionKey, models, false);
+  document.cookie = "omnigent_admin_view=off; Path=/";
+  expect(
+    readModelCatalogCache(sandboxSessionCatalogKey("company", "codex-native", "ag_1")),
+  ).toBeNull();
+  document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
   expect(readModelCatalogCache(key())).toBeNull();
   expect(
     readModelCatalogCache(sandboxSessionCatalogKey("company", "claude-native", "ag_1")),
