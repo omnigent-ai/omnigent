@@ -570,7 +570,7 @@ def test_signal_preserves_runner_identity(
 @pytest.mark.parametrize(
     "method, expected_signal", [("terminate", signal.SIGTERM), ("kill", signal.SIGKILL)]
 )
-@pytest.mark.parametrize("failure", [None, psutil.NoSuchProcess, psutil.AccessDenied])
+@pytest.mark.parametrize("failure", [None, psutil.NoSuchProcess, psutil.AccessDenied, OSError])
 def test_signal_uses_captured_process_without_control_exchange(
     monkeypatch: pytest.MonkeyPatch, method: str, expected_signal: int, failure: type | None
 ) -> None:

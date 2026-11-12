@@ -161,7 +161,7 @@ class ZygoteRunnerProc:
         process = self._process
         if self.returncode is not None or process is None:
             return
-        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             process.send_signal(sig)
 
 

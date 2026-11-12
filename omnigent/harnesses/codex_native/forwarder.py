@@ -3484,6 +3484,7 @@ async def _replay_resume_response(
             thread_id=thread_id,
             turns=turns,
             forwarder_state=forwarder_state,
+            replay_from_turn_id=replay_from_turn_id,
         )
 
 
@@ -3509,6 +3510,7 @@ async def _post_resume_turn_status(
     thread_id: str | None,
     turns: list[object],
     forwarder_state: _CodexForwarderState | None = None,
+    replay_from_turn_id: str | None = None,
 ) -> None:
     """
     Publish a missed lifecycle edge from explicit ``thread/resume`` turn state.
@@ -3526,11 +3528,14 @@ async def _post_resume_turn_status(
     :param turns: Raw Codex resume turn list.
     :param forwarder_state: Mutable forwarder state holding the turns whose
         failure was already posted, or ``None``.
+    :param replay_from_turn_id: Persisted turn this subscription is recovering.
     :returns: None.
     """
     if thread_id is None:
         return
-    edge = _resume_turn_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
+    edge = _resume_turn_status_edge_for_latest_turn(
+        bridge_dir, thread_id, turns, replay_from_turn_id=replay_from_turn_id
+    )
     if (
         edge is not None
         and _turn_failure_already_posted(forwarder_state, edge.turn_id)
@@ -3548,6 +3553,8 @@ def _resume_turn_status_edge_for_latest_turn(
     bridge_dir: Path,
     thread_id: str,
     turns: list[object],
+    *,
+    replay_from_turn_id: str | None = None,
 ) -> _CodexTurnStatusEdge | None:
     """
     Return the Omnigent status represented by the latest resume turn.
@@ -3556,6 +3563,7 @@ def _resume_turn_status_edge_for_latest_turn(
     :param thread_id: Codex thread id from the resume payload, e.g.
         ``"thread_123"``.
     :param turns: Raw Codex resume turn list.
+    :param replay_from_turn_id: Persisted turn eligible for terminal idle backfill.
     :returns: Status edge when the latest turn has explicit lifecycle state and
         belongs to the bridge's current thread; otherwise ``None``.
     """
@@ -3572,6 +3580,10 @@ def _resume_turn_status_edge_for_latest_turn(
             return None
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
+            return None
+        # Fresh resume snapshots can report a just-started turn as terminal.
+        # Only the matching recovery turn can settle through idle backfill.
+        if status == "idle" and turn_id != replay_from_turn_id:
             return None
         update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
@@ -5215,41 +5227,62 @@ async def _handle_terminal_turn_boundary_inner(
         params,
         forwarder_state=forwarder_state,
     )
-    with _turn_status_publication_scope(session_id, terminal.edge, phase="before_status"):
-        if delta_coalescer is not None:
-            await delta_coalescer.flush()
-        # Safety net: if a compaction was reported in progress but Codex never
-        # emitted a completion signal we recognize (e.g. a protocol-spelling
-        # drift), force the spinner closed at the turn boundary so it can't hang.
-        if (
-            forwarder_state is not None
-            and forwarder_state.compaction_status_posted == "in_progress"
-        ):
-            await _post_compaction_status(
-                client, session_id, "completed", forwarder_state=forwarder_state
+    prepared_bridge = (
+        read_bridge_state(bridge_dir)
+        if bridge_dir is not None and terminal.edge is not None
+        else None
+    )
+    preparation_error: Exception | None = None
+    try:
+        with _turn_status_publication_scope(session_id, terminal.edge, phase="before_status"):
+            if delta_coalescer is not None:
+                await delta_coalescer.flush()
+            # Safety net: if a compaction was reported in progress but Codex never
+            # emitted a completion signal we recognize (e.g. a protocol-spelling
+            # drift), force the spinner closed at the turn boundary so it can't hang.
+            if (
+                forwarder_state is not None
+                and forwarder_state.compaction_status_posted == "in_progress"
+            ):
+                await _post_compaction_status(
+                    client, session_id, "completed", forwarder_state=forwarder_state
+                )
+            await _maybe_persist_interrupted_partial_text(
+                client,
+                session_id=session_id,
+                method=method,
+                params=params,
+                forwarder_state=forwarder_state,
             )
-        await _maybe_persist_interrupted_partial_text(
-            client,
-            session_id=session_id,
-            method=method,
-            params=params,
-            forwarder_state=forwarder_state,
-        )
-        await _flush_turn_diff(
-            client,
-            session_id=session_id,
-            params=params,
-            forwarder_state=forwarder_state,
-        )
+            await _flush_turn_diff(
+                client,
+                session_id=session_id,
+                params=params,
+                forwarder_state=forwarder_state,
+            )
+    except Exception as exc:  # noqa: BLE001 -- re-raised after publishing the native outcome.
+        preparation_error = exc
+    if preparation_error is not None and bridge_dir is not None:
+        if prepared_bridge is None or read_bridge_state(bridge_dir) != prepared_bridge:
+            raise preparation_error
     terminal_turn_id = _terminal_turn_id_from_params(params)
     if forwarder_state is not None and terminal_turn_id is not None:
         forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
-    if terminal.edge is not None:
-        await _post_turn_status_edge(client, session_id, terminal.edge)
-        if forwarder_state is not None and terminal.edge.status == "failed":
-            forwarder_state.turn_failure_surfaced = True
-            await forwarder_state.forget_posted_terminals()
+    # A failed output flush must not discard the native turn's known outcome.
+    # Keep this post in the current handler, preserving native event order.
+    try:
+        if terminal.edge is not None:
+            await _post_turn_status_edge(client, session_id, terminal.edge)
+            if forwarder_state is not None and terminal.edge.status == "failed":
+                forwarder_state.turn_failure_surfaced = True
+                await forwarder_state.forget_posted_terminals()
+    except Exception:
+        if preparation_error is not None:
+            raise preparation_error from preparation_error.__cause__
+        raise
+    if preparation_error is not None:
+        raise preparation_error
     terminal_thread_id = _thread_id_from_params(params)
     if (
         handled

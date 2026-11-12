@@ -6570,6 +6570,11 @@
             "title": "Managed Sandboxes Enabled",
             "type": "boolean"
           },
+          "move_to_managed_sandbox": {
+            "default": false,
+            "title": "Move To Managed Sandbox",
+            "type": "boolean"
+          },
           "needs_setup": {
             "title": "Needs Setup",
             "type": "boolean"
@@ -6714,6 +6719,11 @@
             "title": "Session Move Source Checks",
             "type": "boolean"
           },
+          "session_organize_source_checks": {
+            "default": false,
+            "title": "Session Organize Source Checks",
+            "type": "boolean"
+          },
           "session_pull_requests": {
             "default": false,
             "title": "Session Pull Requests",
@@ -6738,6 +6748,11 @@
             ],
             "title": "Sharing Mode",
             "type": "string"
+          },
+          "sibling_other_project_standalone": {
+            "default": false,
+            "title": "Sibling Other Project Standalone",
+            "type": "boolean"
           },
           "sibling_session_destinations": {
             "default": "any_host",
@@ -8889,6 +8904,50 @@
           "live"
         ],
         "title": "SessionLiveMCPServers",
+        "type": "object"
+      },
+      "SessionManagedHostRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /v1/sessions/{session_id}/managed-host`.\n\nMoves an existing session onto a new server-provisioned sandbox \u2014 the\nsandbox counterpart of `POST /v1/hosts/{host_id}/runners`, which\nbinds a connected host. The fields mean what they do on a managed fork.",
+        "properties": {
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Id for the new sandbox host, 32 lowercase hex characters, sent only when `GET /v1/info` reports `request_managed_sandbox_host_id`; `None` lets the server mint one.",
+            "title": "Host Id"
+          },
+          "sandbox_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which configured sandbox provider to provision (one of the server's `sandbox_providers`); `None` takes the server's first.",
+            "title": "Sandbox Provider"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Git repository URL (optionally `#<branch>`) cloned into the sandbox as the session's working directory, e.g. `\"https://github.com/org/repo#main\"`; `None` gives the session an empty sandbox.",
+            "title": "Workspace"
+          }
+        },
+        "title": "SessionManagedHostRequest",
         "type": "object"
       },
       "SessionMcpStartupEvent": {
@@ -18965,6 +19024,60 @@
         "summary": "Reconnect Live Mcp Server",
         "tags": [
           "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/managed-host": {
+      "post": {
+        "description": "Move an existing session onto a new server-provisioned sandbox.\n\nThe sandbox counterpart of `POST /v1/hosts/{host_id}/runners`: the\ncaller first releases the session's runner (`PATCH` with\n`runner_id: \"\"`), then this claims the session's runner, registers\nthe background launch a managed create does, and only then drops the\nold host binding. It returns before the sandbox exists. Until the new\nhost binds, the claim keeps any other host from taking the session and\na message sent meanwhile waits for the launch rather than relaunching\non the old host.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionManagedHostRequest`.\n\n**Returns:** The session snapshot, with `host_id` and `workspace` null and `sandbox_status` reporting the launch.\n\n**Raises**\n\n- `OmnigentError` \u2014 403/404 unless the caller owns the session; 400 for a sub-agent or side chat, a session with no agent, one already on a sandbox, or a sandbox this server has not configured; 409 while a runner is bound, for a session with no host (such as one already moving), if the binding changed during the move, or if `body.host_id` is taken.",
+        "operationId": "move_session_to_managed_host_v1_sessions__session_id__managed_host_post",
+        "parameters": [
+          {
+            "description": "Session to move, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionManagedHostRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Move Session To Managed Host",
+        "tags": [
+          "sessions"
         ]
       }
     },

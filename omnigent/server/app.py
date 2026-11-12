@@ -320,6 +320,9 @@ class ServerInfoResponse(BaseModel):
     # A multipart create's metadata accepts ``model_override``; older servers
     # reject it.
     session_bundle_model_override: bool = True
+    # POST /v1/sessions/{id}/managed-host moves a session onto a new sandbox;
+    # absent on older servers, which clients treat as unsupported.
+    move_to_managed_sandbox: bool = False
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
@@ -347,6 +350,12 @@ class ServerInfoResponse(BaseModel):
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
+    # Every other agent-tool organizing write checks it too: session title, pin
+    # and archive, and project rename, icon and delete.
+    session_organize_source_checks: bool = False
+    # An agent's create that names a project other than its source's project makes a
+    # standalone session; older servers refuse it while sibling sessions are on.
+    sibling_other_project_standalone: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -3727,6 +3736,7 @@ def create_app(
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,
+                "move_to_managed_sandbox": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
@@ -3743,6 +3753,8 @@ def create_app(
                 "scheduled_task_projects": project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
                 "session_move_source_checks": True,
+                "session_organize_source_checks": True,
+                "sibling_other_project_standalone": True,
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
