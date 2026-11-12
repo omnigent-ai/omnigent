@@ -530,8 +530,9 @@ def test_non_signer_egress_setup_rolls_back_before_return(
     assert not egress_tmpdir.exists()
 
 
-def test_brokered_gateway_command_source_is_rejected_before_worker_start(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("brokered_gateway", [True, False])
+def test_worker_rejects_unsupported_credentials_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, brokered_gateway: bool
 ) -> None:
     marker = tmp_path / "command-ran"
     binding = CredentialProxyEntry(
@@ -544,16 +545,21 @@ def test_brokered_gateway_command_source_is_rejected_before_worker_start(
     start_proxy = Mock()
     create_launcher = Mock()
     create_tmpdir = Mock()
+    resolve_policy = Mock(return_value=_active_policy(tmp_path))
 
-    monkeypatch.setattr(
-        "omnigent.inner.codex_worker.resolve_sandbox", lambda *_: _active_policy(tmp_path)
-    )
+    monkeypatch.setattr("omnigent.inner.codex_worker.resolve_sandbox", resolve_policy)
     monkeypatch.setattr("omnigent.inner.codex_worker.create_private_tmpdir", create_tmpdir)
     monkeypatch.setattr("omnigent.inner.codex_worker.start_egress_proxy", start_proxy)
     monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
-    worker_env = {"PATH": os.environ["PATH"], BROKERED_CODEX_ENV: "1"}
+    worker_env = {"PATH": os.environ["PATH"]}
+    if brokered_gateway:
+        worker_env[BROKERED_CODEX_ENV] = "1"
+    original_env = dict(worker_env)
 
-    with pytest.raises(ValueError, match="renewable file/socket source"):
+    with pytest.raises(
+        ValueError,
+        match="renewable file/socket source" if brokered_gateway else "credential_proxy",
+    ):
         prepare_codex_worker(
             codex_path=str(tmp_path / "codex"),
             cwd=tmp_path,
@@ -569,7 +575,9 @@ def test_brokered_gateway_command_source_is_rejected_before_worker_start(
             worker_env=worker_env,
         )
 
-    assert worker_env == {"PATH": os.environ["PATH"], BROKERED_CODEX_ENV: "1"}
+    assert worker_env == original_env
+    if not brokered_gateway:
+        resolve_policy.assert_not_called()
     start_proxy.assert_not_called()
     create_launcher.assert_not_called()
     create_tmpdir.assert_not_called()

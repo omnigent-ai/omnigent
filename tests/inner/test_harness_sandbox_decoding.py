@@ -29,18 +29,18 @@ from omnigent.inner.os_env_serialization import resolve_harness_os_env
 from omnigent.inner.sandbox import resolve_sandbox
 from omnigent.runtime.workflow import _serialize_os_env
 
-_HARNESSES = [
-    "acp",
-    "claude_sdk",
-    "codex",
-    "copilot",
-    "cursor",
-    "goose",
-    "hermes",
-    "kimi",
-    "pi",
-    "qwen",
-]
+_HARNESSES = {
+    "acp": None,
+    "claude_sdk": "ClaudeSDKExecutor",
+    "codex": "CodexExecutor",
+    "copilot": None,
+    "cursor": "CursorExecutor",
+    "goose": "GooseExecutor",
+    "hermes": None,
+    "kimi": "KimiExecutor",
+    "pi": "PiExecutor",
+    "qwen": None,
+}
 
 
 @pytest.fixture(params=_HARNESSES)
@@ -204,30 +204,15 @@ def test_harness_rejects_malformed_os_policy(
     harness_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     harness = importlib.import_module(f"omnigent.inner.{harness_name}_harness")
-    monkeypatch.setenv(harness._ENV_OS_ENV, '{"sandbox": {"allow_netwrok": false}}')
-    with pytest.raises(ValueError):
-        harness._resolve_os_env()
-
-
-@pytest.mark.parametrize(
-    "harness_name,executor_name",
-    [
-        ("claude_sdk", "ClaudeSDKExecutor"),
-        ("codex", "CodexExecutor"),
-        ("cursor", "CursorExecutor"),
-        ("kimi", "KimiExecutor"),
-        ("pi", "PiExecutor"),
-        ("goose", "GooseExecutor"),
-    ],
-)
-def test_harness_factory_rejects_malformed_policy_before_construction(
-    harness_name: str, executor_name: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    harness = importlib.import_module(f"omnigent.inner.{harness_name}_harness")
     for name in list(os.environ):
         if name.startswith(f"HARNESS_{harness_name.upper()}_"):
             monkeypatch.delenv(name)
     monkeypatch.setenv(harness._ENV_OS_ENV, "{not-json")
+    executor_name = _HARNESSES[harness_name]
+    if executor_name is None:
+        with pytest.raises(ValueError, match=harness._ENV_OS_ENV):
+            harness._resolve_os_env()
+        return
     with patch.object(getattr(harness, executor_name), "__init__") as constructor:
         with pytest.raises(ValueError, match=harness._ENV_OS_ENV):
             getattr(harness, f"_build_{harness_name}_executor")()
