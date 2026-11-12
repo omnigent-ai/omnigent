@@ -105,7 +105,7 @@ from omnigent.runner.mcp_execution_registry import (
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
@@ -8928,14 +8928,18 @@ async def _settle_orphaned_running_rows(
         # reconnecting runners within grace survive.
         if result is None or result.runner_online:
             continue
-        if result.host_online is False and conv.host_id is not None:
+        # A hostless sub-agent shares its parent's runner, so the hold is the tunnel host's.
+        host_id = conv.host_id or await asyncio.to_thread(
+            routing_host_id, conv, conversation_store
+        )
+        if host_id is not None and result.host_online is not True:
             # A sleeping host can resume its runner; a read must not end that
             # bounded wait on another replica.
-            if conv.host_id not in offline_hosts:
-                offline_hosts[conv.host_id] = await _host_row_offline(
-                    host_store, conv.host_id, updated_since=hold_stale_before
+            if host_id not in offline_hosts:
+                offline_hosts[host_id] = await _host_row_offline(
+                    host_store, host_id, updated_since=hold_stale_before
                 )
-            if offline_hosts[conv.host_id] is not False:
+            if offline_hosts[host_id] is not False:
                 continue
         await asyncio.to_thread(
             reconcile_orphaned_running_status,
