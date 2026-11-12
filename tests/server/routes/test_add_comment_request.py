@@ -8,6 +8,8 @@ that any relaxation or tightening of the validator surfaces immediately.
 
 from __future__ import annotations
 
+import random
+
 import pytest
 from pydantic import ValidationError
 
@@ -81,12 +83,19 @@ def test_add_comment_request_rejects_end_index_before_start_index() -> None:
 
 
 @pytest.mark.parametrize("side,line,start", [("LEFT", 9, 7), ("RIGHT", 1, None)])
-def test_pr_comment_anchor(side: str, line: int, start: int | None) -> None:
+@pytest.mark.parametrize(
+    "pr_url",
+    [
+        "https://github.com/acme/app/pull/1",
+        pytest.param("https://example.test/pull/" + "a" * 3000, id="compressible-url"),
+    ],
+)
+def test_pr_comment_anchor(side: str, line: int, start: int | None, pr_url: str) -> None:
     """PR coordinates survive validation independently of file offsets."""
     request = AddCommentRequest(
         **_valid_kwargs(
             anchor_metadata={
-                "pr_url": "https://github.com/acme/app/pull/1",
+                "pr_url": pr_url,
                 "side": side,
                 "line": line,
                 "start_line": start,
@@ -109,6 +118,10 @@ def test_pr_comment_anchor(side: str, line: int, start: int | None) -> None:
         {"head_sha": ""},
         {"base_sha": "not-a-sha"},
         {"pr_url": "x" * 4097},
+        pytest.param(
+            {"pr_url": "https://example.test/pull/" + random.Random(0).randbytes(1500).hex()},
+            id="incompressible-url",
+        ),
     ],
 )
 def test_invalid_pr_comment_anchor(override: dict) -> None:

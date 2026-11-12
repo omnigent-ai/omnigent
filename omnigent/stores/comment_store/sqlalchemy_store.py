@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import asdict
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -19,7 +18,11 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Comment, CommentsFingerprint
 from omnigent.entities.comment import PullRequestCommentAnchor
-from omnigent.stores.comment_store import MAX_COMMENT_PAGE_SIZE, CommentStore
+from omnigent.stores.comment_store import (
+    MAX_COMMENT_PAGE_SIZE,
+    CommentStore,
+    serialize_comment_anchor,
+)
 
 
 def _to_entity(row: SqlComment) -> Comment:
@@ -100,6 +103,7 @@ class SqlAlchemyCommentStore(CommentStore):
         # backfill (created_at * 1e6) and docs rely on.
         created_us = now_epoch_us()
         comment_id = uuid.uuid4().hex
+        serialized_anchor = serialize_comment_anchor(anchor_metadata)
 
         def write(session: Session) -> Comment:
             row = SqlComment(
@@ -114,7 +118,7 @@ class SqlAlchemyCommentStore(CommentStore):
                 updated_at=created_us,
                 anchor_content=anchor_content,
                 created_by=created_by,
-                anchor_metadata=json.dumps(asdict(anchor_metadata)) if anchor_metadata else None,
+                anchor_metadata=serialized_anchor,
             )
             session.add(row)
             return _to_entity(row)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 
 import httpx
 import pytest
@@ -263,6 +264,21 @@ async def test_local_pr_comment_round_trip(client: httpx.AsyncClient, session_id
         "head_sha": "a" * 40,
         "base_sha": "b" * 40,
     }
+    oversized_anchor = {
+        **anchor,
+        "pr_url": "https://example.test/pull/" + random.Random(0).randbytes(1500).hex(),
+    }
+    rejected = await client.post(
+        f"/v1/sessions/{session_id}/comments",
+        json=_comment_payload(anchor_metadata=oversized_anchor, start_index=0, end_index=0),
+    )
+    assert rejected.status_code == 422
+    assert "storage limit" in rejected.text
+    empty = await client.get(
+        f"/v1/sessions/{session_id}/comments", params={"include_pr_comments": "true"}
+    )
+    assert empty.status_code == 200
+    assert empty.json()["comments"] == []
     response = await client.post(
         f"/v1/sessions/{session_id}/comments",
         json=_comment_payload(anchor_metadata=anchor, start_index=0, end_index=0),

@@ -11,7 +11,7 @@ from dataclasses import asdict
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from omnigent.db.enum_codecs import COMMENT_STATUS
 from omnigent.entities import Comment
@@ -25,7 +25,11 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found
 from omnigent.stores import ConversationStore
-from omnigent.stores.comment_store import MAX_COMMENT_PAGE_SIZE, CommentStore
+from omnigent.stores.comment_store import (
+    MAX_COMMENT_PAGE_SIZE,
+    CommentStore,
+    serialize_comment_anchor,
+)
 from omnigent.stores.permission_store import PermissionStore
 
 
@@ -86,6 +90,15 @@ class AddCommentRequest(BaseModel):
     end_index: int
     anchor_content: str | None = None
     anchor_metadata: PullRequestCommentAnchor | None = None
+
+    @field_validator("anchor_metadata")
+    @classmethod
+    def _validate_anchor_storage_size(
+        cls, anchor: PullRequestCommentAnchor | None
+    ) -> PullRequestCommentAnchor | None:
+        """Reject anchors that cannot fit the persisted column with a validation error."""
+        serialize_comment_anchor(anchor)
+        return anchor
 
     @model_validator(mode="after")
     def _validate_range(self) -> AddCommentRequest:

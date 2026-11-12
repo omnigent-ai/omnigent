@@ -1,11 +1,24 @@
 """Comments store: manages per-review comments for a conversation."""
 
+import json
 from abc import ABC, abstractmethod
+from dataclasses import asdict
 
+from omnigent.db.compression import encode
 from omnigent.entities import Comment, CommentsFingerprint
-from omnigent.entities.comment import PullRequestCommentAnchor
+from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES, PullRequestCommentAnchor
 
 MAX_COMMENT_PAGE_SIZE = 100
+
+
+def serialize_comment_anchor(anchor: PullRequestCommentAnchor | None) -> str | None:
+    """Serialize coordinates and validate their framed storage size before writing."""
+    if anchor is None:
+        return None
+    payload = json.dumps(asdict(anchor))
+    if len(encode(payload) or b"") > COMMENT_ANCHOR_MAX_STORED_BYTES:
+        raise ValueError("PR comment anchor exceeds the 1,024-byte storage limit")
+    return payload
 
 
 class CommentStore(ABC):
