@@ -584,7 +584,7 @@ def _complete_browser_login(
         click.echo("  → Opening the OAuth URL in your browser. If it doesn't open, visit:")
         click.echo(f"    {url}")
         click.echo(
-            "  → On a headless host (Arca)? Forward the callback port to your "
+            "  → On a headless host? Forward the callback port to your "
             f"laptop too: `ssh -L {port}:localhost:{port} -N <this-host>`."
         )
         webbrowser.open(url)

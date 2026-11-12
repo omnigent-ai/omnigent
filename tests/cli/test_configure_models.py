@@ -2670,14 +2670,14 @@ def test_credential_label_cli_config_uses_provider_name() -> None:
     """A cli-config credential labels from the provider entry name.
 
     The display_name is ignored so cli-config providers show consistently
-    alongside other kinds (e.g. isaac-databricks-codex → Isaac-Databricks-Codex).
+    alongside other kinds (e.g. gateway-databricks-codex → Gateway-Databricks-Codex).
     """
     from omnigent.onboarding.configure_models import credential_label
 
     label = credential_label(
-        "cli-config", "isaac-databricks-codex", display_name="Databricks Unity Gateway"
+        "cli-config", "gateway-databricks-codex", display_name="Databricks Unity Gateway"
     )
-    assert label == "Isaac-Databricks-Codex"
+    assert label == "Gateway-Databricks-Codex"
 
 
 def test_credential_label_cli_config_falls_back_to_entry_name() -> None:
@@ -2730,7 +2730,7 @@ command = "jq"
 
 
 def _write_codex_config_toml(home) -> None:
-    """Write an isaac-style ``~/.codex/config.toml`` under the test HOME.
+    """Write a gateway ``~/.codex/config.toml`` under the test HOME.
 
     :param home: The tmp HOME directory (the ``isolated_config`` fixture
         redirects ``$HOME`` there).

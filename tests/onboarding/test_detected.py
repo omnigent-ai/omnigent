@@ -414,7 +414,7 @@ def test_cli_config_detection_wins_codex_default_over_login() -> None:
 
     Detection priority (config provider first) mirrors codex's own
     resolution — config.toml's default provider beats auth.json. Failure
-    means an isaac-configured machine with a stray auth.json would default
+    means a machine configured for a gateway with a stray auth.json would default
     omnigents to the ChatGPT login while plain ``codex`` uses the gateway.
     """
     merged = effective_config_with_detected({}, [_codex_config_det(), _codex_login()])

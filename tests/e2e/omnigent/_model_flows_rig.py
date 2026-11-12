@@ -143,7 +143,7 @@ def shape_providers(shape: str) -> dict[str, Any]:
 
     - ``claude-subscription`` — claude's subscription entry claims anthropic.
     - ``claude-gateway`` — a ``kind: gateway`` entry with an anthropic family
-      claims anthropic (the isaac-style hand-written gateway entry).
+      claims anthropic (a manually configured gateway entry).
     - ``codex-databricks`` — the ``kind: databricks`` entry claims openai.
     - ``codex-subscription`` — codex's subscription entry claims openai.
 

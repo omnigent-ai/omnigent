@@ -485,7 +485,7 @@ def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) ->
 # The shape a Codex setup writes (Unity Gateway mode): a custom
 # [model_providers.Databricks] table authenticated by a token-printing
 # command, selected via a top-level model_provider — and NO auth.json.
-_ISAAC_STYLE_CODEX_CONFIG = """
+_GATEWAY_CODEX_CONFIG = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
@@ -503,10 +503,10 @@ refresh_interval_ms = 1500000
 model_provider = "Databricks"
 """
 
-# The DetectedProvider the isaac-style config must produce, asserted by
+# The DetectedProvider the gateway config must produce, asserted by
 # full equality so any drifted field (name slug, kind, family, source
 # wording, provider id, display name) turns the test red.
-_ISAAC_STYLE_DETECTION = DetectedProvider(
+_GATEWAY_DETECTION = DetectedProvider(
     name="codex-databricks",
     kind="cli-config",
     family="openai",
@@ -521,7 +521,7 @@ def _write_codex_config(home, body: str) -> None:
 
     :param home: The tmp HOME directory (from the ``clean_env`` fixture).
     :param body: The TOML text to write, e.g.
-        :data:`_ISAAC_STYLE_CODEX_CONFIG`.
+        :data:`_GATEWAY_CODEX_CONFIG`.
     """
     codex_dir = home / ".codex"
     codex_dir.mkdir(exist_ok=True)
@@ -529,15 +529,15 @@ def _write_codex_config(home, body: str) -> None:
 
 
 def test_codex_config_custom_provider_detected(clean_env) -> None:
-    """An isaac-style config.toml (custom provider + auth command) is detected.
+    """A gateway config.toml (custom provider + auth command) is detected.
 
     This is the state a Codex setup leaves behind — no
     auth.json at all — which the subscription detection cannot see. Failure
     means managed users' gateway-configured codex shows as "not configured"
     in setup (the original bug).
     """
-    _write_codex_config(clean_env, _ISAAC_STYLE_CODEX_CONFIG)
-    assert detect_providers() == [_ISAAC_STYLE_DETECTION]
+    _write_codex_config(clean_env, _GATEWAY_CODEX_CONFIG)
+    assert detect_providers() == [_GATEWAY_DETECTION]
 
 
 @pytest.mark.parametrize(
@@ -566,7 +566,7 @@ def test_codex_config_provider_transport_reads_base_url_and_auth(
 
     _write_codex_config(
         clean_env,
-        _ISAAC_STYLE_CODEX_CONFIG.replace(
+        _GATEWAY_CODEX_CONFIG.replace(
             "timeout_ms = 5000\nrefresh_interval_ms = 1500000", settings
         ),
     )
@@ -602,7 +602,7 @@ def test_codex_config_detected_before_codex_login(clean_env) -> None:
     subscription would auto-default and route differently from the user's
     own ``codex`` terminal.
     """
-    _write_codex_config(clean_env, _ISAAC_STYLE_CODEX_CONFIG)
+    _write_codex_config(clean_env, _GATEWAY_CODEX_CONFIG)
     codex_dir = clean_env / ".codex"
     (codex_dir / "auth.json").write_text('{"OPENAI_API_KEY": "sk-test"}')
 
@@ -885,7 +885,7 @@ def test_prewarm_detect_providers_failure_falls_back_to_fresh_sweep(
 # reverted). These tests pin that: detection yields a subscription, and the
 # managed paths are read from an explicit tuple (absolute paths escape $HOME).
 
-_ISAAC_CLAUDE_SETTINGS: dict[str, object] = {
+_GATEWAY_CLAUDE_SETTINGS: dict[str, object] = {
     "env": {
         "ANTHROPIC_BASE_URL": "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic",
         "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8",
@@ -905,8 +905,8 @@ def _write_managed_settings(home, monkeypatch, payload: object):
 
 
 def test_claude_managed_gateway_reads_base_url_and_credential(clean_env, monkeypatch) -> None:
-    """An isaac-style settings file yields (base_url, has_credential=True)."""
-    _write_managed_settings(clean_env, monkeypatch, _ISAAC_CLAUDE_SETTINGS)
+    """A gateway settings file yields (base_url, has_credential=True)."""
+    _write_managed_settings(clean_env, monkeypatch, _GATEWAY_CLAUDE_SETTINGS)
     base_url, has_credential = ambient.claude_managed_gateway()
     assert base_url == "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic"
     assert has_credential is True
@@ -921,7 +921,7 @@ def test_claude_managed_gateway_detected_as_subscription_not_cli_config(
     a poison pill an older runner's parser rejects, breaking every turn. Failure
     here means the revert's root cause has been reintroduced.
     """
-    _write_managed_settings(clean_env, monkeypatch, _ISAAC_CLAUDE_SETTINGS)
+    _write_managed_settings(clean_env, monkeypatch, _GATEWAY_CLAUDE_SETTINGS)
     detected = detect_providers()
     assert [(d.name, d.kind, d.family) for d in detected] == [
         ("claude", "subscription", "anthropic")
@@ -941,7 +941,7 @@ def test_claude_managed_gateway_wins_over_cli_login_no_double_count(
     from omnigent.onboarding import harness_install
 
     monkeypatch.setattr(harness_install, "harness_cli_logged_in", lambda key: True)
-    _write_managed_settings(clean_env, monkeypatch, _ISAAC_CLAUDE_SETTINGS)
+    _write_managed_settings(clean_env, monkeypatch, _GATEWAY_CLAUDE_SETTINGS)
     claude_rows = [d for d in detect_providers() if d.name == "claude"]
     assert len(claude_rows) == 1
     assert claude_rows[0].source == "Claude Code managed settings"
@@ -967,7 +967,7 @@ def test_claude_managed_gateway_synthesizes_a_subscription_entry(clean_env, monk
     """
     from omnigent.onboarding.detected import synthesize_detected_entries
 
-    _write_managed_settings(clean_env, monkeypatch, _ISAAC_CLAUDE_SETTINGS)
+    _write_managed_settings(clean_env, monkeypatch, _GATEWAY_CLAUDE_SETTINGS)
     entries = synthesize_detected_entries(detect_providers())
     assert entries["claude"] == {"kind": "subscription", "cli": "claude"}
 
@@ -975,7 +975,7 @@ def test_claude_managed_gateway_synthesizes_a_subscription_entry(clean_env, monk
 @pytest.mark.parametrize(
     "payload,expected",
     [
-        (_ISAAC_CLAUDE_SETTINGS, "Databricks Unity Gateway"),
+        (_GATEWAY_CLAUDE_SETTINGS, "Databricks Unity Gateway"),
         (
             {
                 "env": {"ANTHROPIC_BASE_URL": "https://llm.corp.example.com/v1"},
@@ -999,7 +999,10 @@ def test_claude_managed_gateway_display_name(
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
-        (_ISAAC_CLAUDE_SETTINGS, "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic"),
+        (
+            _GATEWAY_CLAUDE_SETTINGS,
+            _GATEWAY_CLAUDE_SETTINGS["env"]["ANTHROPIC_BASE_URL"],
+        ),
         ({"env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}, "apiKeyHelper": "t"}, None),
         ({"env": {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}}, None),
         ({"apiKeyHelper": "print-token"}, None),
@@ -1027,7 +1030,7 @@ def test_claude_managed_gateway_first_readable_file_decides(clean_env, monkeypat
     high = clean_env / "high.json"
     high.write_text(json.dumps({"env": {"MCP_TOOL_TIMEOUT": "1"}}))
     low = clean_env / "low.json"
-    low.write_text(json.dumps(_ISAAC_CLAUDE_SETTINGS))
+    low.write_text(json.dumps(_GATEWAY_CLAUDE_SETTINGS))
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (high, low))
     assert ambient.claude_managed_gateway() == (None, False)
 
