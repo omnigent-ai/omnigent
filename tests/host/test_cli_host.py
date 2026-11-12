@@ -1894,17 +1894,21 @@ def test_foreground_host_connects_once_a_starting_daemon_yields_the_workspace(
 
 
 @pytest.mark.parametrize(
-    ("launch_token", "daemon_host_id", "coexists"),
+    ("launch_token", "env_identity", "daemon_host_id", "coexists"),
     [
-        pytest.param("launch-token", "b" * 32, True, id="managed-host-other-id"),
-        pytest.param("launch-token", "a" * 32, False, id="managed-host-same-id"),
-        pytest.param(None, "b" * 32, False, id="env-identity-without-launch-token"),
+        pytest.param("launch-token", True, "b" * 32, True, id="managed-host-other-id"),
+        pytest.param("launch-token", True, "a" * 32, False, id="managed-host-same-id"),
+        pytest.param(None, True, "b" * 32, False, id="env-identity-without-launch-token"),
+        pytest.param(
+            "launch-token", False, "b" * 32, False, id="launch-token-without-env-identity"
+        ),
     ],
 )
 def test_foreground_managed_host_runs_beside_a_daemon_of_another_host_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     launch_token: str | None,
+    env_identity: bool,
     daemon_host_id: str,
     coexists: bool,
 ) -> None:
@@ -1919,6 +1923,9 @@ def test_foreground_managed_host_runs_beside_a_daemon_of_another_host_id(
         monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
     else:
         monkeypatch.setenv("OMNIGENT_HOST_TOKEN", launch_token)
+    if not env_identity:
+        monkeypatch.delenv("OMNIGENT_HOST_ID")
+        monkeypatch.delenv("OMNIGENT_HOST_NAME")
     monkeypatch.setattr(
         "omnigent.cli._pid_is_recorded_daemon",
         lambda record: record.pid in {os.getpid(), _SAME_WORKSPACE_PID},
