@@ -6,13 +6,7 @@ import { useScheduleEscape } from "./useScheduleEscape";
 import { cn } from "@/lib/utils";
 import { pickerTriggerClass } from "./pickerStyles";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import {
-  ChevronDownIcon,
-  ChevronUpIcon,
-  ClockIcon,
-  FolderOpenIcon,
-  TriangleAlertIcon,
-} from "lucide-react";
+import { ChevronDownIcon, ClockIcon, FolderOpenIcon, TriangleAlertIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -68,8 +62,7 @@ import {
   type WorkerPlacement,
 } from "@/components/scheduled/triggerTemplates";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
-import { AgentHarnessPicker, ConnectHostInstructions } from "@/shell/NewChatDialog";
-import { getCliServerUrl } from "@/lib/host";
+import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { ProjectPicker, ProjectRowIcon } from "@/shell/ProjectPicker";
 import { useProjects, useResolveOrCreateProjectId } from "@/hooks/useConversations";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -430,7 +423,6 @@ export function CreateScheduledTaskDialog({
   });
   function resetMenus() {
     setWorkspaceBrowserOpen(false);
-    setConnectHostOpen(false);
     setProjectMenuOpen(false);
     setAgentMenuOpen(false);
     selectOpenCountRef.current = 0;
@@ -462,9 +454,6 @@ export function CreateScheduledTaskDialog({
   // the first online host), and an older unpinned task keeps resolving its host
   // when it fires.
   const [hostId, setHostId] = useState<string>("");
-  // The inline connect-host instructions, so a user whose host is offline can
-  // connect one without closing the dialog and losing the form.
-  const [connectHostOpen, setConnectHostOpen] = useState(false);
   const [workspace, setWorkspace] = useState<string>("");
   const [baseBranch, setBaseBranch] = useState<string | null>(null);
   // When on, each fire runs in a FRESH managed sandbox (execution_target =
@@ -724,12 +713,12 @@ export function CreateScheduledTaskDialog({
   const hostOptions = hosts ?? [];
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
-  const anyHostOnline = hostOptions.some((h) => h.status === "online");
-  // With no online host the instructions are the only way forward, so they show
-  // expanded; otherwise connecting another host is an optional, collapsed step.
-  const showConnectHostToggle = !sandboxMode && !hostsPending && anyHostOnline;
-  const showConnectHostInstructions =
-    !sandboxMode && !hostsPending && (!anyHostOnline || connectHostOpen);
+  // Say so when no host can take the automation; a picked offline host has its own note.
+  const showNoHostOnline =
+    !sandboxMode &&
+    !hostsPending &&
+    selectedHost?.status !== "offline" &&
+    !hostOptions.some((h) => h.status === "online");
   function handleWorkerSettingsChange(settings: TriggerWorkerSettings) {
     if (trigger !== null) {
       setSwitchedWorkerSettings(settings);
@@ -1522,41 +1511,17 @@ export function CreateScheduledTaskDialog({
                         This host is offline. Runs fail until it reconnects.
                       </p>
                     )}
-                    {showConnectHostToggle && (
-                      <button
-                        type="button"
-                        onClick={() => setConnectHostOpen((v) => !v)}
-                        className="col-span-2 flex cursor-pointer items-center gap-1 justify-self-start text-sm text-muted-foreground transition hover:text-foreground"
-                        data-testid="task-connect-host-toggle"
-                        aria-expanded={connectHostOpen}
+                    {showNoHostOnline && (
+                      <p
+                        className="flex items-center gap-1.5 text-sm text-muted-foreground"
+                        data-testid="task-no-host-online"
+                        role="status"
                       >
-                        {connectHostOpen ? (
-                          <ChevronUpIcon className="size-3.5" />
-                        ) : (
-                          <ChevronDownIcon className="size-3.5" />
-                        )}
-                        {selectedHost?.status === "offline"
-                          ? "Reconnect a host from your terminal"
-                          : "Connect another host from your terminal"}
-                      </button>
-                    )}
-                    {showConnectHostInstructions && (
-                      <div className="col-span-2" data-testid="task-connect-host">
-                        <ConnectHostInstructions
-                          serverUrl={getCliServerUrl()}
-                          label={
-                            anyHostOnline
-                              ? "Run this on the machine you want to use. It appears in the list once connected:"
-                              : hostOptions.length === 0
-                                ? "No hosts connected yet. Run this on the machine you want to use:"
-                                : "No hosts online. Run this on the machine you want to use:"
-                          }
-                          onSshConnected={(connectedHostId) => {
-                            setConnectHostOpen(false);
-                            handleTargetChange(connectedHostId);
-                          }}
-                        />
-                      </div>
+                        <TriangleAlertIcon className="size-3.5 shrink-0" />
+                        {hostOptions.length === 0 ? "No host is connected." : "No host is online."}
+                        {/* A new automation picks the first host that comes online. */}
+                        {isEdit ? "" : " Connect one and it’s picked here automatically."}
+                      </p>
                     )}
                   </div>
 

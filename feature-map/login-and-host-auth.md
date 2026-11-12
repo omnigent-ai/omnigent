@@ -122,9 +122,8 @@ in the native menu, and **Sign out of <server>** in the sidebar server picker (D
 the browser, which is how a user switches accounts). To connect a machine over SSH,
 use the SSH field under the `omni host` command (desktop app only; not yet on
 Windows): **Connect new host** in a new session's host menu, or the clone dialog
-(from the header or the reconnect dialog's Clone tab) or the automation dialog's
-**Run on** field, when no host is online or under **Connect another host from your
-terminal**. Each selects the new host.
+(from the header or the reconnect dialog's Clone tab) when no host is online or
+under **Connect another host from your terminal**. Each selects the new host.
 
 **iOS:** Connect on the connect screen to an OIDC server; a server picked in the
 native server menu or the sidebar server picker; relaunching the app, deep links,
