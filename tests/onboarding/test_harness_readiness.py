@@ -923,7 +923,7 @@ def test_kimi_native_custom_supported_binary_ignores_older_path_binary(
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
 
     assert harness_is_configured("kimi-native") is True
     assert probes == [str(custom_kimi)]
@@ -990,7 +990,7 @@ def test_kimi_native_custom_outdated_binary_drives_diagnosis_once(
             )
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
-    monkeypatch.setattr(hi.subprocess, "run", _run)
+    monkeypatch.setattr(hi, "run_isolated", _run)
 
     assert harness_is_configured("kimi") is True
     result = configured_harness_map()
