@@ -47,7 +47,7 @@ export function offersSaveWorkflow(skills: readonly { name: string }[]): boolean
  *
  * @param skillPrefix The harness's skill prefix, `"/"` or `"$"` for Codex's own CLI.
  * @param workflow The saved workflow, e.g. `{ id: "0123…", name: "Triage flaky tests" }`.
- * @param details What this run is about, e.g. `"The upload tests"`; may be empty.
+ * @param details The specifics for this run, e.g. `"The upload tests"`; may be empty.
  * @param reviewPlanFirst Whether the user reviews the plan before the work starts.
  */
 export function savedWorkflowMessage(

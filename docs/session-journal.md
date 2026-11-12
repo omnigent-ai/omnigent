@@ -119,7 +119,7 @@ needs ("Give it: the test suite"). You can also ask in chat, "save this as a
 workflow"; with no name given, the agent suggests one first.
 
 Once you have saved workflows, **Run a workflow** lists them, with a search
-field and **Describe a new workflow…** below them. Pick one, add this run's
+field and **New workflow** below them. Pick one, add this run's
 details, and choose **Run workflow**: the agent loads the saved workflow with
 `sys_workflow_load` and uses its steps as the plan, filling in the details.
 The saved steps are a starting point, so the agent can still replan. You can

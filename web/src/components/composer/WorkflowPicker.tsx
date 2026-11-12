@@ -7,7 +7,7 @@ import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 /**
  * Searchable list of the user's saved workflows, shown in place of the "+"
  * menu's items when Run a workflow has saved ones to offer. Picking one calls
- * `onSelect(workflow)`; the last row, "Describe a new workflow…", calls
+ * `onSelect(workflow)`; the last row, "New workflow", calls
  * `onDescribe(text)` with whatever was typed, for the description dialog.
  *
  * Laid out like `ProjectPicker`'s "Search or create project" list.
@@ -76,7 +76,7 @@ export function WorkflowPicker({
           <span className="flex size-4 shrink-0 items-center justify-center">
             <PlusIcon className="size-3.5" />
           </span>
-          Describe a new workflow…
+          New workflow
         </DropdownMenuItem>
       </div>
     </div>
