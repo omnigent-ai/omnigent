@@ -318,9 +318,9 @@ def test_reused_automation_settings(
                 "aria-expanded", "false"
             )
             page.get_by_role("button", name="Advanced", exact=True).click()
-            page.get_by_test_id("task-model-trigger").click()
+            page.get_by_test_id("task-worker-model-trigger").click()
             page.get_by_role("option", name="Opus", exact=True).click()
-            page.get_by_test_id("task-effort-trigger").click()
+            page.get_by_test_id("task-worker-effort-trigger").click()
             page.get_by_role("option", name="High", exact=True).click()
             page.get_by_test_id("create-scheduled-task-submit").click()
             expect(page.get_by_role("dialog")).to_have_count(0)
@@ -330,8 +330,8 @@ def test_reused_automation_settings(
             page.get_by_test_id("task-detail-edit").click()
             expect(worker_agent).to_contain_text("Claude Code")
             page.get_by_role("button", name="Advanced", exact=True).click()
-            expect(page.get_by_test_id("task-model-trigger")).to_have_text("Opus")
-            expect(page.get_by_test_id("task-effort-trigger")).to_have_text("High")
+            expect(page.get_by_test_id("task-worker-model-trigger")).to_have_text("Opus")
+            expect(page.get_by_test_id("task-worker-effort-trigger")).to_have_text("High")
             page.get_by_test_id("task-worker-settings").scroll_into_view_if_needed()
             return
         expect(page.get_by_test_id("task-agent-picker")).to_be_visible()

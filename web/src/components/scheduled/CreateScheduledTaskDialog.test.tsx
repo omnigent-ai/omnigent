@@ -3173,6 +3173,69 @@ describe("automation trigger type", () => {
     expect(isTaskSessionTriggerPrompt(mutateAsync.mock.calls[0][0].prompt)).toBe(true);
   });
 
+  it("sets the polling session's and matching sessions' models and efforts separately", async () => {
+    render(dialog());
+    await choose("GitHub");
+    type("task-trigger-scope", "acme/app");
+    type("task-trigger-instructions", "Review the pull request.");
+    const workerSettings = screen.getByTestId("task-worker-settings");
+    // Matching sessions follow the polling session until they get their own settings.
+    await choose("Haiku", "task-model-trigger");
+    expect(screen.getByTestId("task-worker-model-trigger")).toHaveTextContent("Haiku");
+    expect(workerSettings).toHaveTextContent(
+      "They match the polling session until you change them.",
+    );
+    await choose("Opus", "task-worker-model-trigger");
+    await choose("High", "task-worker-effort-trigger");
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Haiku");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Default");
+    expect(workerSettings).not.toHaveTextContent("They match the polling session");
+    expect(workerSettings).toHaveTextContent(
+      "Each session started for a matching item uses these.",
+    );
+    expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent(
+      "Polling: Haiku, Auto · Matching sessions: Opus, High",
+    );
+    // A later polling change no longer carries over.
+    await choose("Sonnet", "task-model-trigger");
+    expect(screen.getByTestId("task-worker-model-trigger")).toHaveTextContent("Opus");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const created = mutateAsync.mock.calls[0][0];
+    expect(created).toMatchObject({ templateId: "github", modelOverride: "sonnet" });
+    expect(created).not.toHaveProperty("reasoningEffort");
+    expect(readTriggerWorkerSettings(created.prompt)).toEqual({
+      agentId: null,
+      model: "opus",
+      effort: "high",
+      permissionMode: "",
+    });
+  });
+
+  it("starts matching sessions with the polling session's settings unless changed", async () => {
+    render(dialog());
+    await choose("Slack");
+    type("task-trigger-scope", "support");
+    type("task-trigger-instructions", "Answer the question.");
+    await choose("Opus", "task-worker-model-trigger");
+    // Choosing another agent clears the workers' own settings with the polling ones.
+    fireEvent.click(screen.getByTestId("pick-agent-polly"));
+    fireEvent.click(screen.getByTestId("pick-harness-claude"));
+    expect(screen.getByTestId("task-worker-model-trigger")).toHaveTextContent("Default");
+    await choose("Haiku", "task-model-trigger");
+    await choose("Low", "task-effort-trigger");
+    expect(screen.getByTestId("task-worker-model-trigger")).toHaveTextContent("Haiku");
+    expect(screen.getByTestId("task-worker-effort-trigger")).toHaveTextContent("Low");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const created = mutateAsync.mock.calls[0][0];
+    expect(created).toMatchObject({ modelOverride: "haiku", reasoningEffort: "low" });
+    expect(readTriggerWorkerSettings(created.prompt)).toMatchObject({
+      model: "haiku",
+      effort: "low",
+    });
+  });
+
   // This full draft round-trip needs extra time with coverage on shared CI runners.
   it("restores schedule and source drafts without carrying conditions between integrations", async () => {
     async function chooseTimezone(zone: string) {
@@ -3464,9 +3527,9 @@ describe("automation trigger type", () => {
     it("keeps a worker permission mode chosen while switched when switching back", async () => {
       render(dialog({ editingTask: slackTask }, { session_create_permission_modes: true }));
       await choose("Jira");
-      await choose("Auto", "task-permission-trigger");
+      await choose("Auto", "task-worker-permission-trigger");
       await choose("Slack");
-      expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Auto");
+      expect(screen.getByTestId("task-worker-permission-trigger")).toHaveTextContent("Auto");
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       const input = updateMutateAsync.mock.calls[0][0].input;
@@ -4341,15 +4404,15 @@ describe("editing template prompts", () => {
           : "Applies to new sessions started for matching items.",
       );
       fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-      expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("task-worker-model-trigger")).not.toBeInTheDocument();
       await select("task-worker-agent-trigger", "Claude Code");
       expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
         "aria-expanded",
         "false",
       );
       fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-      await select("task-model-trigger", "Opus");
-      await select("task-effort-trigger", "High");
+      await select("task-worker-model-trigger", "Opus");
+      await select("task-worker-effort-trigger", "High");
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
       const input = updateMutateAsync.mock.calls[0][0].input;
@@ -4378,12 +4441,12 @@ describe("editing template prompts", () => {
         />,
       );
       expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Claude Code");
-      expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("task-worker-model-trigger")).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
-      expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
-      expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
+      expect(screen.getByTestId("task-worker-model-trigger")).toHaveTextContent("Opus");
+      expect(screen.getByTestId("task-worker-effort-trigger")).toHaveTextContent("High");
       await select("task-worker-agent-trigger", "Polly");
-      expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("task-worker-model-trigger")).not.toBeInTheDocument();
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(2));
       expect(readTriggerWorkerSettings(updateMutateAsync.mock.calls[1][0].input.prompt)).toEqual({
@@ -4394,6 +4457,56 @@ describe("editing template prompts", () => {
       });
     },
   );
+
+  it("changes the polling session's settings on edit only for a new polling session", async () => {
+    const saved = updateTriggerWorkerSettings(original, {
+      agentId: "ag_claude_native",
+      model: "opus",
+      effort: "high",
+      permissionMode: "",
+    })!;
+    const task = scheduledTask({
+      prompt: saved,
+      agentId: "ag_claude_native",
+      modelOverride: "sonnet",
+      sessionMode: "continue",
+      sessionId: "poller",
+    });
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />, {
+      info: { scheduled_task_session_modes: true },
+    });
+    const select = async (id: string, name: string) => {
+      fireEvent.keyDown(screen.getByTestId(id), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name }));
+    };
+    expect(screen.getByTestId("task-polling-settings")).toHaveTextContent(
+      "The current polling session keeps these. Check Start a new session on the next run to change them.",
+    );
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet");
+    expect(screen.getByTestId("task-model-trigger")).toBeDisabled();
+    expect(screen.getByTestId("task-worker-model-trigger")).toHaveTextContent("Opus");
+    expect(screen.getByTestId("task-worker-effort-trigger")).toHaveTextContent("High");
+    expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent(
+      "Polling: Sonnet · Matching sessions: Opus, High",
+    );
+    fireEvent.click(screen.getByTestId("task-start-new-session"));
+    expect(screen.getByTestId("task-polling-settings")).toHaveTextContent(
+      "The next run starts a new polling session with these.",
+    );
+    await select("task-model-trigger", "Haiku");
+    expect(screen.getByTestId("task-worker-model-trigger")).toHaveTextContent("Opus");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(input).toMatchObject({ modelOverride: "haiku", sessionId: null });
+    expect(input).not.toHaveProperty("agentId");
+    expect(readTriggerWorkerSettings(input.prompt)).toEqual({
+      agentId: "ag_claude_native",
+      model: "opus",
+      effort: "high",
+      permissionMode: "",
+    });
+  });
 
   it.each([
     ["ag_claude_native", "auto", "Auto"],
@@ -4411,7 +4524,7 @@ describe("editing template prompts", () => {
       withCodexAgent();
       const task = scheduledTask({ prompt: saved, sessionMode: "continue", sessionId: "poller" });
       render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />);
-      expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("task-worker-permission-trigger")).not.toBeInTheDocument();
       expect(screen.getByTestId("task-worker-permission-unapplied")).toHaveTextContent(
         `Matching sessions are set to start in ${label}, which this server can't apply`,
       );
@@ -4472,10 +4585,10 @@ describe("editing template prompts", () => {
       fireEvent.click(await screen.findByRole("option", { name }));
     };
     await select("task-worker-agent-trigger", "Claude Code");
-    await select("task-permission-trigger", "Auto");
+    await select("task-worker-permission-trigger", "Auto");
     // Claude's Auto isn't a Codex mode.
     await select("task-worker-agent-trigger", "Codex");
-    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
+    expect(screen.getByTestId("task-worker-permission-trigger")).toHaveTextContent("Default");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const input = updateMutateAsync.mock.calls[0][0].input;
@@ -4498,13 +4611,13 @@ describe("editing template prompts", () => {
       fireEvent.keyDown(screen.getByTestId("task-worker-agent-trigger"), { key: "Enter" });
       fireEvent.click(await screen.findByRole("option", { name: "Claude Code" }));
       if (!supported) {
-        expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
+        expect(screen.queryByTestId("task-worker-permission-trigger")).not.toBeInTheDocument();
         return;
       }
       expect(screen.getByTestId("task-worker-settings")).toHaveTextContent(
         "Modes that skip approval aren't available here.",
       );
-      fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+      fireEvent.keyDown(screen.getByTestId("task-worker-permission-trigger"), { key: "Enter" });
       expect(await screen.findByRole("option", { name: "Auto" })).toBeInTheDocument();
       // The server refuses these for a session an agent starts.
       for (const name of ["Bypass permissions", "Don't ask"])

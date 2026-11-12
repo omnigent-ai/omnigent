@@ -23,6 +23,7 @@ export function ModelEffortFields({
   onEffortChange,
   onPermissionModeChange,
   onSelectOpenChange,
+  idPrefix = "task",
 }: {
   /** Selected model id/alias, or "" = agent default (nothing overridden). */
   model: string;
@@ -38,6 +39,8 @@ export function ModelEffortFields({
   /** Forwarded to each Select's onOpenChange so the parent Dialog can keep an
    * open dropdown from dismissing the whole modal. */
   onSelectOpenChange?: (open: boolean) => void;
+  /** Prefix for element ids and test ids, so two groups can share a form. */
+  idPrefix?: string;
 }) {
   const modelOptions = settings.models.map((option) => ({
     id: option.id,
@@ -57,12 +60,12 @@ export function ModelEffortFields({
   return (
     <div className="flex flex-col gap-3 sm:gap-4">
       {settings.supportsModel && (
-        <div className="flex flex-col gap-3" data-testid="task-model-effort-row">
+        <div className="flex flex-col gap-3" data-testid={`${idPrefix}-model-effort-row`}>
           <div
             className="flex w-full min-w-0 items-center justify-between gap-4"
-            data-testid="task-model-control"
+            data-testid={`${idPrefix}-model-control`}
           >
-            <Label htmlFor="task-model">Model</Label>
+            <Label htmlFor={`${idPrefix}-model`}>Model</Label>
             <Select
               disabled={disabled}
               value={model === "" ? MODEL_SELECT_DEFAULT : model}
@@ -72,8 +75,8 @@ export function ModelEffortFields({
               onOpenChange={onSelectOpenChange}
             >
               <SelectTrigger
-                id="task-model"
-                data-testid="task-model-trigger"
+                id={`${idPrefix}-model`}
+                data-testid={`${idPrefix}-model-trigger`}
                 className={cn(
                   "w-auto max-w-[65%] border-0 shadow-none text-muted-foreground",
                   pickerTriggerClass,
@@ -99,9 +102,9 @@ export function ModelEffortFields({
           {effortOptions.length > 0 && (
             <div
               className="flex w-full min-w-0 items-center justify-between gap-4"
-              data-testid="task-effort-control"
+              data-testid={`${idPrefix}-effort-control`}
             >
-              <Label htmlFor="task-effort">Effort</Label>
+              <Label htmlFor={`${idPrefix}-effort`}>Effort</Label>
               <Select
                 disabled={disabled}
                 value={effort === "" ? EFFORT_SELECT_NONE : effort}
@@ -111,8 +114,8 @@ export function ModelEffortFields({
                 onOpenChange={onSelectOpenChange}
               >
                 <SelectTrigger
-                  id="task-effort"
-                  data-testid="task-effort-trigger"
+                  id={`${idPrefix}-effort`}
+                  data-testid={`${idPrefix}-effort-trigger`}
                   className={cn(
                     "w-auto max-w-[65%] border-0 shadow-none text-muted-foreground",
                     pickerTriggerClass,
@@ -144,9 +147,9 @@ export function ModelEffortFields({
       {permissionOptions.length > 0 && (
         <div
           className="flex w-full min-w-0 items-center justify-between gap-4"
-          data-testid="task-permission-control"
+          data-testid={`${idPrefix}-permission-control`}
         >
-          <Label htmlFor="task-permission">Permissions</Label>
+          <Label htmlFor={`${idPrefix}-permission`}>Permissions</Label>
           <Select
             disabled={disabled}
             value={
@@ -161,8 +164,8 @@ export function ModelEffortFields({
             onOpenChange={onSelectOpenChange}
           >
             <SelectTrigger
-              id="task-permission"
-              data-testid="task-permission-trigger"
+              id={`${idPrefix}-permission`}
+              data-testid={`${idPrefix}-permission-trigger`}
               className={cn(
                 "w-auto max-w-[65%] border-0 shadow-none text-muted-foreground",
                 pickerTriggerClass,

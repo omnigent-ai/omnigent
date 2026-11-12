@@ -70,6 +70,8 @@ export function TriggerWorkerSettingsFields({
   settings,
   permissionModesSupported = false,
   taskSession = false,
+  creating = false,
+  followsPolling = false,
   disabled,
   onChange,
   onSelectOpenChange,
@@ -80,6 +82,10 @@ export function TriggerWorkerSettingsFields({
   permissionModesSupported?: boolean;
   /** Every match goes to one task session, so changes wait for the next one. */
   taskSession?: boolean;
+  /** The automation is being created, so no sessions exist yet. */
+  creating?: boolean;
+  /** The values still mirror the polling session's settings. */
+  followsPolling?: boolean;
   disabled: boolean;
   onChange: (value: TriggerWorkerSettings) => void;
   onSelectOpenChange: (open: boolean) => void;
@@ -104,6 +110,7 @@ export function TriggerWorkerSettingsFields({
         permissionMode={value.permissionMode}
         settings={{ ...settings, permissions }}
         disabled={disabled}
+        idPrefix="task-worker"
         onModelChange={(model) =>
           onChange({
             ...value,
@@ -147,9 +154,13 @@ export function TriggerWorkerSettingsFields({
         </p>
       )}
       <p className="text-sm text-muted-foreground">
-        {taskSession
-          ? "Applies to the next task session. The current task session and the polling session keep their settings; archive the task session so the next match starts one with these. "
-          : "Applies to new sessions started for matching items. Existing sessions, including the polling session, keep their settings. "}
+        {creating && taskSession && "The task session started for the first match uses these. "}
+        {creating && !taskSession && "Each session started for a matching item uses these. "}
+        {!creating &&
+          (taskSession
+            ? "Applies to the next task session. The current task session and the polling session keep their settings; archive the task session so the next match starts one with these. "
+            : "Applies to new sessions started for matching items. Existing sessions, including the polling session, keep their settings. ")}
+        {followsPolling && "They match the polling session until you change them. "}
         Default uses the selected harness&apos;s configuration.
         {permissions.length > 0 && " Modes that skip approval aren't available here."}
       </p>

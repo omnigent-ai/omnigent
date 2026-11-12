@@ -67,6 +67,14 @@ to customize.
   and preserves the separate prompts when saved and reopened.
   The detail page also keeps the system prompt collapsed by default, with a
   bounded read-only preview when expanded; use Edit automation to change it.
+- `polling-and-worker-settings`: a trigger's Advanced splits **Polling session** (the
+  automation's model, effort, and permissions, used by the session that checks for matches)
+  from **Matching sessions** (**Task session** for one task session), so polling can use a
+  lighter model. During creation the workers copy the polling settings until changed;
+  another agent or Run on target resets them. The summary beside Advanced names both
+  groups. On edit, the polling group stays locked while the current polling session is
+  reused and unlocks with **Start a new session on the next run**; worker changes never
+  rebind the poller. Worker controls use `task-worker-*` test ids.
 - `source-switching`: editing a recognized trigger whose worker settings can be
   read shows Trigger type with the five integrations (not Schedule). Picking another one opens that integration's
   form with the instructions, Harness for matching sessions, worker placement, and
