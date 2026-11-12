@@ -1318,6 +1318,13 @@ def register_core_routes(
         )
 
     @router.post(
+        "/sessions/orchestrated/host",
+        status_code=201,
+        response_model=None,
+        include_in_schema=False,
+        dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+    )
+    @router.post(
         "/sessions/orchestrated",
         status_code=201,
         response_model=None,
@@ -1332,6 +1339,10 @@ def register_core_routes(
             raise OmnigentError(
                 "Independent sessions require an orchestration source", code=ErrorCode.FORBIDDEN
             )
+        if request.url.path.endswith("/sessions/orchestrated/host") and not (
+            request.app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS)
+        ):
+            raise OmnigentError("Scripted sessions are disabled", code=ErrorCode.FORBIDDEN)
         return await create_session(request)
 
     @router.post(
@@ -1427,6 +1438,14 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        explicit_host = request.url.path.endswith("/sessions/orchestrated/host")
+        if explicit_host and (
+            body.host_type != "external" or not body.host_id or not body.workspace
+        ):
+            raise OmnigentError(
+                "Explicit host placement requires host_id and workspace on an external host",
+                code=ErrorCode.INVALID_INPUT,
+            )
         orchestration_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
         source = None
         if orchestration_source is not None:
@@ -1489,16 +1508,30 @@ def register_core_routes(
                 placement = await asyncio.to_thread(
                     routing_host_session, source, conversation_store
                 )
-                if placement is None or not placement.host_id or not placement.workspace:
+                destination_host = body.host_id
+                destination_workspace = body.workspace
+                if explicit_host:
+                    from omnigent.server.session_families import require_sibling_destination
+
+                    require_sibling_destination(
+                        request,
+                        placement.host_id if placement is not None else None,
+                        host_id=body.host_id,
+                        host_type=body.host_type,
+                    )
+                elif placement is None or not placement.host_id or not placement.workspace:
                     raise OmnigentError(
                         "Sender needs a connected host and workspace", code=ErrorCode.INVALID_INPUT
                     )
+                else:
+                    destination_host = placement.host_id
+                    destination_workspace = placement.workspace
                 try:
                     body = type(body).model_validate(
                         {
                             **body.model_dump(exclude_unset=True),
-                            "host_id": placement.host_id,
-                            "workspace": placement.workspace,
+                            "host_id": destination_host,
+                            "workspace": destination_workspace,
                         }
                     )
                 except ValidationError as exc:

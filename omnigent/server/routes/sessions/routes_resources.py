@@ -3796,6 +3796,11 @@ def register_resources_routes(
             runner_path=f"/v1/sessions/{session_id}/resources/github/commits",
         )
 
+    @router.post(
+        "/sessions/{session_id}/resources/github/prs/orchestrated",
+        response_model=None,
+        include_in_schema=False,
+    )
     @router.post("/sessions/{session_id}/resources/github/prs", response_model=None)
     async def update_session_github_pr(request: Request, session_id: str) -> dict[str, Any]:
         """
@@ -3809,6 +3814,25 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :returns: The refreshed ``session.github.info`` object.
         """
+        from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+        from omnigent.server.session_orchestration import require_orchestration_source
+
+        if request.url.path.endswith("/prs/orchestrated") and not request.headers.get(
+            ORCHESTRATION_SOURCE_HEADER
+        ):
+            raise OmnigentError(
+                "PR linking requires an orchestration source", code=ErrorCode.FORBIDDEN
+            )
+        if ORCHESTRATION_SOURCE_HEADER in request.headers:
+            if not request.app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS):
+                raise OmnigentError("Scripted sessions are disabled", code=ErrorCode.FORBIDDEN)
+            await asyncio.to_thread(
+                require_orchestration_source,
+                request,
+                _get_user_id(request, auth_provider),
+                conversation_store,
+                permission_store,
+            )
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("url"), str):
