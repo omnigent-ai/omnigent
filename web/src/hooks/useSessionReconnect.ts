@@ -1,16 +1,8 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 
-import { fetchHosts } from "@/hooks/useHosts";
 import { onRunnerHealthPolled, refreshRunnerHealth } from "@/hooks/useRunnerHealth";
-import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
-import {
-  connectArcaHost,
-  controlHost,
-  getHostIdentity,
-  isElectronShell,
-  supportsArcaConnect,
-} from "@/lib/nativeBridge";
+import { controlHost, getHostIdentity, isElectronShell } from "@/lib/nativeBridge";
 import { type PostEventResponse, retrySession } from "@/lib/sessionsApi";
 import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
 import type { SandboxStatus } from "@/lib/types";
@@ -86,14 +78,12 @@ function launchKey(launch: SandboxStatus | null): string {
 export function useSessionReconnect({
   sessionId,
   hostId,
-  hostName,
   hostResumable = false,
   hostOnline,
   isOwner,
 }: {
   sessionId: string | null;
   hostId: string | null;
-  hostName?: string | null;
   hostResumable?: boolean;
   /** The session's host liveness; a woken sandbox counts as starting until it is `true`. */
   hostOnline?: boolean | null;
@@ -103,7 +93,6 @@ export function useSessionReconnect({
   const [reconnecting, setReconnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [canReconnectThisMachine, setCanReconnectThisMachine] = useState(false);
-  const [canReconnectArca, setCanReconnectArca] = useState(false);
   const [sandboxWake, setSandboxWake] = useState<"waking" | "awaiting_online" | null>(null);
   const inFlight = useRef<{ progressToast?: string | number } | null>(null);
   // The open session's launch stage, compared against its value at the wake's click.
@@ -112,21 +101,10 @@ export function useSessionReconnect({
   const wakeStart = useRef<{ operation: object; launch: string; stageChanged: boolean } | null>(
     null,
   );
-  const isSessionArcaHost = useCallback(
-    () =>
-      hostId !== null && isArcaHost({ host_id: hostId, name: hostName ?? "" }, readArcaHostId()),
-    [hostId, hostName],
-  );
-  const runsArcaConnect = useCallback(
-    () => !!hostId && isOwner && supportsArcaConnect() && isSessionArcaHost(),
-    [hostId, isOwner, isSessionArcaHost],
-  );
-
   useEffect(() => {
     setDialogOpen(false);
     setError(null);
     setCanReconnectThisMachine(false);
-    setCanReconnectArca(false);
     setReconnecting(false);
     setSandboxWake(null);
     return () => {
@@ -136,59 +114,6 @@ export function useSessionReconnect({
       inFlight.current = null;
     };
   }, [sessionId, hostId, isOwner]);
-
-  const reconnectArca = useCallback(async () => {
-    if (inFlight.current) return;
-    if (!runsArcaConnect()) {
-      setCanReconnectArca(false);
-      setDialogOpen(true);
-      return;
-    }
-
-    const operation: { progressToast?: string | number } = {};
-    inFlight.current = operation;
-    // A failed attempt opens the dialog, which needs the Arca action for its retry.
-    setCanReconnectArca(true);
-    setReconnecting(true);
-    setError(null);
-    try {
-      operation.progressToast = toast.loading("Reconnecting Arca…");
-      const result = await connectArcaHost();
-      if (inFlight.current !== operation) return;
-      if (!result.ok) {
-        if (!result.canceled && !result.shownInConsole) {
-          setError(result.error ?? "Couldn't reconnect Arca. Try again.");
-        }
-        setDialogOpen(true);
-        return;
-      }
-      if (result.identity) writeArcaHostId(result.identity.hostId);
-      // The connect starts whichever Arca the user has now, which may not be this
-      // session's host, so only the server's view of this host decides success.
-      const hosts = await fetchHosts(false).catch(() => null);
-      if (inFlight.current !== operation) return;
-      if (hosts === null) {
-        setError("Couldn't check whether this session's host is back online. Try again.");
-        setDialogOpen(true);
-        return;
-      }
-      if (!hosts.some((host) => host.host_id === hostId && host.status === "online")) {
-        setError(
-          "This session's host is still offline. If Arca came back as a different host, use Switch host to move the session.",
-        );
-        setDialogOpen(true);
-        return;
-      }
-      setDialogOpen(false);
-      toast.success(result.alreadyRunning ? "Arca is already online." : "Arca is back online.");
-    } finally {
-      if (inFlight.current === operation) {
-        if (operation.progressToast !== undefined) toast.dismiss(operation.progressToast);
-        inFlight.current = null;
-        setReconnecting(false);
-      }
-    }
-  }, [hostId, runsArcaConnect]);
 
   const starting = sandboxWake !== null;
   useEffect(() => {
@@ -286,14 +211,6 @@ export function useSessionReconnect({
       setDialogOpen(true);
       return;
     }
-    // Arca is a remote machine, so it can never match the desktop host
-    // identity below. Starting it here still needs the user's confirmation
-    // in the desktop app.
-    if (isSessionArcaHost()) {
-      await reconnectArca();
-      return;
-    }
-
     const operation: { progressToast?: string | number } = {};
     inFlight.current = operation;
     setReconnecting(true);
@@ -304,7 +221,6 @@ export function useSessionReconnect({
       if (inFlight.current !== operation) return;
       if (!identity?.cliInstalled || identity.hostId !== hostId) {
         setCanReconnectThisMachine(false);
-        setCanReconnectArca(false);
         setDialogOpen(true);
         return;
       }
@@ -331,21 +247,16 @@ export function useSessionReconnect({
         setReconnecting(false);
       }
     }
-  }, [hostId, hostResumable, isOwner, isSessionArcaHost, reconnectArca, wakeSandbox]);
+  }, [hostId, hostResumable, isOwner, wakeSandbox]);
 
   return {
     reconnect,
-    /** Whether `reconnect` runs the desktop's Arca connect for this session's host. */
-    reconnectsArca: runsArcaConnect(),
     /** A sandbox wake is running or its host has not yet been seen online. */
     sandboxStarting: sandboxWake !== null,
     dialogOpen,
     setDialogOpen,
     localReconnect: canReconnectThisMachine
       ? { reconnecting, error, onReconnect: () => void reconnect() }
-      : undefined,
-    arcaReconnect: canReconnectArca
-      ? { reconnecting, error, onReconnect: () => void reconnectArca() }
       : undefined,
   };
 }

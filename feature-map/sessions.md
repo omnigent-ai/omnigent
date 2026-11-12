@@ -152,12 +152,9 @@ the header menu), and each place is a separate entry point.
   Participating sandbox providers require a [profile selection](sandbox-profiles.md)
   before submission, including branch clones.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
-  dialog with the command to run; the desktop app reconnects a local host
-  itself, and starts an Arca host recognized by its saved ID or default name
-  from the same action (the desktop's Arca console still asks before running).
-  A failed attempt opens the dialog for retry; so does an Arca connect after
-  which the server still lists the session's host offline (usually because the
-  host came back under a new ID), with **Switch host** to move the session.
+  dialog with the command to run. The desktop app can restart its local host;
+  a failed attempt opens the dialog for retry. Remote hosts can use the shown
+  command or **Switch host** to move the session.
   States: reconnecting (spinner), reconnect failed (retry), host offline.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory, optionally with a new git
@@ -489,15 +486,8 @@ sandbox-profile picker and source-profile default for participating providers.
 The dialog shows the command for this situation (for example
 `omnigent host` when the host is offline, or the harness's `--resume` command
 when a local session is stranded). In the desktop app, **Reconnect host** acts
-directly for this machine or a recognized Arca host; Arca's connect console
-asks for confirmation before running, and a failed attempt opens the dialog,
-whose **Reconnect Arca** action retries. Success is reported only once the
-server lists the session's own host online; otherwise the dialog says the host
-is still offline and points to **Switch host** in case Arca came back as a
-different host. In a session on an offline Arca host, the desktop app keeps the
-composer open: sending starts the same Arca reconnect, the message waits in the
-queue as **Waiting for host** without reaching the server, and it sends once the
-host is back. In a sandbox session (for example an Arclet) whose host is
+directly for this machine. A failed attempt opens the dialog for retry.
+Remote hosts use the shown command or **Switch host**. In a sandbox session whose host is
 asleep, **Reconnect host** in the composer's host menu has the server wake the
 sandbox and start the agent without sending a message, in the browser too.
 The host status dot in the composer chip and its menu spins while the sandbox
@@ -1090,14 +1080,8 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`,
-  `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_reconnects_arca_from_current_chat`,
-  `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_arca_reconnect_failure_offers_retry`,
-  `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_send_reconnects_offline_arca_then_sends`
   drive the real SPA and server with an injected desktop bridge and offline host
-  responses. The Arca journeys cover a remembered host and a host that was not
-  saved; they check one-action start, progress, failure and retry,
-  and a message that waits for the host, not live SSH or the desktop's consent
-  console.
+  responses, covering local startup, failure and retry.
 - **`reconnect`, asleep sandbox:**
   `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_opening_asleep_session_wakes_sandbox_in_status_dot`
   drives the real SPA and server with the session patched to an asleep Arclet

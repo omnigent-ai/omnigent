@@ -38,7 +38,6 @@
   "tests/e2e_ui/mobile/test_terminal_touch_drag_scrollback.py": 1,
   "tests/e2e_ui/mobile/test_touch_drag_bounded_history_paging.py": 1,
   "tests/e2e_ui/sessions/test_idle_notifications.py": 2,
-  "tests/e2e_ui/sessions/test_reconnect_arca_from_app.py": 2,
   "tests/e2e_ui/sessions/test_sidebar_awaiting_tag_layout.py": 1,
   "tests/e2e_ui/shells/test_new_shell.py": 1,
   "tests/e2e_ui/test_recorded_page_clip_screenshots.py": 1,
