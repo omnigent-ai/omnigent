@@ -325,6 +325,8 @@ function WorkflowSessionForm({
     const reasoningEffort = pinnedValue(runConfig.reasoningEffort);
     try {
       const session = await createSession(agent.id, [], {
+        // The drafting session is named for the workflow it creates.
+        title: request.kind === "create" ? `Create workflow ${request.name}` : undefined,
         ...(sandboxSelected
           ? {
               sandbox: {

@@ -154,6 +154,10 @@ describe("WorkflowSessionDialog", () => {
     fireEvent.click(submit());
 
     await waitFor(() => expect(navigate).toHaveBeenCalledWith("/c/conv_run"));
+    expect(vi.mocked(createSession).mock.calls[0]![2]).not.toHaveProperty(
+      "title",
+      expect.anything(),
+    );
     expect(createSession).toHaveBeenCalledWith(CODEX.id, [], {
       hostId: "host_2",
       workspace: "/home/you/app",
@@ -346,6 +350,7 @@ describe("WorkflowSessionDialog", () => {
 
     await waitFor(() => expect(navigate).toHaveBeenCalledWith("/c/conv_run"));
     expect(vi.mocked(createSession).mock.calls[0]![2]).toMatchObject({
+      title: "Create workflow Upgrade a dependency",
       hostId: "host_1",
       workspace: "/srv/app",
     });
