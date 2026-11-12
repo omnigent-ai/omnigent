@@ -90,6 +90,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["features"] == {
         "sandbox_profiles": False,
         "usage_page": False,
+        "session_overview": False,
         "harness_install": False,
         "canvas": False,
         "arca_shutdown_warnings": False,

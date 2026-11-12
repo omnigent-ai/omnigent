@@ -1,4 +1,3 @@
-import { formatSessionCostUsd } from "@/lib/formatCost";
 // Subagents tab content for the right-side rail. Renders the session
 // tree under the root conversation — a "main" link back to the root,
 // then its sub-agent sessions recursively (children, grandchildren,
@@ -15,6 +14,9 @@ import { formatSessionCostUsd } from "@/lib/formatCost";
 // Each row is a Link to the target conversation page so cmd/middle-
 // click opens it in a new tab, matching the sidebar's behavior.
 
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { formatSessionCostUsd } from "@/lib/formatCost";
 import { lazy, Suspense, useState } from "react";
 import type { ComponentType, SVGProps } from "react";
 import {
@@ -480,6 +482,11 @@ function SubagentRow({
   collapsedRows: Record<string, boolean>;
   onToggleCollapsed: (id: string) => void;
 }) {
+  const overviewEnabled = isFeatureEnabled(useServerInfo(), "session_overview");
+  const costLabel =
+    typeof child.own_cost_usd === "number"
+      ? formatSessionCostUsd(child.own_cost_usd)
+      : "Unavailable";
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
   const search = sessionNavigationSearch(useLocation().search);
@@ -589,11 +596,6 @@ function SubagentRow({
             )}
             <StatusAvatar {...status} />
             <div className="min-w-0 flex-1">
-              <span title="Own-agent cost" className="text-xs font-mono text-muted-foreground">
-                {child.own_cost_usd == null
-                  ? "Unavailable"
-                  : formatSessionCostUsd(child.own_cost_usd)}
-              </span>
               <div className="flex min-w-0 items-center gap-[2px]">
                 <span
                   data-testid="subagent-agent-avatar"
@@ -606,6 +608,14 @@ function SubagentRow({
                   )}
                 </span>
                 <span className="min-w-0 flex-1 truncate text-sm font-medium">{primary}</span>
+                {overviewEnabled && (
+                  <span
+                    title={`Own-agent cost: ${costLabel}`}
+                    className="min-w-0 max-w-[45%] truncate font-mono text-[10px] text-muted-foreground"
+                  >
+                    {costLabel}
+                  </span>
+                )}
                 {child.routed_model ? (
                   // Model the intelligent router picked for this sub-agent — the
                   // per-subagent half of routing visibility.

@@ -16,8 +16,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
+
+vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: vi.fn(() => "loading") }));
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // Keep the real module (MAX_TREE_DEPTH and friends) — only the
@@ -135,6 +139,7 @@ const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
 ];
 
 beforeEach(() => {
+  vi.mocked(useServerInfo).mockReturnValue("loading");
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
   // Default: parent's status is idle. Tests override per-case.
@@ -1570,4 +1575,24 @@ describe("SubagentsPanel", () => {
     expect(childRow(container, "conv_grandchild").className.split(/\s+/)).toContain("bg-accent");
     expect(childRow(container, "conv_child").className.split(/\s+/)).not.toContain("bg-accent");
   });
+});
+
+it.each([false, true])("shows own-agent costs only when session_overview is %s", (enabled) => {
+  vi.mocked(useServerInfo).mockReturnValue({
+    ...FALLBACK_SERVER_INFO,
+    features: { session_overview: enabled },
+  });
+  mockChildTree({
+    conv_parent: [childInfo({ id: "child", session_name: "Worker", own_cost_usd: 0 })],
+  });
+  renderPanel();
+  const cost = screen.queryByTitle("Own-agent cost: $0.00");
+  if (enabled) {
+    expect(cost).toBeInTheDocument();
+    expect(cost).toHaveClass("min-w-0", "truncate");
+    expect(screen.getByRole("link", { name: /Worker.*\$0.00/ })).toBeInTheDocument();
+  } else {
+    expect(cost).toBeNull();
+    expect(screen.getByRole("link", { name: /Worker/ })).toBeInTheDocument();
+  }
 });

@@ -1,3 +1,5 @@
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { formatSessionCostUsd } from "@/lib/formatCost";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { NodeTypes, NodeProps, Node } from "@xyflow/react";
@@ -52,6 +54,9 @@ function NodeStatusDot({ activity }: { activity: AgentActivity }) {
 }
 
 function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
+  const overviewEnabled = isFeatureEnabled(useServerInfo(), "session_overview");
+  const costLabel =
+    typeof data.ownCostUsd === "number" ? formatSessionCostUsd(data.ownCostUsd) : "Unavailable";
   const { label, activity, statusLabel, isActive, preview } = data;
   const tint = ACTIVITY_TINT[activity];
 
@@ -72,16 +77,18 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
         style={{ width: NODE_WIDTH }}
       >
         <div className="flex items-center gap-1.5">
-          <span className="truncate text-sm font-medium leading-tight">{label}</span>
+          <span className="min-w-0 truncate text-sm font-medium leading-tight">{label}</span>
           <span className="flex-1" />
+          {overviewEnabled && data.ownCostUsd !== undefined && (
+            <span
+              title={`Own-agent cost: ${costLabel}`}
+              className="min-w-0 max-w-[45%] truncate font-mono text-[10px] text-muted-foreground"
+            >
+              {costLabel}
+            </span>
+          )}
           <NodeStatusDot activity={activity} />
         </div>
-        {data.ownCostUsd !== undefined && (
-          <p className="text-[10px] text-muted-foreground">
-            Own cost:{" "}
-            {data.ownCostUsd === null ? "Unavailable" : formatSessionCostUsd(data.ownCostUsd)}
-          </p>
-        )}
         {preview && (
           <p className="mt-1 truncate text-[10px] leading-tight text-muted-foreground">{preview}</p>
         )}
