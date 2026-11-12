@@ -10,9 +10,15 @@ nothing reads them for access checks. The application writes them with the
 owning ``scheduled_tasks`` row and deletes them with it.
 
 Additive and unused by earlier releases, so this schema can ship before the
-application code that writes it. Rolling the schema back drops the table and
-the share instructions in it. There are no foreign-key constraints (schema Rule
-R032).
+application code that writes it. Rollout and rollback order:
+
+- The upgrade runs at startup. A server started against the upgraded database
+  needs a build that knows this revision; older builds refuse to start.
+- To roll back to a build without this revision, first downgrade to
+  ``a7d4c2e9f610`` with a build that knows it. The downgrade drops the table and
+  any share instructions in it, so it is safe only before the first share is saved.
+
+There are no foreign-key constraints (schema Rule R032).
 """
 
 from __future__ import annotations
