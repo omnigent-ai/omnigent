@@ -1750,10 +1750,10 @@ def create_app(
     :param permission_store: Store for session-level access grants.
         ``None`` disables permission checks (all access allowed).
     :param scheduled_task_store: Store backing the recurring-task
-        scheduler. When provided, the FastAPI lifespan
-        starts an :class:`ScheduledTaskScheduler` that arms a timer per
-        active task and fires the injected ``on_fire`` callback on
-        schedule. ``None`` disables the scheduler entirely.
+        scheduler. When provided, the FastAPI lifespan starts the database
+        scheduler (:class:`PersistentTaskScheduler`), or with automations_v2 off,
+        a :class:`ScheduledTaskScheduler` that arms a timer per active task.
+        ``None`` disables the scheduler entirely, in either mode.
     :param preference_store: Optional shared-preference API; no launcher adoption.
     :param automations: Whether this request's caller can use automations. A static
         bool or a zero-arg callable resolved per request; ``None`` enables them.
@@ -1924,12 +1924,8 @@ def create_app(
         else mcp_disabled_servers
     )
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
-    if automations_v2_enabled:
-        if scheduled_task_store is None:
-            raise ValueError(
-                "automations_v2 requires a scheduled task store. Pass scheduled_task_store "
-                "to create_app(), or leave automations_v2 disabled until scheduling is configured."
-            )
+    # Without a store there are no automations, so neither mode starts a scheduler.
+    if automations_v2_enabled and scheduled_task_store is not None:
         if not isinstance(scheduled_task_store, ScheduledTaskDispatchStore):
             raise TypeError(
                 "The configured scheduled task store does not implement the operations needed "

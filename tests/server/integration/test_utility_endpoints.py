@@ -98,7 +98,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "sidebar_grouping_ui": True,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
-        "automations_v2": False,
+        "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
         "workflows_page": False,
