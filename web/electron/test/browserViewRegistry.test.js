@@ -450,14 +450,14 @@ function makeEventCapturingRegistry(extra = {}) {
 }
 
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
-  it("uses the same live Arca context for initial URL, redirect, frame and popup", () => {
+  it("uses the same live eligible-host context for initial URL, redirect, frame and popup", () => {
     let eligible = true;
     const context = { serverTarget: "selected-server", sourceHostId: "actual-host" };
     const { registry, fire, windowOpen, loaded } = makeEventCapturingRegistry({
       allowsLocalhost: (ctx) => eligible && ctx === context,
     });
     assert.equal(
-      registry.openOrNavigate("arca", "http://localhost:5173", undefined, {
+      registry.openOrNavigate("local-preview", "http://localhost:5173", undefined, {
         agent: true,
         agentContext: context,
       }).ok,
@@ -488,7 +488,7 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
     assert.equal(registry.has("unknown"), false);
   });
 
-  it("does not carry a previous Arca context into another navigation or registry", () => {
+  it("does not carry a previous host context into another navigation or registry", () => {
     const context = {};
     const options = { allowsLocalhost: (ctx) => ctx === context };
     const first = makeEventCapturingRegistry(options);
@@ -845,7 +845,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
   });
 
   it("attributes worker requests to the strictest partition owner and guards orphaned workers", async () => {
-    const context = { sourceHostId: "arca-host" };
+    const context = { sourceHostId: "local-host" };
     const { registry, lookups } = makeNetworkGuardRegistry({
       allowsLocalhost: (ctx) => ctx === context,
     });
@@ -1115,7 +1115,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
           return route;
         },
       });
-      const url = "http://spog.dev.localhost:5173/";
+      const url = "http://preview.dev.localhost:5173/";
       registry.openOrNavigate("conv_1", url, undefined, { agent: true, agentContext: context });
       const webContentsId = idOf("conv_1");
       const cancels = await Promise.all(
@@ -1127,8 +1127,8 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.deepEqual(direct.cancels, [false, false, true, true]);
     // Only loopback responses reach the route check.
     assert.deepEqual(direct.proxyLookups, [
-      "http://spog.dev.localhost:5173/",
-      "http://spog.dev.localhost:5173/",
+      "http://preview.dev.localhost:5173/",
+      "http://preview.dev.localhost:5173/",
     ]);
     // A local proxy answers from loopback but resolves the name on its own network.
     const localProxy = await responsesOn("PROXY 127.0.0.1:3128", ["127.0.0.1"]);
@@ -1145,14 +1145,18 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
         allowsLocalhost: (ctx) => ctx === context,
         resolveProxy,
       });
-      registry.openOrNavigate("local", "http://spog.dev.localhost:5173/", undefined, {
+      registry.openOrNavigate("local", "http://preview.dev.localhost:5173/", undefined, {
         agent: true,
         agentContext: context,
       });
       registry.openOrNavigate("remote", "https://example.com/", undefined, { agent: true });
       const webContentsId = idOf(viewId);
-      const page = { webContentsId, url: "http://spog.dev.localhost:5173/", resourceType: "xhr" };
-      const socket = { webContentsId, url: "ws://spog.dev.localhost:5173/hmr" };
+      const page = {
+        webContentsId,
+        url: "http://preview.dev.localhost:5173/",
+        resourceType: "xhr",
+      };
+      const socket = { webContentsId, url: "ws://preview.dev.localhost:5173/hmr" };
       const worker = { ...page, webContentsId: undefined };
       const verdicts = {
         request: await registry.shouldCancelAgentRequest(page),
@@ -1192,10 +1196,10 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     );
     // WebSockets are looked up by their own scheme, which picks their proxy.
     assert.deepEqual(directLookups, [
-      "http://spog.dev.localhost:5173/",
-      "http://spog.dev.localhost:5173/",
-      "ws://spog.dev.localhost:5173/hmr",
-      "ws://spog.dev.localhost:5173/hmr",
+      "http://preview.dev.localhost:5173/",
+      "http://preview.dev.localhost:5173/",
+      "ws://preview.dev.localhost:5173/hmr",
+      "ws://preview.dev.localhost:5173/hmr",
     ]);
     // An `https=`-only proxy rule carries WebSockets but not plain HTTP.
     assert.deepEqual(
@@ -1300,16 +1304,16 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.deepEqual(lookups, [{ hostname: "lvh.me", partition }]);
   });
 
-  it("keeps the Arca loopback exception for exact hosts but not DNS aliases", async () => {
-    const context = { sourceHostId: "arca-host" };
+  it("keeps loopback access for exact hosts but not DNS aliases", async () => {
+    const context = { sourceHostId: "local-host" };
     const { registry, idOf } = makeNetworkGuardRegistry({
       allowsLocalhost: (ctx) => ctx === context,
     });
-    registry.openOrNavigate("arca", "http://localhost:5173/", undefined, {
+    registry.openOrNavigate("local-preview", "http://localhost:5173/", undefined, {
       agent: true,
       agentContext: context,
     });
-    const webContentsId = idOf("arca");
+    const webContentsId = idOf("local-preview");
     await Promise.all(
       [
         ["http://localhost:5173/", "127.0.0.1"],
