@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -901,6 +902,7 @@ class _ForwardDedupeState:
     attributed_costs: dict[str, float] = field(default_factory=dict)
     attribution_disabled_children: set[str] = field(default_factory=set)
     attribution_retry_at: dict[str, float] = field(default_factory=dict)
+    attribution_next_index: int = 0
     # Last POLICY/budget cost (USD) POSTed as ``policy_cost_usd`` —
     # ``max(S, forwarder transcript estimate)``, which reflects in-flight
     # sub-agent spend so the gate can block mid-turn. Separate baseline
@@ -1360,6 +1362,7 @@ async def forward_claude_transcript_to_session(
     # the per-poll cost reconciliation from re-parsing unchanged transcripts.
     # Reset on /clear and /fork rotations alongside ``dedupe``.
     cost_cache: dict[Path, _TranscriptCostCacheEntry] = {}
+    attribution_cache: dict[Path, _TranscriptCostCacheEntry] = {}
     # (mtime_ns, size) of the statusLine shim's raw capture last normalized
     # into context.json (see claude_native_status.sync_raw_status_context).
     status_raw_sig: tuple[int, int] | None = None
@@ -1375,6 +1378,7 @@ async def forward_claude_transcript_to_session(
     task_statuses: dict[str, str] = {}
     task_order: list[str] = []
     subagent_task: asyncio.Task[SubagentForwardState] | None = None
+    attribution_task: asyncio.Task[None] | None = None
     observer_stderr_offset = 0
     transcript_diagnostics = _TranscriptDiscoveryDiagnostics(started_at=time.monotonic())
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
@@ -1402,6 +1406,12 @@ async def forward_claude_transcript_to_session(
         loop_failure_logged_at = 0.0
         while True:
             try:
+                if attribution_task is not None and attribution_task.done():
+                    try:
+                        attribution_task.result()
+                    except Exception:
+                        _logger.exception("Claude child cost worker failed; retrying next poll")
+                    attribution_task = None
                 if subagent_task is not None and subagent_task.done():
                     try:
                         subagent_state = subagent_task.result()
@@ -1438,7 +1448,9 @@ async def forward_claude_transcript_to_session(
                     )
                     if rotation is not None:
                         await _cancel_subagent_forward_task(subagent_task)
+                        await _cancel_subagent_forward_task(attribution_task)
                         subagent_task = None
+                        attribution_task = None
                         # Tell the superseded (old) conversation it was cleared:
                         # persist a notice linking to the rotated-to session and
                         # emit a live redirect event. Use the loop's ``session_id``
@@ -1486,6 +1498,7 @@ async def forward_claude_transcript_to_session(
                         # subagents/ dir, so prior cost entries are dead; drop
                         # them so cost is recomputed fresh for the new session.
                         cost_cache = {}
+                        attribution_cache = {}
                         await asyncio.sleep(poll_interval_s)
                         continue
                     rotation = await _maybe_rotate_session_on_fork(
@@ -1496,7 +1509,9 @@ async def forward_claude_transcript_to_session(
                     )
                     if rotation is not None:
                         await _cancel_subagent_forward_task(subagent_task)
+                        await _cancel_subagent_forward_task(attribution_task)
                         subagent_task = None
+                        attribution_task = None
                         session_id = rotation
                         state = None
                         hook_state = None
@@ -1528,6 +1543,7 @@ async def forward_claude_transcript_to_session(
                         # subagents/ dir, so prior cost entries are dead; drop
                         # them so cost is recomputed fresh for the new session.
                         cost_cache = {}
+                        attribution_cache = {}
                         await asyncio.sleep(poll_interval_s)
                         continue
                     if not external_session_id_mirrored:
@@ -1658,12 +1674,21 @@ async def forward_claude_transcript_to_session(
                                         status_retry_tracker=subagent_status_retries,
                                         batch_capability=session_event_batch_capability,
                                         status_capability=subagent_status_capability,
-                                        cost_dedupe=dedupe,
-                                        cost_cache=cost_cache,
                                     ),
                                     timeout=_FORWARD_LOOP_STALL_DEADLINE_S,
                                 ),
                                 name=f"claude-child-history-{current_session_id}",
+                            )
+                        if attribution_task is None:
+                            attribution_task = asyncio.create_task(
+                                _forward_child_costs(
+                                    client=subagent_client,
+                                    parent_transcript_path=transcript_path,
+                                    subagent_state=subagent_state,
+                                    dedupe=dedupe,
+                                    cost_cache=attribution_cache,
+                                ),
+                                name=f"claude-child-cost-{current_session_id}",
                             )
                         # Mirror the live statusLine model EVERY poll (not just
                         # when a turn produced new transcript items, which
@@ -1690,6 +1715,7 @@ async def forward_claude_transcript_to_session(
                         )
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
+                await _cancel_subagent_forward_task(attribution_task)
                 raise
             except TimeoutError:
                 # Every parent HTTP response pushes the deadline forward, so
@@ -1729,6 +1755,7 @@ async def forward_claude_transcript_to_session(
                 await asyncio.sleep(_loop_retry_delay_s(poll_interval_s, loop_failures))
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
+                await _cancel_subagent_forward_task(attribution_task)
                 raise
 
 
@@ -2788,8 +2815,6 @@ async def _forward_available_subagents(
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability | None = None,
     status_capability: _SubagentStatusCapability | None = None,
-    cost_dedupe: _ForwardDedupeState | None = None,
-    cost_cache: dict[Path, _TranscriptCostCacheEntry] | None = None,
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
@@ -2822,8 +2847,6 @@ async def _forward_available_subagents(
         event arrays. A new cache is created for direct callers that omit it.
     :param status_capability: Process-local cache of whether the server accepts
         idle observations. A new cache is created for direct callers that omit it.
-    :param cost_dedupe: Optional display-attribution state for the child-history lane.
-    :param cost_cache: Size-keyed transcript pricing cache for attribution.
     :returns: Updated state with new sub-agents registered and
         existing sub-agents' cursors advanced.
     """
@@ -3051,14 +3074,6 @@ async def _forward_available_subagents(
                 exc_info=result,
                 extra={"session_id": parent_session_id},
             )
-    if cost_dedupe is not None and cost_cache is not None:
-        await _forward_child_costs(
-            client=client,
-            parent_transcript_path=transcript_path,
-            subagent_state=checkpoint.state,
-            dedupe=cost_dedupe,
-            cost_cache=cost_cache,
-        )
     return checkpoint.state
 
 
@@ -3183,9 +3198,13 @@ async def _forward_child_costs(
     dedupe: _ForwardDedupeState,
     cost_cache: dict[Path, _TranscriptCostCacheEntry],
 ) -> None:
-    """Backfill display-only child attribution, independently of transcript delivery."""
+    """Report one eligible child's own cost, rotating fairly across the snapshot."""
     directory = _subagents_dir_for_transcript(parent_transcript_path)
-    for entry in subagent_state.subagents.values():
+    entries = list(subagent_state.subagents.values())
+    for _ in entries:
+        index = dedupe.attribution_next_index % len(entries)
+        entry = entries[index]
+        dedupe.attribution_next_index = (index + 1) % len(entries)
         child_id = entry.child_conversation_id
         if (
             not child_id
@@ -3200,41 +3219,47 @@ async def _forward_child_costs(
             cache=cost_cache,
         )
         if cost is None or cost <= dedupe.attributed_costs.get(child_id, -1):
-            continue
+            return
         try:
-            await _post_external_session_usage(
-                client,
-                session_id=child_id,
-                usage={"attributed_cost_usd": cost},
-            )
-        except httpx.HTTPError as exc:
+            # Bound optional delivery below the child-history client's timeout.
+            async with asyncio.timeout(_POST_TIMEOUT_S):
+                await _post_external_session_usage(
+                    client,
+                    session_id=child_id,
+                    usage={"attributed_cost_usd": cost},
+                )
+        except (httpx.HTTPError, TimeoutError) as exc:
             if (
                 isinstance(exc, httpx.HTTPStatusError)
                 and 400 <= exc.response.status_code < 500
-                and exc.response.status_code not in (408, 429)
+                and exc.response.status_code not in _HTTP_TRANSIENT_STATUS_CODES
             ):
                 dedupe.attribution_disabled_children.add(child_id)
                 _logger.warning(
                     "Disabling Claude child cost attribution; child=%s http_status=%s",
                     child_id,
-                    _http_status_for_log(exc),
+                    _http_status_for_log(exc) if isinstance(exc, httpx.HTTPError) else None,
                 )
-                continue
-            delay = 30.0
+                return
+            delay = _HTTP_POST_RETRY_BASE_DELAY_S
             if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
                 retry_after = exc.response.headers.get("retry-after")
-                with contextlib.suppress(ValueError):
-                    delay = max(delay, float(retry_after)) if retry_after else delay
+                if retry_after:
+                    with contextlib.suppress(ValueError):
+                        requested_delay = float(retry_after)
+                        if math.isfinite(requested_delay):
+                            delay = min(_HTTP_POST_RETRY_MAX_DELAY_S, max(delay, requested_delay))
             dedupe.attribution_retry_at[child_id] = time.monotonic() + delay
             _logger.warning(
                 "Failed to forward Claude child cost; child=%s http_status=%s retry_in=%.1fs",
                 child_id,
-                _http_status_for_log(exc),
+                _http_status_for_log(exc) if isinstance(exc, httpx.HTTPError) else None,
                 delay,
             )
-            continue
+            return
         dedupe.attribution_retry_at.pop(child_id, None)
         dedupe.attributed_costs[child_id] = cost
+        return
 
 
 async def _forward_session_cost(
@@ -4986,9 +5011,9 @@ async def _ensure_state_for_transcript(
 
 
 async def _cancel_subagent_forward_task(
-    task: asyncio.Task[SubagentForwardState] | None,
+    task: asyncio.Task[SubagentForwardState] | asyncio.Task[None] | None,
 ) -> None:
-    """Cancel and best-effort drain the independent child-history worker."""
+    """Cancel and best-effort drain a child worker."""
     if task is None:
         return
     task.cancel()

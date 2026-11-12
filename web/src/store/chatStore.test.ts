@@ -96,7 +96,11 @@ import {
   requestCloseDuringLaunch,
   setTerminalLaunching,
 } from "@/lib/terminals";
-import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
+import {
+  type ChildSessionInfo,
+  childSessionsQueryKey,
+  childSessionsQueryOptions,
+} from "@/hooks/useChildSessions";
 import {
   ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
   ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
@@ -778,6 +782,40 @@ describe("chatStore — lazy subtree usage", () => {
       usage_by_model: { "model-a": { input_tokens: inputTokens, total_cost_usd: cost } },
     });
   }
+
+  it.each([false, true])(
+    "ignores a superseded successful initial bind (usage included=%s)",
+    async (usageIncluded) => {
+      let finishMetadata!: (response: Response) => void;
+      const metadata = new Promise<Response>((resolve) => {
+        finishMetadata = resolve;
+      });
+      const readUsage = vi.fn(() => usage("conv_usage", 99));
+      routeUsage("conv_usage", readUsage, metadata);
+      const binding = useChatStore.getState().switchTo("conv_usage");
+      await tick();
+      const entry = conversationRegistry.peek("conv_usage")!;
+      const oldController = entry.getState().abortController!;
+      onTestFinished(() => oldController.abort());
+      const replacement = new AbortController();
+      entry.setState({
+        abortController: replacement,
+        boundAgentId: "agent_replacement",
+        loadingConversation: true,
+        sessionUsageLoading: true,
+      });
+      finishMetadata(snapshot("conv_usage", { usage_included: usageIncluded, total_cost_usd: 99 }));
+      await binding;
+      expect(entry.getState()).toMatchObject({
+        abortController: replacement,
+        boundAgentId: "agent_replacement",
+        loadingConversation: true,
+        sessionUsageLoading: true,
+        sessionCostUsd: null,
+      });
+      expect(readUsage).not.toHaveBeenCalled();
+    },
+  );
 
   it("finishes binding before usage, then hydrates the full cost and model map", async () => {
     seedSession("conv_usage", [userMessage("resp_1", "hello")]);
@@ -11338,7 +11376,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       ]);
     });
 
-    it("preserves omitted own cost and honors zero/null in warm and cold child caches", () => {
+    it("preserves omitted own cost and honors zero/null in warm and cold child caches", async () => {
       const key = childSessionsQueryKey("conv_parent");
       const send = (fields: Record<string, unknown>) =>
         handleSessionEvent({
@@ -11361,6 +11399,31 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       client.removeQueries({ queryKey: key });
       send({ own_cost_usd: 0 });
       expect(cost()).toBe(0);
+      let finishRead!: (response: Response) => void;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).includes("/child_sessions"))
+          return new Promise<Response>((resolve) => {
+            finishRead = resolve;
+          });
+        return defaultFetchHandler(input, init);
+      });
+      const read = client.fetchQuery(childSessionsQueryOptions("conv_parent"));
+      await tick();
+      send({ own_cost_usd: 0 });
+      send({ last_message_preview: null });
+      finishRead(
+        mockResponse({
+          data: [
+            { id: "conv_child1", title: "fetched", own_cost_usd: 9, last_message_preview: "older" },
+          ],
+        }),
+      );
+      await read;
+      expect(client.getQueryData<ChildSessionInfo[]>(key)?.[0]).toMatchObject({
+        title: "fetched",
+        own_cost_usd: 0,
+        last_message_preview: null,
+      });
     });
 
     it("merges an existing child in place on a status change", () => {

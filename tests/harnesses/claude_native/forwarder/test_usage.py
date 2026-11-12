@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -700,14 +702,29 @@ async def test_forward_session_cost_tags_display_advance_with_model(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [400, 404, 429, 503, None])
+@pytest.mark.parametrize(
+    "failure,retry_after",
+    [
+        (400, None),
+        (404, None),
+        (503, None),
+        (None, None),
+        (429, None),
+        (429, "10"),
+        (429, "9999999999"),
+        (429, "inf"),
+        (429, "NaN"),
+        (429, "invalid"),
+    ],
+)
 async def test_child_attribution_backfills_dedupes_and_retries_without_health_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     failure: int | None,
+    retry_after: str | None,
 ) -> None:
     clock = [100.0]
-    monkeypatch.setattr(forwarder.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(forwarder, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     prices = [0.5]
 
     def price(path: Path, *, include_sidechains: bool, cache: dict) -> float:
@@ -719,7 +736,10 @@ async def test_child_attribution_backfills_dedupes_and_retries_without_health_fa
 
     def respond(request: httpx.Request) -> httpx.Response:
         posts.append(json.loads(request.content)["data"])
-        return httpx.Response(failure if len(posts) == 1 and failure else 202)
+        return httpx.Response(
+            failure if len(posts) == 1 and failure else 202,
+            headers={"retry-after": retry_after} if retry_after is not None else {},
+        )
 
     state = forwarder.SubagentForwardState(
         subagents={
@@ -747,6 +767,9 @@ async def test_child_attribution_backfills_dedupes_and_retries_without_health_fa
         await run()
         await run()
         assert len(posts) == 1
+        if failure in (429, 503):
+            expected_delay = {"10": 10.0, "9999999999": 30.0}.get(retry_after, 1.0)
+            assert dedupe.attribution_retry_at["conv_child"] == 100 + expected_delay
         clock[0] += 31
         await run()
         if failure in (400, 404):
@@ -763,22 +786,26 @@ async def test_child_attribution_backfills_dedupes_and_retries_without_health_fa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rejection", [400, 404, 422, 429, 503])
+@pytest.mark.parametrize("rejection", [400, 404, 422, 429, 503, "timeout"])
 async def test_child_attribution_rejection_does_not_suppress_siblings(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rejection: int
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rejection: int | str
 ) -> None:
     clock = [100.0]
     price = [0.5]
-    monkeypatch.setattr(forwarder.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(forwarder, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     monkeypatch.setattr(
         forwarder, "_transcript_cost_size_cached", lambda *args, **kwargs: price[0]
     )
     posts: list[str] = []
 
-    def respond(request: httpx.Request) -> httpx.Response:
+    monkeypatch.setattr(forwarder, "_POST_TIMEOUT_S", 0.01)
+
+    async def respond(request: httpx.Request) -> httpx.Response:
         child = request.url.path.split("/")[-2]
         posts.append(child)
-        return httpx.Response(rejection if child == "rejected" else 202)
+        if child == "rejected" and rejection == "timeout":
+            await asyncio.Event().wait()
+        return httpx.Response(int(rejection) if child == "rejected" else 202)
 
     state = forwarder.SubagentForwardState(
         subagents={
@@ -801,13 +828,15 @@ async def test_child_attribution_rejection_does_not_suppress_siblings(
             )
 
         await run()
+        assert posts == ["rejected"]
+        await run()
         price[0] = 1.0
         await run()
         assert posts == ["rejected", "valid", "valid"]
         clock[0] += 31
         await run()
     assert dedupe.attributed_costs == {"valid": 1.0}
-    if rejection in (429, 503):
+    if rejection in (429, 503, "timeout"):
         assert posts == ["rejected", "valid", "valid", "rejected"]
         assert dedupe.attribution_disabled_children == set()
     else:

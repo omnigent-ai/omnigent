@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import type { MouseEvent, ReactNode } from "react";
+import type { ComponentType, MouseEvent, ReactNode } from "react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
@@ -7,28 +7,41 @@ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { SubagentsGraphView } from "./SubagentsGraphView";
+import type { AgentNodeData } from "./subagentGraphLayout";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
 // The real canvas exhausts jsdom's memory; this stand-in renders one button per
 // node and forwards clicks the way React Flow's `onNodeClick` does.
 interface StubNode {
   id: string;
-  data: { sessionId: string };
+  data: AgentNodeData;
 }
 vi.mock("@xyflow/react", () => ({
   ReactFlow: ({
     nodes,
     onNodeClick,
+    nodeTypes,
   }: {
     nodes: StubNode[];
     onNodeClick: (event: MouseEvent, node: StubNode) => void;
+    nodeTypes: Record<string, ComponentType<{ data: AgentNodeData }>>;
     children?: ReactNode;
   }) => (
     <div>
-      {nodes.map((node) => (
-        <button key={node.id} type="button" onClick={(event) => onNodeClick(event, node)}>
-          {node.data.sessionId}
-        </button>
-      ))}
+      {nodes.map((node) => {
+        const AgentNode = nodeTypes.agent;
+        return (
+          <button
+            key={node.id}
+            type="button"
+            aria-label={node.data.sessionId}
+            onClick={(event) => onNodeClick(event, node)}
+          >
+            <AgentNode data={node.data} />
+          </button>
+        );
+      })}
     </div>
   ),
   Background: () => null,
@@ -83,9 +96,37 @@ function renderGraph(opener: (id: string) => boolean, initialEntry = "/c/conv_ro
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  delete child.own_cost_usd;
 });
 
 describe("SubagentsGraphView node clicks", () => {
+  it.each([
+    [false, 0, null],
+    [true, 0, "$0.00"],
+    [true, null, "Unavailable"],
+  ] as const)("renders graph own-cost badges (enabled=%s, cost=%s)", (enabled, cost, label) => {
+    child.own_cost_usd = cost;
+    render(
+      <MemoryRouter>
+        <CapabilitiesProvider
+          info={{ ...FALLBACK_SERVER_INFO, features: { session_overview: enabled } }}
+        >
+          <SubagentsGraphView conversationId="conv_root" rootSessionId="conv_root" />
+        </CapabilitiesProvider>
+      </MemoryRouter>,
+    );
+    const badges = screen.queryAllByTitle(/^Own-agent cost:/);
+    expect(badges).toHaveLength(label === null ? 0 : 1);
+    if (label !== null) {
+      expect(badges[0]).toHaveTextContent(label);
+      expect(badges[0]).toHaveClass("min-w-0", "truncate");
+      expect(screen.getByRole("button", { name: "conv_child" })).toContainElement(badges[0]);
+    }
+    expect(
+      screen.getByRole("button", { name: "conv_root" }).querySelector("[title^='Own-agent cost:']"),
+    ).toBeNull();
+  });
+
   it("opens a sub-agent node in the Workspace panel when the setting is on", () => {
     writeOpenSubagentsInPanel(true);
     const opener = vi.fn(() => true);

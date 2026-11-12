@@ -9,7 +9,7 @@ the header menu), and each place is a separate entry point.
 
 ## Sub-features
 
-- `overview`: With the default-off `session_overview` server flag enabled, the header cost control opens an operational summary. It docks beside chat when Workspace is closed and space permits; narrow windows use an overlay. Explicit dismissal is remembered per session. Child rows navigate through the editor acceptance guard; modified clicks open their normal links.
+- `overview`: With the default-off `session_overview` server flag enabled, the header cost control opens an operational summary. It docks beside chat when Workspace is closed and space permits; narrow windows use an overlay. X or Escape remembers dismissal per session; accepted Agents/Changes navigation clears only the overlay request, allowing docking to return when Workspace closes. Child rows navigate through the editor acceptance guard; modified clicks open their normal links.
 
 - `siblings`: **Add nested agent** creates a private, fresh conversation in the
   same sidebar family. Its composer follows the server's Add Agent destination

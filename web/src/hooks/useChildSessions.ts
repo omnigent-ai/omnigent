@@ -1,4 +1,10 @@
-import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import {
+  queryOptions,
+  replaceEqualDeep,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
 import { useCallback, useSyncExternalStore } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { setSessionParent } from "@/lib/sessionHost";
@@ -102,6 +108,110 @@ interface ChildSessionsResponse {
  */
 export function childSessionsQueryKey(conversationId: string): readonly unknown[] {
   return ["conversation", conversationId, "child_sessions"];
+}
+
+interface ChildSessionsJournal {
+  patches: Map<string, Partial<ChildSessionInfo>>;
+  retire: () => void;
+}
+
+const childSessionsRequests = new WeakMap<QueryClient, Map<string, ChildSessionsJournal>>();
+const childSessionsResponses = new WeakMap<ChildSessionInfo[], ChildSessionsJournal>();
+
+/** Apply the same sparse upserts to live cache writes and completed HTTP lists. */
+function applyChildSessionPatches(
+  children: ChildSessionInfo[],
+  patches: Map<string, Partial<ChildSessionInfo>>,
+): ChildSessionInfo[] {
+  const rows = new Map(children.map((child) => [child.id, child]));
+  const inserted: string[] = [];
+  for (const [id, patch] of patches) {
+    const current = rows.get(id);
+    if (current === undefined) inserted.push(id);
+    rows.set(id, {
+      ...(current ?? {
+        title: null,
+        task_summary: null,
+        tool: null,
+        session_name: null,
+        labels: {},
+        current_task_status: null,
+        last_task_error: null,
+        busy: false,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+      }),
+      ...patch,
+      id,
+    });
+  }
+  return [...inserted.reverse(), ...children.map((child) => child.id)].map((id) => rows.get(id)!);
+}
+
+/** Record sanitized, present SSE fields, then show them immediately. */
+export function patchChildSessionsCache(
+  client: QueryClient,
+  parentId: string,
+  childId: string,
+  patch: Partial<ChildSessionInfo>,
+): void {
+  const journal = childSessionsRequests.get(client)?.get(parentId);
+  if (journal) journal.patches.set(childId, { ...journal.patches.get(childId), ...patch });
+  const key = childSessionsQueryKey(parentId);
+  const updatedAt = client.getQueryState(key)?.dataUpdatedAt ?? 0;
+  client.setQueryData<ChildSessionInfo[]>(
+    key,
+    (children) => applyChildSessionPatches(children ?? [], new Map([[childId, patch]])),
+    { updatedAt },
+  );
+}
+
+/** Shared by observers and imperative reads so every HTTP commit replays live receipts. */
+export function childSessionsQueryOptions(sessionId: string | null) {
+  return queryOptions({
+    queryKey:
+      sessionId === null
+        ? ["conversation", null, "child_sessions"]
+        : childSessionsQueryKey(sessionId),
+    queryFn: async ({ client, signal }): Promise<ChildSessionInfo[]> => {
+      if (sessionId === null) return [];
+      const requests = childSessionsRequests.get(client) ?? new Map<string, ChildSessionsJournal>();
+      childSessionsRequests.set(client, requests);
+      const journal: ChildSessionsJournal = {
+        patches: new Map(),
+        retire: () => {
+          if (requests.get(sessionId) === journal) requests.delete(sessionId);
+          signal.removeEventListener("abort", journal.retire);
+        },
+      };
+      requests.set(sessionId, journal);
+      signal.addEventListener("abort", journal.retire, { once: true });
+      try {
+        const children = await fetchChildSessions(sessionId, signal);
+        signal.throwIfAborted();
+        childSessionsResponses.set(children, journal);
+        return children;
+      } catch (error) {
+        journal.retire();
+        throw error;
+      }
+    },
+    structuralSharing: (previous, incoming) => {
+      const children = incoming as ChildSessionInfo[];
+      const journal = childSessionsResponses.get(children);
+      if (!journal) return replaceEqualDeep(previous, children);
+      try {
+        return replaceEqualDeep(previous, applyChildSessionPatches(children, journal.patches));
+      } finally {
+        childSessionsResponses.delete(children);
+        journal.retire();
+      }
+    },
+    enabled: sessionId !== null,
+    staleTime: 60_000,
+    retry: false,
+    refetchOnMount: true,
+  });
 }
 
 /** True for any key built by ``childSessionsQueryKey``. */
@@ -217,6 +327,7 @@ export async function fetchChildSessions(
   let after: string | null = null;
   let hasMore = true;
   while (hasMore) {
+    signal?.throwIfAborted();
     const params = new URLSearchParams({ limit: "100" });
     if (after !== null) params.set("after", after);
     // Cursor pages depend on the preceding response.
@@ -228,6 +339,7 @@ export async function fetchChildSessions(
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     // oxlint-disable-next-line no-await-in-loop
     const page = (await res.json()) as ChildSessionsResponse;
+    signal?.throwIfAborted();
     for (const row of page.data) rows.set(row.id, row);
     hasMore = page.has_more === true;
     if (!hasMore) break;
@@ -280,15 +392,7 @@ export function useChildSessions(
 ): UseChildSessionsResult {
   const sessionId = isTempConvId(conversationId) ? null : conversationId;
   const { data, isLoading, error } = useQuery({
-    queryKey:
-      sessionId === null
-        ? ["conversation", null, "child_sessions"]
-        : childSessionsQueryKey(sessionId),
-    queryFn: ({ signal }) => fetchChildSessions(sessionId as string, signal),
-    enabled: sessionId !== null,
-    staleTime: 60_000,
-    retry: false,
-    refetchOnMount: true,
+    ...childSessionsQueryOptions(sessionId),
     refetchInterval: pollMs ?? false,
   });
   return {

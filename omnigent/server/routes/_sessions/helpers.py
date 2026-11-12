@@ -2341,6 +2341,41 @@ def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
         return None
 
 
+def _own_cost_for_display(conv: Conversation, *, harness: str | None = None) -> float | None:
+    """Project own spend without relabeling Claude's descendant-inclusive bill."""
+    usage = conv.session_usage or {}
+    if "attributed_cost_usd" in usage:
+        return _priced_cost_for_display({"total_cost_usd": usage["attributed_cost_usd"]})
+    if (
+        harness == "claude-native"
+        or conv.harness_override == "claude-native"
+        or conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
+        or "policy_cost_usd" in usage
+    ):
+        return None
+    return _priced_cost_for_display(usage)
+
+
+def _cost_display_harnesses(conversations: Sequence[Conversation]) -> dict[str, str | None]:
+    """Resolve custom-agent cost provenance with one batched agent read."""
+    from omnigent.runtime._globals import _agent_store
+
+    candidates = [
+        conv
+        for conv in conversations
+        if "total_cost_usd" in (conv.session_usage or {})
+        and "attributed_cost_usd" not in (conv.session_usage or {})
+    ]
+    if not candidates:
+        return {}
+    agents = (
+        _agent_store.get_many(list({conv.agent_id for conv in candidates if conv.agent_id}))
+        if _agent_store is not None
+        else {}
+    )
+    return {conv.id: _resolve_harness(conv, agents_by_id=agents) for conv in candidates}
+
+
 def _model_usage_bucket(usage: dict[str, Any], model: str) -> dict[str, float]:
     """
     Get-or-create the per-model usage sub-bucket inside ``usage["by_model"]``.
@@ -5033,6 +5068,7 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
             parent_id,
             _latest_message_preview(items_by_child.get(conv.id, [])),
             cached_status=status,
+            harness=_cost_display_harnesses([conv]).get(conv.id),
         )
         event = SessionChildSessionUpdatedEvent(
             type="session.child_session.updated",
@@ -11736,6 +11772,7 @@ def _child_session_summary_from_conversation(
     last_message_preview: str | None,
     *,
     cached_status: str | None = None,
+    harness: str | None = None,
 ) -> ChildSessionSummary:
     """
     Build a :class:`ChildSessionSummary` from a child conversation.
@@ -11773,6 +11810,7 @@ def _child_session_summary_from_conversation(
         live ``_session_status_cache``; a status-edge publisher passes the
         edge's own value so a burst of transitions fans out one summary per
         edge instead of the latest status repeated.
+    :param harness: Resolved harness from the batch's cached agent specs.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -11842,9 +11880,7 @@ def _child_session_summary_from_conversation(
 
     routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
     return ChildSessionSummary(
-        own_cost_usd=(conv.session_usage or {}).get(
-            "attributed_cost_usd", (conv.session_usage or {}).get("total_cost_usd")
-        ),
+        own_cost_usd=_own_cost_for_display(conv, harness=harness),
         id=conv.id,
         parent_session_id=parent_session_id,
         title=display_title,

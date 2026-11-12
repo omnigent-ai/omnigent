@@ -269,6 +269,7 @@ from omnigent.server.routes._sessions.helpers import (
     _coerce_cumulative_field,
     _collect_descendant_conversation_ids,
     _consume_pre_resolved_harness_elicitation,
+    _cost_display_harnesses,
     _create_and_publish_antigravity_child,
     _create_and_publish_codex_child,
     _create_and_publish_devin_child,
@@ -316,6 +317,7 @@ from omnigent.server.routes._sessions.helpers import (
     _native_terminal_failure_from_runner_response,
     _native_terminal_name_for_harness,
     _NativeTerminalEnsureOutcome,
+    _own_cost_for_display,
     _owner_from_grants,
     _owns_host_runner,
     _parse_background_tasks,
@@ -1344,9 +1346,7 @@ def _build_session_list_item(
     # `user_id` is the requesting caller, never broadcast to other viewers.
     viewer_last_seen, viewer_unread = _read_state_entry(user_id, conv.id)
     return SessionListItem(
-        own_cost_usd=(conv.session_usage or {}).get(
-            "attributed_cost_usd", (conv.session_usage or {}).get("total_cost_usd")
-        ),
+        own_cost_usd=_own_cost_for_display(conv, harness=harness),
         id=conv.id,
         agent_id=conv.agent_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
@@ -1449,12 +1449,15 @@ def _publish_subtree_cost_to_ancestors(
     )
     child = next((row for row in tree if row.id == session_id), None)
     if child is not None and child.parent_conversation_id is not None:
-        usage = child.session_usage or {}
         child_event = SessionChildSessionUpdatedEvent(
             type="session.child_session.updated",
             conversation_id=child.parent_conversation_id,
             child_session_id=session_id,
-            child={"own_cost_usd": usage.get("attributed_cost_usd", usage.get("total_cost_usd"))},
+            child={
+                "own_cost_usd": _own_cost_for_display(
+                    child, harness=_cost_display_harnesses([child]).get(child.id)
+                )
+            },
         )
         session_stream.publish(child.parent_conversation_id, child_event.model_dump())
     for ancestor_id in ancestor_ids_from_tree(tree, session_id):
@@ -12971,14 +12974,14 @@ async def _child_session_summaries_from_conversations(
     parent_ids: Mapping[str, str] | None = None,
 ) -> list[ChildSessionSummary]:
     """
-    Build child summaries with one batched message-preview lookup.
+    Build child summaries with batched message previews and agent metadata.
 
     ``ChildSessionSummary.last_message_preview`` needs the latest visible
     message per child. Loading those by calling ``list_items`` once per
     child blocks the event loop and creates N+1 database traffic. This
     helper reads newest message items for all child ids in a worker
-    thread, computes previews in memory, then builds summaries without
-    further store access.
+    thread, computes previews in memory, then resolves cost provenance with
+    one batched agent read rather than per-child lookups.
 
     :param children: Child conversation rows from
         ``list_conversations(kind="sub_agent")``.
@@ -13002,11 +13005,13 @@ async def _child_session_summaries_from_conversations(
         child_id: _latest_message_preview(message_items)
         for child_id, message_items in message_items_by_child.items()
     }
+    harnesses = await asyncio.to_thread(_cost_display_harnesses, children)
     return [
         _child_session_summary_from_conversation(
             child,
             (parent_ids or {}).get(child.id, parent_session_id),
             previews.get(child.id),
+            harness=harnesses.get(child.id),
         )
         for child in children
     ]

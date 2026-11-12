@@ -109,7 +109,11 @@ import {
   type SseStreamResult,
 } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
-import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import {
+  childSessionsQueryKey,
+  patchChildSessionsCache,
+  type ChildSessionInfo,
+} from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
@@ -5184,6 +5188,7 @@ async function bindStream(
   hydratePending = false,
 ): Promise<void> {
   racedNativeModelOptions.delete(id);
+  const entry = conversationRegistry.peek(id);
   const controller = new AbortController();
   const ignoredNativeMessageIds = new Set<string>();
   nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
@@ -5320,7 +5325,14 @@ async function bindStream(
         ),
       ),
     ]);
-    if (isConversationDisposed(id)) return;
+    if (
+      entry === undefined ||
+      entry.disposed ||
+      conversationRegistry.peek(id) !== entry ||
+      controller.signal.aborted ||
+      get().abortController !== controller
+    )
+      return;
     const items = page.items;
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
@@ -5540,6 +5552,7 @@ async function bindStream(
   } catch (err) {
     if (
       isConversationDisposed(id) ||
+      conversationRegistry.peek(id) !== entry ||
       controller.signal.aborted ||
       get().abortController !== controller
     )
@@ -9751,9 +9764,7 @@ function applyTerminalDeleted(sessionId: string, resourceId: string): void {
  * changed (a status delta omits ``last_message_preview``; a preview delta
  * carries only it). So we overlay *present* fields onto the existing row
  * (a status flip keeps the preview, a preview update keeps busy/status),
- * and insert from present fields when the child isn't cached yet. Cold
- * cache (parent not viewed since reload) is a no-op — the eventual
- * ``useChildSessions`` mount pulls a fresh list.
+ * and insert from present fields when the child isn't cached yet.
  */
 function applyChildSessionUpdated(
   parentId: string,
@@ -9761,12 +9772,6 @@ function applyChildSessionUpdated(
   child: Record<string, unknown>,
 ): void {
   if (queryClient === null) return;
-  const key = childSessionsQueryKey(parentId);
-  // Initialize a cold cache rather than skipping: snapshot-on-connect
-  // sends full child rows over the stream, so seeding here lets child
-  // status/preview update live even when no useChildSessions is mounted.
-  const current = queryClient.getQueryData<ChildSessionInfo[]>(key) ?? [];
-  const updatedAt = queryClient.getQueryState(key)?.dataUpdatedAt ?? 0;
 
   // Build a patch from only the fields PRESENT in the payload (undefined
   // = "not in this delta, leave as-is"); explicit null is a real value.
@@ -9806,30 +9811,7 @@ function applyChildSessionUpdated(
     patch.pending_elicitations_count =
       typeof child.pending_elicitations_count === "number" ? child.pending_elicitations_count : 0;
 
-  const idx = current.findIndex((c) => c.id === childId);
-  if (idx === -1) {
-    // Insert: absent fields default (null / not-busy) until a fuller
-    // update (snapshot/refetch) fills them in.
-    const inserted: ChildSessionInfo = {
-      id: childId,
-      ...(patch.own_cost_usd !== undefined ? { own_cost_usd: patch.own_cost_usd } : {}),
-      title: patch.title ?? null,
-      task_summary: patch.task_summary ?? null,
-      tool: patch.tool ?? null,
-      session_name: patch.session_name ?? null,
-      labels: patch.labels ?? {},
-      current_task_status: patch.current_task_status ?? null,
-      last_task_error: patch.last_task_error ?? null,
-      busy: patch.busy ?? false,
-      last_message_preview: patch.last_message_preview ?? null,
-      pending_elicitations_count: patch.pending_elicitations_count ?? 0,
-    };
-    queryClient.setQueryData<ChildSessionInfo[]>(key, [inserted, ...current], { updatedAt });
-    return;
-  }
-  const next = [...current];
-  next[idx] = { ...current[idx], ...patch };
-  queryClient.setQueryData<ChildSessionInfo[]>(key, next, { updatedAt });
+  patchChildSessionsCache(queryClient, parentId, childId, patch);
 }
 
 /**

@@ -3129,7 +3129,17 @@ def test_publish_subtree_cost_to_ancestors_publishes_each_ancestor_subtree(
         for pub in recorder.published
         if pub.event["type"] == "session.child_session.updated"
     ]
-    assert patches[0]["child"] == {"own_cost_usd": 4.0}
+    assert patches == [
+        {
+            "type": "session.child_session.updated",
+            "sequence_number": None,
+            "conversation_id": p.id,
+            "child_session_id": c.id,
+            "child": {"own_cost_usd": 4.0},
+        }
+    ]
+    assert len(recorder.published) == 3
+    assert recorder.published[0].conversation_id == p.id
     by_conv = {pub.conversation_id: pub.event for pub in recorder.published}
     # Only the two ancestors are re-published — never the originating child.
     # A "conv_c" entry would mean the helper republished the node that already

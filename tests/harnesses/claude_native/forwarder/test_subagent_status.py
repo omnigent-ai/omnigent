@@ -1041,11 +1041,21 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
     blocked_lane: str,
 ) -> None:
     """A stuck child request cannot prevent the next live parent poll."""
+    from omnigent.runner.transports.ws_tunnel.event_delivery import (
+        RunnerEventDispatcher,
+        TunnelEventClient,
+    )
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        EventAckFrame,
+        EventBatchFrame,
+        decode_frame,
+    )
+
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
-    _seed_subagent_on_disk(
+    child_transcript = _seed_subagent_on_disk(
         transcript_path=transcript_path,
         subagent_id="blocked-child",
         agent_type="Explore",
@@ -1077,13 +1087,19 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
     )
     monkeypatch.setattr(forwarder, "_transcript_cost_size_cached", lambda *args, **kwargs: 0.5)
     estimated_children: list[list[str]] = []
+    new_child_estimated = asyncio.Event()
+    new_child_history = asyncio.Event()
+    child_request_cancelled = asyncio.Event()
 
     def estimate(**kwargs: Any) -> float:
         estimated_children.append(
             [entry.child_conversation_id for entry in kwargs["active_subagents"]]
         )
+        if "conv_later_child" in estimated_children[-1]:
+            loop.call_soon_threadsafe(new_child_estimated.set)
         return cost[0]
 
+    loop = asyncio.get_running_loop()
     monkeypatch.setattr(forwarder, "_session_cost_estimate", estimate)
     parent_cost_forwarded = asyncio.Event()
     child_request_started = asyncio.Event()
@@ -1093,8 +1109,15 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8")) if request.content else {}
         if isinstance(body, dict) and body.get("type") == "external_subagent_start":
-            return httpx.Response(202, json={"child_session_id": "conv_blocked_child"})
+            child_id = (
+                "conv_later_child"
+                if body["data"]["subagent_id"] == "later-child"
+                else "conv_blocked_child"
+            )
+            return httpx.Response(202, json={"child_session_id": child_id})
         if isinstance(body, list):
+            if "fresh-child-output" in request.content.decode():
+                new_child_history.set()
             if blocked_lane == "history":
                 child_request_started.set()
                 await release_child.wait()
@@ -1110,7 +1133,11 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
                 and blocked_lane == "attribution"
             ):
                 child_request_started.set()
-                await release_child.wait()
+                try:
+                    await release_child.wait()
+                except asyncio.CancelledError:
+                    child_request_cancelled.set()
+                    raise
             if (
                 request.url.path == "/v1/sessions/conv_parent/events"
                 and body["data"].get("policy_cost_usd") == 2.0
@@ -1124,10 +1151,29 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
             parent_item_forwarded.set()
         return httpx.Response(202, json={})
 
+    dispatcher = RunnerEventDispatcher()
+    tunnel_events: list[str] = []
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        for event in frame.events:
+            tunnel_events.append(event["type"])
+            await handler(
+                httpx.Request(
+                    "POST", f"http://ap/v1/sessions/{frame.session_id}/events", json=event
+                )
+            )
+        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    dispatcher.ready(send)
+
     @contextlib.asynccontextmanager
     async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler), base_url="http://ap"
+        async with TunnelEventClient(
+            event_dispatcher=dispatcher,
+            transport=httpx.MockTransport(handler),
+            base_url="http://ap",
         ) as client:
             yield client
 
@@ -1146,6 +1192,29 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
     try:
         await asyncio.wait_for(child_request_started.wait(), timeout=2.0)
         cost[0] = 2.0
+        if blocked_lane == "attribution":
+            with child_transcript.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "isSidechain": True,
+                            "type": "assistant",
+                            "uuid": "fresh-child-item",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": "fresh-child-output"}],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            _seed_subagent_on_disk(
+                transcript_path=transcript_path,
+                subagent_id="later-child",
+                agent_type="Explore",
+                description="later child",
+                tool_use_id="toolu_later_child",
+            )
         with transcript_path.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
@@ -1163,8 +1232,16 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
         await asyncio.wait_for(parent_item_forwarded.wait(), timeout=1.0)
         await asyncio.wait_for(parent_cost_forwarded.wait(), timeout=1.0)
         assert ["conv_blocked_child"] in estimated_children
+        assert "external_conversation_item" in tunnel_events
+        assert "external_session_usage" not in tunnel_events
+        if blocked_lane == "attribution":
+            await asyncio.wait_for(new_child_history.wait(), timeout=1.0)
+            await asyncio.wait_for(new_child_estimated.wait(), timeout=1.0)
+            assert not release_child.is_set()
     finally:
-        release_child.set()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+    if blocked_lane == "attribution":
+        assert child_request_cancelled.is_set()

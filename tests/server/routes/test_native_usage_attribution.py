@@ -545,3 +545,34 @@ async def test_flush_telemetry_reports_the_callers_installation_id(db_uri: str) 
         )
 
     assert [e.host_installation_id for e in events] == ["inst-host-9", None]
+
+
+@pytest.mark.parametrize(
+    "child,mixed",
+    [
+        (False, {}),
+        (True, {"cumulative_cost_usd": 3.0}),
+        (True, {"policy_cost_usd": 4.0}),
+        (True, {"cumulative_input_tokens": 10}),
+    ],
+)
+def test_attributed_cost_rejects_non_child_and_mixed_billing(
+    db_uri: str,
+    child: bool,
+    mixed: dict,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation(title="parent", agent_id=_AGENT_ID)
+    target = (
+        store.create_conversation(
+            title="child",
+            agent_id=_AGENT_ID,
+            parent_conversation_id=parent.id,
+        )
+        if child
+        else parent
+    )
+    store.set_session_usage(target.id, {"total_cost_usd": 2.0})
+    with pytest.raises(OmnigentError, match="Cost attribution"):
+        _persist_native_cumulative_usage(target.id, {"attributed_cost_usd": 1.0, **mixed}, store)
+    assert _usage(store, target.id) == {"total_cost_usd": 2.0}

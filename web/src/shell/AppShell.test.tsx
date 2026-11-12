@@ -3247,25 +3247,76 @@ describe("Right workspace card visibility", () => {
       expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
       expect(readSessionWorkspaceState("conv_auto").open).toBe(persistOpen);
       expect(readDefaultWorkspacePanelOpen()).toBe(persistOpen);
+      if (!persistOpen) {
+        act(() =>
+          useChatStore.setState({
+            sideChatToOpen: {
+              childId: "pending:explicit",
+              parentId: "conv_auto",
+              persistOpen: true,
+            },
+          }),
+        );
+        expect(readSessionWorkspaceState("conv_auto").open).toBe(false);
+        fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+        expect(readSessionWorkspaceState("conv_auto").open).toBe(true);
+        expect(readDefaultWorkspacePanelOpen()).toBe(true);
+      }
     },
   );
 
-  it("remembers overview dismissal when opening the Agents workspace", () => {
-    const baseMatchMedia = window.matchMedia;
-    const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
-      ...baseMatchMedia(query),
-      matches: query === "(min-width: 768px)" || baseMatchMedia(query).matches,
-    }));
-    onTestFinished(() => viewport.mockRestore());
-    writeWorkspacePanelDefault("collapsed");
-    mockConversations([{ id: "conv_overview", permission_level: null }]);
-    renderShell("/c/conv_overview", serverInfo({ features: { session_overview: true } }));
-    fireEvent.click(screen.getByRole("button", { name: "View all agents" }));
-    expect(readSessionWorkspaceState("conv_overview").overviewDismissed).toBe(true);
-    expect(readSessionWorkspaceState("conv_overview").open).toBe(true);
-    expect(readDefaultWorkspacePanelOpen()).toBe(true);
-    expect(screen.queryByRole("region", { name: "Session overview" })).toBeNull();
-  });
+  it.each(["View all agents", "View changes"])(
+    "temporarily hides the overview only after accepting %s",
+    (destination) => {
+      const baseMatchMedia = window.matchMedia;
+      const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...baseMatchMedia(query),
+        matches: query === "(min-width: 768px)" || baseMatchMedia(query).matches,
+      }));
+      onTestFinished(() => viewport.mockRestore());
+      writeWorkspacePanelDefault("collapsed");
+      mockConversations([{ id: "conv_overview", permission_level: null }]);
+      renderShell("/c/conv_overview", serverInfo({ features: { session_overview: true } }), {
+        dirtyFileViewer: true,
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Open session overview" }));
+      const overview = screen.getByRole("region", { name: "Session overview" });
+      fireEvent.click(screen.getByRole("button", { name: destination }));
+      expect(overview.parentElement).toHaveClass("block");
+      expect(readSessionWorkspaceState("conv_overview").open).not.toBe(true);
+      expect(readSessionWorkspaceState("conv_overview").overviewDismissed).toBe(false);
+      fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+      expect(overview.parentElement).not.toHaveClass("block");
+      expect(readSessionWorkspaceState("conv_overview").overviewDismissed).toBe(false);
+      expect(readSessionWorkspaceState("conv_overview").open).toBe(true);
+      expect(readDefaultWorkspacePanelOpen()).toBe(true);
+      fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+      expect(overview.parentElement).toHaveClass("@min-[1100px]:block");
+    },
+  );
+
+  it.each(["X", "Escape"])(
+    "persists overview dismissal only through %s and lets the header reopen it",
+    (dismissal) => {
+      const info = serverInfo({ features: { session_overview: true } });
+      mockConversations([{ id: "conv_overview", permission_level: null }]);
+      renderShell("/c/conv_overview", info);
+      fireEvent.click(screen.getByRole("button", { name: "Open session overview" }));
+      if (dismissal === "X")
+        fireEvent.click(screen.getByRole("button", { name: "Hide session overview" }));
+      else
+        fireEvent.keyDown(screen.getByRole("region", { name: "Session overview" }), {
+          key: "Escape",
+        });
+      expect(readSessionWorkspaceState("conv_overview").overviewDismissed).toBe(true);
+      cleanup();
+      renderShell("/c/conv_overview", info);
+      expect(screen.queryByRole("region", { name: "Session overview" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Open session overview" }));
+      expect(screen.getByRole("region", { name: "Session overview" })).toBeInTheDocument();
+      expect(readSessionWorkspaceState("conv_overview").overviewDismissed).toBe(false);
+    },
+  );
 
   it("reveals a collapsed workspace when New Browser Tab opens a tab", async () => {
     writeWorkspacePanelDefault("collapsed");

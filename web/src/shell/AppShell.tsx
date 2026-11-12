@@ -1620,6 +1620,14 @@ function AppShellImpl() {
     setOverviewState({ sessionId: serverConversationId, requested: visible, dismissed: !visible });
     writeSessionWorkspaceState(serverConversationId, { overviewDismissed: !visible });
   };
+  const hideOverviewOverlay = () => {
+    if (!serverConversationId) return;
+    setOverviewState({
+      sessionId: serverConversationId,
+      requested: false,
+      dismissed: overviewDismissed,
+    });
+  };
   const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
   const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
     fileNavigationGuardsRef.current.add(guard);
@@ -2999,7 +3007,7 @@ function AppShellImpl() {
                           handleRightRailTabChange("subagents");
                           revealRightPanel();
                         }
-                        setOverviewVisible(false);
+                        hideOverviewOverlay();
                       }}
                       onOpenChanges={() => {
                         if (isMobileViewport()) openChangesPanel();
@@ -3007,7 +3015,7 @@ function AppShellImpl() {
                           handleRightRailTabChange("changes");
                           revealRightPanel();
                         }
-                        setOverviewVisible(false);
+                        hideOverviewOverlay();
                       }}
                       requested={overviewRequested}
                       sessionId={serverConversationId!}
