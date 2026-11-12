@@ -641,6 +641,12 @@ boundaries. Confined harness processes require a supported Linux or macOS
 backend. Claude SDK containment also requires a system-installed Claude CLI;
 `OMNIGENT_CLAUDE_SDK_NO_SANDBOX` cannot bypass a requested sandbox.
 
+The Copilot, Cursor, Hermes, and Antigravity inner adapters cannot install
+process confinement and reject requests for it. Supplying `os_env` without a
+sandbox type selects the platform default, which these adapters also reject.
+Choose a sandbox-capable harness for confinement. Use an explicit
+`sandbox.type: none` only when unrestricted execution is intended.
+
 ### Secretless credential proxy
 
 `sandbox.credential_proxy` lets sandboxed tools authenticate to external hosts

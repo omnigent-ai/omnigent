@@ -535,22 +535,31 @@ class TestConstructor(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
-        executor = ClaudeSDKExecutor(
-            os_env=OSEnvSpec(
-                type="caller_process",
-                sandbox=OSEnvSandboxSpec(type="none"),
-            )
-        )
-        self.assertTrue(executor._os_env)
-        self.assertIsNotNone(executor._os_env_spec)
+        for declared_cwd, selected_cwd, expected_cwd in (
+            (None, None, None),
+            ("/tmp/work", None, "/tmp/work"),
+            ("/tmp/work", "/tmp/selected", "/tmp/selected"),
+        ):
+            with self.subTest(declared_cwd=declared_cwd, selected_cwd=selected_cwd):
+                executor = ClaudeSDKExecutor(
+                    cwd=selected_cwd,
+                    os_env=OSEnvSpec(
+                        type="caller_process",
+                        cwd=declared_cwd,
+                        sandbox=OSEnvSandboxSpec(type="none"),
+                    ),
+                )
+                self.assertTrue(executor._os_env)
+                self.assertIsNotNone(executor._os_env_spec)
+                self.assertEqual(executor._cwd, expected_cwd)
 
     def test_os_env_spec_wraps_cli_and_enables_native_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, PreparedClaudeCli
         from omnigent.inner.datamodel import OSEnvSpec
 
         for declared_cwd, selected_cwd, prepared_cwd, expected_cwd in (
-            ("/tmp/work", None, None, "/tmp/work"),
-            ("./project", "/tmp/work", None, "/tmp/work"),
+            ("/tmp/work", None, "/tmp/work", "/tmp/work"),
+            ("./project", "/tmp/selected", "/tmp/selected", "/tmp/selected"),
             ("./project", "/tmp/work", "/tmp/work/project", "/tmp/work/project"),
         ):
             spec = OSEnvSpec(type="caller_process", cwd=declared_cwd)
@@ -661,37 +670,6 @@ class TestConstructor(unittest.TestCase):
         )
         self.assertIsNone(executor._cwd)
         self.assertIsNone(executor._cli_sandbox_cwd)
-
-    def test_os_env_spec_without_supported_native_sandbox_disables_native_tools(self):
-        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, PreparedClaudeCli
-        from omnigent.inner.datamodel import OSEnvSpec
-
-        spec = OSEnvSpec(type="caller_process", cwd="/tmp/work")
-        for selected_cwd, expected_cwd in (
-            (None, "/tmp/work"),
-            ("/tmp/selected", "/tmp/selected"),
-        ):
-            with (
-                self.subTest(selected_cwd=selected_cwd),
-                patch(
-                    "omnigent.inner.claude_sdk_executor._find_system_claude",
-                    return_value="/usr/bin/claude",
-                ),
-                patch(
-                    "omnigent.inner.claude_sdk_executor.prepare_claude_cli_path",
-                    return_value=PreparedClaudeCli(
-                        cli_path="/usr/bin/claude",
-                        enable_native_tools=False,
-                    ),
-                ),
-            ):
-                executor = ClaudeSDKExecutor(cwd=selected_cwd, os_env=spec)
-
-                self.assertFalse(executor._os_env)
-                self.assertEqual(executor._os_env_spec, spec)
-                self.assertEqual(executor._cli_path, "/usr/bin/claude")
-                self.assertEqual(executor._cwd, expected_cwd)
-                self.assertIsNone(executor._cli_sandbox_cwd)
 
     def test_model_override(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
