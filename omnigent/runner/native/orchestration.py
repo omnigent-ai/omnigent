@@ -86,6 +86,7 @@ from omnigent.process_logging import process_log_reference
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
+    CLINE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
     DEVIN_NATIVE_TERMINAL_ROLE,
@@ -10615,6 +10616,210 @@ async def _launch_hermes(ctx: NativeLaunchContext) -> SessionResourceView:
 async def _launch_qwen(ctx: NativeLaunchContext) -> SessionResourceView:
     """Adapter: build the qwen-native terminal from a launch context."""
     return await _auto_create_qwen_terminal(
+        ctx.session_id,
+        ctx.resource_registry,
+        ctx.publish_event,
+        server_client=ctx.server_client,
+        ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
+    )
+
+
+async def _auto_create_cline_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, _JsonObject], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the cline-native hub session + TUI terminal for a session.
+
+    Ensures the workspace's ``cline hub`` daemon is running, registers the
+    Omnigent ``serve-mcp`` MCP server with it (``mcp.servers.upsert``),
+    creates (or resumes) the hub session over the hub's WebSocket command
+    protocol, publishes the endpoint in bridge state for the harness
+    executor, starts the event forwarder that mirrors the hub's session
+    events into the Omnigent conversation, and launches ``cline -i --id
+    <session>`` in a runner-owned tmux pane for the interactive surface.
+    Auth is Cline's own (``cline auth`` / provider API keys in ``~/.cline``).
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :param agent_spec: The session's resolved agent spec; its ``os_env`` is
+        inherited by the terminal.
+    :returns: Created terminal resource view.
+    """
+    from omnigent.harnesses.cline_native.bridge import (
+        ClineBridgeState,
+        clear_bridge_state,
+        prepare_bridge_dir,
+        write_bridge_state,
+    )
+    from omnigent.harnesses.cline_native.client import ClineHubClient, ClineHubError
+    from omnigent.harnesses.cline_native.forwarder import run_cline_forwarder
+    from omnigent.harnesses.cline_native.main import resolve_cline_executable
+    from omnigent.harnesses.cline_native.serve import ensure_cline_hub
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    # Tear down any forwarder left from a prior terminal for this session so
+    # old and new tasks can't both mirror (double-posting).
+    await _cancel_auto_forwarder_task(session_id)
+    bridge_dir = prepare_bridge_dir(session_id)
+    clear_bridge_state(bridge_dir)
+
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = os.path.realpath(str(launch_config.workspace))
+    cline_command = resolve_cline_executable()
+    runner_server_url = _required_runner_env("RUNNER_SERVER_URL").rstrip("/")
+
+    # Start the Omnigent builtin-tool relay BEFORE the hub session exists so
+    # ``tool_relay.json`` is present when the omnigent serve-mcp stdio server
+    # is registered — the sys_* / load_skill / web_fetch surface, with policy
+    # enforced server-side on each call.
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
+
+    endpoint = await ensure_cline_hub(cwd=workspace, executable=cline_command)
+    client = await ClineHubClient.connect(
+        endpoint.ws_url,
+        endpoint.auth_token,
+        workspace_root=workspace,
+        cwd=workspace,
+    )
+    try:
+        if server_client is not None:
+            with contextlib.suppress(Exception):
+                await client.upsert_mcp_stdio(
+                    "omnigent",
+                    sys.executable,
+                    [
+                        "-I",
+                        "-m",
+                        "omnigent.harnesses.claude_native.bridge",
+                        "serve-mcp",
+                        "--bridge-dir",
+                        str(bridge_dir),
+                    ],
+                    env={"PYTHONUNBUFFERED": "1"},
+                )
+        external_id = launch_config.external_session_id
+        cline_session_id: str | None = None
+        if external_id:
+            try:
+                cline_session_id = await client.session_resume(
+                    external_id,
+                    workspace_root=workspace,
+                    cwd=workspace,
+                )
+            except (ClineHubError, OSError, RuntimeError):
+                _logger.warning(
+                    "cline session.resume failed for %s; starting a fresh session",
+                    external_id,
+                )
+        if cline_session_id is None:
+            # Approvals route through Omnigent's elicitation hook (the
+            # executor answers ``approval.requested`` via
+            # ``native-permission-request``), so tools are NOT auto-approved.
+            cline_session_id = await client.session_create(
+                workspace_root=workspace,
+                cwd=workspace,
+                auto_approve_tools=False,
+            )
+            if server_client is not None and cline_session_id:
+                with contextlib.suppress(Exception):
+                    await server_client.patch(
+                        f"/v1/sessions/{session_id}",
+                        json={"external_session_id": cline_session_id},
+                    )
+    except BaseException:
+        await client.close()
+        raise
+
+    write_bridge_state(
+        bridge_dir,
+        ClineBridgeState(
+            ws_url=endpoint.ws_url,
+            auth_token=endpoint.auth_token,
+            session_id=cline_session_id,
+            pid=0,
+            server_url=(runner_server_url or ""),
+            headers=(dict(server_client.headers) if server_client is not None else {}),
+        ),
+    )
+    # The launch connection is only needed for setup; the forwarder and the
+    # executor each hold their own.
+    await client.close()
+
+    # Mirror hub events (assistant deltas/finished, tool calls, usage, run
+    # lifecycle) into the Omnigent chat via a dedicated subscribed connection.
+    if server_client is not None and cline_session_id:
+        forwarder_task = asyncio.create_task(
+            run_cline_forwarder(
+                ws_url=endpoint.ws_url,
+                auth_token=endpoint.auth_token,
+                hub_session_id=cline_session_id,
+                base_url=str(server_client.base_url).rstrip("/"),
+                headers={},
+                session_id=session_id,
+            ),
+            name=f"cline-forwarder-{session_id}",
+        )
+        _register_auto_forwarder_task(session_id, forwarder_task)
+
+    # Launch the interactive TUI pane attached to the same hub session —
+    # ``cline -i --id`` resumes by session id, so the pane and Omnigent drive
+    # one shared session.
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="cline",
+        session_key="main",
+        resource_role=CLINE_NATIVE_TERMINAL_ROLE,
+        parent_os_env=agent_os_env,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=workspace,
+                sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+            ),
+            command=cline_command,
+            args=[
+                "-i",
+                "--id",
+                cline_session_id,
+                *list(launch_config.terminal_launch_args or []),
+            ],
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    _logger.info("Auto-created cline hub session + TUI for session %s", session_id)
+    return terminal_view
+
+
+async def _launch_cline(ctx: NativeLaunchContext) -> SessionResourceView:
+    """Adapter: build the cline-native terminal from a launch context."""
+    return await _auto_create_cline_terminal(
         ctx.session_id,
         ctx.resource_registry,
         ctx.publish_event,

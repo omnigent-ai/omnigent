@@ -90,3 +90,7 @@ DEVIN_NATIVE_WRAPPER_VALUE = "devin-native-ui"
 # Value the ``omnigent hermes`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 HERMES_NATIVE_WRAPPER_VALUE = "hermes-native-ui"
+
+# Value the ``omnigent cline`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+CLINE_NATIVE_WRAPPER_VALUE = "cline-native-ui"

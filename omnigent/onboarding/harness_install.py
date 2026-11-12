@@ -420,6 +420,12 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary through the catalog.
     "devin-native": DEVIN_KEY,
     "native-devin": DEVIN_KEY,
+    # Native Cline (``cline-native``) wraps the ``cline`` CLI; the bare
+    # ``cline`` spelling is the ACP row and ``native-cline`` the reversed
+    # spelling — all gate on the same binary.
+    "cline": "cline",
+    "cline-native": "cline",
+    "native-cline": "cline",
 }
 
 
