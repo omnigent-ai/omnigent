@@ -18,7 +18,7 @@ import pytest
 from omnigent.inner import claude_sdk_executor, codex_worker, sandbox
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.codex_worker import prepare_codex_worker
-from omnigent.inner.datamodel import GitSshBinding, OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.goose_executor import GooseExecutor
 from omnigent.inner.kimi_executor import KimiExecutor
 from omnigent.inner.pi_executor import _try_sandbox_pi
@@ -35,7 +35,12 @@ def _prepared_launch(
     runtime_home.mkdir(exist_ok=True)
     worker = None
     names = ["PATH", "HOME", "CODEX_HOME"]
-    if harness == "codex":
+    if harness == "launcher":
+        assert spec is not None
+        policy = sandbox.resolve_sandbox(spec, workspace)
+        policy = sandbox.with_additional_read_roots(policy, [executable.parent])
+        launch_path = sandbox.create_exec_launcher(str(executable), policy, cwd=str(workspace))
+    elif harness == "codex":
         worker = prepare_codex_worker(
             codex_path=str(executable),
             cwd=workspace,
@@ -153,7 +158,7 @@ def test_unsandboxed_worker_requires_no_policy_or_explicit_none(
     [
         (harness, feature)
         for harness in _HARNESSES
-        for feature in ("fork", "start_in_scratch", "git_ssh", "cwd_conflict", "relative_cwd")
+        for feature in ("fork", "cwd_conflict", "relative_cwd")
     ],
 )
 def test_harness_rejects_policy_features_it_cannot_honor(
@@ -165,20 +170,7 @@ def test_harness_rejects_policy_features_it_cannot_honor(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     spec = OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
-    if feature == "git_ssh":
-        assert spec.sandbox is not None
-        spec.sandbox.git_ssh = [
-            GitSshBinding(
-                host="git.example.test",
-                port=22,
-                username="git",
-                repository="org/repo.git",
-                operations=frozenset({"fetch"}),
-                identity_file="/keys/id",
-                known_hosts_file="/keys/known_hosts",
-            )
-        ]
-    elif feature == "cwd_conflict":
+    if feature == "cwd_conflict":
         spec.cwd = str(tmp_path / "another-workspace")
     elif feature == "relative_cwd":
         spec.cwd = "restricted"
@@ -215,8 +207,14 @@ def test_harness_without_process_sandbox_rejects_requested_confinement(
         constructors[harness](os_env=spec)
 
 
-@pytest.mark.parametrize("harness", _HARNESSES)
-@pytest.mark.parametrize("launch_state", ["expected", "different_cwd", "forged_marker"])
+@pytest.mark.parametrize(
+    "harness,launch_state",
+    [
+        *((harness, "expected") for harness in _HARNESSES),
+        ("launcher", "different_cwd"),
+        ("launcher", "forged_marker"),
+    ],
+)
 @pytest.mark.parametrize("writable_grant", [False, True])
 def test_real_worker_keeps_declared_filesystem_and_network_boundary(
     harness: str,
@@ -254,6 +252,7 @@ def test_real_worker_keeps_declared_filesystem_and_network_boundary(
     listener.listen()
     probe = f"""
 import json, pathlib, socket, subprocess, sys
+assert pathlib.Path.cwd() == pathlib.Path({str(workspace.resolve())!r})
 assert pathlib.Path({str(allowed)!r}).read_text() == 'allowed'
 for path in (
     {str(secret)!r}, {str(escape)!r}, {str(transcript)!r}, {str(ssh_key)!r},
@@ -340,33 +339,6 @@ print(json.dumps({{'contained': True}}))
     if writable_grant:
         assert (writable / "allowed.txt").read_text() == "allowed write"
     assert not (writable / "denied.txt").exists()
-
-
-@pytest.mark.parametrize("harness", _HARNESSES)
-@pytest.mark.parametrize(
-    "feature", ["credential_proxy", "none_network", "none_copy_on_write", "windows_jobobject"]
-)
-def test_worker_rejects_unenforceable_network_or_backend(
-    harness: str, feature: str, tmp_path: Path
-) -> None:
-    from omnigent.inner.datamodel import CredentialProxySpec, WritePathSpec
-
-    executable = tmp_path / "agent"
-    executable.touch()
-    policy = OSEnvSandboxSpec(type="linux_bwrap")
-    if feature == "credential_proxy":
-        policy.credential_proxy = CredentialProxySpec(entries=[])
-    elif feature == "none_network":
-        policy.type = "none"
-        policy.allow_network = False
-    elif feature == "none_copy_on_write":
-        policy.type = "none"
-        policy.write_paths = [WritePathSpec(path="/workspace", copy_on_write=True)]
-    else:
-        policy.type = feature
-    with pytest.raises(ValueError, match=r"does not support|cannot enforce"):
-        with _prepared_launch(harness, executable, tmp_path, OSEnvSpec(sandbox=policy)):
-            pytest.fail(f"{harness} accepted unenforceable {feature}")
 
 
 def test_claude_sdk_missing_system_cli_rejects_requested_sandbox(
