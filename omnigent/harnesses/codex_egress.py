@@ -17,8 +17,7 @@ from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 CERTIFICATE_FAILURE_CODE = "model_endpoint_certificate_rejected"
 CERTIFICATE_FAILURE_TITLE = "Codex can't reach its model endpoint"
 CERTIFICATE_REMEDIATION = (
-    "Renew the TLS certificate used to reach the model endpoint (on a Databricks "
-    "laptop, run dbcert), then send your message again."
+    "Renew the TLS certificate used to reach the model endpoint, then send your message again."
 )
 _EVIDENCE_LIMIT = 300
 

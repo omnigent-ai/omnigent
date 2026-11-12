@@ -37,10 +37,10 @@ _CLIENT_UPDATE_OUTPUT = (
 
 # Codex's turn error when a custom model provider's token command fails its refresh.
 _PROVIDER_AUTH_OUTPUT = (
-    "provider auth command `isaac` exited with status exit status: 1: [INFO] Access token "
+    "provider auth command `token` exited with status exit status: 1: [INFO] Access token "
     "expiring. Attempting silent refresh.\n[ERROR] Silent token refresh failed: Failed to "
     "refresh token: HTTP Error 400: Bad Request.\nError: Could not get an AI DevTools access "
-    "token. Run `isaac` to log in and try again."
+    "token. Run `token` to log in and try again."
 )
 _CODEX_LOGIN_HINT = "\n\nIf this looks like an auth issue, running `codex login` may help."
 
@@ -465,10 +465,10 @@ def test_codex_provider_auth_diagnosis_names_the_command_to_sign_in(message: str
     assert diagnosis == FailureDiagnosis(
         title="Codex couldn't get a model provider token",
         cause=(
-            "The model provider's token command `isaac` failed on the host: Error: Could not "
-            "get an AI DevTools access token. Run `isaac` to log in and try again."
+            "The model provider's token command `token` failed on the host: Error: Could not "
+            "get an AI DevTools access token. Run `token` to log in and try again."
         ),
-        remediation="Run `isaac` on the host to sign in again, then send your message again.",
+        remediation="Run `token` on the host to sign in again, then send your message again.",
     )
 
 
@@ -482,7 +482,7 @@ def test_codex_provider_auth_diagnosis_names_the_command_to_sign_in(message: str
 @pytest.mark.parametrize("hint", ["", _CODEX_LOGIN_HINT])
 def test_codex_provider_auth_diagnosis_explains_exhausted_storage(failure: str, hint: str) -> None:
     message = (
-        "provider auth command `isaac` exited with status exit status: 1: "
+        "provider auth command `token` exited with status exit status: 1: "
         "Traceback (most recent call last):\n"
         '  File "/opt/token-helper/bootstrap.py", line 10, in create_venv\n'
         f"    tempfile.mkdtemp()\n{failure}{hint}"
@@ -492,7 +492,7 @@ def test_codex_provider_auth_diagnosis_explains_exhausted_storage(failure: str, 
 
     assert diagnosis == FailureDiagnosis(
         title="Host storage is full",
-        cause=f"The model provider's token command `isaac` failed on the host: {failure}",
+        cause=f"The model provider's token command `token` failed on the host: {failure}",
         remediation=(
             "Free space or inodes on the affected host filesystem, or raise its disk quota, "
             "then send your message again."
@@ -510,22 +510,22 @@ def test_codex_provider_auth_diagnosis_explains_exhausted_storage(failure: str, 
             "Sign in to the model provider again on the host, then send your message again.",
         ),
         (
-            "provider auth command `/opt/bin/isaac` failed to start: "
+            "provider auth command `/opt/bin/token` failed to start: "
             "No such file or directory (os error 2)",
-            "The model provider's token command `/opt/bin/isaac` couldn't be started on the "
+            "The model provider's token command `/opt/bin/token` couldn't be started on the "
             "host: No such file or directory (os error 2)",
-            "Check that `/opt/bin/isaac` is installed and on PATH on the host, then send your "
+            "Check that `/opt/bin/token` is installed and on PATH on the host, then send your "
             "message again.",
         ),
         (
-            "provider auth command `isaac` timed out after 5000ms",
-            "The model provider's token command `isaac` timed out on the host.",
-            "Run `isaac` on the host to sign in again, then send your message again.",
+            "provider auth command `token` timed out after 5000ms",
+            "The model provider's token command `token` timed out on the host.",
+            "Run `token` on the host to sign in again, then send your message again.",
         ),
         (
-            "provider auth command `isaac` produced an empty token",
-            "The model provider's token command `isaac` returned no usable token.",
-            "Run `isaac` on the host to sign in again, then send your message again.",
+            "provider auth command `token` produced an empty token",
+            "The model provider's token command `token` returned no usable token.",
+            "Run `token` on the host to sign in again, then send your message again.",
         ),
     ],
 )
@@ -540,7 +540,7 @@ def test_codex_provider_auth_diagnosis_covers_each_codex_outcome(
 
 def test_codex_provider_auth_diagnosis_fits_its_labels() -> None:
     message = (
-        f"provider auth command `{'isaac' * 40}` exited with status exit status: 1: "
+        f"provider auth command `{'token' * 40}` exited with status exit status: 1: "
         f"Error: {'token refresh failed ' * 30}"
     )
     diagnosis = diagnose_codex_provider_auth_failure(message)
@@ -554,7 +554,7 @@ def test_codex_provider_auth_diagnosis_fits_its_labels() -> None:
 
 @pytest.mark.parametrize(
     "message",
-    ["", "401 Unauthorized: your login has expired.", "auth command `isaac` exited"],
+    ["", "401 Unauthorized: your login has expired.", "auth command `token` exited"],
 )
 def test_codex_provider_auth_diagnosis_ignores_unrelated_errors(message: str) -> None:
     assert diagnose_codex_provider_auth_failure(message) is None

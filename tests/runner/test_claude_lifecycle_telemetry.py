@@ -58,7 +58,7 @@ async def launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "0")
     directory = bridge.prepare_bridge_dir(_SESSION, workspace=tmp_path)
     instance = make_test_terminal_instance("claude", "main", tmp_path)
-    instance.command = "isaac"
+    instance.command = "token"
     instance.args = bridge.augment_claude_args((), bridge_dir=directory)
     instance.lifecycle_trace.session_id = _SESSION
     for key, value in instance.lifecycle_trace.launch_environment(instance.diagnostic_id).items():

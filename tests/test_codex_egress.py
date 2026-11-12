@@ -13,7 +13,7 @@ from omnigent.harnesses.codex_egress import (
     is_connection_retry,
 )
 
-_DBCERT_LINE = (
+_CERTIFICATE_ERROR_LINE = (
     "Failed to fetch safe flags from proxy: [SSL: SSLV3_ALERT_CERTIFICATE_EXPIRED] "
     "ssl/tls alert certificate expired (_ssl.c:2580)"
 )
@@ -22,9 +22,9 @@ _DBCERT_LINE = (
 @pytest.mark.parametrize(
     ("line", "expired"),
     [
-        (_DBCERT_LINE, True),
+        (_CERTIFICATE_ERROR_LINE, True),
         ("Missing/Expired Certificate", True),
-        ("\x1b[31mMissing/Expired Certificate\x1b[0m Please run 'dbcert' on your laptop", True),
+        ("\x1b[31mMissing/Expired Certificate\x1b[0m Please renew your client certificate", True),
         ("error sending request: invalid peer certificate: Expired", True),
         ("the server certificate has expired", True),
         (
@@ -160,16 +160,16 @@ def test_connection_retry_detail_names_codex_reason() -> None:
 
 
 def test_certificate_failure_message_names_model_cause_and_evidence() -> None:
-    failure = detect_certificate_failure(_DBCERT_LINE)
+    failure = detect_certificate_failure(_CERTIFICATE_ERROR_LINE)
     assert failure is not None
     assert certificate_failure_message(failure, model="gpt-5") == (
         "Codex could not connect to its model endpoint for gpt-5: the TLS certificate has "
-        f"expired (stderr: {_DBCERT_LINE})."
+        f"expired (stderr: {_CERTIFICATE_ERROR_LINE})."
     )
     assert certificate_failure_message(failure).startswith(
         "Codex could not connect to its model endpoint: the TLS certificate has expired"
     )
-    assert "run dbcert" in CERTIFICATE_REMEDIATION
+    assert "Renew the TLS certificate" in CERTIFICATE_REMEDIATION
 
 
 def test_connection_retry_detail_redacts_and_bounds_codex_text() -> None:
@@ -196,7 +196,7 @@ def test_is_connection_failure_text_matches_connection_level_wording() -> None:
 
 
 def test_certificate_failure_message_keeps_codex_text() -> None:
-    failure = detect_certificate_failure(_DBCERT_LINE)
+    failure = detect_certificate_failure(_CERTIFICATE_ERROR_LINE)
     assert failure is not None
     message = certificate_failure_message(failure, codex_error="stream disconnected")
     assert message.endswith("). Codex reported: stream disconnected")

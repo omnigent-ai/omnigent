@@ -357,7 +357,7 @@ _CLIENT_UPDATE_REQUIRED = re.compile(
     re.IGNORECASE,
 )
 # Codex's report that a model provider's ``auth.command`` gave it no token, e.g.
-# "provider auth command `isaac` exited with status exit status: 1: <helper stderr>".
+# "provider auth command `token` exited with status exit status: 1: <helper stderr>".
 _CODEX_PROVIDER_AUTH_FAILURE = re.compile(
     r"provider auth command `(?P<command>[^`\n]+)` (?P<outcome>exited with status"
     r"|produced an empty token|timed out|failed to start|wrote non-UTF-8)"
@@ -486,11 +486,11 @@ def diagnose_codex_provider_auth_failure(message: str) -> FailureDiagnosis | Non
     """Explain a model provider token command that failed, naming the command to run.
 
     A custom Codex model provider can set ``auth.command`` (for example
-    ``isaac``) to print a bearer token. Its output can identify an expired
+    ``token``) to print a bearer token. Its output can identify an expired
     login or exhausted host storage, which need different recovery steps.
 
-    :param message: Codex's turn error, e.g. ``"provider auth command `isaac`
-        exited with status exit status: 1: ... Run `isaac` to log in and try again."``.
+    :param message: Codex's turn error, e.g. ``"provider auth command `token`
+        exited with status exit status: 1: ... Run `token` to log in and try again."``.
     :returns: A diagnosis whose fields each fit a persisted label, or ``None``
         when *message* is not that failure.
     """
