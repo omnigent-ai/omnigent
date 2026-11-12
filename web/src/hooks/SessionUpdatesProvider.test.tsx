@@ -1049,11 +1049,289 @@ describe("SessionUpdatesProvider list invalidation", () => {
       act(() => vi.advanceTimersByTime(5_000));
 
       expect(listInvalidations(invalidate)).toEqual([]);
-      // Its tree view still refreshes.
-      expect(invalidate).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("conv_a") });
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("patches a watched child's tree row in place instead of refetching its list", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      client.setQueryData(childSessionsQueryKey("conv_a"), [
+        {
+          id: "child_1",
+          title: null,
+          task_summary: null,
+          tool: null,
+          session_name: null,
+          current_task_status: "completed",
+          busy: false,
+          last_message_preview: "earlier output",
+          pending_elicitations_count: 0,
+        },
+      ]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+      const childFrame = (ownStatus: string, updatedAt: number) => ({
+        type: "changed",
+        items: [
+          {
+            ...conv("child_1"),
+            updated_at: updatedAt,
+            parent_session_id: "conv_a",
+            status: ownStatus,
+            own_status: ownStatus,
+            last_task_error: null,
+            child_session_count: 0,
+          },
+        ],
+      });
+
+      // A busy child ticking along: patched, never refetched.
+      for (let t = 1; t <= 5; t += 1) {
+        act(() => handler(childFrame("running", t)));
+        act(() => vi.advanceTimersByTime(4_000));
+      }
+      expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+        expect.objectContaining({ busy: true, current_task_status: "in_progress" }),
+      ]);
+      const childListCalls = () =>
+        invalidate.mock.calls.filter(
+          ([filters]) =>
+            JSON.stringify(filters?.queryKey) === JSON.stringify(childSessionsQueryKey("conv_a")),
+        );
+      expect(childListCalls()).toEqual([]);
+
+      // Finishing its turn refetches once, after the coalescing delay, for
+      // the preview.
+      act(() => handler(childFrame("idle", 6)));
+      act(() => handler(childFrame("idle", 7)));
+      expect(childListCalls()).toEqual([]);
+      act(() => vi.advanceTimersByTime(1_000));
+      expect(childListCalls()).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not reconcile the sidebar for an off-sidebar owner of an open tree", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      // A top-level session outside the sidebar whose sub-agent tree is open.
+      const observer = new QueryObserver(client, {
+        queryKey: childSessionsQueryKey("conv_owner"),
+        queryFn: async () => [],
+        staleTime: Infinity,
+      });
+      const unsubscribe = observer.subscribe(() => {});
+      try {
+        renderProvider(client, ["/"]);
+        const invalidate = vi.spyOn(client, "invalidateQueries");
+        const handler = frameHandler();
+        // The owner's own row ticks while its sub-agent works.
+        for (let t = 1; t <= 6; t += 1) {
+          act(() =>
+            handler({
+              type: "changed",
+              items: [
+                {
+                  ...conv("conv_owner"),
+                  project_id: "proj_filed",
+                  updated_at: t,
+                  status: "running",
+                  own_status: "running",
+                  child_session_count: 1,
+                  last_task_error: null,
+                },
+              ],
+            }),
+          );
+          act(() => vi.advanceTimersByTime(4_000));
+        }
+        const sidebarCalls = invalidate.mock.calls.filter(
+          ([filters]) => JSON.stringify(filters?.queryKey) === JSON.stringify(["conversations"]),
+        );
+        expect(sidebarCalls).toEqual([]);
+      } finally {
+        unsubscribe();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refetches a tree list when the first frame counts a child its fetch missed", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/"]);
+    const row = (id: string) => ({ id, busy: false, pending_elicitations_count: 0 });
+    let fetched = [row("child_1")];
+    const queryFn = vi.fn(async () => fetched);
+    const observer = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey("conv_a"),
+      queryFn,
+      staleTime: Infinity,
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    try {
+      await waitFor(() => expect(observer.getCurrentResult().isSuccess).toBe(true));
+      // A native sub-agent is created after the fetch; the first frame for
+      // the parent already counts it.
+      fetched = [row("child_2"), row("child_1")];
+      act(() =>
+        frameHandler()({
+          type: "snapshot",
+          items: [{ ...conv("conv_a"), own_status: "running", child_session_count: 2 }],
+        }),
+      );
+      await waitFor(() => expect(queryFn).toHaveBeenCalledTimes(2), { timeout: 3_000 });
+      await waitFor(() =>
+        expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toHaveLength(2),
+      );
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("watches children of mounted tree lists only", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const row = (id: string) => ({ id, busy: false, pending_elicitations_count: 0 });
+    client.setQueryData(childSessionsQueryKey("conv_a"), [row("child_1")]);
+    // A list cached by a tree that has since unmounted (e.g. a collapsed row).
+    client.setQueryData(childSessionsQueryKey("child_2"), [row("grandchild_x")]);
+    const observer = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey("conv_a"),
+      queryFn: async () => [row("child_1")],
+      staleTime: Infinity,
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    try {
+      renderProvider(client, ["/"]);
+      expect(lastWatched()).toEqual(["child_1", "conv_a"]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("keeps a frame that lands while a tree list's fetch is in flight", async () => {
+    // fetch(child idle) -> frame(child running) -> fetch resolves with the
+    // stale idle row. The stream won't resend the unchanged row, so the
+    // provider must re-apply it.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/"]);
+    const idleRow = {
+      id: "child_1",
+      title: null,
+      busy: false,
+      current_task_status: "completed",
+      pending_elicitations_count: 0,
+    };
+    let release: (rows: unknown[]) => void = () => {};
+    const queryFn = vi
+      .fn()
+      .mockResolvedValueOnce([idleRow])
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+      );
+    const observer = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey("conv_a"),
+      queryFn,
+      staleTime: Infinity,
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    try {
+      await waitFor(() => expect(observer.getCurrentResult().isSuccess).toBe(true));
+      void observer.refetch();
+      await waitFor(() => expect(queryFn).toHaveBeenCalledTimes(2));
+      act(() =>
+        frameHandler()({
+          type: "changed",
+          items: [
+            {
+              ...conv("child_1"),
+              parent_session_id: "conv_a",
+              status: "running",
+              own_status: "running",
+              last_task_error: null,
+              child_session_count: 0,
+            },
+          ],
+        }),
+      );
+      await act(async () => release([idleRow]));
+      await waitFor(() => expect(observer.getCurrentResult().isFetching).toBe(false));
+
+      expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+        expect.objectContaining({ busy: true, current_task_status: "in_progress" }),
+      ]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("finds children added while disconnected from an older server's snapshot", async () => {
+    // Older servers send no child_session_count; a reconnect snapshot falls
+    // back to refetching mounted tree lists.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/"]);
+    const row = (id: string) => ({ id, busy: false, pending_elicitations_count: 0 });
+    let fetched = [row("child_1")];
+    const queryFn = vi.fn(async () => fetched);
+    const observer = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey("conv_a"),
+      queryFn,
+      staleTime: Infinity,
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    try {
+      await waitFor(() => expect(observer.getCurrentResult().isSuccess).toBe(true));
+      fetched = [row("child_2"), row("child_1")];
+      act(() =>
+        frameHandler()({
+          type: "snapshot",
+          items: [{ ...conv("conv_a"), status: "running" }],
+        }),
+      );
+      await waitFor(
+        () => expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toHaveLength(2),
+        { timeout: 3_000 },
+      );
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("follows tree lists as they mount and unmount, watching their owners", async () => {
+    // The owner is watched even when it is no sidebar row (a grid pane, a
+    // scrolled-out root), so its child-count changes still arrive.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const row = (id: string) => ({ id, busy: false, pending_elicitations_count: 0 });
+    client.setQueryData(childSessionsQueryKey("conv_off"), [row("child_x")]);
+    renderProvider(client, ["/"]);
+    expect(lastWatched()).toEqual(["conv_a"]);
+
+    const observer = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey("conv_off"),
+      queryFn: async () => [row("child_x")],
+      staleTime: Infinity,
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    await waitFor(() => expect(lastWatched()).toEqual(["child_x", "conv_a", "conv_off"]));
+
+    unsubscribe();
+    await waitFor(() => expect(lastWatched()).toEqual(["conv_a"]));
   });
 
   it("still reconciles the lists when a watched top-level session is missing from them", () => {

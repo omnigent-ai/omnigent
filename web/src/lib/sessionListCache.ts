@@ -126,7 +126,12 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
   const row = conv as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(wire)) {
     const current = row[key];
-    if (key === "labels" || key === "pull_request" || key === "family") {
+    if (
+      key === "labels" ||
+      key === "pull_request" ||
+      key === "family" ||
+      key === "last_task_error"
+    ) {
       if (JSON.stringify(current) !== JSON.stringify(value)) changed.add(key);
     } else if (current !== value) {
       changed.add(key);

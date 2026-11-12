@@ -183,7 +183,13 @@ export function executionLogTabKey(idOrMain: string): string {
   return `executionLog:${idOrMain}`;
 }
 
-function parseChildSessionError(value: unknown): ChildSessionError | null {
+/**
+ * Parse a wire ``last_task_error`` into its UI shape.
+ *
+ * @param value - Wire value, e.g. ``{"code": "x", "message": "y"}``.
+ * @returns The error, or ``null`` when absent or malformed.
+ */
+export function parseChildSessionError(value: unknown): ChildSessionError | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
   if (typeof record.code !== "string" || typeof record.message !== "string") return null;

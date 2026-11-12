@@ -311,9 +311,23 @@ export interface Conversation {
    * For sub-agent sessions, the id of the direct parent session.
    * `null` / absent for top-level sessions. Included in
    * `WS /v1/sessions/updates` frames so `SessionUpdatesProvider` can
-   * invalidate the parent's child-sessions cache when the child changes.
+   * patch the child's row in the parent's child-sessions cache.
    */
   parent_session_id?: string | null;
+  /**
+   * The session's own status, without `status`'s roll-up of running children,
+   * e.g. `"running"`. `null` when none was recorded; absent on older servers.
+   */
+  own_status?: "idle" | "running" | "failed" | null;
+  /** Error from the session's latest failed run; absent on older servers. */
+  last_task_error?: { code: string; message: string } | null;
+  /**
+   * Non-archived direct sub-agent children. A change means the cached child
+   * list gained or lost a member. Absent on older servers.
+   */
+  child_session_count?: number;
+  /** Task-derived label, e.g. `"Investigate auth flow"`; absent on older servers. */
+  task_summary?: string | null;
   /**
    * First-class project this session is filed under (`projects.id`), or
    * `null`/absent when unfiled. Distinct from the legacy `omni_project`
