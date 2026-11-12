@@ -84,7 +84,7 @@ function renderMerge(pr: PullRequest, compact = false, accounts?: MergeAccounts)
     </QueryClientProvider>
   );
   const view = render(tree(pr));
-  return { invalidate, rerender: (next: PullRequest) => view.rerender(tree(next)) };
+  return { client, invalidate, rerender: (next: PullRequest) => view.rerender(tree(next)) };
 }
 
 async function openDialog(buttonName = "Squash and merge") {
@@ -306,13 +306,16 @@ describe("merging as another account", () => {
   };
 
   it("switches the PR's account after a refusal, then merges as it", async () => {
-    const { posts } = stubFetch(allMethods);
-    const { invalidate } = renderMerge(pullRequest(), false, twoAccounts);
+    // Each account has its own last-used method.
+    let defaultMethod: PullRequestMergeMethod = "squash";
+    const { posts } = stubFetch(() => mergeOptions(["merge", "squash", "rebase"], defaultMethod)());
+    const { client } = renderMerge(pullRequest(), false, twoAccounts);
+    const sessionInfo = { object: "session.github.info", selected_pr_url: PR_URL };
+    client.setQueryData(["github-info", "conv_1"], sessionInfo);
 
     await openDialog();
     const dialog = screen.getByRole("dialog");
-    const confirm = within(dialog).getByRole("button", { name: "Squash and merge" });
-    fireEvent.click(confirm);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Squash and merge" }));
     await waitFor(() => expect(posts).toHaveLength(1));
     const refusal = "The GitHub account on the host cannot merge this pull request.";
     await act(async () => {
@@ -332,22 +335,52 @@ describe("merging as another account", () => {
     // The refusal was the previous account's, and no merge starts mid-switch.
     expect(screen.queryByText(refusal)).not.toBeInTheDocument();
     expect(picker).toHaveTextContent("personal");
-    expect(confirm).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "Squash and merge" })).toBeDisabled();
 
+    defaultMethod = "rebase";
+    const prInfo = { object: "session.github.info", selected_pr_url: PR_URL, pr: { number: 7 } };
     await act(async () => {
-      posts[1].respond(json({ object: "session.github.info" }));
+      posts[1].respond(json(prInfo));
     });
-    await waitFor(() => expect(confirm).toBeEnabled());
-    // The default method is the account's own.
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["github-merge-options", "conv_1"] });
+    const confirm = await within(dialog).findByRole("button", { name: "Rebase and merge" });
+    expect(confirm).toBeEnabled();
     expect(picker).toHaveTextContent("personal");
+    // The PR's reply fills that PR's query and leaves the session's alone.
+    expect(client.getQueryData(["github-info", "conv_1", PR_URL])).toEqual(prInfo);
+    expect(client.getQueryData(["github-info", "conv_1"])).toEqual(sessionInfo);
 
     fireEvent.click(confirm);
     await waitFor(() => expect(posts).toHaveLength(3));
     expect(posts[2]).toMatchObject({
       path: MERGE_PATH,
-      body: { pr_url: PR_URL, merge_method: "squash", expected_head: HEAD },
+      body: { pr_url: PR_URL, merge_method: "rebase", expected_head: HEAD },
     });
+  });
+
+  it("stays open until an account switch saves", async () => {
+    const { posts } = stubFetch(allMethods);
+    renderMerge(pullRequest(), false, twoAccounts);
+
+    await openDialog();
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("combobox", { name: "Merge as" }));
+    fireEvent.click(screen.getByRole("option", { name: "personal" }));
+    await waitFor(() => expect(posts).toHaveLength(1));
+
+    // Reopening would show the old account while the host merges as the new one.
+    const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+    expect(cancel).toBeDisabled();
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    expect(screen.getByRole("dialog")).toBe(dialog);
+    expect(within(dialog).getByRole("button", { name: "Squash and merge" })).toBeDisabled();
+
+    await act(async () => {
+      posts[0].respond(json({ object: "session.github.info" }));
+    });
+    await waitFor(() => expect(cancel).toBeEnabled());
+    fireEvent.click(cancel);
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   });
 
   it("says when the account can't be switched", async () => {

@@ -1144,6 +1144,34 @@ describe("PullRequestPanel", () => {
       expect(screen.getByText("Merge pull request #6000?")).toBeInTheDocument();
     });
 
+    it.each([true, false])(
+      "offers the PR's accounts to merge as when it can switch them (%s)",
+      (switching) => {
+        state.info!.data!.capabilities!.account_switching = switching;
+        state.info!.data!.accounts = ["work", "personal"].map((login) => ({
+          login,
+          active: login === "work",
+          state: "success",
+          host: "github.com",
+        }));
+        state.info!.data!.selected_account = "work";
+        renderPanel();
+
+        // The repository resolved, so only the merge dialog asks for an account.
+        expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
+        const merge = screen.getByRole("region", { name: "Merge" });
+        fireEvent.click(within(merge).getByRole("button", { name: "Merge pull request" }));
+        const picker = within(screen.getByRole("dialog")).queryByRole("combobox", {
+          name: "Merge as",
+        });
+        if (switching) {
+          expect(picker).toHaveTextContent("work (active)");
+        } else {
+          expect(picker).toBeNull();
+        }
+      },
+    );
+
     it("divides the metadata from the description", () => {
       renderPanel();
 

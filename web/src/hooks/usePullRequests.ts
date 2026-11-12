@@ -642,6 +642,9 @@ export function useSetPullRequestPreference(conversationId: string | undefined) 
         ["github-info", conversationId, ...(body.pr_url ? [body.pr_url] : [])],
         info,
       );
+    },
+    // The host may save the choice and still fail the reply, so refetch either way.
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
       queryClient.invalidateQueries({ queryKey: ["github-changed-files", conversationId] });
       queryClient.invalidateQueries({ queryKey: ["github-pr-diff", conversationId] });

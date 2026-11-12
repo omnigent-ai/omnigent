@@ -276,8 +276,10 @@ function PullRequestMergeDialog({
   return (
     <Dialog
       open
-      // Keep the dialog up while a merge is in flight so its outcome stays visible.
-      onOpenChange={(next) => !next && !merge.isPending && onClose()}
+      // Keep the dialog up while a merge is in flight so its outcome stays visible,
+      // and while an account switch saves: a reopened dialog would show the old
+      // account while the host already merges as the new one.
+      onOpenChange={(next) => !next && !merge.isPending && !setPref.isPending && onClose()}
     >
       <DialogContent>
         <DialogHeader>
@@ -315,7 +317,11 @@ function PullRequestMergeDialog({
           </p>
         )}
         <DialogFooter>
-          <Button variant="outline" disabled={merge.isPending} onClick={onClose}>
+          <Button
+            variant="outline"
+            disabled={merge.isPending || setPref.isPending}
+            onClick={onClose}
+          >
             Cancel
           </Button>
           <Button
