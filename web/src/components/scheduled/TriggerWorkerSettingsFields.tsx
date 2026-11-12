@@ -8,6 +8,7 @@ import type { TriggerWorkerSettings } from "./triggerTemplates";
 import type { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
 import { ScheduleSelect as Select } from "./ScheduleSelect";
 import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Button } from "@/components/ui/button";
 
 export function TriggerWorkerHarnessField({
   value,
@@ -83,19 +84,14 @@ export function TriggerWorkerSettingsFields({
   onChange: (value: TriggerWorkerSettings) => void;
   onSelectOpenChange: (open: boolean) => void;
 }) {
-  // The server refuses these for a session an agent starts. A server that can't apply a
-  // saved mode still shows it, so it can be cleared: a newer runner refuses the call there.
+  // The server refuses these for a session an agent starts.
   const permissions = permissionModesSupported
     ? settings.permissions.filter((option) => !APPROVAL_SKIPPING_PERMISSION_MODES.has(option.value))
-    : value.permissionMode
-      ? [
-          settings.permissions.find((option) => option.value === value.permissionMode) ?? {
-            value: value.permissionMode,
-            label: value.permissionMode,
-            description: "",
-          },
-        ]
-      : [];
+    : [];
+  // A newer runner refuses a saved mode on a server that can't apply it, so offer to drop it.
+  const unappliedMode = permissionModesSupported ? "" : value.permissionMode;
+  const unappliedLabel =
+    settings.permissions.find((option) => option.value === unappliedMode)?.label ?? unappliedMode;
   return (
     <div className="space-y-3" data-testid="task-worker-settings">
       <ModelEffortFields
@@ -117,6 +113,27 @@ export function TriggerWorkerSettingsFields({
         onPermissionModeChange={(permissionMode) => onChange({ ...value, permissionMode })}
         onSelectOpenChange={onSelectOpenChange}
       />
+      {unappliedMode && (
+        <div
+          className="flex items-center justify-between gap-3"
+          data-testid="task-worker-permission-unapplied"
+        >
+          <p className="text-sm text-destructive">
+            Matching sessions are set to start in {unappliedLabel}, which this server can&apos;t
+            apply, so they won&apos;t start.
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={disabled}
+            data-testid="task-worker-permission-clear"
+            onClick={() => onChange({ ...value, permissionMode: "" })}
+          >
+            Clear
+          </Button>
+        </div>
+      )}
       {settings.blockedReason && (
         <p role="alert" className="text-sm text-destructive">
           {settings.blockedReason}
