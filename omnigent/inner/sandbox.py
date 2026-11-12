@@ -537,9 +537,11 @@ def validate_harness_sandbox(
     from .os_env_serialization import validate_sandbox_scan_options
 
     validate_sandbox_scan_options(sandbox)
+    # Relative declarations do not override the selected session workspace.
     if (
         cwd is not None
         and spec.cwd
+        and Path(spec.cwd).expanduser().is_absolute()
         and sandbox.type != "none"
         and not cwd.resolve(strict=False).is_relative_to(_resolve_grant_root(cwd, spec.cwd))
     ):

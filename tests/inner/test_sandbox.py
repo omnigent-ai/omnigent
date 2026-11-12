@@ -745,7 +745,14 @@ def test_harness_policy_validation_rejects_unsupported_features(feature: str) ->
 
 @pytest.mark.parametrize(
     "declaration,conflicts",
-    [(".", False), ("restricted", True), ("parent", False), ("outside", True), ("prefix", True)],
+    [
+        (".", False),
+        ("./sub", False),
+        ("sub", False),
+        ("parent", False),
+        ("outside", True),
+        ("prefix", True),
+    ],
 )
 def test_harness_policy_validation_resolves_relative_cwd(
     declaration: str, conflicts: bool, tmp_path: pathlib.Path
@@ -768,7 +775,8 @@ def test_harness_policy_validation_resolves_relative_cwd(
 
 
 @pytest.mark.parametrize(
-    "feature", ["credential_proxy", "none_network", "none_copy_on_write", "windows_jobobject"]
+    "feature",
+    ["credential_proxy", "none_network", "none_egress", "none_copy_on_write", "windows_jobobject"],
 )
 def test_harness_policy_validation_rejects_unenforceable_network_or_backend(feature: str) -> None:
     from omnigent.inner.datamodel import (
@@ -785,6 +793,9 @@ def test_harness_policy_validation_rejects_unenforceable_network_or_backend(feat
     elif feature == "none_network":
         policy.type = "none"
         policy.allow_network = False
+    elif feature == "none_egress":
+        policy.type = "none"
+        policy.egress_rules = ["GET api.example.com/**"]
     elif feature == "none_copy_on_write":
         policy.type = "none"
         policy.write_paths = [WritePathSpec(path="/workspace", copy_on_write=True)]

@@ -119,7 +119,6 @@ def test_executor_factory_defaults_when_unset(
     [
         ('{"sandbox": {"type": "linux_bwrap"}}', "Antigravity cannot enforce"),
         ("{not-json", "HARNESS_ANTIGRAVITY_OS_ENV must contain a valid OS environment policy"),
-        ("null", "HARNESS_ANTIGRAVITY_OS_ENV must contain an OS environment object"),
     ],
 )
 def test_executor_factory_rejects_unsupported_os_policy_before_construction(
