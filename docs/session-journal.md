@@ -118,8 +118,8 @@ run to run, and saves the workflow with a description that says what a run
 needs ("Give it: the test suite"). You can also ask in chat, "save this as a
 workflow"; with no name given, the agent suggests one first. Describe a new
 workflow in chat ("make a workflow that triages flaky tests") and the agent
-replies with a draft, then waits: save it now, or try it once first on the
-details you give it.
+writes the draft as the session's plan, so its steps show in the Tasks tab,
+then waits: save it now, or try it once first on the details you give it.
 
 Once you have saved workflows, **Run a workflow** lists them, with a search
 field and **New workflow** below them. Pick one, add this run's
