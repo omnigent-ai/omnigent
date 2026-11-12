@@ -1116,11 +1116,10 @@ async def test_a_run_during_an_unregistered_sandboxs_teardown_keeps_the_session(
         await terminate(*args)
 
     monkeypatch.setattr(fire_mod, "_terminate_run_sandbox", slow_teardown)
+    tracker = ManagedLaunchTracker()
 
     first = asyncio.create_task(
-        _unregistered_executor(store, conversations, ManagedLaunchTracker()).fire(
-            claimed.task, claimed.lease
-        )
+        _unregistered_executor(store, conversations, tracker).fire(claimed.task, claimed.lease)
     )
     try:
         await asyncio.wait_for(tearing_down.wait(), 10)
@@ -1128,6 +1127,10 @@ async def test_a_run_during_an_unregistered_sandboxs_teardown_keeps_the_session(
         assert conversations.get_conversation(unstarted.session_id).labels[STARTUP_LABEL] == (
             "failed"
         )
+        # Requests waiting on the abandoned launch settle only once its sandbox is gone.
+        abandoned = tracker.get(unstarted.session_id)
+        assert abandoned is not None
+        assert not abandoned.settled.is_set()
         await asyncio.wait_for(
             _unregistered_executor(store, conversations, ManagedLaunchTracker()).fire(
                 unstarted, second
@@ -1151,6 +1154,8 @@ async def test_a_run_during_an_unregistered_sandboxs_teardown_keeps_the_session(
     ]
     assert store.get(claimed.task.id).session_id == unstarted.session_id
     assert launched == [unstarted.session_id]
+    assert abandoned.settled.is_set()
+    assert abandoned.error == runs[claimed.lease.run.id].error
 
 
 def _bound_unstarted_session_waits(monkeypatch: pytest.MonkeyPatch) -> None:
