@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
 
+from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR
+
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
 from .model_auth import (
@@ -176,7 +178,7 @@ class SubprocessModelSigner:
 
         env = {
             name: value
-            for name in ("HOME", "PATH", "LANG", "LC_ALL", "TZ")
+            for name in ("HOME", "PATH", "LANG", "LC_ALL", "TZ", CLIENT_SURFACE_ENV_VAR)
             if (value := os.environ.get(name)) is not None
         }
         try:

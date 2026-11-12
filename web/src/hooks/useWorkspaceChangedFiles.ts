@@ -105,6 +105,7 @@ interface WorkspaceQueryOptions {
 export interface WorkspaceChangedFile {
   path: string;
   name: string;
+  repository_root?: string;
   /** Change status: "created", "modified", or "deleted". */
   status: "created" | "modified" | "deleted";
   bytes: number | null;
@@ -239,6 +240,7 @@ interface ChangedFilesResponse {
   data: {
     path: string;
     name: string;
+    repository_root?: string;
     status: "created" | "modified" | "deleted";
     bytes: number | null;
     modified_at: number | null;
@@ -283,6 +285,7 @@ async function fetchWorkspaceChangedFiles(
   const data: WorkspaceChangedFile[] = json.data.map((e) => ({
     path: e.path,
     name: e.name,
+    repository_root: e.repository_root,
     status: e.status,
     bytes: e.bytes,
     modified_at: e.modified_at,
@@ -571,6 +574,7 @@ async function fetchWorkspaceFileSearch(
   include: string,
   exclude: string,
   location: string,
+  signal?: AbortSignal,
 ): Promise<WorkspaceFileSearchResult> {
   const params = new URLSearchParams({ limit: "500" });
   if (query) params.set("q", query);
@@ -581,6 +585,7 @@ async function fetchWorkspaceFileSearch(
   if (base) params.set("base", base);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/search${segment ? `/${segment}` : ""}?${params}`,
+    { signal },
   );
   // 404 means the runner has no OS environment for this session (cloud-only
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
@@ -629,8 +634,16 @@ export function useWorkspaceFileSearch(
       trimmedExclude,
       location,
     ],
-    queryFn: () =>
-      fetchWorkspaceFileSearch(conversationId!, trimmed, trimmedInclude, trimmedExclude, location),
+    // React Query aborts the signal when a newer query replaces this one.
+    queryFn: ({ signal }) =>
+      fetchWorkspaceFileSearch(
+        conversationId!,
+        trimmed,
+        trimmedInclude,
+        trimmedExclude,
+        location,
+        signal,
+      ),
     enabled:
       (options.enabled ?? true) && !!conversationId && trimmed.length > 0 && serveable !== false,
     staleTime: 5_000,

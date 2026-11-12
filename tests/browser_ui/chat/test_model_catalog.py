@@ -8,7 +8,12 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, Request, expect
 
-from tests.browser_ui.chat.session_contract import ChatSessionContract, model_option
+from tests._helpers.picker_routes import OWN_AGENTS
+from tests.browser_ui.chat.session_contract import (
+    ChatSessionContract,
+    list_payload,
+    model_option,
+)
 
 
 def _open_models(page: Page) -> None:
@@ -419,6 +424,138 @@ def test_bound_host_catalog_replaces_the_launch_preview(
     expect(rows.nth(1)).to_have_attribute("data-model-id", "haiku")
 
 
+_SESSION_ROWS = [
+    model_option("opus", display_name="Opus (session)", is_default=True),
+    model_option("haiku", display_name="Haiku (session)"),
+]
+
+
+def _serve_landing_beside_sandbox(chat: ChatSessionContract) -> None:
+    """Offer the session's Claude agent on the landing page with only managed sandboxes."""
+    chat.contract.json(
+        "/v1/agents",
+        list_payload(
+            [
+                {
+                    "id": chat.agent_id,
+                    "name": "claude-code-native-ui",
+                    "display_name": "Claude Code",
+                    "harness": "claude-native",
+                    "skills": [],
+                }
+            ]
+        ),
+    )
+    chat.contract.json(OWN_AGENTS, list_payload([]))
+    chat.contract.json("/v1/skills", {"skills": []})
+    chat.contract.json("/v1/hosts", {"hosts": []})
+
+
+def _deliver_session_catalog(chat: ChatSessionContract) -> None:
+    chat.set_catalog(harness="claude-native", models=_SESSION_ROWS, selected_model="opus")
+    chat.emit(
+        {
+            "event": "session.model_options",
+            "data": {"type": "session.model_options", "conversation_id": chat.session_id},
+        }
+    )
+
+
+def _open_landing_models(page: Page, agent_id: str) -> None:
+    page.get_by_test_id("new-chat-landing-agent-select").click()
+    page.get_by_test_id(f"new-chat-landing-agent-config-{agent_id}").get_by_text(
+        "Edit", exact=True
+    ).click()
+
+
+def test_new_session_picker_offers_a_running_sandbox_catalog(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A sandbox session's catalog replaces the gateway preview for the next launch."""
+    chat = chat_session_contract
+    _serve_launching_sandbox(chat, harness="claude-native", wrapper="claude-code-native-ui")
+    _serve_landing_beside_sandbox(chat)
+
+    page.goto(chat.base_url)
+    expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=20_000)
+    _open_landing_models(page, chat.agent_id)
+    expect(page.get_by_test_id("new-chat-landing-agent-model-gateway/opus")).to_be_visible()
+    expect(page.get_by_test_id("new-chat-landing-agent-model-haiku")).to_have_count(0)
+    page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
+
+    page.locator(f'aside [data-sidebar-session-id="{chat.session_id}"] a').click()
+    chat.wait_for_stream()
+    _deliver_session_catalog(chat)
+    _open_models(page)
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
+    expect(rows.nth(0)).to_have_attribute("data-model-id", "opus")
+    expect(rows).to_have_count(2)
+    page.keyboard.press("Escape")
+
+    page.get_by_test_id("new-chat-button").click()
+    expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible()
+    _open_landing_models(page, chat.agent_id)
+    expect(page.get_by_test_id("new-chat-landing-agent-model-haiku")).to_contain_text(
+        "Haiku (session)"
+    )
+    expect(page.get_by_test_id("new-chat-landing-agent-model-opus")).to_be_visible()
+    expect(page.get_by_test_id("new-chat-landing-agent-model-gateway/opus")).to_have_count(0)
+    # Claude Code's own effort ladder, which the gateway rows do not describe.
+    expect(page.get_by_test_id("new-chat-landing-agent-effort-xhigh")).to_be_visible()
+
+
+def test_launch_pick_missing_from_the_sandbox_resets_to_default(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A launch model the sandbox lacks is replaced by the default, with a notice."""
+    chat = chat_session_contract
+    _serve_launching_sandbox(chat, harness="claude-native", wrapper="claude-code-native-ui")
+    _serve_landing_beside_sandbox(chat)
+    creates: list[dict] = []
+
+    def create(request: Request) -> dict[str, str]:
+        body = request.post_data_json
+        creates.append(body)
+        chat.update_session(
+            model_override=body.get("model_override"),
+            reasoning_effort=body.get("reasoning_effort"),
+        )
+        return {"id": chat.session_id}
+
+    chat.contract.json("/v1/sessions", create, method="POST")
+
+    page.goto(chat.base_url)
+    expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=20_000)
+    _open_landing_models(page, chat.agent_id)
+    page.get_by_test_id("new-chat-landing-agent-model-gateway/sonnet").click()
+    page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
+    page.get_by_test_id("new-chat-landing-input").fill("summarize the repo")
+    page.get_by_test_id("new-chat-landing-submit").click()
+
+    expect(page.get_by_test_id("runner-starting-indicator").first).to_contain_text(
+        "Provisioning sandbox", timeout=20_000
+    )
+    assert [body.get("model_override") for body in creates] == ["gateway/sonnet"]
+    chat.wait_for_stream()
+    _deliver_session_catalog(chat)
+
+    expect(
+        page.get_by_text(
+            "Sonnet via gateway isn't available in this sandbox. Using the default model."
+        )
+    ).to_be_visible()
+    # "default" is the clear alias; Claude Code's effort ladder fits every model.
+    assert chat.session_patches == [{"model_override": "default"}]
+    _open_models(page)
+    expect(page.locator('[data-model-id="opus"]')).to_be_visible()
+    # No off-catalog "(current)" row keeps the unavailable pick alive.
+    expect(page.locator('[data-model-id="gateway/sonnet"]')).to_have_count(0)
+
+
 @pytest.mark.parametrize("mobile", [False, True], ids=["desktop", "mobile"])
 @pytest.mark.parametrize("entrypoint", ["tray", "workspace"])
 def test_side_chat_model_settings_before_and_after_first_message(
@@ -488,10 +625,10 @@ def test_side_chat_model_settings_before_and_after_first_message(
     contract.json(path, patch, method="PATCH")
     contract.json(f"{path}/events", message, method="POST")
     contract.json(f"{path}/agent", chat._agent())
-    for resource in ("items", "child_sessions", "resources/terminals"):
+    for resource in ("items", "child_sessions", "side_chats", "resources/terminals"):
         contract.json(f"{path}/{resource}", list_payload([]))
     contract.response(f"{path}/read-state", method="PUT")
-    contract.route(f"**{path}/stream*", lambda route: route.continue_(url=chat.stream.url))
+    contract.route(f"**{path}/stream*", chat.route_stream)
 
     page.goto(chat.url)
     chat.wait_for_stream()
@@ -513,17 +650,17 @@ def test_side_chat_model_settings_before_and_after_first_message(
         page.get_by_role("menuitem", name="Side chat", exact=True).click()
 
     picker = page.get_by_role("button", name="Side chat model and effort")
+    page.get_by_test_id("side-chat-input").fill("Explain this in the side chat.")
     picker.click()
     page.get_by_test_id("side-chat-model-edit").click()
     page.get_by_role("menuitemcheckbox", name="Opus", exact=True).click()
     page.get_by_role("menuitemcheckbox", name="Low", exact=True).click()
     page.keyboard.press("Escape")
-    # The tray creates a live fork; only an unsent draft displays the requested model.
-    expect(picker).to_contain_text("Sonnet" if entrypoint == "tray" else "Opus")
+    # Each entrypoint opens an unsent draft that shows the requested model.
+    expect(picker).to_contain_text("Opus")
     expect(picker).to_contain_text("Low")
-    assert len(forks) == (1 if entrypoint == "tray" else 0)
+    assert len(forks) == 0
     assert chat.session_patches == []
-    page.get_by_test_id("side-chat-input").fill("Explain this in the side chat.")
     with page.expect_response(
         lambda response: (
             response.url.endswith(f"{path}/events") and response.request.method == "POST"
@@ -532,9 +669,8 @@ def test_side_chat_model_settings_before_and_after_first_message(
         page.get_by_test_id("side-chat-send").click()
     expect(page.get_by_test_id("side-chat-input")).to_have_value("")
     assert len(forks) == 1
-    if entrypoint == "workspace":
-        assert forks[0]["model_override"] == "opus"
-        assert forks[0]["reasoning_effort"] == "low"
+    assert forks[0]["model_override"] == "opus"
+    assert forks[0]["reasoning_effort"] == "low"
     assert child["model_override"] == "opus"
     assert child["reasoning_effort"] == "low"
     assert forks[0]["side_chat"] is True
@@ -547,6 +683,8 @@ def test_side_chat_model_settings_before_and_after_first_message(
             "data": {"conversation_id": child_id, "model": "opus"},
         }
     )
+    if mobile:
+        page.get_by_test_id("side-chat-input").fill("A follow-up side question.")
     expect(picker).to_contain_text("Opus")
     expect(page.get_by_test_id("composer-config-gear")).to_contain_text("Sonnet")
     picker.click()

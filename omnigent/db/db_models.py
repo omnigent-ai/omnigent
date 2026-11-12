@@ -7,7 +7,7 @@ import hashlib
 import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import (
     BigInteger,
@@ -32,9 +32,16 @@ from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
+from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
 from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
+
+if TYPE_CHECKING:
+    from sqlalchemy import Connection, Dialect, Table
+    from sqlalchemy.sql.compiler import DDLCompiler
+    from sqlalchemy.sql.ddl import BaseDDLElement
+    from sqlalchemy.sql.schema import SchemaItem
 
 # 32-byte sha256 digest column. LargeBinary → BYTEA (Postgres) / BLOB (SQLite),
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
@@ -622,6 +629,30 @@ class SqlSessionPermission(OmnigentBase):
 _MYSQL_BLOB_TEXT = CompressedText().with_variant(CompressedText(max_stored_bytes=65_535), "mysql")
 
 
+def _on_sqlite_family(
+    ddl: BaseDDLElement,
+    target: SchemaItem | str,
+    bind: Connection | None,
+    tables: list[Table] | None = None,
+    state: Any | None = None,
+    *,
+    dialect: Dialect,
+    compiler: DDLCompiler | None = None,
+    checkfirst: bool = False,
+) -> bool:
+    """
+    Whether DDL runs on SQLite or Cloudflare D1, which serves SQLite.
+
+    Neither enforces declared column types, so a size or type bound needs a
+    CHECK there.
+
+    :param dialect: The dialect running the DDL, e.g. ``"sqlite"``.
+    :returns: ``True`` for those two dialects.
+    """
+    del ddl, target, bind, tables, state, compiler, checkfirst
+    return dialect.name in ("sqlite", "cloudflare_d1")
+
+
 class SqlConversationMetadata(OmnigentBase):
     """
     SQLAlchemy model for the ``omnigent_conversation_metadata`` table.
@@ -671,14 +702,27 @@ class SqlConversationMetadata(OmnigentBase):
     live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     # Outstanding elicitation (approval-prompt) count; NULL = never written.
     pending_elicitation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Whether the agent's work outlives its ended turn, e.g. a background shell;
+    # NULL = never written.
+    background_work_running: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # When the bound runner decided that value, in its own epoch nanoseconds;
+    # NULL = never written.
+    background_work_reported_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Why a running session's agent is parked on a terminal prompt; NULL = not parked.
+    blocked_on: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # First-class project membership. Relates to projects.id; no DB FK
     # (Rule R032). NULL = unfiled. Coexists with the implicit ``omni_project``
     # label via the store's dual-read until labels are consolidated.
     project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Independent peers share a stable ID; NULL means a standalone session.
+    family_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     # JSON document of the session's linked pull requests and pending unlinks,
     # kept under 16,384 stored bytes by SessionPullRequestStore; NULL = none
     # reported. Deferred so whole-row reads (e.g. the session list) skip it.
     pull_requests: Mapped[str | None] = mapped_column(CompressedText, nullable=True, deferred=True)
+    # The session whose Workspace rail lists this side chat; NULL = not a side chat.
+    # No DB FK (Rule R032).
+    side_chat_parent_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),
@@ -686,11 +730,35 @@ class SqlConversationMetadata(OmnigentBase):
             "host_id IS NULL OR workspace IS NOT NULL",
             name="ck_conversation_metadata_workspace_required_for_host",
         ),
+        # SQLite ignores VARCHAR lengths: 128 characters at up to four bytes each.
+        CheckConstraint(
+            "blocked_on IS NULL OR length(CAST(blocked_on AS BLOB)) <= 512",
+            name="ck_conversation_metadata_blocked_on_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # SQLite stores any value in a BOOLEAN column, so it could hold a long string.
+        CheckConstraint(
+            "background_work_running IS NULL OR background_work_running IN (0, 1)",
+            name="ck_conversation_metadata_running_boolean",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # SQLite stores any value in a BIGINT column, so it could hold a long string.
+        CheckConstraint(
+            "background_work_reported_at IS NULL "
+            "OR typeof(background_work_reported_at) = 'integer'",
+            name="ck_conversation_metadata_reported_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
         # Supports list_conversations_by_runner_id and get_runner_ids.
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
         Index("ix_conversation_metadata_host_id", "workspace_id", "host_id", "id"),
         # "list sessions in project X" + per-project counts (GROUP BY project_id).
         Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
+        # Lists a session's side chats on any device, in id order.
+        Index(
+            "ix_conversation_metadata_side_chat_parent_id",
+            "workspace_id",
+            "side_chat_parent_id",
+            "id",
+        ),
+        Index("ix_conversation_metadata_family_id", "workspace_id", "family_id", "id"),
     )
 
 
@@ -1085,6 +1153,8 @@ class SqlComment(OmnigentBase):
     :param created_by: Email of the user who created this comment,
         e.g. ``"alice@example.com"``. ``NULL`` for legacy comments or
         comments created in single-user mode.
+    :param anchor_metadata: Bounded provider-specific coordinates for comments
+        that are not anchored by workspace-file character offsets.
     """
 
     __tablename__ = "comments"
@@ -1118,6 +1188,10 @@ class SqlComment(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(BigInteger)
     anchor_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    anchor_metadata: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=COMMENT_ANCHOR_MAX_STORED_BYTES), nullable=True
+    )
 
     __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
 
@@ -1534,6 +1608,8 @@ class SqlScheduledTask(OmnigentBase):
     # (Claude Code). The fire path converts it to the runner's
     # ``--permission-mode`` launch arg. NULL = use the agent default.
     permission_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # JSON list of MCP service names every fired session starts with. NULL = none.
+    mcp_services: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     # Per-firing cost budget in USD. When set, the fire path attaches a
     # cost_budget policy to each spawned session. NULL = no per-firing cap.
     max_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -1569,6 +1645,9 @@ class SqlScheduledTask(OmnigentBase):
     session_mode: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     # Relates to conversations.id. No DB foreign key (Rule R032).
     session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # The session each run's new session starts as a copy of. Relates to
+    # conversations.id. No DB foreign key (Rule R032).
+    source_session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 

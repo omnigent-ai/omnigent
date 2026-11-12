@@ -34,6 +34,7 @@ permissions:
   contents: read
 
 env:
+  OMNIGENT_CI_PIPELINE: integration
   # No web SPA build during `uv sync`: this job never serves the bundle
   # and the hardened runner has no npm mirror (build would time out).
   OMNIGENT_SKIP_WEB_UI: "true"

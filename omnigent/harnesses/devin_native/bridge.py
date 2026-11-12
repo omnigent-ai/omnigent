@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent._platform import stable_user_id
+from omnigent.inner.agent_env import forwarded_session_env_names
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -269,6 +270,7 @@ def build_devin_native_terminal_env(
     """Build the allowlisted child environment for the ``devin`` TUI."""
     env = os.environ if source_env is None else source_env
     child = {key: env[key] for key in _CHILD_ENV_ALLOWLIST if env.get(key)}
+    child.update({key: env[key] for key in forwarded_session_env_names(env) if key in env})
     bridge_dir = prepare_bridge_dir(session_id)
     child[DEVIN_NATIVE_BRIDGE_DIR_ENV_VAR] = str(bridge_dir)
     return child
@@ -645,17 +647,16 @@ def _render_agent_rule(instructions: str, session_id: str) -> str:
 
 
 def write_devin_agent_rule(workspace: Path, instructions: str | None, *, session_id: str) -> bool:
-    """Deliver a custom agent's instructions to Devin as an always-on rule.
+    """Deliver authored instructions to Devin as an always-on rule.
 
     Writes ``<workspace>/.windsurf/rules/omnigent-agent-instructions.md`` with the
     ``trigger: always_on`` frontmatter Devin requires to load a rule into every
-    turn's system prompt. Idempotent: called with ``None`` (a plain Devin agent,
-    no instructions) it removes any rule a prior custom-agent launch left, so the
+    turn's system prompt. Called with ``None``, it removes a prior owned rule so the
     workspace never carries stale instructions.
 
     :param workspace: The session's workspace directory (Devin reads rules
         relative to its CWD, which is this workspace).
-    :param instructions: The verbatim ``AgentSpec.instructions``, or ``None``.
+    :param instructions: Author instructions, or ``None`` for a plain session.
     :param session_id: The Omnigent conversation id, stamped as the rule's owner.
     :returns: ``True`` when the instructions are live in the rule file. ``False``
         means the caller must deliver them another way (see
@@ -759,12 +760,11 @@ def remove_devin_agent_rule_if_owned(workspace: Path, session_id: str) -> bool:
 def write_agent_instructions_preamble(bridge_dir: Path, instructions: str) -> None:
     """Stage instructions for the first injected message.
 
-    The fallback for workspaces where the rule channel is not session-scoped.
-    Unlike the rule this is not always-on, so it is a weaker delivery — used only
-    when the alternative is leaking instructions into other sessions.
+    Carries framework guidance and any authored text that cannot use the shared
+    workspace rule. Unlike that rule, this is scoped to the session's first message.
 
     :param bridge_dir: Per-session bridge directory.
-    :param instructions: Verbatim agent instructions; blank writes nothing.
+    :param instructions: Startup instructions; blank writes nothing.
     """
     if not instructions.strip():
         return

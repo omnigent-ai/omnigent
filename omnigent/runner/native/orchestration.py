@@ -39,20 +39,21 @@ if TYPE_CHECKING:
         CodexNativeAppServer,
     )
     from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
-    from omnigent.harnesses.opencode_native.client import OpenCodeClient, OpenCodeSession
+    from omnigent.harnesses.opencode_native.client import OpenCodeClient
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
+    from omnigent.terminals.registry import TerminalRegistry
 
 import click
 import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
-from omnigent.debug_logging import debug_event, runner_primary_session_id
+from omnigent.debug_logging import StageTimings, debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
     session_resource_view_to_dict,
@@ -83,6 +84,7 @@ from omnigent.native.native_coding_agents import (
 from omnigent.native.native_dispatch import resolve_hook
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
+from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -182,6 +184,68 @@ def _publish_tmux_target_for_bridge(
         socket_path=instance.socket_path,
         tmux_target=instance.tmux_target,
     )
+
+
+def _readvertise_live_claude_tmux_target(
+    bridge_dir: Path,
+    instance: TerminalInstance,
+    *,
+    terminal_registry: TerminalRegistry,
+    session_id: str,
+) -> None:
+    """
+    Advertise a registered live Claude pane whose ``tmux.json`` is missing or stale.
+
+    Injection can only reach the pane once the advertisement names its socket
+    and target. Publication runs through
+    :meth:`TerminalRegistry.publish_if_registered`, so a pane closed or
+    replaced since the caller's probe never advertises over its successor.
+    Failures are logged and leave injection to its existing wait.
+
+    :param bridge_dir: The session's claude-native bridge directory.
+    :param instance: The registered, alive ``claude`` pane instance.
+    :param terminal_registry: Registry that holds *instance*.
+    :param session_id: Owning session/conversation id.
+    :returns: None.
+    """
+    from omnigent.harnesses.claude_native.bridge import read_tmux_target, write_tmux_target
+
+    expected = {"socket_path": str(instance.socket_path), "tmux_target": instance.tmux_target}
+    try:
+        advertised = read_tmux_target(bridge_dir)
+        if advertised == expected:
+            return
+        published = terminal_registry.publish_if_registered(
+            session_id,
+            instance.name,
+            instance.session_key,
+            instance,
+            lambda: write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            ),
+        )
+        if published:
+            _logger.warning(
+                "live claude pane had %s tmux advertisement for conv=%s; re-advertised",
+                "no" if advertised is None else "a stale",
+                session_id,
+                extra={"session_id": session_id},
+            )
+        else:
+            _logger.info(
+                "claude pane for conv=%s was closed or replaced before re-advertising; skipped",
+                session_id,
+                extra={"session_id": session_id},
+            )
+    except Exception:
+        _logger.warning(
+            "failed to re-advertise claude tmux target for conv=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
 
 
 # Background transcript-forwarder tasks for host-spawned claude-native and
@@ -1522,6 +1586,9 @@ class _OpenCodeNativeLaunchConfig:
         transcript should be seeded as a text preamble
         (``omnigent.fork.carry_history``); opencode has no native session to
         clone, so the runner rehydrates from the copied Omnigent transcript.
+    :param fork_source_id: Source Omnigent conversation id of a forked clone.
+    :param fork_source_external_id: Source OpenCode session id, stamped only
+        for untruncated same-harness forks.
     """
 
     workspace: Path
@@ -1530,6 +1597,8 @@ class _OpenCodeNativeLaunchConfig:
     model_override: str | None
     external_session_id: str | None
     fork_carry_history: bool = False
+    fork_source_id: str | None = None
+    fork_source_external_id: str | None = None
 
 
 async def _opencode_native_launch_config(
@@ -1576,15 +1645,26 @@ async def _opencode_native_launch_config(
         not isinstance(session_workspace, str) or not session_workspace
     ):
         raise RuntimeError(f"Invalid workspace for OpenCode session {session_id!r}.")
-    # On a forked clone, the server stamps carry-history (opencode has no native
-    # session to clone, so the runner rehydrates the copied transcript as a
-    # noReply preamble — same path as a lost-session resume).
-    from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+    # Fork directives are only consulted while the clone has no OpenCode
+    # session of its own (see _prepare_opencode_native_fork).
+    from omnigent.stores.conversation_store import (
+        FORK_CARRY_HISTORY_LABEL_KEY,
+        FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+        FORK_SOURCE_LABEL_KEY,
+    )
 
     labels = snapshot.get("labels")
-    fork_carry_history = (
-        isinstance(labels, dict) and labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
-    )
+    fork_carry_history = False
+    fork_source_id: str | None = None
+    fork_source_external_id: str | None = None
+    if isinstance(labels, dict):
+        fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+        source_id = labels.get(FORK_SOURCE_LABEL_KEY)
+        if isinstance(source_id, str) and source_id:
+            fork_source_id = source_id
+        source_external = labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
+        if isinstance(source_external, str) and source_external:
+            fork_source_external_id = source_external
     return _OpenCodeNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -1592,7 +1672,154 @@ async def _opencode_native_launch_config(
         model_override=model_override,
         external_session_id=external_session_id,
         fork_carry_history=fork_carry_history,
+        fork_source_id=fork_source_id,
+        fork_source_external_id=fork_source_external_id,
     )
+
+
+def _prepare_opencode_native_fork(
+    launch_config: _OpenCodeNativeLaunchConfig,
+    *,
+    bridge_dir: Path,
+    workspace: str,
+) -> str | None:
+    """
+    Stage a same-harness native fork before the clone's server starts.
+
+    Copies the source conversation's OpenCode DB into *bridge_dir* so the
+    clone's ``opencode serve`` can fork the source session. Only an unbound
+    clone whose source ran opencode in the same workspace qualifies; every
+    other case returns ``None`` and the launch falls back to the preamble.
+
+    :param launch_config: The clone's launch config.
+    :param bridge_dir: The clone's bridge directory.
+    :param workspace: The clone's workspace path.
+    :returns: The source OpenCode session id to fork, or ``None``.
+    """
+    from omnigent.harnesses.opencode_native.bridge import (
+        bridge_dir_for_bridge_id,
+        copy_opencode_database_for_fork,
+        opencode_db_path_for_bridge_dir,
+        read_bridge_state,
+    )
+
+    source_conversation = launch_config.fork_source_id
+    source_session = launch_config.fork_source_external_id
+    if (
+        launch_config.external_session_id is not None
+        or not launch_config.fork_carry_history
+        or not source_conversation
+        or not source_session
+        or not source_session.startswith("ses_")
+    ):
+        return None
+    source_bridge_dir = bridge_dir_for_bridge_id(source_conversation)
+    source_state = read_bridge_state(source_bridge_dir)
+    # A forked session inherits the parent's directory, so only fork in place.
+    if source_state is not None and source_state.workspace not in (None, workspace):
+        return None
+    # A relaunch before the clone recorded its own session id finds the earlier
+    # copy in place; re-copying would delete the turns run on it since the fork.
+    if opencode_db_path_for_bridge_dir(bridge_dir).exists():
+        return source_session
+    if not copy_opencode_database_for_fork(source_bridge_dir, bridge_dir):
+        return None
+    return source_session
+
+
+async def _resolve_opencode_session(
+    *,
+    client: OpenCodeClient,
+    launch_config: _OpenCodeNativeLaunchConfig,
+    omnigent_session_id: str,
+    workspace: str,
+    server_client: httpx.AsyncClient | None,
+    fork_source_session_id: str | None,
+    fresh: bool = False,
+) -> str:
+    """
+    Resume, fork, or create the conversation's OpenCode session.
+
+    Order: resume the persisted session; else fork the staged source session;
+    else create a session that asks for every permission and, for a lost
+    session or a forked clone, seed the Omnigent transcript as context.
+
+    :param client: Client bound to the conversation's ``opencode serve``.
+    :param launch_config: The conversation's launch config.
+    :param omnigent_session_id: Omnigent conversation id.
+    :param workspace: Workspace directory for a new session.
+    :param server_client: Runner Omnigent server client (transcript source).
+    :param fork_source_session_id: Source session staged by
+        :func:`_prepare_opencode_native_fork`, or ``None``.
+    :param fresh: ``True`` for ``/clear``: always create an unseeded session.
+    :returns: The OpenCode session id to attach.
+    """
+    from omnigent.harnesses.opencode_native.client import OpenCodeClientError
+    from omnigent.harnesses.opencode_native.provider import ASK_ALL_PERMISSIONS
+
+    resume_lost_history = False
+    if not fresh and launch_config.external_session_id is not None:
+        existing = await client.get_session(launch_config.external_session_id)
+        if existing is not None:
+            return existing.id
+        resume_lost_history = True
+    if not fresh and fork_source_session_id is not None:
+        try:
+            forked = await client.fork(fork_source_session_id, before=None)
+        except (OpenCodeClientError, httpx.HTTPError):
+            _logger.warning(
+                "opencode fork: native fork of %s failed for %s; using transcript preamble",
+                fork_source_session_id,
+                omnigent_session_id,
+                exc_info=True,
+                extra={"session_id": omnigent_session_id},
+            )
+        else:
+            return forked.id
+    permissions: list[dict[str, object]] = [dict(rule) for rule in ASK_ALL_PERMISSIONS]
+    created = await client.create_session(
+        title=f"omnigent:{omnigent_session_id}",
+        directory=workspace,
+        permissions=permissions,
+        metadata={"omnigent_conversation": omnigent_session_id},
+    )
+    if not fresh and (resume_lost_history or launch_config.fork_carry_history):
+        await _rehydrate_opencode_session_from_transcript(
+            opencode_client=client,
+            opencode_session_id=created.id,
+            omnigent_session_id=omnigent_session_id,
+            server_client=server_client,
+        )
+    return created.id
+
+
+# Root ``opencode`` flags the runner owns: auto-approval would bypass policy,
+# and server/session selection would detach the TUI from the per-session server.
+_OPENCODE_TUI_DROPPED_FLAGS = frozenset({"--auto", "--standalone", "--continue", "-c"})
+_OPENCODE_TUI_DROPPED_VALUE_FLAGS = frozenset({"--server", "--session", "-s"})
+
+
+def _sanitize_opencode_tui_args(args: Sequence[str]) -> list[str]:
+    """
+    Drop user pass-through TUI flags that conflict with the runner-owned server.
+
+    :param args: User ``terminal_launch_args``, e.g. ``["--auto", "--prompt", "hi"]``.
+    :returns: The args with conflicting flags (and their values) removed.
+    """
+    kept: list[str] = []
+    skip_value = False
+    for arg in args:
+        if skip_value:
+            skip_value = False
+            continue
+        name, has_value, _ = arg.partition("=")
+        if name in _OPENCODE_TUI_DROPPED_FLAGS:
+            continue
+        if name in _OPENCODE_TUI_DROPPED_VALUE_FLAGS:
+            skip_value = not has_value
+            continue
+        kept.append(arg)
+    return kept
 
 
 async def _auto_create_opencode_terminal(
@@ -1603,16 +1830,15 @@ async def _auto_create_opencode_terminal(
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    fresh: bool = False,
 ) -> SessionResourceView:
     """
     Auto-create an OpenCode terminal for an opencode-native session.
 
-    Mirrors :func:`_auto_create_codex_terminal`, substituting ``opencode
-    serve`` / ``opencode attach`` for Codex's app-server/remote transport:
-    boots a per-session ``opencode serve`` process, resumes-or-creates the
-    OpenCode session, persists bridge state + ``external_session_id``,
-    starts the SSE forwarder, then registers the ``opencode attach`` TUI as
-    a streamable terminal resource attached to that server.
+    Boots a per-conversation ``opencode serve --stdio``, resumes, forks, or
+    creates the OpenCode session, persists bridge state and
+    ``external_session_id``, starts the SSE forwarder, then registers the
+    ``opencode --server <url> --session <id>`` TUI as a streamable terminal.
 
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :param resource_registry: Registry used to launch the terminal.
@@ -1620,21 +1846,23 @@ async def _auto_create_opencode_terminal(
     :param agent_spec: Optional resolved agent spec (os_env + model).
     :param server_client: Runner Omnigent server HTTP client.
     :param ensure_comment_relay: Callback that starts the Omnigent builtin-tool
-        relay for this session's bridge dir (the nested
-        ``_ensure_comment_relay_started``). ``None`` skips wiring the Omnigent
-        MCP relay (tests / no server).
+        relay for this session's bridge dir. ``None`` skips the relay.
+    :param fresh: ``True`` for ``/clear``: start an empty session and skip
+        resume, fork, and transcript seeding.
     :returns: The created terminal resource view.
     """
     from omnigent.harnesses.opencode_native.app_server import (
         OpenCodeNativeServer,
-        build_opencode_attach_args,
+        build_tui_command,
         opencode_terminal_env,
     )
     from omnigent.harnesses.opencode_native.bridge import (
         OpenCodeNativeBridgeState,
         clear_bridge_state,
+        connect_env_provider_keys,
         prepare_bridge_dir,
         seed_opencode_auth,
+        seeded_provider_ids,
         write_bridge_state,
         write_opencode_policy_plugin,
         write_relay_bridge_config,
@@ -1664,39 +1892,30 @@ async def _auto_create_opencode_terminal(
     clear_bridge_state(bridge_dir)
 
     model_override = launch_config.model_override or _opencode_native_model_from_spec(agent_spec)
-    # Route opencode through the Databricks Unity Gateway when the spec names a
-    # profile. Unlike codex/claude/pi (which consume HARNESS_*_GATEWAY_* env the
-    # CLI translates), opencode reads provider/auth from its own config file, so
-    # synthesize an opencode.json into the per-session XDG config dir BEFORE the
-    # server boots. Best-effort: if the gateway can't be resolved (no profile,
-    # databricks-sdk absent, auth failure), opencode falls back to whatever
-    # provider config the ambient env/global config already gives it.
+    # opencode reads providers, MCP, plugins and permissions only from its config
+    # file, so always write the per-session opencode.json before the server boots.
     from omnigent.harnesses.opencode_native.bridge import xdg_config_home_for_bridge_dir
     from omnigent.harnesses.opencode_native.provider import (
+        build_opencode_config,
         build_opencode_mcp_block,
-        build_opencode_model_default_config,
         build_opencode_omnigent_mcp_server,
-        build_opencode_provider_config,
         managed_connect_opencode_config,
         maybe_merge_user_provider_config,
         resolve_bound_opencode_gateway,
         resolve_databricks_gateway,
+        write_opencode_instructions,
         write_opencode_provider_config,
     )
 
-    # Accumulate the synthesized opencode.json: provider/model (Databricks
-    # gateway or a pinned default) + the agent's MCP servers + force-ask.
-    config: dict[str, object] = {}
+    # Synthesize the per-session v2 opencode.json: providers/model, MCP servers,
+    # plugins, instructions, and an ask-all permission ruleset so every tool call
+    # raises permission.asked for the forwarder's policy gate.
     xdg_config_home = xdg_config_home_for_bridge_dir(bridge_dir)
     managed_opencode_broker_cmd: str | None = None
-    # A spec/CLI-selected Databricks gateway wins first (an explicit ``--model``
-    # that names a gateway endpoint, or a spec profile), exactly as claude/codex/pi
-    # resolve the spec provider before their broker fallback.
-    # ``resolve_databricks_gateway`` returns None when no profile is selected (the
-    # bare managed-connect host); the ucode-config path below is then the last
-    # resort. On that bare host it adopts ucode's pinned served model — replacing an
-    # unrecognized explicit ``--model`` (logged below), since the workspace gateway
-    # is the only working provider there.
+    extra_providers: dict[str, dict[str, object]] = {}
+    plugin_paths: list[str] = []
+    # A spec/CLI-selected gateway wins first, exactly as claude/codex/pi resolve the
+    # spec provider before their broker fallback; the ucode config is the last resort.
     opencode_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     gateway = await asyncio.to_thread(
         resolve_bound_opencode_gateway,
@@ -1708,27 +1927,15 @@ async def _auto_create_opencode_terminal(
             _opencode_native_profile_from_spec(agent_spec), model_id=model_override
         )
     if gateway is not None:
-        # Pin the per-prompt model to the synthesized provider/endpoint id, and
-        # write it as opencode's default model too so the TUI launches on it.
         model_override = gateway.qualified_model
-        config = dict(build_opencode_provider_config(gateway))
-        config["model"] = model_override
     else:
-        # Managed connect host (last resort): reuse ucode's generated opencode
-        # config (provider block + served model + refreshing auth plugin), the
-        # same artifact lakebox and ucode itself use. The plugin mints per request
-        # via ``ucode auth-token`` → the broker command forwarded into the opencode
-        # env below, so no static omnigent-minted token. Offloaded to a thread: on
-        # the first launch (before the host-boot configure has written opencode's
-        # config) it may run a ``ucode configure`` subprocess, which must not block
-        # the runner's event loop. None off a managed connect host.
-        managed_config = await asyncio.to_thread(managed_connect_opencode_config, xdg_config_home)
+        # Managed connect host: reuse ucode's providers with an Omnigent-owned v2
+        # auth plugin that mints per request via the broker command. Offloaded to a
+        # thread because it may run ``ucode configure`` on first launch.
+        managed_config = await asyncio.to_thread(
+            managed_connect_opencode_config, xdg_config_home, bridge_dir
+        )
         if managed_config:
-            # The auth plugin needs the broker command to mint per request; derive
-            # it from the SAME sidecar the config gated on (not a separate profile
-            # read), so the two can't disagree. Only adopt the managed config when
-            # the command resolves — a provider block with no mint command can't
-            # authenticate, so without it leave opencode on its own login instead.
             from omnigent.host.databricks_credential import (
                 _read_sidecar,
                 _sidecar_path,
@@ -1740,8 +1947,13 @@ async def _auto_create_opencode_terminal(
                 broker_token_command(_oc_sidecar["workspace_host"]) if _oc_sidecar else None
             )
             if managed_opencode_broker_cmd:
-                config = managed_config
-                pinned = config.get("model")
+                providers = managed_config.get("providers")
+                if isinstance(providers, dict):
+                    extra_providers = providers
+                managed_plugins = managed_config.get("plugins")
+                if isinstance(managed_plugins, list):
+                    plugin_paths.extend(p for p in managed_plugins if isinstance(p, str))
+                pinned = managed_config.get("model")
                 if isinstance(pinned, str):
                     if model_override and model_override != pinned:
                         _logger.info(
@@ -1757,61 +1969,29 @@ async def _auto_create_opencode_terminal(
                     "opencode managed connect: ucode config resolved but no broker command "
                     "(sidecar missing/mismatched); leaving opencode on its own login."
                 )
-        if not config and model_override:
-            # No custom provider, but a model is pinned (``omni opencode --model``
-            # or the ``omni setup`` OpenCode default): write opencode's default
-            # model so the native TUI and first turn use it instead of
-            # ``opencode/big-pickle``. OpenCode resolves the provider from the
-            # model-id prefix against its own auth.json, so no provider block is
-            # needed.
-            config = dict(build_opencode_model_default_config(model_override))
 
-    # Build opencode's ``mcp`` block: the Omnigent builtin-tool relay (so the
-    # model can call sys_*/load_skill/web_fetch — the real "connects to Omnigent
-    # MCP") PLUS the agent's own declared MCP servers (translated into opencode's
-    # config). The relay is added only when we'll actually start it below
-    # (``ensure_comment_relay`` present), else serve-mcp would launch with no
-    # tool_relay.json to read. Force every tool call to prompt so it routes
-    # through Omnigent's policy engine via the forwarder's permission gate —
-    # opencode's enforcement is reactive (no pre-tool hook), so "ask" is what
-    # makes the policy verdicts apply to MCP (and other) tools.
-    mcp_block = build_opencode_mcp_block(_opencode_native_mcp_servers_from_spec(agent_spec))
+    # MCP: the Omnigent builtin-tool relay (only when it will be started below, so
+    # serve-mcp finds tool_relay.json) plus the agent's own declared servers.
+    mcp_servers = build_opencode_mcp_block(_opencode_native_mcp_servers_from_spec(agent_spec))
     if server_client is not None and ensure_comment_relay is not None:
-        mcp_block.update(build_opencode_omnigent_mcp_server(bridge_dir))
-    if mcp_block:
-        config.setdefault("$schema", "https://opencode.ai/config.json")
-        config["mcp"] = mcp_block
-        config["permission"] = "ask"
+        mcp_servers.update(build_opencode_omnigent_mcp_server(bridge_dir))
 
-    # Load the Omnigent policy-bridge plugin so opencode's lifecycle hooks reach
-    # the policy engine at phases the reactive permission.asked path can't:
-    # REQUEST (gate TUI-typed prompts at submit) and TOOL_RESULT (gate/redact
-    # tool output). The plugin POSTs PHASE_REQUEST / PHASE_TOOL_RESULT to
-    # ``/policies/evaluate`` (same contract as claude's UserPromptSubmit /
-    # PostToolUse hooks); coordinates come from the OMNIGENT_* env stamped on
-    # the server below. Only wired when there's a server to evaluate against.
+    # The policy plugin gates REQUEST (TUI-typed prompts) and TOOL_RESULT phases the
+    # permission.asked path cannot reach; coordinates come from the OMNIGENT_* env.
     policy_env: dict[str, str] = {}
     if managed_opencode_broker_cmd:
-        # ucode's auth plugin runs ``ucode auth-token`` → get_databricks_token,
-        # which mints from this broker command (databricks/ucode#531).
+        # The ucode auth plugin runs ``ucode auth-token``, which mints from this command.
         policy_env["DATABRICKS_BEARER_COMMAND"] = managed_opencode_broker_cmd
     runner_server_url = os.environ.get("RUNNER_SERVER_URL")
     if server_client is not None and runner_server_url:
-        plugin_path = write_opencode_policy_plugin(bridge_dir)
-        config.setdefault("$schema", "https://opencode.ai/config.json")
-        existing_plugins = config.get("plugin")
-        config["plugin"] = ([*existing_plugins] if isinstance(existing_plugins, list) else []) + [
-            str(plugin_path)
-        ]
+        plugin_paths.append(str(write_opencode_policy_plugin(bridge_dir)))
         policy_env["OMNIGENT_POLICY_URL"] = runner_server_url
         policy_env["OMNIGENT_SESSION_ID"] = session_id
-        # Point the plugin at tool_relay.json so it can pick up relay
-        # credentials as soon as the relay starts (written later by
-        # ensure_comment_relay). The plugin re-reads on every call.
+        # The plugin re-reads tool_relay.json per call, picking up the relay once it starts.
         from omnigent.harnesses.claude_native.bridge import _TOOL_RELAY_FILE
 
         policy_env["OMNIGENT_RELAY_FILE"] = str(bridge_dir / _TOOL_RELAY_FILE)
-        # Bake fallback headers for the first calls before relay starts.
+        # Fallback routing headers for calls made before the relay starts.
         from omnigent.runner._entry import _make_auth_token_factory
 
         _policy_factory = await asyncio.to_thread(_make_auth_token_factory)
@@ -1825,18 +2005,29 @@ async def _auto_create_opencode_terminal(
                 databricks_request_headers(runner_server_url, bearer_token=_policy_token)
             )
 
-    # Carry the user's global provider definitions (e.g. OpenAI-compatible
-    # endpoints with custom base URLs) into the synthesized config: the
-    # per-session XDG_CONFIG_HOME hides ~/.config/opencode from the server.
+    # opencode 2.0 ignores config ``instructions``; the per-session global AGENTS.md is read.
+    instructions_path = write_opencode_instructions(
+        xdg_config_home, _opencode_session_instructions_from_spec(agent_spec)
+    )
+    config = build_opencode_config(
+        model=model_override,
+        gateway=gateway,
+        mcp_servers=mcp_servers,
+        plugin_paths=plugin_paths,
+        instructions=str(instructions_path) if instructions_path is not None else None,
+        extra_providers=extra_providers,
+    )
+    # The per-session XDG_CONFIG_HOME hides the user's global config; carry over
+    # their providers, default model, plugins and MCP servers (v1 or v2 spelling).
     config = maybe_merge_user_provider_config(config)
+    write_opencode_provider_config(
+        xdg_config_home,
+        config,
+        client_surface=resource_registry.client_surface(session_id),
+    )
 
-    if config:
-        write_opencode_provider_config(xdg_config_home_for_bridge_dir(bridge_dir), config)
-
-    # The server runs with a per-session XDG_DATA_HOME, so copy the user's
-    # `opencode auth login` credentials in — otherwise it can't authenticate
-    # their providers and falls back to the no-auth default model. No-op on a
-    # remote runner (no local auth.json) / Databricks-gateway path.
+    # The per-session DB imports $XDG_DATA_HOME/opencode/auth.json once when it is
+    # created; seed it with the user's auth.json and v2 SQLite credentials.
     seed_opencode_auth(bridge_dir)
 
     # Start the Omnigent builtin-tool relay BEFORE opencode boots, so
@@ -1850,10 +2041,24 @@ async def _auto_create_opencode_terminal(
             await_notify=False,
         )
 
+    # A forked clone copies the source conversation's DB before its own server
+    # opens it, so the source session can be forked natively.
+    # The snapshot copies a whole SQLite DB, so it runs off the event loop.
+    fork_source_session_id = (
+        None
+        if fresh
+        else await asyncio.to_thread(
+            _prepare_opencode_native_fork,
+            launch_config,
+            bridge_dir=bridge_dir,
+            workspace=workspace,
+        )
+    )
     server = OpenCodeNativeServer(
         bridge_dir=bridge_dir,
         workspace=launch_config.workspace,
         extra_env=policy_env or None,
+        session_id=session_id,
     )
     await server.start()
     _AUTO_OPENCODE_SERVERS[session_id] = server
@@ -1861,41 +2066,38 @@ async def _auto_create_opencode_terminal(
     try:
         client = server.client()
         try:
-            opencode_session_id: str | None = None
-            resume_lost_history = False
-            if launch_config.external_session_id is not None:
-                existing = await client.get_session(launch_config.external_session_id)
-                if existing is not None:
-                    opencode_session_id = existing.id
-                else:
-                    # The persisted opencode session is gone (new host / wiped
-                    # XDG store) — we'll rehydrate from the Omnigent transcript
-                    # below instead of silently starting empty.
-                    resume_lost_history = True
-            if opencode_session_id is None:
-                created = await client.create_session({"title": f"omnigent:{session_id}"})
-                opencode_session_id = created.id
-                # Rehydrate prior context (text-prefix replay) when this is a
-                # lost-session resume OR a forked clone carrying history — both
-                # seed the copied Omnigent transcript as a noReply preamble.
-                if resume_lost_history or launch_config.fork_carry_history:
-                    await _rehydrate_opencode_session_from_transcript(
-                        opencode_client=client,
-                        opencode_session_id=opencode_session_id,
-                        omnigent_session_id=session_id,
-                        server_client=server_client,
-                        model_override=model_override,
+            # Keys that live only in the runner's environment reach the
+            # per-session server through its integration API (best effort).
+            try:
+                await connect_env_provider_keys(client, stored=seeded_provider_ids(bridge_dir))
+            except Exception:
+                _logger.warning(
+                    "opencode launch: env provider key hand-off failed for %s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+            opencode_session_id = await _resolve_opencode_session(
+                client=client,
+                launch_config=launch_config,
+                omnigent_session_id=session_id,
+                workspace=workspace,
+                server_client=server_client,
+                fork_source_session_id=fork_source_session_id,
+                fresh=fresh,
+            )
+            # Persist a newly created or forked session id so a relaunch resumes it.
+            if (
+                server_client is not None
+                and opencode_session_id != launch_config.external_session_id
+            ):
+                with contextlib.suppress(httpx.HTTPError):
+                    await server_client.patch(
+                        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                        json={"external_session_id": opencode_session_id},
+                        params={"include_usage": "false"},
+                        timeout=10.0,
                     )
-                # Persist the OpenCode session id so a later relaunch resumes
-                # it (best effort, like codex-native).
-                if server_client is not None:
-                    with contextlib.suppress(httpx.HTTPError):
-                        await server_client.patch(
-                            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
-                            json={"external_session_id": opencode_session_id},
-                            params={"include_usage": "false"},
-                            timeout=10.0,
-                        )
         finally:
             await client.aclose()
 
@@ -1950,6 +2152,13 @@ async def _auto_create_opencode_terminal(
         )
         _register_auto_forwarder_task(session_id, forwarder_task)
 
+    tui_argv = build_tui_command(
+        server.opencode_path,
+        base_url=server.base_url,
+        session_id=opencode_session_id,
+        workspace=workspace,
+        extra_args=_sanitize_opencode_tui_args(launch_config.terminal_launch_args or ()),
+    )
     agent_os_env = _agent_os_env_from_spec(agent_spec)
     try:
         terminal_view = await resource_registry.launch_auxiliary_terminal(
@@ -1964,14 +2173,13 @@ async def _auto_create_opencode_terminal(
                     cwd=workspace,
                     sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
                 ),
-                command=server.opencode_path,
-                args=build_opencode_attach_args(
-                    server_url=server.base_url,
-                    workspace=workspace,
-                    session_id=opencode_session_id,
-                    opencode_args=tuple(launch_config.terminal_launch_args or ()),
+                command=tui_argv[0],
+                args=tui_argv[1:],
+                env=opencode_terminal_env(
+                    server.auth_secret,
+                    xdg_data_home=server.xdg_data_home,
+                    xdg_config_home=server.xdg_config_home,
                 ),
-                env=opencode_terminal_env(server),
                 scrollback=100_000,
                 tmux_allow_passthrough=True,
                 tmux_start_on_attach=False,
@@ -2053,13 +2261,12 @@ def _build_opencode_policy_evaluator(
     """
     Build the policy evaluator the OpenCode permission forwarder consults.
 
-    Mirrors codex-native's policy hook exactly: every OpenCode
-    ``permission.v2.asked`` request is POSTed to this session's
-    ``/v1/sessions/{id}/policies/evaluate`` endpoint as a
-    ``PHASE_TOOL_CALL`` event. The server evaluates configured policies and
-    — for an ``ASK`` verdict — parks a human approval card and blocks until
-    it is resolved, returning a hard ``ALLOW``/``DENY``. The forwarder turns
-    that into an OpenCode ``once``/``always``/``reject`` reply.
+    Every OpenCode ``permission.asked`` request is POSTed to this session's
+    ``/v1/sessions/{id}/policies/evaluate`` endpoint as a ``PHASE_TOOL_CALL``
+    event named after the v2 action (``shell``, ``edit``, ``subagent``, ...).
+    The server evaluates configured policies and, for an ``ASK`` verdict,
+    parks a human approval card and blocks until it is resolved. The
+    forwarder turns the verdict into an OpenCode ``once`` or ``reject`` reply.
 
     Fails CLOSED: an unreachable server, a non-200, a malformed body, or an
     unresolved ``ASK`` all yield a ``deny``/``ask`` verdict the forwarder
@@ -2071,21 +2278,28 @@ def _build_opencode_policy_evaluator(
     :returns: An async evaluator returning a verdict mapping, or a deny
         verdict on failure.
     """
-    from omnigent.harnesses.opencode_native.permissions import OPENCODE_NATIVE_HARNESS
+    from omnigent.harnesses.opencode_native.permissions import (
+        OPENCODE_NATIVE_HARNESS,
+        evaluate_elicitation_id,
+    )
 
     session_component = urllib.parse.quote(conversation_id, safe="")
     url = f"/v1/sessions/{session_component}/policies/evaluate"
 
     async def _evaluate(normalized: Mapping[str, object]) -> Mapping[str, object] | None:
-        arguments: _JsonObject = {
-            key: normalized[key]
-            for key in ("command", "path", "url")
-            if normalized.get(key) is not None
-        }
+        provided = normalized.get("arguments")
+        if isinstance(provided, Mapping):
+            arguments: _JsonObject = {str(key): value for key, value in provided.items()}
+        else:
+            arguments = {
+                key: normalized[key]
+                for key in ("command", "path", "url")
+                if normalized.get(key) is not None
+            }
         metadata = normalized.get("metadata")
         if isinstance(metadata, Mapping) and metadata:
             arguments.setdefault("metadata", dict(metadata))
-        body = {
+        body: dict[str, object] = {
             "event": {
                 "type": "PHASE_TOOL_CALL",
                 "target": "",
@@ -2096,6 +2310,10 @@ def _build_opencode_policy_evaluator(
                 "context": {"harness": OPENCODE_NATIVE_HARNESS},
             },
         }
+        request_id = normalized.get("request_id")
+        if isinstance(request_id, str) and request_id:
+            # Lets the forwarder withdraw the parked card when the TUI answers first.
+            body["_omnigent_elicitation_id"] = evaluate_elicitation_id(request_id)
         try:
             resp = await server_client.post(
                 url, json=body, timeout=_OPENCODE_POLICY_EVALUATE_TIMEOUT_S
@@ -2150,61 +2368,71 @@ def _opencode_native_model_from_spec(
         return None
 
 
-def _resolve_opencode_compact_model(
-    session: OpenCodeSession | None,
-    messages: list[_JsonObject],
-    model_override: str | None,
-) -> tuple[str | None, str | None]:
+def _opencode_model_ref(model: str | None) -> dict[str, str] | None:
     """
-    Resolve the ``(provider_id, model_id)`` for an opencode ``/summarize``.
+    Parse ``provider/model[#variant]`` into an OpenCode ``Model.Ref``.
 
-    opencode's ``/summarize`` requires an explicit model, but Omnigent
-    creates the session WITHOUT one (the model is pinned per prompt), so
-    ``session.raw["model"]`` is usually absent. Resolve it from a
-    most-authoritative-first fallback chain:
+    Splits on the first ``/`` (gateway ids such as ``omnigent/omnigent/x``
+    keep the rest as the model id) and on the last ``#`` after it, the same
+    way the transport's ``split_model_id`` does for ``POST .../model``.
 
-    1. The most-recent assistant message carries the live model on its
-       ``info`` as ``providerID`` + ``modelID`` (the MESSAGE keys). Iterate
-       in reverse for the last ``info.role == "assistant"`` with both set.
-    2. Else the session ``model`` field (covers create-with-model / TUI
-       switchModel) — on the SESSION object the keys are ``providerID`` +
-       ``id`` (NOT ``modelID``).
-    3. Else ``model_override`` from bridge state, a qualified
-       ``"provider/model"`` string split on the FIRST ``/``.
-
-    :param session: The :class:`OpenCodeSession` (``.raw`` is the payload),
-        or ``None``.
-    :param messages: The session's messages, each ``{"info": ..., "parts": ...}``.
-    :param model_override: Bridge-state ``model_override`` (qualified
-        ``provider/model``), or ``None``.
-    :returns: ``(provider_id, model_id)``; both ``None`` when unresolved.
+    :param model: Qualified model string, e.g. ``"openai/gpt-5#high"``.
+    :returns: ``{"providerID", "id"[, "variant"]}``, or ``None`` when unparsable.
     """
-    # 1. The latest assistant message's live model (message keys:
-    #    ``providerID`` + ``modelID``).
-    for message in reversed(messages):
-        info = message.get("info") if isinstance(message, dict) else None
-        if not isinstance(info, dict) or info.get("role") != "assistant":
-            continue
-        provider_id = info.get("providerID")
-        model_id = info.get("modelID")
-        if isinstance(provider_id, str) and provider_id and isinstance(model_id, str) and model_id:
-            return provider_id, model_id
+    from omnigent.harnesses.opencode_native.http_transport import split_model_id
 
-    # 2. The session ``model`` field (session keys: ``providerID`` + ``id``).
-    model = session.raw.get("model") if session is not None else None
-    if isinstance(model, dict):
+    if not isinstance(model, str) or not model.strip():
+        return None
+    split = split_model_id(model.strip())
+    if split is None:
+        return None
+    provider_id, model_id, variant = split
+    if not model_id or "#" in provider_id:
+        return None
+    ref = {"providerID": provider_id, "id": model_id}
+    if variant:
+        ref["variant"] = variant
+    return ref
+
+
+def _opencode_model_options_from_catalog(models: list[_JsonObject]) -> list[_JsonObject]:
+    """
+    Map OpenCode v2 ``Model.Info`` entries onto web model-picker options.
+
+    Disabled and deprecated models are hidden; duplicates keep the first
+    (the catalog is ordered by release date).
+
+    :param models: ``GET /api/model`` data, e.g.
+        ``[{"id": "gpt-5", "providerID": "openai", "name": "GPT-5", ...}]``.
+    :returns: Options keyed by the qualified ``provider/model`` id.
+    """
+    options: list[_JsonObject] = []
+    seen: set[str] = set()
+    for model in models:
         provider_id = model.get("providerID")
         model_id = model.get("id")
-        if isinstance(provider_id, str) and provider_id and isinstance(model_id, str) and model_id:
-            return provider_id, model_id
-
-    # 3. Bridge-state ``model_override`` (``provider/model``, split on first ``/``).
-    if isinstance(model_override, str) and "/" in model_override:
-        provider_id, _, model_id = model_override.partition("/")
-        if provider_id and model_id:
-            return provider_id, model_id
-
-    return None, None
+        if not isinstance(provider_id, str) or not provider_id:
+            continue
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        if model.get("enabled") is False or model.get("status") == "deprecated":
+            continue
+        qualified = f"{provider_id}/{model_id}"
+        if qualified in seen:
+            continue
+        seen.add(qualified)
+        name = model.get("name")
+        options.append(
+            {
+                "id": qualified,
+                "model": model_id,
+                "providerID": provider_id,
+                "displayName": qualified,
+                "name": name if isinstance(name, str) and name else model_id,
+                "isDefault": False,
+            }
+        )
+    return options
 
 
 def _opencode_native_profile_from_spec(
@@ -2281,17 +2509,18 @@ async def _rehydrate_opencode_session_from_transcript(
     opencode_session_id: str,
     omnigent_session_id: str,
     server_client: httpx.AsyncClient | None,
-    model_override: str | None,
 ) -> bool:
     """
-    Seed a fresh opencode session with prior context (text-prefix replay).
+    Seed a fresh OpenCode session with the Omnigent transcript as context.
 
-    opencode has no history-import API, so on a cross-host resume (where the
-    persisted opencode session is gone) inject the Omnigent transcript as a
-    single ``noReply`` context message — the agent resumes with its prior
-    context instead of silent amnesia. Best-effort: returns ``False`` when the
-    transcript can't be fetched or is empty.
+    Used when the persisted OpenCode session is gone (new host, wiped bridge
+    dir) or a forked clone could not fork natively. The transcript is recorded
+    through ``seed_context`` without starting a model turn. Best effort.
 
+    :param opencode_client: Client bound to the conversation's server.
+    :param opencode_session_id: The freshly created OpenCode session id.
+    :param omnigent_session_id: Omnigent conversation id whose items to replay.
+    :param server_client: Runner Omnigent server client, or ``None``.
     :returns: ``True`` when prior context was seeded.
     """
     if server_client is None:
@@ -2315,20 +2544,14 @@ async def _rehydrate_opencode_session_from_transcript(
     transcript = _render_opencode_transcript_text(items if isinstance(items, list) else [])
     if not transcript:
         return False
-    provider_id: str | None = None
-    model_id: str | None = None
-    if model_override and "/" in model_override:
-        provider_id, model_id = model_override.split("/", 1)
     text = (
         "[Resumed session — the prior opencode session was unavailable on this "
         "host, so the earlier conversation is included below for context. Treat "
         "it as history; do not re-run prior actions.]\n\n" + transcript
     )
     try:
-        await opencode_client.seed_context(
-            opencode_session_id, text, provider_id=provider_id, model_id=model_id
-        )
-    except Exception:  # rehydration is best effort.
+        await opencode_client.seed_context(opencode_session_id, text)
+    except Exception:
         _logger.warning(
             "opencode resume: rehydration seed failed for %s", omnigent_session_id, exc_info=True
         )
@@ -2651,6 +2874,7 @@ async def _auto_create_pi_terminal(
     from omnigent.harnesses.pi_native.main import resolve_pi_executable
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.runner._entry import _make_auth_token_factory
+    from omnigent.runtime.prompt import raw_author_instructions
 
     launch_config = await _pi_native_launch_config(
         session_id=session_id,
@@ -2735,15 +2959,18 @@ async def _auto_create_pi_terminal(
         workspace=launch_config.workspace,
         server_client=server_client,
     )
-    raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
-    instructions_path = write_agent_instructions(bridge_dir, raw_instructions)
     pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     context_files = True
     system_prompt_mode = "append"
     if pi_spec is not None:
         context_files = pi_spec.executor.config.get("context_files", True)
         system_prompt_mode = pi_spec.executor.config.get("system_prompt_mode", "append")
+        if system_prompt_mode == "replace" and raw_author_instructions(pi_spec) is None:
+            raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
+    startup_instructions = _native_startup_instructions_from_spec(agent_spec)
+    instructions_path = write_agent_instructions(bridge_dir, startup_instructions)
     provider_args: list[str] = []
+    pi_env_unset = pi_native_env_unset(os.environ)
     pi_env = {
         PI_NATIVE_CONFIG_ENV_VAR: str(config),
         "OMNIGENT_PI_NATIVE_BRIDGE_DIR": str(bridge_dir),
@@ -2791,6 +3018,10 @@ async def _auto_create_pi_terminal(
                 launch_config.reasoning_effort,
                 selection=spec_model,
                 global_agent_dir=global_pi_agent_dir(workspace=launch_config.workspace),
+                client_surface=resource_registry.client_surface(session_id),
+                pi_env=terminal_pane_environment(
+                    inherit_env=True, env=pi_env, env_unset=pi_env_unset
+                ),
             )
             pi_env.update(launch.env)
             provider_args.extend(launch.args)
@@ -2858,7 +3089,7 @@ async def _auto_create_pi_terminal(
             # the picker with entries that bypass the managed models.json
             # provider — and Pi needs no credential env (its auth rides the
             # managed apiKey). Empty list = no scrubbing.
-            env_unset=pi_native_env_unset(os.environ),
+            env_unset=pi_env_unset,
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
@@ -2911,14 +3142,14 @@ async def _auto_create_pi_terminal(
             warning=credential_warning,
         )
     if effort_notice is not None:
-        await _post_pi_native_notice(
+        await _post_native_launch_notice(
             session_id=session_id,
             server_client=server_client,
             code="pi_native_effort_ignored",
             notice=effort_notice,
         )
     if model_notice is not None:
-        await _post_pi_native_notice(
+        await _post_native_launch_notice(
             session_id=session_id,
             server_client=server_client,
             code="pi_native_model_rerouted",
@@ -2991,7 +3222,7 @@ async def _post_pi_native_credential_warning(
         )
 
 
-async def _post_pi_native_notice(
+async def _post_native_launch_notice(
     *,
     session_id: str,
     server_client: httpx.AsyncClient | None,
@@ -3029,9 +3260,9 @@ async def _post_pi_native_notice(
             timeout=30.0,
         )
         resp.raise_for_status()
-    except httpx.HTTPError:
+    except (httpx.HTTPError, RuntimeError):  # a closed client only loses the notice
         _logger.warning(
-            "pi-native: failed to surface %s notice for session %s",
+            "native launch: failed to surface %s notice for session %s",
             code,
             session_id,
             exc_info=True,
@@ -4040,6 +4271,7 @@ async def _auto_create_devin_terminal(
     )
     from omnigent.harnesses.devin_native.main import build_devin_launch, resolve_devin_launch_model
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.runtime.prompt import build_native_startup_instructions, raw_author_instructions
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args + model_override); reused here, not
@@ -4054,17 +4286,15 @@ async def _auto_create_devin_terminal(
     workspace = str(workspace_path)
     bridge_dir = prepare_bridge_dir(session_id)
 
-    # Deliver a custom agent's instructions as an always-on Windsurf rule (the
-    # only channel Devin applies to every turn); a plain agent clears any stale
-    # rule a prior custom-agent launch left in this workspace. Where that rule
-    # would not be session-scoped — a home-directory workspace Devin reads from
-    # every cwd, or one another agent's live rule already owns — the instructions
-    # ride the first message instead, which is weaker but stays in this session.
-    raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
-    rule_is_live = write_devin_agent_rule(workspace_path, raw_instructions, session_id=session_id)
-    if raw_instructions and not rule_is_live:
-        write_agent_instructions_preamble(bridge_dir, raw_instructions)
-    elif rule_is_live:
+    # Reserve the workspace rule for authored roles; framework guidance belongs
+    # in this session's preamble so plain sessions cannot occupy the shared slot.
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    authored = raw_author_instructions(spec) if spec is not None else None
+    rule_is_live = write_devin_agent_rule(workspace_path, authored, session_id=session_id)
+    write_agent_instructions_preamble(
+        bridge_dir, build_native_startup_instructions(None if rule_is_live else spec)
+    )
+    if rule_is_live:
         # Record the workspace so the SessionEnd hook can remove this rule when
         # the session ends, rather than leaving it to load into a later Devin run.
         write_devin_workspace_hint(bridge_dir, workspace_path)
@@ -5215,26 +5445,22 @@ async def _auto_create_codex_terminal(
             extra={"session_id": session_id},
         )
     pick_to_reset: str | None = None
-    # Explicit launches (model-flows design §4): validate an explicit request
-    # against the shared catalog, and give a Default launch on codex's own
-    # login the ACCOUNT's real default — so the ``model =`` line copied from
-    # the user's shared config can never govern a session (the stale-gpt-5.4
-    # 400 class). Profile-backed shapes already resolve their default at
-    # materialization time and are left alone.
+    model_reset_notice: str | None = None
+    # Validate an explicit pick against the launch's model list. A Default launch on
+    # codex's own login pins the account default, so a ``model =`` line copied from the
+    # shared config never governs it. Profile shapes resolve their default when built.
     if codex_binding is None and (
         launch_config.model_override
         or (_codex_launch.model is None and _codex_launch.profile is None)
     ):
-        from omnigent.harnesses.codex_native.app_server import (
-            codex_launch_catalog,
-            codex_launch_catalog_is_stale,
-            codex_reprobed_launch_catalog,
+        from omnigent.harnesses.codex_native.app_server import codex_launch_models
+        from omnigent.models.codex_model_vocabulary import (
+            codex_reachable_model_slug,
+            codex_spawn_model,
         )
-        from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug
         from omnigent.models.model_catalog_store import default_row
 
-        _codex_catalog: list[_JsonObject] | None = None
-        _codex_catalog_was_stale = False
+        _launch_models = None
         try:
             if _catalog_launch is None:
                 _catalog_launch = await asyncio.to_thread(
@@ -5243,69 +5469,72 @@ async def _auto_create_codex_terminal(
                     spec=_launch_spec,
                     terminal_launch_args=_codex_terminal_args,
                 )
-            # Read staleness before the fetch can start a background probe.
-            # The fingerprint and probe must use this session's provider.
-            _codex_catalog_was_stale = await codex_launch_catalog_is_stale(
-                codex_path=_codex_cli_path, launch=_catalog_launch
-            )
-            _codex_catalog = await codex_launch_catalog(
+            # The list and any reload must use this session's provider.
+            _launch_models = await codex_launch_models(
                 codex_path=_codex_cli_path, launch=_catalog_launch
             )
         except Exception:  # discovery must not prevent a launch
             _logger.warning(
-                "codex launch catalog unavailable for session=%s",
+                "codex launch model list unavailable for session=%s",
                 session_id,
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-        if launch_config.model_override and _codex_catalog:
+        if launch_config.model_override and _launch_models is not None:
             pick = launch_config.model_override
-            reachable = codex_reachable_model_slug(pick, _codex_catalog)
-            fresh_rows = _codex_catalog
-            if reachable is None and _codex_catalog_was_stale:
-                fresh_rows = await codex_reprobed_launch_catalog(
-                    codex_path=_codex_cli_path, launch=_catalog_launch
+            reachable = codex_reachable_model_slug(pick, _launch_models.rows)
+            if reachable is None and _launch_models.stale and _catalog_launch is not None:
+                _launch_models = await codex_launch_models(
+                    codex_path=_codex_cli_path, launch=_catalog_launch, reload=True
                 )
-                if fresh_rows:
-                    _codex_catalog = fresh_rows
-                    _codex_catalog_was_stale = False
-                    reachable = codex_reachable_model_slug(pick, fresh_rows)
-            if reachable is None:
+                if _launch_models is not None:
+                    reachable = codex_reachable_model_slug(pick, _launch_models.rows)
+            if _launch_models is None or (reachable is None and _launch_models.cached_fallback):
+                # Only a live list can retire the pick; Codex or the gateway reports a real miss.
+                _logger.warning(
+                    "codex-native: no live model list confirms the pick %r for session %s; "
+                    "launching on the pick",
+                    pick,
+                    session_id,
+                    extra={"session_id": session_id},
+                )
+            elif reachable is None:
                 # Re-resolve so provider overrides cannot retain the old model.
-                # A failed probe permits fallback, but cannot retire the pick.
+                listed = _launch_models.rows
                 fallback_model = unpinned_model
                 if (
                     fallback_model is not None
-                    and fresh_rows
-                    and codex_reachable_model_slug(fallback_model, fresh_rows) is None
+                    and codex_reachable_model_slug(fallback_model, listed) is None
                 ):
                     # `omnigent codex --model` pins the same id in the spec, so
                     # falling back to it would relaunch the unlisted model.
                     fallback_model = None
+                listed_default = default_row(listed)
+                if fallback_model is None and _codex_launch.profile is not None and listed_default:
+                    # Pin the workspace default so the notice names the model that runs.
+                    fallback_model = str(listed_default["id"])
                 _codex_launch = await asyncio.to_thread(
                     resolve_native_codex_launch,
                     model=fallback_model,
                     spec=_launch_spec,
                     terminal_launch_args=_codex_terminal_args,
                 )
-                pick_to_reset = pick if fresh_rows else None
-                outcome = (
-                    "resetting the pick to Default after terminal launch"
-                    if pick_to_reset is not None
-                    else "keeping the pick because the catalog re-probe failed"
-                )
-                offered = ", ".join(
-                    str(row.get("id") or row.get("model") or "") for row in _codex_catalog
-                )
+                pick_to_reset = pick
+                offered = ", ".join(str(row.get("id") or row.get("model") or "") for row in listed)
                 _logger.warning(
-                    "codex-native: model pick %r for session %s is not in the provider's "
-                    "model list (it offers: %s); launching on the default and %s",
+                    "codex-native: model pick %r for session %s is not in the launch's "
+                    "model list (it offers: %s); launching on the default and resetting "
+                    "the pick after terminal launch",
                     pick,
                     session_id,
                     offered,
-                    outcome,
                     extra={"session_id": session_id},
                 )
+        _codex_catalog: list[_JsonObject] | None = None
+        _codex_catalog_was_stale = False
+        if _launch_models is not None and _codex_launch.profile is None:
+            # A workspace listing is not Codex's model/list, so only Codex rows seed the launch.
+            _codex_catalog, _codex_catalog_was_stale = _launch_models.rows, _launch_models.stale
         if _codex_launch.model is None and _codex_launch.profile is None and _codex_catalog:
             # Same staleness rule as the claude branch: never convert a stale
             # entry's default into an explicit model pin.
@@ -5326,6 +5555,14 @@ async def _auto_create_codex_terminal(
                     _codex_launch = dataclasses.replace(_codex_launch, model=_default_id)
         if _codex_catalog and not _codex_catalog_was_stale:
             _fresh_codex_catalog = _codex_catalog
+        if pick_to_reset is not None:
+            launched = _codex_launch.model
+            launched_label = (
+                (codex_spawn_model(launched) or launched) if launched else "the default model"
+            )
+            model_reset_notice = (
+                f"{pick_to_reset} isn't available on this host; using {launched_label}."
+            )
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
@@ -5620,21 +5857,19 @@ async def _auto_create_codex_terminal(
         from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
 
         _codex_routing_note = smart_routing_spawn_note("codex-native")
-    _codex_developer_instructions = (
-        "\n\n".join(
-            x
-            for x in [
-                _native_startup_raw_instructions_from_spec(agent_spec),
-                _codex_routing_note,
-            ]
-            if x
-        )
-        or None
+    _codex_developer_instructions = "\n\n".join(
+        x
+        for x in [
+            _native_startup_instructions_from_spec(agent_spec),
+            _codex_routing_note,
+        ]
+        if x
     )
     # SDK initialization can block on DNS/auth before model discovery times out.
     # Keep it off the runner loop so heartbeats and other sessions can progress.
     app_server = await asyncio.to_thread(
         build_codex_native_server,
+        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
         session_id=session_id,
         socket_path=socket_path,
         codex_home=codex_home,
@@ -5711,7 +5946,12 @@ async def _auto_create_codex_terminal(
     )
     retained_resume_client: CodexAppServerClient | None = None
     if launch_config.external_session_id is not None:
+        from omnigent.harnesses.codex_native.main import _find_codex_rollout
+
         try:
+            resume_rollout = await asyncio.to_thread(
+                _find_codex_rollout, codex_home, launch_config.external_session_id
+            )
             # The rollout was written above, so a missing one is codex still
             # indexing it or skipping a file it cannot read: retry, then reset.
             for retry_delay_s in (*_CODEX_MISSING_ROLLOUT_RETRY_DELAYS_S, None):
@@ -5729,6 +5969,7 @@ async def _auto_create_codex_terminal(
                         retain_client=codex_remote_resume_omits_permission_args(
                             app_server.codex_cli_version
                         ),
+                        rollout_path=resume_rollout,
                     )
                     break
                 except Exception as exc:
@@ -5939,6 +6180,13 @@ async def _auto_create_codex_terminal(
             session_id,
             server_client,
             expected_model_override=pick_to_reset,
+        )
+    if model_reset_notice is not None:
+        await _post_native_launch_notice(
+            session_id=session_id,
+            server_client=server_client,
+            code="codex_native_model_unavailable",
+            notice=model_reset_notice,
         )
 
     # A prompt a previous launch blocked for routing but never got to replay
@@ -7544,31 +7792,48 @@ def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
     return model
 
 
-def _native_startup_raw_instructions_from_spec(
+def _opencode_session_instructions_from_spec(
     agent_spec: AgentSpec | ResolvedSpec | None,
 ) -> str | None:
-    """Read raw author instructions for a native harness's startup-additive channel.
+    """Compose the session-snapshot instructions written to OpenCode's AGENTS.md.
 
-    Shared by Claude/Pi native's ``--append-system-prompt`` and Codex native's
-    ``developer_instructions``. Returns the verbatim ``AgentSpec.instructions``
-    text only — never the fully framework-composed per-turn string. Terminal
-    launch is not tied to any one turn, while the composed string is
-    assembled per conversation for the turn about to run (late-bound
-    framework text like ``SHARED_SESSION_AUTHORSHIP_INSTRUCTION`` is
-    selected per conversation), so a startup channel carrying one turn's
-    composition would address every later turn with it.
+    Author instructions plus the spec-level framework instructions from
+    ``omnigent.runtime.prompt``. No per-request text or turn-bound framework
+    text is included: AGENTS.md is written once per launch and read for every
+    later turn. Tool schemas are empty, matching the runner's own composition.
 
     :param agent_spec: Agent spec object, or a resolved wrapper carrying a
         ``spec`` attribute. ``None`` means no spec was available.
-    :returns: The original resolved instructions text, or ``None`` when
-        absent/whitespace-only.
+    :returns: The composed text, or stable image guidance when there is no spec.
     """
-    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.runtime.prompt import (
+        build_instructions_nullable,
+        build_native_startup_instructions,
+    )
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     if spec is None:
-        return None
-    return raw_author_instructions(spec)
+        return build_native_startup_instructions(None)
+    return build_instructions_nullable(spec, None, [])
+
+
+def _native_startup_instructions_from_spec(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> str:
+    """Compose native startup instructions without turn-bound framework metadata.
+
+    Shared by Claude/Pi native's ``--append-system-prompt`` and Codex native's
+    ``developer_instructions``. The shared composer preserves author text and
+    adds only guidance that applies throughout the native session.
+
+    :param agent_spec: Agent spec object, or a resolved wrapper carrying a
+        ``spec`` attribute. ``None`` means no spec was available.
+    :returns: Author instructions followed by stable framework guidance.
+    """
+    from omnigent.runtime.prompt import build_native_startup_instructions
+
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    return build_native_startup_instructions(spec)
 
 
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
@@ -7908,6 +8173,33 @@ async def _claude_legacy_prompt_consumed(
     return has_prior_history
 
 
+def _without_claude_session_id_arg(args: list[str]) -> list[str]:
+    """Drop a pass-through ``--session-id`` that a cold ``--resume`` would conflict with.
+
+    Claude exits with code 1 when ``--session-id`` accompanies ``--resume``
+    without ``--fork-session``; the id only named the session's first launch.
+
+    :param args: Pass-through Claude args, e.g. ``["--session-id", "<uuid>", "--verbose"]``.
+    :returns: *args* without ``--session-id <value>`` / ``--session-id=<value>``,
+        unchanged when ``--fork-session`` is present.
+    """
+    if "--fork-session" in args:
+        return args
+    kept: list[str] = []
+    skip_value = False
+    for arg in args:
+        if skip_value:
+            skip_value = False
+            continue
+        if arg == "--session-id":
+            skip_value = True
+            continue
+        if arg.startswith("--session-id="):
+            continue
+        kept.append(arg)
+    return kept
+
+
 def _build_claude_native_base_args(
     *,
     reasoning_effort: str | None,
@@ -7974,7 +8266,10 @@ def _build_claude_native_base_args(
         skip_leading_prompt = (
             skip_initial_prompt and _claude_legacy_launch_prompt(terminal_launch_args) is not None
         )
-        args.extend(terminal_launch_args[1:] if skip_leading_prompt else terminal_launch_args)
+        passthrough = terminal_launch_args[1:] if skip_leading_prompt else terminal_launch_args
+        if resume_external_session_id:
+            passthrough = _without_claude_session_id_arg(passthrough)
+        args.extend(passthrough)
     # model_override is a default: it applies only when the user did
     # not pass their own ``--model`` (in either the long ``--model X``
     # or the joined ``--model=X`` form).
@@ -7994,9 +8289,8 @@ def _claude_terminal_env_unset(
     resolve auth against the wrong workspace.
 
     Always drops ``CLAUDECODE`` because Claude Code rejects any child launch
-    carrying that nested-session marker, regardless of its auth mode. When the
-    launch config carries an ``apiKeyHelper``, also drops ambient credentials
-    that override the helper or open Claude Code's custom-API-key menu.
+    carrying that nested-session marker, regardless of its auth mode. Also
+    drops ambient credentials that conflict with the selected authentication.
 
     :param claude_config: The resolved native launch config, or ``None``
         (Claude's own login) — which still strips the nested-session marker.
@@ -8928,6 +9222,7 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
+        claude_terminal_relay_env,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
         validate_claude_hook_interpreter_compatibility,
@@ -8941,6 +9236,7 @@ async def _auto_create_claude_terminal(
         )
     )
     started_at = time.monotonic()
+    timings = StageTimings()
     _logger.info(
         "Claude terminal auto-create starting: session=%s workspace=%s bundle_dir=%s "
         "agent_name=%s skills_filter=%s",
@@ -9033,6 +9329,7 @@ async def _auto_create_claude_terminal(
         session_id,
         extra={"session_id": session_id},
     )
+    timings.mark("bridge")
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     # The Omnigent server URL + auth are needed in two places below: the
@@ -9070,6 +9367,7 @@ async def _auto_create_claude_terminal(
         session_id=session_id,
         session_init=session_init,
     )
+    timings.mark("launch_metadata")
     session_effort = launch_metadata.reasoning_effort
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
@@ -9277,6 +9575,7 @@ async def _auto_create_claude_terminal(
     # Claude's own login — so a host-spawned native-claude session honors the
     # provider selection just like the in-process claude-sdk harness and the
     # CLI path.
+    timings.mark("resume_transcript")
     claude_config: ClaudeNativeUcodeConfig | None = None
     _launch_config_resolution_failed = False
     from omnigent.inference_config import (
@@ -9337,6 +9636,7 @@ async def _auto_create_claude_terminal(
         launch_model = resolve_bound_model(
             inference_config, "claude-native", session_model_override or unpinned_launch_model
         )
+    timings.mark("launch_config")
     # A pick the provider cannot serve is dropped only once the fallback
     # terminal is actually up, so a failed launch never loses it.
     reset_pick_after_launch = False
@@ -9488,6 +9788,7 @@ async def _auto_create_claude_terminal(
     # no gain — nothing later re-picks the launch model there.
     if launch_metadata.routing_enabled:
         claude_config = claude_config_with_launch_model_pinned(claude_config, launch_model)
+    timings.mark("catalog")
     if record_launch_config is not None and not _launch_config_resolution_failed:
         record_launch_config(session_id, claude_config)
     # Persist the vocabulary + launch model onto the bridge so mid-session
@@ -9590,6 +9891,7 @@ async def _auto_create_claude_terminal(
         _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
     claude_args = augment_claude_args(
         base_claude_args,
+        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
         bridge_dir=bridge_dir,
         workspace=Path(workspace),
         ap_server_url=server_url,
@@ -9601,11 +9903,8 @@ async def _auto_create_claude_terminal(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(
-            x
-            for x in [_native_startup_raw_instructions_from_spec(agent_spec), routed_spawn_note]
-            if x
-        )
-        or None,
+            x for x in [_native_startup_instructions_from_spec(agent_spec), routed_spawn_note] if x
+        ),
         allowed_tools=routed_spawn_tools,
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.
@@ -9614,8 +9913,8 @@ async def _auto_create_claude_terminal(
 
     # Apply the per-harness startup command/args override from config
     # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
-    # downstream integration can wrap this managed-host launch — e.g. Databricks'
-    # ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
+    # downstream integration can wrap this managed-host launch — e.g. a wrapper
+    # such as ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
     # ``isaac -- <augmented args>`` (the config args prepend, and augmentation
     # appended above, so the ``--`` stays first). Identity by default. This is
     # the same resolver the local-CLI native launch uses (see cli_native.py), so
@@ -9657,7 +9956,13 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=build_native_claude_terminal_env(claude_config),
+        env={
+            **build_native_claude_terminal_env(
+                claude_config,
+                client_surface=resource_registry.client_surface(session_id),
+            ),
+            **claude_terminal_relay_env(bridge_dir),
+        },
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
         # inherit this env and several build ``WorkspaceClient`` without pinning
@@ -9719,6 +10024,7 @@ async def _auto_create_claude_terminal(
         env_spec.scrollback,
         extra={"session_id": session_id},
     )
+    timings.mark("prepare_terminal")
     try:
         terminal_view = await resource_registry.launch_required_terminal(
             session_id=session_id,
@@ -9744,6 +10050,7 @@ async def _auto_create_claude_terminal(
         with contextlib.suppress(Exception):
             await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
         raise
+    timings.mark("tmux_launch")
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
     # Surface the terminal on the live SSE stream so an already-connected
@@ -9768,7 +10075,13 @@ async def _auto_create_claude_terminal(
         terminal_metadata.get("tmux_socket"),
         terminal_metadata.get("tmux_target"),
         (time.monotonic() - started_at) * 1000,
-        extra={"session_id": session_id},
+        # Stage split of this launch, to find which step dominates startup.
+        extra=debug_event(
+            "claude_terminal_launched",
+            session_id=session_id,
+            terminal_id=terminal_payload.get("id"),
+            **timings.attributes(),
+        ),
     )
 
     publish_event(

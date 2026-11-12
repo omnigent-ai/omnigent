@@ -248,6 +248,21 @@ afterEach(() => {
 });
 
 describe("useWorkspaceChangedFiles gating", () => {
+  it("preserves optional repository identity and workspace-relative paths", async () => {
+    onlineMock.mockReturnValue(true);
+    const entries = [
+      { path: "api/app.py", name: "app.py", repository_root: "api" },
+      { path: "notes.md", name: "notes.md" },
+    ].map((entry) => ({ ...entry, status: "modified", bytes: 12, modified_at: null }));
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse({ object: "list", data: entries, has_more: false }));
+    const { result } = renderHook(() => useWorkspaceChangedFiles("conv_repos"), { wrapper: Wrap });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.data).toMatchObject(entries);
+    expect(result.current.data?.data[1].repository_root).toBeUndefined();
+  });
+
   it("does not fetch when the runner is offline and the host is also down", async () => {
     onlineMock.mockReturnValue(false);
     hostOnlineMock.mockReturnValue(false);
@@ -762,6 +777,30 @@ describe("useWorkspaceFileSearch truncation", () => {
     );
 
     await waitFor(() => expect(screen.getByTestId("truncated")).toHaveTextContent("true"));
+  });
+
+  it("cancels a search request that a newer query replaced", async () => {
+    onlineMock.mockReturnValue(true);
+    const signals: AbortSignal[] = [];
+    fetchMock.mockImplementation((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.signal) signals.push(init.signal);
+      return new Promise<Response>(() => {});
+    });
+
+    const { rerender } = render(
+      <Wrap>
+        <FileSearchTruncatedProbe id="conv_live" query="ap" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(signals).toHaveLength(1));
+    rerender(
+      <Wrap>
+        <FileSearchTruncatedProbe id="conv_live" query="app" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(signals).toHaveLength(2));
+    await waitFor(() => expect(signals[0].aborted).toBe(true));
+    expect(signals[1].aborted).toBe(false);
   });
 });
 

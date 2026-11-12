@@ -590,3 +590,81 @@ def test_agent_for_user_creates_no_row_when_the_bundle_is_missing(
 
     assert excinfo.value.code == ErrorCode.SESSION_AGENT_MISSING
     assert agents.list_user_agents("bob@example.com").data == []
+
+
+class _UncheckableArtifactStore(LocalArtifactStore):
+    """A store whose existence check fails, as a remote store's can mid-request."""
+
+    def __init__(self, root: str, *, put_error: Exception | None = None) -> None:
+        super().__init__(root)
+        self.puts: list[str] = []
+        self._put_error = put_error
+
+    def exists(self, key: str) -> bool:
+        raise ConnectionError("artifact store unavailable")
+
+    def put(self, key: str, data: bytes) -> None:
+        self.puts.append(key)
+        if self._put_error is not None:
+            raise self._put_error
+        super().put(key, data)
+
+
+def _bind_orion(db_uri: str, root: str) -> tuple[SqlAlchemyAgentStore, bytes]:
+    """Bind one upload through a healthy store; returns the agent store and bundle."""
+    from omnigent.server.bundles import uploaded_agent_for
+
+    agents = SqlAlchemyAgentStore(db_uri)
+    bundle = _make_bundle_bytes({"config.yaml": _MIN_CONFIG.format(name="orion")})
+    bound = uploaded_agent_for(
+        agents,
+        LocalArtifactStore(root),
+        owner="alice@example.com",
+        spec=validate_agent_bundle(bundle),
+        bundle_bytes=bundle,
+    )
+    assert bound is not None
+    return agents, bundle
+
+
+def test_uploaded_agent_rewrites_its_bundle_when_the_store_cannot_confirm_it(
+    db_uri: str, tmp_path: Path
+) -> None:
+    from omnigent.server.bundles import uploaded_agent_for
+
+    root = str(tmp_path / "artifacts")
+    agents, bundle = _bind_orion(db_uri, root)
+    artifacts = _UncheckableArtifactStore(root)
+
+    agent = uploaded_agent_for(
+        agents,
+        artifacts,
+        owner="alice@example.com",
+        spec=validate_agent_bundle(bundle),
+        bundle_bytes=bundle,
+    )
+
+    assert agent is not None
+    assert artifacts.puts == [agent.bundle_location]
+    assert LocalArtifactStore(root).get(agent.bundle_location) == bundle
+
+
+def test_uploaded_agent_reports_the_rewrite_failure_when_the_store_is_down(
+    db_uri: str, tmp_path: Path
+) -> None:
+    from omnigent.server.bundles import uploaded_agent_for
+
+    root = str(tmp_path / "artifacts")
+    agents, bundle = _bind_orion(db_uri, root)
+    put_error = PermissionError("no write access to the artifact store")
+
+    with pytest.raises(PermissionError) as excinfo:
+        uploaded_agent_for(
+            agents,
+            _UncheckableArtifactStore(root, put_error=put_error),
+            owner="alice@example.com",
+            spec=validate_agent_bundle(bundle),
+            bundle_bytes=bundle,
+        )
+
+    assert excinfo.value is put_error

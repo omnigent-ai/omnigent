@@ -365,6 +365,26 @@ describe("parseEvent — session.status (background_tasks detail)", () => {
   });
 });
 
+describe("parseEvent — session.status (background_agents)", () => {
+  function agents(status: string, data: Record<string, unknown>) {
+    const ev = parseEvent("session.status", { conversation_id: "conv_a", status, ...data });
+    return (ev as SessionStatusEvent | null)?.backgroundAgents;
+  }
+
+  it("names the agents a claude-native waiting edge waits on", () => {
+    expect(
+      agents("waiting", {
+        background_agents: [{ id: "a1", type: "subagent", description: "Audit" }, "junk"],
+      }),
+    ).toEqual([{ id: "a1", type: "subagent", description: "Audit" }]);
+  });
+
+  it("ignores agents on any edge other than waiting", () => {
+    expect(agents("running", { background_agents: [{ id: "a1" }] })).toBeUndefined();
+    expect(agents("waiting", {})).toBeUndefined();
+  });
+});
+
 describe("parseEvent — session.mcp_startup", () => {
   it("parses a per-server startup map for the MCP startup band", () => {
     const ev = parseEvent("session.mcp_startup", {

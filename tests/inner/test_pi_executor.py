@@ -1,6 +1,7 @@
 """Tests for PiExecutor."""
 
 import asyncio
+import base64
 import contextlib
 import itertools
 import json
@@ -12,6 +13,7 @@ import socket
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1860,10 +1862,11 @@ class TestPiExecutorConstructor(unittest.TestCase):
             _run(executor._get_gateway_token())
 
         read_cfg.assert_not_called()
-        from omnigent.inner.pi_executor import _GATEWAY_AUTH_TIMEOUT_S
+        from omnigent.inner.pi_executor import _GATEWAY_TURN_AUTH_TIMEOUT_S
 
+        # The refresh owns its task, so a bridge request's short wait does not bound the helper.
         fetch_command_token.assert_awaited_once_with(
-            "printf token", timeout_s=_GATEWAY_AUTH_TIMEOUT_S
+            "printf token", timeout_s=_GATEWAY_TURN_AUTH_TIMEOUT_S
         )
         self.assertEqual(executor._databricks_host, "https://example.databricks.com")
         self.assertEqual(executor._databricks_token, "command-token")
@@ -2144,6 +2147,54 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
 
+def test_gateway_managed_dir_adds_host_mcp_servers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pi_host_mcp_servers: None,
+) -> None:
+    """The gateway's temporary agent dir merges host MCP servers into a private copy."""
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+    from omnigent.inner import pi_mcp
+
+    global_agent = tmp_path / "pi-agent"
+    global_agent.mkdir()
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(global_agent))
+    # Pi's filtered env drops this variable, so a server needing it is skipped.
+    monkeypatch.setenv("RUNNER_ONLY_SECRET", "sentinel-runner-only")
+    host_servers = [
+        ConfiguredMcpServer(
+            summary={"name": "docs", "harness": "codex"}, config={"command": "docs-mcp"}
+        ),
+        ConfiguredMcpServer(
+            summary={"name": "leaky", "harness": "claude"},
+            config={"command": "tool", "args": ["${RUNNER_ONLY_SECRET}"]},
+        ),
+    ]
+    monkeypatch.setattr(pi_mcp, "_host_mcp_servers", lambda: host_servers)
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+        _run(executor._get_gateway_token())
+
+    config = executor._build_env_and_dir(
+        [], 12345, "bridge-token", _build_models_json("https://h.example.com", "tok")
+    )
+    try:
+        assert "RUNNER_ONLY_SECRET" not in config.env
+        managed_config = Path(config.env["PI_CODING_AGENT_DIR"]) / "mcp.json"
+        assert json.loads(managed_config.read_text(encoding="utf-8")) == {
+            "mcpServers": {"docs": {"command": "docs-mcp"}}
+        }
+        assert not (global_agent / "mcp.json").exists()
+    finally:
+        shutil.rmtree(config.tmp_dir, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # Pi tool allowlist (--no-tools + --tools) tests — function-based per
 # the project's testing rules. ``--no-tools`` alone disables every tool
@@ -2417,6 +2468,189 @@ async def test_gateway_refresh_before_turn_outlasts_the_bridge_deadline(monkeypa
     with pytest.raises(OSError, match="timed out"):
         await executor._get_gateway_token()
     assert await executor._get_gateway_token(before_turn=True) == "slow-token"
+
+
+def _jwt_expiring_in(seconds: float) -> str:
+    claims = base64.urlsafe_b64encode(json.dumps({"exp": time.time() + seconds}).encode())
+    return f"unsigned.{claims.rstrip(b'=').decode()}.not-verified"
+
+
+@pytest.mark.parametrize(("old_lifetime_s", "reused"), [(600, True), (10, False), (None, False)])
+async def test_gateway_slow_refresh_reuses_only_an_unexpired_token(
+    tmp_path, monkeypatch, old_lifetime_s, reused
+):
+    # A workspace too slow to renew the token within Pi's command deadline must not fail
+    # the request while the cached token's exp claim leaves it valid.
+    from omnigent.inner import pi_executor
+
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 5)
+    old = "opaque-token" if old_lifetime_s is None else _jwt_expiring_in(old_lifetime_s)
+    new = _jwt_expiring_in(3600)
+    token_file, delay_file, runs_file = tmp_path / "token", tmp_path / "delay", tmp_path / "runs"
+    token_file.write_text(old)
+    delay_file.write_text("0")
+    files = {
+        name: shlex.quote(str(path))
+        for name, path in [("token", token_file), ("delay", delay_file), ("runs", runs_file)]
+    }
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command=(
+            f"echo run >> {files['runs']}; sleep $(cat {files['delay']}); cat {files['token']}"
+        ),
+        gateway_auth_refresh_interval_ms="0",
+    )
+    try:
+        assert await executor._get_gateway_token(before_turn=True) == old
+        token_file.write_text(new)
+        delay_file.write_text("1")
+        if reused:
+            assert await executor._get_gateway_token() == old
+        else:
+            with pytest.raises(OSError, match="timed out"):
+                await executor._get_gateway_token()
+        # The slow helper was not killed: its token answers the next request.
+        assert await executor._get_gateway_token(before_turn=True) == new
+        assert runs_file.read_text().count("run") == 2
+    finally:
+        await executor.close()
+
+
+async def test_gateway_slow_refresh_rechecks_expiry_after_the_host_sleeps(tmp_path, monkeypatch):
+    # The monotonic clock stops while a host sleeps, so only the token's exp claim, read
+    # against wall time, can tell that the cached token expired in the meantime.
+    from omnigent.inner import pi_executor
+
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 5)
+    token = _jwt_expiring_in(600)
+    delay_file = tmp_path / "delay"
+    delay_file.write_text("0")
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command=f"sleep $(cat {shlex.quote(str(delay_file))}); printf %s {token}",
+        gateway_auth_refresh_interval_ms="0",
+    )
+    try:
+        assert await executor._get_gateway_token(before_turn=True) == token
+        delay_file.write_text("1")
+        monkeypatch.setattr(
+            pi_executor,
+            "time",
+            SimpleNamespace(monotonic=time.monotonic, time=lambda: time.time() + 1000),
+        )
+        with pytest.raises(OSError, match="timed out"):
+            await executor._get_gateway_token()
+    finally:
+        await executor.close()
+
+
+@pytest.mark.parametrize(
+    ("broken_helper", "cached", "outcome"),
+    [
+        ("exit 1", "jwt", "command failed"),
+        ("sleep 30", "jwt", None),
+        ("sleep 30", "opaque", "timed out"),
+    ],
+    ids=["failing-helper", "hung-helper", "hung-helper-opaque-token"],
+)
+async def test_gateway_refresh_falls_back_only_for_a_slow_helper(
+    tmp_path, monkeypatch, broken_helper, cached, outcome
+):
+    # A helper that exits with an error (signed out, revoked) fails the request even while
+    # the cached token has plenty of lifetime left. One that outlives its own budget only
+    # ran slow, so an unexpired token still covers it, on both waiting paths.
+    from omnigent.inner import pi_executor
+
+    # The helper's budget ends before the bridge stops waiting, so both paths see it lapse.
+    monkeypatch.setattr(pi_executor, "_GATEWAY_TURN_AUTH_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 5)
+    token = _jwt_expiring_in(600) if cached == "jwt" else "opaque-token"
+    broken_flag = tmp_path / "broken"
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command=(
+            f"if [ -e {shlex.quote(str(broken_flag))} ]; then {broken_helper}; fi; "
+            f"printf %s {token}"
+        ),
+        gateway_auth_refresh_interval_ms="0",
+    )
+    try:
+        assert await executor._get_gateway_token(before_turn=True) == token
+        broken_flag.touch()
+        for before_turn in (False, True):
+            if outcome is None:
+                assert await executor._get_gateway_token(before_turn=before_turn) == token
+            else:
+                with pytest.raises(OSError, match=outcome):
+                    await executor._get_gateway_token(before_turn=before_turn)
+    finally:
+        await executor.close()
+
+
+async def test_gateway_close_reaps_a_refresh_no_request_awaits(tmp_path, monkeypatch):
+    # Once a request reuses the old token, the slow helper runs on with nothing waiting
+    # for it; closing the executor must still kill it.
+    from omnigent.inner import pi_executor
+
+    monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.2)
+    token = _jwt_expiring_in(600)
+    marker, pid_file = (shlex.quote(str(tmp_path / name)) for name in ("ran", "helper pid"))
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command=(
+            f"if [ -e {marker} ]; then echo $$ > {pid_file}; sleep 30 & wait; fi; "
+            f"touch {marker}; printf %s {token}"
+        ),
+        gateway_auth_refresh_interval_ms="0",
+    )
+    try:
+        assert await executor._get_gateway_token(before_turn=True) == token
+        assert await executor._get_gateway_token() == token
+        async with asyncio.timeout(3):
+            while not (tmp_path / "helper pid").exists():
+                await asyncio.sleep(0.01)
+        pid = int((tmp_path / "helper pid").read_text())
+    finally:
+        await asyncio.wait_for(executor.close(), 3)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+@pytest.mark.parametrize(("lifetime_s", "renew_after_s"), [(600, 300), (120, 30), (7200, 900)])
+async def test_gateway_renews_a_token_before_it_expires(monkeypatch, lifetime_s, renew_after_s):
+    # The Databricks CLI renews a token only near its expiry, so a fixed cache interval
+    # could outlive the token and leave a slow renewal nothing valid to reuse.
+    from omnigent.inner import pi_executor
+
+    fetch = AsyncMock(return_value=_jwt_expiring_in(lifetime_s))
+    monkeypatch.setattr(pi_executor, "_fetch_shell_command_token", fetch)
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command="get-token",
+    )
+    monkeypatch.setattr(
+        pi_executor, "time", SimpleNamespace(monotonic=lambda: now, time=time.time)
+    )
+    now = 100.0
+    await executor._get_gateway_token()
+    now += renew_after_s - 1
+    await executor._get_gateway_token()
+    assert fetch.await_count == 1
+    now += 2
+    await executor._get_gateway_token()
+    assert fetch.await_count == 2
 
 
 async def test_gateway_bridge_authenticates_and_cancels_helper_on_shutdown(tmp_path):
@@ -4553,8 +4787,12 @@ def test_models_json_lists_only_live_gateway_models() -> None:
     ]
 
 
-def test_models_json_attributes_only_unity_gateway_providers() -> None:
+def test_models_json_attributes_only_unity_gateway_providers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Providers on ``/ai-gateway/`` paths name Pi and Omnigent; serving endpoints don't."""
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     providers = _build_models_json("https://dbc-1.cloud.databricks.com", "tok")["providers"]
 
     attributed = {name for name, provider in providers.items() if "headers" in provider}
