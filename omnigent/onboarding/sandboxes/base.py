@@ -722,8 +722,8 @@ class SandboxLifecycle(ABC):
         Whether to :meth:`stop` a managed sandbox whose session was archived.
 
         Asked only for a sandbox this provider can resume. If this returns
-        ``True``, the server then checks that no session on the host is
-        unarchived before it stops the sandbox. The default follows the provider's
+        ``True``, the server then checks that no other session uses the sandbox
+        before it stops it. The default follows the provider's
         ``stop_on_archive`` server setting. Override it to decide per owner at
         archive time, for example from a feature flag, so a rollout or rollback
         needs no server restart. Runs in a worker thread, after the archive

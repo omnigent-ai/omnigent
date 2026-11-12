@@ -275,8 +275,9 @@ Failed terminations stay pending and are retried by later sweeps; providers must
 therefore make `terminate()` succeed when the sandbox is already absent.
 
 When a provider's `stop_on_archive` setting is true, archiving a session calls
-`stop()` on its sandbox once no unarchived session is bound to the host, and
-the next message after an unarchive wakes it through `resume()`. Only providers
+`stop()` on its sandbox when no other session uses it (no other session on the
+host, and no side chat or sub-agent of the session), and the next message after
+an unarchive wakes it through `resume()`. Only providers
 whose capabilities declare `resume_stopped` are stopped. `stop()` must treat an
 already stopped sandbox as success; raising `SandboxCapabilityError` leaves the
 sandbox running. Before stopping, the server calls

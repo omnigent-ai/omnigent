@@ -8,7 +8,6 @@ import click
 import pytest
 
 from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
-from omnigent.server import managed_hosts
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
@@ -18,11 +17,7 @@ from omnigent.server.managed_hosts import (
     stop_archived_session_sandbox,
 )
 from omnigent.server.routes._sessions import orchestration
-from omnigent.stores.conversation_store import (
-    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
-    SIDE_CHAT_LABEL_KEY,
-    SIDE_CHAT_SOURCE_LABEL_KEY,
-)
+from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from tests.server.helpers import FakeSandboxLauncher, HostStartInvocation
@@ -111,19 +106,13 @@ async def test_the_providers_launcher_makes_the_final_call(db_uri, monkeypatch, 
     assert len(fake.stopped) == (0 if configured else 1)
 
 
-@pytest.mark.parametrize("unarchived", ["itself", "sibling"])
-async def test_an_unarchive_while_the_launcher_decides_keeps_the_sandbox(
-    db_uri, monkeypatch, unarchived
-):
+async def test_an_unarchive_while_the_launcher_decides_keeps_the_sandbox(db_uri, monkeypatch):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
-    sibling = conversations.create_conversation(host_id=conv.host_id, workspace="/workspace")
-    conversations.update_conversation(sibling.id, archived=True)
 
     def stop_when_archived(**_kwargs: object) -> bool:
         # The user unarchives (and may already be sending a message) while a
         # slow decision, such as a flag lookup, is in flight.
-        target = conv.id if unarchived == "itself" else sibling.id
-        conversations.update_conversation(target, archived=False)
+        conversations.update_conversation(conv.id, archived=False)
         return True
 
     monkeypatch.setattr(fake, "stop_when_archived", stop_when_archived)
@@ -143,102 +132,44 @@ async def test_a_failing_launcher_decision_leaves_the_sandbox_running(db_uri, mo
 
 
 @pytest.mark.parametrize("other_archived", [False, True], ids=["in-use", "also-archived"])
-async def test_keeps_a_sandbox_another_unarchived_session_uses(db_uri, other_archived):
+async def test_keeps_a_sandbox_another_session_is_bound_to(db_uri, other_archived):
+    # An archived sibling may still be in its Undo grace or finishing its last
+    # turn, which only its own teardown knows, so any sibling keeps the sandbox.
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
     other = conversations.create_conversation(host_id=conv.host_id, workspace="/workspace")
     if other_archived:
         conversations.update_conversation(other.id, archived=True)
 
-    stopped = await _stop(fake, host_store, conversations, conv)
-    assert stopped is other_archived
-    assert len(fake.stopped) == (1 if other_archived else 0)
+    assert await _stop(fake, host_store, conversations, conv) is False
+    assert fake.stopped == []
 
 
-@pytest.mark.parametrize("side_chat_archived", [False, True], ids=["in-use", "also-archived"])
-@pytest.mark.parametrize("via_sub_agent", [False, True], ids=["of-source", "of-sub-agent"])
-async def test_keeps_a_sandbox_an_unarchived_side_chat_uses(
-    db_uri, side_chat_archived, via_sub_agent
-):
-    # Side chats and sub-agents have no host binding: they run on their source's
-    # or parent's runner, so only a walk from the host's sessions finds them.
+@pytest.mark.parametrize("archived", [False, True], ids=["in-use", "also-archived"])
+@pytest.mark.parametrize("kind", ["side-chat", "sub-agent"])
+async def test_keeps_a_sandbox_a_side_chat_or_sub_agent_runs_on(db_uri, archived, kind):
+    # Side chats and sub-agents run on the session's runner without a host binding.
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
-    parent_id = conv.id
-    if via_sub_agent:
-        parent_id = conversations.create_conversation(
+    if kind == "side-chat":
+        other = conversations.create_conversation(side_chat_parent_id=conv.id)
+    else:
+        other = conversations.create_conversation(
             kind="sub_agent", title="helper", parent_conversation_id=conv.id
-        ).id
-    side_chat = conversations.create_conversation(side_chat_parent_id=parent_id)
-    assert side_chat.host_id is None
-    if side_chat_archived:
-        conversations.update_conversation(side_chat.id, archived=True)
+        )
+    assert other.host_id is None
+    if archived:
+        conversations.update_conversation(other.id, archived=True)
 
-    stopped = await _stop(fake, host_store, conversations, conv)
-    assert stopped is side_chat_archived
-    assert len(fake.stopped) == (1 if side_chat_archived else 0)
-
-
-@pytest.mark.parametrize(("cap", "stops"), [(3, False), (4, True)], ids=["capped", "complete"])
-async def test_keeps_the_sandbox_when_the_walk_passes_the_session_cap(
-    db_uri, monkeypatch, cap, stops
-):
-    # Four sessions in all, and no page fills up: only the total count can trip.
-    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
-    first = conversations.create_conversation(
-        kind="sub_agent", title="one", parent_conversation_id=conv.id
-    )
-    conversations.create_conversation(
-        kind="sub_agent", title="two", parent_conversation_id=conv.id
-    )
-    conversations.create_conversation(
-        kind="sub_agent", title="nested", parent_conversation_id=first.id
-    )
-    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_MAX_SESSIONS", cap)
-    assert await _stop(fake, host_store, conversations, conv) is stops
-    assert len(fake.stopped) == (1 if stops else 0)
-
-
-@pytest.mark.parametrize("full_page", ["side-chats", "children"])
-async def test_keeps_the_sandbox_when_a_walk_page_is_full(db_uri, monkeypatch, full_page):
-    # Two archived side chats or two sub-agents fill a page of two: the rest of
-    # that page's list is unknown, so the sandbox stays up.
-    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
-    for title in ("one", "two"):
-        if full_page == "side-chats":
-            side_chat = conversations.create_conversation(side_chat_parent_id=conv.id)
-            conversations.update_conversation(side_chat.id, archived=True)
-        else:
-            conversations.create_conversation(
-                kind="sub_agent", title=title, parent_conversation_id=conv.id
-            )
-    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_MAX_SESSIONS", 2)
     assert await _stop(fake, host_store, conversations, conv) is False
-    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_MAX_SESSIONS", 4)
-    assert await _stop(fake, host_store, conversations, conv) is True
+    assert fake.stopped == []
 
 
-async def test_archiving_the_last_side_chat_stops_its_sources_sandbox(db_uri, monkeypatch):
+async def test_a_session_without_its_own_host_binding_is_left_alone(db_uri):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
-    side_chat = conversations.create_conversation(
-        side_chat_parent_id=conv.id,
-        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: conv.id},
-    )
-    # The source is archived first, while its side chat is still in use.
-    assert await _stop(fake, host_store, conversations, conv) is False
+    side_chat = conversations.create_conversation(side_chat_parent_id=conv.id)
     conversations.update_conversation(side_chat.id, archived=True)
     side_chat = conversations.get_conversation(side_chat.id)
-    assert side_chat.host_id is None
-    # The walk to the source reads only the labels it needs, not all of them.
-    full_read = conversations.get_conversation
-
-    def no_full_source_read(conversation_id: str):
-        assert conversation_id != conv.id, "the source must be read without all its labels"
-        return full_read(conversation_id)
-
-    monkeypatch.setattr(conversations, "get_conversation", no_full_source_read)
-
-    assert await _stop(fake, host_store, conversations, side_chat) is True
-    assert fake.stopped == [host_store.get_host(conv.host_id).sandbox_id]
-    assert fake.terminated == []
+    assert await _stop(fake, host_store, conversations, side_chat) is False
+    assert fake.stopped == []
 
 
 async def test_keeps_a_sandbox_its_provider_cannot_resume(db_uri):
@@ -249,19 +180,10 @@ async def test_keeps_a_sandbox_its_provider_cannot_resume(db_uri):
     assert fake.stopped == []
 
 
-@pytest.mark.parametrize("archived", ["run", "its-side-chat"])
-async def test_keeps_a_scheduled_task_runs_sandbox(db_uri, archived):
+async def test_keeps_a_scheduled_task_runs_sandbox(db_uri):
     fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(
         db_uri, labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task-1"}
     )
-    if archived == "its-side-chat":
-        # An unlabeled side chat runs on the run's sandbox, which the task manages.
-        side_chat = conversations.create_conversation(
-            side_chat_parent_id=conv.id,
-            labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: conv.id},
-        )
-        conversations.update_conversation(side_chat.id, archived=True)
-        conv = conversations.get_conversation(side_chat.id)
     assert await _stop(fake, host_store, conversations, conv) is False
     assert fake.stopped == []
 
@@ -298,20 +220,6 @@ async def test_keeps_the_sandbox_when_the_store_cannot_list_the_hosts_sessions(
         monkeypatch.setattr(conversations, "get_session_activity", without_archived)
     assert await _stop(fake, host_store, conversations, conv) is False
     assert fake.stopped == []
-
-
-@pytest.mark.parametrize(("pages", "stops"), [(2, False), (3, True)], ids=["capped", "complete"])
-async def test_keeps_the_sandbox_when_the_hosts_sessions_exceed_the_page_cap(
-    db_uri, monkeypatch, pages, stops
-):
-    fake, host_store, conversations, conv = await _archived_session_on_a_sandbox(db_uri)
-    other = conversations.create_conversation(host_id=conv.host_id, workspace="/workspace")
-    conversations.update_conversation(other.id, archived=True)
-    # Two archived sessions: a cap that a full listing reaches counts the host
-    # as in use, since sessions past it are unknown.
-    monkeypatch.setattr(managed_hosts, "_ARCHIVE_STOP_MAX_SESSIONS", pages)
-    assert await _stop(fake, host_store, conversations, conv) is stops
-    assert len(fake.stopped) == (1 if stops else 0)
 
 
 @pytest.mark.parametrize(

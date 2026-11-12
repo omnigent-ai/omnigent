@@ -1375,17 +1375,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = self._get_meta(conversation_id)
             return _to_conversation(row, meta, _fetch_labels(session, conversation_id))
 
-    def get_conversation_with_label_keys(
-        self, conversation_id: str, label_keys: tuple[str, ...]
-    ) -> Conversation | None:
-        with shared_read_scope(), self._conv_session("select_conversation_by_id") as session:
-            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if row is None:
-                return None
-            meta = self._get_meta(conversation_id)
-            labels = _fetch_labels(session, conversation_id, keys=label_keys)
-            return _to_conversation(row, meta, labels)
-
     def find_conversation_by_external_session_id(
         self,
         external_session_id: str,

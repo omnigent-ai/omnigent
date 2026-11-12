@@ -5143,73 +5143,38 @@ async def release_session_managed_host(
     )
 
 
-# Caps each page and the whole walk of a sandbox's sessions on archive; a larger
-# or incomplete set leaves the sandbox running.
-_ARCHIVE_STOP_MAX_SESSIONS = 100
-
-
-async def _host_may_be_in_use(
+async def _sandbox_has_other_users(
     host_id: str, session_id: str, conversation_store: ConversationStore
 ) -> bool:
     """
-    Whether any session on *host_id* may still use it.
+    Whether anything but the archived *session_id* may still use *host_id*.
 
-    *session_id* is a session bound to *host_id*, used to confirm the listing.
+    Only a lone sandbox is stopped: another session bound to the host, or a side
+    chat or sub-agent of the session (they run on its runner without a host
+    binding), keeps it running whether archived or not. An archived sibling may
+    still be inside its Undo grace or finishing its last turn, which only its own
+    teardown knows. The session itself must still be archived, since an unarchive
+    cannot cancel a teardown that has started.
 
-    The host's own sessions are those bound to it. Side chats and sub-agents
-    have no host binding and run on their source's or parent's runner, so they
-    are found by walking out from those sessions. An unarchived host session or
-    side chat counts as in use, which also covers the archived session having
-    been unarchived since its teardown began. Sub-agents are not archived with their
-    parent, so they are only walked for their own side chats.
-
-    Fails closed: a session whose archived state can't be read, a host listing
-    that omits *session_id* (a store that can't list a host's sessions), a full
-    page, or more than :data:`_ARCHIVE_STOP_MAX_SESSIONS` sessions counts as in
-    use.
+    Fails closed: a host listing that omits *session_id* (a store that can't list
+    a host's sessions) or an unknown archived state counts as in use.
     """
-    limit = _ARCHIVE_STOP_MAX_SESSIONS
-
-    async def all_archived(ids: list[str]) -> bool:
-        if not ids:
-            return True
-        # Reads no labels, so the cost stays bounded by the page of ids.
-        activity = await asyncio.to_thread(conversation_store.get_session_activity, ids)
-        return all(
-            conversation_id in activity and activity[conversation_id].archived is True
-            for conversation_id in ids
-        )
-
     host_sessions = await asyncio.to_thread(
-        conversation_store.list_host_conversation_ids, host_id, limit=limit
+        conversation_store.list_host_conversation_ids, host_id, limit=2
     )
-    if len(host_sessions) >= limit or session_id not in host_sessions:
+    if host_sessions != [session_id]:
         return True
-    if not await all_archived(host_sessions):
+    side_chats = await asyncio.to_thread(
+        conversation_store.list_side_chat_ids, session_id, limit=1
+    )
+    children = await asyncio.to_thread(
+        conversation_store.list_child_conversation_ids_page, session_id, limit=1
+    )
+    if side_chats or children:
         return True
-    seen = set(host_sessions)
-    frontier = list(host_sessions)
-    while frontier:
-        next_frontier: list[str] = []
-        for parent_id in frontier:
-            side_chats = await asyncio.to_thread(
-                conversation_store.list_side_chat_ids, parent_id, limit=limit
-            )
-            children = await asyncio.to_thread(
-                conversation_store.list_child_conversation_ids_page, parent_id, limit=limit
-            )
-            if len(side_chats) >= limit or len(children) >= limit:
-                return True
-            if not await all_archived([i for i in side_chats if i not in seen]):
-                return True
-            for conversation_id in (*side_chats, *(child_id for child_id, _ in children)):
-                if conversation_id not in seen:
-                    seen.add(conversation_id)
-                    next_frontier.append(conversation_id)
-            if len(seen) > limit:
-                return True
-        frontier = next_frontier
-    return False
+    activity = await asyncio.to_thread(conversation_store.get_session_activity, [session_id])
+    row = activity.get(session_id)
+    return row is None or row.archived is not True
 
 
 async def stop_archived_session_sandbox(
@@ -5221,11 +5186,11 @@ async def stop_archived_session_sandbox(
     """
     Best-effort stop of an opted-in archived session's sandbox, keeping it resumable.
 
-    The sandbox is the session's own host's, or for a side chat or sub-agent its
-    source's or parent's. The provider's ``stop_on_archive`` setting, passed
-    through the launcher's ``stop_when_archived`` hook, decides; scheduled task
-    runs are skipped, and :func:`_host_may_be_in_use` must find no session still
-    using the sandbox. Any failure before the stop leaves the sandbox running.
+    The provider's ``stop_on_archive`` setting, passed through the launcher's
+    ``stop_when_archived`` hook, decides. Only the sandbox of a session bound to
+    it directly, and used by no other session (see
+    :func:`_sandbox_has_other_users`), is stopped; scheduled task runs are
+    skipped. Any failure before the stop leaves the sandbox running.
 
     Nothing holds new work off while the provider stops the sandbox: a session
     unarchived and messaged during that call can start a runner the stop then
@@ -5239,35 +5204,14 @@ async def stop_archived_session_sandbox(
         hosts are not configured.
     :returns: ``True`` when the provider stopped the sandbox.
     """
-    from omnigent.runner.routing import routing_host_session
-    from omnigent.stores.conversation_store import (
-        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
-        SIDE_CHAT_LABEL_KEY,
-        SIDE_CHAT_SOURCE_LABEL_KEY,
-    )
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 
-    # The walk to the host session needs only these labels; reading no others
-    # keeps a source with many labels from growing the teardown's reads.
-    label_keys = (SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY, SCHEDULED_TASK_ORIGIN_LABEL_KEY)
-
-    if config is None:
+    if config is None or conv.host_id is None:
         return False
     if conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY):
         return False
     try:
-        owner = await asyncio.to_thread(
-            routing_host_session,
-            conv,
-            conversation_store,
-            read=partial(
-                conversation_store.get_conversation_with_label_keys, label_keys=label_keys
-            ),
-        )
-        if owner is None or owner.host_id is None:
-            return False
-        if owner.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY):
-            return False
-        host = await asyncio.to_thread(host_store.get_host, owner.host_id)
+        host = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host is None or host.sandbox_id is None:
             return False
         launcher = _launcher_for_teardown(host, config)
@@ -5285,7 +5229,7 @@ async def stop_archived_session_sandbox(
             return False
         # After the hook, which may be slow: an unarchive can't cancel a started
         # teardown.
-        if await _host_may_be_in_use(host.host_id, owner.id, conversation_store):
+        if await _sandbox_has_other_users(host.host_id, conv.id, conversation_store):
             return False
         try:
             await asyncio.to_thread(launcher.stop, host.sandbox_id)
