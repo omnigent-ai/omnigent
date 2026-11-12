@@ -2317,7 +2317,7 @@ class PiExecutor(Executor):
             self._pi_path,
             os_env,
             cwd,
-            spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR"],
+            spawn_env_names=[*self._env, "TMPDIR", "PI_CODING_AGENT_DIR"],
             extra_read_roots=_pi_bundle_resource_roots(bundle_dir, bundle_args),
         )
         self._pi_launch_path = sandboxed.launch_path

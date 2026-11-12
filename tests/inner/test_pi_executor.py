@@ -5479,6 +5479,7 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     from omnigent.inner.sandbox import SandboxPolicy
 
     monkeypatch.setenv("FAKE_HOST_SECRET", "PWNED")
+    monkeypatch.delenv("TMPDIR", raising=False)
     captured: dict[str, SandboxPolicy] = {}
     if layout == "standalone":
         executable = tmp_path / "install/bin/pi"
@@ -5519,7 +5520,8 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     with (
         patch("omnigent.inner.pi_executor._find_pi_cli", return_value=str(pi_binary)),
         patch(
-            "subprocess.run", return_value=SimpleNamespace(stdout="0.80.4\n", stderr="")
+            "omnigent.inner._proc.run_isolated",
+            return_value=SimpleNamespace(stdout="0.80.4\n", stderr=""),
         ) as probe,
     ):
         executor = PiExecutor(
@@ -5527,14 +5529,17 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
         )
 
+    probe_env = probe.call_args.kwargs["env"]
     probe.assert_called_once_with(
         ["/fake/launcher", "--version"],
         capture_output=True,
         text=True,
         timeout=5.0,
-        env=executor._env,
+        env=probe_env,
         cwd=str(tmp_path),
     )
+    assert {key: value for key, value in probe_env.items() if key != "TMPDIR"} == executor._env
+    assert not Path(probe_env["TMPDIR"]).exists()
     assert "FAKE_HOST_SECRET" not in probe.call_args.kwargs["env"]
     assert executor._settled_turn_boundary is True
     # The launcher wrap actually engaged (not the silent no-sandbox
@@ -5547,6 +5552,7 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     # Per-spawn gateway var must be pruneproof even though it is not in
     # the clean base env yet at construction time.
     assert "PI_CODING_AGENT_DIR" in allowlist
+    assert "TMPDIR" in allowlist
     # A clean-env staple proves the executor's deliberate env names got
     # baked in (an empty allowlist would prune PATH and break node).
     assert "PATH" in allowlist
@@ -5572,7 +5578,7 @@ def test_pi_rejects_sandbox_before_version_probe(
         sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
     )
     with (
-        patch("subprocess.run") as probe,
+        patch("omnigent.inner._proc.run_isolated") as probe,
         patch(
             "omnigent.inner.sandbox.resolve_sandbox", side_effect=OSError("sandbox unavailable")
         ),

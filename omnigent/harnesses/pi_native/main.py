@@ -198,17 +198,21 @@ def pi_version(
     :returns: Parsed version tuple, e.g. ``(0, 79, 10)``, or ``None``.
     """
     import re
-    import subprocess
+
+    from omnigent.inner._proc import run_isolated
 
     try:
-        result = subprocess.run(
-            [executable, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-            env=env,
-            cwd=cwd,
-        )
+        # The parent owns scratch cleanup even if the sandbox launcher is killed.
+        with TemporaryDirectory(prefix="omnigent-pi-probe-") as probe_tmpdir:
+            probe_env = {**(os.environ if env is None else env), "TMPDIR": probe_tmpdir}
+            result = run_isolated(
+                [executable, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                env=probe_env,
+                cwd=cwd,
+            )
     except Exception:  # noqa: BLE001
         return None
     # Older Pi (mariozechner package) prints the version to stderr via
