@@ -47,7 +47,7 @@ export function ModelEffortFields({
   idPrefix?: string;
   /** Offers an empty mode under this label because it inherits another session's. */
   inheritedPermissionLabel?: string;
-  /** The mode Default saves; "" leaves the mode empty. */
+  /** The mode Default saves; "" leaves the mode empty. Default is hidden when this mode is listed. */
   defaultPermissionMode?: string;
 }) {
   const modelOptions = settings.models.map((option) => ({
@@ -63,6 +63,10 @@ export function ModelEffortFields({
   }
   const permissionOptions = settings.permissions.filter(
     (option) => settings.harness === "claude-native" || option.value !== "default",
+  );
+  // Default would duplicate a listed mode (Claude lists its default as Manual).
+  const showsDefaultPermission = !permissionOptions.some(
+    (option) => option.value === defaultPermissionMode,
   );
   const inheritsPermission = Boolean(inheritedPermissionLabel) && permissionMode === "";
   const permissionForSelectValue = (value: string) => {
@@ -198,7 +202,9 @@ export function ModelEffortFields({
                   {inheritedPermissionLabel}
                 </SelectItem>
               )}
-              <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
+              {showsDefaultPermission && (
+                <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
+              )}
               {permissionOptions.map((m) => (
                 <SelectItem key={m.value} value={m.value}>
                   {m.label}

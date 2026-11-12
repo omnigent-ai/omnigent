@@ -196,8 +196,8 @@ export function TriggerWorkerSettingsFields({
             : "Applies to new sessions started for matching items. Existing sessions, including the polling session, keep their settings. ")}
         {followsPolling && "They match the polling session until you change them. "}
         Default uses the selected harness&apos;s configuration.
-        {permissions.length > 0 &&
-          " With Default permissions, they don't take the polling session's mode. Modes that skip approval aren't available here."}
+        {pollingInherited && " Pick another mode so they don't run in the polling session's."}
+        {permissions.length > 0 && " Modes that skip approval aren't available here."}
       </p>
     </div>
   );

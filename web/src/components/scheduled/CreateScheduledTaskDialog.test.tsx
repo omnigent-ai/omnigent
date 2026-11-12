@@ -4325,37 +4325,53 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     },
   );
 
-  it("starts workers in their harness's default mode when Default is chosen for them", async () => {
-    renderTrigger("jira", {
-      session_create_permission_modes: true,
-      scheduled_task_approval_skipping_modes: true,
-    });
-    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "Bypass permissions" }));
-    // Without a mode of their own, workers would inherit the polling session's bypass.
-    const workerPermission = () => screen.getByTestId("task-worker-permission-trigger");
-    const pickWorkerPermission = async (name: string) => {
+  it.each([
+    // Claude lists its default mode as Manual, so no separate Default is offered.
+    ["claude-native", "Bypass permissions", "bypassPermissions", "Manual", false],
+    ["codex-native", "Full Access", "full-access", "Default", true],
+  ])(
+    "lets %s workers leave the polling session's mode for their harness's default",
+    async (harness, pollingLabel, pollingMode, defaultLabel, offersDefault) => {
+      vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+        data: [testAgent("selected-agent", `${harness}-ui`, { harness })],
+      } as ReturnType<typeof agentsHook.useAvailableAgents>);
+      renderTrigger("jira", {
+        scheduled_task_harness_settings: true,
+        session_create_permission_modes: true,
+        scheduled_task_approval_skipping_modes: true,
+      });
+      fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: pollingLabel }));
+      // Without a mode of their own, workers would inherit the polling session's.
+      const workerPermission = () => screen.getByTestId("task-worker-permission-trigger");
+      const pickWorkerPermission = async (name: string) => {
+        fireEvent.keyDown(workerPermission(), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name }));
+      };
+      expect(workerPermission()).toHaveTextContent("Same as polling session");
+      expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent(
+        "Same as polling session",
+      );
       fireEvent.keyDown(workerPermission(), { key: "Enter" });
-      fireEvent.click(await screen.findByRole("option", { name }));
-    };
-    expect(workerPermission()).toHaveTextContent("Same as polling session");
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveTextContent(
-      "Same as polling session",
-    );
-    await pickWorkerPermission("Default");
-    expect(workerPermission()).toHaveTextContent("Manual");
-    await pickWorkerPermission("Same as polling session");
-    expect(workerPermission()).toHaveTextContent("Same as polling session");
-    await pickWorkerPermission("Default");
-    expect(screen.getByTestId("task-worker-settings")).toHaveTextContent(
-      "With Default permissions, they don't take the polling session's mode.",
-    );
-    type("task-trigger-scope", "ES");
-    type("task-trigger-instructions", "Triage it.");
-    const prompt = await submittedPrompt();
-    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("bypassPermissions");
-    expect(readTriggerWorkerSettings(prompt)?.permissionMode).toBe("default");
-  });
+      await screen.findByRole("option", { name: defaultLabel });
+      expect(screen.queryAllByRole("option", { name: "Default" })).toHaveLength(
+        offersDefault ? 1 : 0,
+      );
+      fireEvent.click(screen.getByRole("option", { name: defaultLabel }));
+      expect(workerPermission()).toHaveTextContent(defaultLabel);
+      await pickWorkerPermission("Same as polling session");
+      expect(workerPermission()).toHaveTextContent("Same as polling session");
+      await pickWorkerPermission(defaultLabel);
+      expect(screen.getByTestId("task-worker-settings")).toHaveTextContent(
+        "Pick another mode so they don't run in the polling session's.",
+      );
+      type("task-trigger-scope", "ES");
+      type("task-trigger-instructions", "Triage it.");
+      const prompt = await submittedPrompt();
+      expect(mutateAsync.mock.calls[0][0].permissionMode).toBe(pollingMode);
+      expect(readTriggerWorkerSettings(prompt)?.permissionMode).toBe("default");
+    },
+  );
 
   it("separates the rendered system and user prompts on Edit as prompt", async () => {
     renderTrigger("github");
