@@ -1789,7 +1789,7 @@ class TestCodexExecutor(unittest.TestCase):
                         messages=[{"role": "user", "content": "hi"}],
                         tools=[],
                         system_prompt="",
-                        model=CODEX_DEFAULT_MODEL,
+                        model="test-model",
                         cwd=".",
                         sandbox="workspace-write",
                     )
