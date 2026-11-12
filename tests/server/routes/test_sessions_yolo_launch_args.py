@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.server.routes.sessions import _derive_terminal_launch_args_from_spec
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
@@ -376,3 +377,65 @@ def test_claude_native_permission_mode_translates_without_headless_defaults() ->
         "--permission-mode",
         "bypassPermissions",
     ]
+
+
+_CODEX_BYPASS = ["--dangerously-bypass-approvals-and-sandbox"]
+
+
+@pytest.mark.parametrize("headless_defaults", [True, False])
+@pytest.mark.parametrize("yolo", [None, "True", "False"])
+@pytest.mark.parametrize(
+    "mode", ["default", "ask-for-approval", "approve-for-me", "full-access", "read-only"]
+)
+def test_codex_native_permission_mode_maps_to_mode_launch_args(
+    mode: str, yolo: str | None, headless_defaults: bool
+) -> None:
+    """
+    A codex-native ``permission_mode`` maps to that mode's launch args.
+
+    The mode wins over ``yolo`` and the headless default bypass, so a spec
+    declaring ``approve-for-me`` launches with Codex's auto reviewer rather
+    than full bypass or Codex's user-reviewed default. ``default`` leaves
+    args unset.
+    """
+    config: dict[str, object] = {"harness": "codex-native", "permission_mode": mode}
+    if yolo is not None:
+        config["yolo"] = yolo
+    spec = _spec_with_config(config)
+    expected = PERMISSION_LAUNCH_ARGS["codex-native"][mode] or None
+    assert (
+        _derive_terminal_launch_args_from_spec(spec, headless_defaults=headless_defaults)
+        == expected
+    )
+
+
+def test_codex_native_approve_for_me_uses_auto_reviewer() -> None:
+    """Pin the concrete argv for ``approve-for-me`` on a headless worker."""
+    spec = _spec_with_config({"harness": "codex-native", "permission_mode": "approve-for-me"})
+    assert _derive_terminal_launch_args_from_spec(spec) == [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+        "-c",
+        'approvals_reviewer="auto_review"',
+    ]
+
+
+@pytest.mark.parametrize("mode", ["bypass", "Approve-for-me", " approve-for-me", "auto", 1])
+@pytest.mark.parametrize(("headless_defaults", "expected"), [(True, _CODEX_BYPASS), (False, None)])
+def test_codex_native_unsupported_permission_mode_keeps_existing_behavior(
+    mode: object, headless_defaults: bool, expected: list[str] | None
+) -> None:
+    """
+    An unsupported codex-native ``permission_mode`` is ignored.
+
+    ``bypass`` has no launch args (specs use ``yolo: true``), and modes are
+    matched exactly, so these fall back to the headless default bypass or,
+    for interactive creates, Codex's own default.
+    """
+    spec = _spec_with_config({"harness": "codex-native", "permission_mode": mode})
+    assert (
+        _derive_terminal_launch_args_from_spec(spec, headless_defaults=headless_defaults)
+        == expected
+    )
