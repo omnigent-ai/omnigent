@@ -4186,6 +4186,8 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
         running = True
         socket_path = "/tmp/fake-claude.sock"
         tmux_target = "claude:0.0"
+        lifecycle_trace = SimpleNamespace(launch_id="c" * 32)
+        diagnostic_id = "d" * 32
 
     class _FakeTerminalRegistry:
         """Returns the live instance for any (session, terminal, key) lookup."""
@@ -4285,6 +4287,8 @@ class _LiveClaudeInstance:
     running = True
     socket_path = "/tmp/fake-claude.sock"
     tmux_target = "main"
+    lifecycle_trace = SimpleNamespace(launch_id="c" * 32)
+    diagnostic_id = "d" * 32
 
 
 class _LiveClaudeTerminalRegistry:

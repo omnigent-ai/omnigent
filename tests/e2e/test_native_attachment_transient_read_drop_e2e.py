@@ -33,6 +33,8 @@ from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import TurnComplete
 from omnigent.runner.app import _resolve_forwarded_message_content
 from tests._helpers.live_server import find_free_port
+from tests.e2e.test_claude_native_delivery_timeout_e2e import _FAKE_CLAUDE_TUI
+from tests.inner._claude_native_peer import prepare_native_peer
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -66,58 +68,6 @@ def _flaky_get(self, file_id, session_id=None):
 _fs.SqlAlchemyFileStore.get = _flaky_get
 
 from omnigent.cli import main
-
-main()
-"""
-
-# Render the composer expected by the bridge and record text submitted to it.
-_FAKE_CLAUDE_TUI = """\
-import os, sys, termios, tty
-
-PROMPT_GLYPH = "\\u276f"
-RULE = "\\u2500" * 30
-
-
-def render(draft, transcript):
-    sys.stdout.write("\\x1b[2J\\x1b[H")
-    for line in transcript:
-        sys.stdout.write(line + "\\r\\n")
-    sys.stdout.write(RULE + "\\r\\n")
-    sys.stdout.write(PROMPT_GLYPH + " " + draft + "\\r\\n")
-    sys.stdout.write(RULE + "\\r\\n")
-    sys.stdout.flush()
-
-
-def main():
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    tty.setraw(fd)
-    chars = []
-    transcript = []
-    render("", transcript)
-    try:
-        while True:
-            data = os.read(fd, 1)
-            if not data:
-                break
-            byte = data[0]
-            if byte == 3:  # Ctrl-C tears the pane down on teardown
-                break
-            if byte == 13:  # Enter submits a non-empty draft
-                if chars:
-                    transcript.append("sent: " + "".join(chars))
-                    chars = []
-                    render("", transcript)
-                continue
-            if byte < 0x20:
-                # Swallow control bytes (Escape, the ESC of bracketed-paste
-                # markers); the visible message content is printable.
-                continue
-            chars.append(chr(byte))
-            render("".join(chars), transcript)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
 
 main()
 """
@@ -263,7 +213,7 @@ def fault_injected_server(tmp_path: Path) -> Iterator[str]:
 
 
 @pytest.fixture
-def claude_pane() -> Iterator[Path]:
+def claude_pane(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """A real ``tmux`` pane running the fake Claude TUI, advertised through the
     production ``write_tmux_target``.
 
@@ -290,6 +240,8 @@ def claude_pane() -> Iterator[Path]:
             "24",
             sys.executable,
             str(tui_path),
+            "unused-trigger",
+            "0",
         ],
         check=True,
         timeout=30.0,
@@ -297,7 +249,14 @@ def claude_pane() -> Iterator[Path]:
 
     # The bridge validates its dir sits under the trusted claude-native root.
     bridge_dir = _BRIDGE_ROOT / f"attach-transient-{uuid.uuid4().hex}"
-    write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="claude")
+    write_tmux_target(
+        bridge_dir,
+        socket_path=socket_path,
+        tmux_target="claude",
+        launch_id="c" * 32,
+        instance_id="d" * 32,
+    )
+    prepare_native_peer(bridge_dir, monkeypatch=monkeypatch, root=_BRIDGE_ROOT)
 
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:

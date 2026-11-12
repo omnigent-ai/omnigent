@@ -25,6 +25,7 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorError, TurnComplete
+from tests.inner._claude_native_peer import prepare_native_peer
 
 _REFUSAL = "Answer the pending Claude question or permission request before sending a message."
 _NOT_CLEARED = (
@@ -110,7 +111,7 @@ class _Pane:
 
 
 @pytest.fixture
-def pane(monkeypatch: pytest.MonkeyPatch) -> _Pane:
+def pane(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Pane:
     fake = _Pane(refusals=[True], pending_polls=2)
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fake.inject_user_message)
     # raising=False: main has neither, so these tests fail there on behaviour.
@@ -134,6 +135,7 @@ def pane(monkeypatch: pytest.MonkeyPatch) -> _Pane:
     )
     monkeypatch.setattr(claude_native_executor, "kill_session", fake.kill_session)
     monkeypatch.setattr(claude_native_executor, "_MESSAGE_HOLD_POLL_S", 0.0, raising=False)
+    prepare_native_peer(tmp_path / "bridge", monkeypatch=monkeypatch, root=tmp_path)
     return fake
 
 
@@ -187,7 +189,6 @@ async def test_clearing_a_held_conversation_does_not_deliver_into_its_replacemen
 ) -> None:
     """An answered prompt must not replay the old conversation's held message after /clear."""
     bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
     active_session = bridge_dir / "bridge.json"
     active_session.write_text(json.dumps({"active_session_id": "old-session"}))
     monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "old-session")

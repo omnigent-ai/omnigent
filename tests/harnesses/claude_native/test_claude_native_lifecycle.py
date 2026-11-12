@@ -484,7 +484,18 @@ def test_generated_session_end_command_records_evidence_in_an_isolated_process(
     for key, value in trace.launch_environment(_INSTANCE_ID).items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "0")
-    settings = bridge.build_hook_settings(directory)
+    source_python = tmp_path / "source-python"
+    source_python.write_text(
+        f"#!{sys.executable}\n"
+        "import runpy, sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parents[3])!r})\n"
+        "assert sys.argv[1:3] == ['-I', '-m']\n"
+        "sys.argv = sys.argv[3:]\n"
+        "runpy.run_module(sys.argv[0], run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    source_python.chmod(0o755)
+    settings = bridge.build_hook_settings(directory, python_executable=str(source_python))
     for name, fields in (
         ("SessionStart", {"source": "startup"}),
         ("SessionEnd", {"reason": "prompt_input_exit", "prompt": "private synthetic prompt"}),

@@ -183,6 +183,8 @@ def _publish_tmux_target_for_bridge(
         bridge_dir_for_bridge_id(bridge_id),
         socket_path=instance.socket_path,
         tmux_target=instance.tmux_target,
+        launch_id=instance.lifecycle_trace.launch_id,
+        instance_id=instance.diagnostic_id,
     )
 
 

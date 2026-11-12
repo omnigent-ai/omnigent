@@ -4422,15 +4422,48 @@ def test_framework_context_hook_consumes_hidden_notice(
     tmp_path: Path,
 ) -> None:
     """The hook returns hidden context once, then removes it."""
-    path = tmp_path / "pending_framework_context.txt"
-    path.write_text("downscaled", encoding="utf-8")
-    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    from omnigent.harnesses.claude_native.framework_context import write_prompt_framework_context
+    from omnigent.inner.terminal_lifecycle import TERMINAL_INSTANCE_ID_ENV, TERMINAL_LAUNCH_ID_ENV
+
+    record_hook_event(tmp_path, {"hook_event_name": "SessionStart", "session_id": "native-a"})
+    write_tmux_target(
+        tmp_path,
+        socket_path="/tmp/example.sock",
+        tmux_target="main",
+        launch_id="a" * 32,
+        instance_id="b" * 32,
+    )
+    monkeypatch.setenv(TERMINAL_LAUNCH_ID_ENV, "a" * 32)
+    monkeypatch.setenv(TERMINAL_INSTANCE_ID_ENV, "b" * 32)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.read_active_session_id", lambda _: "session-a"
+    )
+    claude_native_hook.record_hook_payload(
+        tmp_path,
+        {"hook_event_name": "SessionStart", "session_id": "native-a"},
+        prompt_framework_context=True,
+    )
+    handle = write_prompt_framework_context(tmp_path, "inspect image", ["downscaled"])
+    assert handle is not None
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "native-a",
+                    "prompt": "inspect image",
+                }
+            )
+        ),
+    )
 
     assert claude_native_hook.main(["framework-context", "--bridge-dir", str(tmp_path)]) == 0
 
     output = json.loads(capsys.readouterr().out)
     assert output["hookSpecificOutput"]["additionalContext"] == "downscaled"
-    assert not path.exists()
+    assert not handle.path.exists()
 
 
 def test_session_start_hook_preserves_generated_startup_context(
@@ -5293,7 +5326,10 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
         terminate_process(proc, timeout_s=5)
 
 
-def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
+@pytest.mark.parametrize("launch_id", [None, "launch-original"])
+def test_write_tmux_target_persists_socket_and_target(
+    tmp_path: Path, launch_id: str | None
+) -> None:
     """
     The runner advertisement file is shaped so the harness can find it.
 
@@ -5309,6 +5345,7 @@ def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
         pid=12345,
+        launch_id=launch_id,
     )
     after = time.time()
 
@@ -5317,6 +5354,16 @@ def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
     assert payload["tmux_target"] == "claude:0.0"
     assert payload["pid"] == 12345
     assert before <= payload["updated_at"] <= after
+    owner = claude_native_bridge.read_delivery_owner(bridge_dir)
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+        pid=12345,
+        launch_id=launch_id,
+    )
+    refreshed = claude_native_bridge.read_delivery_owner(bridge_dir)
+    assert (refreshed == owner) is (launch_id is not None)
 
 
 # Each send-keys first leaves copy mode in the same tmux call; without it,
@@ -6220,22 +6267,79 @@ def test_inject_user_message_retries_enter_for_a_draft_below_the_prompt_row(
 
 
 @pytest.mark.parametrize(
-    "replay_captures,recovered_draft",
-    [(8, ""), (25, ""), (8, "unfinished terminal edit")],
-    ids=["composer-returned", "still-replaying", "nonempty-composer"],
+    "replay_captures,recovered_draft,paste_outcome",
+    [
+        (8, "", "immediate"),
+        (25, "", "immediate"),
+        (8, "unfinished terminal edit", "immediate"),
+        *[
+            (8, "", outcome)
+            for outcome in (
+                "owner-change-before-readiness",
+                "owner-change-with-visible-draft",
+                "late-draft",
+                "late-unframed-echo",
+                "native-ack",
+                "early-native-ack",
+                "native-ack-wrapped",
+                "native-ack-blocks",
+                "older-record-then-native-ack",
+                "newer-record-keeps-draft",
+                "subagent-record",
+                "foreign-session-record",
+                "never-visible",
+                "new-conversation",
+                "new-native-session",
+                "new-terminal",
+                "same-address-new-terminal",
+                "new-launch-same-address",
+                "readvertised-same-terminal",
+                "foreign-record",
+                "cancelled",
+            )
+        ],
+    ],
+    ids=[
+        "composer-returned",
+        "still-replaying",
+        "nonempty-composer",
+        "owner-change-before-readiness",
+        "owner-change-with-visible-draft",
+        "late-draft",
+        "late-unframed-echo",
+        "native-ack",
+        "early-native-ack",
+        "native-ack-wrapped",
+        "native-ack-blocks",
+        "older-record-then-native-ack",
+        "newer-record-keeps-draft",
+        "subagent-record",
+        "foreign-session-record",
+        "never-visible",
+        "new-conversation",
+        "new-native-session",
+        "new-terminal",
+        "same-address-new-terminal",
+        "new-launch-same-address",
+        "readvertised-same-terminal",
+        "foreign-record",
+        "cancelled",
+    ],
 )
 def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     replay_captures: int,
     recovered_draft: str,
+    paste_outcome: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A paste that lands while a resumed TUI is still replaying must not be submitted blind.
 
-    The first paste is dropped while replaying; the composer may return before
-    the paste wait ends. Delivery pastes once more and presses Enter only after
-    the draft is visible in the input box.
+    The first paste may remain unobserved while Claude replays its transcript.
+    Continue observing it without pasting again or pressing an unverified Enter.
+    A fresh native receipt needs no Enter; a late draft receives one.
     """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
@@ -6245,12 +6349,31 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
-    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = claude_native_bridge.prepare_bridge_dir(
+        "conversation-original", workspace=tmp_path
+    )
     write_tmux_target(
         bridge_dir,
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="claude:0.0",
+        launch_id="launch-original"
+        if paste_outcome in {"new-launch-same-address", "readvertised-same-terminal"}
+        else None,
     )
+    text = "Task: ship the paste submit fix and verify\n" * 8
+    transcript_path = tmp_path / "transcript.jsonl"
+    transcript_path.write_text("")
+    claude_native_bridge.record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "native-original",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    caplog.set_level(logging.INFO, logger="omnigent.harnesses.claude_native.delivery_diagnostics")
+    cancelled = threading.Event()
     replay_pane = "Resuming the conversation from the transcript...\n"
     pasted_pane = _composer_pane().replace("❯ \n", "❯\n  [Pasted text #1 +7 lines]\n")
     tui: dict[str, Any] = {
@@ -6258,7 +6381,9 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
         "replaying": False,
         "replay_captures": 0,
         "pastes": 0,
+        "paste_outcome_captures": 0,
         "enter_saw_draft": [],
+        "changed_owner": False,
     }
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -6271,22 +6396,138 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
         """
         del kwargs
         if "capture-pane" in cmd:
+            if not tui["changed_owner"] and (
+                (paste_outcome == "owner-change-before-readiness" and tui["pastes"] == 0)
+                or (paste_outcome == "owner-change-with-visible-draft" and tui["pastes"] == 1)
+            ):
+                tui["changed_owner"] = True
+                claude_native_bridge.write_active_session_id(bridge_dir, "conversation-new")
             if tui["replaying"]:
                 tui["replay_captures"] += 1
                 if tui["replay_captures"] > replay_captures:
                     tui["replaying"] = False
-                    tui["pane"] = _composer_pane(recovered_draft)
+                    tui["pane"] = (
+                        _composer_pane(recovered_draft)
+                        if recovered_draft
+                        else pasted_pane
+                        if paste_outcome == "immediate"
+                        else _composer_pane()
+                    )
                 else:
                     return SimpleNamespace(returncode=0, stdout=replay_pane, stderr="")
+            if tui["pastes"] == 1 and not tui["replaying"] and paste_outcome != "immediate":
+                tui["paste_outcome_captures"] += 1
+                if tui["paste_outcome_captures"] == (
+                    10 if paste_outcome == "early-native-ack" else 30
+                ):
+                    if paste_outcome == "late-draft":
+                        tui["pane"] = pasted_pane
+                    elif paste_outcome == "late-unframed-echo":
+                        tui["pane"] = "Resuming the conversation...\n❯ " + text.splitlines()[0]
+                    elif paste_outcome in {
+                        "native-ack",
+                        "early-native-ack",
+                        "native-ack-wrapped",
+                        "native-ack-blocks",
+                        "foreign-record",
+                        "subagent-record",
+                        "foreign-session-record",
+                        "older-record-then-native-ack",
+                        "newer-record-keeps-draft",
+                    }:
+                        content = (
+                            text
+                            if paste_outcome
+                            not in {
+                                "foreign-record",
+                                "older-record-then-native-ack",
+                                "newer-record-keeps-draft",
+                            }
+                            else "another input"
+                        )
+                        if paste_outcome == "native-ack-wrapped":
+                            content = (
+                                f'<pasted_content id="native-paste">\n{text}\n'
+                                '</pasted_content id="native-paste">'
+                            )
+                        if paste_outcome == "native-ack-blocks":
+                            content = [{"type": "text", "text": content}]
+                        transcript_path.write_text(
+                            json.dumps(
+                                {
+                                    "type": "user",
+                                    "uuid": "fresh-user-record",
+                                    "sessionId": "native-other"
+                                    if paste_outcome == "foreign-session-record"
+                                    else "native-original",
+                                    "isSidechain": paste_outcome == "subagent-record",
+                                    "message": {"role": "user", "content": content},
+                                }
+                            )
+                            + "\n"
+                        )
+                    elif paste_outcome == "new-conversation":
+                        claude_native_bridge.write_active_session_id(
+                            bridge_dir, "conversation-new"
+                        )
+                    elif paste_outcome == "new-native-session":
+                        claude_native_bridge.record_hook_event(
+                            bridge_dir,
+                            {
+                                "hook_event_name": "SessionStart",
+                                "session_id": "native-new",
+                                "source": "clear",
+                                "transcript_path": str(transcript_path),
+                            },
+                        )
+                    elif paste_outcome == "new-terminal":
+                        write_tmux_target(
+                            bridge_dir,
+                            socket_path=Path("/tmp/example/new.sock"),
+                            tmux_target="claude:0.0",
+                        )
+                    elif paste_outcome in {
+                        "same-address-new-terminal",
+                        "new-launch-same-address",
+                        "readvertised-same-terminal",
+                    }:
+                        write_tmux_target(
+                            bridge_dir,
+                            socket_path=Path("/tmp/example/tmux.sock"),
+                            tmux_target="claude:0.0",
+                            launch_id="launch-original"
+                            if paste_outcome == "readvertised-same-terminal"
+                            else "launch-new"
+                            if paste_outcome == "new-launch-same-address"
+                            else None,
+                        )
+                    elif paste_outcome == "cancelled":
+                        cancelled.set()
+                if tui["paste_outcome_captures"] == 40:
+                    if paste_outcome in {"readvertised-same-terminal", "newer-record-keeps-draft"}:
+                        tui["pane"] = pasted_pane
+                    elif paste_outcome == "older-record-then-native-ack":
+                        with transcript_path.open("a") as handle:
+                            handle.write(
+                                json.dumps(
+                                    {
+                                        "type": "user",
+                                        "uuid": "owned-user-record",
+                                        "sessionId": "native-original",
+                                        "message": {"role": "user", "content": text},
+                                    }
+                                )
+                                + "\n"
+                            )
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
             tui["pastes"] += 1
             if tui["pastes"] == 1:
-                # The first paste is swallowed while the resumed TUI replays its transcript.
-                tui["replaying"] = True
-                tui["pane"] = replay_pane
+                # The paste remains unobserved while Claude replays its transcript.
+                tui["replaying"] = paste_outcome != "owner-change-with-visible-draft"
+                tui["pane"] = replay_pane if tui["replaying"] else pasted_pane
             else:
-                tui["pane"] = pasted_pane
+                raise AssertionError("An unacknowledged paste must never be replayed")
         if cmd[-1] == "Enter":
             tui["enter_saw_draft"].append("[Pasted text" in tui["pane"])
             if "[Pasted text" in tui["pane"]:
@@ -6308,13 +6549,47 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
         assert tui["enter_saw_draft"] == []
         assert tui["pane"] == _composer_pane(recovered_draft)
         return
-    inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
+    with claude_native_bridge.cancellable_injection(cancelled):
+        if paste_outcome not in {
+            "immediate",
+            "late-draft",
+            "native-ack",
+            "early-native-ack",
+            "native-ack-wrapped",
+            "native-ack-blocks",
+            "older-record-then-native-ack",
+            "readvertised-same-terminal",
+        }:
+            with pytest.raises(RuntimeError):
+                inject_user_message(bridge_dir, content=text)
+            assert tui["enter_saw_draft"] == []
+            assert tui["pastes"] == (0 if paste_outcome == "owner-change-before-readiness" else 1)
+            return
+        inject_user_message(bridge_dir, content=text)
+
+    if paste_outcome in {
+        "native-ack",
+        "early-native-ack",
+        "native-ack-wrapped",
+        "native-ack-blocks",
+        "older-record-then-native-ack",
+    }:
+        assert tui["enter_saw_draft"] == []
+        assert tui["pastes"] == 1
+        [record] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", "") == "claude_native_delivery_finished"
+        ]
+        assert record.attributes["delivery_outcome"] == "native_recorded"
+        assert record.attributes["submit_sent"] is False
+        return
 
     assert tui["enter_saw_draft"] == [True], (
         "An Enter was pressed while the composer was not showing the draft: "
         f"{tui['enter_saw_draft']}"
     )
-    assert tui["pastes"] == 2, "The message should be pasted again once the composer is back."
+    assert tui["pastes"] == 1, "The original paste must remain the only submission."
     assert tui["pane"] == _composer_pane(), "The message was left unsent in the input box."
 
 
@@ -14376,6 +14651,41 @@ def test_wait_for_claude_prompt_ready_preserves_a_panel_that_will_not_close(
     assert bool(sends) == bool(timeout_s)
 
 
+@pytest.mark.parametrize("surface", ["panel", "billing", "boot"])
+def test_read_only_startup_observation_never_changes_the_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    _fake_tmux(monkeypatch, [_TASK_DETAILS_PANE if surface == "panel" else _BOOTING_PANE])
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_REPAINT_AFTER_S", 0)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "auto_mode_billing_notice_visible",
+        lambda _pane: surface == "billing",
+    )
+
+    def cannot_mutate(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("a startup observation changed the terminal before hook adoption")
+
+    for name in (
+        "_restore_occupied_input",
+        "_acknowledge_auto_mode_billing_notice",
+        "_request_claude_repaint",
+    ):
+        monkeypatch.setattr(claude_native_bridge, name, cannot_mutate)
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=1.0,
+            bridge_dir=tmp_path,
+            extend_for_slow_boot=False,
+            read_only=True,
+        )
+    assert clock.monotonic() <= 1.0 + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+
+
 def test_wait_for_claude_prompt_ready_ignores_a_single_dialog_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -16426,7 +16736,7 @@ async def test_lifecycle_hooks_record_through_the_relay_without_starting_python(
 async def test_turn_ends_session_rotation_and_a_missing_relay_run_the_python_hook(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Stop, and a SessionStart from ``/clear`` or ``/resume``, run the Python hook.
+    """SessionStart and Stop run Python; other lifecycle hooks can use the relay.
 
     Claude writes a turn's final message while its Stop hooks run, and Python's
     start-up keeps that message ahead of the Stop record. ``/clear`` and
@@ -16438,11 +16748,13 @@ async def test_turn_ends_session_rotation_and_a_missing_relay_run_the_python_hoo
     settings = claude_native_bridge.build_hook_settings(
         bridge_dir, python_executable=str(python), ap_server_url="http://127.0.0.1:9"
     )
-    lifecycle_hook = _unmatched_hook_command(settings, "SessionStart", "/hook/claude/event")
+    session_start_hook = _unmatched_hook_command(
+        settings, "SessionStart", "--prompt-framework-context"
+    )
     try:
         for source in ("clear", "resume"):
             payload = {"hook_event_name": "SessionStart", "source": source, "session_id": "c-1"}
-            result = await _run_hook_command(lifecycle_hook, payload, _TERMINAL_ENV)
+            result = await _run_hook_command(session_start_hook, payload, _TERMINAL_ENV)
             assert result.returncode == 0, result.stderr
         for event in ("Stop", "StopFailure"):
             stop_hook = _unmatched_hook_command(settings, event, "claude_native.hook")
@@ -16451,11 +16763,13 @@ async def test_turn_ends_session_rotation_and_a_missing_relay_run_the_python_hoo
     finally:
         relay.close()
     prompt = {"hook_event_name": "UserPromptSubmit"}
+    lifecycle_hook = _unmatched_hook_command(settings, "UserPromptSubmit", "/hook/claude/event")
     result = await _run_hook_command(lifecycle_hook, prompt, _TERMINAL_ENV)
     assert result.returncode == 0, result.stderr
 
     log = runs.read_text()
     assert log.count(f"-I -m omnigent.harnesses.claude_native.hook --bridge-dir {bridge_dir}") == 5
+    assert log.count("--prompt-framework-context") == 2
     assert '"source": "clear"' in log and '"source": "resume"' in log
     for event in ("Stop", "StopFailure", "UserPromptSubmit"):
         assert f'"hook_event_name": "{event}"' in log
@@ -16620,22 +16934,53 @@ def test_framework_context_hook_starts_python_only_for_pending_context(
     The terminal-side Python hook consumes prompt notices and retains startup
     context for later SessionStart events.
     """
+    from omnigent.harnesses.claude_native import framework_context
+
+    bridge_dir = claude_native_bridge.prepare_bridge_dir("conv_hook_context", workspace=tmp_path)
+    claude_native_bridge.write_tmux_target(
+        bridge_dir,
+        socket_path="/unused/socket",
+        tmux_target="main",
+        launch_id=_TERMINAL_ENV["OMNIGENT_TERMINAL_LAUNCH_ID"],
+        instance_id=_TERMINAL_ENV["OMNIGENT_TERMINAL_INSTANCE_ID"],
+    )
+    claude_native_hook.record_hook_payload(
+        bridge_dir,
+        {"hook_event_name": "SessionStart", "session_id": "native-context"},
+        env=_TERMINAL_ENV,
+        prompt_framework_context=True,
+    )
     event_name = "SessionStart" if startup else "UserPromptSubmit"
     subcommand = "startup-context" if startup else "framework-context"
-    filename = (
-        claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
-        if startup
-        else claude_native_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE
-    )
     fake_python, runs = _fake_hook_python(tmp_path)
     fake_settings = claude_native_bridge.build_hook_settings(
-        tmp_path, python_executable=str(fake_python)
+        bridge_dir, python_executable=str(fake_python)
     )
     fake_hook = _unmatched_hook_command(fake_settings, event_name, subcommand)
-    real_hook = _unmatched_hook_command(
-        claude_native_bridge.build_hook_settings(tmp_path), event_name, subcommand
+    # The isolated hook must import this worktree instead of another editable install.
+    source_python = tmp_path / "source-python"
+    source_python.write_text(
+        f"#!{sys.executable}\n"
+        "import runpy, sys\n"
+        f"sys.path.insert(0, {str(Path(__file__).resolve().parents[3])!r})\n"
+        "assert sys.argv[1:3] == ['-I', '-m']\n"
+        "sys.argv = sys.argv[3:]\n"
+        "runpy.run_module(sys.argv[0], run_name='__main__')\n",
+        encoding="utf-8",
     )
-    payload = json.dumps({"hook_event_name": event_name})
+    source_python.chmod(0o755)
+    real_hook = _unmatched_hook_command(
+        claude_native_bridge.build_hook_settings(bridge_dir, python_executable=str(source_python)),
+        event_name,
+        subcommand,
+    )
+    payload = json.dumps(
+        {
+            "hook_event_name": event_name,
+            "session_id": "native-context",
+            "prompt": "inspect this input",
+        }
+    )
 
     def run(command: str) -> str:
         result = subprocess.run(
@@ -16645,14 +16990,21 @@ def test_framework_context_hook_starts_python_only_for_pending_context(
             text=True,
             timeout=60,
             check=False,
+            env={"PATH": os.environ["PATH"], **_TERMINAL_ENV},
         )
         assert result.returncode == 0, result.stderr
         return result.stdout
 
     assert run(fake_hook) == ""
     assert not runs.exists()
-    context_file = tmp_path / filename
-    context_file.write_text("generated context", encoding="utf-8")
+    handle = framework_context.write_prompt_framework_context(
+        bridge_dir, "inspect this input", ["generated context"]
+    )
+    if startup:
+        context_file = bridge_dir / claude_native_bridge.CLAUDE_STARTUP_CONTEXT_FILE
+        context_file.write_text("generated context", encoding="utf-8")
+    else:
+        context_file = handle.path
     outputs = [run(real_hook), run(real_hook)]
 
     assert json.loads(outputs[0]) == {
@@ -16663,6 +17015,30 @@ def test_framework_context_hook_starts_python_only_for_pending_context(
     }
     assert outputs[1] == (outputs[0] if startup else "")
     assert context_file.exists() == startup
+    if startup:
+        assert handle.path.exists()
+        payload = json.dumps(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "native-context",
+                "prompt": "inspect this input",
+            }
+        )
+        prompt_hook = _unmatched_hook_command(
+            claude_native_bridge.build_hook_settings(
+                bridge_dir, python_executable=str(source_python)
+            ),
+            "UserPromptSubmit",
+            "framework-context",
+        )
+        assert json.loads(run(prompt_hook)) == {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "generated context",
+            }
+        }
+        assert context_file.read_text() == "generated context"
+    assert not handle.path.exists()
     context_file.unlink(missing_ok=True)
     assert run(fake_hook) == ""
     assert not runs.exists()
@@ -18054,6 +18430,92 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
         }
     else:
         assert settings_path.read_bytes() == original
+
+
+def test_owned_tmux_mutation_holds_metadata_until_the_command_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A metadata writer cannot overtake the final owner check and its pane mutation."""
+    from omnigent.native.native_bridge_common import _try_bridge_dir_cleanup_lock
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = prepare_bridge_dir("original-session", workspace=tmp_path)
+    write_tmux_target(
+        bridge_dir,
+        socket_path=tmp_path / "tmux.sock",
+        tmux_target="main",
+        launch_id="original-launch",
+        instance_id="original-instance",
+    )
+    record_hook_event(
+        bridge_dir, {"hook_event_name": "SessionStart", "session_id": "native-original"}
+    )
+    owner = claude_native_bridge.read_delivery_owner(bridge_dir)
+    command_entered = threading.Event()
+    release_command = threading.Event()
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+    checks_locked: list[bool] = []
+    mutation_calls: list[list[str]] = []
+    current_owner = claude_native_bridge._current_delivery_owner
+
+    def observe_owner_check(path: Path, expected: Any) -> Any:
+        with _try_bridge_dir_cleanup_lock(path) as acquired:
+            checks_locked.append(not acquired)
+        return current_owner(path, expected)
+
+    def run_tmux(command: list[str], **_kwargs: Any) -> Any:
+        if "capture-pane" in command:
+            with _try_bridge_dir_cleanup_lock(bridge_dir) as acquired:
+                assert acquired, "observing the pane must leave metadata writers free"
+            return SimpleNamespace(returncode=0, stdout="quiet pane", stderr="")
+        mutation_calls.append(command)
+        command_entered.set()
+        assert checks_locked[-1], "the final ownership check must hold the metadata lock"
+        assert release_command.wait(timeout=5.0)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(claude_native_bridge, "_current_delivery_owner", observe_owner_check)
+    monkeypatch.setattr(subprocess, "run", run_tmux)
+
+    def mutate() -> None:
+        with claude_native_bridge.cancellable_injection(
+            threading.Event(), expected_owner=owner, bridge_dir=bridge_dir
+        ):
+            claude_native_bridge._run_tmux(str(tmp_path / "tmux.sock"), "send-keys", "Enter")
+
+    def replace_owner() -> None:
+        writer_started.set()
+        claude_native_bridge.write_active_session_id(bridge_dir, "replacement-session")
+        writer_finished.set()
+
+    with claude_native_bridge.cancellable_injection(
+        threading.Event(), expected_owner=owner, bridge_dir=bridge_dir
+    ):
+        assert (
+            claude_native_bridge._capture_pane(str(tmp_path / "tmux.sock"), "main") == "quiet pane"
+        )
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        command = workers.submit(mutate)
+        try:
+            assert command_entered.wait(timeout=5.0)
+            if command.done():
+                command.result()
+            writer = workers.submit(replace_owner)
+            assert writer_started.wait(timeout=5.0)
+            with _try_bridge_dir_cleanup_lock(bridge_dir) as acquired:
+                assert not acquired
+            assert not writer_finished.is_set()
+            assert claude_native_bridge.read_active_session_id(bridge_dir) == "original-session"
+        finally:
+            release_command.set()
+        command.result(timeout=5.0)
+        writer.result(timeout=5.0)
+    assert claude_native_bridge.read_active_session_id(bridge_dir) == "replacement-session"
+    with pytest.raises(claude_native_bridge.ClaudeMessageNotAccepted):
+        mutate()
+    assert len(mutation_calls) == 1
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")

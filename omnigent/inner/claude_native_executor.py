@@ -8,17 +8,20 @@ import logging
 import os
 import shutil
 import threading
+from collections import deque
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
-    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     MANAGED_SANDBOX_SIGN_IN_REMEDY,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudeComposerNotCleared,
+    ClaudeDeliveryOwner,
+    ClaudeDeliveryUnconfirmed,
     ClaudeInputBoxOccupied,
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
@@ -27,8 +30,13 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTerminalExited,
     ClaudeUserPromptPending,
     TmuxSessionNotAdvertised,
+    _bridge_metadata_write_lock,
+    _current_delivery_owner,
+    _wait_for_claude_prompt_ready,
+    _wait_for_tmux_info,
     cancellable_injection,
     claude_pane_ready,
+    delivery_owner_is_current,
     has_pending_user_prompt,
     inject_slash_command,
     inject_user_message,
@@ -37,12 +45,22 @@ from omnigent.harnesses.claude_native.bridge import (
     kill_session,
     read_active_session_id,
     read_claude_status_model,
+    read_delivery_owner,
     read_launch_model,
     read_model_env,
     read_model_picker_values,
     read_transcript_path,
     terminal_dialog_pending,
 )
+from omnigent.harnesses.claude_native.framework_context import (
+    MAX_PENDING_PROMPT_CONTEXTS,
+    PromptFrameworkContextHandle,
+    PromptFrameworkContextPending,
+    discard_prompt_framework_context,
+    prompt_framework_context_capability_ready,
+    write_prompt_framework_context,
+)
+from omnigent.harnesses.claude_native.submit_verification import capture_submit_boundary
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -50,6 +68,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     TextChunk,
     ToolSpec,
@@ -107,6 +126,19 @@ def _can_hold_refusal(
     return True
 
 
+def _prompt_context_required(text: str, notices: list[str]) -> bool:
+    """Exact UI-only help has no submission hook to consume prompt context."""
+    if text != "/help":
+        return True
+    if any(notices):
+        raise ClaudeMessageNotAccepted(
+            "Claude's /help cannot receive this message's attachments or extra context. "
+            "Open Help in the terminal and send the attachment in a regular chat message. "
+            "Nothing was sent."
+        )
+    return False
+
+
 class ClaudeNativeExecutor(Executor):
     """
     Harness-side executor for ``omnigent claude`` web UI turns.
@@ -140,6 +172,9 @@ class ClaudeNativeExecutor(Executor):
         self._inject_lock = asyncio.Lock()
         # Set while ``run_turn`` holds a refused message (see ``_hold_message``).
         self._holding_message = False
+        self._unconfirmed_framework_contexts: deque[PromptFrameworkContextHandle] = deque(
+            maxlen=MAX_PENDING_PROMPT_CONTEXTS
+        )
         # The model the pane is currently on, so a routing turn only types
         # ``/model`` when the model actually changes. Seeded lazily from the
         # spawn ``launch_model`` on the first turn (``None`` = not yet known).
@@ -183,8 +218,18 @@ class ClaudeNativeExecutor(Executor):
         try:
             async with self._inject_lock:
                 await self._inject_prompt(text, framework_notices(content))
-        except RuntimeError:
+        except (
+            ClaudeMessageNotAccepted,
+            ClaudePromptTimeout,
+            ClaudeSignInPending,
+            ClaudeTerminalDialog,
+            ClaudeTerminalExited,
+            ClaudeUserPromptPending,
+            TmuxSessionNotAdvertised,
+        ):
             return False
+        except (RuntimeError, OSError) as exc:
+            raise InjectionDeliveryAmbiguous(str(exc)) from exc
         return True
 
     async def _inject_turn(
@@ -197,9 +242,12 @@ class ClaudeNativeExecutor(Executor):
         """Apply a routed ``/model`` switch, then inject the message, in one lock hold."""
         async with self._inject_lock:
             self._require_active_session()
-            context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
-            context_path.unlink(missing_ok=True)
+            _prompt_context_required(text, notices)
+            owner = read_delivery_owner(self._bridge_dir)
             if wanted_model_arg is not None:
+                owner = await self._wait_for_context_owner(
+                    owner, asyncio.get_running_loop().time() + _MESSAGE_HOLD_S
+                )
                 # Accepted trade-off: ``/model <id>`` also saves the
                 # pick as the person's global default for new Claude
                 # sessions. Runs to completion before the message
@@ -212,12 +260,13 @@ class ClaudeNativeExecutor(Executor):
                         command=f"/model {wanted_model_arg}",
                         auto_confirm=True,
                         confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-                    )
+                    ),
+                    expected_owner=owner,
                 )
                 # Track the routed id, not the alias: the next turn's
                 # comparison is against what routing asked for.
                 self._applied_model = wanted_model
-            await self._inject_prompt(text, notices)
+            await self._inject_prompt(text, notices, expected_owner=owner)
 
     async def _hold_message(self, refusal: RuntimeError, deadline: float) -> bool:
         """
@@ -347,18 +396,170 @@ class ClaudeNativeExecutor(Executor):
             ),
         )
 
-    async def _inject_prompt(self, text: str, notices: list[str]) -> None:
+    async def _inject_prompt(
+        self,
+        text: str,
+        notices: list[str],
+        *,
+        expected_owner: ClaudeDeliveryOwner | None = None,
+    ) -> None:
         """Inject user text with one-shot context while holding the injection lock."""
         self._require_active_session()
-        context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
-        context_path.unlink(missing_ok=True)
-        if notices:
-            context_path.write_text("\n\n".join(notices), encoding="utf-8")
+        needs_context = _prompt_context_required(text, notices)
+        owner = expected_owner or read_delivery_owner(self._bridge_dir)
+        deadline = asyncio.get_running_loop().time() + _MESSAGE_HOLD_S
+        owner = await self._wait_for_context_owner(owner, deadline)
+        handle: PromptFrameworkContextHandle | None = None
+        while needs_context:
+            self._require_active_session()
+            if not delivery_owner_is_current(self._bridge_dir, owner):
+                raise ClaudeMessageNotAccepted("Claude's input owner changed; nothing was sent.")
+            try:
+                transcript_path = read_transcript_path(self._bridge_dir)
+                boundary = (
+                    capture_submit_boundary(transcript_path, owner.native_session_id)
+                    if transcript_path is not None and owner.native_session_id is not None
+                    else None
+                )
+                handle = write_prompt_framework_context(
+                    self._bridge_dir,
+                    text,
+                    notices,
+                    submit_boundary=boundary,
+                    expected_owner=owner,
+                )
+                break
+            except PromptFrameworkContextPending:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise ClaudeMessageNotAccepted(
+                        "An earlier identical Claude input is still awaiting its submission hook; "
+                        "this message was not delivered. Inspect the terminal before retrying."
+                    ) from None
+                self._holding_message = True
+                try:
+                    await asyncio.sleep(_MESSAGE_HOLD_POLL_S)
+                finally:
+                    self._holding_message = False
         try:
-            await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
-        except BaseException:
-            context_path.unlink(missing_ok=True)
+            await self._inject(
+                partial(inject_user_message, self._bridge_dir, content=text), expected_owner=owner
+            )
+        except (
+            ClaudeMessageNotAccepted,
+            ClaudePromptTimeout,
+            ClaudeSignInPending,
+            ClaudeTerminalDialog,
+            ClaudeTerminalExited,
+            ClaudeUserPromptPending,
+            TmuxSessionNotAdvertised,
+        ):
+            discard_prompt_framework_context(handle)
             raise
+        except asyncio.CancelledError:
+            discard_prompt_framework_context(handle, retain_fence=True)
+            raise
+        except BaseException:
+            if handle is not None:
+                self._unconfirmed_framework_contexts = deque(
+                    (item for item in self._unconfirmed_framework_contexts if item.path.exists()),
+                    maxlen=MAX_PENDING_PROMPT_CONTEXTS,
+                )
+                self._unconfirmed_framework_contexts.append(handle)
+            raise
+
+    async def _wait_for_context_owner(
+        self, owner: ClaudeDeliveryOwner, deadline: float
+    ) -> ClaudeDeliveryOwner:
+        """Wait for this launch's startup evidence without adopting a replacement."""
+        ready_owner: ClaudeDeliveryOwner | None = None
+        owner_changed = False
+        capability_missing = False
+        startup_failure: RuntimeError | None = None
+
+        def ready() -> bool:
+            nonlocal ready_owner, owner_changed, capability_missing, startup_failure
+            current = _current_delivery_owner(self._bridge_dir, owner)
+            if current is not None:
+                if current.session_id and current.native_session_id:
+                    if prompt_framework_context_capability_ready(self._bridge_dir):
+                        ready_owner = current
+                        return True
+                    capability_missing = True
+                try:
+                    if not current.socket_path or not current.tmux_target:
+                        _wait_for_tmux_info(self._bridge_dir, timeout_s=0)
+                    else:
+                        _wait_for_claude_prompt_ready(
+                            current.socket_path,
+                            current.tmux_target,
+                            timeout_s=1.0,
+                            bridge_dir=self._bridge_dir,
+                            extend_for_slow_boot=False,
+                            read_only=True,
+                        )
+                except ClaudePromptTimeout:
+                    pass
+                except (
+                    ClaudeSignInPending,
+                    ClaudeTerminalDialog,
+                    ClaudeTerminalExited,
+                    ClaudeUserPromptPending,
+                    TmuxSessionNotAdvertised,
+                ) as exc:
+                    if delivery_owner_is_current(self._bridge_dir, owner):
+                        startup_failure = exc
+                    else:
+                        owner_changed = True
+                    return True
+                return False
+            observed = read_delivery_owner(self._bridge_dir)
+            if (
+                owner.native_session_id is None
+                and replace(observed, native_session_id=None) == owner
+            ):
+                return False
+            owner_changed = True
+            return True
+
+        if not await asyncio.to_thread(ready):
+            self._holding_message = True
+            try:
+                await self._poll_until(deadline, ready)
+            finally:
+                self._holding_message = False
+        self._require_active_session()
+        if startup_failure is not None:
+            raise startup_failure
+        if capability_missing and ready_owner is None and not owner_changed:
+            raise ClaudeMessageNotAccepted(
+                "This Claude terminal has not confirmed the current Omnigent input hooks. "
+                "Let its current work finish, stop the session terminal, then reopen it "
+                "to resume before retrying this message. Nothing was sent."
+            )
+        if owner_changed or ready_owner is None:
+            raise ClaudeMessageNotAccepted(
+                "Claude Code's owning session and terminal could not be confirmed; "
+                "nothing was sent."
+            )
+        return ready_owner
+
+    def _discard_unconfirmed_contexts(self, owner: ClaudeDeliveryOwner) -> None:
+        """Retire only this executor's entries while it still owns their native launch."""
+        if read_delivery_owner(self._bridge_dir) != owner:
+            return
+        retained: deque[PromptFrameworkContextHandle] = deque(maxlen=MAX_PENDING_PROMPT_CONTEXTS)
+        for handle in self._unconfirmed_framework_contexts:
+            if handle.owner == owner:
+                discard_prompt_framework_context(handle, retain_fence=True)
+            elif handle.path.exists():
+                retained.append(handle)
+        self._unconfirmed_framework_contexts = retained
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        """Retire owned notices; existing cancellation and terminal controls stop the work."""
+        del session_key
+        self._discard_unconfirmed_contexts(read_delivery_owner(self._bridge_dir))
+        return False
 
     def _require_active_session(self) -> None:
         """Reject queued input if /clear replaced its conversation while it waited."""
@@ -453,6 +654,7 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` only accepts this session's picker values, aliases, and
         # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
+        turn_owner = read_delivery_owner(self._bridge_dir)
         try:
             with telemetry.span("claude_native.inject"):
                 hold_deadline: float | None = None
@@ -485,7 +687,7 @@ class ClaudeNativeExecutor(Executor):
                 exc_info=not clean_exit,
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
+            cleanup_error = self._reap_failed_turn(owner=turn_owner)
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -498,7 +700,7 @@ class ClaudeNativeExecutor(Executor):
             )
             # The pane is still alive here: this turn's error reports the close,
             # so the runner must not also report the pane's exit as a failure.
-            cleanup_error = self._reap_failed_turn(expected_close=True)
+            cleanup_error = self._reap_failed_turn(expected_close=True, owner=turn_owner)
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -549,19 +751,33 @@ class ClaudeNativeExecutor(Executor):
             )
             yield ExecutorError(message=describe_exception(exc), undelivered=True)
             return
-        except RuntimeError as exc:
+        except ClaudeDeliveryUnconfirmed as exc:
+            yield ExecutorError(
+                message=str(exc),
+                code="claude_delivery_unconfirmed",
+                title="Claude delivery is unconfirmed",
+                remediation="Inspect the terminal before sending this message again.",
+                preserve_session=True,
+            )
+            return
+        except (RuntimeError, OSError) as exc:
             _logger.exception(
                 "claude-native: failed to deliver message to harness",
                 extra={"session_id": self._request_session_id},
             )
-            yield ExecutorError(message=describe_exception(exc))
+            yield ExecutorError(message=describe_exception(exc), preserve_session=True)
             return
         yield TurnComplete(response=None)
 
-    async def _inject(self, operation: Callable[[], None]) -> None:
+    async def _inject(
+        self, operation: Callable[[], None], *, expected_owner: ClaudeDeliveryOwner | None = None
+    ) -> None:
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
         cancelled = threading.Event()
-        with cancellable_injection(cancelled):
+        owner = expected_owner or read_delivery_owner(self._bridge_dir)
+        with cancellable_injection(
+            cancelled, expected_owner=owner, bridge_dir=self._bridge_dir
+        ) as ownership:
             worker = asyncio.create_task(asyncio.to_thread(operation))
         try:
             await asyncio.shield(worker)
@@ -572,13 +788,29 @@ class ClaudeNativeExecutor(Executor):
                     await asyncio.shield(worker)
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
-            self._reap_failed_turn()
+            if ownership is not None and ownership.wrote_input:
+                raise InjectionDeliveryAmbiguous(
+                    "Native input acknowledgement was interrupted after typing began; "
+                    "the message may already be queued or running."
+                ) from None
+            if delivery_owner_is_current(self._bridge_dir, owner):
+                self._discard_unconfirmed_contexts(owner)
+                self._reap_failed_turn(owner=owner)
             raise
 
-    def _reap_failed_turn(self, *, expected_close: bool = False) -> str | None:
+    def _reap_failed_turn(
+        self, *, expected_close: bool = False, owner: ClaudeDeliveryOwner | None = None
+    ) -> str | None:
         """Kill the Claude pane before a delivery timeout becomes ``failed``."""
         try:
-            kill_session(self._bridge_dir, timeout_s=1.0, expected_close=expected_close)
+            with (
+                _bridge_metadata_write_lock(self._bridge_dir)
+                if owner is not None
+                else contextlib.nullcontext()
+            ):
+                if owner is not None and not delivery_owner_is_current(self._bridge_dir, owner):
+                    return None
+                kill_session(self._bridge_dir, timeout_s=1.0, expected_close=expected_close)
         except TmuxSessionNotAdvertised:
             _logger.debug(
                 "claude-native: timed-out session already disappeared",

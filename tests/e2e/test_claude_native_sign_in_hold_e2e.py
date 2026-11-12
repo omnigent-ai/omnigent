@@ -120,7 +120,13 @@ def test_message_waits_for_launcher_sign_in_then_is_sent(
         contextlib.ExitStack() as resources,
     ):
         monkeypatch.setenv("TMPDIR", native_tmp)
-        stack = resources.enter_context(_native_stack(tmp_path, _launcher_script(tui, signed_in)))
+        stack = resources.enter_context(
+            _native_stack(
+                tmp_path,
+                _launcher_script(tui, signed_in),
+                runner_env={"OMNIGENT_TEST_CLAUDE_HOOKS": "1"},
+            )
+        )
         client = resources.enter_context(
             httpx.Client(base_url=stack.base_url, trust_env=False, timeout=120)
         )
@@ -173,8 +179,8 @@ def test_message_waits_for_launcher_sign_in_then_is_sent(
         pane = _pane(advert)
         assert _sent(pane) == [first, second], pane
 
-        # The fake TUI writes no Claude transcript, so the run is judged by what reached
-        # the pane and by the notices: one hold notice, one "sending now", no failure.
+        # The fake TUI writes no assistant transcript, so the run is judged by the
+        # pane and notices: one hold notice, one "sending now", no failure.
         _wait(
             lambda: _notices(
                 _items(client, stack.base_url, session_id), "databricks_sign_in_completed"
