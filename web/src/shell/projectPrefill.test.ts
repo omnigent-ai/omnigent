@@ -10,6 +10,7 @@ import type { ProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
 import {
   initialPrefillState,
   projectPrefillStep,
+  projectRepository,
   withProjectLaunchDefaults,
   type ProjectPrefillConfig,
 } from "./projectPrefill";
@@ -344,5 +345,23 @@ describe("withProjectLaunchDefaults", () => {
     expect(
       withProjectLaunchDefaults(repositoryProject, { hostId: "host_2", workspace: "/elsewhere" }),
     ).toEqual(repositoryProject);
+  });
+});
+
+describe("projectRepository", () => {
+  it.each([
+    ["a legacy URL string", "https://git.example.com/team/sample.git"],
+    ["a missing URL", { branch: "main" }],
+    ["a non-string URL", { url: 42 }],
+    ["a non-string branch", { url: "https://git.example.com/team/sample.git", branch: 1 }],
+    ["null", null],
+  ])("ignores %s", (_label, value) => {
+    expect(projectRepository(value)).toBeUndefined();
+  });
+
+  it("keeps a usable repository", () => {
+    const url = "https://git.example.com/team/sample.git";
+    expect(projectRepository({ url, branch: "release" })).toEqual({ url, branch: "release" });
+    expect(projectRepository({ url, branch: "" })).toEqual({ url });
   });
 });

@@ -660,6 +660,17 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.workspaces).toEqual(["https://git.example.com/team/sample.git#release"]);
   });
 
+  it("ignores a saved repository value it can't use", async () => {
+    vi.mocked(useProjectConfig).mockReturnValue({
+      data: { host_id: "__sandbox__", repository: "https://git.example.com/team/legacy.git" },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useProjectConfig>);
+    renderSandboxLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("Repository"),
+    );
+  });
+
   it("clears the sandbox repository and profile on an in-place project switch", async () => {
     // Mounted mirror of the unmount/remount sandbox-leak case: clicking
     // another project's pencil only changes `?project=` — the screen never

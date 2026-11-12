@@ -41,6 +41,19 @@ export interface ProjectPrefillConfig {
 }
 
 /**
+ * A project's saved repository, or undefined when the client-owned config holds
+ * a value this client can't use (e.g. a legacy URL string). The server ignores
+ * such values too.
+ */
+export function projectRepository(value: unknown): ProjectPrefillConfig["repository"] {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { url, branch } = value as Record<string, unknown>;
+  if (typeof url !== "string" || url.trim() === "") return undefined;
+  if (branch !== undefined && typeof branch !== "string") return undefined;
+  return branch ? { url, branch } : { url };
+}
+
+/**
  * Overlay how a project's last session started on its stored defaults. The
  * started agent becomes `launchAgentId`; when it is the stored agent and the
  * start recorded its own harness options, those replace the stored model and

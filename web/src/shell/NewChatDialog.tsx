@@ -213,6 +213,7 @@ import {
   initialPrefillState,
   prefillDone,
   projectPrefillStep,
+  projectRepository,
   withProjectLaunchDefaults,
   type ProjectPrefillConfig,
   type ProjectPrefillState,
@@ -2353,7 +2354,7 @@ function NewChatLandingContent({
     const stored: ProjectPrefillConfig = c
       ? {
           hostId: c.host_id,
-          repository: c.repository,
+          repository: projectRepository(c.repository),
           sandboxProvider: c.sandbox_provider,
           workspace: c.workspace,
           agentId: c.agent_id,
