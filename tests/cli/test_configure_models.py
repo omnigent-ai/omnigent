@@ -3986,6 +3986,46 @@ def test_setup_repairs_provider_default_it_does_not_serve(isolated_config, monke
     assert set(load_providers({"providers": providers})) == set(providers)
 
 
+@pytest.mark.parametrize(("first", "second"), [("1", "1"), ("2", "1"), ("1", "2"), ("2", "q")])
+def test_setup_saves_invalid_provider_choices_only_after_every_entry(
+    isolated_config, monkeypatch, first, second
+):
+    config_path = isolated_config / "config.yaml"
+    repairable = {
+        "kind": "databricks",
+        "profile": "example",
+        "native_gemini": True,
+        "default": "openai",
+    }
+    unrepairable = {"kind": "databricks", "default": True}
+    config_path.write_text(
+        yaml.safe_dump(
+            {"providers": {"databricks-gemini-example": repairable, "workspace": unrepairable}}
+        )
+    )
+    before = config_path.read_bytes()
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    result = CliRunner().invoke(cli, ["setup"], input=f"{first}\n{second}\nq\n")
+    output = " ".join(result.output.split())
+    assert "provider 'workspace': a profile or connection: databricks is required" in output
+    assert output.count("Keep it without the invalid default") == 1
+    assert output.count("Remove this provider") == 2
+    if second != "1":
+        assert result.exit_code == 1, result.output
+        assert config_path.read_bytes() == before
+        return
+    assert result.exit_code == 0, result.output
+    providers = _config_yaml(isolated_config).get("providers") or {}
+    if first == "1":
+        assert providers == {
+            "databricks-gemini-example": {
+                key: value for key, value in repairable.items() if key != "default"
+            }
+        }
+    else:
+        assert providers == {}
+
+
 @pytest.mark.parametrize(
     "profile_text",
     [

@@ -3694,7 +3694,7 @@ def _repair_invalid_provider_entries() -> bool:
         fixed = drop_unserved_default_scopes(str(name), entry) if isinstance(entry, dict) else None
         options = ["Remove this provider", "Leave unchanged and exit"]
         descriptions = [
-            "Deletes this entry from the config. Stored keys stay in place.",
+            "Deletes this entry from the config. Keys stored outside the config stay in place.",
             "Exits setup without changing the config.",
         ]
         if fixed is not None:

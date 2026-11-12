@@ -12334,9 +12334,8 @@ def setup(internal_beta: bool) -> None:
         return
 
     # --no-internal-beta: validate existing providers before entering the
-    # picker so malformed user config is reported as an actionable CLI error,
-    # not an application crash from the picker's ambient-adoption step.
-    # Interactive runs can repair or remove the malformed entries instead.
+    # picker. Interactive runs can repair or remove malformed entries; other runs
+    # get an actionable CLI error, not a crash from the picker's ambient adoption.
     from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.onboarding.provider_config import load_providers
 
