@@ -10,12 +10,14 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
+from omnigent.inner import terminal as terminal_module
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalCreateResult, TerminalInstance
 from omnigent.terminals import TerminalRegistry, registry
@@ -62,6 +64,83 @@ def _launch_failed_event(caplog: pytest.LogCaptureFixture) -> logging.LogRecord:
     )
     assert record is not None, "expected a terminal_launch_failed log event"
     return record
+
+
+@pytest.mark.parametrize(
+    "outcome", ["ready", "unavailable", "cancelled", "conversation_cleaned", "shutdown"]
+)
+async def test_terminal_preparation_keeps_loop_responsive_and_owns_cancelled_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    created = _capture_instances(monkeypatch)
+    original_create = registry.create_terminal_instance
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop_progressed = threading.Event()
+    launch = AsyncMock()
+    monkeypatch.setattr(TerminalInstance, "launch", launch)
+    monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+
+    def prepare(*args: Any, **kwargs: Any) -> TerminalCreateResult:
+        result = original_create(*args, **kwargs)
+        loop.call_soon_threadsafe(entered.set)
+        if not release.wait(2):
+            raise RuntimeError("terminal preparation blocked event-loop progress")
+        loop_progressed.set()
+        return result
+
+    def preflight() -> None:
+        if outcome == "unavailable":
+            loop.call_soon_threadsafe(entered.set)
+            if not release.wait(2):
+                raise RuntimeError("tmux preflight blocked event-loop progress")
+            loop_progressed.set()
+            raise terminal_module.TmuxUnavailableError("tmux is unavailable")
+
+    monkeypatch.setattr(terminal_module, "_require_supported_tmux", preflight)
+    monkeypatch.setattr(registry, "create_terminal_instance", prepare)
+    terminal_registry = TerminalRegistry()
+    task = asyncio.create_task(
+        terminal_registry.launch("owned-session", "shell", "main", _spec(tmp_path))
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        if outcome == "cancelled":
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            assert not task.done(), "cancellation must retain the preparing instance"
+        elif outcome == "conversation_cleaned":
+            await terminal_registry.cleanup_conversation("owned-session")
+        elif outcome == "shutdown":
+            await terminal_registry.shutdown()
+        release.set()
+        if outcome == "unavailable":
+            with pytest.raises(terminal_module.TmuxUnavailableError, match="unavailable"):
+                await task
+            assert not created
+            launch.assert_not_awaited()
+        elif outcome in ("cancelled", "conversation_cleaned", "shutdown"):
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert len(created) == 1
+            assert not created[0].private_dir.exists()
+            launch.assert_not_awaited()
+        else:
+            assert await task is created[0]
+            launch.assert_awaited_once()
+            assert terminal_registry.get("owned-session", "shell", "main") is created[0]
+        assert loop_progressed.is_set()
+        if outcome != "ready":
+            assert terminal_registry.active_conversation_ids() == []
+    finally:
+        release.set()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await task
+        await terminal_registry.shutdown()
+        for instance in created:
+            await instance.close()
 
 
 @requires_tmux
