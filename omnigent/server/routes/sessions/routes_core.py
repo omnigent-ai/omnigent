@@ -6188,7 +6188,6 @@ def register_core_routes(
             conv,
             before_item_id=body.item_id,
             command="/rewind",
-            # The rewound chat keeps its name.
             title=conv.title or "",
             notice=lambda new_id: supersession_notice_text(
                 new_id,

@@ -1501,9 +1501,10 @@ live viewers follow via `session.superseded` with `reason: "rewind"`.
 Clients put `prompt` back in the composer, with `attachments`: the
 prompt's files as the fork's own copies (a fork copies every source
 file), readable from the fork's `resources/files/{file_id}/content`. An
-image the prompt carried inline (no stored file, e.g. after an import)
-comes back as its `image_url` data URI instead, with `file_id: null`, for
-the client to upload on send. Rewinding never rolls back files on disk. `GET /v1/info` reports
+image or document the prompt carried inline (no stored file, e.g. after
+an import) comes back as its `image_url` or `file_data` data URI
+instead, with `file_id: null`, for the client to upload on send.
+Rewinding never rolls back files on disk. `GET /v1/info` reports
 `session_rewind: true`, which also means
 `GET /v1/sessions/{id}/items?type=message` filters items by type.
 

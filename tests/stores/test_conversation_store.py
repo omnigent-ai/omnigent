@@ -6473,17 +6473,19 @@ def test_fork_conversation_truncated_drops_external_session_directive(
     assert fork.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
 
 
-@pytest.mark.parametrize("cutoff", ["up_to_response_id", "before_item_id"])
-def test_truncated_fork_of_a_fork_drops_inherited_native_directive(
+@pytest.mark.parametrize("cutoff", ["up_to_response_id", "before_item_id", "cross_family"])
+def test_fork_of_a_fork_drops_inherited_native_directive(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
     cutoff: str,
 ) -> None:
-    """Truncating a fork drops the native directive it inherited from its own source.
+    """A truncated or cross-family fork drops the native directive its source inherited.
 
-    Fork A into B, then truncate B: an inherited directive naming A's native
-    session would make the runner clone A's full transcript, bringing back
-    the turns the truncation discarded.
+    Fork A into B, then truncate B or fork it the way a cross-family fork
+    does (``resume_source_native_session=False``): an inherited directive
+    naming A's native session would make the runner clone A's full
+    transcript, bringing back discarded turns or handing the target a
+    transcript in the wrong format.
     """
     from omnigent.stores.conversation_store import FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
 
@@ -6500,14 +6502,16 @@ def test_truncated_fork_of_a_fork_drops_inherited_native_directive(
     conversation_store.set_external_session_id(chat_b.id, "claude-uuid-b")
 
     second_prompt_id = conversation_store.list_items(chat_b.id).data[2].id
-    cutoff_kwargs = (
-        {"up_to_response_id": "resp_001"}
-        if cutoff == "up_to_response_id"
-        else {"before_item_id": second_prompt_id}
-    )
-    truncated = conversation_store.fork_conversation(chat_b.id, **cutoff_kwargs)
+    cutoff_kwargs: dict[str, Any] = {
+        "up_to_response_id": {"up_to_response_id": "resp_001"},
+        "before_item_id": {"before_item_id": second_prompt_id},
+        "cross_family": {"resume_source_native_session": False},
+    }[cutoff]
+    fork = conversation_store.fork_conversation(chat_b.id, **cutoff_kwargs)
 
-    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in truncated.labels, truncated.labels
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels, fork.labels
+    if cutoff == "cross_family":
+        assert len(conversation_store.list_items(fork.id).data) == 6
 
 
 def test_fork_conversation_cross_family_drops_external_session_directive(

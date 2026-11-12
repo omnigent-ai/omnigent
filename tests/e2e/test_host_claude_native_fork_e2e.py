@@ -854,3 +854,11 @@ def test_rewind_claude_native_resumes_only_the_earlier_history(
             assert dropped not in reply, (
                 f"rewound claude-native session recalled the dropped word {dropped!r}: {reply!r}"
             )
+
+            # The source keeps its whole conversation and resumes on its host.
+            _launch_runner(http_client, host_id=host_id, session_id=source_id, workspace=workspace)
+            reply = _recall_code_words(http_client, session_id=source_id, expected=dropped)
+            assert kept in reply, (
+                f"source claude-native session forgot the kept word {kept!r} after a rewind: "
+                f"{reply!r}"
+            )
