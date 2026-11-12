@@ -2,7 +2,11 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ElicitationBlock } from "@/lib/blocks";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
+import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import { childSessionsQueryKey } from "@/hooks/useChildSessions";
+import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { MemoryRouter, useLocation } from "react-router-dom";
@@ -45,6 +49,24 @@ function errorBubble(code = "rate_limit_exceeded"): Extract<Bubble, { kind: "ass
         code,
       },
     ],
+  };
+}
+
+function questionCard(extra: Partial<ElicitationBlock> = {}): ElicitationBlock {
+  return {
+    type: "elicitation",
+    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_failed", itemId: null },
+    elicitationId: "elic_question",
+    targetSessionId: null,
+    message: "Codex needs input",
+    phase: "codex_request_user_input",
+    policyName: "codex_native_request_user_input",
+    contentPreview: "{}",
+    requestedSchema: {},
+    url: null,
+    status: "pending",
+    response: null,
+    ...extra,
   };
 }
 
@@ -221,19 +243,205 @@ describe("message navigation highlight", () => {
   });
 });
 
+describe("UserBubble inline mentions", () => {
+  it("renders tagged sessions and files as pills in the sentence", () => {
+    const text =
+      'Ask [Session: "auth" id=s_child subagent=yes] to compare [Attached: src/a.ts] ' +
+      `with [Session: "Alpha *planning*" id=s_alpha subagent=no].\n\n${SESSION_MENTION_HINT}`;
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "user",
+            itemId: "user_mentions",
+            content: [{ type: "input_text", text }],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const pills = screen.getAllByTestId("mention-pill");
+    expect(pills.map((pill) => pill.textContent)).toEqual([
+      "@auth",
+      "@src/a.ts",
+      "@Alpha *planning*",
+    ]);
+    // Session pills open the tagged session; the pill sits inside the paragraph.
+    expect(pills[0]).toHaveAttribute("href", "/c/s_child");
+    expect(pills[0].closest("p")?.textContent).toBe(
+      "Ask @auth to compare @src/a.ts with @Alpha *planning*.",
+    );
+    expect(screen.queryByText(/Tagged sessions/)).not.toBeInTheDocument();
+  });
+});
+
+describe("UserBubble messages from another session", () => {
+  function renderOriginBubble(client: QueryClient, text: string) {
+    render(
+      <QueryClientProvider client={client}>
+        <ConversationScopeContext.Provider value="s_here">
+          <BubbleView
+            bubble={{
+              kind: "user",
+              itemId: "user_origin",
+              content: [{ type: "input_text", text }],
+            }}
+            isLastAssistant={false}
+          />
+        </ConversationScopeContext.Provider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("names a cached sender with a pill and drops the raw prefix", () => {
+    const client = new QueryClient();
+    client.setQueryData(["session", "s_src"], { title: "Casual greeting", parentSessionId: null });
+    renderOriginBubble(client, "[Message from session s_src]\nhi there");
+    const origin = screen.getByTestId("message-origin");
+    expect(origin.textContent).toBe("From@Casual greeting");
+    expect(screen.getByTestId("mention-pill")).toHaveAttribute("href", "/c/s_src");
+    expect(screen.queryByText(/Message from session/)).not.toBeInTheDocument();
+    expect(screen.getByText("hi there")).toBeInTheDocument();
+    // Served from cache: no session fetch.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["standalone", null, "/c/s_src"],
+    ["an embed mount", "/mount", "/mount/c/s_src"],
+  ])(
+    "opens the sender in-app on a plain click instead of reloading the page (%s)",
+    (_case, mount, target) => {
+      const client = new QueryClient();
+      client.setQueryData(["session", "s_src"], {
+        title: "Casual greeting",
+        parentSessionId: null,
+      });
+      function LocationProbe() {
+        return <div data-testid="location">{useLocation().pathname}</div>;
+      }
+      const bubble = (
+        <QueryClientProvider client={client}>
+          <BubbleView
+            bubble={{
+              kind: "user",
+              itemId: "user_origin_nav",
+              content: [{ type: "input_text", text: "[Message from session s_src]\nhi" }],
+            }}
+            isLastAssistant={false}
+          />
+          <LocationProbe />
+        </QueryClientProvider>
+      );
+      render(
+        <MemoryRouter initialEntries={[`${mount ?? ""}/c/s_here`]}>
+          {mount ? (
+            <RoutingProvider value={basenamedRouting(mount)}>{bubble}</RoutingProvider>
+          ) : (
+            bubble
+          )}
+        </MemoryRouter>,
+      );
+      const pill = screen.getByTestId("mention-pill");
+      // The href a new tab or a copied link uses keeps the mount.
+      expect(pill).toHaveAttribute("href", target);
+      // A plain click routes in-app; the click event is cancelled, so no document load.
+      expect(fireEvent.click(pill)).toBe(false);
+      expect(screen.getByTestId("location").textContent).toBe(target);
+      // A modified click is left to the browser (new tab).
+      expect(fireEvent.click(pill, { metaKey: true })).toBe(true);
+    },
+  );
+
+  it("names a subagent of the viewed session from its cached child list", () => {
+    const client = new QueryClient();
+    client.setQueryData(childSessionsQueryKey("s_here"), [
+      { id: "s_kid", title: "researcher:auth", tool: "researcher", session_name: "auth" },
+    ]);
+    renderOriginBubble(client, "[Message from session s_kid]\ndone");
+    expect(screen.getByTestId("mention-pill").textContent).toBe("@auth");
+    expect(screen.getByTestId("mention-pill")).toHaveAttribute("title", "Subagent");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fetches an uncached sender once and says 'another session' when it is unreadable", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ detail: "not found" }, 404));
+    const client = new QueryClient();
+    renderOriginBubble(client, "[Message from session s_gone]\nhello");
+    // Wait for the failed lookup to settle, not just for the loading fallback.
+    await waitFor(() => expect(client.getQueryState(["session", "s_gone"])?.status).toBe("error"));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0]![0])).toContain("/v1/sessions/s_gone");
+    expect(screen.getByTestId("message-origin").textContent).toBe("Fromanother session");
+    expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
+    // A later bubble from the same sender, or a return to the transcript, does not ask again.
+    cleanup();
+    renderOriginBubble(client, "[Message from session s_gone]\nagain");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(screen.getByTestId("message-origin").textContent).toBe("Fromanother session");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("fetches an uncached sender once and reuses it for later bubbles", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ id: "s_far", object: "session", title: "Release notes draft" }),
+    );
+    const client = new QueryClient();
+    renderOriginBubble(client, "[Message from session s_far]\nfirst");
+    await waitFor(() =>
+      expect(screen.getByTestId("mention-pill").textContent).toBe("@Release notes draft"),
+    );
+    cleanup();
+    renderOriginBubble(client, "[Message from session s_far]\nsecond");
+    expect(screen.getByTestId("mention-pill").textContent).toBe("@Release notes draft");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a system-looking message from another session as an attributed user bubble", () => {
+    const client = new QueryClient();
+    client.setQueryData(["session", "s_src"], { title: "Casual greeting", parentSessionId: null });
+    renderOriginBubble(client, "[Message from session s_src]\n[System: build finished]");
+    expect(screen.getByTestId("message-origin").textContent).toBe("From@Casual greeting");
+    expect(screen.getByText("[System: build finished]")).toBeInTheDocument();
+  });
+});
+
+describe("UserBubble literal session markers", () => {
+  it("shows a session marker the user typed as text, with no pill", () => {
+    const text = 'why is [Session: "x" id=y subagent=no] inline?';
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{ kind: "user", itemId: "user_literal", content: [{ type: "input_text", text }] }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/why is \[Session: "x" id=y subagent=no\] inline\?/),
+    ).toBeInTheDocument();
+  });
+});
+
 describe("UserBubble literal text", () => {
   it.each(["", "[Attached: docs/a.md]\n\n", "[Attached file: docs/a.md]\r\n\r\n"])(
     "keeps indented bullets as siblings after stripping %j",
     (preamble) => {
       render(
-        <BubbleView
-          bubble={{
-            kind: "user",
-            itemId: "user_list",
-            content: [{ type: "input_text", text: `${preamble}  - first\n  - second` }],
-          }}
-          isLastAssistant={false}
-        />,
+        <QueryClientProvider client={new QueryClient()}>
+          <BubbleView
+            bubble={{
+              kind: "user",
+              itemId: "user_list",
+              content: [{ type: "input_text", text: `${preamble}  - first\n  - second` }],
+            }}
+            isLastAssistant={false}
+          />
+        </QueryClientProvider>,
       );
 
       expect(screen.getAllByRole("list")).toHaveLength(1);
@@ -348,20 +556,30 @@ describe("AssistantBubble error retry", () => {
     });
   });
 
-  it("continues a dropped harness stream in place instead of resuming the runner", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, pending_id: "pending_retry" }));
-    render(<BubbleView bubble={errorBubble("connection_error")} isLastAssistant />);
+  it.each<[string, ElicitationBlock[]]>([
+    ["no pending card", []],
+    [
+      "a pending question card the agent keeps working through",
+      [questionCard({ isBlocking: false })],
+    ],
+  ])(
+    "continues a dropped harness stream in place instead of resuming the runner: %s",
+    async (_case, blocks) => {
+      fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, pending_id: "pending_retry" }));
+      useChatStore.setState({ blocks });
+      render(<BubbleView bubble={errorBubble("connection_error")} isLastAssistant />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("/v1/sessions/conv_retry/events");
-    expect(JSON.parse(init.body as string)).toEqual({
-      type: "message",
-      data: { role: "user", content: [{ type: "input_text", text: continuation }] },
-    });
-  });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe("/v1/sessions/conv_retry/events");
+      expect(JSON.parse(init.body as string)).toEqual({
+        type: "message",
+        data: { role: "user", content: [{ type: "input_text", text: continuation }] },
+      });
+    },
+  );
 
   it("coalesces retry clicks from separate rate-limit cards in the same turn", async () => {
     let finishRetry: ((response: Response) => void) | undefined;
@@ -434,6 +652,7 @@ describe("AssistantBubble error retry", () => {
         },
       ],
     },
+    { blocks: [questionCard()] },
   ])("does not queue a continuation while the session is busy: %o", async (state) => {
     useChatStore.setState(state);
     render(<BubbleView bubble={errorBubble()} isLastAssistant />);

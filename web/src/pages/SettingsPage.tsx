@@ -42,6 +42,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
@@ -77,6 +78,7 @@ import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
+import { SessionTitleInstructionsControl } from "@/components/SessionTitleInstructionsControl";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
@@ -117,8 +119,15 @@ import {
   fetchDatabricksStatus,
   type DatabricksConnectionStatus,
 } from "@/lib/databricksIntegration";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import {
+  getCurrentIsAdmin,
+  getCurrentAdminEligibility,
+  resolveIdentity,
+  subscribeIdentity,
+} from "@/lib/identity";
+import { isAdminViewEnabled, setAdminViewEnabled } from "@/lib/adminView";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -213,6 +222,12 @@ import {
   writeProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
 import {
+  DEFAULT_SESSION_ROW_QUICK_ACTIONS,
+  SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
+  useSessionRowQuickActions,
+  writeSessionRowQuickActions,
+} from "@/lib/sessionRowQuickActionsPreferences";
+import {
   DEFAULT_WORKSPACE_TAB,
   defaultWorkspaceTabs,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
@@ -270,7 +285,7 @@ import {
   writeCustomTheme,
 } from "@/lib/customTheme";
 import { useHostTheme } from "@/lib/embedded";
-import { getOmnigentThemeSettingsUrl } from "@/lib/host";
+import { getOmnigentThemeSettingsUrl, isDatabricksWorkspace } from "@/lib/host";
 import {
   applyImportedSettings,
   collectSettings,
@@ -1034,6 +1049,29 @@ function ProjectFolderPaginationControl() {
   );
 }
 
+/** On by default: sidebar rows show hover Pin and Archive buttons beside the "…" menu. */
+function SessionRowQuickActionsControl() {
+  const shown = useSessionRowQuickActions();
+  const labelId = useId();
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Show Pin and Archive buttons on session rows"
+        labelId={labelId}
+        description={`Turn this off to keep Pin and Archive in the session row's "…" menu and right-click menu only, so they are harder to click by mistake.`}
+      />
+      <Switch
+        aria-labelledby={labelId}
+        checked={shown}
+        onCheckedChange={writeSessionRowQuickActions}
+        data-testid="session-row-quick-actions-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.appearance.session_row_quick_actions"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
@@ -1064,6 +1102,7 @@ function AppearanceSection() {
     writeFoldAssistantNarration(DEFAULT_FOLD_ASSISTANT_NARRATION);
     writeProjectFolderCollapse(DEFAULT_PROJECT_FOLDER_COLLAPSE);
     writeProjectFolderPageSize(PROJECT_FOLDER_PAGE_SIZE);
+    writeSessionRowQuickActions(DEFAULT_SESSION_ROW_QUICK_ACTIONS);
 
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
@@ -1094,6 +1133,7 @@ function AppearanceSection() {
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
           PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
           PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+          SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
           HIDDEN_PICKER_AGENTS_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
@@ -1178,7 +1218,10 @@ function AppearanceSection() {
           </SettingsGroup>
 
           <SettingsGroup title="Sidebar" testId="settings-group-sidebar">
-            <ProjectFolderPaginationControl />
+            <SessionRowQuickActionsControl />
+            <div className="mt-4 border-t border-border pt-4">
+              <ProjectFolderPaginationControl />
+            </div>
           </SettingsGroup>
 
           <SettingsGroup title="Interface typography" testId="settings-group-interface-type">
@@ -1931,8 +1974,46 @@ function TerminalClipboardControl() {
   );
 }
 
+function AdminViewControl() {
+  const eligible = useSyncExternalStore(subscribeIdentity, getCurrentAdminEligibility, () => false);
+  const info = useServerInfo();
+  // Failed discovery has no capability flag; keep an existing off cookie recoverable.
+  if (
+    !eligible ||
+    info === "loading" ||
+    isBootFallbackInfo(info) ||
+    info.admin_view === false ||
+    (isAdminViewEnabled() && (!info.admin_view || info.single_user || isDatabricksWorkspace()))
+  )
+    return null;
+  return (
+    <SettingsGroup title="Administration">
+      <div className="flex items-center justify-between gap-4">
+        <SettingsLabel
+          label="Admin view"
+          description="Turn off to use your normal session access."
+        />
+        <Switch
+          aria-label="Admin view"
+          checked={isAdminViewEnabled()}
+          onCheckedChange={(enabled) => {
+            try {
+              setAdminViewEnabled(enabled);
+            } catch (error) {
+              toast.error(error instanceof Error ? error.message : "Could not change admin view.");
+            }
+          }}
+          componentId="settings.general.admin_view"
+        />
+      </div>
+    </SettingsGroup>
+  );
+}
+
 /** App-wide behavior settings. */
 function GeneralSection() {
+  const info = useServerInfo();
+  const titleInstructions = info !== "loading" && info.session_title_instructions === true;
   return (
     <Section title="General" description="Configure general Omnigent behavior.">
       <div className="flex flex-col gap-6">
@@ -1944,6 +2025,11 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Sessions" testId="settings-group-sessions">
           <BackgroundSessionTitlesControl />
+          {titleInstructions && (
+            <div className="mt-4 border-t border-border pt-4">
+              <SessionTitleInstructionsControl />
+            </div>
+          )}
           <div className="mt-4 border-t border-border pt-4">
             <OpenSubagentsInPanelControl />
           </div>
@@ -1961,6 +2047,7 @@ function GeneralSection() {
             <GlobalShortcutControl />
           </SettingsGroup>
         )}
+        <AdminViewControl />
       </div>
     </Section>
   );
@@ -2682,6 +2769,7 @@ function UpdatesSection() {
 
 function AccountSection() {
   const info = useServerInfo();
+  const capabilitiesLoading = info === "loading" || isBootFallbackInfo(info);
   const accountsEnabled = info !== "loading" && info.accounts_enabled;
   // Identity for display. Sourced from the mode-agnostic `/v1/me` probe so it
   // works under OIDC too (the accounts-only `/auth/me` doesn't exist there).
@@ -2698,11 +2786,12 @@ function AccountSection() {
   const [pwDone, setPwDone] = useState(false);
 
   useEffect(() => {
+    if (capabilitiesLoading) return;
     void (async () => {
       const userId = await resolveIdentity();
       setMe(userId === null ? null : { id: userId, is_admin: getCurrentIsAdmin() });
     })();
-  }, []);
+  }, [capabilitiesLoading]);
 
   const onSignOut = useCallback(() => signOutOfBrowserSession(accountsEnabled), [accountsEnabled]);
 

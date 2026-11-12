@@ -11,7 +11,9 @@ from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import _server_state, configure_mock_llm
 
-_TURNS = 80
+# Two items per turn: more than the initial window plus one older page, so
+# scrolling back lands at least two pages.
+_TURNS = 200
 _NEWEST_REPLY = f"reply number {_TURNS - 1}"
 _VIEWPORT = {"width": 1280, "height": 480}
 _TAG_SCROLLER = """

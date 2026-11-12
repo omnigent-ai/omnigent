@@ -9,9 +9,15 @@ import { SwitchHostDialog } from "./SwitchHostDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
-import { launchRunner, updateSession } from "@/lib/sessionsApi";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
+import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
+import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import { handleSessionEvent } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 
 // Heavy children have their own suites; stub them so this one stays on the
 // dialog's two-call move and its recovery from a half-finished switch.
@@ -64,8 +70,13 @@ vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
 vi.mock("@/hooks/useRecentWorkspaces", () => ({
   useRecentWorkspaces: () => ({ recent: ["/Users/alice/repo"], addRecent: vi.fn() }),
 }));
+vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxProfilesModule>()),
+  fetchSandboxProfiles: vi.fn(),
+}));
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsApiModule>()),
+  launchManagedHost: vi.fn(),
   launchRunner: vi.fn(),
   updateSession: vi.fn(),
 }));
@@ -91,6 +102,7 @@ vi.mock("@/components/ui/select", () => ({
   ),
   SelectTrigger: ({ children }: { children: ReactNode }) => children,
   SelectValue: () => null,
+  SelectSeparator: () => null,
   SelectContent: ({ children }: { children: ReactNode }) => children,
   SelectItem: ({
     value,
@@ -110,16 +122,56 @@ vi.mock("@/components/ui/select", () => ({
 const useHostsMock = vi.mocked(useHosts);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const launchRunnerMock = vi.mocked(launchRunner);
+const launchManagedHostMock = vi.mocked(launchManagedHost);
 const updateSessionMock = vi.mocked(updateSession);
 
-function renderDialog() {
+// A server that provisions Modal sandboxes, moves sessions onto them, and lets
+// the caller name the new host.
+const SANDBOX_SERVER: Partial<ServerInfo> = {
+  managed_sandboxes_enabled: true,
+  move_to_managed_sandbox: true,
+  sandbox_provider: "modal",
+  sandbox_providers: ["modal"],
+  sandbox_provider_capabilities: {
+    modal: { accepts_session_move: true },
+    e2b: { accepts_session_move: true },
+  },
+  request_managed_sandbox_host_id: true,
+};
+
+/**
+ * Render the dialog for a session on ``host_old``.
+ *
+ * @param info - Server capabilities; omitted leaves the context loading, which
+ *   keeps the sandbox rows hidden.
+ */
+function renderDialog(info?: Partial<ServerInfo>) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const dialog = (
+    <SwitchHostDialog open onOpenChange={() => {}} sessionId="conv_1" currentHostId="host_old" />
+  );
   render(
     <QueryClientProvider client={client}>
-      <SwitchHostDialog open onOpenChange={() => {}} sessionId="conv_1" currentHostId="host_old" />
+      {info === undefined ? (
+        dialog
+      ) : (
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...info }}>
+          {dialog}
+        </CapabilitiesProvider>
+      )}
     </QueryClientProvider>,
   );
   return client;
+}
+
+/** Leave the session's own laptop as the only online host. */
+function onlyOriginHostOnline(): void {
+  useHostsMock.mockReturnValue({
+    data: [
+      { host_id: "host_old", name: "mac-laptop", owner: "alice", status: "online" },
+      { host_id: "host_new", name: "linux-box", owner: "alice", status: "offline" },
+    ],
+  } as unknown as ReturnType<typeof useHosts>);
 }
 
 beforeEach(() => {
@@ -127,6 +179,7 @@ beforeEach(() => {
   useHostsMock.mockReset();
   useHostFilesystemMock.mockReset();
   launchRunnerMock.mockReset();
+  launchManagedHostMock.mockReset();
   updateSessionMock.mockReset();
   useHostsMock.mockReturnValue({
     data: [
@@ -140,9 +193,19 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof useHostFilesystem>);
   updateSessionMock.mockResolvedValue({} as Awaited<ReturnType<typeof updateSession>>);
   launchRunnerMock.mockResolvedValue({ runnerId: "runner_new" });
+  launchManagedHostMock.mockResolvedValue({} as Awaited<ReturnType<typeof launchManagedHost>>);
+  vi.mocked(fetchSandboxProfiles).mockReset().mockResolvedValue({
+    profiles: [],
+    managed_providers: [],
+    default_profile_ids: {},
+    next_cursor: null,
+  });
 });
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  conversationRegistry.clear();
+});
 
 describe("SwitchHostDialog", () => {
   it("shows a loading status before exposing a supported host-switch form", async () => {
@@ -373,5 +436,301 @@ describe("SwitchHostDialog", () => {
       "conv_1",
       "/Users/alice/git/omnigent",
     );
+  });
+
+  describe("new sandbox target", () => {
+    it("lists a sandbox per provider only on a server that can move a session onto one", () => {
+      renderDialog({ ...SANDBOX_SERVER, managed_sandboxes_enabled: false });
+      expect(screen.queryByTestId("switch-host-sandbox-option-modal")).toBeNull();
+      cleanup();
+
+      // An older server launches sandboxes but lacks the move, which would
+      // fail only after the switch has released the runner.
+      renderDialog({ ...SANDBOX_SERVER, move_to_managed_sandbox: false });
+      expect(screen.queryByTestId("switch-host-sandbox-option-modal")).toBeNull();
+      cleanup();
+
+      renderDialog({ ...SANDBOX_SERVER, sandbox_providers: ["modal", "e2b"] });
+      expect(screen.getByTestId("switch-host-sandbox-option-modal")).toHaveTextContent(
+        "Modal Sandbox",
+      );
+      expect(screen.getByTestId("switch-host-sandbox-option-e2b")).toBeInTheDocument();
+      // A fresh provision is never the default while another host is online.
+      expect(screen.getByTestId("mock-host-select")).toHaveValue("host_new");
+    });
+
+    it("lists no sandbox once the session has lost its host", () => {
+      // The server only moves a session off a host it still has, e.g. not after
+      // an earlier switch failed partway and left it unbound.
+      vi.mocked(useSession).mockReturnValue({
+        session: {
+          id: "conv_1",
+          agentId: "agent_1",
+          agentName: null,
+          status: "idle",
+          title: null,
+          createdAt: 0,
+          items: [],
+          permissionLevel: null,
+          parentSessionId: null,
+          subAgentName: null,
+          kind: "default",
+          hostId: null,
+          labels: {},
+        },
+        isLoading: false,
+        error: null,
+      });
+      renderDialog(SANDBOX_SERVER);
+      expect(screen.queryByTestId("switch-host-sandbox-option-modal")).toBeNull();
+      expect(screen.getByTestId("mock-host-select")).toHaveValue("host_new");
+    });
+
+    it.each([false, true])(
+      "leaves out a provider a session can't move onto (profile discovery on: %s)",
+      (profileDiscovery) => {
+        const server = {
+          ...SANDBOX_SERVER,
+          sandbox_providers: ["modal", "profiled", "unreported"],
+          sandbox_provider_capabilities: {
+            modal: { accepts_session_move: true },
+            // Manages sandbox profiles, which the server won't move a session onto.
+            profiled: { accepts_session_move: false },
+            // Says nothing about moves, so it is left out too.
+            unreported: { multi_repo: true },
+          },
+          features: { sandbox_profiles: profileDiscovery },
+        };
+        renderDialog(server);
+        expect(screen.getByTestId("switch-host-sandbox-option-modal")).toBeInTheDocument();
+        expect(screen.queryByTestId("switch-host-sandbox-option-profiled")).toBeNull();
+        expect(screen.queryByTestId("switch-host-sandbox-option-unreported")).toBeNull();
+        cleanup();
+
+        // With nothing else to pick, nothing can release the runner.
+        onlyOriginHostOnline();
+        renderDialog({ ...server, sandbox_providers: ["profiled", "unreported"] });
+        expect(screen.getByTestId("switch-host-no-targets")).toBeVisible();
+        expect(screen.queryByTestId("switch-host-button")).toBeNull();
+        expect(updateSessionMock).not.toHaveBeenCalled();
+        expect(fetchSandboxProfiles).not.toHaveBeenCalled();
+      },
+    );
+
+    it("moves the session onto a new sandbox after releasing its runner", async () => {
+      conversationRegistry.acquire("conv_1");
+      // What the move returns; its launch events may reach another replica's stream.
+      launchManagedHostMock.mockResolvedValue({
+        sandboxStatus: { stage: "provisioning", error: null, provider: "modal" },
+      } as Awaited<ReturnType<typeof launchManagedHost>>);
+      const client = renderDialog(SANDBOX_SERVER);
+      client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"), [
+        { id: "terminal_shellA_s1", name: "shellA", session: "s1", running: true },
+      ]);
+
+      fireEvent.change(screen.getByTestId("mock-host-select"), {
+        target: { value: "__sandbox__:modal" },
+      });
+      // A sandbox doesn't exist yet, so a repository replaces the directory.
+      expect(screen.queryByTestId("mock-workspace-input")).toBeNull();
+      fireEvent.change(screen.getByTestId("switch-host-sandbox-repo-input"), {
+        target: { value: "https://github.com/example/repo" },
+      });
+      fireEvent.change(screen.getByTestId("switch-host-sandbox-branch-input"), {
+        target: { value: "feature/login" },
+      });
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+
+      await waitFor(() => expect(launchManagedHostMock).toHaveBeenCalledTimes(1));
+      expect(updateSessionMock).toHaveBeenCalledWith("conv_1", {
+        runnerId: "",
+        modelOverride: null,
+        silent: true,
+      });
+      // The managed-host endpoint refuses a session whose runner is still bound.
+      expect(updateSessionMock.mock.invocationCallOrder[0]).toBeLessThan(
+        launchManagedHostMock.mock.invocationCallOrder[0],
+      );
+      const [sessionId, sandbox] = launchManagedHostMock.mock.calls[0];
+      expect(sessionId).toBe("conv_1");
+      expect(sandbox).toMatchObject({
+        provider: "modal",
+        workspace: "https://github.com/example/repo#feature/login",
+      });
+      expect(sandbox.hostId).toMatch(/^[0-9a-f]{32}$/);
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+      await waitFor(() =>
+        expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"))).toEqual([]),
+      );
+      expect(conversationRegistry.peek("conv_1")!.getState().sandboxStatus).toMatchObject({
+        stage: "provisioning",
+        provider: "modal",
+      });
+    });
+
+    it("doesn't reopen a launch that finished before the move's response", async () => {
+      conversationRegistry.acquire("conv_1");
+      launchManagedHostMock.mockImplementation(async () => {
+        for (const stage of ["provisioning", "ready"] as const) {
+          handleSessionEvent(
+            {
+              type: "session_sandbox_status",
+              conversationId: "conv_1",
+              stage,
+              error: null,
+              provider: "modal",
+              details: null,
+            },
+            "conv_1",
+          );
+        }
+        // Read before the launch finished, so it still says provisioning.
+        return {
+          sandboxStatus: { stage: "provisioning", error: null, provider: "modal" },
+        } as Awaited<ReturnType<typeof launchManagedHost>>;
+      });
+      const client = renderDialog(SANDBOX_SERVER);
+      fireEvent.change(screen.getByTestId("mock-host-select"), {
+        target: { value: "__sandbox__:modal" },
+      });
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+
+      await waitFor(() =>
+        expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"))).toEqual([]),
+      );
+      expect(conversationRegistry.peek("conv_1")!.getState().sandboxStatus).toBeNull();
+    });
+
+    it("keeps a launch event that lands before the move's response", async () => {
+      conversationRegistry.acquire("conv_1");
+      launchManagedHostMock.mockImplementation(async () => {
+        handleSessionEvent(
+          {
+            type: "session_sandbox_status",
+            conversationId: "conv_1",
+            stage: "failed",
+            error: "quota exceeded",
+            provider: "modal",
+            details: null,
+          },
+          "conv_1",
+        );
+        return {
+          sandboxStatus: { stage: "provisioning", error: null, provider: "modal" },
+        } as Awaited<ReturnType<typeof launchManagedHost>>;
+      });
+      const client = renderDialog(SANDBOX_SERVER);
+      fireEvent.change(screen.getByTestId("mock-host-select"), {
+        target: { value: "__sandbox__:modal" },
+      });
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+
+      // The move is through once the old host's terminals are cleared.
+      await waitFor(() =>
+        expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"))).toEqual([]),
+      );
+      expect(conversationRegistry.peek("conv_1")!.getState().sandboxStatus).toMatchObject({
+        stage: "failed",
+        error: "quota exceeded",
+      });
+    });
+
+    it("waits for the runner release, and doesn't move when it fails", async () => {
+      let release!: (value: Awaited<ReturnType<typeof updateSession>>) => void;
+      updateSessionMock.mockReturnValueOnce(
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+      );
+      renderDialog(SANDBOX_SERVER);
+      fireEvent.change(screen.getByTestId("mock-host-select"), {
+        target: { value: "__sandbox__:modal" },
+      });
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+      await waitFor(() => expect(updateSessionMock).toHaveBeenCalledTimes(1));
+      // The endpoint refuses a session whose runner is still bound.
+      expect(launchManagedHostMock).not.toHaveBeenCalled();
+      await act(async () => {
+        release({} as Awaited<ReturnType<typeof updateSession>>);
+      });
+      await waitFor(() => expect(launchManagedHostMock).toHaveBeenCalledTimes(1));
+      cleanup();
+
+      updateSessionMock.mockRejectedValueOnce(new Error("release failed"));
+      renderDialog(SANDBOX_SERVER);
+      fireEvent.change(screen.getByTestId("mock-host-select"), {
+        target: { value: "__sandbox__:modal" },
+      });
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+      expect(await screen.findByTestId("switch-host-error")).toHaveTextContent("release failed");
+      expect(launchManagedHostMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("defaults to an empty sandbox when no other host is online", async () => {
+      onlyOriginHostOnline();
+      renderDialog({ ...SANDBOX_SERVER, request_managed_sandbox_host_id: false });
+
+      expect(screen.queryByTestId("switch-host-no-targets")).toBeNull();
+      await waitFor(() =>
+        expect(screen.getByTestId("mock-host-select")).toHaveValue("__sandbox__:modal"),
+      );
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+
+      await waitFor(() => expect(launchManagedHostMock).toHaveBeenCalledTimes(1));
+      expect(launchManagedHostMock).toHaveBeenCalledWith("conv_1", {
+        provider: "modal",
+        workspace: null,
+      });
+    });
+
+    it("blocks a branch without a repository, a malformed repository URL and an invalid branch", () => {
+      onlyOriginHostOnline();
+      renderDialog(SANDBOX_SERVER);
+      const button = screen.getByTestId("switch-host-button");
+      const repo = screen.getByTestId("switch-host-sandbox-repo-input");
+
+      fireEvent.change(screen.getByTestId("switch-host-sandbox-branch-input"), {
+        target: { value: "main" },
+      });
+      expect(button).toBeDisabled();
+      expect(screen.getByTestId("switch-host-sandbox-repo-error")).toHaveTextContent(
+        "Add the repository this branch belongs to.",
+      );
+
+      fireEvent.change(repo, { target: { value: "/Users/alice/repo" } });
+      expect(button).toBeDisabled();
+      expect(screen.getByTestId("switch-host-sandbox-repo-error")).toHaveTextContent(
+        "Enter a repository URL",
+      );
+
+      fireEvent.change(repo, { target: { value: "git@github.com:org/repo.git" } });
+      expect(button).toBeEnabled();
+      expect(screen.queryByTestId("switch-host-sandbox-repo-error")).toBeNull();
+
+      // A bad branch is reported under the branch input, not the repository.
+      fireEvent.change(screen.getByTestId("switch-host-sandbox-branch-input"), {
+        target: { value: "bad..branch" },
+      });
+      expect(button).toBeDisabled();
+      expect(screen.getByTestId("switch-host-sandbox-branch-error")).toHaveTextContent(
+        "Enter a valid branch name",
+      );
+      expect(screen.queryByTestId("switch-host-sandbox-repo-error")).toBeNull();
+    });
+
+    it("offers the origin host again when the sandbox launch is refused", async () => {
+      launchManagedHostMock.mockRejectedValue(
+        new Error("sandbox provider 'modal' is not configured on this server"),
+      );
+      onlyOriginHostOnline();
+      renderDialog(SANDBOX_SERVER);
+
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+
+      const error = await screen.findByTestId("switch-host-error");
+      expect(error).toHaveTextContent("isn't running anywhere");
+      expect(error).toHaveTextContent("is not configured on this server");
+      expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
+    });
   });
 });

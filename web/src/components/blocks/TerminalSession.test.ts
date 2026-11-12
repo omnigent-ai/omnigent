@@ -770,6 +770,107 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  describe("pasteCommand", () => {
+    function inputFrames(socket: FakeWebSocket) {
+      return socket.sent.flatMap((frame) =>
+        typeof frame === "string" ? [] : [new TextDecoder().decode(frame)],
+      );
+    }
+
+    it("pastes one line without Enter and refuses a disconnected socket", () => {
+      const { socket, session } = makeSession();
+      const onResult = vi.fn();
+      session.pasteCommand("pwd", onResult);
+      expect(onResult).toHaveBeenCalledExactlyOnceWith(
+        "The shell is not connected. Nothing was sent.",
+      );
+      expect(inputFrames(socket)).toEqual([]);
+      onResult.mockClear();
+      socket.open();
+      const cancel = session.pasteCommand("printf 'hello λ'\n", onResult);
+      expect(inputFrames(socket)).toEqual(["printf 'hello λ'"]);
+      expect(onResult).toHaveBeenCalledExactlyOnceWith(null);
+      cancel();
+      socket.close();
+      session.pasteCommand("pwd", onResult);
+      expect(inputFrames(socket)).toHaveLength(1);
+      session.dispose();
+    });
+
+    it.each(["printf hello\npwd\n", "printf hello\r\npwd\r\n", "printf\t'hello'\n"])(
+      "waits for bracketed paste and sends %j once without Enter",
+      async (command) => {
+        const { socket, session } = makeSession();
+        const term = (session as unknown as { term: Terminal }).term;
+        const onResult = vi.fn();
+        socket.open();
+        session.pasteCommand(command, onResult);
+        expect(inputFrames(socket)).toEqual([]);
+        expect(onResult).not.toHaveBeenCalled();
+        await new Promise<void>((resolve) => {
+          term.write("\x1b[?2004h", resolve);
+        });
+        const pasted = command.replace(/\r\n/g, "\n").replace(/\n$/, "").replaceAll("\n", "\r");
+        expect(inputFrames(socket)).toEqual([`\x1b[200~${pasted}\x1b[201~`]);
+        expect(onResult).toHaveBeenCalledExactlyOnceWith(null);
+        await new Promise<void>((resolve) => {
+          term.write("\x1b[?2004l\x1b[?2004h", resolve);
+        });
+        expect(inputFrames(socket)).toHaveLength(1);
+        expect(onResult).toHaveBeenCalledOnce();
+        session.dispose();
+      },
+    );
+
+    it.each(["timeout", "cancel", "dispose"])(
+      "cleans up pending input after %s without sending or replaying",
+      async (outcome) => {
+        vi.useFakeTimers();
+        const { socket, session } = makeSession();
+        const term = (session as unknown as { term: Terminal }).term;
+        const onResult = vi.fn();
+        try {
+          socket.open();
+          const cancel = session.pasteCommand("printf hello\npwd", onResult);
+          if (outcome === "cancel") cancel();
+          if (outcome === "dispose") session.dispose();
+          await vi.advanceTimersByTimeAsync(4999);
+          expect(onResult).not.toHaveBeenCalled();
+          await vi.advanceTimersByTimeAsync(1);
+          if (outcome === "timeout")
+            expect(onResult).toHaveBeenCalledExactlyOnceWith(
+              "The shell is not ready to safely paste this command. Nothing was sent.",
+            );
+          else expect(onResult).not.toHaveBeenCalled();
+          if (outcome !== "dispose") {
+            term.write("\x1b[?2004h");
+            await vi.advanceTimersByTimeAsync(20);
+          }
+          expect(inputFrames(socket)).toEqual([]);
+          expect(onResult).toHaveBeenCalledTimes(outcome === "timeout" ? 1 : 0);
+        } finally {
+          session.dispose();
+          vi.useRealTimers();
+        }
+      },
+    );
+
+    it.each(["echo \x1b[201~\npwd", "pwd\r", "echo \x7f", "echo \x85"])(
+      "rejects control characters in %j without sending",
+      (command) => {
+        const { socket, session } = makeSession();
+        const onResult = vi.fn();
+        socket.open();
+        session.pasteCommand(command, onResult)();
+        expect(onResult).toHaveBeenCalledExactlyOnceWith(
+          "This command contains terminal control characters.",
+        );
+        expect(inputFrames(socket)).toEqual([]);
+        session.dispose();
+      },
+    );
+  });
+
   it("grabs keyboard focus on open when focusOnConnect is set", () => {
     // WHY: a foreground surface should claim the keyboard as it comes up.
     const { socket, session } = makeSession();

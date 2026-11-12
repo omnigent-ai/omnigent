@@ -164,6 +164,19 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   inventory every few seconds until the row is connected. In a claude-sdk
   session, the next turn after the row turns connected reaches that server
   without starting a new session. Custom agent servers carry no account state.
+  A claude-sdk session whose agent is running also shows each host server's
+  live connection in that session (connected, failed with its error, needs
+  sign-in, connecting, disabled, or not loaded when the CLI omits it),
+  including servers only the CLI loaded; a failed or needs-sign-in row whose
+  account needs no sign-in offers **Reconnect**, which shows reconnecting,
+  then the refreshed state or the reconnect error. Before the first turn the
+  panel says live status appears once the agent is running. Read-only viewers
+  see the state without Reconnect. **Go to Settings** keeps the session's host
+  selected even when it is a sandbox host the host picker otherwise hides.
+  While the host has an enterprise `managed-mcp.json`, Claude rows are only the
+  servers that file pins (no user or plugin rows), and Claude sessions reach
+  Omnigent's tools only through the file's `omnigent` relay entry
+  (`docs/CLAUDE_MANAGED_MCP.md`).
 - `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
   composers, including cached plugins whose marketplace inventory is unavailable.
   Selecting a row inserts its namespaced identifier.
@@ -174,6 +187,26 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
+- `at-mentions`: a bare `@` in the in-session or new-session composer shows a
+  "Sessions" row. Opening it (click, Enter, Tab or →) shows a "Subagents" row
+  for the current session's subagents, then every other session the sidebar
+  has loaded; Back or Esc goes up one level. In native coding-agent sessions workspace files and folders sit
+  below the Sessions row. Typing lists the top matching sessions inline above
+  the files and, after a short pause, searches session titles and the
+  workspace. Picking a row puts a
+  pill-styled `@name` token in the sentence; Backspace deletes a token whole, and
+  deleting it untags the item. On send each token becomes a marker in place
+  (`[Attached: path]` or `[Session: "title" id=… subagent=yes|no]`), and a
+  tagged session adds one tool hint at the end, so native terminals show the
+  markers as typed text. The sent message shows the tokens as inline pills; a
+  session pill opens that session. The new-session composer lists the same
+  sessions (no subagents yet) with the same title search; its files come from
+  the host directory listing only, without the recursive workspace search.
+  States: file listing still loading (Enter holds; a pending session search
+  does not hold it), no match (Enter sends the literal text), late results
+  arriving (the highlighted row stays put), a file and a session with the same
+  name (the later one gets a suffix such as `@README.md (file)`), Attach to
+  agent from the file viewer (adds a token at the end).
 - `dictation`: the microphone button beside the message box dictates speech
   into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
   terminal or code editor. While a browser or server take is listening, Enter
@@ -217,6 +250,15 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   session. Up/Down at the text boundaries browse recalled messages; editing one
   returns to normal caret navigation. Whitespace and queued messages recalled
   for editing remain drafts.
+- `edit-sent-message`: Edit and resend (pencil) on your own sent message copies
+  its text and "@"-mentions into that pane's composer; attachments stay with the
+  original message, which the agent already has. The transcript is unchanged.
+  Sending is a new message, steered or queued like any mid-turn send, and Edit
+  never stops the agent. A non-empty draft asks "Replace your draft?" first.
+  Side chats, grid session panes, and writable sub-agent Workspace tabs edit
+  into their own composer, where "@"-mentions return as attachment markers. Edit
+  is hidden on messages the server hasn't accepted yet, messages with no text,
+  other contributors' messages (shared session or not), and read-only composers.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
   untouched draft; user edits remain. The "Something went wrong" card from the
@@ -236,7 +278,7 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   renewal. States: valid, invalid, checking, skipped, refreshing, failed, and
   CLI not installed.
 - `launch-action-required`: while a managed launch needs the user to do
-  something, such as an Arclet waiting for its owner's dbcert, the session's chat
+  something, such as a sandbox still waiting for its owner's credentials, the session's chat
   transcript shows a yellow banner with the deployment's instructions. Provisioning
   continues, and the banner leaves when the launch moves on. Dismissing hides
   only that warning; a later one shows again.
@@ -302,7 +344,15 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   box (stop it with the macOS Dictation controls), and other platforms show no
   button. A side chat's composer ("Ask a side question...") shows the same
   button under the same rule; the shortcut belongs to the main composer.
+- Type `@` mid-sentence and pick a session, a subagent of this session, or (in a
+  native coding-agent session) a file or folder; the pick becomes a pill in the
+  sentence. Send it, then click the session pill in the sent message to open
+  that session. From the file viewer, **Attach to agent** adds a file token to
+  the end of the draft.
 - Send while the agent is working to queue a message, then steer it.
+- Hover one of your sent messages and click Edit and resend (pencil) to copy
+  its text into the message box, revise, and send it as a new message.
+  Attachments stay on the original message.
 - With the in-session message box empty, press Up to recall a previous prompt
   (or the last queued message). While writing a draft, Up stops at the top.
 - With a native session's host offline, send a message; it waits in the queue
@@ -341,9 +391,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   alone must not open the browser, and renewal alone must not create a sandbox.
   While **Checking laptop credentials…** is visible, **Skip** starts that launch
   without waiting for verification or opening sign-in. Later launches check again.
-- On a deployment whose launches report that the user needs to act, such as
-  Databricks' managed Arclets, start a managed session whose launch needs you,
-  e.g. an Arclet whose owner's dbcert hasn't arrived. The session's chat
+- On a deployment whose launches can report that the user needs to act, start a
+  managed session whose launch needs you, e.g. a sandbox still waiting for its
+  owner's credentials. The session's chat
   transcript keeps showing **Provisioning sandbox…** and adds a yellow banner
   saying what to do. The terminal view doesn't show it.
 - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
@@ -400,9 +450,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - With an Arca connected, choose **Arclet Sandbox** with a native terminal agent
   and type `/` for Claude or `$` for Codex before the first send. The menu previews that Arca's home-level
   catalog; selecting a skill completes the prompt while the launch stays on Arclet.
-  Runtime availability follows Arclet's existing skill sync and plugin installation;
-  custom skill roots or plugins installed only on Arca may be absent on Arclet.
-  With no connected Arca, host skills become available after the sandbox starts.
+  Skill roots or plugins installed only on the connected host may be missing on
+  the sandbox. With no connected Arca, host skills become available after the sandbox starts.
   SDK agents continue using their bundled skills before the sandbox starts.
   Browser coverage: `tests/browser_ui/chat/test_arclet_skills.py`.
 - Open **MCPs** in the workspace bar above the composer (the plug icon when space is tight), then turn
@@ -445,7 +494,8 @@ pill; later selections apply on the next turn. For other supported harnesses,
 open the side-chat model pill to choose model/effort before or after its
 first message. Follow the **Side-chat settings** recipe in [Sessions](sessions.md)
 for draft persistence and parent-isolation checks. The microphone beside
-**Ask a side question...** starts dictation.
+**Ask a side question...** starts dictation. Edit and resend (pencil) on a sent
+side-chat message loads it into that side chat's composer, not the main one.
 
 ## Driving it with the repro environment
 
@@ -686,6 +736,24 @@ Other connection providers alone do not enable the managed MCP picker.
   server's tool. Covered by
   `tests/e2e_ui/chat/test_claude_sdk_host_mcp_servers.py::test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session`
   and, for a reconnect that hangs, `tests/e2e/test_claude_sdk_mcp_reconnect_timeout_e2e.py`.
+  For live state, open `/mcp` in a new claude-sdk session on a host and expect
+  the not-running note; send a message while a Claude server rejects sign-in,
+  reopen `/mcp` and expect **Failed** or **Needs sign-in** with **Reconnect**;
+  finish the sign-in, click Reconnect and expect **Connected**. Covered by
+  `test_claude_sdk_host_mcp_servers.py::test_claude_sdk_mcp_panel_shows_live_state_and_reconnects`,
+  with the row and merge cases in `SlashCommandMenu.test.tsx` and
+  `ChatPage.composer.test.tsx`.
+  Under an enterprise `managed-mcp.json` carrying the `omnigent` relay entry,
+  `tests/e2e_ui/chat/test_claude_sdk_host_mcp_servers.py::test_claude_sdk_session_under_managed_mcp_config_keeps_omnigent_tools`
+  starts a claude-sdk session, expects only the managed row in `/mcp`, flips it
+  to **Connected** and expects the next turn to use the server. It writes the
+  platform's real managed file, so it runs only with
+  `OMNIGENT_TEST_CLAUDE_MANAGED_MCP=1` on a disposable machine or container
+  where that directory is writable. Its `bwrap` variant gives the agent a
+  `linux_bwrap` sandbox and also needs Bubblewrap on Linux; in a container, run
+  it privileged so bwrap can mount `/proc`. Without the entry, expect the
+  session to start without Omnigent tools and the runner log to name the
+  missing entry.
   Registry states: `web/src/components/SlashCommandMenu.test.tsx` covers the
   row labels, the Sign in / Signing in… / error renderings and the Settings
   link; `ChatPage.composer.test.tsx` covers the catalog join (sign-in from the
@@ -824,6 +892,17 @@ Other connection providers alone do not enable the managed MCP picker.
   Multiline, whitespace, quotes, and queued drafts have component coverage in
   `web/src/pages/ChatPage.composer.test.tsx`. The new-session and side-chat
   composers have no prompt recall; the vendor terminal owns its own history.
+- **`edit-sent-message`:**
+  `tests/e2e_ui/chat/test_edit_sent_message.py` covers editing a message with
+  an image (only its text is copied), editing mid-turn, and side chats. The
+  replace-draft dialog, pending messages, other authors, and read-only composers
+  have component coverage in `web/src/pages/ChatPage.userBubble.test.tsx`,
+  `web/src/pages/ChatPage.composer.test.tsx`, and
+  `web/src/components/chat/SideChatPane.test.tsx`. Grid session panes and
+  sub-agent Workspace tabs render the same `SideChatPane`, whose Edit logic has
+  component coverage; their own wiring is checked by hand: open
+  a grid pane or a writable Workspace tab, click Edit on a message you sent
+  there, and confirm that pane's composer fills while the main one stays empty.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport
@@ -860,8 +939,8 @@ Other connection providers alone do not enable the managed MCP picker.
   native bridge, CLI process, and local server with a fake dbcert executable and
   machine policy. Follow `web/electron/e2e/README.md` for build and recording
   prerequisites. It proves explicit refresh and launch, preserved input, skipping
-  a pending check, and skipped kubeconfig updates and existing-Arca sync; macOS
-  SSO and Companion transfer need a manual managed-desktop check. Component tests in
+  a pending check, and skipped kubeconfig updates and host sync; macOS sign-in
+  needs a manual managed-desktop check. Component tests in
   `web/src/shell/NewChatDialog.test.tsx` and
   `web/src/components/DbcertBanner.test.tsx` cover leaving during a check, late
   results after skipping, retry, dismissal, check errors, and older shells.
@@ -889,11 +968,10 @@ Other connection providers alone do not enable the managed MCP picker.
 - Test touch sizing with a real touch device or browser touch emulation; resizing
   a mouse browser alone does not enable it.
 
-- The Arclet dbcert preflight needs both the updated desktop shell and web UI,
-  with Databricks-internal features enabled for the managed server. Browsers,
-  older shells, other sandbox providers, and already-connected hosts do not
-  perform this laptop check. The existing session banner checks the host's
-  certificate instead; refreshing it does not prove new-session gating works.
+- The Arclet dbcert preflight needs the updated desktop shell and web UI, with
+  managed features enabled on the server. Browsers, older shells, other sandbox
+  providers, and already-connected hosts skip this check. Refreshing a host's
+  credential from the session banner does not prove new-session gating works.
   Skip bypasses only this launch's check; it does not renew credentials or
   guarantee that sandbox authentication will succeed.
 - The launch action banner appears only on deployments whose launch code
@@ -931,6 +1009,9 @@ Other connection providers alone do not enable the managed MCP picker.
 - The Claude and Codex pickers here list the native harnesses' catalogs. A
   `claude-sdk` or `codex` SDK worker has no picker of its own, so don't verify
   its models here: see the smart routing note in the [index](./README.md#not-yet-mapped).
+- An enterprise `managed-mcp.json` affects every Claude Code process on the
+  machine, including other test runs. Don't deploy one on a shared developer
+  machine; the managed `/mcp` journey needs a disposable container or VM.
 - The managed MCP picker uses only the administrator's registry; it does not
   add arbitrary MCP URLs or enable itself from existing GitHub/Databricks
   connections. Bearer-token accounts must be connected in settings first.

@@ -162,9 +162,11 @@ async def test_run_turn_does_not_advertise_active_omnigent_tools(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("queued", [False, True])
 async def test_run_turn_rejects_stale_session_after_clear(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    queued: bool,
 ) -> None:
     """
     Old-session turns must not type into the post-``/clear`` Claude pane.
@@ -203,18 +205,37 @@ async def test_run_turn_rejects_stale_session_after_clear(
     )
 
     executor = ClaudeNativeExecutor(tmp_path)
-    events = [
-        event
-        async for event in executor.run_turn(
-            messages=[{"role": "user", "content": "old tab message"}],
-            tools=[],
-            system_prompt="ignored",
-        )
-    ]
+
+    async def run() -> list[object]:
+        return [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": "old tab message"}],
+                tools=[],
+                system_prompt="ignored",
+            )
+        ]
+
+    if queued:
+        (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+        ready_for_lock = asyncio.Event()
+
+        def model_command_arg(_model: str | None) -> None:
+            ready_for_lock.set()
+
+        monkeypatch.setattr(executor, "_model_command_arg", model_command_arg)
+        async with executor._inject_lock:
+            pending = asyncio.create_task(run())
+            await ready_for_lock.wait()
+            (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_new"}')
+        events = await pending
+    else:
+        events = await run()
 
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "no longer active after /clear" in events[0].message
+    assert events[0].undelivered is True
 
 
 @pytest.mark.asyncio
@@ -442,9 +463,11 @@ async def test_enqueue_session_message_refuses_auth_commands(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("queued", [False, True])
 async def test_enqueue_session_message_rejects_stale_session_after_clear(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    queued: bool,
 ) -> None:
     """
     Stale-session steering must not reach the post-``/clear`` Claude pane.
@@ -479,10 +502,22 @@ async def test_enqueue_session_message_rejects_stale_session_after_clear(
     )
 
     executor = ClaudeNativeExecutor(tmp_path)
-    injected = await executor.enqueue_session_message(
-        session_key="main",
-        content="old steering",
-    )
+    if queued:
+        (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+        ready_for_lock = asyncio.Event()
+
+        def content_to_text(_content: object, _bridge_dir: Path) -> str:
+            ready_for_lock.set()
+            return "old steering"
+
+        monkeypatch.setattr(claude_native_executor, "_content_to_text", content_to_text)
+        async with executor._inject_lock:
+            pending = asyncio.create_task(executor.enqueue_session_message("main", "old steering"))
+            await ready_for_lock.wait()
+            (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_new"}')
+        injected = await pending
+    else:
+        injected = await executor.enqueue_session_message("main", "old steering")
 
     assert injected is False
 
@@ -1229,9 +1264,11 @@ async def test_run_turn_path_traversal_filename_sanitized(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("clear_during_switch", [False, True])
 async def test_run_turn_applies_routed_model_before_message_under_one_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    clear_during_switch: bool,
 ) -> None:
     """
     A routed model is switched via ``/model`` BEFORE the message, in order.
@@ -1249,6 +1286,10 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
     """
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
     bridge_dir = tmp_path / "bridge"
+    if clear_during_switch:
+        bridge_dir.mkdir()
+        (bridge_dir / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+        monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_old")
     calls: list[tuple[str, str]] = []
 
     def fake_inject_slash_command(
@@ -1262,6 +1303,8 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
         """Record the ``/model`` switch keystroke and its auto_confirm flag."""
         del bridge_dir_arg, timeout_s
         calls.append(("slash", command, auto_confirm))
+        if clear_during_switch:
+            (bridge_dir / "bridge.json").write_text('{"active_session_id": "conv_new"}')
 
     def fake_inject_user_message(
         bridge_dir_arg: Path,
@@ -1295,13 +1338,19 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
         )
     ]
 
-    assert calls == [
+    expected_calls = [
         # auto_confirm=True mirrors the manual picker path so the switch is
         # accepted if the CLI ever pops a confirmation dialog.
         ("slash", "/model sonnet", True),
         ("message", "review this function"),
-    ], f"Expected /model (auto_confirm) then message, in order; got {calls}."
-    assert events == [TurnComplete(response=None)]
+    ]
+    assert calls == (expected_calls[:1] if clear_during_switch else expected_calls)
+    if clear_during_switch:
+        assert len(events) == 1 and isinstance(events[0], ExecutorError)
+        assert events[0].undelivered is True
+        assert "no longer active after /clear" in events[0].message
+    else:
+        assert events == [TurnComplete(response=None)]
 
 
 @pytest.mark.asyncio

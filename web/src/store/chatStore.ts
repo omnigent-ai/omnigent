@@ -79,6 +79,7 @@ import {
   HOST_OFFLINE_CODE,
   INITIAL_WINDOW_ITEMS,
   interrupt as interruptSession,
+  OLDER_HISTORY_PAGE_ITEMS,
   openSessionStream,
   postEvent,
   SIGN_IN_EXPIRED_CODE,
@@ -693,6 +694,8 @@ export interface ComposerAttachment {
   path: string;
   isDir: boolean;
   lineRange?: { start: number; end: number };
+  /** Composer ``@`` token once tagged; unique across tagged files and sessions. */
+  token?: string;
 }
 
 /**
@@ -775,6 +778,13 @@ export interface ConversationState {
    * tracked (or an older runner reported only the count).
    */
   backgroundTasks: BackgroundTaskInfo[];
+  /**
+   * Background agents a finished claude-native turn left running, while
+   * `sessionStatus` is `waiting`. The turn is over, so the composer sends right
+   * away; the working indicator names these instead of shimmering. Empty
+   * otherwise.
+   */
+  backgroundAgents: BackgroundTaskInfo[];
   /**
    * Why a still-`running` session is parked, e.g. "permission prompt".
    * Terminal-backed agents can block on a dialog the web UI does not
@@ -1260,9 +1270,8 @@ export interface AppChatState {
 export interface ChatActions {
   send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
   clearSideChatToOpen: () => void;
-  /** Open a generic side chat as a rail tab under `parentId`, seeding its
-   *  composer with `draft` (the typed `/side` question) so it isn't lost while
-   *  the fork launches. */
+  /** Open a side chat as a rail tab under `parentId`, optionally seeding its
+   *  composer with `draft` so it isn't lost while the fork launches. */
   openSideChatWithDraft: (childSessionId: string, draft: string, parentId: string) => void;
   /** Clear a side chat's seeded composer draft (called after it's consumed). */
   clearSideChatDraft: (childSessionId: string) => void;
@@ -1669,6 +1678,16 @@ function waitForInitialDispatch(conversationId: string, tempId: string): Promise
     });
     check();
   });
+}
+
+/** Shared empty list, so edges that carry no agents don't re-render readers. */
+const EMPTY_BACKGROUND_AGENTS: BackgroundTaskInfo[] = [];
+
+/** The background agents a snapshot names; only a `waiting` snapshot carries them. */
+function snapshotBackgroundAgents(session: Session): BackgroundTaskInfo[] {
+  return session.status === "waiting"
+    ? (session.backgroundAgents ?? EMPTY_BACKGROUND_AGENTS)
+    : EMPTY_BACKGROUND_AGENTS;
 }
 
 /** Settle a seeded model from a snapshot, under the condition `sessionBindingPatch` uses at bind. */
@@ -2195,6 +2214,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionStatus: "idle",
   backgroundTaskCount: 0,
   backgroundTasks: [],
+  backgroundAgents: [],
   blockedOn: null,
   isNativeTerminalSession: false,
   nativeVendorOwnsModel: false,
@@ -2973,6 +2993,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
             patch.backgroundTasks = [];
+            patch.backgroundAgents = [];
           }
           return patch;
         });
@@ -3146,6 +3167,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           sessionStatus: "idle",
           backgroundTaskCount: 0,
           backgroundTasks: [],
+          backgroundAgents: [],
         });
       } else {
         // Sent alongside an already-streaming turn (or a stranded latch): the
@@ -3259,6 +3281,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             patch.sessionStatus = "idle";
             patch.backgroundTaskCount = 0;
             patch.backgroundTasks = [];
+            patch.backgroundAgents = [];
           }
           return patch;
         });
@@ -3349,6 +3372,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         sessionStatus: "idle",
         backgroundTaskCount: 0,
         backgroundTasks: [],
+        backgroundAgents: [],
         blockedOn: null,
       };
       if (s.activeResponse?.state === "streaming") {
@@ -3924,6 +3948,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     try {
       const { items, hasMore } = await fetchSessionItemsPage(conversationId, {
         olderThan: oldestItemId,
+        limit: OLDER_HISTORY_PAGE_ITEMS,
       });
       if (stale()) return;
       const newBlocks = itemsToBlocks(items);
@@ -5173,15 +5198,15 @@ async function bindStream(
 
   // Opening a conversation URL with no session list loaded yet leaves the
   // session→host map empty, so the SSE stream
-  // (and every host-scoped request) would open UNKEYED and route to the default
-  // replica — NOT the one holding this session's runner tunnel. The live tail
+  // (and every host-scoped request) would open on the client's own key and route
+  // to an arbitrary replica — NOT the one holding this session's runner tunnel. The live tail
   // then subscribes to the wrong replica's event bus and silently delivers
   // nothing (the server swallows the miss; there's no 503 to trigger the keyless
   // retry). The snapshot's launch stage also lives only on that replica. When
   // requests route by host, resolve the session's host_id FIRST (one fast
   // metadata GET that populates the map via sessionFromWire) so the stream and
   // snapshot key correctly. Best-effort: a failed resolve falls through to the
-  // unkeyed open (no worse than pre-fix). Re-apply after every resync, see
+  // client-keyed open (no worse than pre-fix). Re-apply after every resync, see
   // agentbricks/mas/.claude/skills/sync-omnigents/SKILL.md.
   if (isHostRoutingEnabled() && getSessionHost(id) === null) {
     try {
@@ -5191,7 +5216,7 @@ async function bindStream(
       await (resolveSessionHost(id) ?? getSessionSlim(id));
     } catch {
       // Best-effort: a failed resolve (bad id, transient) falls through to the
-      // unkeyed open; the snapshot fetch surfaces the real error.
+      // client-keyed open; the snapshot fetch surfaces the real error.
     }
     // Liveness, not the visible id: a background bind must survive a switch away
     // (that is the whole feature). Only a dispose (evicted) bails — and then the
@@ -5485,6 +5510,7 @@ async function bindStream(
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         backgroundTasks: session.backgroundTasks ?? [],
+        backgroundAgents: snapshotBackgroundAgents(session),
         blockedOn: null,
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
@@ -5738,6 +5764,7 @@ function reconnectStatusPatch(
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
   patch.backgroundTasks = session.backgroundTasks ?? [];
+  patch.backgroundAgents = snapshotBackgroundAgents(session);
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
@@ -5825,6 +5852,47 @@ async function reconcileLaunchStatus(id: string, set: Setter, get: Getter): Prom
   }
   if (isConversationDisposed(id)) return;
   set((s) => (s.sandboxStatus === before ? launchSnapshotPatch(session, s) : {}));
+}
+
+/** Launch-stage events applied per live conversation; see {@link captureLaunchStatus}. */
+const launchStatusRevisions = new WeakMap<ConversationEntry, number>();
+
+function launchStatusRevision(entry: ConversationEntry): number {
+  return launchStatusRevisions.get(entry) ?? 0;
+}
+
+/**
+ * Capture a conversation's launch stage before a request that starts a sandbox launch.
+ *
+ * Returns a function that shows the stage the request's response reports. A move
+ * runs on the replica its sandbox connects to, so the launch's early events may
+ * never reach this page's stream, which doesn't replay them. A launch event that
+ * lands after the capture is newer, and wins.
+ */
+export function captureLaunchStatus(conversationId: string): (session: Session) => void {
+  const entry = conversationRegistry.peek(conversationId);
+  const revision = entry === undefined ? undefined : launchStatusRevision(entry);
+  const before = setterForState(conversationId)?.sandboxStatus;
+  return (session) => {
+    const status = session.sandboxStatus;
+    const state = setterForState(conversationId);
+    if (status == null || state === null || entry === undefined) return;
+    // A launch that moved on and back (provisioning, then ready) leaves the same
+    // stage behind, so the count of launch events is compared too.
+    if (conversationRegistry.peek(conversationId) !== entry) return;
+    if (launchStatusRevision(entry) !== revision || state.sandboxStatus !== before) return;
+    handleSessionEvent(
+      {
+        type: "session_sandbox_status",
+        conversationId,
+        stage: status.stage,
+        error: status.error ?? null,
+        provider: status.provider ?? undefined,
+        details: status.details ?? null,
+      },
+      conversationId,
+    );
+  };
 }
 
 /** How a status reconcile hands a stream that missed events to the reconnect backfill. */
@@ -8599,7 +8667,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         mcpStartupLaunch: updateMcpStartupLaunch(s.mcpStartupLaunch, event.pending),
       }));
       return;
-    case "session_sandbox_status":
+    case "session_sandbox_status": {
+      const launchEntry =
+        sourceConversationId === null ? undefined : conversationRegistry.peek(sourceConversationId);
+      if (launchEntry !== undefined) {
+        launchStatusRevisions.set(launchEntry, launchStatusRevision(launchEntry) + 1);
+      }
       // `ready` clears the launch indicator and starts the launch grace (the runner is
       // up, its terminal not yet); `failed` keeps the reason so the page can explain
       // why the sandbox never came up.
@@ -8646,6 +8719,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           .catch(() => {});
       }
       return;
+    }
     case "session_mcp_startup": {
       // Mirror the harness's per-MCP-server startup map while the round
       // is in flight; cleared once no server is still `starting`.
@@ -8913,6 +8987,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           patch.backgroundTaskCount = 0;
           patch.backgroundTasks = [];
         }
+        // Only a claude-native `waiting` edge names background agents; any other
+        // edge ends that wait (the agent finished or a new turn started).
+        patch.backgroundAgents =
+          event.status === "waiting" ? (event.backgroundAgents ?? []) : EMPTY_BACKGROUND_AGENTS;
         if (event.status === "failed" && s.blocks.some(isLiveProvisionalBlock)) {
           patch.blocks = s.blocks.map((block) =>
             isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted

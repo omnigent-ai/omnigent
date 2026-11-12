@@ -48,12 +48,14 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     HostPluginsResultFrame,
     HostProbeAccountsFrame,
+    HostSetMcpServerEnabledResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
     encode_host_frame,
 )
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
+from omnigent.server.feature_flags import FeatureFlags, McpDisabledServersGate, active_harnesses
 
 _logger = logging.getLogger(__name__)
 
@@ -189,6 +191,7 @@ def _fail_pending_skills(conn: HostConnection) -> None:
 def _fail_pending_mcp_servers(conn: HostConnection) -> None:
     """Fail MCP inventory requests as soon as their host disappears."""
     _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
+    _fail_pending_inventory(conn.pending_mcp_server_enabled, conn.host_id)
 
 
 def _fail_pending_worktrees(conn: HostConnection) -> None:
@@ -580,6 +583,9 @@ class HostConnection:
     pending_skill_content: dict[str, asyncio.Future[HostSkillContentResultFrame]] = field(
         default_factory=dict
     )
+    pending_mcp_server_enabled: dict[str, asyncio.Future[HostSetMcpServerEnabledResultFrame]] = (
+        field(default_factory=dict)
+    )
     pending_mcp_tools: dict[str, asyncio.Future[HostMcpToolsResultFrame]] = field(
         default_factory=dict
     )
@@ -612,8 +618,15 @@ class HostRegistry:
     don't race.
     """
 
-    def __init__(self) -> None:
-        """Initialize an empty host registry."""
+    def __init__(
+        self,
+        *,
+        mcp_disabled_servers: McpDisabledServersGate = False,
+        feature_flags: FeatureFlags | None = None,
+    ) -> None:
+        """Initialize an empty host registry with fail-closed launch activation."""
+        self._mcp_disabled_servers = mcp_disabled_servers
+        self._feature_flags = feature_flags or FeatureFlags()
         self._lock = threading.RLock()
         # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
         # one stable host_id can be live in more than one workspace.
@@ -629,6 +642,10 @@ class HostRegistry:
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
+
+    def mcp_disabled_servers_active_harnesses(self) -> list[str] | None:
+        """Resolve launch activation; omit the wire field when no harness is active."""
+        return active_harnesses(self._mcp_disabled_servers, self._feature_flags) or None
 
     def register(
         self,

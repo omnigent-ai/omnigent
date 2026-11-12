@@ -6,6 +6,7 @@ import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChange
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
+import type * as UseSessionLiveMcpServersModule from "@/hooks/useSessionLiveMcpServers";
 import type * as UseAgentsModule from "@/hooks/useAgents";
 import type { Agent } from "@/hooks/useAgents";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
@@ -60,8 +61,15 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
     ...actual,
     useWorkspaceAllFiles: () => ({ data: undefined }),
     useWorkspaceDirectory: () => ({ data: undefined }),
+    useWorkspaceFileSearch: () => ({ data: undefined }),
   };
 });
+// The "@" menu's session rows read the sidebar cache and a search query; these
+// tests don't open it, so stub the source like the workspace hooks above.
+vi.mock("@/hooks/useSessionMentionEntries", () => ({
+  MENTION_SEARCH_DEBOUNCE_MS: 300,
+  useSessionMentionEntries: () => [],
+}));
 
 // The /mcp panel's registry read and popup sign-in; the MCP cases script both.
 vi.mock("@/lib/mcpRegistry", () => ({
@@ -176,6 +184,23 @@ vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHarnessInventoryModule>()),
   useHostMcpServers: hostMcpQueryMock,
 }));
+const { liveMcpQueryMock, liveMcpReconnectMock } = vi.hoisted(() => ({
+  liveMcpQueryMock: vi.fn(() => ({
+    data: undefined as UseSessionLiveMcpServersModule.SessionLiveMcpServers | undefined,
+    isError: false,
+  })),
+  liveMcpReconnectMock: vi.fn(() => ({
+    reconnect: vi.fn(),
+    reconnectingName: null as string | null,
+    error: null as UseSessionLiveMcpServersModule.LiveMcpReconnectError | null,
+    clearError: vi.fn(),
+  })),
+}));
+vi.mock("@/hooks/useSessionLiveMcpServers", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSessionLiveMcpServersModule>()),
+  useSessionLiveMcpServers: liveMcpQueryMock,
+  useReconnectLiveMcpServer: liveMcpReconnectMock,
+}));
 const { sessionAgentQueryMock } = vi.hoisted(() => ({
   sessionAgentQueryMock: vi.fn(() => ({ data: undefined as Agent | undefined, isError: false })),
 }));
@@ -209,6 +234,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking } from "./ChatPage";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
+import { withSessionMentionHint } from "@/lib/composerMentions";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -3752,6 +3778,15 @@ describe("Composer MCP status command", () => {
     hostMcpQueryMock.mockReturnValue({ data: [], isLoading: false, isError: false });
     sessionAgentQueryMock.mockReset();
     sessionAgentQueryMock.mockReturnValue({ data: undefined, isError: false });
+    liveMcpQueryMock.mockReset();
+    liveMcpQueryMock.mockReturnValue({ data: undefined, isError: false });
+    liveMcpReconnectMock.mockReset();
+    liveMcpReconnectMock.mockReturnValue({
+      reconnect: vi.fn(),
+      reconnectingName: null,
+      error: null,
+      clearError: vi.fn(),
+    });
   });
 
   it("shows the effective session MCPs in a read-only panel", () => {
@@ -4323,6 +4358,153 @@ describe("Composer MCP status command", () => {
       expect(sessionAgentQueryMock).toHaveBeenCalledWith("conv_mcp");
     },
   );
+
+  it("shows the claude-sdk harness's live connections and reconnects by its name", () => {
+    composerSessionSnapshot.hostId = "host_sdk";
+    setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
+    const agent = {
+      id: "agent_sdk",
+      name: "SDK agent",
+      mcp_servers: [{ name: "glean", transport: "http" as const, description: "Agent glean" }],
+    };
+    sessionAgentQueryMock.mockReturnValue({ data: agent, isError: false });
+    hostMcpQueryMock.mockReturnValue({
+      data: [
+        { name: "search", harness: "claude", plugin: "tools", transport: "http", scope: "user" },
+        { name: "search", harness: "claude", plugin: "crm", transport: "http", scope: "user" },
+        {
+          name: "wiki",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "connected",
+        },
+        { name: "glean", harness: "claude", transport: "http", scope: "user" },
+        {
+          name: "mail",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "connected",
+        },
+      ],
+      isLoading: false,
+      isError: false,
+    });
+    liveMcpQueryMock.mockReturnValue({
+      data: {
+        live: true,
+        servers: [
+          { name: "plugin:tools:search", status: "failed", error: "token expired" },
+          { name: "plugin:crm:search", status: "connected" },
+          { name: "search", status: "pending", scope: "user" },
+          { name: "wiki", status: "needs-auth" },
+          { name: "glean", status: "connected" },
+          { name: "project-db", status: "connected", scope: "project" },
+        ],
+      },
+      isError: false,
+    });
+    const reconnect = vi.fn();
+    liveMcpReconnectMock.mockReturnValue({
+      reconnect,
+      reconnectingName: null,
+      error: null,
+      clearError: vi.fn(),
+    });
+    const { rerender } = render(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [agent] })} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    expect(liveMcpQueryMock).toHaveBeenLastCalledWith("conv_mcp", true);
+    // Each plugin's host row matches the CLI's prefixed name, and the CLI's own
+    // unprefixed "search" keeps a row of its own.
+    expect(
+      screen.getAllByTestId("mcp-live-status-search").map((status) => status.textContent),
+    ).toEqual([
+      "In this session: Failed: token expired",
+      "In this session: Connected",
+      "In this session: Connecting…",
+    ]);
+    expect(screen.getByTestId("mcp-server-row-wiki")).toHaveTextContent("Account: Connected");
+    expect(screen.getByTestId("mcp-live-status-wiki")).toHaveTextContent("Needs sign-in");
+    // Servers only the CLI loaded still show.
+    expect(screen.getByTestId("mcp-live-status-project-db")).toHaveTextContent("Connected");
+    // An agent server sharing a host name is a different endpoint and gets no live state.
+    expect(screen.getByTestId("mcp-server-row-glean")).toHaveTextContent("Agent glean");
+    expect(screen.queryByTestId("mcp-live-status-glean")).toBeNull();
+    // A signed-in host server the CLI did not load is not shown as simply connected.
+    expect(screen.getByTestId("mcp-server-row-mail")).toHaveTextContent("Account: Connected");
+    expect(screen.getByTestId("mcp-live-status-mail")).toHaveTextContent("Not loaded");
+    expect(screen.queryByTestId("mcp-reconnect-mail")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("mcp-reconnect-search"));
+    expect(reconnect).toHaveBeenCalledWith("plugin:tools:search");
+
+    // A failed re-read keeps its last data, which no longer counts as live.
+    liveMcpQueryMock.mockReturnValue({ ...liveMcpQueryMock(), isError: true });
+    rerender(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [agent] })} />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("mcp-live-status-wiki")).toBeNull();
+    expect(screen.queryByTestId("mcp-reconnect-search")).toBeNull();
+
+    // A refused reconnect whose follow-up status read failed still shows the refusal.
+    liveMcpQueryMock.mockReturnValue({
+      data: { live: false, reason: "unavailable", servers: [] },
+      isError: false,
+    });
+    liveMcpReconnectMock.mockReturnValue({
+      reconnect,
+      reconnectingName: null,
+      error: { name: "plugin:tools:search", message: "token expired" },
+      clearError: vi.fn(),
+    });
+    rerender(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [agent] })} />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("mcp-live-status-search")).toBeNull();
+    expect(screen.getByTestId("mcp-reconnect-error")).toHaveTextContent(
+      "Reconnecting plugin:tools:search failed: token expired",
+    );
+  });
+
+  it("notes why a claude-sdk session shows no live state", () => {
+    const data = { live: false, reason: "not_running" as const, servers: [] };
+    composerSessionSnapshot.hostId = "host_sdk";
+    setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
+    const agent = { id: "agent_sdk", name: "SDK agent", mcp_servers: [] };
+    sessionAgentQueryMock.mockReturnValue({ data: agent, isError: false });
+    liveMcpQueryMock.mockReturnValue({ data, isError: false });
+    render(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [agent] })} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Live connection status appears once this session’s agent is running; send a message to start it.",
+    );
+  });
+
+  it("does not ask a native harness for live MCP connections", () => {
+    composerSessionSnapshot.hostId = "host_native";
+    setComposerState({ boundAgentId: "agent_native", sessionHarness: "claude-native" });
+    render(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [] })} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    expect(liveMcpQueryMock).toHaveBeenLastCalledWith("conv_mcp", false);
+  });
 
   it("shows only the agent's servers in a claude-sdk session with no host", () => {
     setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
@@ -5227,15 +5409,23 @@ describe("Composer pending elicitation", () => {
     expect(onSend).toHaveBeenCalledWith("carry on", undefined);
   });
 
-  it("ignores mirrored sub-agent elicitations addressed to a child session", () => {
-    // A child's prompt mirrored into this chat doesn't park THIS session's
-    // turn — inbox talk-back to the parent must keep working.
-    useChatStore.setState({ blocks: [elicitationBlock({ targetSessionId: "conv_child" })] });
+  // Neither card parks THIS session's turn: a child's prompt mirrored into
+  // this chat, or a question the agent keeps working past.
+  it.each([
+    [
+      "mirrored sub-agent elicitations addressed to a child session",
+      "conv_mirrored",
+      { targetSessionId: "conv_child" },
+    ],
+    ["non-blocking question cards", "conv_non_blocking", { isBlocking: false as const }],
+  ])("ignores %s", (_case, conversationId, overrides) => {
+    useChatStore.setState({ conversationId, blocks: [elicitationBlock(overrides)] });
     const onSend = vi.fn();
     render(<Composer {...composerProps({ onSend })} />);
     const ta = textarea();
 
     expect(ta.disabled).toBe(false);
+    expect(ta.placeholder).not.toBe("Respond to the pending request above to continue");
     fireEvent.change(ta, { target: { value: "status update please" } });
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("status update please", undefined);
@@ -6054,7 +6244,8 @@ describe("Composer reply quotes", () => {
     fireEvent.change(textarea(), { target: { value: "My answer" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     const [text, , replyDraft] = vi.mocked(props.onSend).mock.calls[0]!;
-    expect(text).toBe("[Attached file: src/example.ts]\n\n> Actual card\n\nMy answer");
+    // The drained file is an inline token, so its marker keeps the token's trailing space.
+    expect(text).toBe("[Attached file: src/example.ts] \n\n> Actual card\n\nMy answer");
     expect(serializeReplyDraft(replyDraft!)).toBe(text);
     act(() =>
       useChatStore.setState({
@@ -6063,7 +6254,7 @@ describe("Composer reply quotes", () => {
     );
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Actual card");
     expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue(
-      "[Attached file: src/example.ts]\n\n",
+      "[Attached file: src/example.ts] ",
     );
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toBe(text);
@@ -6087,11 +6278,19 @@ describe("Composer reply quotes", () => {
 
 describe("Composer side-chat entry points", () => {
   beforeEach(() => {
-    setComposerState({ conversationId: "conv_test", skills: [], sessionHarness: "openai-agents" });
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [],
+      sessionHarness: "openai-agents",
+      sideChatToOpen: null,
+      sideChatDrafts: {},
+      sideChatComposers: {},
+    });
   });
   afterEach(() => {
     cleanup();
     composerSessionSnapshot.sideChatAllowed = null;
+    vi.restoreAllMocks();
   });
 
   // An admin has owner level, but only the root session's owner starts side chats.
@@ -6107,6 +6306,68 @@ describe("Composer side-chat entry points", () => {
     fireEvent.change(textarea(), { target: { value: "" } });
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     expect(screen.queryByTestId("composer-side-chat-action") !== null).toBe(offered);
+  });
+
+  it("opens a focused pending tab after the add menu closes", async () => {
+    const authenticatedFetch = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockImplementation(() => new Promise<Response>(() => {}));
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+
+    await waitFor(() => expect(useChatStore.getState().sideChatToOpen).not.toBeNull());
+    const { sideChatToOpen, sideChatComposers, sideChatDrafts } = useChatStore.getState();
+    expect(sideChatToOpen).toEqual({
+      childId: expect.stringMatching(/^pending:/),
+      parentId: "conv_test",
+    });
+    expect(sideChatComposers[sideChatToOpen!.childId]).toMatchObject({ autoFocus: true });
+    expect(sideChatDrafts[sideChatToOpen!.childId]).toBeUndefined();
+    expect(textarea()).toHaveValue("");
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
+  it("does not open a side chat after its parent changes while the menu closes", async () => {
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    const trigger = screen.getByRole("button", { name: "Add" });
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    const restoredTriggerFocus = vi.fn();
+    trigger.addEventListener("focus", restoredTriggerFocus);
+
+    try {
+      fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+      act(() => useChatStore.setState({ conversationId: "conv_other" }));
+      await waitFor(() => expect(restoredTriggerFocus).toHaveBeenCalled());
+      await act(
+        () =>
+          new Promise<void>((resolve) => {
+            requestAnimationFrame(() => resolve());
+          }),
+      );
+
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      expect(useChatStore.getState().sideChatComposers).toEqual({});
+    } finally {
+      trigger.removeEventListener("focus", restoredTriggerFocus);
+    }
+  });
+
+  it("focuses the native side-chat question after the add menu closes", async () => {
+    const user = userEvent.setup();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+
+    await waitFor(() => expect(textarea()).toHaveValue("/side "));
+    expect(textarea()).toHaveFocus();
+    await user.keyboard("question");
+    expect(textarea()).toHaveValue("/side question");
   });
 });
 
@@ -6928,7 +7189,8 @@ describe("Composer — editing queued messages", () => {
       }),
     );
     if (quoted) act(() => ref.current?.appendReplyQuote("Quoted answer"));
-    fireEvent.change(textarea(), { target: { value: QUEUED_TEXT } });
+    // Keep the drained inline token: deleting it would untag the file.
+    fireEvent.change(textarea(), { target: { value: textarea().value + QUEUED_TEXT } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     const original = useChatStore.getState().queuedMessages[0]!;
     expect(original.text).toContain("[Attached file: src/example.ts]");
@@ -7024,6 +7286,157 @@ describe("Composer — editing queued messages", () => {
 
     await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
     expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+  });
+});
+
+describe("Composer — editing a sent message", () => {
+  const CONV = "conv_edit_sent";
+  const sentMessage = { text: "Summarize these [Attached: src/app.ts]" };
+  const toasts: unknown[] = [];
+  const recordToast = (event: Event) => toasts.push((event as CustomEvent).detail.content);
+
+  beforeEach(() => {
+    clearSessionDrafts();
+    // A running turn, which Edit must not stop.
+    useChatStore.setState({
+      conversationId: CONV,
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "running",
+      queuedMessages: [],
+    });
+    toasts.length = 0;
+    window.addEventListener("omnigent:toast", recordToast);
+  });
+
+  afterEach(() => {
+    window.removeEventListener("omnigent:toast", recordToast);
+    cleanup();
+  });
+
+  it("copies the text and @-tags into an empty composer and sends it as a new message", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ isWorking: true });
+    renderWithTooltips(<Composer {...props} ref={ref} />);
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+
+    // The sent marker comes back as the file's tag token.
+    expect(textarea()).toHaveValue("Summarize these @src/app.ts");
+    expect(textarea()).toHaveFocus();
+    expect(props.onStop).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: "Summarize these, briefly, @src/app.ts" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(props.onSend).toHaveBeenCalledTimes(1);
+    const [sentText, sentFiles] = vi.mocked(props.onSend).mock.calls[0]! as [
+      string,
+      File[] | undefined,
+    ];
+    expect(sentText).toContain("Summarize these, briefly,");
+    expect(sentText).toContain("src/app.ts");
+    expect(sentFiles).toBeUndefined();
+  });
+
+  it("keeps a file and a session with the same name as separate tags", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    renderWithTooltips(<Composer {...props} ref={ref} />);
+    const session = '[Session: "README.md" id=sess_readme subagent=no]';
+    const sent = withSessionMentionHint(`compare [Attached: README.md] with ${session}`, true);
+
+    act(() => ref.current?.editSentMessage({ text: sent }));
+
+    expect(textarea()).toHaveValue("compare @README.md (file) with @README.md");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    const [sentText] = vi.mocked(props.onSend).mock.calls[0]! as [string];
+    expect(sentText.match(/\[Attached(?: file)?: README\.md\]/g)).toHaveLength(1);
+    expect(sentText.split(session)).toHaveLength(2);
+  });
+
+  it("asks before replacing a draft, keeping it unless the user confirms", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Keep draft" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("half-written thought");
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "Replace draft" }),
+    );
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("Summarize these @src/app.ts");
+    expect(textarea()).toHaveFocus();
+    expect(toasts).toEqual([]);
+  });
+
+  it("treats an attachment-only draft as a draft, and replacing it drops the attachment", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    const draftFile = new File(["draft"], "draft.txt", { type: "text/plain" });
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [draftFile] },
+    });
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
+
+    await waitFor(() => expect(textarea()).toHaveValue("Summarize these @src/app.ts"));
+    expect(screen.queryByText("draft.txt")).toBeNull();
+  });
+
+  it("dismisses a pending confirmation when the conversation changes", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+    act(() => ref.current?.editSentMessage(sentMessage));
+    await screen.findByRole("dialog", { name: "Replace your draft?" });
+
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    act(() => useChatStore.setState({ conversationId: CONV }));
+
+    await act(async () => {});
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(textarea()).toHaveValue("half-written thought");
+  });
+
+  it("says so when the composer stops taking input before Replace draft", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { rerender } = renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+    act(() => ref.current?.editSentMessage(sentMessage));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ disabled: true })} ref={ref} />
+      </TooltipProvider>,
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("half-written thought");
+    expect(toasts).toEqual(["The composer can't take a message right now."]);
+  });
+
+  it("ignores Edit while the composer is disabled", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps({ disabled: true })} ref={ref} />);
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(toasts).toEqual(["The composer can't take a message right now."]);
   });
 });
 
