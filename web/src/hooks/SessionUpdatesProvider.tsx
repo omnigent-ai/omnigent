@@ -29,6 +29,7 @@ import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import {
+  isPinWriteSettling,
   isSessionArchiving,
   isSessionDeleting,
   markRecentlyCreated,
@@ -85,6 +86,8 @@ function listIds(data: ConversationsInfiniteData | undefined): Set<string> {
  * @param items - Wire items from a snapshot/changed frame.
  * @param activeId - The open session, which is never inserted when it is
  *   another user's, and never counts as a new session.
+ * @param snapshotArchived - Last streamed archived flag per session, so a
+ *   frozen Archived snapshot row reports its flip only once.
  * @returns Query hashes of the lists the local patch couldn't settle, which
  *   need a server refetch.
  */
@@ -92,7 +95,8 @@ function applyItemsToCache(
   queryClient: QueryClient,
   items: SessionListWireItem[],
   activeId: string | undefined,
-  viewerId?: string | null,
+  viewerId: string | null | undefined,
+  snapshotArchived: Map<string, boolean>,
 ): Set<string> {
   // Frames are full rows with explicit nulls; convert null → undefined so a
   // cleared field overlays the cache in the same shape GET /v1/sessions
@@ -131,11 +135,24 @@ function applyItemsToCache(
       else changes.set(id, { row: change.row, fields: new Set(change.fields) });
     }
   };
+  // A frozen Archived snapshot row still says archived after a streamed unarchive.
+  // Report that flip only when the stream's archived value changes, not on every frame.
+  const noteSnapshotChanges = (listChanges: Map<string, MembershipChange>) => {
+    for (const [id, change] of listChanges) {
+      const fields = new Set(change.fields);
+      if (fields.has("archived") && snapshotArchived.get(id) === (change.row.archived === true)) {
+        fields.delete("archived");
+      }
+      if (fields.size > 0) noteChanges(new Map([[id, { row: change.row, fields }]]));
+    }
+  };
   const entries = queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["conversations"],
   });
   for (const [key, data] of entries) {
     const filters = filtersFromConversationQueryKey(key);
+    const snapshot =
+      queryClient.getQueryCache().find({ queryKey: key, exact: true })?.meta?.snapshot === true;
     const {
       data: merged,
       found,
@@ -143,10 +160,17 @@ function applyItemsToCache(
       changes: listChanges,
     } = mergeItemsIntoPages(data, itemsById, filters);
     for (const id of found) foundAnywhere.add(id);
-    noteChanges(listChanges);
+    if (snapshot) noteSnapshotChanges(listChanges);
+    else noteChanges(listChanges);
     // The Archived scope is read for membership but never patched or inserted into.
     if (key[4] === "archived") {
-      lists.push({ queryHash: hashKey(key), filters, ids: listIds(data), needsRefetch });
+      // A snapshot never refetches, so its frozen rows can't ask for one.
+      lists.push({
+        queryHash: hashKey(key),
+        filters,
+        ids: listIds(data),
+        needsRefetch: needsRefetch && !snapshot,
+      });
       continue;
     }
     // Surface a brand-new watched session (a create here or elsewhere, a share)
@@ -252,6 +276,9 @@ function applyItemsToCache(
       ...item,
     });
   }
+  for (const item of itemsById.values()) {
+    if (item.archived !== undefined) snapshotArchived.set(item.id, item.archived === true);
+  }
   const targets = listReconcileTargets({
     lists,
     changes,
@@ -266,10 +293,13 @@ function applyItemsToCache(
       targets.add(ARCHIVED_PROJECT_NAMES_HASH);
     }
     // A pin made elsewhere that the pinned list lacks, or an unpin it still
-    // shows (its patch keeps the cached pin so local pins aren't dropped).
+    // shows (its patch keeps the cached pin so local pins aren't dropped). A
+    // session with a local pin write in flight is skipped: the pinned list may
+    // still predate that write.
     const pinned = row.labels?.[PINNED_LABEL_KEY] != null;
     if (
       fields.has("pinned") &&
+      !isPinWriteSettling(queryClient, row.id) &&
       (pinned ? row.archived !== true && !pinnedIds.has(row.id) : pinnedIds.has(row.id))
     ) {
       targets.add(PINNED_CONVERSATIONS_HASH);
@@ -331,6 +361,9 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
   // socket reconnects, so changes missed while disconnected are caught by
   // the post-reconnect snapshot.
   const commentsFingerprintsRef = useRef(new Map<string, string>());
+
+  // Last streamed archived flag per session, for the frozen Archived snapshot.
+  const snapshotArchivedRef = useRef(new Map<string, boolean>());
 
   // Last permission level streamed for the open session, so a change to it
   // (a share upgraded or revoked) reconciles list membership.
@@ -512,6 +545,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         case "removed":
           for (const id of frame.ids) {
             commentsFingerprintsRef.current.delete(id);
+            snapshotArchivedRef.current.delete(id);
             // A revoked share or a deletion must not be re-injected by the
             // keep-alive once the refetch correctly leaves it out.
             unmarkRecentlyCreated(id);
@@ -567,6 +601,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             frame.items,
             activeIdRef.current,
             getCurrentUserId(),
+            snapshotArchivedRef.current,
           );
           // Reconcile list membership when the open session's permission
           // changes (e.g. its owner shares it with the viewer directly, or

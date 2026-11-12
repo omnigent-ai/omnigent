@@ -12,14 +12,23 @@ import type { ContextType, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  clearPinWriteTracking,
   clearSessionTombstones,
+  PINNED_CONVERSATIONS_KEY,
+  type PinnedConversationsResult,
   useArchiveConversation,
   useConversations,
+  usePinnedConversations,
   useMoveToProject,
+  useTogglePinnedConversation,
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
-import { clearRecentlyCreated, type ConversationsInfiniteData } from "@/lib/sessionListCache";
+import {
+  clearRecentlyCreated,
+  type ConversationsInfiniteData,
+  PINNED_LABEL_KEY,
+} from "@/lib/sessionListCache";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 
 // Mock the socket transport so setWatched is observable and start/stop are
@@ -171,6 +180,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clearSessionTombstones();
+  clearPinWriteTracking();
   clearRecentlyCreated();
   vi.unstubAllGlobals();
 });
@@ -279,6 +289,25 @@ function frameHandler(): (frame: unknown) => void {
   const call = subscribe.mock.calls.at(-1);
   if (!call) throw new Error("provider never subscribed to the socket");
   return call[0] as unknown as (frame: unknown) => void;
+}
+
+// Any refetch of the session lists, as opposed to e.g. a comments refresh.
+// Targeted rounds pass only a predicate over query hashes.
+function listInvalidations(invalidate: { mock: { calls: unknown[][] } }) {
+  return invalidate.mock.calls.filter(([filters]: unknown[]) => {
+    const { queryKey, predicate } = (filters ?? {}) as {
+      queryKey?: unknown[];
+      predicate?: unknown;
+    };
+    const key = queryKey?.[0];
+    return (
+      (queryKey === undefined && predicate !== undefined) ||
+      key === "conversations" ||
+      key === "project-sessions" ||
+      key === "archived-project-names" ||
+      key === "pinned-conversations"
+    );
+  });
 }
 
 // Wire-shaped session row carrying a comments fingerprint. Frames send full
@@ -1018,24 +1047,6 @@ describe("SessionUpdatesProvider list invalidation", () => {
     }
   });
 
-  // Any refetch of the session lists, as opposed to e.g. a comments refresh.
-  // Targeted rounds pass only a predicate over query hashes.
-  function listInvalidations(invalidate: { mock: { calls: unknown[][] } }) {
-    return invalidate.mock.calls.filter(([filters]: unknown[]) => {
-      const { queryKey, predicate } = (filters ?? {}) as {
-        queryKey?: unknown[];
-        predicate?: unknown;
-      };
-      const key = queryKey?.[0];
-      return (
-        (queryKey === undefined && predicate !== undefined) ||
-        key === "conversations" ||
-        key === "project-sessions" ||
-        key === "archived-project-names"
-      );
-    });
-  }
-
   it("patches a background session's updated_at bump without refetching the lists", () => {
     // Running agents bump updated_at on every tick; each list view sorts its
     // own rows, so a refetch would only re-read every list for nothing.
@@ -1327,15 +1338,248 @@ describe("SessionUpdatesProvider list invalidation", () => {
       const invalidate = vi.spyOn(client, "invalidateQueries");
       const handler = frameHandler();
 
+      client.setQueryData(["archived-project-names"], []);
+      invalidate.mockClear();
       act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), permission_level: 1 }] }));
       act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), permission_level: 4 }] }));
       act(() => vi.advanceTimersByTime(300));
 
-      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+      // Every session list the access change could reach; the pinned list is not reconciled.
+      expect(invalidatedKeys(client, invalidate)).toEqual([
+        JSON.stringify(["archived-project-names"]),
+        JSON.stringify(["conversations", "", false]),
+        JSON.stringify(["project-sessions", "Other", "updated_at", false]),
+      ]);
     } finally {
       vi.useRealTimers();
     }
   });
+});
+
+describe("SessionUpdatesProvider archived snapshot", () => {
+  it("reports a streamed unarchive once, not on every later frame", async () => {
+    vi.useFakeTimers();
+    try {
+      // No live list is cached: an unarchive that refetched one would hold the
+      // reconcile round open and hide a repeated picker transition.
+      const client = new QueryClient();
+      // The Archived scope is a snapshot: its rows stay frozen at the last read.
+      const archivedKey = ["conversations", "", false, null, "archived"];
+      client.getQueryCache().build(client, { queryKey: archivedKey, meta: { snapshot: true } });
+      client.setQueryData<ConversationsInfiniteData>(archivedKey, {
+        pages: [
+          {
+            data: [{ ...conv("conv_x"), archived: true }],
+            first_id: "conv_x",
+            last_id: "conv_x",
+            has_more: false,
+          },
+        ],
+        pageParams: [undefined],
+      });
+      client.setQueryData(["archived-project-names"], []);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_x"), archived: false }] }));
+      // Async so the round that the first frame started can settle before the next.
+      await act(async () => vi.advanceTimersByTime(300));
+      expect(invalidatedKeys(client, invalidate)).toContain(
+        JSON.stringify(["archived-project-names"]),
+      );
+
+      invalidate.mockClear();
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...conv("conv_x"), archived: false, title: "Renamed" }],
+        }),
+      );
+      // Past the reconcile pacing gap, so a repeated transition would have fired.
+      await act(async () => vi.advanceTimersByTime(3_000));
+      expect(listInvalidations(invalidate)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("SessionUpdatesProvider pin writes in flight", () => {
+  interface Deferred<T> {
+    promise: Promise<T>;
+    resolve: (value: T) => void;
+  }
+  function deferred<T>(): Deferred<T> {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  }
+  const okJson = (body: unknown) => ({ ok: true, status: 200, json: async () => body }) as Response;
+  const pinnedPage = (rows: Conversation[]) => okJson({ data: rows, has_more: false });
+
+  // The pin PATCH and the pinned-list reads wait on responses the test releases.
+  function stubPinFetch() {
+    const patches: Deferred<Response>[] = [];
+    const pinnedReads: { url: string; response: Deferred<Response> }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: RequestInit) => {
+        if (init?.method === "PATCH") {
+          const response = deferred<Response>();
+          patches.push(response);
+          return response.promise;
+        }
+        if (url.includes("pinned=true")) {
+          const response = deferred<Response>();
+          pinnedReads.push({ url, response });
+          return response.promise;
+        }
+        return Promise.resolve(pinnedPage([]));
+      }),
+    );
+    return {
+      patches,
+      pinnedReads,
+      // Answers every pinned read started so far; the shared scope has no pins.
+      releasePinnedReads(rows: Conversation[]) {
+        for (const read of pinnedReads.splice(0)) {
+          const mine = !read.url.includes("visibility=shared");
+          read.response.resolve(pinnedPage(mine ? rows : []));
+        }
+      },
+    };
+  }
+
+  function renderPinHarness(client: QueryClient) {
+    const toggle: { current: ReturnType<typeof useTogglePinnedConversation> | null } = {
+      current: null,
+    };
+    function Harness() {
+      usePinnedConversations();
+      toggle.current = useTogglePinnedConversation();
+      return null;
+    }
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/"]}>
+          <SessionUpdatesProvider>
+            <Harness />
+          </SessionUpdatesProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    return toggle;
+  }
+
+  // Seeds conv_a as pinned (unpin) or unpinned (pin), with the pinned list to match.
+  function seedPinCase(client: QueryClient, pinned: boolean) {
+    const pinLabel = { [PINNED_LABEL_KEY]: "1" };
+    const before = pinned ? {} : pinLabel;
+    const after = pinned ? pinLabel : {};
+    client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
+      pages: [
+        {
+          data: [{ ...conv("conv_a"), labels: before }],
+          first_id: "conv_a",
+          last_id: "conv_a",
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    });
+    client.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+      conversations: pinned ? [] : [{ ...conv("conv_a"), labels: pinLabel }],
+      filterHonored: true,
+    });
+    return {
+      before,
+      after,
+      membershipBefore: pinned ? [] : [{ ...conv("conv_a"), labels: pinLabel }],
+    };
+  }
+
+  const cases = [
+    ["pin", true],
+    ["unpin", false],
+  ] as const;
+
+  // Lets the provider's targeted round (250 ms debounce) run.
+  const settle = () =>
+    act(async () => {
+      await new Promise<void>((done) => {
+        setTimeout(done, 400);
+      });
+    });
+
+  it.each(cases)(
+    "does not schedule a pinned-list read for a %s while its write is in flight",
+    async (_name, pinned) => {
+      const fetch = stubPinFetch();
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const { before, after } = seedPinCase(client, pinned);
+      const toggle = renderPinHarness(client);
+      const handler = frameHandler();
+
+      act(() => toggle.current!.mutate({ id: "conv_a", pinned }));
+      // The frame predates the write, so it still shows the old label.
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), labels: before }] }));
+      await settle();
+      expect(fetch.pinnedReads).toHaveLength(0);
+
+      await waitFor(() => expect(fetch.patches).toHaveLength(1));
+      await act(async () => {
+        fetch.patches[0].resolve(okJson({ ...conv("conv_a"), labels: after }));
+      });
+      await settle();
+      expect(fetch.pinnedReads).toHaveLength(0);
+      expect(
+        client
+          .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+          ?.conversations.map((row) => row.id),
+      ).toEqual(pinned ? ["conv_a"] : []);
+    },
+  );
+
+  it.each(cases)(
+    "does not let a pinned read started before the %s restore the old membership",
+    async (_name, pinned) => {
+      const fetch = stubPinFetch();
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const { before, after, membershipBefore } = seedPinCase(client, pinned);
+      const toggle = renderPinHarness(client);
+      const handler = frameHandler();
+
+      // A pinned read already in flight when the write starts.
+      void client.refetchQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
+      await waitFor(() => expect(fetch.pinnedReads.length).toBeGreaterThan(0));
+
+      act(() => toggle.current!.mutate({ id: "conv_a", pinned }));
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), labels: before }] }));
+      await waitFor(() => expect(fetch.patches).toHaveLength(1));
+      await act(async () => {
+        fetch.patches[0].resolve(okJson({ ...conv("conv_a"), labels: after }));
+      });
+      await waitFor(() =>
+        expect(
+          client
+            .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+            ?.conversations.map((row) => row.id),
+        ).toEqual(pinned ? ["conv_a"] : []),
+      );
+
+      // The older read answers with the membership from before the write.
+      await act(async () => fetch.releasePinnedReads(membershipBefore));
+      await settle();
+      expect(
+        client
+          .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+          ?.conversations.map((row) => row.id),
+      ).toEqual(pinned ? ["conv_a"] : []);
+    },
+  );
 });
 
 describe("SessionUpdatesProvider projects_changed frames", () => {

@@ -1,12 +1,9 @@
 """E2E: a session change refetches only the sidebar lists it can affect.
 
-Each expanded project folder keeps its own ``GET /v1/sessions?project=…``
-list. When the updates stream reports a change the local patch can't place,
-the sidebar re-reads lists from the server; re-reading every folder for any
-change multiplied one busy session into a request per folder per tab. These
-tests change sessions from "another client" (the API) with three folders open
-and check both halves: each folder shows the right sessions, and only the
-folders the change could move a session in or out of are fetched again.
+Reconcile only lists whose membership or pagination may have changed. Three
+project folders stay open while another client (the API) changes sessions; each
+folder must show the right sessions, and only the folders a change can move a
+session in or out of are fetched again.
 """
 
 from __future__ import annotations

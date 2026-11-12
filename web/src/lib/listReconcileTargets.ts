@@ -1,7 +1,4 @@
-// Picks which cached session lists a session-updates frame actually needs the
-// server to re-read. Refetching every mounted list (both scopes, every expanded
-// project folder, every tab) for any change is what made one busy session cost
-// dozens of `GET /v1/sessions` calls; most changes are placed by the local patch.
+// Reconcile only lists whose membership or pagination may have changed.
 
 import {
   type ConversationListFilters,
