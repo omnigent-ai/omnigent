@@ -67,7 +67,7 @@ const STATE_LABELS: Record<StepState, string> = {
 const SEGMENT_COLORS: Record<StepState, string> = {
   waiting: "bg-foreground/10",
   ready: "bg-session-active/25",
-  running: "bg-session-active",
+  running: "bg-session-active animate-pulse motion-reduce:animate-none",
   stopped: "bg-status-gray",
   needs_input: "bg-brand-accent",
   done: "bg-success",
@@ -645,7 +645,7 @@ function ProgressStrip({
                     className={cn(
                       "h-1.5 w-full rounded-full transition-[height,opacity] duration-150 group-hover:h-2 group-focus-visible:h-2 group-focus-visible:ring-2 group-focus-visible:ring-ring/50",
                       SEGMENT_COLORS[item.state],
-                      !lit(index) && "opacity-30",
+                      !lit(index) && "animate-none opacity-30",
                     )}
                   />
                 </button>
