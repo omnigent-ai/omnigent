@@ -1816,9 +1816,18 @@ class SqlScheduledTaskShare(OmnigentBase):
     level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
 
     __table_args__ = (
-        # SQLite ignores VARCHAR lengths: 128 characters at up to four bytes each.
+        # SQLite and D1 ignore VARCHAR lengths: 128 characters at up to four bytes each.
         CheckConstraint(
             "length(CAST(user_id AS BLOB)) <= 512",
             name="ck_scheduled_task_shares_user_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # SQLite and D1 store any value in an integer column.
+        CheckConstraint(
+            "typeof(workspace_id) = 'integer'",
+            name="ck_scheduled_task_shares_workspace_id_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(level) = 'integer'",
+            name="ck_scheduled_task_shares_level_integer",
         ).ddl_if(callable_=_on_sqlite_family),
     )
