@@ -1649,6 +1649,16 @@ def test_a_pipeline_stage_cd_does_not_affect_the_parent_when_continued() -> None
     ]
 
 
+def test_a_process_substitution_keeps_the_explicit_repository() -> None:
+    refs, was_created = extract_prs(
+        "Bash",
+        {"command": "gh pr edit 41 --body-file <(printf x) -R example/other"},
+        "",
+    )
+    assert [ref.url for ref in refs] == ["https://github.com/example/other/pull/41"]
+    assert was_created is False
+
+
 def test_a_pattern_with_parentheses_is_not_a_command_for_pr_attribution() -> None:
     # An extended glob is a pattern for printf, not a command that runs.
     refs, was_created = extract_prs(
@@ -1970,6 +1980,22 @@ def test_quoted_operator_characters_do_not_split_a_simple_command(
             {},
             ["/w/topic"],
             id="bash-pipe-ampersand-does-not-restore-the-directory",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "! cd / || git status"},
+            "/tmp",
+            {},
+            [],
+            id="negated-cd-is-not-tracked",
+        ),
+        pytest.param(
+            "Bash",
+            {"command": "echo $[ (git) ]"},
+            "/tmp",
+            {},
+            [],
+            id="legacy-arithmetic-is-not-a-git-call",
         ),
         pytest.param(
             "Bash",
