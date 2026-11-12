@@ -81,7 +81,9 @@ const {
   useSessionWorktreesMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
-  projectRowsRef: { current: undefined as { id: string; name: string }[] | undefined },
+  projectRowsRef: {
+    current: undefined as { id: string; name: string; icon?: string }[] | undefined,
+  },
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
   renameProjectSpy: vi.fn(),
@@ -4629,6 +4631,42 @@ describe("Sidebar view options", () => {
     expect(link).toHaveClass("items-center");
     expect(link).not.toHaveClass("flex-col");
     expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).show).toEqual(["harness"]);
+  });
+
+  it("leads pinned rows with their project's emoji when Project is shown", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ show: ["project"] }));
+    projectRowsRef.current = [
+      { id: "p_Alpha", name: "Alpha", icon: "🧪" },
+      { id: "p_Plain", name: "Plain" },
+    ];
+    seedPins(["conv_pinned_alpha", "conv_pinned_plain", "conv_pinned_unfiled"]);
+    mockConversations([
+      conv("conv_pinned_alpha", "Codex", { project_id: "p_Alpha" }),
+      conv("conv_pinned_plain", "Codex", { project_id: "p_Plain" }),
+      conv("conv_pinned_unfiled", "Codex"),
+      conv("conv_filed_alpha", "Codex", { project_id: "p_Alpha" }),
+    ]);
+    renderGroupingSidebar();
+    const projectIcon = (id: string) =>
+      within(screen.getByText(id).closest("a")!).queryByTestId("project-icon");
+
+    expect(projectIcon("conv_pinned_alpha")).toHaveTextContent("🧪");
+    // Decorative, so the row's accessible name stays the session title.
+    expect(screen.getByRole("link", { name: "conv_pinned_alpha" })).toBeInTheDocument();
+    // No emoji to show: a project without one, or a pin outside any project.
+    expect(projectIcon("conv_pinned_plain")).toBeNull();
+    expect(projectIcon("conv_pinned_unfiled")).toBeNull();
+    // A row inside its folder already sits under the project's glyph.
+    fireEvent.click(screen.getByText("Alpha"));
+    expect(projectIcon("conv_filed_alpha")).toBeNull();
+
+    openViewSubmenu("session-show-menu");
+    fireEvent.click(screen.getByTestId("session-show-project"));
+    expect(projectIcon("conv_pinned_alpha")).toBeNull();
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).show).toEqual([]);
+    fireEvent.click(screen.getByTestId("session-show-project"));
+    expect(projectIcon("conv_pinned_alpha")).toHaveTextContent("🧪");
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).show).toEqual(["project"]);
   });
 
   it("resolves an unrecorded branch only when Branch is shown, without a GitHub lookup", () => {

@@ -3987,6 +3987,7 @@ const ORDERING_LABELS: Record<SidebarOrdering, string> = {
 };
 const SHOW_LABELS: Record<SidebarShowField, string> = {
   harness: "Harness",
+  project: "Project",
   updated: "Updated",
   environment: "Environment",
   repo: "Repo",
@@ -5785,6 +5786,10 @@ function ConversationRowImpl({
   const trailingLayout =
     TRAILING_SLOT_LAYOUT[trailingSlotKind(sessionState, hasSessionIndicator, showUpdated)];
   const showHarness = show.includes("harness");
+  // "Show → Project" leads a pinned row's title with its project's emoji, since
+  // pinning lifts the row out of the folder that would otherwise show it. Folder
+  // rows already sit under that glyph, and projects without an emoji add nothing.
+  const titleProjectIcon = show.includes("project") && isPinned ? projectFlyoutIcon : null;
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
@@ -6054,6 +6059,10 @@ function ConversationRowImpl({
       {/* Row 1: the session name. Working, needs-approval, unseen, and draft
           markers render in the shared trailing indicator slot below. */}
       <div className="flex w-full items-center">
+        {/* Same box and gap as a project folder's glyph, so titles line up with folder names. */}
+        {titleProjectIcon !== null && (
+          <ProjectRowIcon icon={titleProjectIcon} className="mr-2 size-4" />
+        )}
         <span
           className={cn(
             "relative min-w-0 truncate",
