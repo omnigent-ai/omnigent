@@ -115,6 +115,15 @@ def broker_dir() -> Iterator[Path]:
         ("name", "Upper"),
         ("host", "*.example.test"),
         ("host", "example.test;id"),
+        pytest.param("host", "0." * 100_000 + "!", id="long-repeated-labels"),
+        ("host", "a" * 64 + ".example.test"),
+        ("host", ".".join(["a" * 63] * 3 + ["b" * 62])),
+        ("host", "-db.example.test"),
+        ("host", "db-.example.test"),
+        ("host", "db..example.test"),
+        ("host", "db.example.test."),
+        ("host", "db_1.example.test"),
+        ("host", "db.\u00e9xample.test"),
         ("host", "127.0.0.1"),
         ("host", "169.254.169.254"),
         ("host", "100.100.100.200"),
@@ -147,6 +156,21 @@ def test_tcp_route_rejects_duplicate_names() -> None:
     entry = {"name": "db", "host": "db.example.test", "port": 5432}
     with pytest.raises(OmnigentError, match="unique"):
         parse_tcp_egress([entry, entry])
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "DB-1.Example.Test",
+        "a" * 63,
+        ".".join(["a" * 63] * 3 + ["b" * 61]),
+        "0." * 120 + "example.test",
+    ],
+)
+def test_tcp_route_accepts_bounded_dns_names(host: str) -> None:
+    assert parse_tcp_egress([{"name": "db", "host": host, "port": 5432}]) == [
+        TcpEgressRoute("db", host.lower(), 5432)
+    ]
 
 
 def test_tcp_route_parsers_and_runtime_reject_weak_backend(

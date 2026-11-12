@@ -12,10 +12,7 @@ from .datamodel import TcpEgressRoute
 from .egress.proxy import _CLOUD_TRAP_NETWORKS
 
 _NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
-_DNS = re.compile(
-    r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
-    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z"
-)
+_DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 _BLOCKED_ZERO_NETWORK = ipaddress.ip_network("0.0.0.0/8")
 _BLOCKED_CONTROL = ipaddress.ip_network("100.100.100.200/32")
 _BLOCKED_IPV6_METADATA = (
@@ -79,7 +76,9 @@ def parse_tcp_egress(
             address = ipaddress.ip_address(host)
         except ValueError:
             address = None
-            if not _DNS.fullmatch(host):
+            if not 1 <= len(host) <= 253 or not all(
+                _DNS_LABEL.fullmatch(part) for part in host.split(".")
+            ):
                 raise OmnigentError(
                     f"{label}.host must be an exact ASCII DNS name or IP address"
                 ) from None
