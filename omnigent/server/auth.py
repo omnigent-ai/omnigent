@@ -422,6 +422,13 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
+    def canonical_user_id(self, user_id: str) -> str:
+        """Return a caller-typed *user_id*, e.g. a sharing grantee, as :meth:`get_user_id` would.
+
+        Default: unchanged, since a provider's IDs may be case-sensitive.
+        """
+        return user_id
+
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
         """
         Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
@@ -620,6 +627,18 @@ class UnifiedAuthProvider(AuthProvider):
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
         return self._check_header(request)
+
+    def canonical_user_id(self, user_id: str) -> str:
+        """Lowercase *user_id* in OIDC and accounts modes, whose sign-in lowercases it.
+
+        Header mode and the case-sensitive client-credentials machine subject keep their IDs.
+        """
+        if self._source not in ("oidc", "accounts"):
+            return user_id
+        from omnigent.server.routes.client_credentials import configured_machine_sub
+
+        stripped = user_id.strip()
+        return stripped if stripped == configured_machine_sub() else stripped.lower()
 
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
         """

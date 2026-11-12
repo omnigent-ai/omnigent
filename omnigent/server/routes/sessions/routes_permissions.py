@@ -76,6 +76,10 @@ class _PermissionListResponse(TypedDict):
     next_cursor: str | None
 
 
+def _canonical_user_id(auth_provider: AuthProvider | None, user_id: str) -> str:
+    return user_id if auth_provider is None else auth_provider.canonical_user_id(user_id)
+
+
 def register_permissions_routes(
     router: APIRouter,
     *,
@@ -150,12 +154,13 @@ def register_permissions_routes(
                 "Permissions not enabled",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        if body.user_id == user_id:
+        grantee = _canonical_user_id(auth_provider, body.user_id)
+        if grantee == user_id:
             raise OmnigentError(
                 "Cannot modify your own permissions",
                 code=ErrorCode.FORBIDDEN,
             )
-        if body.user_id == RESERVED_USER_PUBLIC:
+        if grantee == RESERVED_USER_PUBLIC:
             # Public-access kill switch, independent of the sharing_mode gate
             # above (see app.state.public_sharing). Blocks the anyone-with-the
             # -link grant while leaving user-to-user sharing intact. ``getattr``
@@ -175,22 +180,20 @@ def register_permissions_routes(
                     f"Public access is limited to {ceiling.value} (level {ceiling.level})",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        target = await asyncio.to_thread(permission_store.get_user, body.user_id)
-        with target_account_scope(body.user_id, target.account_generation if target else None):
-            existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
+        target = await asyncio.to_thread(permission_store.get_user, grantee)
+        with target_account_scope(grantee, target.account_generation if target else None):
+            existing = await asyncio.to_thread(permission_store.get, grantee, session_id)
             if existing is not None and existing.level == LEVEL_OWNER:
                 raise OmnigentError(
                     "Cannot modify owner permissions",
                     code=ErrorCode.FORBIDDEN,
                 )
-            await asyncio.to_thread(permission_store.ensure_user, body.user_id)
-            perm = await asyncio.to_thread(
-                permission_store.grant, body.user_id, session_id, body.level
-            )
+            await asyncio.to_thread(permission_store.ensure_user, grantee)
+            perm = await asyncio.to_thread(permission_store.grant, grantee, session_id, body.level)
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
-        _announce_session_added(body.user_id, session_id)
-        add_audit_attrs(target_user_id=body.user_id, level=body.level)
+        _announce_session_added(grantee, session_id)
+        add_audit_attrs(target_user_id=grantee, level=body.level)
         return PermissionObject(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
@@ -242,6 +245,12 @@ def register_permissions_routes(
         # exists and is visible to the caller without leaking others' via
         # 403/404.
         leaving_self = target_user_id == user_id
+        target_ids = [target_user_id]
+        canonical_target = _canonical_user_id(auth_provider, target_user_id)
+        # A manager revoke also reaches the canonical spelling of a typed ID, but not
+        # the caller's own grant, which only leaving by the exact ID removes.
+        if not leaving_self and canonical_target not in (target_user_id, user_id):
+            target_ids.append(canonical_target)
         await _require_access(
             user_id,
             session_id,
@@ -273,19 +282,30 @@ def register_permissions_routes(
                     f"Leave the parent session {conv.parent_conversation_id!r} instead.",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        existing = await asyncio.to_thread(permission_store.get, target_user_id, session_id)
-        if existing is not None and existing.level == LEVEL_OWNER:
-            raise OmnigentError(
-                "Cannot leave a session you own. Delete or archive it instead."
-                if leaving_self
-                else "Cannot revoke owner permissions",
-                code=ErrorCode.FORBIDDEN,
-            )
-        await asyncio.to_thread(permission_store.revoke, target_user_id, session_id)
+        # The owner grant is never revoked. Reached only through the canonical
+        # spelling, it is skipped so a stale alias of the owner can still be removed.
+        revoked_ids: list[str] = []
+        for candidate_id in target_ids:
+            existing = await asyncio.to_thread(permission_store.get, candidate_id, session_id)
+            if existing is None or existing.level != LEVEL_OWNER:
+                revoked_ids.append(candidate_id)
+            elif candidate_id == target_user_id:
+                raise OmnigentError(
+                    "Cannot leave a session you own. Delete or archive it instead."
+                    if leaving_self
+                    else "Cannot revoke owner permissions",
+                    code=ErrorCode.FORBIDDEN,
+                )
+        for revoked_user_id in revoked_ids:
+            await asyncio.to_thread(permission_store.revoke, revoked_user_id, session_id)
         # The leaver's own tab drops the row via the client mutation's success
         # handler; their other tabs converge on the next watch-set diff, which
         # reports the now-inaccessible id as removed. No extra push needed.
-        add_audit_attrs(target_user_id=target_user_id, left_self=leaving_self)
+        add_audit_attrs(
+            target_user_id=target_user_id,
+            revoked_user_ids=",".join(revoked_ids),
+            left_self=leaving_self,
+        )
         return Response(status_code=204)
 
     @router.get(

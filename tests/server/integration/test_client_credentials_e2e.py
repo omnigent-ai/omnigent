@@ -37,8 +37,9 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
 from omnigent.server.device_grant_store import hash_secret
+from tests._helpers.session import post_session_bundle
 from tests.server.helpers import build_agent_bundle
 
 pytestmark = pytest.mark.asyncio
@@ -57,6 +58,7 @@ def _build_app(
     machine_client: bool = True,
     device_grant: bool = False,
     partial_machine_config: bool = False,
+    machine_sub: str = _MACHINE_SUB,
 ) -> SimpleNamespace:
     """Build an accounts-mode app, with or without the machine client configured.
 
@@ -68,6 +70,7 @@ def _build_app(
         ``POST /oauth/token`` with this grant — both dispatch from it.
     :param partial_machine_config: When True, set only one ``OMNIGENT_MACHINE_*``
         variable, which the config parser rejects as an operator error.
+    :param machine_sub: The configured machine principal.
     :returns: The built app and its permission store.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -101,7 +104,7 @@ def _build_app(
         monkeypatch.setenv(
             "OMNIGENT_MACHINE_CLIENT_SECRET_HASH", hash_secret(_CLIENT_SECRET, _COOKIE_SECRET)
         )
-        monkeypatch.setenv("OMNIGENT_MACHINE_SUB", _MACHINE_SUB)
+        monkeypatch.setenv("OMNIGENT_MACHINE_SUB", machine_sub)
         monkeypatch.setenv("OMNIGENT_MACHINE_TOKEN_TTL", "1800")
     if partial_machine_config:
         monkeypatch.setenv("OMNIGENT_MACHINE_CLIENT_ID", _CLIENT_ID)
@@ -363,6 +366,60 @@ async def test_machine_client_owns_and_operates_its_own_session(env: SimpleNames
     # Delete its own session (the owner-only path).
     deleted = await env.client.delete(f"/v1/sessions/{session_id}", headers=auth)
     assert deleted.status_code == 200, deleted.text
+
+
+async def test_mixed_case_machine_principal_is_shared_and_leaves_by_its_exact_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A login user shares with the case-sensitive machine subject, which can read and leave.
+
+    The lowercase spelling is a separate human identity that the machine cannot remove, even
+    after the configured subject changes while its token stays valid.
+    """
+    from omnigent.db.utils import clear_engine_cache
+
+    machine_sub = "BuildBot@Example.com"
+    built = _build_app(tmp_path, monkeypatch, machine_sub=machine_sub)
+    transport = httpx.ASGITransport(app=built.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        login_auth = {"Authorization": f"Bearer {await _login_grant_token(client)}"}
+        created = await post_session_bundle(
+            client.post,
+            "/v1/sessions",
+            build_agent_bundle(name="shared-agent"),
+            headers=login_auth,
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["session_id"]
+        shared = await client.put(
+            f"/v1/sessions/{session_id}/permissions",
+            json={"user_id": machine_sub, "level": LEVEL_READ},
+            headers=login_auth,
+        )
+        assert shared.status_code == 200, shared.text
+        assert shared.json()["user_id"] == machine_sub
+        human_id = machine_sub.lower()
+        built.permission_store.ensure_user(human_id)
+        built.permission_store.grant(human_id, session_id, LEVEL_READ)
+
+        machine_auth = {"Authorization": f"Bearer {await _mint_token(client)}"}
+        session_url = f"/v1/sessions/{session_id}"
+        assert (await client.get(session_url, headers=machine_auth)).status_code == 200
+        cross_leave = await client.delete(
+            f"{session_url}/permissions/{human_id}", headers=machine_auth
+        )
+        assert cross_leave.status_code == 403, cross_leave.text
+        monkeypatch.setenv("OMNIGENT_MACHINE_SUB", "OtherBot@Example.com")
+        assert (await client.get(session_url, headers=machine_auth)).status_code == 200
+        left = await client.delete(
+            f"{session_url}/permissions/{machine_sub}", headers=machine_auth
+        )
+        assert left.status_code == 204, left.text
+        assert built.permission_store.get(machine_sub, session_id) is None
+        human_grant = built.permission_store.get(human_id, session_id)
+        assert human_grant is not None and human_grant.level == LEVEL_READ
+        assert (await client.get(session_url, headers=machine_auth)).status_code == 404
+    clear_engine_cache()
 
 
 # Paths off the delegated allowlist that a machine token must never reach:

@@ -177,6 +177,11 @@ def _token_ttl_from_env() -> int:
     return token_ttl
 
 
+def configured_machine_sub() -> str | None:
+    """Return the configured machine principal (``OMNIGENT_MACHINE_SUB``), or ``None``."""
+    return os.environ.get(_SUB_ENV, "").strip() or None
+
+
 @dataclass(frozen=True)
 class MachineClientConfig:
     """The single confidential machine client, read from the environment.
@@ -209,7 +214,7 @@ class MachineClientConfig:
         """
         client_id = os.environ.get(_CLIENT_ID_ENV, "").strip()
         secret_hash = os.environ.get(_CLIENT_SECRET_HASH_ENV, "").strip()
-        sub = os.environ.get(_SUB_ENV, "").strip()
+        sub = configured_machine_sub() or ""
         if not (client_id or secret_hash or sub):
             return None
         if not (client_id and secret_hash and sub):

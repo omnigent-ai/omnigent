@@ -1265,6 +1265,32 @@ async def test_admin_user_bypasses_permission_checks(
 # ── Revoke nonexistent: idempotent 204 ──────────────────────
 
 
+async def test_header_identity_grant_keeps_its_case(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Header mode grants the exact identity the proxy asserts, including its case."""
+    session_id = (await _create_session_as(auth_client, "", "user-a"))["id"]
+
+    resp = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="user-a",
+        target_user="Alice@Example.com",
+        level=LEVEL_READ,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["user_id"] == "Alice@Example.com"
+    for header_identity, expected_status in (
+        ("Alice@Example.com", 200),
+        ("alice@example.com", 404),
+    ):
+        resp = await auth_client.get(
+            f"/v1/sessions/{session_id}",
+            headers={"X-Forwarded-Email": header_identity},
+        )
+        assert resp.status_code == expected_status, resp.text
+
+
 async def test_revoke_nonexistent_grant_returns_204(
     auth_client: httpx.AsyncClient,
 ) -> None:

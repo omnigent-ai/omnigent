@@ -6,6 +6,7 @@ clients read before loading anything to decide how to sign in.
 
 from __future__ import annotations
 
+import pytest
 from starlette.requests import HTTPConnection
 
 from omnigent.server.accounts_config import AccountsConfig
@@ -33,6 +34,17 @@ def _oidc_config(redirect_uri: str) -> OIDCConfig:
     )
 
 
+def _accounts_config() -> AccountsConfig:
+    return AccountsConfig(
+        cookie_secret=b"s" * 32,
+        session_ttl_hours=8,
+        base_url="https://a.test",
+        init_admin_password=None,
+        invite_ttl_seconds=3600,
+        magic_ttl_seconds=300,
+    )
+
+
 class _CustomProvider(AuthProvider):
     def get_user_id(self, request: HTTPConnection) -> str | None:
         return "embedded-user"
@@ -49,15 +61,7 @@ def test_auth_mode_names_each_source() -> None:
 
 
 def test_auth_mode_names_accounts() -> None:
-    config = AccountsConfig(
-        cookie_secret=b"s" * 32,
-        session_ttl_hours=8,
-        base_url="https://a.test",
-        init_admin_password=None,
-        invite_ttl_seconds=3600,
-        magic_ttl_seconds=300,
-    )
-    provider = UnifiedAuthProvider(source="accounts", accounts_config=config)
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=_accounts_config())
     assert auth_mode(provider) == "accounts"
     assert provider.session_cookie_name == "__Host-ap_session"
 
@@ -70,3 +74,26 @@ def test_session_cookie_name_follows_redirect_scheme() -> None:
     assert https.session_cookie_name == "__Host-ap_session"
     assert http.session_cookie_name == "ap_session"
     assert header.session_cookie_name is None
+
+
+def test_canonical_user_id_matches_each_source_sign_in() -> None:
+    oidc = UnifiedAuthProvider(source="oidc", oidc_config=_oidc_config("https://a.test/cb"))
+    accounts = UnifiedAuthProvider(source="accounts", accounts_config=_accounts_config())
+    header = UnifiedAuthProvider(source="header", local_single_user=False)
+
+    assert oidc.canonical_user_id(" Alice@Example.com ") == "alice@example.com"
+    assert accounts.canonical_user_id("Alice@Example.com") == "alice@example.com"
+    assert header.canonical_user_id("Alice@Example.com") == "Alice@Example.com"
+    assert _CustomProvider().canonical_user_id("Alice@Example.com") == "Alice@Example.com"
+
+
+def test_canonical_user_id_keeps_the_machine_subject_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_MACHINE_SUB", "BuildBot@Example.com")
+    oidc = UnifiedAuthProvider(source="oidc", oidc_config=_oidc_config("https://a.test/cb"))
+    accounts = UnifiedAuthProvider(source="accounts", accounts_config=_accounts_config())
+
+    for provider in (oidc, accounts):
+        assert provider.canonical_user_id(" BuildBot@Example.com ") == "BuildBot@Example.com"
+        assert provider.canonical_user_id("BUILDBOT@EXAMPLE.COM") == "buildbot@example.com"

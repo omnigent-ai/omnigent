@@ -9,7 +9,7 @@ ASGI pipeline end-to-end, matching how the server runs in production.
 
 Covers: first-run setup, login, login failure, /auth/me, invite +
 register, self-serve password change, admin user listing, logout,
-and magic-link mint + redeem.
+magic-link mint + redeem, and sharing a session with a login identity.
 """
 
 from __future__ import annotations
@@ -24,10 +24,13 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
-from omnigent.server.auth import create_auth_provider
+from omnigent.server.auth import LEVEL_MANAGE, LEVEL_READ, create_auth_provider
+from omnigent.server.routes.sessions import routes_permissions
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
+from tests._helpers.session import post_session_bundle
+from tests.server.helpers import build_agent_bundle
 
 pytestmark = pytest.mark.asyncio
 
@@ -529,3 +532,212 @@ async def test_unauthenticated_cannot_mint_magic_link(
     """POST /auth/magic without a session returns 401."""
     resp = await client.post("/auth/magic")
     assert resp.status_code == 401
+
+
+# ── 10. Sharing with a login identity ─────────────────────
+
+
+async def test_mixed_case_share_grant_reaches_registered_user(
+    client: httpx.AsyncClient,
+) -> None:
+    """A share grant typed with different email case reaches the user who logs in."""
+    admin_headers = _cookie_header(await _login(client, _ADMIN_USERNAME, _ADMIN_PASSWORD))
+    invite_resp = await client.post(
+        "/auth/invite", json={"is_admin": False}, headers=admin_headers
+    )
+    assert invite_resp.status_code == 200, invite_resp.text
+    register_resp = await client.post(
+        "/auth/register",
+        json={
+            "invite": invite_resp.json()["token"],
+            "username": "alice@example.com",
+            "password": "alice-pw-123456",
+        },
+    )
+    assert register_resp.status_code == 200, register_resp.text
+    alice_headers = _cookie_header(await _login(client, "alice@example.com", "alice-pw-123456"))
+
+    create_resp = await post_session_bundle(
+        client.post,
+        "/v1/sessions",
+        build_agent_bundle(name="shared-agent"),
+        headers=admin_headers,
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+
+    grant_resp = await client.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={"user_id": "Alice@Example.com", "level": 1},
+        headers=admin_headers,
+    )
+    assert grant_resp.status_code == 200, grant_resp.text
+
+    permissions_resp = await client.get(
+        f"/v1/sessions/{session_id}/permissions", headers=admin_headers
+    )
+    assert permissions_resp.status_code == 200, permissions_resp.text
+    grantees = {
+        grant["user_id"]: grant["level"] for grant in permissions_resp.json()["permissions"]
+    }
+    assert grantees == {_ADMIN_USERNAME: 4, "alice@example.com": 1}
+
+    alice_get = await client.get(f"/v1/sessions/{session_id}", headers=alice_headers)
+    assert alice_get.status_code == 200, alice_get.text
+
+    users_resp = await client.get("/auth/users", headers=admin_headers)
+    assert users_resp.status_code == 200, users_resp.text
+    assert {user["id"] for user in users_resp.json()["users"]} == {
+        _ADMIN_USERNAME,
+        "alice@example.com",
+    }
+
+
+async def _register_user(
+    client: httpx.AsyncClient,
+    admin_headers: dict[str, str],
+    username: str,
+    password: str,
+) -> dict[str, str]:
+    """Register *username* through an admin invite and return its login headers."""
+    invite_resp = await client.post(
+        "/auth/invite", json={"is_admin": False}, headers=admin_headers
+    )
+    assert invite_resp.status_code == 200, invite_resp.text
+    register_resp = await client.post(
+        "/auth/register",
+        json={"invite": invite_resp.json()["token"], "username": username, "password": password},
+    )
+    assert register_resp.status_code == 200, register_resp.text
+    return _cookie_header(await _login(client, username, password))
+
+
+async def _create_session(client: httpx.AsyncClient, headers: dict[str, str]) -> str:
+    create_resp = await post_session_bundle(
+        client.post, "/v1/sessions", build_agent_bundle(name="shared-agent"), headers=headers
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    return create_resp.json()["session_id"]
+
+
+async def _grantees(
+    client: httpx.AsyncClient, session_id: str, headers: dict[str, str]
+) -> dict[str, int]:
+    resp = await client.get(f"/v1/sessions/{session_id}/permissions", headers=headers)
+    assert resp.status_code == 200, resp.text
+    return {grant["user_id"]: grant["level"] for grant in resp.json()["permissions"]}
+
+
+async def test_mixed_case_revoke_reaches_the_login_identity_but_not_the_caller_or_owner(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revoking by another casing removes the canonical grant, but never the caller's or owner's.
+
+    Leaving needs the exact ID, so a read-only grantee cannot remove another spelling.
+    """
+    admin_headers = _cookie_header(await _login(client, _ADMIN_USERNAME, _ADMIN_PASSWORD))
+    alice_headers = await _register_user(
+        client, admin_headers, "alice@example.com", "alice-pw-123456"
+    )
+    session_id = await _create_session(client, admin_headers)
+    permissions_url = f"/v1/sessions/{session_id}/permissions"
+    grant = {"user_id": "alice@example.com", "level": 1}
+
+    grant_resp = await client.put(permissions_url, json=grant, headers=admin_headers)
+    assert grant_resp.status_code == 200, grant_resp.text
+    audit_attrs: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        routes_permissions, "add_audit_attrs", lambda **attrs: audit_attrs.append(attrs)
+    )
+    revoke_resp = await client.delete(
+        f"{permissions_url}/Alice@Example.com", headers=admin_headers
+    )
+    assert revoke_resp.status_code == 204, revoke_resp.text
+    assert audit_attrs == [
+        {
+            "target_user_id": "Alice@Example.com",
+            "revoked_user_ids": "Alice@Example.com,alice@example.com",
+            "left_self": False,
+        }
+    ]
+    assert await _grantees(client, session_id, admin_headers) == {_ADMIN_USERNAME: 4}
+    alice_get = await client.get(f"/v1/sessions/{session_id}", headers=alice_headers)
+    assert alice_get.status_code == 404, alice_get.text
+
+    grant_resp = await client.put(permissions_url, json=grant, headers=admin_headers)
+    assert grant_resp.status_code == 200, grant_resp.text
+    permission_store = SqlAlchemyPermissionStore(f"sqlite:///{tmp_path}/test.db")
+    for alias in ("ALICE@EXAMPLE.COM", "Admin"):
+        permission_store.ensure_user(alias)
+        permission_store.grant(alias, session_id, LEVEL_READ)
+    leave_resp = await client.delete(f"{permissions_url}/ALICE@EXAMPLE.COM", headers=alice_headers)
+    assert leave_resp.status_code == 403, leave_resp.text
+    assert await _grantees(client, session_id, admin_headers) == {
+        _ADMIN_USERNAME: 4,
+        "Admin": LEVEL_READ,
+        "ALICE@EXAMPLE.COM": LEVEL_READ,
+        "alice@example.com": LEVEL_READ,
+    }
+
+    grant_resp = await client.put(
+        permissions_url, json={**grant, "level": LEVEL_MANAGE}, headers=admin_headers
+    )
+    assert grant_resp.status_code == 200, grant_resp.text
+    for alias in ("ALICE@EXAMPLE.COM", "Admin"):
+        alias_resp = await client.delete(f"{permissions_url}/{alias}", headers=alice_headers)
+        assert alias_resp.status_code == 204, alias_resp.text
+    assert await _grantees(client, session_id, admin_headers) == {
+        _ADMIN_USERNAME: 4,
+        "alice@example.com": LEVEL_MANAGE,
+    }
+    permission_store.grant("Admin", session_id, LEVEL_READ)
+    owner_alias_resp = await client.delete(f"{permissions_url}/Admin", headers=admin_headers)
+    assert owner_alias_resp.status_code == 204, owner_alias_resp.text
+    owner_resp = await client.delete(f"{permissions_url}/{_ADMIN_USERNAME}", headers=alice_headers)
+    assert owner_resp.status_code == 403, owner_resp.text
+    assert await _grantees(client, session_id, admin_headers) == {
+        _ADMIN_USERNAME: 4,
+        "alice@example.com": LEVEL_MANAGE,
+    }
+
+
+async def test_revoke_by_typed_id_removes_both_spellings_idempotently(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Revoking a mixed-case ID removes its stored and canonical grants, and repeats cleanly."""
+    admin_headers = _cookie_header(await _login(client, _ADMIN_USERNAME, _ADMIN_PASSWORD))
+    session_id = await _create_session(client, admin_headers)
+    permission_store = SqlAlchemyPermissionStore(f"sqlite:///{tmp_path}/test.db")
+    for stored_user_id in ("Alice@Example.com", "alice@example.com"):
+        permission_store.ensure_user(stored_user_id)
+        permission_store.grant(stored_user_id, session_id, LEVEL_READ)
+    assert await _grantees(client, session_id, admin_headers) == {
+        _ADMIN_USERNAME: 4,
+        "Alice@Example.com": LEVEL_READ,
+        "alice@example.com": LEVEL_READ,
+    }
+
+    for _ in range(2):
+        revoke_resp = await client.delete(
+            f"/v1/sessions/{session_id}/permissions/Alice@Example.com", headers=admin_headers
+        )
+        assert revoke_resp.status_code == 204, revoke_resp.text
+        assert await _grantees(client, session_id, admin_headers) == {_ADMIN_USERNAME: 4}
+
+
+async def test_mixed_case_public_alias_keeps_the_public_level_ceiling(
+    client: httpx.AsyncClient,
+) -> None:
+    """``__PUBLIC__`` resolves to the public grantee, so public sharing stays capped at read."""
+    admin_headers = _cookie_header(await _login(client, _ADMIN_USERNAME, _ADMIN_PASSWORD))
+    session_id = await _create_session(client, admin_headers)
+    grant_resp = await client.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={"user_id": "__PUBLIC__", "level": LEVEL_MANAGE},
+        headers=admin_headers,
+    )
+    assert grant_resp.status_code == 400, grant_resp.text
+    assert await _grantees(client, session_id, admin_headers) == {_ADMIN_USERNAME: 4}
