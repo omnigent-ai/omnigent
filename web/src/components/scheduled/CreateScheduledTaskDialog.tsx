@@ -1366,10 +1366,6 @@ export function CreateScheduledTaskDialog({
                     fields={triggerFields}
                     onChange={setTriggerFields}
                     onSelectOpenChange={handleSelectOpenChange}
-                    // Arclet sandboxes provide their agents' MCP tools, Jira and Slack included.
-                    toolsProvided={
-                      sandboxMode && info !== "loading" && info.sandbox_provider === "arclet"
-                    }
                     taskSessionMode={triggerTaskSessionMode}
                     renderedPrompt={renderedTemplatePrompt}
                     onEditAsPrompt={() => {

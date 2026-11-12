@@ -139,7 +139,7 @@ to customize.
 - `capabilities`: Jira, Slack, GitHub, Linear, and PagerDuty templates require session continuity
   and orchestration. Unsupported servers still allow creation from scratch.
 - `tools-note`: the form says which tools the agent needs where the task runs,
-  except on an Arclet sandbox, which already has them. Neither the template form
+  including sandboxes. Neither the template form
   nor editing a task saved from one shows the Session choice; templates always
   keep one session, and editing keeps only the reset to a new session.
 - `responsive`: gallery items have icons, descriptions, access requirements,

@@ -1,4 +1,4 @@
-"""Automation repository selection in the built SPA with synthetic Arclet contracts."""
+"""Automation repository selection in the built SPA with synthetic Example contracts."""
 
 from contextlib import contextmanager
 from typing import Any
@@ -31,8 +31,8 @@ def test_automation_sandbox_repository(
                 "scheduled_task_session_modes": True,
                 "scheduled_task_projects": True,
                 "scheduled_task_subhour": True,
-                "sandbox_provider": "arclet",
-                "sandbox_provider_capabilities": {"arclet": {"repo_catalog": catalog}},
+                "sandbox_provider": "example",
+                "sandbox_provider_capabilities": {"example": {"repo_catalog": catalog}},
                 "picker": {
                     "restrict_to_agent_names": [
                         "claude-native-ui",
@@ -122,7 +122,7 @@ def test_automation_sandbox_repository(
             "Review the repository for stale documentation."
         )
         page.get_by_label("Run on", exact=True).click()
-        page.get_by_role("option", name="Arclet Sandbox", exact=True).click()
+        page.get_by_role("option", name="Example Sandbox", exact=True).click()
         agent_picker = page.get_by_test_id("task-agent-picker").get_by_role("button")
         expect(agent_picker).to_be_visible()
         agent_picker.click()

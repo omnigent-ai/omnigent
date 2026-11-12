@@ -230,7 +230,7 @@ describe("Automations first-visit introduction", () => {
         {
           ...fullInfo,
           branding: {
-            app_name: "Isaac",
+            app_name: "Example Assistant",
             heading: null,
             logos: { main: null, loading: null, favicon: null },
             powered_by: false,
@@ -240,7 +240,9 @@ describe("Automations first-visit introduction", () => {
       ),
     );
     expect(within(root).getByRole("dialog")).toBeVisible();
-    expect(within(root).getByText("Put recurring work on autopilot with Isaac.")).toBeVisible();
+    expect(
+      within(root).getByText("Put recurring work on autopilot with Example Assistant."),
+    ).toBeVisible();
     view.unmount();
     root.remove();
   });
