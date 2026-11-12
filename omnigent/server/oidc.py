@@ -28,6 +28,47 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
+REAUTH_MAX_AGE_ENV = "OMNIGENT_OIDC_REAUTH_MAX_AGE"
+# Nonzero: Entra caps id_token exp at auth_time + max_age. Freshness is
+# enforced by the callback's auth_time >= reauth_at check.
+DEFAULT_REAUTH_MAX_AGE_SECONDS = 300
+
+
+def parse_reauth_max_age(raw: str | None) -> int:
+    """
+    Read the ``max_age`` a forced re-auth sends, from :data:`REAUTH_MAX_AGE_ENV`.
+
+    A value that is not a positive integer falls back to the default with a
+    warning, so a typo cannot bring back a token that expires on arrival.
+
+    :param raw: The env var's value, e.g. ``"90"``; ``None`` or blank when unset.
+    :returns: Seconds to send as ``max_age``, e.g. ``300``.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return DEFAULT_REAUTH_MAX_AGE_SECONDS
+    try:
+        seconds = int(value)
+    except ValueError:
+        seconds = 0
+    if seconds <= 0:
+        _logger.warning(
+            "%s must be a positive number of seconds; using %d",
+            REAUTH_MAX_AGE_ENV,
+            DEFAULT_REAUTH_MAX_AGE_SECONDS,
+        )
+        return DEFAULT_REAUTH_MAX_AGE_SECONDS
+    return seconds
+
+
+def _parse_strict_flag(name: str) -> bool:
+    """Read an on-by-default env flag: ``0``/``false``/``no`` disable it; typos raise."""
+    raw = os.environ.get(name, "").strip().lower()
+    if raw not in {"", "1", "true", "yes", "0", "false", "no"}:
+        raise RuntimeError(f"{name} must be 1/true/yes or 0/false/no")
+    return raw not in {"0", "false", "no"}
+
+
 # ── PKCE helpers (RFC 7636) ──────────────────────────────────────
 
 
@@ -306,6 +347,17 @@ class OIDCConfig:
         the IdP; set it equal to ``session_ttl_hours`` to disable renewal.
         Renewal also needs the database-backed logout record, so a
         ``create_app`` without a ``permission_store`` never renews.
+    :param reauth_max_age_seconds: ``max_age`` sent on a forced re-auth,
+        from ``OMNIGENT_OIDC_REAUTH_MAX_AGE``, e.g. ``300``.
+    :param require_reauth: When ``False``, forced re-authentication
+        logins (CLI tickets, device consent) skip verifying the
+        id_token's ``auth_time``; they still send ``prompt=login`` and
+        ``max_age`` unless ``reauth_prompt`` is also ``False``. Validated
+        for every provider, but GitHub never forces re-authentication, so
+        it has no effect there.
+    :param reauth_prompt: When ``False``, forced re-authentication logins
+        omit ``prompt=login`` and ``max_age`` for IdPs that fail such
+        requests. Requires ``require_reauth`` to be ``False``.
     """
 
     issuer: str
@@ -331,6 +383,10 @@ class OIDCConfig:
     def session_max_lifetime_seconds(self) -> int:
         """Absolute browser-session lifetime, never below the idle window."""
         return max(self.session_max_lifetime_hours, self.session_ttl_hours) * 3600
+
+    reauth_max_age_seconds: int = DEFAULT_REAUTH_MAX_AGE_SECONDS
+    require_reauth: bool = True
+    reauth_prompt: bool = True
 
     @property
     def base_url(self) -> str:
@@ -445,6 +501,7 @@ class OIDCConfig:
         session_max_lifetime_hours = parse_session_max_lifetime_hours(
             "OMNIGENT_OIDC_SESSION_MAX_LIFETIME_HOURS", session_ttl_hours
         )
+        reauth_max_age_seconds = parse_reauth_max_age(os.environ.get(REAUTH_MAX_AGE_ENV))
         logout_redirect_uri = (
             os.environ.get("OMNIGENT_OIDC_LOGOUT_REDIRECT_URI", "").strip() or None
         )
@@ -496,6 +553,34 @@ class OIDCConfig:
                     "marker, so logins will be rejected unless "
                     "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is also set."
                 )
+
+        # Some IdPs (e.g. Cloudflare Access) omit auth_time or ignore
+        # max_age, so forced re-authentication can never be verified.
+        require_reauth = _parse_strict_flag("OMNIGENT_OIDC_REQUIRE_REAUTH")
+        # Some IdPs (e.g. GitLab) fail authorization requests that carry
+        # prompt=login or max_age, so they must not be sent at all.
+        reauth_prompt = _parse_strict_flag("OMNIGENT_OIDC_REAUTH_PROMPT")
+        if require_reauth and not reauth_prompt:
+            raise RuntimeError(
+                "OMNIGENT_OIDC_REAUTH_PROMPT=0 requires OMNIGENT_OIDC_REQUIRE_REAUTH=0: "
+                "without prompt=login the IdP cannot confirm re-authentication"
+            )
+        if not reauth_prompt and not is_github:
+            _logger.warning(
+                "OMNIGENT_OIDC_REAUTH_PROMPT is disabled: CLI, host, and "
+                "device-approval logins do not ask %s to re-authenticate, so "
+                "an existing IdP session is reused and only the consent "
+                "screen confirms the request.",
+                issuer,
+            )
+        elif not require_reauth and not is_github:
+            _logger.warning(
+                "OMNIGENT_OIDC_REQUIRE_REAUTH is disabled: CLI, host, and "
+                "device-approval logins still ask %s to re-authenticate, but "
+                "the id_token's auth_time is not verified. If the IdP reuses "
+                "its session, only the consent screen confirms the request.",
+                issuer,
+            )
 
         # Determine provider type and resolve endpoints.
         endpoints = {
@@ -557,6 +642,8 @@ class OIDCConfig:
                 allow_invites=allow_invites,
                 skip_email_verification=skip_email_verification,
                 session_max_lifetime_hours=session_max_lifetime_hours,
+                require_reauth=require_reauth,
+                reauth_prompt=reauth_prompt,
             )
 
         # Standard OIDC: fetch discovery document.
@@ -604,4 +691,7 @@ class OIDCConfig:
             skip_email_verification=skip_email_verification,
             email_claim=email_claim,
             session_max_lifetime_hours=session_max_lifetime_hours,
+            reauth_max_age_seconds=reauth_max_age_seconds,
+            require_reauth=require_reauth,
+            reauth_prompt=reauth_prompt,
         )

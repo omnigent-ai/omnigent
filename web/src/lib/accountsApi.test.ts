@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getMe, login, logout } from "./accountsApi";
+import { getMe, login, logout, signOutOfBrowserSession } from "./accountsApi";
 import { ACTIVITY_AGE_HEADER, recordActivity, resetActivityForTests } from "./activity";
 
 const fetchMock = vi.fn();
@@ -107,5 +107,29 @@ describe("activity age", () => {
 
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     expect(new Headers(init.headers).has(ACTIVITY_AGE_HEADER)).toBe(false);
+  });
+});
+
+describe("signOutOfBrowserSession", () => {
+  const originalLocation = window.location;
+  beforeEach(() => {
+    Object.defineProperty(window, "location", { configurable: true, value: { href: "" } });
+  });
+  afterEach(() => {
+    Object.defineProperty(window, "location", { configurable: true, value: originalLocation });
+  });
+
+  it("accounts mode clears the cookie, then opens the login form", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(null));
+    await signOutOfBrowserSession(true);
+    expect(fetchMock.mock.calls[0][0]).toBe("/proxy/6767/auth/logout");
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: "POST" });
+    expect(window.location.href).toBe("/proxy/6767/login");
+  });
+
+  it("OIDC follows the server's logout redirect", async () => {
+    await signOutOfBrowserSession(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(window.location.href).toBe("/proxy/6767/auth/logout");
   });
 });

@@ -53,6 +53,8 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.live_server import terminate_process
+from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import ServerRunner, server_runner
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e.conftest import (
@@ -758,3 +760,99 @@ def test_diff_endpoint_shows_git_diff_for_modified_file(
         f"  got: {diff_body['after']!r}\n"
         "The diff endpoint is not reading the current file content from disk."
     )
+
+
+@pytest.mark.min_runner_version("0.21.0")
+def test_parent_workspace_changes_survive_runner_restart(
+    tmp_path: Path, mock_llm_server_url: str
+) -> None:
+    """The real runner reconstructs sibling repositories from disk without tool hooks."""
+    workspace = tmp_path / "workspace"
+    repositories = [workspace / name for name in ("api", "web")]
+
+    def git(repository: Path, *arguments: str) -> str:
+        return subprocess.check_output(
+            ["git", "-c", "user.email=e2e@omnigent.test", "-c", "user.name=e2e", *arguments],
+            cwd=repository,
+            text=True,
+        )
+
+    for repository in repositories:
+        repository.mkdir(parents=True)
+        git(repository, "init", "-q")
+        (repository / "shared.txt").write_text(f"{repository.name} original\n")
+        (repository / "deleted.txt").write_text("original deletion\n")
+        git(repository, "add", ".")
+        git(repository, "commit", "-qm", "seed")
+    env = {
+        "OPENAI_API_KEY": "mock-key",
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+        "OMNIGENT_SKIP_ONBOARD": "1",
+        "OMNIGENT_NO_UPDATE_CHECK": "1",
+    }
+    with (
+        server_runner(tmp_path / "stack", workspace=workspace, server_env=env) as stack,
+        httpx.Client(base_url=stack.base_url, timeout=60, trust_env=False) as client,
+    ):
+        stack.start_runner(cwd=workspace, env=env)
+        session_id = _create_bound_session(
+            client,
+            live_runner_id=stack.runner_id,
+            databricks_workspace_host=None,
+            mock_llm_server_url=mock_llm_server_url,
+        )
+        for repository in repositories:
+            (repository / "shared.txt").write_text(f"{repository.name} edited\n")
+        git(repositories[0], "add", "shared.txt")
+        (repositories[0] / "deleted.txt").unlink()
+        (repositories[1] / "new.txt").write_text("new file\n")
+
+        def assert_matches_git() -> dict[str, str]:
+            response = client.get(_fs_changes_url(session_id))
+            response.raise_for_status()
+            rows = {row["path"]: row for row in response.json()["data"]}
+            expected = {
+                f"{repository.name}/{entry[3:]}": (
+                    "created"
+                    if entry[:2] == "??"
+                    else "deleted"
+                    if "D" in entry[:2]
+                    else "modified"
+                )
+                for repository in repositories
+                for entry in git(repository, "status", "--porcelain=v1", "-z").split("\0")
+                if entry
+            }
+            assert {path: row["status"] for path, row in rows.items()} == expected
+            for path, row in rows.items():
+                repository_name, filename = path.split("/", 1)
+                assert row["repository_root"] == repository_name
+                repository = workspace / repository_name
+                diff = client.get(_fs_diff_url(session_id, path))
+                diff.raise_for_status()
+                assert diff.json()["before"] == (
+                    None
+                    if row["status"] == "created"
+                    else git(repository, "show", f"HEAD:{filename}")
+                )
+                assert diff.json()["after"] == (
+                    None if row["status"] == "deleted" else (workspace / path).read_text()
+                )
+            return expected
+
+        before_restart = assert_matches_git()
+        assert len(before_restart) == 4
+        terminate_process(stack.runner)
+        poll_until(
+            lambda: not client.get(f"/v1/runners/{stack.runner_id}/status").json()["online"]
+        )
+        stack.runner = None
+        stack.start_runner(cwd=workspace, env=env)
+        bind_session_runner(client.patch, "", session_id, stack.runner_id)
+        assert assert_matches_git() == before_restart
+        git(repositories[0], "commit", "-qam", "accept edits")
+        git(repositories[1], "restore", "shared.txt")
+        (repositories[1] / "new.txt").unlink()
+        assert assert_matches_git() == {}
+        (repositories[0] / "shared.txt").write_text("next edit\n")
+        assert assert_matches_git() == {"api/shared.txt": "modified"}

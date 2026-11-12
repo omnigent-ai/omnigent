@@ -44,9 +44,11 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, TextIO
 
+import httpx
 import pytest
 
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+from tests.e2e._native_resume_helpers import poll_for_pending_elicitation
 from tests.e2e.conftest import (
     configure_mock_llm,
     get_mock_requests,
@@ -54,6 +56,8 @@ from tests.e2e.conftest import (
 )
 
 pexpect = pytest.importorskip("pexpect")
+
+from tests._helpers.terminal_screen import TerminalScreen  # noqa: E402
 
 _ASK_DEMO_DIR = Path(__file__).resolve().parents[1] / "resources" / "agents" / "ask-demo"
 _FIXTURES_DIR = Path(__file__).resolve().parents[1] / "_fixtures" / "agents"
@@ -337,9 +341,9 @@ def _wait_for_prompt_ready(
     child: Any,
     timeout: float = 30.0,
     welcome_pattern: str = "ask.demo",
-) -> None:
+) -> str:
     """
-    Wait until the REPL is ready for input.
+    Wait until the REPL is ready for input and return its local server URL.
 
     ``omnigent chat <path>`` starts a local server, waits for
     health, then launches the REPL. The welcome block
@@ -363,39 +367,40 @@ def _wait_for_prompt_ready(
         welcome block. Defaults to ``"ask.demo"`` (for the
         ``ask-demo`` fixture); pass a different pattern for
         other fixtures.
+    :returns: The local server URL printed in the banner, e.g.
+        ``"http://127.0.0.1:6767"``, for tests that act as a
+        second client.
     """
     child.expect(welcome_pattern, timeout=timeout)
+    # A non-digit terminator keeps a pty chunk boundary from truncating the port.
+    child.expect(r"(http://127\.0\.0\.1:\d+)[^\d]", timeout=timeout)
+    server_url = _strip_ansi(child.match.group(1)).strip()
     # The banner is not input-readiness. Wait for the status
     # toolbar's ``· ready`` (idle ``state: sleeping``) marker
     # so the next send() lands in prompt_toolkit's live loop
     # instead of racing ahead of it.
     child.expect(r"·\s*ready", timeout=timeout)
+    return server_url
 
 
-def _wait_for_turn_complete(child: Any, timeout: float = 45.0) -> None:
+def _wait_for_turn_complete(screen: TerminalScreen, reply: str, timeout: float = 45.0) -> None:
     """
-    Block until the current turn has finished streaming.
+    Block until the current turn has committed *reply* and the REPL is idle.
 
-    The REPL's bottom toolbar is the turn-state oracle: it reads
-    ``state: running`` (animated spinner) while a handler task is
-    in flight and flips back to ``state: sleeping`` (``· ready``)
-    once the turn fully lands. The older tests waited on a
-    ``\\d+\\.\\d+s`` decimal "elapsed" footer, but the current REPL
-    never renders one — the only elapsed readout is the integer
-    ``streaming… Ns`` segment that disappears on completion. Waiting
-    for that stale pattern times out even though the turn finished.
+    The bottom toolbar reads ``state: running`` while a handler task is in
+    flight and ``state: sleeping`` once the turn lands. prompt-toolkit repaints
+    only the toolbar cells that changed (e.g. ``state: sl\\x1b[Ceping``), so the
+    raw PTY stream need not contain the idle text; match the rendered screen.
 
-    A single ``· ready`` expect is enough: every send/approve site
-    leaves the toolbar in ``state: running`` (the turn is dispatched,
-    or an approval is pending), so the next ``· ready`` is the
-    post-turn idle settle — never a stale pre-turn toolbar. Keeping it
-    to one expect also preserves ``child.before`` as the full
-    span of the turn's rendered output, which several callers scan.
-
-    :param child: Active pexpect child.
+    :param screen: Screen attached to the REPL child right after spawning.
+    :param reply: The turn's scripted response, e.g. ``"Hello there!"``.
     :param timeout: Max seconds to wait for the turn to settle.
     """
-    child.expect(r"·\s*ready", timeout=timeout)
+    screen.wait_for(
+        lambda text: f"◆ {reply}" in text and "state: sleeping" in text,
+        timeout=timeout,
+        what=f"the turn replying {reply!r} to finish",
+    )
 
 
 def _read_pending(child: Any, seconds: float = 0.2) -> str:
@@ -735,6 +740,7 @@ def test_repl_approve_always_caches_for_later_turns(
         dimensions=(40, 120),
         timeout=_LAUNCH_TIMEOUT,
     )
+    screen = TerminalScreen(child)
     try:
         _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT)
 
@@ -745,7 +751,7 @@ def test_repl_approve_always_caches_for_later_turns(
         # Echo line confirms the REPL parsed "a" as
         # APPROVE_ALWAYS, not as a generic non-"y" refusal.
         child.expect("approved always", timeout=5)
-        _wait_for_turn_complete(child, timeout=30)
+        _wait_for_turn_complete(screen, "Hello there!", timeout=30)
 
         # Drain between turns so the next buffer is clean.
         _read_pending(child, seconds=1.5)
@@ -879,18 +885,13 @@ def test_repl_tool_call_refusal_blocks_tool(
     ap_cli: str,
     repl_env: dict[str, str],
     mock_llm_server_url: str,
+    repl_transcript: TextIO,
 ) -> None:
     """
-    TOOL_CALL ASK → explicit decline → turn aborts → tool NEVER runs.
+    Declining a tool call aborts its turn and leaves the REPL usable.
 
-    An explicit refusal (typing "n") now aborts the agent turn rather
-    than feeding a denial marker to the LLM and letting it continue.
-    The tool must never execute: its raw output must not appear in the
-    terminal or reach the mock LLM as a function_call_output.
-
-    The mock LLM is scripted to emit the ``echo`` ``function_call`` so
-    the TOOL_CALL ASK fires. (The follow-up text is never reached: the
-    turn aborts on decline before any second LLM call.)
+    The denied tool's output must never appear in the terminal or reach
+    the model. A separate user prompt must still receive its scripted reply.
     """
     _configure_mock_tool_then_text(
         mock_llm_server_url,
@@ -913,27 +914,32 @@ def test_repl_tool_call_refusal_blocks_tool(
         dimensions=(40, 120),
         timeout=_LAUNCH_TIMEOUT,
     )
+    child.logfile_read = repl_transcript
     try:
         _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT, welcome_pattern="e2e.tool.gate")
         child.send("testing456" + "\r")
         child.expect("approval required", timeout=45)
         child.send("n" + "\r")
         child.expect("refused", timeout=5)
-        # Turn is now aborted — wait for the REPL to return to idle.
-        _wait_for_turn_complete(child, timeout=30)
-        # The tool must never have run: raw echo output must not appear
-        # anywhere in the terminal buffer captured so far.
-        assert "echo: testing456" not in child.before, (
-            "Raw tool output appeared in REPL despite refusal — the tool "
-            "ran when it must not have."
-        )
-        # The mock LLM must NOT have received a second request carrying a
-        # function_call_output, because the turn was aborted before the
-        # denial reached the LLM.
         joined = _wait_for_function_call_outputs(mock_llm_server_url, timeout=5.0)
         assert "echo: testing456" not in joined, (
-            "Raw tool output leaked to the LLM despite refusal — "
+            "Raw tool output leaked to the LLM despite refusal: "
             f"function_call_outputs: {joined[:800]}"
+        )
+        # A reply to a new turn proves recovery even when the idle toolbar
+        # is repainted in fragments instead of emitting a complete marker.
+        recovery_prompt = "resume-after-tool-refusal"
+        recovery_reply = "RECOVERED_AFTER_TOOL_REFUSAL"
+        configure_mock_llm(mock_llm_server_url, [{"text": recovery_reply}], match=recovery_prompt)
+        child.send(recovery_prompt + "\r")
+        child.expect(recovery_reply, timeout=30)
+        repl_transcript.flush()
+        terminal_output = _strip_ansi(Path(repl_transcript.name).read_text())
+        assert "echo: testing456" not in terminal_output, (
+            "Raw tool output appeared in REPL despite refusal."
+        )
+        assert "tool-call-refuse-followup-marker" not in terminal_output, (
+            "The denied turn continued after refusal."
         )
     finally:
         try:
@@ -1723,6 +1729,104 @@ def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
             "the sub-agent ASK is non-interactive today.\n"
             f"Captured:\n{full_turn[:1500]}"
         )
+    finally:
+        try:
+            child.send("/quit" + "\r")
+            child.expect(pexpect.EOF, timeout=5)
+        except Exception:
+            pass
+        if child.isalive():
+            child.terminate(force=True)
+
+
+def _resolve_from_another_client(
+    http: httpx.Client, session_id: str, elicitation_id: str, action: str
+) -> httpx.Response:
+    """Resolve an elicitation through the endpoint the approval page uses."""
+    return http.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": action},
+    )
+
+
+def test_repl_ignores_unrelated_elicitation_resolved(
+    ap_cli: str,
+    repl_env: dict[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """
+    A pending policy ASK settles only through the user's verdict or another
+    client's resolution of that same elicitation.
+
+    ``response.elicitation_resolved`` fans out for every elicitation in the
+    session. An event for an earlier card (different id, here a decline) is
+    not an answer to the card in front of the user: the ASK must stay pending
+    and the gated turn must not reach the LLM. Cancelling the pending card
+    itself from another client releases it as a refusal, and the distinct
+    verdicts show which event settled the prompt. No path here approves a
+    turn, so the LLM is never called.
+    """
+    _configure_mock_text(mock_llm_server_url, ["should not be reached"], match="unrelated-resolve")
+    child = pexpect.spawn(
+        ap_cli,
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
+        env=repl_env,
+        encoding="utf-8",
+        codec_errors="replace",
+        dimensions=(40, 120),
+        timeout=_LAUNCH_TIMEOUT,
+    )
+    try:
+        server_url = _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT)
+        with httpx.Client(base_url=server_url, trust_env=False, timeout=10.0) as http:
+            # Turn 1: a real elicitation, declined at the keyboard. The session
+            # snapshot's pending_elicitations supplies each prompt's id.
+            child.send("first unrelated-resolve" + "\r")
+            child.expect("approval required", timeout=30)
+            # ``--no-session`` creates the session with the first turn. The
+            # needle-pinned snapshot polls below fail loudly if this is not it.
+            sessions = http.get("/v1/sessions", params={"visibility": "all"})
+            sessions.raise_for_status()
+            session_id = sessions.json()["data"][0]["id"]
+            prior_elicitation_id = poll_for_pending_elicitation(
+                http, conversation_id=session_id, timeout=15, needle="first unrelated-resolve"
+            )["elicitation_id"]
+            child.send("n" + "\r")
+            child.expect("refused", timeout=5)
+            child.expect(r"Denied by policy", timeout=10)
+
+            # Turn 2: pend on a second ASK and leave it unanswered.
+            child.send("second unrelated-resolve" + "\r")
+            child.expect("approval required", timeout=30)
+            pending_elicitation_id = poll_for_pending_elicitation(
+                http, conversation_id=session_id, timeout=15, needle="second unrelated-resolve"
+            )["elicitation_id"]
+            assert pending_elicitation_id != prior_elicitation_id
+
+            requests_before = len(get_mock_requests(mock_llm_server_url))
+
+            # Another client declines the DIFFERENT, prior elicitation first,
+            # then cancels the pending card; the stream preserves that order and
+            # the distinct verdicts show which event settled the prompt.
+            resolve = _resolve_from_another_client(
+                http, session_id, prior_elicitation_id, "decline"
+            )
+            assert resolve.status_code == 202, resolve.text
+            resolve = _resolve_from_another_client(
+                http, session_id, pending_elicitation_id, "cancel"
+            )
+            assert resolve.status_code == 202, resolve.text
+
+            child.expect(r"› ([^\r\n]*)\r?\n", timeout=15)
+            settlement = _strip_ansi(child.match.group(1)).strip()
+            assert settlement.startswith("cancelled elsewhere"), (
+                "Pending policy ASK was settled by the unrelated elicitation_resolved "
+                f"event instead of its own cancel; first settlement line: {settlement!r}"
+            )
+            child.expect(r"Denied by policy", timeout=15)
+            assert len(get_mock_requests(mock_llm_server_url)) == requests_before, (
+                "Gated turn reached the LLM — the pending ASK was approved without a user verdict."
+            )
     finally:
         try:
             child.send("/quit" + "\r")

@@ -219,7 +219,7 @@ async def run_benchmark(
         "backend": backend,
         "network_delay_ms": args.network_delay_ms,
     }
-    generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    generated_at = datetime.datetime.now(datetime.UTC).isoformat()
     report = build_report(
         journey_results,
         generated_at=generated_at,

@@ -6,12 +6,14 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from omnigent.runtime import pending_elicitations
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests.budgets import budget
 from tests.server.helpers import create_session_for_agent, create_test_agent
 from tests.test_kiro_native_permissions import (
     _permission_msg,
@@ -244,12 +246,27 @@ async def test_kiro_child_delivery_stays_pending_in_parent_until_receipt(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
     receipt: bool,
     disconnected: bool,
 ) -> None:
     from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions import orchestration
 
     monkeypatch.setattr(sessions, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.2)
+    grace_expired = asyncio.Event()
+    request.addfinalizer(grace_expired.set)
+
+    async def controlled_sleep(delay: float, result=None):
+        if delay == sessions._HARNESS_ELICITATION_REPARK_GRACE_S:
+            await grace_expired.wait()
+            return result
+        return await asyncio.sleep(delay, result)
+
+    # Hold abandonment cleanup until the pending-card and receipt checks finish.
+    monkeypatch.setattr(
+        orchestration, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": controlled_sleep})
+    )
     agent = await create_test_agent(client, "kiro-child-delivery")
     parent = await create_session_for_agent(client, agent["id"])
     child = (
@@ -340,7 +357,9 @@ async def test_kiro_child_delivery_stays_pending_in_parent_until_receipt(
             assert confirmed.status_code == 202
             assert pending_elicitations.count_for(child) == 0
             assert pending_elicitations.count_for(parent) == 1
-        await asyncio.gather(*sessions._deferred_elicitation_clear_tasks)
+        grace_expired.set()
+        async with asyncio.timeout(budget(5)):
+            await asyncio.gather(*sessions._deferred_elicitation_clear_tasks)
         snapshot = (await client.get(f"/v1/sessions/{parent}")).json()
         assert [entry["elicitation_id"] for entry in snapshot["pending_elicitations"]] == [
             parent_eid
@@ -350,6 +369,7 @@ async def test_kiro_child_delivery_stays_pending_in_parent_until_receipt(
         assert not parent_hook.done()
         assert (await client.get(detail_url)).json()["status"] == "resolved"
     finally:
+        grace_expired.set()
         hook.cancel()
         parent_hook.cancel()
         await asyncio.gather(hook, parent_hook, return_exceptions=True)

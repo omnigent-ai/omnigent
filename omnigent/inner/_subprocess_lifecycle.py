@@ -24,6 +24,14 @@ from . import _proc
 logger = logging.getLogger(__name__)
 
 
+async def subprocess_exited(proc: asyncio.subprocess.Process, *, timeout: float = 0.25) -> bool:
+    """Allow child-exit notification to catch up with EOF, with a bounded wait."""
+    if proc.returncode is None:
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+    return proc.returncode is not None
+
+
 async def terminate_subprocess(
     proc: Any,  # type: ignore[explicit-any]
     *,
@@ -43,11 +51,11 @@ async def terminate_subprocess(
         terminate_tree(proc)
         try:
             await asyncio.wait_for(proc.wait(), timeout=terminate_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             kill_tree(proc)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=kill_timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.error(
                     "%s pid=%s did not reap within %.2fs after SIGKILL",
                     label,
@@ -65,7 +73,7 @@ async def terminate_subprocess(
         kill_tree(proc)
         try:
             await asyncio.wait_for(proc.wait(), timeout=kill_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error(
                 "%s pid=%s remained unreaped after leader exit",
                 label,

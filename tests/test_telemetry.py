@@ -10,7 +10,11 @@ from unittest.mock import patch
 
 import pytest
 
-from omnigent.telemetry.surface import classify_surface
+from omnigent.telemetry.surface import (
+    CLIENT_SURFACE_LABEL_KEY,
+    classify_surface,
+    resolve_client_surface,
+)
 
 # ── classify_surface ────────────────────────────────────────────────────────
 
@@ -61,6 +65,31 @@ def test_classify_surface_regular_browser() -> None:
 
 
 # ── is_disabled ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("surface", ["desktop", "web", "ios", "android", "mobile", "cli"])
+def test_client_surface_header_overrides_transport_user_agent(surface: str) -> None:
+    assert (
+        resolve_client_surface({"x-omnigent-client": surface, "user-agent": "python-httpx/0.28"})
+        == surface
+    )
+
+
+def test_client_surface_inherits_for_internal_child_requests() -> None:
+    parent = {CLIENT_SURFACE_LABEL_KEY: "desktop"}
+    assert (
+        resolve_client_surface({"user-agent": "python-httpx/0.28"}, parent_labels=parent)
+        == "desktop"
+    )
+    assert resolve_client_surface({"x-omnigent-client": "ios"}, parent_labels=parent) == "ios"
+
+
+@pytest.mark.parametrize("header", [None, "unrecognised", "desktop\r\ninjected: value"])
+def test_client_surface_invalid_header_uses_user_agent(header: str | None) -> None:
+    headers = {"user-agent": "python-httpx/0.28"}
+    if header is not None:
+        headers["x-omnigent-client"] = header
+    assert resolve_client_surface(headers) == "cli"
 
 
 @pytest.fixture(autouse=True)

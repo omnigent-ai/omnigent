@@ -18,10 +18,11 @@
 
 import { withActivityAge } from "./activity";
 import { withBasePath } from "./basePath";
+import { withRoutingKey } from "./host";
 
-/** Same-origin `fetch` for the `/auth/*` routes, carrying the activity age. */
+/** Standalone `/auth/*` fetch carrying both routing and browser activity context. */
 function accountsFetch(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(withBasePath(path), withActivityAge(init));
+  return fetch(withBasePath(path), withActivityAge(withRoutingKey(init)));
 }
 
 /** Body of POST /auth/login. */
@@ -134,6 +135,20 @@ export async function logout(): Promise<void> {
     // Body wasn't JSON; keep the generic message.
   }
   throw new Error(message);
+}
+
+/**
+ * End the browser session and leave the app. Accounts mode clears the cookie and
+ * opens the login form; OIDC follows the server's /auth/logout redirect. Both
+ * navigate with a full page load so client caches reset.
+ */
+export async function signOutOfBrowserSession(accountsEnabled: boolean): Promise<void> {
+  if (accountsEnabled) {
+    await logout();
+    window.location.href = withBasePath("/login");
+    return;
+  }
+  window.location.href = withBasePath("/auth/logout");
 }
 
 /**

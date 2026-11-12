@@ -1,25 +1,8 @@
-"""Regression test — pi agent dies mid long tool-calling turn.
+"""A real Pi tool call must survive an expired stdout-idle read budget.
 
-A pi-harness turn whose tool call runs longer than the executor's
-120s stdout idle budget must survive to completion. Today it dies
-with ``inner executor error: Pi process ended without response.``:
-``omnigent/inner/pi_executor.py`` reads pi's stdout with
-``rpc.read_line(timeout=120.0)`` and treats a timeout exactly like
-EOF, so a tool that stays silent for >120s (a long build, test
-suite, download, ...) kills the turn even though the pi process is
-alive and the tool is still running.
-
-Journey (real user path, mock-scripted model):
-
-1. ``omnigent run <agent.yaml> --harness pi -p ...``
-2. the model issues one ``long_task`` tool call taking ~150s
-3. the tool finishes and the model's final answer (carrying a
-   sentinel) must reach stdout — instead the turn errors at ~120s.
-
-Mirrors ``test_yaml_hello_world.py::test_yaml_agent_with_tools[pi]``
-(the proven short-tool lane) so the only variable is tool duration.
-The long tool lives in a per-test temp module because the shared
-``sleep_tool`` example intentionally caps its duration at 10s.
+PR CI uses a short read budget and tool sleep through the real CLI, harness
+subprocess, Pi RPC and mock-provider path. Nightly CI also crosses the production
+120-second budget. Both cases observe a real idle read while the tool is running.
 """
 
 from __future__ import annotations
@@ -34,10 +17,6 @@ import pytest
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 
-# The tool sleeps longer than pi_executor's hardcoded 120s
-# ``read_line`` idle budget so the turn crosses the failure window.
-_TOOL_SLEEP_S = 150
-
 # Sentinel served only in the mock's SECOND response, i.e. only after
 # the forced ``long_task`` tool_call round-trips. Its presence in
 # stdout proves the long tool-calling turn survived to completion.
@@ -47,31 +26,28 @@ _BUG_MESSAGE = "Pi process ended without response"
 
 _PROMPT = "Run the long maintenance task now using the long_task tool."
 
-# Sleep (150s) + harness startup + two mock LLM calls, with headroom.
+# Production-duration sleep + harness startup + two mock LLM calls, with headroom.
 _RUN_TIMEOUT_SEC = 420
 
 
 @pytest.mark.timeout(600)
+@pytest.mark.parametrize(
+    ("idle_timeout_s", "tool_sleep_s"),
+    [
+        pytest.param(1.0, 4.0, id="short-idle-budget"),
+        pytest.param(None, 150.0, id="production-idle-budget", marks=pytest.mark.nightly),
+    ],
+)
 def test_pi_survives_long_tool_calling_turn(
     tmp_path: Path,
     omnigent_python: Path,
     omnigent_repo_root: Path,
     mock_credentials_env: dict[str, str],
     mock_llm_server_url: str,
+    idle_timeout_s: float | None,
+    tool_sleep_s: float,
 ) -> None:
-    """
-    A pi turn with one ~150s tool call completes instead of dying
-    with ``Pi process ended without response.`` at the 120s stdout
-    idle budget.
-
-    :param tmp_path: Per-test dir hosting the long-tool module and
-        agent YAML (the shared example tools cap sleeps at 10s).
-    :param omnigent_python: Interpreter with omnigent + pi deps.
-    :param omnigent_repo_root: Cwd for the subprocess.
-    :param mock_credentials_env: Env pointing OPENAI_* at the mock
-        LLM server (pi speaks the OpenAI API).
-    :param mock_llm_server_url: Base URL of the mock LLM server.
-    """
+    """An idle read during a real silent tool call must not end the turn."""
     skip_if_harness_cli_missing("pi")
 
     mock_model = "mock-pi-long-tool"
@@ -106,7 +82,7 @@ def test_pi_survives_long_tool_calling_turn(
 
             def long_task() -> dict:
                 (_HERE / "long_task_started").touch()
-                time.sleep({_TOOL_SLEEP_S})
+                time.sleep({tool_sleep_s})
                 (_HERE / "long_task_finished").touch()
                 return {{"status": "completed"}}
             """
@@ -131,7 +107,41 @@ def test_pi_survives_long_tool_calling_turn(
     )
 
     env = dict(mock_credentials_env)
-    # The YAML's ``callable:`` dotted path lives in tmp_path.
+    # Patch inside the real harness child, not just its spawning CLI process.
+    (tmp_path / "sitecustomize.py").write_text(
+        textwrap.dedent(
+            f"""
+            import sys
+            from pathlib import Path
+
+            if "omnigent.runtime.harnesses._runner" in sys.orig_argv and "pi" in sys.orig_argv:
+                from omnigent.inner import pi_executor
+
+                root = Path(__file__).parent
+                idle_timeout_s = {idle_timeout_s!r}
+                if idle_timeout_s is not None:
+                    pi_executor._TURN_STDOUT_IDLE_TIMEOUT_S = idle_timeout_s
+                original_read_line = pi_executor._PiRpcSession.read_line
+
+                async def observe_idle_read(self, timeout=pi_executor._TURN_STDOUT_IDLE_TIMEOUT_S):
+                    line = await original_read_line(self, timeout=timeout)
+                    if (
+                        line is None
+                        and self.process is not None
+                        and self.process.returncode is None
+                        and not self.stdout_at_eof()
+                        and (root / "long_task_started").exists()
+                        and not (root / "long_task_finished").exists()
+                    ):
+                        (root / "idle_read_observed").write_text(str(timeout))
+                    return line
+
+                pi_executor._PiRpcSession.read_line = observe_idle_read
+            """
+        ),
+        encoding="utf-8",
+    )
+    # The tool module and harness-only startup shim both live in tmp_path.
     env["PYTHONPATH"] = os.pathsep.join(p for p in (str(tmp_path), env.get("PYTHONPATH", "")) if p)
 
     result = subprocess.run(
@@ -166,10 +176,16 @@ def test_pi_survives_long_tool_calling_turn(
         f"reach the tool.\n\nstdout:\n{result.stdout!r}\n\n"
         f"stderr:\n{result.stderr!r}"
     )
+    idle_read_marker = tmp_path / "idle_read_observed"
+    assert idle_read_marker.exists(), (
+        f"No stdout-idle timeout was observed while the tool was running.\n{combined}"
+    )
+    if idle_timeout_s is not None:
+        assert float(idle_read_marker.read_text()) == idle_timeout_s
     assert _BUG_MESSAGE not in combined, (
         f"Long-tool regression: the pi turn died mid tool call with "
-        f"{_BUG_MESSAGE!r} — the 120s stdout idle budget fired while the "
-        f"{_TOOL_SLEEP_S}s tool was still running "
+        f"{_BUG_MESSAGE!r} — the stdout idle budget fired while the "
+        f"{tool_sleep_s}s tool was still running "
         f"(tool_finished={tool_finished}).\n\n"
         f"stdout:\n{result.stdout!r}\n\nstderr:\n{result.stderr!r}"
     )
@@ -178,12 +194,10 @@ def test_pi_survives_long_tool_calling_turn(
         f"long tool-calling turn (tool_finished={tool_finished}).\n\n"
         f"stdout:\n{result.stdout!r}\n\nstderr:\n{result.stderr!r}"
     )
-    # The sentinel lives only in the mock's SECOND response, served only
-    # after the ~150s ``long_task`` tool_call executes and its result is
-    # sent back — so its presence proves the turn survived end-to-end.
+    # Only the mock's response after the completed tool call carries the sentinel.
     assert _LONG_TOOL_SENTINEL in result.stdout, (
         f"Final-answer sentinel {_LONG_TOOL_SENTINEL!r} not in stdout; the "
-        f"pi harness did not complete the long ({_TOOL_SLEEP_S}s) tool "
+        f"pi harness did not complete the long ({tool_sleep_s}s) tool "
         f"round-trip (tool_finished={tool_finished}).\n\n"
         f"stdout:\n{result.stdout!r}\n\nstderr:\n{result.stderr!r}"
     )

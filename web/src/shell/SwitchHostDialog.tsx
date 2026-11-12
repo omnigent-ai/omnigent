@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { AlertTriangleIcon } from "lucide-react";
+import { AlertTriangleIcon, GitBranchIcon, MonitorCloudIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -17,6 +17,7 @@ import {
   Select,
   SelectContent,
   SelectItem,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
@@ -26,11 +27,17 @@ import { WorkspacePathField } from "./WorkspacePathField";
 import { HostLabel } from "./HostLabel";
 import { normalizeWorkspacePath } from "./NewChatDialog";
 import { useHosts } from "@/hooks/useHosts";
+import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
-import { launchRunner, updateSession } from "@/lib/sessionsApi";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
+import { randomUUID } from "@/lib/randomUUID";
+import { composeSandboxWorkspace, sandboxRepoProblem } from "@/lib/sandboxRepositories";
+import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
-import { useChatStore } from "@/store/chatStore";
+import { captureLaunchStatus, useChatStore } from "@/store/chatStore";
 
 /**
  * Move an existing session onto a different host, from the composer's
@@ -51,8 +58,13 @@ import { useChatStore } from "@/store/chatStore";
  * A directory is always required: workspaces are per-machine, so the
  * old path means nothing on the new host even when it reads the same.
  *
+ * Sandbox targets use the managed-host endpoint; the session page tracks
+ * provisioning.
+ *
  * The first available host is selected on open and its directory
  * defaulted, so the common "just move it over there" case is one click.
+ * A sandbox costs a fresh provision, so it is the default only when no
+ * other host is online.
  *
  * Step 1 landing without step 2 (a dropped connection between them)
  * leaves the session bound to nothing. The dialog stays open on that
@@ -113,6 +125,13 @@ function SupportedSwitchHostDialog({
   const markRunnerLaunched = useChatStore((s) => s.markRunnerLaunched);
 
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
+  // A new server-provisioned sandbox picked instead of a connected host; its
+  // provider is null on a server that names none.
+  const [sandboxSelected, setSandboxSelected] = useState(false);
+  const [sandboxProvider, setSandboxProvider] = useState<string | null>(null);
+  // Repository cloned into the sandbox, recomposed into `<url>[#<branch>]`.
+  const [sandboxRepoUrl, setSandboxRepoUrl] = useState("");
+  const [sandboxRepoBranch, setSandboxRepoBranch] = useState("");
   const [workspace, setWorkspace] = useState("");
   const [browsing, setBrowsing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -121,6 +140,27 @@ function SupportedSwitchHostDialog({
   // unbound, so the retry copy has to say so rather than implying the
   // old host is still serving it.
   const [stranded, setStranded] = useState(false);
+
+  // Sandbox rows appear only when the server can launch a sandbox and move a
+  // session onto it; "loading" keeps them hidden until the boot probe resolves.
+  const info = useServerInfo();
+  const moveSupported =
+    info !== "loading" && info.managed_sandboxes_enabled && info.move_to_managed_sandbox;
+  // A half-finished switch can leave the session with no host, and the server
+  // only moves a session off a host it still has.
+  const { session } = useSession(sessionId);
+  const sessionHostless = session != null && session.hostId === null;
+  const sandboxProviderRows = useMemo(() => {
+    if (info === "loading" || !moveSupported || sessionHostless) return [];
+    // Only providers the server says take a moved session (not one that manages
+    // sandbox profiles): picking another would release the runner for a move it
+    // refuses.
+    return sandboxProviderOptions(info).filter(
+      (provider) =>
+        info.sandbox_provider_capabilities?.[provider ?? info.sandbox_provider ?? ""]
+          ?.accepts_session_move === true,
+    );
+  }, [info, moveSupported, sessionHostless]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -143,12 +183,24 @@ function SupportedSwitchHostDialog({
   );
 
   // Land on a usable selection instead of an empty form: take the first
-  // available host as soon as the list arrives.
+  // available host as soon as the list arrives, else the first sandbox.
   useEffect(() => {
-    if (open && selectedHostId === null && targetHosts.length > 0) {
+    if (!open || sandboxSelected || selectedHostId !== null || hosts === undefined) return;
+    if (targetHosts.length > 0) {
       setSelectedHostId(targetHosts[0].host_id);
+    } else if (sandboxProviderRows.length > 0) {
+      setSandboxSelected(true);
+      setSandboxProvider(sandboxProviderRows[0]);
     }
-  }, [open, selectedHostId, targetHosts]);
+  }, [open, sandboxSelected, selectedHostId, hosts, targetHosts, sandboxProviderRows]);
+
+  // Drop a sandbox pick whose row is gone, e.g. once the session lost its host.
+  useEffect(() => {
+    if (sandboxSelected && !sandboxProviderRows.includes(sandboxProvider)) {
+      setSandboxSelected(false);
+      setSandboxProvider(null);
+    }
+  }, [sandboxSelected, sandboxProvider, sandboxProviderRows]);
 
   // Home listing for the chosen host. Shares the picker's query key, so
   // opening the browser afterwards costs no extra request.
@@ -189,6 +241,10 @@ function SupportedSwitchHostDialog({
   function handleOpenChange(next: boolean): void {
     if (!next) {
       setSelectedHostId(null);
+      setSandboxSelected(false);
+      setSandboxProvider(null);
+      setSandboxRepoUrl("");
+      setSandboxRepoBranch("");
       setWorkspace("");
       setBrowsing(false);
       setError(null);
@@ -213,10 +269,32 @@ function SupportedSwitchHostDialog({
     setBrowsing(true);
   }
 
+  function selectHost(hostId: string): void {
+    setSandboxSelected(false);
+    setSelectedHostId(hostId);
+  }
+
+  function selectSandbox(provider: string | null): void {
+    setSandboxSelected(true);
+    setSandboxProvider(provider);
+    // The repository fields replace the host directory, which has nothing
+    // left to browse.
+    setSelectedHostId(null);
+    setBrowsing(false);
+  }
+
+  const repoProblem = sandboxRepoProblem(sandboxRepoUrl, sandboxRepoBranch);
+  const repositoryError = repoProblem?.field === "repository" ? repoProblem.message : null;
+  const branchError = repoProblem?.field === "branch" ? repoProblem.message : null;
+  const canSwitch = sandboxSelected
+    ? repoProblem === null
+    : selectedHostId !== null && workspaceValid;
+
   async function handleSwitch(): Promise<void> {
-    if (!selectedHostId || !workspaceValid) return;
+    if (!canSwitch) return;
     setSubmitting(true);
     setError(null);
+    let released = false;
     try {
       // Drop the model override alongside the runner binding. A model id is
       // host-bound — the catalog depends on that machine's credentials — so
@@ -226,13 +304,29 @@ function SupportedSwitchHostDialog({
       // keeps this off the transcript: it's part of the move, not a /model.
       await updateSession(sessionId, { runnerId: "", modelOverride: null, silent: true });
       // From here the session is unbound until the launch lands.
+      released = true;
       setStranded(true);
-      await launchRunner(selectedHostId, sessionId, workspaceTrimmed);
-      // The new runner is booting but nothing on the wire says so yet, and
-      // no turn is in flight to imply it — without this the session reads as
-      // idle and the move lands on a silent, empty chat.
-      markRunnerLaunched();
-      addRecent(workspaceTrimmed);
+      if (sandboxSelected) {
+        // The launch's own events report progress from here, but its first ones
+        // may go to another replica's stream; the response shows where it is.
+        const showLaunch = captureLaunchStatus(sessionId);
+        const moved = await launchManagedHost(sessionId, {
+          provider: sandboxProvider,
+          workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ?? null,
+          // Route the launch by the new sandbox's host id.
+          ...(info !== "loading" && info.request_managed_sandbox_host_id
+            ? { hostId: randomUUID().replace(/-/g, "") }
+            : {}),
+        });
+        showLaunch(moved);
+      } else if (selectedHostId !== null) {
+        await launchRunner(selectedHostId, sessionId, workspaceTrimmed);
+        // The new runner is booting but nothing on the wire says so yet, and
+        // no turn is in flight to imply it — without this the session reads as
+        // idle and the move lands on a silent, empty chat.
+        markRunnerLaunched();
+        addRecent(workspaceTrimmed);
+      }
       // Close before refreshing. The session refetch reports the new host,
       // and keeping the dialog on screen for two round trips leaves it
       // sitting in "Switching…" long after the move has landed.
@@ -250,19 +344,27 @@ function SupportedSwitchHostDialog({
       void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(sessionId) });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't switch hosts. Try again.");
+      // A failed launch may have repointed or cleared the host; refetch so the
+      // picker reflects where the session is bound now.
+      if (released) void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
     } finally {
       setSubmitting(false);
     }
   }
 
-  const noTargets = hosts !== undefined && targetHosts.length === 0;
+  const noTargets =
+    hosts !== undefined && targetHosts.length === 0 && sandboxProviderRows.length === 0;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent data-testid="switch-host-dialog" className="flex flex-col gap-4 sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Switch host</DialogTitle>
-          <DialogDescription>Move this session to another connected machine.</DialogDescription>
+          <DialogDescription>
+            {sandboxProviderRows.length > 0
+              ? "Move this session to another connected machine or a new sandbox."
+              : "Move this session to another connected machine."}
+          </DialogDescription>
         </DialogHeader>
 
         {noTargets ? (
@@ -274,14 +376,33 @@ function SupportedSwitchHostDialog({
             <div className="flex flex-col gap-2">
               <span className="text-xs font-medium text-muted-foreground">Host</span>
               <Select
-                value={selectedHostId ?? ""}
-                onValueChange={(v) => setSelectedHostId(v)}
+                value={
+                  sandboxSelected ? sandboxHostChoice(sandboxProvider) : (selectedHostId ?? "")
+                }
+                onValueChange={(v) => {
+                  const provider = sandboxHostChoiceProvider(v);
+                  if (provider !== undefined) selectSandbox(provider);
+                  else selectHost(v);
+                }}
                 componentId="switch_host.host"
               >
                 <SelectTrigger className="w-full text-xs" data-testid="switch-host-select">
                   <SelectValue placeholder="Select a host" />
                 </SelectTrigger>
                 <SelectContent>
+                  {sandboxProviderRows.map((provider) => (
+                    <SelectItem
+                      key={provider ?? "default"}
+                      value={sandboxHostChoice(provider)}
+                      data-testid={`switch-host-sandbox-option-${provider ?? "default"}`}
+                    >
+                      <span className="flex items-center gap-2">
+                        <MonitorCloudIcon className="size-4 text-muted-foreground" />
+                        <span>{sandboxOptionLabel(provider)}</span>
+                      </span>
+                    </SelectItem>
+                  ))}
+                  {sandboxProviderRows.length > 0 && targetHosts.length > 0 && <SelectSeparator />}
                   {targetHosts.map((host) => (
                     <SelectItem
                       key={host.host_id}
@@ -295,43 +416,118 @@ function SupportedSwitchHostDialog({
               </Select>
             </div>
 
-            <div className="flex flex-col gap-2">
-              <span className="text-xs font-medium text-muted-foreground">Working directory</span>
-              {selectedHostId ? (
-                <>
-                  <WorkspacePathField
-                    hostId={selectedHostId}
-                    value={workspace}
-                    onChange={handleWorkspaceChange}
-                    onBrowse={() => setBrowsing((v) => !v)}
-                    onCommit={commitWorkspacePath}
-                    recent={recent}
-                    dropdownDisabled={browsing}
-                  />
-                  <WorkspacePickerDialog
-                    open={browsing}
-                    onOpenChange={setBrowsing}
-                    hostId={selectedHostId}
-                    initialPath={workspaceTrimmed}
-                    onConfirm={handleWorkspaceChange}
-                  />
-                  <p
-                    className="flex items-start gap-1.5 text-xs text-warning"
-                    data-testid="switch-host-warning"
+            {sandboxSelected ? (
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-1">
+                  <label
+                    htmlFor="switch-host-sandbox-repo"
+                    className="text-xs font-medium text-muted-foreground"
                   >
-                    <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
-                    <span>
-                      Files don't move across hosts. Anything uncommitted stays on the old machine,
-                      and the agent picks up in this directory instead.
-                    </span>
-                  </p>
-                </>
-              ) : (
-                <p className="text-xs text-muted-foreground">
-                  Select a host to choose a directory.
+                    Repository (optional)
+                  </label>
+                  <input
+                    id="switch-host-sandbox-repo"
+                    type="text"
+                    value={sandboxRepoUrl}
+                    onChange={(e) => setSandboxRepoUrl(e.target.value)}
+                    placeholder="https://github.com/org/repo"
+                    data-testid="switch-host-sandbox-repo-input"
+                    aria-invalid={repositoryError !== null || undefined}
+                    className="rounded-md border border-input aria-invalid:border-destructive bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
+                  />
+                  {repositoryError !== null ? (
+                    <p
+                      role="alert"
+                      className="text-xs text-destructive"
+                      data-testid="switch-host-sandbox-repo-error"
+                    >
+                      {repositoryError}
+                    </p>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      Cloned into the sandbox as the session's working directory. Leave blank to
+                      start in an empty sandbox.
+                    </p>
+                  )}
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label
+                    htmlFor="switch-host-sandbox-branch"
+                    className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"
+                  >
+                    <GitBranchIcon className="size-3.5" />
+                    Branch (optional)
+                  </label>
+                  <input
+                    id="switch-host-sandbox-branch"
+                    type="text"
+                    value={sandboxRepoBranch}
+                    onChange={(e) => setSandboxRepoBranch(e.target.value)}
+                    placeholder="main"
+                    data-testid="switch-host-sandbox-branch-input"
+                    aria-invalid={branchError !== null || undefined}
+                    className="rounded-md border border-input aria-invalid:border-destructive bg-background px-3 py-2 font-mono text-xs outline-none transition-colors focus-visible:border-ring"
+                  />
+                  {branchError !== null && (
+                    <p
+                      role="alert"
+                      className="text-xs text-destructive"
+                      data-testid="switch-host-sandbox-branch-error"
+                    >
+                      {branchError}
+                    </p>
+                  )}
+                </div>
+                <p
+                  className="flex items-start gap-1.5 text-xs text-warning"
+                  data-testid="switch-host-warning"
+                >
+                  <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+                  <span>
+                    Files don't move into the sandbox. Anything uncommitted stays on the old
+                    machine, and the agent picks up in the new sandbox instead.
+                  </span>
                 </p>
-              )}
-            </div>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                <span className="text-xs font-medium text-muted-foreground">Working directory</span>
+                {selectedHostId ? (
+                  <>
+                    <WorkspacePathField
+                      hostId={selectedHostId}
+                      value={workspace}
+                      onChange={handleWorkspaceChange}
+                      onBrowse={() => setBrowsing((v) => !v)}
+                      onCommit={commitWorkspacePath}
+                      recent={recent}
+                      dropdownDisabled={browsing}
+                    />
+                    <WorkspacePickerDialog
+                      open={browsing}
+                      onOpenChange={setBrowsing}
+                      hostId={selectedHostId}
+                      initialPath={workspaceTrimmed}
+                      onConfirm={handleWorkspaceChange}
+                    />
+                    <p
+                      className="flex items-start gap-1.5 text-xs text-warning"
+                      data-testid="switch-host-warning"
+                    >
+                      <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
+                      <span>
+                        Files don't move across hosts. Anything uncommitted stays on the old
+                        machine, and the agent picks up in this directory instead.
+                      </span>
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Select a host to choose a directory.
+                  </p>
+                )}
+              </div>
+            )}
 
             {/* A stranded failure reads as two separate outages — the old host
                 "stopped working" and the new one "wouldn't connect" — so lead
@@ -360,7 +556,7 @@ function SupportedSwitchHostDialog({
                   other submit button here uses. */}
               <Button
                 data-testid="switch-host-button"
-                disabled={!selectedHostId || !workspaceValid}
+                disabled={!canSwitch}
                 loading={submitting}
                 onClick={handleSwitch}
               >

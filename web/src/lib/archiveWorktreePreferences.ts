@@ -1,6 +1,6 @@
 // App-global preference (Settings › Git): remove a session's git worktree
 // when the session is archived. Unset means the user hasn't chosen yet, so the
-// first archive of a worktree session prompts (see ArchiveWorktreeDialog).
+// first archive of a worktree session prompts (see ArchivePrompt).
 
 export const DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY = "omnigent:delete-worktrees-on-archive";
 

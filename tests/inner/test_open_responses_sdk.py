@@ -910,6 +910,7 @@ class TestOpenAIClientConfig(unittest.TestCase):
             _get_openai_client()
             openai_cls.assert_called_once_with(
                 base_url="https://example.com/serving-endpoints",
+                default_headers={},
                 api_key="test-key",
                 **RetryPolicy().openai.kwargs(),
             )
@@ -933,6 +934,7 @@ class TestOpenAIClientConfig(unittest.TestCase):
             _get_openai_client()
             openai_cls.assert_called_once_with(
                 base_url="https://example.cloud.databricks.com/ai-gateway/openai/v1",
+                default_headers={},
                 api_key="dapi_test",
                 **RetryPolicy().openai.kwargs(),
             )

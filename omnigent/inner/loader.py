@@ -76,6 +76,7 @@ _OmnigentYamlLoader.add_implicit_resolver(  # type: ignore[no-untyped-call]
 def load_agent_def(
     path_or_dict: str | Path | YamlData,
     *,
+    expand_env: bool = True,
     enforce_handler_allowlist: bool = False,
 ) -> AgentDef:
     """Load an AgentDef from a YAML file path or a raw dict.
@@ -89,6 +90,8 @@ def load_agent_def(
     resolution. See :func:`_resolve_instructions` for the rules.
 
     :param path_or_dict: A YAML file path or already-parsed dict.
+    :param expand_env: Whether to expand executor auth environment references.
+        Must be ``False`` for tenant-supplied bundles.
     :param enforce_handler_allowlist: When ``True``, reject dynamic tool
         targets (including nested agent tools) and unregistered function
         policy handlers before importing or calling them. This guards the untrusted
@@ -126,6 +129,7 @@ def load_agent_def(
         _reject_unregistered_policy_handlers(data)
     return _parse_agent_def(
         data,
+        expand_env=expand_env,
         instructions_root=instructions_root,
         allow_dynamic_tools=not enforce_handler_allowlist,
     )
@@ -253,6 +257,7 @@ def _resolve_instructions(
 def _parse_agent_def(
     data: YamlData,
     *,
+    expand_env: bool,
     allow_dynamic_tools: bool,
     instructions_root: Path | None = None,
 ) -> AgentDef:
@@ -296,7 +301,7 @@ def _parse_agent_def(
     # Executor
     executor_data = data.get("executor")
     if executor_data:
-        agent.executor = _parse_executor_spec(executor_data)
+        agent.executor = _parse_executor_spec(executor_data, expand_env=expand_env)
 
     from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
 
@@ -317,11 +322,13 @@ def _parse_agent_def(
 
     # Tools
     for tname, tdata in data.get("tools", {}).items():
-        agent.tools[tname] = _parse_tool(tname, tdata, allow_dynamic_tools=allow_dynamic_tools)
+        agent.tools[tname] = _parse_tool(
+            tname, tdata, expand_env=expand_env, allow_dynamic_tools=allow_dynamic_tools
+        )
 
     # Policies
     for pname, pdata in data.get("policies", {}).items():
-        agent.policies[pname] = _parse_policy(pname, pdata)
+        agent.policies[pname] = _parse_policy(pname, pdata, expand_env=expand_env)
 
     # Memories
     for mname, mdata in data.get("memories", {}).items():
@@ -387,7 +394,9 @@ def _parse_agent_def(
 # ---------------------------------------------------------------------------
 
 
-def _parse_tool(name: str, data: str | YamlData, *, allow_dynamic_tools: bool) -> Tool:
+def _parse_tool(
+    name: str, data: str | YamlData, *, expand_env: bool, allow_dynamic_tools: bool
+) -> Tool:
     if isinstance(data, str):
         if data == "inherit":
             return InheritedTool(name=name)
@@ -517,7 +526,9 @@ def _parse_tool(name: str, data: str | YamlData, *, allow_dynamic_tools: bool) -
 
         sub_tools: dict[str, Tool] = {}
         for sname, sdata in data.get("tools", {}).items():
-            sub_tools[sname] = _parse_tool(sname, sdata, allow_dynamic_tools=allow_dynamic_tools)
+            sub_tools[sname] = _parse_tool(
+                sname, sdata, expand_env=expand_env, allow_dynamic_tools=allow_dynamic_tools
+            )
         raw_max_sessions = data.get("max_sessions")
         max_sessions: int | None = None
         if raw_max_sessions is not None:
@@ -536,7 +547,7 @@ def _parse_tool(name: str, data: str | YamlData, *, allow_dynamic_tools: bool) -
             description=data.get("description"),
             prompt=data.get("prompt"),
             tools=sub_tools,
-            executor=_parse_executor_spec(data.get("executor")),
+            executor=_parse_executor_spec(data.get("executor"), expand_env=expand_env),
             os_env=(
                 data.get("os_env")
                 if data.get("os_env") == "inherit"
@@ -580,7 +591,7 @@ def _parse_tool(name: str, data: str | YamlData, *, allow_dynamic_tools: bool) -
 # ---------------------------------------------------------------------------
 
 
-def _parse_policy(name: str, data: YamlData | str | bool | None) -> Policy:
+def _parse_policy(name: str, data: YamlData | str | bool | None, *, expand_env: bool) -> Policy:
     if not isinstance(data, dict):
         return Policy(name=name)
 
@@ -631,7 +642,7 @@ def _parse_policy(name: str, data: YamlData | str | bool | None) -> Policy:
             # `None` means no prompt was configured; PromptPolicy.evaluate()
             # fails closed in that case.
             prompt=data.get("prompt"),
-            executor=_parse_executor_spec(data.get("executor")),
+            executor=_parse_executor_spec(data.get("executor"), expand_env=expand_env),
             allow_set_labels=bool(data.get("allow_set_labels", False)),
             allowed_label_keys=(
                 [str(key) for key in data.get("allowed_label_keys", [])]
@@ -665,7 +676,9 @@ def _resolve_callable(dotted_path: str) -> DynamicCallable | None:
         return None
 
 
-def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | None:
+def _parse_executor_spec(
+    data: YamlData | str | bool | None, *, expand_env: bool
+) -> ExecutorSpec | None:
     if not data:
         return None
     if isinstance(data, str):
@@ -698,7 +711,7 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
         if isinstance(raw_auth, dict):
             from omnigent.spec.parser import _parse_executor_auth
 
-            auth = _parse_executor_auth(data, expand_env=True)
+            auth = _parse_executor_auth(data, expand_env=expand_env)
         context_files = data.get("context_files")
         if "context_files" in data and not isinstance(context_files, bool):
             raise ValueError("executor.context_files must be a boolean")

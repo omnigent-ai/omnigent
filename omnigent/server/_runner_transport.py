@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 
+from omnigent.scheduled_context import add_scheduled_run_header
+
 # Type alias: callable returning an async context manager around a
 # connected websockets client. Kept ``Any`` because the actual return
 # type lives in :mod:`websockets.asyncio.client` and varies between
@@ -25,6 +27,7 @@ def build_uds_runner(uds_path: str) -> tuple[httpx.AsyncClient, RunnerWSFactory]
         transport ignores the host portion.
     """
     client = httpx.AsyncClient(
+        event_hooks={"request": [add_scheduled_run_header]},
         transport=httpx.AsyncHTTPTransport(uds=uds_path),
         base_url="http://runner",
         timeout=httpx.Timeout(5.0, read=None),
