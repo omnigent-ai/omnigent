@@ -187,3 +187,45 @@ async def test_stop_leaves_running_session_with_fresh_runner(
     assert 200 <= resp.status_code < 300
     # No reconciliation fired: the relay cache was never written to idle.
     assert _session_status_cache.get(session_id) != "idle"
+
+
+# ── Facet 3: GET child_sessions settles orphaned "running" children ──────
+
+
+def _seed_running_child(db_uri: str, *, runner_fresh: bool) -> tuple[str, str]:
+    """Seed a parent session and a sub-agent child persisted as ``running``.
+
+    :returns: ``(parent_id, child_id)``.
+    """
+    parent_id = _seed_running_session(db_uri, runner_fresh=True)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    parent = conv_store.get_conversation(parent_id)
+    assert parent is not None
+    child = conv_store.create_conversation(
+        agent_id=parent.agent_id,
+        kind="sub_agent",
+        parent_conversation_id=parent_id,
+        title="coder:auth",
+    )
+    runner_id = f"runner_{child.id}"
+    assert conv_store.set_runner_id(child.id, runner_id)
+    conv_store.set_session_live_status(child.id, "running")
+    if runner_fresh:
+        conv_store.touch_runner_liveness([runner_id], int(time.time()))
+    _session_status_cache.pop(child.id, None)
+    return parent_id, child.id
+
+
+async def test_child_sessions_reconciles_orphaned_running_child(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Runners poll this list for in-flight sub-agents, so a child whose
+    runner is confirmed gone must read settled there too, as in the list."""
+    parent_id, child_id = _seed_running_child(db_uri, runner_fresh=False)
+
+    resp = await client.get(f"/v1/sessions/{parent_id}/child_sessions")
+    assert resp.status_code == 200
+    row = next(c for c in resp.json()["data"] if c["id"] == child_id)
+    assert row["busy"] is False
+    assert row["current_task_status"] == "completed"

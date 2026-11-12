@@ -232,6 +232,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _run_managed_launch,
     _session_is_moving,
     _session_is_starting,
+    _settle_orphaned_running_rows,
     _spawn_archive_stop,
     _validate_session_model_selection,
     ensure_runner_connected,
@@ -2730,55 +2731,20 @@ def register_core_routes(
             pull_requests = _pull_requests_from_summaries(batch.pull_request_summaries)
             # Settle orphaned running/waiting rows only after stale heartbeats
             # and a missing local cache entry justify a cross-replica probe.
-            if liveness_lookup is not None:
-                orphan_suspects = [
-                    conv
-                    for conv in list_batch
-                    if conv.agent_id is not None
-                    and conv.runner_id is not None
-                    and conv.live_status in ("running", "waiting")
-                    and _session_status_cache.get(conv.id) is None
-                    and not runner_seen_is_fresh(conv.runner_last_seen)
-                    and (
-                        permission_store is None
-                        or _permission_level_from_grants(
-                            user_id,
-                            perms_by_conv.get(conv.id, []),
-                            user_is_admin,
-                        )
-                        == LEVEL_OWNER
+            await _settle_orphaned_running_rows(
+                list_batch,
+                conversation_store=conversation_store,
+                liveness_lookup=liveness_lookup,
+                host_store=getattr(request.app.state, "host_store", None),
+                # Only an owner's read may settle a row.
+                may_settle=lambda conv, perms=perms_by_conv: (
+                    permission_store is None
+                    or _permission_level_from_grants(
+                        user_id, perms.get(conv.id, []), user_is_admin
                     )
-                ]
-                if orphan_suspects:
-                    orphan_liveness = await asyncio.to_thread(
-                        liveness_lookup, [conv.id for conv in orphan_suspects]
-                    )
-                    offline_hosts: dict[str, bool | None] = {}
-                    now = int(time.time())
-                    # Heartbeat expiry and reconnect grace can precede the hold.
-                    hold_stale_before = now - HOST_OFFLINE_HOLD_S - 2 * RUNNER_LIVENESS_TTL_S
-                    for conv in orphan_suspects:
-                        result = orphan_liveness.get(conv.id)
-                        # False means no replica has a tunnel and the heartbeat
-                        # expired, so reconnecting runners within grace survive.
-                        if result is not None and not result.runner_online:
-                            if result.host_online is False and conv.host_id is not None:
-                                # A sleeping host can resume its runner; a list read
-                                # must not end that bounded wait on another replica.
-                                if conv.host_id not in offline_hosts:
-                                    offline_hosts[conv.host_id] = await _host_row_offline(
-                                        getattr(request.app.state, "host_store", None),
-                                        conv.host_id,
-                                        updated_since=hold_stale_before,
-                                    )
-                                if offline_hosts[conv.host_id] is not False:
-                                    continue
-                            await asyncio.to_thread(
-                                reconcile_orphaned_running_status,
-                                conv.id,
-                                conversation_store,
-                                now - RUNNER_LIVENESS_TTL_S,
-                            )
+                    == LEVEL_OWNER
+                ),
+            )
             # Build items after reconciliation so each settled row reads its new
             # status straight from the (now-updated) cache.
             items.extend(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 
 from fastapi import (
     APIRouter,
@@ -22,6 +23,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
 )
@@ -42,8 +44,10 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
+from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations,
+    _settle_orphaned_running_rows,
 )
 from omnigent.server.schemas import (
     ChildSessionList,
@@ -71,8 +75,23 @@ def register_items_routes(
     agent_store: AgentStore,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
 ) -> None:
     """Register the items routes on router."""
+
+    async def _settle_children(
+        request: Request, rows: list[Conversation], parent_level: int | None
+    ) -> None:
+        """Settle orphaned ``running`` children as the session list does, so
+        the tree and runners polling this list never see a dead turn as live.
+        Only the parent's owner may settle (``None`` = permissions off)."""
+        await _settle_orphaned_running_rows(
+            rows,
+            conversation_store=conversation_store,
+            liveness_lookup=liveness_lookup,
+            host_store=getattr(request.app.state, "host_store", None),
+            may_settle=lambda _conv: parent_level is None or parent_level >= LEVEL_OWNER,
+        )
 
     @router.get(
         "/sessions/{session_id}/items",
@@ -212,7 +231,7 @@ def register_items_routes(
             raise _session_not_found()
         if descendants:
             subtree = await _list_descendant_sessions(
-                parent, limit=limit, after=after, max_depth=max_depth
+                request, parent, access.level, limit=limit, after=after, max_depth=max_depth
             )
             if subtree is not None:
                 return subtree
@@ -230,6 +249,7 @@ def register_items_routes(
             sort_by="created_at",
             title=title_filter,
         )
+        await _settle_children(request, page.data, access.level)
         data = await _child_session_summaries_from_conversations(
             page.data,
             session_id,
@@ -243,7 +263,13 @@ def register_items_routes(
         )
 
     async def _list_descendant_sessions(
-        parent: Conversation, *, limit: int, after: str | None, max_depth: int
+        request: Request,
+        parent: Conversation,
+        parent_level: int | None,
+        *,
+        limit: int,
+        after: str | None,
+        max_depth: int,
     ) -> PaginatedList | None:
         """Return a page of *parent*'s sub-agent subtree, breadth-first.
 
@@ -307,6 +333,7 @@ def register_items_routes(
                 raise StaleCursorError(after)
             start = position + 1
         window = ordered[start : start + limit]
+        await _settle_children(request, window, parent_level)
         summaries = await _child_session_summaries_from_conversations(
             window, parent.id, conversation_store, parent_ids=parent_ids
         )
