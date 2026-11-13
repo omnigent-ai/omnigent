@@ -478,7 +478,11 @@ class AcpExecutor(Executor):
         """
         self._config = config
         self._extension = extension
-        with harness_sandbox_preparation() if os_env is not None else contextlib.nullcontext():
+        with (
+            harness_sandbox_preparation()
+            if os_env is not None and (os_env.sandbox is None or os_env.sandbox.type != "none")
+            else contextlib.nullcontext()
+        ):
             self._cwd = _resolve_cwd(cwd)
         self._os_env = os_env
         # Advertise ``clientCapabilities.fs`` so the agent delegates file
@@ -582,7 +586,10 @@ class AcpExecutor(Executor):
         # been deleted after __init__, and this error flows through
         # _startup_error_message so the UI also shows the harness-log path.
         with (
-            harness_sandbox_preparation() if self._os_env is not None else contextlib.nullcontext()
+            harness_sandbox_preparation()
+            if self._os_env is not None
+            and (self._os_env.sandbox is None or self._os_env.sandbox.type != "none")
+            else contextlib.nullcontext()
         ):
             _resolve_cwd(self._cwd, session_id=self._session_id)
             # If the cwd is relative the spawn resolves it against the process cwd;
