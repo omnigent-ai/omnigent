@@ -19,6 +19,7 @@ import stat
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
@@ -58,6 +59,7 @@ from omnigent.host.workspace_tokens import mint_token
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
 from omnigent.workspace_fs import WorkspaceReader
+from tests._helpers.polling import poll_until_async
 from tests.server.routes.test_shell_permission_gate import _StubAgentStore, _StubConversationStore
 
 pytestmark = pytest.mark.asyncio
@@ -97,23 +99,38 @@ def _server_app(
     capable: bool = True,
     sandbox: str | None = "none",
     flag: bool = True,
+    side_chat: bool = False,
+    remote_host: bool = False,
 ) -> FastAPI:
     """The sessions API, with the session's host answering over an in-memory tunnel.
 
-    Each keyword can break one precondition of the server route.
+    Each keyword can break one precondition of the server route, make the
+    session a side chat of a host-bound source, or put the host's tunnel on
+    another replica.
     """
+    from fastapi import Request
+    from fastapi.responses import JSONResponse
+
+    from omnigent.errors import OmnigentError, WrongReplicaError
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import create_sessions_router
     from omnigent.spec.types import AgentSpec
+    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 
     store = _StubConversationStore()
     store.add(_SESSION)
     conv = store.get_conversation(_SESSION)
     assert conv is not None
+    if side_chat:
+        # A side chat has no host of its own; its source session owns host and workspace.
+        store.add("conv_source")
+        conv.labels = {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "conv_source"}
+        conv = store.get_conversation("conv_source")
+        assert conv is not None
     conv.host_id, conv.workspace = "host_ws", str(root)
     registry = HostRegistry()
-    if host:
+    if host and not remote_host:
         hello = HostHelloFrame(
             version="0.1.0-test",
             frame_protocol_version=1,
@@ -142,6 +159,20 @@ def _server_app(
     spec = AgentSpec(spec_version=1, os_env=os_env)
     monkeypatch.setattr(sessions_module, "_load_agent_spec_for_session", lambda *_: spec)
     app = FastAPI()
+
+    @app.exception_handler(OmnigentError)
+    async def _omnigent_error(_request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    if remote_host:
+        app.state.host_store = SimpleNamespace(get_host=lambda _host_id: object())
+        monkeypatch.setattr(
+            "omnigent.server.routes._host_launch.host_absent_error",
+            lambda _host: WrongReplicaError("host is on another replica", host_id="host_ws"),
+        )
     if flag:
         app.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_API}))
     router = create_sessions_router(
@@ -349,6 +380,35 @@ async def test_server_route_refuses_with_a_connect_error(
     assert excinfo.value.code == code
 
 
+@PROTOCOLS
+async def test_server_route_serves_a_side_chat_from_its_source_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: ProtocolType
+) -> None:
+    app = _server_app(_workspace(tmp_path), monkeypatch, side_chat=True)
+    client = _connect(app, _SERVER_BASE, protocol)
+
+    page = await client.list_directory(ListDirectoryRequest())
+
+    assert "notes.md" in {e.name for e in page.entries}
+
+
+async def test_server_route_readdresses_a_host_on_another_replica(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The REST wrong-replica error lets the client's fetch re-address, as for file reads."""
+    app = _server_app(tmp_path, monkeypatch, remote_host=True)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as http:
+        response = await http.post(
+            f"/v1/sessions/{_SESSION}/workspace"
+            "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListDirectory",
+            json={},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "wrong_replica"
+
+
 async def test_host_disconnect_ends_a_waiting_call(tmp_path: Path) -> None:
     """A call waiting on a host that drops gets an error instead of waiting out its timeout."""
     from omnigent.server.workspace_api import HostTarget, HostWorkspaceService
@@ -360,8 +420,7 @@ async def test_host_disconnect_ends_a_waiting_call(tmp_path: Path) -> None:
     service = HostWorkspaceService(HostTarget(registry, conn, str(tmp_path)))
 
     call = asyncio.create_task(service.list_directory(ListDirectoryRequest(), None))  # type: ignore[arg-type]
-    while not conn.pending_workspace_calls:
-        await asyncio.sleep(0)
+    await poll_until_async(lambda: conn.pending_workspace_calls, timeout_s=5)
     registry.deregister("host_ws", conn=conn)
 
     with pytest.raises(ConnectError) as excinfo:

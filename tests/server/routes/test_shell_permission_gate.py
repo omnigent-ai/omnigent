@@ -302,7 +302,13 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
 
     application = FastAPI()
     application.state.feature_flags = FeatureFlags(
-        frozenset({Feature.WORKSPACE_CONTENT_SEARCH, Feature.WORKSPACE_DIRECT_ACCESS})
+        frozenset(
+            {
+                Feature.WORKSPACE_CONTENT_SEARCH,
+                Feature.WORKSPACE_DIRECT_ACCESS,
+                Feature.WORKSPACE_API,
+            }
+        )
     )
 
     @application.exception_handler(OmnigentError)
@@ -1219,3 +1225,25 @@ async def test_workspace_direct_access_is_owner_only(
     assert resp.status_code == status, resp.text
     if status == 404:
         assert "host is not connected" in resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("session", "status"), [("conv_share", 403), ("conv_open", 200)])
+async def test_workspace_api_follows_the_file_read_gate(
+    client: httpx.AsyncClient, session: str, status: int
+) -> None:
+    """A view-only collaborator reads the workspace API only where files are shared."""
+    resp = await client.post(
+        f"/v1/sessions/{session}/workspace"
+        "/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadFile",
+        headers={
+            "X-Forwarded-Email": "viewer@example.com",
+            "Content-Type": "application/connect+json",
+        },
+        content=b"\x00\x00\x00\x00\x02{}",  # one enveloped Connect message
+    )
+
+    assert resp.status_code == status, resp.text
+    if status == 200:
+        # Past the gate; this harness has no host, so the stream ends with that error.
+        assert b"unavailable" in resp.content

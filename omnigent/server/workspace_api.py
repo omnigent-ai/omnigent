@@ -84,7 +84,9 @@ class HostWorkspaceService:
 
     async def _unary(self, method: str, request: Message) -> bytes:
         messages = [message async for message in self._forward(method, request)]
-        return messages[0] if messages else b""
+        if not messages:
+            raise ConnectError(Code.INTERNAL, "The session's host sent no response")
+        return messages[0]
 
     async def _forward(self, method: str, request: Message) -> AsyncIterator[bytes]:
         """Send one call to the host and yield its serialized responses."""
@@ -94,8 +96,7 @@ class HostWorkspaceService:
         request_id = secrets.token_hex(8)
         replies: asyncio.Queue[HostWorkspaceReplyFrame] = asyncio.Queue()
         target.host.pending_workspace_calls[request_id] = replies
-        # ponytail: a caller that disconnects mid-stream leaves the host reading
-        # to the end (at most the 10 MiB read cap); add a cancel frame if needed.
+        # A caller disconnect doesn't stop the host's read (bounded by the 10 MiB cap).
         try:
             call = HostWorkspaceCallFrame(
                 request_id, target.workspace, method, request.SerializeToString()

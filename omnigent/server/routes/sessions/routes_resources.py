@@ -2818,8 +2818,10 @@ def register_resources_routes(
         """Serve the workspace API to any client, answered by the session's host.
 
         Same read gate as the file routes; the API never takes absolute paths.
-        Unconfined sessions only, because the host applies no sandbox's hidden
-        paths. Refusals after authorization are Connect errors.
+        Side chats and sub-agents use the host and workspace of the session that
+        owns them. Unconfined sessions only, because the host applies no sandbox's
+        hidden paths. A host on another replica gets the REST wrong-replica error,
+        so the client's fetch re-addresses it; other refusals are Connect errors.
         """
         from connectrpc.code import Code
         from connectrpc.errors import ConnectError
@@ -2827,7 +2829,10 @@ def register_resources_routes(
         from omnigent.api.workspace.v1alpha1.workspace_connect import (
             WorkspaceServiceASGIApplication,
         )
+        from omnigent.errors import WrongReplicaError
         from omnigent.host.frames import CAP_WORKSPACE_API
+        from omnigent.runner.routing import routing_host_session
+        from omnigent.server.routes import _host_launch
         from omnigent.server.workspace_api import (
             ConnectCallResponse,
             HostTarget,
@@ -2838,10 +2843,16 @@ def register_resources_routes(
         if not flags.enabled(Feature.WORKSPACE_API):
             raise HTTPException(status_code=404, detail="The workspace API is disabled")
         conv = await _authorize_browse_read(session_id, request)
-        host = (
-            host_registry.get(conv.host_id) if host_registry is not None and conv.host_id else None
-        )
-        reach = await _environment_reach_for_session(conv) if host is not None else None
+        owner = await asyncio.to_thread(routing_host_session, conv, conversation_store) or conv
+        host_id = owner.host_id
+        host = host_registry.get(host_id) if host_registry is not None and host_id else None
+        host_store = getattr(request.app.state, "host_store", None)
+        if host is None and host_id and host_store is not None:
+            record = await asyncio.to_thread(host_store.get_host, host_id)
+            absent = _host_launch.host_absent_error(record) if record is not None else None
+            if isinstance(absent, WrongReplicaError):
+                raise absent
+        reach = await _environment_reach_for_session(owner) if host is not None else None
         target: HostTarget | ConnectError
         if host is None or host_registry is None:
             target = ConnectError(Code.UNAVAILABLE, "The session's host is not connected")

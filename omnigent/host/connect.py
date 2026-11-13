@@ -6181,7 +6181,7 @@ class HostProcess:
         elif isinstance(frame, HostWorkspaceCallFrame):
             from omnigent.host.workspace_service import serve_tunnel_call
 
-            # Each response message goes out as soon as the service yields it.
+            # Reply per message so a long ReadFile stays within the server's per-reply timeout.
             async for reply in serve_tunnel_call(self._workspace_reader, frame):
                 await self._send_text(ws, self._encode_frame(reply))
         elif isinstance(frame, HostFsRequestFrame):
