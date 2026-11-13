@@ -1,6 +1,6 @@
 // The embedded browser's Reload icon spins until the reloaded page arrives.
-// A localhost fixture holds each response, so the spinner is checked while the
-// reload request is still pending. Run as described in e2e/README.md.
+// A localhost fixture holds each response until the test releases it, so the
+// spinner is checked while the request is pending. See e2e/README.md to run.
 
 "use strict";
 
@@ -19,21 +19,20 @@ const {
 } = require("./desktopDesignPromptHarness");
 
 const deps = desktopDepsAvailable();
-const RESPONSE_DELAY_MS = 3_000;
+// Long enough for a viewer to see the spin in a retained recording.
+const RECORDING_HOLD_MS = 3_000;
 
-/** A localhost page server that holds every response for `RESPONSE_DELAY_MS`. */
-async function startSlowPageFixture() {
-  const state = { requests: 0, pending: 0 };
+/** A localhost page server that holds each response until `release()`. */
+async function startHeldPageFixture() {
+  const state = { requests: 0, held: [] };
   const server = http.createServer((request, response) => {
     if (request.url !== "/") {
       response.writeHead(404).end();
       return;
     }
     state.requests += 1;
-    state.pending += 1;
     const loadNumber = state.requests;
-    setTimeout(() => {
-      state.pending -= 1;
+    state.held.push(() => {
       response.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",
@@ -41,8 +40,8 @@ async function startSlowPageFixture() {
       response.end(`<!doctype html><title>Slow preview</title>
 <body style="margin:0;padding:32px;font:22px system-ui;background:#f4f6fa;color:#17243a">
 <h1>Slow preview</h1><p id="load" style="font-size:40px">Load #${loadNumber}</p>
-<p>This server waits ${RESPONSE_DELAY_MS / 1000} seconds before every response.</p></body>`);
-    }, RESPONSE_DELAY_MS);
+<p>This server holds every response until the test releases it.</p></body>`);
+    });
   });
   await new Promise((resolve) => {
     server.listen(0, "127.0.0.1", resolve);
@@ -50,6 +49,9 @@ async function startSlowPageFixture() {
   return {
     url: `http://localhost:${server.address().port}/`,
     state,
+    release: () => {
+      for (const respond of state.held.splice(0)) respond();
+    },
     close: () =>
       new Promise((resolve) => {
         server.closeAllConnections?.();
@@ -74,7 +76,7 @@ describe(
         scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-reload-spinner-"));
         recordDir = process.env.OMNIGENT_DESKTOP_RECORD_DIR || path.join(scratch, "recordings");
         fs.mkdirSync(recordDir, { recursive: true });
-        fixture = await startSlowPageFixture();
+        fixture = await startHeldPageFixture();
         backend = await startDesignBackend(scratch);
         ({ desktop } = await launchThisMachineDesktop({
           backend,
@@ -101,6 +103,7 @@ describe(
         await stopCapture();
         await desktop?.electronApp.close();
       } finally {
+        fixture?.release();
         await Promise.all([fixture?.close(), backend?.close()]);
         if (desktop) fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
         if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
@@ -130,6 +133,11 @@ describe(
       await window.keyboard.press("Enter");
       mark("address submitted");
 
+      await eventually(() => fixture.state.held.length === 1, "first request held");
+      await spinning.waitFor({ timeout: 5_000 });
+      mark("first load spinning");
+      await holdForRecording(RECORDING_HOLD_MS);
+      fixture.release();
       const page = await eventually(
         () =>
           electronApp
@@ -143,26 +151,25 @@ describe(
       mark("first load shown");
       await holdForRecording(2_000);
 
-      const clickedAt = Date.now();
       await reload.click();
-      await spinning.waitFor({ timeout: 2_000 });
+      await spinning.waitFor({ timeout: 5_000 });
       mark("reload clicked, spinning");
       await eventually(
-        () => fixture.state.requests === 2 && fixture.state.pending === 1,
-        "reload request reached the slow server",
+        () => fixture.state.requests === 2 && fixture.state.held.length === 1,
+        "reload request held by the server",
       );
       assert.equal(await reload.getAttribute("aria-busy"), "true");
-      // Check again a second before the held response is due.
       await window.waitForTimeout(
-        Math.max(0, RESPONSE_DELAY_MS - 1_000 - (Date.now() - clickedAt)),
+        process.env.OMNIGENT_DESKTOP_RECORD_DIR ? RECORDING_HOLD_MS : 500,
       );
-      assert.equal(fixture.state.pending, 1, "the reload response is still held");
       assert.equal(await spinning.count(), 1, "the icon keeps spinning while the page loads");
+      assert.equal(await reload.isEnabled(), true, "the page can be reloaded again mid-load");
 
+      mark("reload response released");
+      fixture.release();
       await page.locator("#load", { hasText: "Load #2" }).waitFor({ timeout: 20_000 });
       await spinning.waitFor({ state: "detached", timeout: 5_000 });
       mark("reloaded, stopped");
-      assert.equal(fixture.state.pending, 0);
       assert.equal(await reload.getAttribute("aria-busy"), "false");
       await holdForRecording(2_500);
     });
