@@ -9,8 +9,8 @@ import httpx
 
 from omnigent.entities.conversation import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.runner.session_requests import normalize_session_id
 from omnigent.server.auth import LEVEL_OWNER
+from omnigent.session_host import normalize_session_id
 from omnigent.stores.conversation_store import PINNED_LABEL_KEY, PROJECT_LABEL_KEY
 from omnigent.tools.builtins.session_projects import (
     MAX_LISTED_SESSIONS,
