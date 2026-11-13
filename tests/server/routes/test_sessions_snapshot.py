@@ -2571,8 +2571,10 @@ async def test_session_snapshot_fills_cold_claude_catalog_from_host(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("inherited_host", [False, True])
 async def test_session_snapshot_fills_cold_pi_catalog_from_host(
     monkeypatch: pytest.MonkeyPatch,
+    inherited_host: bool,
 ) -> None:
     """
     A cold pi-native catalog falls back to the session's host.
@@ -2615,16 +2617,26 @@ async def test_session_snapshot_fills_cold_pi_catalog_from_host(
         id=session_id,
         created_at=1,
         updated_at=1,
-        root_conversation_id=session_id,
+        root_conversation_id="parent" if inherited_host else session_id,
+        parent_conversation_id="parent" if inherited_host else None,
+        kind="sub_agent" if inherited_host else "default",
         agent_id="ag_test",
-        host_id="host_abc",
+        host_id=None if inherited_host else "host_abc",
         labels={
             _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._PI_NATIVE_WRAPPER_LABEL_VALUE,
         },
     )
+    parent = Conversation(
+        id="parent",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="parent",
+        host_id="host_abc",
+        agent_id="ag_test",
+    )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
-        conversations={session_id: conv},
+        conversations={session_id: conv, "parent": parent},
     )
 
     first = await _get_session_snapshot(

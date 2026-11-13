@@ -13986,6 +13986,7 @@ async def _fetch_model_options(
     conv: Conversation,
     agent_store: AgentStore | None = None,
     agent: Agent | None = None,
+    conversation_store: ConversationStore | None = None,
 ) -> list[dict[str, Any]]:
     """
     Resolve the Web UI model-picker options for a native session.
@@ -14020,6 +14021,7 @@ async def _fetch_model_options(
         from the runtime globals when ``None``.
     :param agent: The bound agent row when the caller already read it, so the
         harness check does not read it again.
+    :param conversation_store: Store for resolving a child's inherited host in the background.
     :returns: Model options, or ``[]`` when the session has no model picker or
         the runner-owned options are not yet available.
     """
@@ -14032,10 +14034,16 @@ async def _fetch_model_options(
             return pushed
         # After server restart, refill from the host so a paused session can
         # select a model before its extension wakes and pushes a fresh catalog.
-        if conv.host_id is not None and session_id not in _model_options_inflight:
-            task = asyncio.create_task(
-                _load_model_options_from_host(session_id, conv.host_id, "pi-native")
-            )
+        if session_id not in _model_options_inflight:
+
+            async def _load_pi_host_options() -> None:
+                host_id = conv.host_id
+                if host_id is None and conversation_store is not None:
+                    host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+                if host_id is not None:
+                    await _load_model_options_from_host(session_id, host_id, "pi-native")
+
+            task = asyncio.create_task(_load_pi_host_options())
             _model_options_inflight[session_id] = task
 
             def _clear_pi_host_options_inflight(_task: asyncio.Task[None]) -> None:
@@ -14734,7 +14742,12 @@ async def _get_session_snapshot(
             llm_model = conv.model_override or catalog.get("default_model")
     else:
         model_options = await _fetch_model_options(
-            runner_client, session_id, conv, agent_store, agent=agent
+            runner_client,
+            session_id,
+            conv,
+            agent_store,
+            agent=agent,
+            conversation_store=conv_store,
         )
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
