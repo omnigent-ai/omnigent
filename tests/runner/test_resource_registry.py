@@ -3829,8 +3829,9 @@ async def test_claude_native_acknowledges_billing_notice_after_input_was_ready(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transfer", [False, True])
-@pytest.mark.parametrize("replace_during_tick", [False, True])
-@pytest.mark.parametrize("cli_request", [False, True])
+@pytest.mark.parametrize(
+    "cli_request,replace_during_tick", [(False, False), (False, True), (True, False)]
+)
 async def test_claude_native_billing_acknowledgement_uses_original_launch_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

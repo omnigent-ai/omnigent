@@ -5186,11 +5186,25 @@ def test_augment_claude_args_preserves_settings_like_option_values(tmp_path: Pat
     assert settings["hooks"]["PreToolUse"]
 
 
-@pytest.mark.parametrize("flag", ["--system-prompt", "--name", "--agent-name"])
-def test_pop_caller_settings_preserves_option_values(flag: str) -> None:
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--system-prompt",
+        "--name",
+        "--agent-name",
+        "--append-subagent-system-prompt",
+        "--plan-mode-instructions",
+    ],
+)
+def test_pop_caller_settings_preserves_option_values(flag: str, tmp_path: Path) -> None:
     literal = '--settings={"env":{"EXAMPLE_KEY":"value"}}'
     args = [flag, literal]
     assert claude_native_bridge._pop_caller_settings(args, workspace=None) == (args, [])
+    baseline = tmp_path / "baseline.json"
+    output = tmp_path / "output.json"
+    args = [flag, "--settings", str(baseline), "--settings", str(baseline)]
+    claude_native_bridge._replace_framework_settings(args, baseline, output)
+    assert args == [flag, "--settings", str(baseline), "--settings", str(output)]
 
 
 @pytest.mark.parametrize("flag", ["disableAllHooks", "allowManagedHooksOnly"])
