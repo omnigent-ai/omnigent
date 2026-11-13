@@ -1988,15 +1988,6 @@ def register_events_routes(
             await _require_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
-            control_runner = await _get_runner_client(
-                session_id, runner_router, conversation=conv, for_control=True
-            )
-            # Shared-session control follows the runner's tunnel. Its host can
-            # reconnect elsewhere; only the owner needs host-directed termination.
-            if control_runner is None or await _owns_host_runner(conv, conversation_store):
-                await _raise_if_runner_on_another_replica(
-                    conv, request.app.state, conversation_store
-                )
         if body.type in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE):
             startup = getattr(request.app.state, "startup_inputs", None)
             if startup is not None:
@@ -2098,6 +2089,15 @@ def register_events_routes(
                 )
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
+            control_runner = await _get_runner_client(
+                session_id, runner_router, conversation=conv, for_control=True
+            )
+            # Shared-session control follows the runner's tunnel. Its host can
+            # reconnect elsewhere; only the owner needs host-directed termination.
+            if control_runner is None or await _owns_host_runner(conv, conversation_store):
+                await _raise_if_runner_on_another_replica(
+                    conv, request.app.state, conversation_store
+                )
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
             # Harness-agnostic forward: the runner kills the external
