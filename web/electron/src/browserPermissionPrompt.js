@@ -151,7 +151,7 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
       // The security-key notice reports a request still in progress, so focus moving to
       // another app, the page or another conversation leaves it open.
       if (kind === "permission") popup.on("blur", close);
-      popup.webContents.on("render-process-gone", close);
+      popup.webContents.on("render-process-gone", hidden);
       popup.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
       popup.webContents.on("will-navigate", (event) => event.preventDefault());
       popup.webContents.on("will-frame-navigate", (event) => event.preventDefault());
@@ -162,7 +162,7 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
         position();
         popup.show();
       });
-      void popup.loadFile(promptPage).catch(close);
+      void popup.loadFile(promptPage).catch(hidden);
     });
     if (prompts.has(parent)) prompts.get(parent).result = result;
     return result;

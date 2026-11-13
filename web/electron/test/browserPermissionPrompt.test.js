@@ -248,6 +248,7 @@ describe("browser permission popover", () => {
         cookieImport: false,
       });
       const wait = async () => {
+        await tick();
         mock.timers.tick(SHOW_DELAY_MS);
         await tick();
       };
@@ -284,6 +285,21 @@ describe("browser permission popover", () => {
       h.parent.webContents.emit("did-stop-loading");
       await wait();
       assert.equal(h.windows.length, beforeNavigation + 1, "the notice returns after navigation");
+      const beforeFailure = h.windows.length;
+      const failedLoad = mock.method(Window.prototype, "loadFile", () =>
+        Promise.reject(new Error("popup failed to load")),
+      );
+      h.windows.at(-1).webContents.emit("render-process-gone");
+      await tick();
+      assert.equal(h.windows.length, beforeFailure, "renderer failure waits before retrying");
+      await wait();
+      assert.equal(h.windows.length, beforeFailure + 1);
+      assert.equal(h.windows.at(-1).destroyed, true, "failed page load is suppressed");
+      await wait();
+      assert.equal(h.windows.length, beforeFailure + 2, "each failed load waits before retrying");
+      failedLoad.mock.restore();
+      await wait();
+      assert.equal(h.windows.length, beforeFailure + 3, "notice recovers after load succeeds");
       h.windows.at(-1).emit("blur");
       await wait();
       assert.equal(h.windows.at(-1).destroyed, false, "focus leaving keeps the notice");
@@ -294,6 +310,7 @@ describe("browser permission popover", () => {
       assert.equal(h.windows.at(-1).destroyed, true);
       assert.equal(h.windows.length, beforeDismiss, "explicit dismissal does not retry");
     } finally {
+      mock.restoreAll();
       mock.timers.reset();
     }
   });
@@ -432,6 +449,7 @@ describe("permission popover page", () => {
     for (const label of ["Allow once", "Always allow", "Deny"]) assert.ok(html.includes(label));
     assert.match(html, /default-src 'none'/);
     assert.match(html, /<main[^>]+\bhidden>/);
+    assert.match(html, /aria-label="Dismiss permission request"/);
     assert.doesNotMatch(html, /Okta Verify|Only allow sites you trust|Always allow and reload/);
   });
 
@@ -486,6 +504,7 @@ describe("permission popover page", () => {
       await tick();
       assert.equal(h.elements.get("prompt").hidden, false);
       assert.equal(h.elements.get("heading").textContent, "Use your security key");
+      assert.equal(h.elements.get("close").ariaLabel, "Dismiss security key notice");
       assert.match(h.elements.get("description").textContent, /touch it to continue/);
       assert.equal(h.elements.get("origin").textContent, ORIGIN);
       assert.equal(h.elements.get("permission-choices").hidden, true);

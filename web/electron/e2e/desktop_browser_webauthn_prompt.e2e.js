@@ -140,9 +140,11 @@ it(
 
       await notice.getByRole("button", { name: "Open in browser" }).click();
       await eventually(() => notice.isClosed(), "the notice to close");
-      assert.deepEqual(await electronApp.evaluate(() => [...globalThis.fakeBrowserOpened]), [
-        verifyUrl,
-      ]);
+      const opened = await eventually(async () => {
+        const urls = await electronApp.evaluate(() => [...globalThis.fakeBrowserOpened]);
+        return urls.length > 0 && urls;
+      }, "the system browser handoff");
+      assert.deepEqual(opened, [verifyUrl]);
       assert.equal(await requestState(), "pending", "browser handoff leaves the request running");
       await pause();
     } finally {

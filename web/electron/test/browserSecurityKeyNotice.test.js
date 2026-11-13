@@ -169,6 +169,8 @@ describe("security-key notice for embedded browser pages", () => {
     await h.wait();
     h.prompts[0].choose("suppressed");
     await flush();
+    assert.equal(h.prompts.length, 1, "suppression does not reopen in a microtask loop");
+    await h.wait();
     assert.equal(h.prompts.length, 2);
     assert.equal(h.prompts[1].options.kind, "security-key");
     visible = false;

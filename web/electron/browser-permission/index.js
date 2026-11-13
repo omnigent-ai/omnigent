@@ -13,6 +13,7 @@ function choose(choice) {
 
 function showSecurityKey(cookieImport) {
   document.title = "Security key";
+  document.getElementById("close").ariaLabel = "Dismiss security key notice";
   document.getElementById("heading").textContent = "Use your security key";
   document.getElementById("description").textContent =
     "Insert your security key and touch it to continue. Built-in biometrics and passkeys saved on this device can't be used here.";

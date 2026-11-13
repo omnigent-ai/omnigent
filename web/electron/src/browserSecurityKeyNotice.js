@@ -45,7 +45,10 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
       .then((choice) => {
         if (shown !== controller) return;
         shown = null;
-        if (choice === "suppressed") return show();
+        if (choice === "suppressed") {
+          timer = setTimeout(show, SHOW_DELAY_MS);
+          return;
+        }
         const url = contents.getURL();
         if (choice !== "open-in-browser" || pageOrigin(url) !== origin) return;
         // The page is still waiting if the system browser fails to open, so offer the notice again.
