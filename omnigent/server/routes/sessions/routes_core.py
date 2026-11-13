@@ -295,7 +295,7 @@ from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.session_pull_request_store import SessionSummary
-from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_surface
+from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_session_surface
 from omnigent.util.claude_launch_args import (
     claude_legacy_launch_prompt,
     without_claude_session_id_arg,
@@ -1963,7 +1963,7 @@ def register_core_routes(
             update={
                 "labels": {
                     **parsed_metadata.labels,
-                    CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(
+                    CLIENT_SURFACE_LABEL_KEY: resolve_session_surface(
                         request.headers,
                         parent_labels=parent_conv.labels if parent_conv is not None else None,
                         requested_labels=parsed_metadata.labels,
@@ -5150,8 +5150,8 @@ def register_core_routes(
         # which the store applies AFTER the drop so the opt-in wins.
         # Internal forks (TUI /fork, codex bypass) keep the source's surface.
         extra_labels: dict[str, str] = {
-            CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(
-                request.headers, requested_labels=source.labels
+            CLIENT_SURFACE_LABEL_KEY: resolve_session_surface(
+                request.headers, source_labels=source.labels
             )
         }
         if body.codex_bypass_sandbox:

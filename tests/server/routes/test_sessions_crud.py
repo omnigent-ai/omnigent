@@ -110,28 +110,30 @@ async def test_native_clear_replacement_keeps_creating_surface(
     assert replacement is not None
     assert replacement.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
 
-    # A non-Omnigent caller can't claim a surface through the body label.
+    # A non-Omnigent caller can't claim a surface through the body label; curl is main's web.
     response = await client.post("/v1/sessions", json=body, headers={"User-Agent": "curl/8"})
     assert response.status_code == 201, response.text
     scripted = store.get_conversation(response.json()["id"])
     assert scripted is not None
-    assert scripted.labels[CLIENT_SURFACE_LABEL_KEY] == "script"
+    assert scripted.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
 
 
+@pytest.mark.parametrize("source_surface", ["desktop", "web"])
 async def test_internal_fork_keeps_source_surface(
     client: httpx.AsyncClient,
     db_uri: str,
+    source_surface: str,
 ) -> None:
-    """A TUI ``/fork`` from the runner keeps the desktop source's surface."""
+    """A TUI ``/fork`` from the runner keeps the source's surface."""
     from omnigent.telemetry.request_headers import client_user_agent
 
     store = SqlAlchemyConversationStore(db_uri)
-    client.headers["X-Omnigent-Client"] = "desktop"
+    client.headers["X-Omnigent-Client"] = source_surface
     agent = await create_test_agent(client, name="fork-surface")
     source_id = agent["_session_id"]
     source = store.get_conversation(source_id)
     assert source is not None
-    assert source.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+    assert source.labels[CLIENT_SURFACE_LABEL_KEY] == source_surface
     del client.headers["X-Omnigent-Client"]
 
     runner_ua = {"User-Agent": client_user_agent().replace("omnigent-cli/", "omnigent-runner/")}
@@ -139,16 +141,59 @@ async def test_internal_fork_keeps_source_surface(
     assert fork.status_code == 201, fork.text
     fork_row = store.get_conversation(fork.json()["id"])
     assert fork_row is not None
-    assert fork_row.labels[CLIENT_SURFACE_LABEL_KEY] == "desktop"
+    assert fork_row.labels[CLIENT_SURFACE_LABEL_KEY] == source_surface
 
-    # A script's fork is labeled by its own User-Agent, not the source's surface.
+    # A curl fork is labeled by its own User-Agent (main's web), not the source's surface.
     scripted = await client.post(
         f"/v1/sessions/{source_id}/fork", json={}, headers={"User-Agent": "curl/8"}
     )
     assert scripted.status_code == 201, scripted.text
     scripted_row = store.get_conversation(scripted.json()["id"])
     assert scripted_row is not None
-    assert scripted_row.labels[CLIENT_SURFACE_LABEL_KEY] == "script"
+    assert scripted_row.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
+
+
+# origin/main's gateway name for a session created by each request shape with no
+# originating session. Every shape here must still get it.
+MAIN_GATEWAY_BY_REQUEST_SHAPE = [
+    ("omnigent-runner/0.22.0 python-httpx/0.28.1", "omnigent-cli"),
+    ("omnigent-host/0.22.0 python-httpx/0.28.1", "omnigent-cli"),
+    ("omnigent-harness/0.22.0 (claude-sdk) python-httpx/0.28.1", "omnigent-cli"),
+    ("omnigent-cli/0.22.0 python-httpx/0.28.1", "omnigent-cli"),
+    ("omnigent-client/0.22.0 python-httpx/0.28.1", "omnigent-cli"),
+    ("omnigent-slack/0.1.0 python-httpx/0.28.1", "omnigent-cli"),
+    ("python-httpx/0.28.1", "omnigent-cli"),
+    ("Python-urllib/3.12", "omnigent-web"),
+    ("curl/7.68.0", "omnigent-web"),
+    ("node", "omnigent-web"),
+    ("Bun/1.3.11", "omnigent-web"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/124.0 Safari/537.36", "omnigent-web"),
+    ("Mozilla/5.0 (Macintosh) Electron/31.0.0", "omnigent-desktop"),
+]
+
+
+@pytest.mark.parametrize(("user_agent", "gateway_surface"), MAIN_GATEWAY_BY_REQUEST_SHAPE)
+async def test_session_gateway_name_matches_main_per_request_shape(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    user_agent: str,
+    gateway_surface: str,
+) -> None:
+    """The gateway name a create-session request gets is main's, for every request shape."""
+    from omnigent.databricks_ai_gateway import CLIENT_SURFACES_HEADER, gateway_attribution_headers
+
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client, name="gateway-shape")
+    response = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"]}, headers={"User-Agent": user_agent}
+    )
+    assert response.status_code == 201, response.text
+    row = store.get_conversation(response.json()["id"])
+    assert row is not None
+    attribution = gateway_attribution_headers(
+        "codex", client_surface=row.labels[CLIENT_SURFACE_LABEL_KEY]
+    )
+    assert attribution[CLIENT_SURFACES_HEADER] == gateway_surface
 
 
 async def test_list_sessions_empty(client: httpx.AsyncClient) -> None:

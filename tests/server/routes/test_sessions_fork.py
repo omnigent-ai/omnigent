@@ -1823,7 +1823,7 @@ async def test_fork_codex_bypass_stamps_label_on_codex_target(
     extra = conv_store.fork_calls[0]["extra_labels"]
     assert extra == {
         "omnigent.codex_native.bypass_sandbox": "1",
-        "omnigent.client_surface": "script",
+        "omnigent.client_surface": "web",
     }, f"bypass opt-in must stamp the codex bypass label, got {extra!r}"
 
 
@@ -2386,7 +2386,7 @@ async def test_fork_managed_launches_its_requested_host_id(
     # fork can't return the row without the id the caller routes it by.
     assert conv_store.fork_calls[0]["extra_labels"] == {
         REQUESTED_HOST_ID_LABEL_KEY: host_id,
-        "omnigent.client_surface": "script",
+        "omnigent.client_surface": "web",
     }
     assert conv_store.label_writes == [(body["id"], {REQUESTED_HOST_ID_LABEL_KEY: host_id})]
 

@@ -23,6 +23,10 @@ CLIENT_SURFACES = frozenset(
         "slack",
     }
 )
+# Surfaces a session may store as its ``omnigent.client_surface`` label. Internal
+# components and ``script`` never are: their sessions take the originating surface,
+# and ``script`` is stored as ``web``, as on main.
+SESSION_SURFACES = frozenset({"web", "desktop", "ios", "android", "mobile", "cli", "sdk", "slack"})
 # Omnigent components acting for a session another surface created.
 _INTERNAL_SURFACES = frozenset({"runner", "host", "harness"})
 # User-Agent product tokens Omnigent's own Python clients send, e.g.
@@ -37,36 +41,85 @@ _OMNIGENT_USER_AGENT_SURFACES = {
 }
 
 
-def resolve_client_surface(
-    headers: Mapping[str, str],
-    *,
-    parent_labels: Mapping[str, str] | None = None,
-    requested_labels: Mapping[str, str] | None = None,
-) -> str:
-    """Identify the creating client; internal child requests inherit their parent's surface.
+def resolve_client_surface(headers: Mapping[str, str]) -> str:
+    """Classify the process that sent this request (request attribution).
+
+    Used for per-request telemetry; session labels come from
+    :func:`resolve_session_surface`.
 
     :param headers: Request headers (lower-cased keys).
-    :param parent_labels: The parent session's labels, for a child session.
-    :param requested_labels: Labels in the create body. A runner, host, or harness
-        re-creating a session (e.g. native ``/clear``) copies the original's labels,
-        so their surface is kept instead of naming the internal component.
     :returns: A value in :data:`CLIENT_SURFACES`, or ``"unknown"``.
     """
     surface = headers.get("x-omnigent-client")
     if surface is not None and surface in CLIENT_SURFACES:
         return surface
-    if parent_labels is not None:
-        inherited = parent_labels.get(CLIENT_SURFACE_LABEL_KEY)
-        if inherited is not None and inherited in CLIENT_SURFACES:
-            return inherited
-    # Attribution is self-reported (User-Agent and labels), not authenticated:
-    # an internal UA may carry its re-created session's original surface forward.
-    classified = classify_surface(headers.get("user-agent"))
-    if classified in _INTERNAL_SURFACES and requested_labels is not None:
-        requested = requested_labels.get(CLIENT_SURFACE_LABEL_KEY)
-        if requested is not None and requested in CLIENT_SURFACES:
-            return requested
-    return classified
+    return classify_surface(headers.get("user-agent"))
+
+
+def resolve_session_surface(
+    headers: Mapping[str, str],
+    *,
+    parent_labels: Mapping[str, str] | None = None,
+    source_labels: Mapping[str, str] | None = None,
+    requested_labels: Mapping[str, str] | None = None,
+) -> str:
+    """Return the surface to store as a session's ``omnigent.client_surface`` label.
+
+    A runner, host, or harness acts for the user's session, so its session takes
+    the originating surface: the parent's label, then the originating session's
+    (an independent placement's source, or a fork's source), then the create body's
+    copied label (a native ``/clear`` replacement). With none of these it gets what
+    main gave the request. Other clients keep their own surface.
+
+    :param headers: Request headers (lower-cased keys).
+    :param parent_labels: The parent session's labels, for a child session.
+    :param source_labels: Labels of the session this request originates from.
+    :param requested_labels: Labels in the create body; only used for internal components.
+    :returns: A value in :data:`SESSION_SURFACES`, or ``"unknown"``.
+    """
+    surface = headers.get("x-omnigent-client")
+    if surface is not None and surface in SESSION_SURFACES:
+        return surface
+    inherited = _stored_surface(parent_labels)
+    if inherited is not None:
+        return inherited
+    user_agent = headers.get("user-agent")
+    classified = classify_surface(user_agent)
+    if classified not in _INTERNAL_SURFACES:
+        return "web" if classified == "script" else classified
+    # Attribution is self-reported (User-Agent and labels), not authenticated.
+    for labels in (source_labels, requested_labels):
+        origin = _stored_surface(labels)
+        if origin is not None:
+            return origin
+    return _main_surface(user_agent)
+
+
+def _stored_surface(labels: Mapping[str, str] | None) -> str | None:
+    """Return the session surface stored in *labels*, if it is a storable one."""
+    if labels is None:
+        return None
+    value = labels.get(CLIENT_SURFACE_LABEL_KEY)
+    return value if value in SESSION_SURFACES else None
+
+
+def _main_surface(user_agent: str | None) -> str:
+    """Return the surface origin/main gave this User-Agent, before component tokens.
+
+    Used as the fallback for an internal component with no originating session,
+    so its session keeps the label it had before component User-Agents existed.
+    """
+    if user_agent is None:
+        return "unknown"
+    if not user_agent or "python-httpx" in user_agent or "python-requests" in user_agent:
+        return "cli"
+    if "Electron" in user_agent:
+        return "desktop"
+    if "iPhone" in user_agent or "iPad" in user_agent:
+        return "ios"
+    if "Android" in user_agent:
+        return "android"
+    return "web"
 
 
 def harness_client_surface() -> str | None:

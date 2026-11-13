@@ -32,6 +32,9 @@ _GW = "https://dbc-1.cloud.databricks.com/ai-gateway/anthropic"
         ("android", "omnigent-mobile"),
         ("mobile", "omnigent-mobile"),
         ("cli", "omnigent-cli"),
+        # SDK and Slack sessions were ``cli`` on main.
+        ("sdk", "omnigent-cli"),
+        ("slack", "omnigent-cli"),
         (None, None),
         ("unknown", None),
         ("desktop\r\ninjected: value", None),

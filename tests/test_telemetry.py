@@ -15,6 +15,7 @@ from omnigent.telemetry.surface import (
     CLIENT_SURFACES,
     classify_surface,
     resolve_client_surface,
+    resolve_session_surface,
 )
 
 # ── classify_surface ────────────────────────────────────────────────────────
@@ -105,15 +106,6 @@ def test_client_surface_header_overrides_transport_user_agent(surface: str) -> N
     )
 
 
-def test_client_surface_inherits_for_internal_child_requests() -> None:
-    parent = {CLIENT_SURFACE_LABEL_KEY: "desktop"}
-    assert (
-        resolve_client_surface({"user-agent": "python-httpx/0.28"}, parent_labels=parent)
-        == "desktop"
-    )
-    assert resolve_client_surface({"x-omnigent-client": "ios"}, parent_labels=parent) == "ios"
-
-
 @pytest.mark.parametrize("header", [None, "unrecognised", "desktop\r\ninjected: value"])
 def test_client_surface_invalid_header_uses_user_agent(header: str | None) -> None:
     headers = {"user-agent": "omnigent-runner/0.22.0 python-httpx/0.28"}
@@ -122,24 +114,70 @@ def test_client_surface_invalid_header_uses_user_agent(header: str | None) -> No
     assert resolve_client_surface(headers) == "runner"
 
 
+def test_session_surface_header_stores_only_user_surfaces() -> None:
+    """A user surface in the header is stored; an internal or script one is not."""
+    assert resolve_session_surface({"x-omnigent-client": "ios"}) == "ios"
+    assert resolve_session_surface({"x-omnigent-client": "sdk"}) == "sdk"
+    headers = {"x-omnigent-client": "runner", "user-agent": "curl/8"}
+    assert resolve_session_surface(headers) == "web"
+
+
+def test_session_surface_inherits_parent_before_user_agent() -> None:
+    parent = {CLIENT_SURFACE_LABEL_KEY: "desktop"}
+    assert (
+        resolve_session_surface({"user-agent": "python-httpx/0.28"}, parent_labels=parent)
+        == "desktop"
+    )
+    assert resolve_session_surface({"x-omnigent-client": "ios"}, parent_labels=parent) == "ios"
+
+
 @pytest.mark.parametrize("component", ["runner", "host", "harness"])
 def test_internal_recreate_keeps_requested_surface(component: str) -> None:
-    """A runner/host/harness re-creating a session keeps the copied surface label."""
+    """A runner/host/harness re-creating a session (native /clear) keeps the copied surface."""
     headers = {"user-agent": client_user_agent_for(component)}
     requested = {CLIENT_SURFACE_LABEL_KEY: "desktop"}
-    assert resolve_client_surface(headers, requested_labels=requested) == "desktop"
-    # A bogus copied value is ignored.
+    assert resolve_session_surface(headers, requested_labels=requested) == "desktop"
+    # A bogus copied value falls back to what main gave the request: the CLI.
     bogus = {CLIENT_SURFACE_LABEL_KEY: "evil"}
-    assert resolve_client_surface(headers, requested_labels=bogus) == component
+    assert resolve_session_surface(headers, requested_labels=bogus) == "cli"
 
 
-@pytest.mark.parametrize("user_agent", ["omnigent-cli/0.22.0", "python-httpx/0.28.1", None])
-def test_external_create_ignores_requested_surface_label(user_agent: str | None) -> None:
-    """Only Omnigent's internal components may carry a surface over in the body."""
+@pytest.mark.parametrize("component", ["runner", "host", "harness"])
+def test_internal_session_takes_originating_surface(component: str) -> None:
+    """An internal component creating a session under another surface takes that surface."""
+    headers = {"user-agent": client_user_agent_for(component)}
+    assert resolve_session_surface(headers, source_labels={CLIENT_SURFACE_LABEL_KEY: "web"}) == (
+        "web"
+    )
+    # An internal component is never stored, so a source labelled with one is ignored.
+    internal_source = {CLIENT_SURFACE_LABEL_KEY: component}
+    assert resolve_session_surface(headers, source_labels=internal_source) == "cli"
+
+
+def test_internal_session_precedence_parent_then_source_then_body() -> None:
+    headers = {"user-agent": client_user_agent_for("runner")}
+    parent = {CLIENT_SURFACE_LABEL_KEY: "desktop"}
+    source = {CLIENT_SURFACE_LABEL_KEY: "web"}
+    body = {CLIENT_SURFACE_LABEL_KEY: "ios"}
+    assert resolve_session_surface(headers, parent_labels=parent, source_labels=source) == (
+        "desktop"
+    )
+    assert resolve_session_surface(headers, source_labels=source, requested_labels=body) == "web"
+    assert resolve_session_surface(headers, requested_labels=body) == "ios"
+
+
+@pytest.mark.parametrize(
+    ("user_agent", "surface"),
+    [("omnigent-cli/0.22.0", "cli"), ("python-httpx/0.28.1", "cli"), (None, "unknown")],
+)
+def test_external_create_ignores_originating_surface_labels(
+    user_agent: str | None, surface: str
+) -> None:
+    """Only Omnigent's internal components may carry a surface over from another session."""
     headers = {"user-agent": user_agent} if user_agent else {}
-    requested = {CLIENT_SURFACE_LABEL_KEY: "desktop"}
-    assert resolve_client_surface(headers, requested_labels=requested) == classify_surface(
-        user_agent
+    labels = {CLIENT_SURFACE_LABEL_KEY: "desktop"}
+    assert (
+        resolve_session_surface(headers, requested_labels=labels, source_labels=labels) == surface
     )
 
 
@@ -147,7 +185,7 @@ def test_runner_spawned_child_session_keeps_parent_surface() -> None:
     """A runner creating a child session doesn't relabel a desktop session as runner."""
     parent = {CLIENT_SURFACE_LABEL_KEY: "desktop"}
     headers = {"user-agent": client_user_agent_for("runner")}
-    assert resolve_client_surface(headers, parent_labels=parent) == "desktop"
+    assert resolve_session_surface(headers, parent_labels=parent) == "desktop"
 
 
 # ── client identity User-Agent ──────────────────────────────────────────────
