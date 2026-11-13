@@ -170,6 +170,7 @@ _SKIP_DIRS: frozenset[str] = frozenset(
 )
 
 # Caps on reading untracked files to count their lines, per changes listing.
+# A read may take one byte past a cap to detect a file that grew past it.
 _UNTRACKED_LINES_MAX_FILES = 1_000
 _UNTRACKED_LINES_MAX_FILE_BYTES = 1024 * 1024
 _UNTRACKED_LINES_MAX_TOTAL_BYTES = 8 * 1024 * 1024

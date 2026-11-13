@@ -1917,6 +1917,38 @@ def test_git_untracked_lines_never_read_through_links_or_fifos(tmp_path: Path) -
     assert [r["untracked_lines"] for r in records] == [2, None, None]
 
 
+def test_git_untracked_lines_read_past_short_reads(tmp_path: Path, monkeypatch) -> None:
+    """A short read is not EOF: the count and the NUL check cover the whole file."""
+    (tmp_path / "text.txt").write_bytes(b"one\ntwo\n")
+    (tmp_path / "late_nul.txt").write_bytes(b"one\n\0two\n")
+    real_read = os.read
+    monkeypatch.setattr(os, "read", lambda fd, size: real_read(fd, min(size, 4)))
+    records = [{"path": path, "bytes": 9} for path in ("text.txt", "late_nul.txt")]
+
+    _count_untracked_lines(tmp_path, records, {"text.txt", "late_nul.txt"})
+    assert [r["untracked_lines"] for r in records] == [2, None]
+
+
+def test_multi_repo_untracked_lines_share_one_budget_newest_first(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Repositories share the listing's budget, spent on the newest file first."""
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_FILES", 1)
+    for age, name in enumerate(("beta", "alpha")):
+        repo = tmp_path / name
+        repo.mkdir()
+        _init_git_with_commit(repo, "same.txt", "x\n")
+        (repo / "new.txt").write_text("1\n2\n")
+        os.utime(repo / "new.txt", (1_000_000 - age, 1_000_000 - age))
+
+    registry = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(_trusted_test_git)
+    records = registry.list_changed_files("session", limit=100)
+    assert [(r["path"], r["untracked_lines"]) for r in records] == [
+        ("beta/new.txt", 2),
+        ("alpha/new.txt", None),
+    ]
+
+
 def test_git_untracked_lines_stop_at_the_caps(tmp_path: Path, monkeypatch) -> None:
     """Newest files are read first; per-file, total and file-count caps yield ``None``."""
     monkeypatch.setattr("omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_FILE_BYTES", 10)

@@ -286,7 +286,13 @@ def read_regular_file_beneath(root: Path, rel: str, max_bytes: int) -> bytes | N
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
-        return os.read(fd, max_bytes + 1)
+        # A short read is not EOF; keep reading until EOF or the cap.
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0 and (chunk := os.read(fd, remaining)):
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
     except OSError:
         return None
     finally:
