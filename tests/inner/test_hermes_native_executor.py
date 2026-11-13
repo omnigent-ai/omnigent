@@ -88,12 +88,31 @@ async def test_interrupt_session_failure(tmp_path: Path, monkeypatch) -> None:
     assert await ex.interrupt_session("main") is False
 
 
-@pytest.mark.parametrize("steering", [False, True])
+async def test_ambiguous_steering_uses_shared_no_replay_contract(tmp_path: Path, monkeypatch):
+    from omnigent.inner.executor import InjectionDeliveryAmbiguous
+
+    sent = []
+    interrupted = []
+    failure = hne.HermesDeliveryUnconfirmed("delivery is unconfirmed")
+
+    def inject(_bridge, *, content):
+        sent.append(content)
+        raise failure
+
+    monkeypatch.setattr(hne, "inject_user_message", inject)
+    monkeypatch.setattr(hne, "inject_interrupt", lambda *_a, **_k: interrupted.append(True))
+    executor = hne.HermesNativeExecutor(tmp_path)
+    with pytest.raises(InjectionDeliveryAmbiguous) as caught:
+        await executor.enqueue_session_message("main", "delayed steering input")
+    assert caught.value.__cause__ is failure
+    assert sent == ["delayed steering input"]
+    assert interrupted == []
+
+
 async def test_unconfirmed_delivery_preserves_native_work_and_late_input_matching(
-    tmp_path: Path, monkeypatch, db_uri: str, steering: bool
+    tmp_path: Path, monkeypatch, db_uri: str
 ) -> None:
     import asyncio
-    import contextlib
     import uuid
     from unittest.mock import Mock
 
@@ -103,7 +122,6 @@ async def test_unconfirmed_delivery_preserves_native_work_and_late_input_matchin
     from omnigent.server.routes._sessions.orchestration import _persist_external_conversation_item
     from omnigent.server.schemas import (
         CreateResponseRequest,
-        InjectionConsumedEvent,
         SessionEventInput,
     )
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -140,68 +158,55 @@ async def test_unconfirmed_delivery_preserves_native_work_and_late_input_matchin
         background_titles_enabled=False,
     )
     try:
-        if steering:
-            ctx._push_injection(request.model_copy(update={"injection_id": "inj_pending"}))
-            watcher = asyncio.create_task(adapter._watch_injections(ctx, executor))
-            try:
-                consumed = await asyncio.wait_for(ctx._event_queue.get(), timeout=5)
-                assert isinstance(consumed, InjectionConsumedEvent)
-                assert consumed.injection_id == "inj_pending"
-            finally:
-                watcher.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await watcher
-        else:
-            with pytest.raises(RuntimeError) as caught:
-                await adapter.run_turn(request, ctx)
-            assert caught.value.code == "hermes_delivery_unconfirmed"
-            assert caught.value.undelivered is False
-            assert adapter._executor is executor
+        with pytest.raises(RuntimeError) as caught:
+            await adapter.run_turn(request, ctx)
+        assert caught.value.code == "hermes_delivery_unconfirmed"
+        assert caught.value.undelivered is False
+        assert adapter._executor is executor
         assert sent == ["delayed first input"]
         assert interrupted == []
         assert [p["pending_id"] for p in pending_inputs.snapshot_for(conv.id)] == [first, second]
-        if not steering:
-            for index, text in enumerate(["delayed first input", "next input"]):
-                await _persist_external_conversation_item(
-                    conv.id,
-                    conv,
-                    SessionEventInput(
-                        type="external_conversation_item",
-                        data={
-                            "item_type": "message",
-                            "item_data": {
-                                "role": "user",
-                                "content": [{"type": "input_text", "text": text}],
-                            },
-                            "source_id": f"hermes:late-row:{index}",
+        for index, text in enumerate(["delayed first input", "next input"]):
+            await _persist_external_conversation_item(
+                conv.id,
+                conv,
+                SessionEventInput(
+                    type="external_conversation_item",
+                    data={
+                        "item_type": "message",
+                        "item_data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": text}],
                         },
-                    ),
-                    store,
-                )
-                assert [p["pending_id"] for p in pending_inputs.snapshot_for(conv.id)] == (
-                    [second] if index == 0 else []
-                )
-            saved = store.list_items(conv.id).data
-            expected_ids = [
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL, f"omnigent-external-item:{conv.id}:hermes:late-row:{index}"
-                ).hex
-                for index in range(2)
-            ]
-            assert [item.id for item in saved] == expected_ids
-            consumed = [
-                call.args[1]["data"]
-                for call in publish.call_args_list
-                if call.args[1].get("type") == "session.input.consumed"
-            ]
-            assert [(event["item_id"], event["cleared_pending_id"]) for event in consumed] == [
-                (expected_ids[0], first),
-                (expected_ids[1], second),
-            ]
-            assert [item.data.content[0]["text"] for item in saved] == [
-                "delayed first input",
-                "next input",
-            ]
+                        "source_id": f"hermes:late-row:{index}",
+                    },
+                ),
+                store,
+            )
+            assert [p["pending_id"] for p in pending_inputs.snapshot_for(conv.id)] == (
+                [second] if index == 0 else []
+            )
+        saved = store.list_items(conv.id).data
+        expected_ids = [
+            uuid.uuid5(
+                uuid.NAMESPACE_URL, f"omnigent-external-item:{conv.id}:hermes:late-row:{index}"
+            ).hex
+            for index in range(2)
+        ]
+        assert [item.id for item in saved] == expected_ids
+        consumed = [
+            call.args[1]["data"]
+            for call in publish.call_args_list
+            if call.args[1].get("type") == "session.input.consumed"
+        ]
+        assert [(event["item_id"], event["cleared_pending_id"]) for event in consumed] == [
+            (expected_ids[0], first),
+            (expected_ids[1], second),
+        ]
+        assert [item.data.content[0]["text"] for item in saved] == [
+            "delayed first input",
+            "next input",
+        ]
         await executor.interrupt_session("main")
         assert interrupted == [True], "explicit user Stop still owns interruption"
     finally:
