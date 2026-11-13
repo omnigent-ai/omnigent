@@ -208,6 +208,7 @@ def test_shell_impl_child_lifetime(tmp_path: Path, command_kind: str, timed_out:
             command += "; wait"
 
     try:
+        started = time.monotonic()
         result = _shell_impl(
             command=command,
             timeout=1,
@@ -216,6 +217,8 @@ def test_shell_impl_child_lifetime(tmp_path: Path, command_kind: str, timed_out:
         )
 
         assert result["timed_out"] is timed_out
+        if timed_out:
+            assert time.monotonic() - started < 15
         assert result["stdout"] == ""
         assert result["stderr"] == ""
         pid = int(pid_file.read_text())
