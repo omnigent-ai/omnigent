@@ -62,13 +62,13 @@ export type FeatureKey =
   | "canvas"
   | "arca_shutdown_warnings"
   | "import_review"
-  | "custom_agents_settings_ui"
   | "sidebar_grouping_ui"
   | "workspace_content_search"
   | "grid_sessions_display_ui"
   | "automations_v2"
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
+  | "session_overview"
   | "session_orchestration";
 
 /** Deployment-wide release-feature values advertised by the server. */
@@ -539,11 +539,7 @@ export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
 }
 
 export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
-  return (
-    isFeatureEnabled(info, "custom_agents_settings_ui") &&
-    info !== "loading" &&
-    info.agent_install === true
-  );
+  return info !== "loading" && info.agent_install === true;
 }
 
 let cachedServerInfo: ServerInfo | null = null;
