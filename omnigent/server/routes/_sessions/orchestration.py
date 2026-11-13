@@ -14002,6 +14002,7 @@ async def _fetch_model_options(
     agent_store: AgentStore | None = None,
     agent: Agent | None = None,
     *,
+    conversation_store: ConversationStore | None = None,
     harness: str | _UnresolvedHarness | None = _UNRESOLVED_HARNESS,
     agent_cache: AgentCache | None = None,
 ) -> list[dict[str, Any]]:
@@ -14043,18 +14044,36 @@ async def _fetch_model_options(
         ACP spec load; the runtime global cache when ``None``.
     :param agent: The bound agent row when the caller already read it, so the
         harness check does not read it again.
+    :param conversation_store: Store for resolving a child's inherited host in the background.
     :returns: Model options, or ``[]`` when the session has no model picker or
         the runner-owned options are not yet available.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
     if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
-        # pi-native's catalog is PUSHED by its extension (its live
-        # ``ctx.modelRegistry``), not fetched: that reflects the models pi
-        # actually loaded regardless of auth path (Omnigent provider OR pi's
-        # own ``/login``), so the picker populates even when no ``models.json``
-        # is written into the bridge dir. Empty until the extension posts
-        # ``external_model_options`` on session start.
-        return _pushed_model_options_cache.get(session_id, [])
+        # The extension's live registry is authoritative, including models
+        # authenticated through Pi's own login rather than Omnigent.
+        pushed = _pushed_model_options_cache.get(session_id)
+        if pushed is not None:
+            return pushed
+        # After server restart, refill from the host so a paused session can
+        # select a model before its extension wakes and pushes a fresh catalog.
+        if session_id not in _model_options_inflight:
+
+            async def _load_pi_host_options() -> None:
+                host_id = conv.host_id
+                if host_id is None and conversation_store is not None:
+                    host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+                if host_id is not None:
+                    await _load_model_options_from_host(session_id, host_id, "pi-native")
+
+            task = asyncio.create_task(_load_pi_host_options())
+            _model_options_inflight[session_id] = task
+
+            def _clear_pi_host_options_inflight(_task: asyncio.Task[None]) -> None:
+                _model_options_inflight.pop(session_id, None)
+
+            task.add_done_callback(_clear_pi_host_options_inflight)
+        return []
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
     if endpoint is None:
         # Generic ACP sessions carry no native wrapper label; their picker
@@ -14773,6 +14792,7 @@ async def _get_session_snapshot(
             conv,
             agent_store,
             agent=agent,
+            conversation_store=conv_store,
             harness=harness,
             agent_cache=agent_cache,
         )
