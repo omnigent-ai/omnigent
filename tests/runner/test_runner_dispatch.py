@@ -2832,7 +2832,6 @@ async def _wait_until_dead(pid: int, timeout: float = 5.0) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.posix_only
 async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
@@ -2850,8 +2849,6 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             ),
         )
         try:
-            helper_pid = await _os_env_helper_pid(registry, spec, "conv_runner_os_env_test")
-
             write = await _execute_os_env_tool(
                 "sys_os_write",
                 {"path": "created.txt", "content": "Привет 世界\nplanet\n"},
@@ -2880,42 +2877,59 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             )
             assert "Привет 世界" in read
             assert json.loads(read)["content"] == "Привет 世界\nworld\n"
-            assert (
-                await _os_env_helper_pid(registry, spec, "conv_runner_os_env_test") == helper_pid
-            )
-
-            error = await _execute_os_env_tool(
-                "sys_os_edit",
-                {"path": "created.txt", "oldText": "absent", "newText": "unused"},
-                agent_spec=spec,
-                conversation_id="conv_runner_os_env_test",
-                resource_registry=registry,
-            )
-            assert json.loads(error)["error"].startswith("Could not find oldText")
-            assert not _process_exists(helper_pid)
-            replacement = await _os_env_helper_pid(registry, spec, "conv_runner_os_env_test")
-            assert replacement != helper_pid
-
-            shell = await _execute_os_env_tool(
-                "sys_os_shell",
-                {"command": "pwd; echo $PPID"},
-                agent_spec=spec,
-                conversation_id="conv_runner_os_env_test",
-                resource_registry=registry,
-            )
-            shell_result = json.loads(shell)
-            assert shell_result["exit_code"] == 0
-            cwd, pid = shell_result["stdout"].split()
-            assert Path(cwd).resolve() == root.resolve()
-            # The shell used the replacement helper and then retired it.
-            assert int(pid) == replacement
-            assert not _process_exists(replacement)
-            after_shell = await _os_env_helper_pid(registry, spec, "conv_runner_os_env_test")
-            assert after_shell != replacement
-
         finally:
             await registry.cleanup_session("conv_runner_os_env_test")
-        assert not _process_exists(after_shell)
+
+
+@pytest.mark.asyncio
+@pytest.mark.posix_only
+async def test_runner_os_env_helper_retires_after_returned_error_and_shell(
+    tmp_path: Path,
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    registry = SessionResourceRegistry()
+    try:
+        helper_pid = await _os_env_helper_pid(registry, spec, "conv_retire")
+        assert await _os_env_helper_pid(registry, spec, "conv_retire") == helper_pid
+        error = await _execute_os_env_tool(
+            "sys_os_edit",
+            {"path": "note.txt", "oldText": "absent", "newText": "unused"},
+            agent_spec=spec,
+            conversation_id="conv_retire",
+            resource_registry=registry,
+        )
+        assert json.loads(error)["error"].startswith("Could not find oldText")
+        assert not _process_exists(helper_pid)
+        assert (tmp_path / "note.txt").read_text() == "ready\n"
+        replacement = await _os_env_helper_pid(registry, spec, "conv_retire")
+        assert replacement != helper_pid
+
+        shell = await _execute_os_env_tool(
+            "sys_os_shell",
+            {"command": "pwd; echo $PPID"},
+            agent_spec=spec,
+            conversation_id="conv_retire",
+            resource_registry=registry,
+        )
+        shell_result = json.loads(shell)
+        assert shell_result["exit_code"] == 0
+        cwd, pid = shell_result["stdout"].split()
+        assert Path(cwd).resolve() == tmp_path.resolve()
+        assert int(pid) == replacement
+        assert not _process_exists(replacement)
+        after_shell = await _os_env_helper_pid(registry, spec, "conv_retire")
+        assert after_shell != replacement
+    finally:
+        await registry.cleanup_session("conv_retire")
+    assert not _process_exists(after_shell)
 
 
 @pytest.mark.asyncio

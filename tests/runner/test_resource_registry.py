@@ -4094,16 +4094,17 @@ async def test_failed_tool_environment_replacement_keeps_the_old_one_owned(
 
 
 @pytest.mark.parametrize(
-    "changed_key",
+    "changed_key,hold_first",
     [
-        "sandbox",
-        "session",
-        "environment",
-        pytest.param("cwd-symlink", marks=pytest.mark.posix_only),
+        pytest.param("sandbox", False, id="sandbox"),
+        pytest.param("session", False, id="session"),
+        pytest.param("environment", False, id="environment"),
+        pytest.param("environment", True, id="held-environment"),
+        pytest.param("cwd-symlink", False, marks=pytest.mark.posix_only, id="cwd-symlink"),
     ],
 )
 async def test_tool_environment_reuse_checks_session_spec_and_resolved_paths(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_key: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_key: str, hold_first: bool
 ) -> None:
     """Only an unchanged session, spec and resolved workspace/policy reuse the lease."""
     import omnigent.inner.os_env as os_env_module
@@ -4130,10 +4131,11 @@ async def test_tool_environment_reuse_checks_session_spec_and_resolved_paths(
 
     first = await registry.lease_tool_environment("conv", spec)
     assert first is not None
-    await first.release(reusable=True)
-    again = await registry.lease_tool_environment("conv", spec)
-    assert again is first
-    await again.release(reusable=True)
+    if not hold_first:
+        await first.release(reusable=True)
+        again = await registry.lease_tool_environment("conv", spec)
+        assert again is first
+        await again.release(reusable=True)
 
     changed_spec = spec
     session_id = "conv"
@@ -4155,8 +4157,16 @@ async def test_tool_environment_reuse_checks_session_spec_and_resolved_paths(
     rebuilt = await registry.lease_tool_environment(session_id, changed_spec)
     assert rebuilt is not None and rebuilt is not first
     assert isinstance(first.environment, _FakeOSEnvironment)
-    assert first.environment._closed is (changed_key != "session")
+    assert first.environment._closed is (changed_key != "session" and not hold_first)
+    if hold_first:
+        await first.release(reusable=True)
+        assert first.environment._closed
+        assert isinstance(rebuilt.environment, _FakeOSEnvironment)
+        assert not rebuilt.environment._closed
     await rebuilt.release(reusable=True)
+    again = await registry.lease_tool_environment(session_id, changed_spec)
+    assert again is rebuilt
+    await again.release(reusable=True)
 
     if changed_key in {"session", "environment"}:
         restored = await registry.lease_tool_environment("conv", spec)
