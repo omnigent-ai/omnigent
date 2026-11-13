@@ -301,11 +301,21 @@ describe("ComposerPrLink", () => {
 
     fireEvent.focus(trigger);
     await screen.findByTestId("composer-pr-preview");
-    fireEvent.click(
-      screen.getByRole("button", { name: "View example/app !7 in the Pull Requests tab" }),
-    );
+    const secondRow = screen.getByRole("button", {
+      name: "View example/app !7 in the Pull Requests tab",
+    });
+    // Safari can blur the focused control before clicking without focusing the target.
+    if (fireEvent.mouseDown(secondRow)) fireEvent.blur(trigger, { relatedTarget: null });
+    fireEvent.click(secondRow);
     expect(onOpen).toHaveBeenLastCalledWith(prs[1].url);
     expect(onOpen).toHaveBeenCalledTimes(2);
     await waitFor(() => expect(screen.queryByTestId("composer-pr-preview")).toBeNull());
+
+    fireEvent.focus(trigger);
+    await screen.findByTestId("composer-pr-preview");
+    await user.tab();
+    fireEvent.scroll(document.body);
+    await waitFor(() => expect(screen.queryByTestId("composer-pr-preview")).toBeNull());
+    expect(trigger).toHaveFocus();
   });
 });

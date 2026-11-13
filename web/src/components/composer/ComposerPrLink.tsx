@@ -192,7 +192,15 @@ export function ComposerPrLink({
 
   return (
     <TooltipProvider delayDuration={200}>
-      <Tooltip open={previewOpen} onOpenChange={setPreviewOpen}>
+      <Tooltip
+        open={previewOpen}
+        onOpenChange={(open) => {
+          if (!open && previewRef.current?.contains(document.activeElement)) {
+            triggerRef.current?.focus();
+          }
+          setPreviewOpen(open);
+        }}
+      >
         <TooltipTrigger asChild>{trigger}</TooltipTrigger>
         {/* The label replaces Radix's hidden copy of the content, which would
             otherwise duplicate each row's controls for assistive technology. */}
@@ -204,6 +212,7 @@ export function ComposerPrLink({
           sideOffset={4}
           align="start"
           collisionPadding={16}
+          onMouseDown={(event) => event.preventDefault()}
           onEscapeKeyDown={() => triggerRef.current?.focus()}
           onKeyDown={(event) => {
             if (event.key !== "Tab") return;
