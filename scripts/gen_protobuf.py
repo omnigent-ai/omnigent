@@ -91,6 +91,9 @@ def _generate() -> int:
         outputs = _generated(tmp_dir)
         for p in outputs:
             shutil.copyfile(tmp_dir / p, _REPO_ROOT / p)
+        # Bindings whose schema or service is gone would otherwise still import.
+        for p in _committed() - set(outputs):
+            (_REPO_ROOT / p).unlink()
     print(f"Generated {', '.join(str(p) for p in outputs)}")
     return 0
 

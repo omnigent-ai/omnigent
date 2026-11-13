@@ -171,6 +171,15 @@ def _cap_file_bytes(rel: str, raw: bytes) -> FileBytes:
     return FileBytes(capped, truncated, is_text=True, content_type=content_type)
 
 
+def is_utf8_encodable(text: str) -> bool:
+    """Return whether ``text`` has no surrogate-escaped bytes, so it encodes as UTF-8."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _resolve_workspace_path(root: Path, path: str) -> Path:
     """Resolve a relative path, including symlinks, within the workspace root."""
     try:
@@ -337,6 +346,10 @@ class WorkspaceReader:
                 404, "not_found", f"Directory {rel!r} not found or not accessible"
             ) from exc
         for name in names:
+            if not is_utf8_encodable(name):
+                # A non-UTF-8 name comes back surrogate-escaped; no JSON or protobuf
+                # answer can carry it, so skip it rather than fail the listing.
+                continue
             full = resolved / name
             child_rel = os.path.join(validated, name) if validated else name
             try:
@@ -392,7 +405,8 @@ class WorkspaceReader:
         Opens without blocking and refuses anything but a regular file, so a
         FIFO or device in the workspace answers "not found" instead of hanging.
         """
-        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
         try:
             fd = os.open(resolved, flags)
         except OSError as exc:

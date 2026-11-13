@@ -49,9 +49,12 @@ def _workspace(root: Path) -> Path:
     (root / "big.txt").write_text("x" * 200_000)  # several 64 KiB chunks
     (root / "src").mkdir()
     (root / "src" / "main.py").write_text("print('hi')\n")
-    if hasattr(os, "symlink"):
+    (root / "empty.txt").write_bytes(b"")
+    try:
         (root / "link.md").symlink_to("notes.md")
         (root / "broken").symlink_to("gone")
+    except OSError:
+        pass  # symlinks need extra privileges on some Windows machines
     return root
 
 
@@ -101,10 +104,20 @@ async def test_read_file_matches_rest_file_content(tmp_path: Path, protocol: Pro
     reader = WorkspaceReader(root)
     client = _client(reader, protocol)
 
-    for path in ["notes.md", "café.txt", "blob.bin", "latin1.txt", "big.txt", "src/main.py"]:
+    paths = [
+        "notes.md",
+        "café.txt",
+        "blob.bin",
+        "latin1.txt",
+        "big.txt",
+        "empty.txt",
+        "src/main.py",
+    ]
+    for path in paths:
         messages = [m async for m in client.read_file(ReadFileRequest(path=path))]
         metadata = messages[0].metadata
         data = b"".join(m.data for m in messages)
+        assert messages[0].HasField("metadata") and not messages[0].data, path
         assert not any(m.HasField("metadata") for m in messages[1:]), path
         assert all(len(m.data) <= 64 * 1024 for m in messages), path
 
