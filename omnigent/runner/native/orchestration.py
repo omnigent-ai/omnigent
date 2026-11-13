@@ -27,6 +27,10 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapp
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from omnigent.util.claude_launch_args import (
+    claude_legacy_launch_prompt,
+    without_claude_session_id_arg,
+)
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -7438,9 +7442,9 @@ async def _agy_cascade_is_locally_owned(bridge_dir: Path, cascade_id: str) -> bo
     :returns: ``True`` when the conversation db exists in this session's Gemini
         dir within the grace window.
     """
-    from omnigent.harnesses.antigravity_native.bridge import agy_gemini_dir
+    from omnigent.harnesses.antigravity_native.bridge import agy_conversation_db
 
-    db = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations" / f"{cascade_id}.db"
+    db = agy_conversation_db(bridge_dir, cascade_id)
     deadline = time.monotonic() + _AGY_CASCADE_OWNERSHIP_GRACE_S
     while True:
         if await asyncio.to_thread(db.is_file):
@@ -7599,13 +7603,26 @@ async def _cold_start_agy_conversation(
             session_id,
         )
         return None
-    # Persist the real id (replacing the ``agy_conv_*`` placeholder) so
-    # ``read_bridge_state`` returns it and the reader/executor address the
-    # cold-started conversation. Offloaded (file I/O).
-    if not await asyncio.to_thread(update_conversation_id, bridge_dir, cascade_id):
+    # Refuse to replace a real id: the reader may have adopted the TUI-minted
+    # cascade meanwhile, and the headless phantom must not clobber it.
+    if not await asyncio.to_thread(
+        update_conversation_id, bridge_dir, cascade_id, expect_placeholder=True
+    ):
+        state = await asyncio.to_thread(read_bridge_state, bridge_dir)
+        if state is not None and not is_placeholder_conversation_id(state.conversation_id):
+            _logger.info(
+                "Antigravity cold-start: bridge state already binds conversation %s for "
+                "session %s (the reader adopted it meanwhile); discarding cold-start "
+                "cascade %s.",
+                state.conversation_id,
+                session_id,
+                cascade_id,
+            )
+            return state.conversation_id
         _logger.warning(
             "Antigravity cold-start: could not persist cold-started conversation id %s for "
-            "session %s (no bridge state to update); the reader will stay on the placeholder id.",
+            "session %s (no bridge state to update, or the binding changed concurrently); "
+            "the reader will stay on the placeholder id.",
             cascade_id,
             session_id,
         )
@@ -8104,9 +8121,7 @@ def _claude_legacy_launch_prompt(terminal_launch_args: list[str] | None) -> str 
         ``["hello", "--permission-mode", "auto"]``.
     :returns: The leading positional, e.g. ``"hello"``, or ``None``.
     """
-    if not terminal_launch_args or terminal_launch_args[0].startswith("-"):
-        return None
-    return terminal_launch_args[0]
+    return claude_legacy_launch_prompt(terminal_launch_args)
 
 
 async def _claude_prompt_in_history(
@@ -8187,19 +8202,7 @@ def _without_claude_session_id_arg(args: list[str]) -> list[str]:
     """
     if "--fork-session" in args:
         return args
-    kept: list[str] = []
-    skip_value = False
-    for arg in args:
-        if skip_value:
-            skip_value = False
-            continue
-        if arg == "--session-id":
-            skip_value = True
-            continue
-        if arg.startswith("--session-id="):
-            continue
-        kept.append(arg)
-    return kept
+    return without_claude_session_id_arg(args)
 
 
 def _build_claude_native_base_args(

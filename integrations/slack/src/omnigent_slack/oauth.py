@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from omnigent_slack.user_agent import USER_AGENT_HEADERS
+
 _DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 
 # Header carrying the optional device-grant client secret. Sent on the
@@ -170,7 +172,9 @@ async def probe_auth_mode(server_url: str, http_timeout: float = 10.0) -> AuthMo
     :returns: The detected :class:`AuthMode`.
     """
     async with httpx.AsyncClient(
-        base_url=server_url.rstrip("/"), timeout=httpx.Timeout(http_timeout)
+        base_url=server_url.rstrip("/"),
+        timeout=httpx.Timeout(http_timeout),
+        headers=USER_AGENT_HEADERS,
     ) as client:
         try:
             resp = await client.get("/v1/me")
@@ -238,7 +242,7 @@ async def _start_device_login(
     client = httpx.AsyncClient(
         base_url=server_url.rstrip("/"),
         timeout=httpx.Timeout(30.0),
-        headers=_secret_headers(client_secret),
+        headers={**USER_AGENT_HEADERS, **_secret_headers(client_secret)},
     )
     try:
         resp = await client.post("/oauth/device/authorize", json={"client_id": client_id})
@@ -318,7 +322,9 @@ async def _poll_device(
 
 async def _start_cli_ticket_login(server_url: str) -> PendingLogin:
     base = server_url.rstrip("/")
-    client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(30.0))
+    client = httpx.AsyncClient(
+        base_url=base, timeout=httpx.Timeout(30.0), headers=USER_AGENT_HEADERS
+    )
     code_verifier = secrets.token_urlsafe(48)
     code_challenge = (
         base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
@@ -408,7 +414,7 @@ class DeviceFlowClient:
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=httpx.Timeout(timeout),
-            headers=_secret_headers(client_secret),
+            headers={**USER_AGENT_HEADERS, **_secret_headers(client_secret)},
         )
 
     async def aclose(self) -> None:

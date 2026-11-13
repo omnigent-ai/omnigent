@@ -501,8 +501,9 @@ def test_run_isolated_timeout_kills_the_whole_tree(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires a POSIX shell")
+@pytest.mark.parametrize("drain_fails", [False, True], ids=["drained", "drain-error"])
 def test_run_isolated_kills_the_tree_on_non_timeout_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drain_fails: bool
 ) -> None:
     # A non-timeout failure from communicate() must still tear down the tree and
     # propagate the original exception, not just the timeout path.
@@ -516,18 +517,24 @@ def test_run_isolated_kills_the_tree_on_non_timeout_error(
         if not state["raised"]:
             # Let the grandchild come up so there is a real tree to tear down.
             deadline = time.monotonic() + 5
-            while not child_pid_path.exists() and time.monotonic() < deadline:
+            while time.monotonic() < deadline:
+                if child_pid_path.exists() and child_pid_path.read_text().strip():
+                    break
                 time.sleep(0.02)
             state["raised"] = True
             raise RuntimeError("boom")
+        if drain_fails:
+            raise RuntimeError("cleanup drain failed")
         return real_communicate(self, *args, **kwargs)
 
     monkeypatch.setattr(subprocess.Popen, "communicate", flaky_communicate)
 
     child_pid: int | None = None
     try:
+        started = time.monotonic()
         with pytest.raises(RuntimeError, match="boom"):
             _proc.run_isolated(["sh", "-c", script], timeout=30, capture_output=True, text=True)
+        assert time.monotonic() - started < 10
         assert child_pid_path.exists()
         child_pid = int(child_pid_path.read_text())
         deadline = time.monotonic() + 5

@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import pathlib
+import shlex
 import shutil
 import sys
 import tempfile
@@ -50,6 +51,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
+from urllib.parse import urlsplit
 
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
@@ -99,9 +101,11 @@ from .executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    is_interruption_marker,
     without_tool_history,
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
@@ -447,6 +451,8 @@ _CONNECT_TIMEOUT_SECONDS = 60.0
 _QUERY_START_TIMEOUT_SECONDS = 30.0
 _MCP_STATUS_TIMEOUT_SECONDS = 10.0
 _MCP_RECONNECT_TIMEOUT_SECONDS = 30.0
+# Leaves room under the harness adapter's 2s interrupt settle budget for the turn to end.
+_INTERRUPT_TIMEOUT_SECONDS = 1.5
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
@@ -1080,6 +1086,10 @@ class _ClaudeClientState:
     mcp_relay: _ManagedMcpRelay | None = None
     # This client's own sandbox launcher, which exposes the managed config and its relay.
     cli_launcher: str | None = None
+    # Set once the current query has been interrupted; cleared when the next query starts.
+    interrupted: bool = False
+    # Whether the next query must carry the runner's interruption marker.
+    interruption_marker_pending: bool = False
 
 
 def _recording_consents(
@@ -2680,6 +2690,26 @@ class ClaudeSDKExecutor(Executor):
         # the loop tears down.
         await self._force_close_client(state.client)
 
+    def _provider_auth_hint(self) -> str:
+        """Say where to fix a credential Claude Code could not authenticate with.
+
+        A Databricks profile gets the exact re-login command; other modes use
+        :func:`_claude_auth_remediation`.
+
+        :returns: One sentence, e.g. ``"Check your selected ~/.databrickscfg
+            profile; re-authenticate with `databricks auth login --profile oss`."``
+        """
+        if self._gateway_uses_databricks_profile:
+            if self._databricks_profile:
+                login = f"databricks auth login --profile {shlex.quote(self._databricks_profile)}"
+            else:
+                # No named profile: the token is minted with ``--host``, and this
+                # path's base URL is always ``<workspace host>/ai-gateway/anthropic``.
+                base_url = urlsplit(self._extra_env.get("ANTHROPIC_BASE_URL", ""))
+                login = f"databricks auth login --host {base_url.scheme}://{base_url.netloc}"
+            return f"Check your selected ~/.databrickscfg profile; re-authenticate with `{login}`."
+        return _claude_auth_remediation(databricks_profile=False, gateway=bool(self._gateway))
+
     def _evict_client_on_cancel(self, session_key: str) -> None:
         state = self._clients.pop(session_key, None)
         if state is None:
@@ -2729,23 +2759,24 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.get(session_key)
         if state is None:
             return False
-        # Interrupt is best-effort and fast; a failure just falls through to
-        # the close below.
+        state.interruption_marker_pending = True
+        if state.interrupted:
+            return True
+        state.interrupted = True
         try:
-            await asyncio.wait_for(state.client.interrupt(), timeout=0.5)
+            await asyncio.wait_for(state.client.interrupt(), timeout=_INTERRUPT_TIMEOUT_SECONDS)
+            return True
+        except asyncio.CancelledError:
+            state.interrupted = False
+            raise
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.warning(
                 "Claude SDK interrupt failed for session %s: %s",
                 session_key,
                 exc,
             )
-        # Always drop the live session after an interrupt. Its transcript
-        # still holds the abandoned prompt, and resumed turns send only the
-        # latest user message (see _build_prompt), so the runner's
-        # "[System: interrupted]" marker would never reach the model. Closing
-        # forces the next turn to rebuild full history (marker included) in a
-        # fresh session — the abandoned request is then visible-but-superseded
-        # rather than silently continued.
+        # The turn may still be running, so drop the session; the next turn
+        # replays history, including the interruption marker, in a fresh one.
         try:
             await self.close_session(session_key)
             return True
@@ -2920,6 +2951,9 @@ class ClaudeSDKExecutor(Executor):
         )
 
     def supports_tool_boundary_interrupt(self) -> bool:
+        return True
+
+    def resumes_after_interrupt(self) -> bool:
         return True
 
     def max_context_tokens(self) -> int | None:
@@ -3398,7 +3432,11 @@ class ClaudeSDKExecutor(Executor):
         await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
         prompt = (
-            self._build_prompt(messages, resume_session=True)
+            self._build_prompt(
+                messages,
+                resume_session=True,
+                after_interrupt=self._clients[session_key].interruption_marker_pending,
+            )
             if resume_session
             else await self._fresh_session_prompt(messages, cfg)
         )
@@ -3713,10 +3751,7 @@ class ClaudeSDKExecutor(Executor):
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
         terminal_auth_failure = False
-        auth_remediation = _claude_auth_remediation(
-            databricks_profile=self._gateway_uses_databricks_profile,
-            gateway=bool(self._gateway),
-        )
+        auth_remediation = self._provider_auth_hint()
         compaction_occurred: bool = False
         claude_session_id: str | None = None
         compaction_transcript_path: pathlib.Path | None = None
@@ -3894,12 +3929,17 @@ class ClaudeSDKExecutor(Executor):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
+                if is_interruption_marker(message):
+                    break
         self._pending_framework_context[session_key] = "\n\n".join(
             notice
             for message in notice_messages
             if message.get("role") == "user"
             for notice in framework_notices(message.get("content"))
         )
+        client_state = self._clients.get(session_key)
+        if client_state is not None:
+            client_state.interrupted = False
         try:
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
@@ -3917,6 +3957,8 @@ class ClaudeSDKExecutor(Executor):
                 raise TimeoutError(
                     f"Claude SDK query start timed out after {int(_QUERY_START_TIMEOUT_SECONDS)}s"
                 ) from exc
+            if client_state is not None:
+                client_state.interruption_marker_pending = False
             message_stream = client.receive_response()
             try:
                 while True:
@@ -4025,7 +4067,13 @@ class ClaudeSDKExecutor(Executor):
                         _am_model = concrete_reported_model(getattr(assistant_msg, "model", None))
                         if _am_model is not None:
                             observed_model = _am_model
-                        if got_stream_events:
+                        if getattr(assistant_msg, "error", None):
+                            # A failed API call (e.g. an apiKeyHelper that printed no
+                            # token) arrives as a ``<synthetic>`` message whose text is
+                            # the error, not a reply. The is_error ResultMessage that
+                            # follows fails the turn.
+                            pass
+                        elif got_stream_events:
                             # StreamEvents already emitted text. Emit the
                             # ToolCallRequest here, once the full
                             # ``tool_block.input`` has assembled — see the
@@ -4140,14 +4188,26 @@ class ClaudeSDKExecutor(Executor):
                                 self._agent_name,
                                 failure_text,
                             )
-                            terminal_auth_failure = is_claude_auth_failure_text(failure_text)
+                            error_status = getattr(result_msg, "api_error_status", None)
+                            # A rejected credential can arrive with text that names no auth
+                            # failure (an apiKeyHelper that minted no token), so the status
+                            # counts too.
+                            rejected = error_status in {401, 403}
+                            terminal_auth_failure = rejected or is_claude_auth_failure_text(
+                                failure_text
+                            )
                             # Keep the next step in the message too: the REPL and
                             # SDK stream render only code/message.
-                            terminal_error = (
-                                f"{failure_text.rstrip(_TRAILING_PUNCTUATION)}. {auth_remediation}"
-                                if terminal_auth_failure
-                                else failure_text
-                            )
+                            failure_line = failure_text.rstrip(_TRAILING_PUNCTUATION)
+                            if rejected:
+                                terminal_error = (
+                                    "Claude SDK provider authentication failed"
+                                    f" (status={error_status}): {failure_line}. {auth_remediation}"
+                                )
+                            elif terminal_auth_failure:
+                                terminal_error = f"{failure_line}. {auth_remediation}"
+                            else:
+                                terminal_error = failure_text
                         elif not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
@@ -4338,6 +4398,14 @@ class ClaudeSDKExecutor(Executor):
         if turn_usage is None:
             turn_usage = _usage_from_observed_call(last_call_usage, observed_model or model)
 
+        if client_state is not None and client_state.interrupted:
+            # The CLI's result for an interrupted query is not a turn outcome. Its compaction
+            # never reaches the server, so drop the compacted client and replay history next turn.
+            if compaction_occurred:
+                self._evict_client_on_cancel(session_key)
+            yield TurnCancelled()
+            return
+
         if terminal_error:
             if compaction_occurred and claude_session_id:
                 compaction_event = _build_compaction_complete_event()
@@ -4433,6 +4501,7 @@ class ClaudeSDKExecutor(Executor):
         *,
         resume_session: bool,
         history_token_budget: int | None = None,
+        after_interrupt: bool = False,
     ) -> str | list[_JsonObject]:
         """
         Build the prompt for the SDK.
@@ -4457,13 +4526,17 @@ class ClaudeSDKExecutor(Executor):
             history may use, e.g. ``100000``. The newest prior messages
             that fit are kept behind a marker counting the omitted ones;
             ``None`` replays every prior message.
+        :param after_interrupt: ``True`` when the resumed session's
+            interruption marker has not been delivered yet.
         :returns: A plain string prompt, or a list of Anthropic
             API content block dicts when multimodal blocks are
             present in the latest user message.
         """
         if resume_session:
             # The live session already holds its tool items; only a fresh one replays them.
-            return ClaudeSDKExecutor._extract_trailing_user_content(without_tool_history(messages))
+            return ClaudeSDKExecutor._extract_trailing_user_content(
+                without_tool_history(messages), after_interrupt=after_interrupt
+            )
 
         if not _has_replayable_history(messages):
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
@@ -4551,6 +4624,8 @@ class ClaudeSDKExecutor(Executor):
     @staticmethod
     def _extract_trailing_user_content(
         messages: list[Message],
+        *,
+        after_interrupt: bool = False,
     ) -> str | list[_JsonObject]:
         """
         Extract the trailing run of consecutive user messages for the SDK.
@@ -4572,6 +4647,8 @@ class ClaudeSDKExecutor(Executor):
         survive.
 
         :param messages: Conversation history.
+        :param after_interrupt: ``True`` when an interruption marker in
+            the run has not been delivered yet, so it is sent too.
         :returns: A string prompt, or a list of Anthropic content
             block dicts when the trailing run is multimodal.
         """
@@ -4590,6 +4667,11 @@ class ClaudeSDKExecutor(Executor):
                     # Compaction may emit no assistant text; keep it out of later prompts.
                     if not trailing:
                         return "/compact"
+                    break
+                # The live session already received the user input before an interruption.
+                if is_interruption_marker(msg):
+                    if after_interrupt:
+                        trailing.append(msg)
                     break
                 trailing.append(msg)
             else:

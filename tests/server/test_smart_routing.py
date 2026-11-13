@@ -378,14 +378,87 @@ async def test_llm_routing_client_resolves_harness_to_the_model_owner(
 
 
 @pytest.mark.asyncio
-async def test_llm_routing_client_clamps_hallucinated_model() -> None:
-    verdict = {"harness": "claude-sdk", "model": "hallucinated-model", "rationale": "hard"}
+@pytest.mark.parametrize("rationale", ["hard", "This is a COMPLEX task (refactor)."])
+async def test_llm_routing_client_clamps_hallucinated_model(rationale: str) -> None:
+    verdict = {"harness": "claude-sdk", "model": "hallucinated-model", "rationale": rationale}
     client = LLMRoutingClient(_FakeLLMClient(verdict))
     models = _models_for("claude-sdk")
     assert models is not None
     result = await client.route("hard task", {"claude-sdk": models})
     assert result is not None
     assert result.model == models[0]  # clamped to cheapest
+
+
+# A judge whose classification and model field disagree is applied by its
+# classification: the rubric defines each class by list position.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict_model", "rationale", "expect_model"),
+    [
+        ("sonnet", "This is a COMPLEX task (setup); selected most capable model opus.", "opus"),
+        ("sonnet", "This is a SIMPLE task (greeting); selected cheapest model haiku.", "haiku"),
+        ("haiku", "This is a MODERATE task (one file); selected mid-range model.", "sonnet"),
+        ("sonnet", "This is a MODERATE task (one file); selected mid-range model.", "sonnet"),
+        ("opus", "This is a COMPLEX task (refactor); selected most capable model opus.", "opus"),
+        ("sonnet", "no classification given", "sonnet"),
+        ("sonnet", "  This is a SIMPLE task (greeting).", "haiku"),
+        ("sonnet", 'The user wrote "This is a COMPLEX task"; it is moderate.', "sonnet"),
+        ("sonnet", "Not true: This is a SIMPLE task.", "sonnet"),
+    ],
+)
+async def test_llm_routing_client_applies_the_stated_tier(
+    verdict_model: str, rationale: str, expect_model: str
+) -> None:
+    verdict = {"harness": "claude-native", "model": verdict_model, "rationale": rationale}
+    client = LLMRoutingClient(_FakeLLMClient(verdict))
+    result = await client.route("task", {"claude-native": ["haiku", "sonnet", "opus"]})
+    assert result is not None
+    assert result.model == expect_model
+    assert result.rationale == rationale
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("models", "verdict_model", "expect_model"),
+    [
+        (["only"], "only", "only"),
+        (["cheap", "capable"], "cheap", "cheap"),
+        (["cheap", "capable"], "capable", "capable"),
+        (["cheap", "middle-a", "middle-b", "capable"], "middle-b", "middle-b"),
+        (["cheap", "middle-a", "middle-b", "capable"], "capable", "middle-a"),
+    ],
+)
+async def test_llm_routing_client_moderate_preserves_an_available_middle_model(
+    models: list[str], verdict_model: str, expect_model: str
+) -> None:
+    verdict = {
+        "harness": "claude-native",
+        "model": verdict_model,
+        "rationale": "This is a MODERATE task (one file).",
+    }
+    result = await LLMRoutingClient(_FakeLLMClient(verdict)).route(
+        "task", {"claude-native": models}
+    )
+    assert result is not None
+    assert result.model == expect_model
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict_harness", ["claude-native", "codex", "unknown"])
+async def test_llm_routing_client_reconciles_within_resolved_harness(
+    verdict_harness: str,
+) -> None:
+    verdict = {
+        "harness": verdict_harness,
+        "model": "sonnet",
+        "rationale": "This is a COMPLEX task (refactor); selected most capable model opus.",
+    }
+    result = await LLMRoutingClient(_FakeLLMClient(verdict)).route(
+        "task",
+        {"codex": ["nano", "gpt"], "claude-native": ["haiku", "sonnet", "opus"]},
+    )
+    assert result is not None
+    assert (result.harness, result.model) == ("claude-native", "opus")
 
 
 @pytest.mark.asyncio

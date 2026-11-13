@@ -4,6 +4,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+/// Serialize test readers and writers of process-global path and pod settings.
+#[cfg(test)]
+pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Walk up from `start` looking for the checkout root.
 ///
 /// The root is the first ancestor holding a `.jj/` or `.git/` marker — the VCS
