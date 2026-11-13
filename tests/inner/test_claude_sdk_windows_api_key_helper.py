@@ -8,11 +8,11 @@ What is covered:
 * Recognition of Omnigent's exact ``printf %s <shlex.quote(key)>`` form,
   including tokens with shell-special characters, and rejection of anything
   else (dynamic commands, shell-expanding look-alikes, trailing syntax).
-* POSIX: helper command and child env are returned unchanged.
+* POSIX: helper command is returned unchanged.
 * Windows (simulated via ``is_windows=True``): the helper is rewritten to an
-  interpreter-based command that contains no key, the key moves into the
-  child env, the ``--settings`` JSON carries no key, dynamic commands are
-  untouched (refresh preserved), unsafe interpreter paths fall back.
+  interpreter-based command with a shell-safe encoded key operand. The
+  credential stays in settings instead of entering the child environment.
+  Dynamic commands are untouched; unsafe interpreter paths fall back.
 * Real execution of the rewritten helper under POSIX ``sh`` (runs on POSIX
   only) and under ``cmd.exe /d /s /c`` (runs on Windows only).
 
@@ -23,6 +23,7 @@ launcher (its shell selection on Windows is not verifiable from this repo).
 
 from __future__ import annotations
 
+import base64
 import os
 import shlex
 import shutil
@@ -34,7 +35,6 @@ import pytest
 
 from omnigent.inner import claude_sdk_executor as ex
 
-_ENV = ex._STATIC_API_KEY_HELPER_SECRET_ENV
 _FAKE_WIN_PYTHON = r"C:\Program Files\Python312\python.exe"
 
 # Dummy tokens only. Each one exercises characters that are special to POSIX
@@ -98,43 +98,31 @@ def test_static_printf_secret_rejects_other_commands(command: str | None) -> Non
 
 @pytest.mark.parametrize("command", [None, _static_cmd("dummy'quoted %value")])
 def test_posix_helper_unchanged(command: str | None) -> None:
-    env = {"EXISTING": "kept"}
     helper, static_key = ex._platform_safe_api_key_helper(
-        command, env, is_windows=False, python_executable="/usr/bin/python3"
+        command, is_windows=False, python_executable="/usr/bin/python3"
     )
     assert helper == command
     assert static_key is None
-    assert env == {"EXISTING": "kept"}
 
 
 # ── Windows (simulated): rewrite ─────────────────────────────────────────
 
 
 @pytest.mark.parametrize("token", DUMMY_TOKENS)
-def test_windows_static_helper_rewritten_without_key(token: str) -> None:
-    env: dict[str, str] = {}
+def test_windows_static_helper_uses_shell_safe_settings_operand(token: str) -> None:
     helper, static_key = ex._platform_safe_api_key_helper(
-        _static_cmd(token), env, is_windows=True, python_executable=_FAKE_WIN_PYTHON
+        _static_cmd(token), is_windows=True, python_executable=_FAKE_WIN_PYTHON
     )
     assert helper is not None
     assert static_key == token
-    assert env == {_ENV: token}
-    # The key never appears in the command (which becomes CLI argv via --settings).
-    assert token not in helper
-    assert "dummy" not in helper
-    assert helper == (
-        f'"{_FAKE_WIN_PYTHON}" -I -S -c '
-        '"import os,sys;sys.stdout.buffer.write(os.environ[sys.argv[1]].encode())" '
-        f"{_ENV}"
-    )
-    # Nothing cmd.exe or POSIX sh would reinterpret inside the double quotes.
+    encoded = helper.rsplit(" ", 1)[1]
+    assert base64.b64decode(encoded, validate=True).decode() == token
+    # Encoding only protects shell syntax. Settings still contain the credential.
     for ch in ("'", "%", "!", "$", "`", "^", "&", "|", "<", ">"):
         assert ch not in helper
     payload = ex._claude_settings_payload(helper, {})
     assert payload is not None
-    assert token not in payload
-    assert "dummy" not in payload
-    assert "apiKeyHelper" in payload
+    assert encoded in payload
 
 
 @pytest.mark.parametrize(
@@ -147,13 +135,11 @@ def test_windows_static_helper_rewritten_without_key(token: str) -> None:
 )
 def test_windows_dynamic_helper_unchanged(command: str) -> None:
     """Dynamic commands keep running each TTL (refresh behavior preserved)."""
-    env: dict[str, str] = {}
     helper, static_key = ex._platform_safe_api_key_helper(
-        command, env, is_windows=True, python_executable=_FAKE_WIN_PYTHON
+        command, is_windows=True, python_executable=_FAKE_WIN_PYTHON
     )
     assert helper == command
     assert static_key is None
-    assert env == {}
 
 
 @pytest.mark.parametrize(
@@ -172,15 +158,13 @@ def test_windows_unsafe_python_path_falls_back(
     python_path: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     token = "dummy-fallback-token-1234"
-    env: dict[str, str] = {}
     command = _static_cmd(token)
     with caplog.at_level("WARNING"):
         helper, static_key = ex._platform_safe_api_key_helper(
-            command, env, is_windows=True, python_executable=python_path
+            command, is_windows=True, python_executable=python_path
         )
     assert helper == command
     assert static_key is None
-    assert env == {}
     assert token not in caplog.text
 
 
@@ -188,11 +172,10 @@ def test_windows_unsafe_python_path_falls_back(
 
 
 def _helper_for_this_interpreter(token: str) -> tuple[str, dict[str, str]]:
-    helper = ex._windows_static_key_helper_command(sys.executable)
+    helper = ex._windows_static_key_helper_command(sys.executable, token)
     if helper is None:
         pytest.skip("sys.executable path contains characters the helper rejects")
     child_env = dict(os.environ)
-    child_env[_ENV] = token
     return helper, child_env
 
 
@@ -234,9 +217,11 @@ def test_windows_helper_uses_interpreter_path_with_spaces(tmp_path: Path) -> Non
         capture_output=True,
         timeout=60,
     )
-    helper = ex._windows_static_key_helper_command(str(venv / "Scripts" / "python.exe"))
+    helper = ex._windows_static_key_helper_command(
+        str(venv / "Scripts" / "python.exe"), "dummy-quoted-path-key"
+    )
     assert helper is not None
-    child_env = {**os.environ, _ENV: "dummy-quoted-path-key"}
+    child_env = dict(os.environ)
     comspec = os.environ.get("COMSPEC", "cmd.exe")
     result = subprocess.run(
         f'"{comspec}" /d /s /c "{helper}"',
@@ -246,72 +231,3 @@ def test_windows_helper_uses_interpreter_path_with_spaces(tmp_path: Path) -> Non
         check=True,
     )
     assert result.stdout == b"dummy-quoted-path-key"
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX sh execution test")
-def test_rewritten_helper_fails_loudly_without_env_under_posix_sh() -> None:
-    helper, child_env = _helper_for_this_interpreter("unused")
-    child_env.pop(_ENV, None)
-    sh = shutil.which("sh") or "/bin/sh"
-    result = subprocess.run([sh, "-c", helper], env=child_env, capture_output=True, timeout=30)
-    assert result.returncode != 0
-    assert result.stdout == b""
-
-
-# -- security boundaries: reserved env, malformed tokens, per-call isolation --
-
-
-@pytest.mark.parametrize("existing", ["", "different-dummy-token"])
-def test_windows_reserved_env_collision_is_not_overwritten(
-    existing: str,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    env = {_ENV: existing}
-    command = _static_cmd("desired-dummy-token")
-    with caplog.at_level("WARNING"):
-        helper, static_key = ex._platform_safe_api_key_helper(
-            command, env, is_windows=True, python_executable=_FAKE_WIN_PYTHON
-        )
-    assert (helper, static_key) == (command, None)
-    assert env == {_ENV: existing}
-    assert "desired-dummy-token" not in caplog.text
-    assert "different-dummy-token" not in caplog.text
-
-
-def test_windows_reserved_env_same_key_is_idempotent() -> None:
-    token = "same-dummy-token"
-    env = {_ENV: token}
-    helper, static_key = ex._platform_safe_api_key_helper(
-        _static_cmd(token), env, is_windows=True, python_executable=_FAKE_WIN_PYTHON
-    )
-    assert helper is not None and helper != _static_cmd(token)
-    assert static_key == token
-    assert env == {_ENV: token}
-
-
-def test_windows_nul_key_falls_back_without_env_mutation(caplog: pytest.LogCaptureFixture) -> None:
-    command = _static_cmd("dummy\x00value")
-    env = {}
-    with caplog.at_level("WARNING"):
-        helper, static_key = ex._platform_safe_api_key_helper(
-            command, env, is_windows=True, python_executable=_FAKE_WIN_PYTHON
-        )
-    assert (helper, static_key) == (command, None)
-    assert env == {}
-    assert "dummy" not in caplog.text
-
-
-def test_windows_two_calls_do_not_share_child_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(_ENV, "parent-dummy-sentinel")
-    first, second = {}, {}
-    helper1, key1 = ex._platform_safe_api_key_helper(
-        _static_cmd("first-dummy"), first, is_windows=True, python_executable=_FAKE_WIN_PYTHON
-    )
-    helper2, key2 = ex._platform_safe_api_key_helper(
-        _static_cmd("second-dummy"), second, is_windows=True, python_executable=_FAKE_WIN_PYTHON
-    )
-    assert helper1 == helper2
-    assert key1 == first[_ENV] == "first-dummy"
-    assert key2 == second[_ENV] == "second-dummy"
-    assert first != second
-    assert os.environ[_ENV] == "parent-dummy-sentinel"

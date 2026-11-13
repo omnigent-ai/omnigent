@@ -1645,14 +1645,11 @@ def _claude_settings_payload(
     return json.dumps(settings, separators=(",", ":")) if settings else None
 
 
-# Static gateway helpers use POSIX printf; Windows needs an interpreter-based
-# helper that reads the key from the invocation's child environment.
-_STATIC_API_KEY_HELPER_SECRET_ENV = "OMNIGENT_CLAUDE_SDK_HELPER_STATIC_KEY"
-
+# Static gateway helpers use POSIX printf; Windows uses an encoded operand.
 # Quote-free code stays literal in both cmd.exe and sh. Binary UTF-8 output
 # preserves key bytes without Windows newline or console-codepage conversion.
 _STATIC_API_KEY_HELPER_CODE = (
-    "import os,sys;sys.stdout.buffer.write(os.environ[sys.argv[1]].encode())"
+    "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.argv[1],validate=True))"
 )
 
 # Characters that would be reinterpreted by cmd.exe (``%`` / ``!`` expansion)
@@ -1685,12 +1682,13 @@ def _static_printf_secret(command: str | None) -> str | None:
     return secret
 
 
-def _windows_static_key_helper_command(python_executable: str | None) -> str | None:
-    """Build the Windows apiKeyHelper that prints the key from the environment.
+def _windows_static_key_helper_command(python_executable: str | None, secret: str) -> str | None:
+    """Build a Windows helper with the key encoded in its existing settings operand.
 
     :param python_executable: Absolute interpreter path, e.g.
         ``"C:\\\\Program Files\\\\Python312\\\\python.exe"``.
-    :returns: ``"<python>" -I -S -c "<code>" <ENV_NAME>``, or ``None`` when
+    :param secret: Literal credential; encoding handles shell quoting, not secrecy.
+    :returns: ``"<python>" -I -S -c "<code>" <base64-key>``, or ``None`` when
         the interpreter path is empty or contains characters that cmd.exe or
         POSIX sh would reinterpret inside double quotes (including a UNC
         ``\\\\`` prefix, which sh collapses inside double quotes).
@@ -1703,13 +1701,12 @@ def _windows_static_key_helper_command(python_executable: str | None) -> str | N
         return None
     return (
         f'"{python_executable}" -I -S -c "{_STATIC_API_KEY_HELPER_CODE}" '
-        f"{_STATIC_API_KEY_HELPER_SECRET_ENV}"
+        f"{base64.b64encode(secret.encode()).decode('ascii')}"
     )
 
 
 def _platform_safe_api_key_helper(
     command: str | None,
-    env: dict[str, str],
     *,
     is_windows: bool | None = None,
     python_executable: str | None = None,
@@ -1717,13 +1714,11 @@ def _platform_safe_api_key_helper(
     """Make a static-key apiKeyHelper runnable by Claude Code on Windows.
 
     On non-Windows platforms, or for any command that is not Omnigent's exact
-    static ``printf`` form, the command is returned unchanged and *env* is
-    not modified.
+    static ``printf`` form, the command is returned unchanged. Like the
+    original helper, settings contain the credential; tools do not inherit
+    a new credential environment variable.
 
     :param command: The apiKeyHelper command, or ``None``.
-    :param env: The Claude CLI child env (``ClaudeAgentOptions.env``); on the
-        Windows static-key path the key is stored under
-        :data:`_STATIC_API_KEY_HELPER_SECRET_ENV`.
     :param is_windows: Platform override for tests; ``None`` uses
         :data:`omnigent._platform.IS_WINDOWS`.
     :param python_executable: Interpreter override for tests; ``None`` uses
@@ -1737,21 +1732,8 @@ def _platform_safe_api_key_helper(
     secret = _static_printf_secret(command)
     if secret is None:
         return command, None
-    # Environment entries cannot contain NUL; avoid configuring a helper
-    # whose subprocess would fail to launch with an invalid environment.
-    if "\x00" in secret:
-        logger.warning("claude-sdk: static API key helper cannot use a NUL-containing key")
-        return command, None
-    # Preserve exact-name conflicts supplied in the child-env dictionary.
-    # Inherited process values are overridden only for this invocation.
-    existing = env.get(_STATIC_API_KEY_HELPER_SECRET_ENV)
-    if existing is not None and existing != secret:
-        logger.warning(
-            "claude-sdk: reserved static-key helper environment variable is already set"
-        )
-        return command, None
     helper = _windows_static_key_helper_command(
-        sys.executable if python_executable is None else python_executable
+        sys.executable if python_executable is None else python_executable, secret
     )
     if helper is None:
         # Never log the command itself: it carries the key.
@@ -1760,10 +1742,6 @@ def _platform_safe_api_key_helper(
             "Windows-safe (unusable Python interpreter path); leaving it unchanged"
         )
         return command, None
-    # The key is intentionally scoped to this invocation's child environment,
-    # not a process-global os.environ mutation. Claude CLI descendants may
-    # inherit the key; this is a documented limitation, not secret isolation.
-    env[_STATIC_API_KEY_HELPER_SECRET_ENV] = secret
     return helper, secret
 
 
@@ -3680,8 +3658,8 @@ class ClaudeSDKExecutor(Executor):
         env = dict(self._extra_env)
         env["CLAUDE_AGENT_SDK_CLIENT_APP"] = "omnigent"
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
-        # Windows static keys use a child-env helper rather than POSIX printf.
-        api_key_helper, static_api_key = _platform_safe_api_key_helper(api_key_helper, env)
+        # Windows uses a Python helper instead of POSIX printf.
+        api_key_helper, static_api_key = _platform_safe_api_key_helper(api_key_helper)
         # Teach Claude Code this gateway's spellings so no model surface routes
         # to an id the gateway rejects: pins for the family aliases, rewrites
         # for the canonical ids the CLI names itself (the refusal-fallback).

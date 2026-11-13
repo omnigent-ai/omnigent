@@ -2302,15 +2302,17 @@ class TestSystemMessages(unittest.TestCase):
         settings = json.loads(captured_options[0].settings)
         if windows_static:
             self.assertEqual(
-                settings["apiKeyHelper"], ex._windows_static_key_helper_command(sys.executable)
+                settings["apiKeyHelper"],
+                ex._windows_static_key_helper_command(sys.executable, token),
             )
-            self.assertEqual(captured_options[0].env[ex._STATIC_API_KEY_HELPER_SECRET_ENV], token)
+            self.assertNotIn(token, captured_options[0].env.values())
+            self.assertNotIn("OMNIGENT_CLAUDE_SDK_HELPER_STATIC_KEY", captured_options[0].env)
             self.assertNotIn("dummy-static", captured_options[0].settings)
             self.assertEqual(discovered[0].api_key, token)
             self.assertIsNone(discovered[0].auth_command)
         else:
             self.assertEqual(settings["apiKeyHelper"], command)
-            self.assertNotIn(ex._STATIC_API_KEY_HELPER_SECRET_ENV, captured_options[0].env)
+            self.assertNotIn("OMNIGENT_CLAUDE_SDK_HELPER_STATIC_KEY", captured_options[0].env)
             self.assertEqual(discovered[0].auth_command, command)
             self.assertIsNone(discovered[0].api_key)
         # The CLI talks to the loopback shim; the shim forwards to the
