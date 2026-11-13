@@ -3437,15 +3437,17 @@ def _merge_caller_settings(
     ``permissions`` lists merge, a caller ``statusLine`` command is chained after
     Omnigent's context capture (in place of the user's global one), and any other
     key Omnigent does not set is taken from the caller. Later caller values win
-    before Omnigent's own values take precedence. Options that would disable
-    the required bridge hooks are rejected.
+    before Omnigent's own values take precedence. Effective ``disableAllHooks``
+    and ``allowManagedHooksOnly`` values of ``true`` are rejected. Other CLI
+    hook controls, including environment modes and plugin-only customization,
+    are passed through; this validation is not exhaustive.
     Caller MCP-denial lists use the last caller value; saved denials append later.
 
     :param settings: Omnigent's invocation settings.
     :param callers: Parsed caller settings, in flag order.
     :param bridge_dir: Bridge directory the statusLine capture writes into.
     :returns: The merged settings.
-    :raises ValueError: Caller settings disable the required bridge hooks.
+    :raises ValueError: Either validated hook-disabling setting is true.
     """
     caller_status = next(
         (caller["statusLine"] for caller in reversed(callers) if "statusLine" in caller), None
