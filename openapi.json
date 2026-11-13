@@ -17617,7 +17617,7 @@
     },
     "/v1/scheduled-tasks/{scheduled_task_id}/permissions/{target_user_id}": {
       "delete": {
-        "description": "Stop sharing one of the caller's automations with a user or group.\n\nThey lose a continue-session automation's session too. Sessions of earlier\nruns of a new-session automation keep their grants. Idempotent: 204 whether\nor not a grant existed.\n\n**Returns:** 204 No Content.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent or a server that cannot share automations.",
+        "description": "Stop sharing one of the caller's automations with a user or group.\n\nThey lose a continue-session automation's session first, then the automation\ngrant. If the session revoke fails, the request fails and the grant stays, so\nrepeating the DELETE retries it. Sessions of earlier runs of a new-session\nautomation keep their grants. Idempotent: 204 without touching anything when\nthey hold no automation grant.\n\n**Returns:** 204 No Content.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent or a server that cannot share automations, 500 when the session revoke fails.",
         "operationId": "revoke_scheduled_task_permission_v1_scheduled_tasks__scheduled_task_id__permissions__target_user_id__delete",
         "parameters": [
           {

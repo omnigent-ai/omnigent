@@ -12,8 +12,9 @@ list at Read, with the owner's authority:
 
 Grantees match by exact ID, as the session share route matches them. Older run
 sessions are never updated. Callers run these as the task's owner: the fire path
-inside its owner scopes, a route in the owner's own request. Nothing here raises;
-a failure is logged so it never changes a run's outcome.
+inside its owner scopes, a route in the owner's own request. Only
+:func:`revoke_from_task_session` raises, so the revoke route can keep the grant for
+a retry; everything else logs a failure so it never changes a run's outcome.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from enum import Enum
 from typing import Any
 
 from omnigent.entities import Conversation, ScheduledTask
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.routes._sessions.helpers import _announce_session_added
 from omnigent.server.session_sharing import require_sharing_mode_allows_grant
@@ -246,8 +247,8 @@ async def sync_task_session(
 ) -> None:
     """Sync a continue-session automation's existing session right after its grants change.
 
-    For the automation's grant and revoke routes; the next run's sync is the
-    backstop. The sync is forced, so it revokes even when no grants are left. Does
+    For the automation's grant and revoke routes; after a grant, the next run's sync
+    is the backstop. The sync is forced, so it revokes even when no grants are left. Does
     nothing for an automation that starts a new session each run, or whose session
     is gone or no longer owned by the automation's owner. Never raises.
 
@@ -291,16 +292,18 @@ async def sync_task_session(
 async def revoke_from_task_session(
     task: ScheduledTask, user_id: str, *, permission_store: PermissionStore | None
 ) -> None:
-    """Revoke *user_id* from a continue-session automation's session, for the revoke route.
+    """Revoke a grantee from a continue-session automation's session, for the revoke route.
 
-    Runs whether or not the automation's grant still existed, so retrying a revoke
-    whose sync failed still removes them; runs skip revocation once the automation
+    The route calls this before it deletes their automation grant, which stays as
+    the record that this revoke is owed: no run would make it once the automation
     has no grants. Leaves the owner's grant, ``__public__`` and a session the
-    automation's owner doesn't own alone, as the sync does. Never raises.
+    automation's owner doesn't own alone, as the sync does.
 
-    :param task: The automation the grantee was removed from.
-    :param user_id: The removed grantee, e.g. ``"alice@example.com"``.
+    :param task: The automation the grantee is being removed from.
+    :param user_id: The grantee, e.g. ``"alice@example.com"``.
     :param permission_store: The server's permission store; ``None`` does nothing.
+    :raises OmnigentError: ``INTERNAL_ERROR`` when the session's grants can't be
+        read or changed, so the caller keeps the automation grant for a retry.
     """
     owner = task.user_id or RESERVED_USER_LOCAL
     if (
@@ -319,13 +322,18 @@ async def revoke_from_task_session(
         grant = await asyncio.to_thread(permission_store.get, user_id, task.session_id)
         if grant is not None and grant.level != LEVEL_OWNER:
             await asyncio.to_thread(permission_store.revoke, user_id, task.session_id)
-    except Exception:
+    except Exception as exc:
         _logger.exception(
             "automation %s: could not revoke %r from session %s",
             task.id,
             user_id,
             task.session_id,
         )
+        raise OmnigentError(
+            "Could not remove them from the automation's session, so the automation is "
+            "still shared with them. Try again.",
+            code=ErrorCode.INTERNAL_ERROR,
+        ) from exc
 
 
 async def delete_task_grants(

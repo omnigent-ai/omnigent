@@ -2,8 +2,10 @@
 
 Mirrors the session share routes. Only the automation's owner may list, grant or
 revoke, and agents may not call these routes. Grants are Read only and never public.
-A change syncs a continue-session automation's session right away, best-effort; the
-next run's sync is the backstop.
+A grant syncs a continue-session automation's session right away, best-effort; the
+next run's sync is the backstop. A revoke removes the person from that session
+before it deletes their automation grant, so a failed revoke is retried by repeating
+the DELETE.
 """
 
 from __future__ import annotations
@@ -392,24 +394,33 @@ def register_scheduled_task_permissions_routes(
     ) -> Response:
         """Stop sharing one of the caller's automations with a user or group.
 
-        They lose a continue-session automation's session too. Sessions of earlier
-        runs of a new-session automation keep their grants. Idempotent: 204 whether
-        or not a grant existed.
+        They lose a continue-session automation's session first, then the automation
+        grant. If the session revoke fails, the request fails and the grant stays, so
+        repeating the DELETE retries it. Sessions of earlier runs of a new-session
+        automation keep their grants. Idempotent: 204 without touching anything when
+        they hold no automation grant.
 
         :param scheduled_task_id: The automation.
         :param target_user_id: The grantee to remove, e.g. ``"alice@example.com"``.
         :returns: 204 No Content.
         :raises OmnigentError: 404 when the caller does not own the automation, 403
-            for an agent or a server that cannot share automations.
+            for an agent or a server that cannot share automations, 500 when the
+            session revoke fails.
         """
         store = require_sharing(request)
         task = await owned_task(request, scheduled_task_id)
-        revoked = await asyncio.to_thread(store.revoke_for_scheduled_task, target_user_id, task.id)
-        # Always, so a retry still removes them when an earlier sync failed.
+        add_audit_attrs(target_user_id=target_user_id)
+        # Access they never had from the automation, such as a hand-made session
+        # share, stays.
+        if (
+            await asyncio.to_thread(store.resolve_scheduled_task_access, [target_user_id], task.id)
+            is None
+        ):
+            return Response(status_code=204)
         await revoke_from_task_session(task, target_user_id, permission_store=store)
+        revoked = await asyncio.to_thread(store.revoke_for_scheduled_task, target_user_id, task.id)
         # A full sync only after a change, so an automation nobody shares never
         # overwrites its session's other shares.
         if revoked:
             await sync_session(request, task)
-        add_audit_attrs(target_user_id=target_user_id)
         return Response(status_code=204)

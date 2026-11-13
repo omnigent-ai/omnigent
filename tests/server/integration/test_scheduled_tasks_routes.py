@@ -4537,9 +4537,10 @@ async def test_grant_changes_reach_a_continued_session_at_once(
     permissions.grant("erin@example.com", session_id, LEVEL_READ)
     task_id = await _create_task(auth_client, session_mode="continue", session_id=session_id)
 
-    # An automation nobody shares leaves its session's sharing alone.
+    # Removing someone the automation never shared with leaves the session alone,
+    # including their own share of it, and runs no sync.
     revoked = await auth_client.delete(
-        _permissions_url(task_id, "nobody@example.com"), headers=_headers()
+        _permissions_url(task_id, "erin@example.com"), headers=_headers()
     )
     assert revoked.status_code == 204, revoked.text
     owner = {"alice@example.com": LEVEL_OWNER}
@@ -4565,7 +4566,7 @@ async def test_grant_changes_reach_a_continued_session_at_once(
 
 
 @_SHARING
-async def test_retrying_a_revoke_removes_the_grantee_after_a_failed_sync(
+async def test_a_revoke_that_cannot_reach_the_session_keeps_the_grant_for_a_retry(
     auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.server.auth import LEVEL_OWNER
@@ -4580,12 +4581,15 @@ async def test_retrying_a_revoke_removes_the_grantee_after_a_failed_sync(
 
     url = _permissions_url(task_id, "bob@example.com")
     monkeypatch.setattr(SqlAlchemyPermissionStore, "revoke", failing)
-    assert (await auth_client.delete(url, headers=_headers())).status_code == 204
-    assert _task_grantees(db_uri, task_id) == []
+    failed = await auth_client.delete(url, headers=_headers())
+    assert failed.status_code == 500, failed.text
+    assert failed.json()["error"]["code"] == "internal_error"
+    # The automation grant records that the session revoke is still owed.
+    assert _task_grantees(db_uri, task_id) == ["bob@example.com"]
     assert "bob@example.com" in _session_grants(db_uri, session_id)
-    # The automation grant is gone, but the retry still reaches the session.
     monkeypatch.setattr(SqlAlchemyPermissionStore, "revoke", revoke)
     assert (await auth_client.delete(url, headers=_headers())).status_code == 204
+    assert _task_grantees(db_uri, task_id) == []
     assert _session_grants(db_uri, session_id) == {"alice@example.com": LEVEL_OWNER}
 
 
