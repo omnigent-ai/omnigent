@@ -27,6 +27,8 @@ from omnigent.tools.base import Tool
 # A reminder must fire after the task exists; rounding up to the minute adds up to
 # another minute.
 MIN_REMINDER_DELAY = timedelta(seconds=60)
+# The end of an ISO-8601 time with "Z" or a whole-minute offset such as "-08:00".
+_WHOLE_MINUTE_OFFSET = re.compile(r"(?:[Zz]|[+-]\d{2}(?::?\d{2})?)$")
 # Below one year, so the rule's month, day and time occur only once after creation.
 MAX_REMINDER_DELAY = timedelta(days=364)
 REMINDER_NAME_CHARS = 60
@@ -457,6 +459,10 @@ def resolve_reminder_time(args: dict[str, Any], now: datetime) -> datetime | str
             return f"'at' is not an ISO-8601 time: {raw!r}."
         if when.tzinfo is None or when.utcoffset() is None:
             return "'at' needs a UTC offset or 'Z', e.g. '2026-11-12T15:00:00-08:00'."
+        if _WHOLE_MINUTE_OFFSET.search(raw.strip()) is None:
+            # fromisoformat also takes offsets with seconds and fractions, which it
+            # can truncate; with only whole minutes, any fraction is the clock's.
+            return "'at' needs a UTC offset in whole minutes, such as 'Z' or '-08:00'."
         fraction = re.search(r"[.,](\d+)", raw)
         # fromisoformat drops digits past microseconds; count them so the time
         # can't round down to a minute before the one asked for.

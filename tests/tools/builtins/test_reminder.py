@@ -90,6 +90,10 @@ def test_at_is_converted_to_utc() -> None:
         ({"at": "0001-01-01T00:00:00+05:00"}, "outside the supported date range"),
         ({"at": "9999-12-31T23:59:59-05:00"}, "outside the supported date range"),
         ({"at": "9999-12-31T23:59:59.9999991Z"}, "outside the supported date range"),
+        # Offsets with seconds or fractions could round the wrong way.
+        ({"at": "2026-11-12T23:00:00+00:00:00.0000001"}, "whole minutes"),
+        ({"at": "2026-11-12T23:00:00.0000000-00:00:00.0000001"}, "whole minutes"),
+        ({"at": "2026-11-12T23:00:00+05:30:15"}, "whole minutes"),
         # Rounding up would overflow here, but the limit is checked first.
         ({"at": "9999-12-31T23:59:59Z"}, "at most 364 days"),
     ],
