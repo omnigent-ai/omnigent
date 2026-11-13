@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { toast } from "sonner";
+import { useDescendantSessions } from "@/hooks/useChildSessions";
 import { useIdentityReady, useViewerId } from "@/hooks/useViewerId";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
@@ -16,18 +17,33 @@ import { getOmnigentServerIdentity } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { randomUUID } from "@/lib/randomUUID";
-import { useNavigate, useParams } from "@/lib/routing";
+import { useNavigate, useParams, useSearchParams } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
   gridSessionIds,
   parseSessionGrids,
   removeGridSession,
+  sessionsGridLayout,
   splitGrid,
   swapGridSessions,
   type SessionGrid,
   type SplitEdge,
 } from "./gridLayout";
+
+const AGENTS_GRID_PREFIX = "agents:";
+const AGENTS_GRID_PAGE_SIZE = 4;
+
+/** Unsaved grid route showing a session's sub-agents, four per page. */
+export const agentsGridPath = (rootSessionId: string) =>
+  `/grid/${AGENTS_GRID_PREFIX}${rootSessionId}`;
+
+export interface AgentsGrid extends SessionGrid {
+  rootSessionId: string;
+  /** 1-based page from the ``page`` search parameter. */
+  page: number;
+  pageCount: number;
+}
 
 interface GridSessionsContextValue {
   enabled: boolean;
@@ -35,6 +51,11 @@ interface GridSessionsContextValue {
   identityReady: boolean;
   grids: SessionGrid[];
   activeGrid?: SessionGrid;
+  /** Sub-agents grid on an agents route; it is never saved or listed. */
+  agentsGrid?: AgentsGrid;
+  /** Root session of an agents route, set while its grid loads or is empty. */
+  agentsRootSessionId?: string;
+  agentsGridLoading: boolean;
   conversationId?: string;
   /** Focused pane of the displayed grid; defaults to its first session. */
   selectedSessionId?: string;
@@ -93,8 +114,36 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
   }, [storageKey, read]);
   const grids = saved.key === storageKey ? saved.grids : EMPTY_GRIDS;
   const activeGrid = grids.find((grid) => grid.id === gridId);
+  const agentsRootSessionId =
+    storageKey !== null && gridId?.startsWith(AGENTS_GRID_PREFIX)
+      ? gridId.slice(AGENTS_GRID_PREFIX.length)
+      : undefined;
+  const { descendants, isLoading: agentsGridLoading } = useDescendantSessions(
+    agentsRootSessionId ?? null,
+  );
+  const [searchParams] = useSearchParams();
+  const agentsPageCount = Math.ceil(descendants.length / AGENTS_GRID_PAGE_SIZE);
+  const agentsPage = Math.min(Math.max(1, Number(searchParams.get("page")) || 1), agentsPageCount);
+  const agentsPageIds = descendants
+    .slice((agentsPage - 1) * AGENTS_GRID_PAGE_SIZE, agentsPage * AGENTS_GRID_PAGE_SIZE)
+    .map((child) => child.id)
+    .join("\n");
+  const agentsGrid = useMemo<AgentsGrid | undefined>(
+    () =>
+      agentsRootSessionId && gridId && agentsPageIds
+        ? {
+            id: gridId,
+            layout: sessionsGridLayout(agentsPageIds.split("\n")),
+            rootSessionId: agentsRootSessionId,
+            page: agentsPage,
+            pageCount: agentsPageCount,
+          }
+        : undefined,
+    [agentsRootSessionId, gridId, agentsPageIds, agentsPage, agentsPageCount],
+  );
+  const displayedGrid = activeGrid ?? agentsGrid;
   const [selection, setSelection] = useState<{ gridId: string; sessionId: string } | null>(null);
-  const activeSessionIds = activeGrid ? gridSessionIds(activeGrid.layout) : [];
+  const activeSessionIds = displayedGrid ? gridSessionIds(displayedGrid.layout) : [];
   const selectedSessionId =
     selection !== null &&
     selection.gridId === gridId &&
@@ -122,6 +171,9 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
       identityReady,
       grids,
       activeGrid,
+      agentsGrid,
+      agentsRootSessionId,
+      agentsGridLoading,
       conversationId,
       selectedSessionId,
       selectSession: (sessionId) => {
@@ -167,6 +219,9 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
   }, [
     grids,
     activeGrid,
+    agentsGrid,
+    agentsRootSessionId,
+    agentsGridLoading,
     conversationId,
     selectedSessionId,
     gridId,

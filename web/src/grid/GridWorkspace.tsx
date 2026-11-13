@@ -20,6 +20,9 @@ import {
 } from "@dnd-kit/core";
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import {
+  ArrowLeftIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
   Grid2X2Icon,
   MoreHorizontalIcon,
   PanelRightCloseIcon,
@@ -31,7 +34,7 @@ import { CanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import { usePaneCycleHotkey } from "@/hooks/usePaneCycleHotkey";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
-import { Link, useParams } from "@/lib/routing";
+import { Link, useParams, useSearchParams } from "@/lib/routing";
 import { SidebarOpenButton } from "@/shell/SidebarOpenButton";
 import { Button } from "@/components/ui/button";
 import { useChatStore } from "@/store/chatStore";
@@ -60,7 +63,7 @@ import {
 import { gridPanes, gridSessionIds, type SessionGrid } from "./gridLayout";
 import { GridSessionPane, type GridWorkspacePanelProps } from "./GridSessionPane";
 import { GridDropOverlay, type GridDropTarget } from "./GridDropTargets";
-import { gridTitle, useGridSessions } from "./GridSessionsContext";
+import { gridTitle, useGridSessions, type AgentsGrid } from "./GridSessionsContext";
 
 export function GridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLAnchorElement> }) {
   const grids = useGridSessions();
@@ -192,7 +195,7 @@ export function RearrangeableGrid({
 }) {
   const { layout } = grid;
   const sessionIds = gridSessionIds(layout);
-  const { selectedSessionId: activeSessionId, selectSession } = useGridSessions()!;
+  const { selectedSessionId: activeSessionId, selectSession, agentsGrid } = useGridSessions()!;
   const workspaceKey = `grid:${grid.id}`;
   const [workspace, setWorkspace] = useState(() => {
     const saved = readSessionWorkspaceState(workspaceKey);
@@ -336,8 +339,14 @@ export function RearrangeableGrid({
                 componentId="grid.open_sidebar"
               />
             )}
-            <Grid2X2Icon className="size-4 shrink-0" />
-            <h1 className="truncate text-ui">{gridTitle(grid)}</h1>
+            {agentsGrid ? (
+              <AgentsGridHeader grid={agentsGrid} />
+            ) : (
+              <>
+                <Grid2X2Icon className="size-4 shrink-0" />
+                <h1 className="truncate text-ui">{gridTitle(grid)}</h1>
+              </>
+            )}
             <span className="flex-1" />
             <Button
               variant="ghost"
@@ -389,6 +398,47 @@ export function RearrangeableGrid({
   );
 }
 
+function AgentsGridHeader({ grid }: { grid: AgentsGrid }) {
+  const [, setSearchParams] = useSearchParams();
+  const showPage = (page: number) => setSearchParams({ page: String(page) });
+  return (
+    <>
+      <Button asChild variant="outline">
+        <Link to={`/c/${grid.rootSessionId}`}>
+          <ArrowLeftIcon />
+          Back to main agent
+        </Link>
+      </Button>
+      <h1 className="truncate text-ui">Sub-agents</h1>
+      {grid.pageCount > 1 && (
+        <div className="flex items-center gap-1 text-ui text-muted-foreground">
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Previous sub-agents"
+            disabled={grid.page === 1}
+            onClick={() => showPage(grid.page - 1)}
+          >
+            <ChevronLeftIcon />
+          </Button>
+          <span>
+            Page {grid.page} of {grid.pageCount}
+          </span>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Next sub-agents"
+            disabled={grid.page === grid.pageCount}
+            onClick={() => showPage(grid.page + 1)}
+          >
+            <ChevronRightIcon />
+          </Button>
+        </div>
+      )}
+    </>
+  );
+}
+
 // Links use dnd-kit, but native URL drops must never navigate away from a grid.
 function preventLinkDrop(event: DragEvent<HTMLElement>) {
   if (event.dataTransfer.types.includes("text/uri-list")) event.preventDefault();
@@ -406,7 +456,8 @@ export function GridWorkspace({
   );
   const grids = useGridSessions();
   const { gridId } = useParams<{ gridId: string }>();
-  const layout = grids?.activeGrid?.layout;
+  const displayedGrid = grids?.activeGrid ?? grids?.agentsGrid;
+  const layout = displayedGrid?.layout;
   // All visible panes must survive LRU eviction when the fourth stream opens.
   useEffect(() => {
     if (!grids?.enabled || !gridId || !layout) return;
@@ -431,6 +482,8 @@ export function GridWorkspace({
   const canReload = grids.desktop && !grids.enabled && grids.identityReady;
   let message = "Grids are available on desktop only. Open a session from the sidebar.";
   if (loading) message = "Waiting for your account identity.";
+  else if (grids.agentsRootSessionId)
+    message = grids.agentsGridLoading ? "Loading sub-agents…" : "This session has no sub-agents.";
   else if (canReload) message = "Your account identity is unavailable. Reload to retry.";
   else if (grids.desktop)
     message =
@@ -442,8 +495,8 @@ export function GridWorkspace({
       onDragOver={preventLinkDrop}
       onDropCapture={preventLinkDrop}
     >
-      {grids.activeGrid ? (
-        <RearrangeableGrid key={gridId} grid={grids.activeGrid} onOpenSidebar={onOpenSidebar} />
+      {displayedGrid ? (
+        <RearrangeableGrid key={gridId} grid={displayedGrid} onOpenSidebar={onOpenSidebar} />
       ) : (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
           {onOpenSidebar && (
@@ -453,11 +506,15 @@ export function GridWorkspace({
               componentId="grid.open_sidebar"
             />
           )}
-          <h1>{loading ? "Loading grid…" : "Grid unavailable"}</h1>
+          <h1>{loading || grids.agentsGridLoading ? "Loading grid…" : "Grid unavailable"}</h1>
           <p>{message}</p>
           {canReload && <Button onClick={() => window.location.reload()}>Reload</Button>}
           <Button asChild variant="outline">
-            <Link to="/">Back to sessions</Link>
+            {grids.agentsRootSessionId ? (
+              <Link to={`/c/${grids.agentsRootSessionId}`}>Back to main agent</Link>
+            ) : (
+              <Link to="/">Back to sessions</Link>
+            )}
           </Button>
         </div>
       )}

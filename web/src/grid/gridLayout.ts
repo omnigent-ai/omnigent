@@ -59,6 +59,17 @@ export function splitGrid(
   };
 }
 
+/** Lays out up to four sessions in reading order: one, side by side, then two rows. */
+export function sessionsGridLayout(sessionIds: string[]): GridLayout {
+  const [first, second, third, fourth] = sessionIds;
+  if (second === undefined) return first;
+  const top: GridLayout = { axis: "columns", children: [first, second] };
+  if (third === undefined) return top;
+  const bottom: GridLayout =
+    fourth === undefined ? third : { axis: "columns", children: [third, fourth] };
+  return { axis: "rows", children: [top, bottom] };
+}
+
 export function removeGridSession(layout: GridLayout, sessionId: string): GridLayout | null {
   if (typeof layout === "string") return layout === sessionId ? null : layout;
   const first = removeGridSession(layout.children[0], sessionId);
