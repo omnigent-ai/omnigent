@@ -31,6 +31,7 @@ from starlette.datastructures import Headers
 
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
+    FunctionCallData,
     MessageData,
     NewConversationItem,
 )
@@ -136,7 +137,11 @@ def _route_to_runner(monkeypatch: pytest.MonkeyPatch, runner: httpx.AsyncClient)
     """Route sessions to this client while checking the prefetched conversation identity."""
 
     async def resolve(
-        session_id: str, runner_router: object, *, conversation: Any = None
+        session_id: str,
+        runner_router: object,
+        *,
+        conversation: Any = None,
+        for_control: bool = False,
     ) -> httpx.AsyncClient:
         assert conversation is None or conversation.id == session_id
         return runner
@@ -401,6 +406,47 @@ async def test_create_titled_session_keeps_title_after_first_message(
     message = next(item for item in items if item.get("role") == "user")
     assert message["user_authored"] is True
     assert not message.get("is_meta")
+
+
+@pytest.mark.parametrize("event_type", ["message", "external_conversation_item"])
+async def test_client_meta_and_external_messages_do_not_infer_user_authorship(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    content_text = "Client meta input" if event_type == "message" else "External input"
+    item_data: dict[str, Any] = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": content_text}],
+    }
+    if event_type == "message":
+        item_data["is_meta"] = True
+        event_data = item_data
+    else:
+        event_data = {
+            "item_type": "message",
+            "item_data": item_data,
+            "response_id": "external_turn",
+        }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": event_type, "data": event_data},
+        )
+        assert response.status_code == 202, response.text
+
+    items_response = await client.get(f"/v1/sessions/{session['id']}/items")
+    assert items_response.status_code == 200, items_response.text
+    [message] = [item for item in items_response.json()["data"] if item["type"] == "message"]
+    assert message["content"] == item_data["content"]
+    assert message.get("is_meta", False) is (event_type == "message")
+    assert "user_authored" not in message
 
 
 async def test_sidebar_rename_wins_in_flight_background_title(
@@ -1291,6 +1337,321 @@ async def test_external_session_status_event_lands_in_status_cache(
         assert item["status"] == "running"
     finally:
         sessions_module._session_status_cache.pop(session["id"], None)
+
+
+async def test_external_background_work_sets_sidebar_flag_without_status_edge(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``external_background_work`` sets the session-list flag and publishes no edge.
+
+    A background shell that outlives its turn keeps the session working. The
+    turn status stays as reported, so the session still takes a new message.
+    """
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    async def listed_item() -> dict[str, Any]:
+        """Return this session's row from the session list."""
+        list_resp = await client.get("/v1/sessions")
+        return next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+
+    status_before = (await listed_item())["status"]
+    published.clear()
+    for running in (True, False):
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_background_work", "data": {"running": running}},
+        )
+        assert resp.status_code == 202, resp.text
+        assert resp.json() == {"queued": False}
+        assert (await listed_item())["background_work_running"] is running
+    assert published == []
+    assert (await listed_item())["status"] == status_before
+
+
+async def test_external_background_work_from_a_replaced_runner_is_rejected(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A report delayed past a rebind cannot overwrite the replacement runner's value."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server import session_live_state
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], token_bound_runner_id("token-a"))
+
+    async def report(token: str, running: bool) -> httpx.Response:
+        return await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token},
+            json={"type": "external_background_work", "data": {"running": running}},
+        )
+
+    assert (await report("token-a", False)).status_code == 202
+    store.replace_runner_id(session["id"], token_bound_runner_id("token-b"))
+    assert (await report("token-b", False)).status_code == 202
+
+    late = await report("token-a", True)
+
+    assert late.status_code == 403, late.text
+    session_live_state.submit("drain", lambda: None).result(timeout=10)
+    list_resp = await client.get("/v1/sessions")
+    row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+    assert row["background_work_running"] is False
+    stored = store.get_conversation(session["id"])
+    assert stored is not None and stored.background_work_running is False
+
+
+async def test_external_background_work_handed_off_mid_request_is_retried(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A report this replica hands off before writing gets a retryable 503 and writes nothing.
+
+    The runner's retry, once the session is settled, is written.
+    """
+    from omnigent.server import session_live_state
+    from omnigent.server.routes._sessions.orchestration import _relinquish_session_live_state
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    real_count = session_live_state.handoff_count
+    calls = 0
+
+    def handoff_while_authorizing(session_id: str) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            # Another replica takes the session after this request began.
+            _relinquish_session_live_state(session_id)
+        return real_count(session_id)
+
+    async def report() -> httpx.Response:
+        return await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_background_work", "data": {"running": True}},
+        )
+
+    monkeypatch.setattr(routes_events, "handoff_count", handoff_while_authorizing)
+    handed_off = await report()
+    session_live_state.submit("drain", lambda: None).result(timeout=10)
+
+    assert handed_off.status_code == 503, handed_off.text
+    stored = store.get_conversation(session["id"])
+    assert stored is not None and stored.background_work_running is None
+
+    retried = await report()
+    session_live_state.submit("drain", lambda: None).result(timeout=10)
+
+    assert retried.status_code == 202, retried.text
+    stored = store.get_conversation(session["id"])
+    assert stored is not None and stored.background_work_running is True
+
+
+async def test_external_background_work_keeps_the_newest_report(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A runner's report that lands after a newer one, such as an abandoned retry, is not stored.
+
+    Only the session's runner orders its reports, so another caller's report time,
+    even a year ahead, cannot hold back the runner's later reports.
+    """
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], token_bound_runner_id("token-a"))
+
+    async def report(running: bool, reported_at: int, *, token: str | None = "token-a") -> None:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: token} if token is not None else {},
+            json={
+                "type": "external_background_work",
+                "data": {"running": running, "reported_at": reported_at},
+            },
+        )
+        assert resp.status_code == 202, resp.text
+
+    def flag() -> bool | None:
+        stored = store.get_conversation(session["id"])
+        assert stored is not None
+        return stored.background_work_running
+
+    await report(False, 2_000)
+    await report(True, 1_000)
+    assert flag() is False
+
+    await report(True, 2_000 + 365 * 24 * 3600 * 10**9, token=None)
+    assert flag() is True
+    await report(False, 3_000)
+    assert flag() is False
+    list_resp = await client.get("/v1/sessions")
+    row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+    assert row["background_work_running"] is False
+
+
+async def test_a_session_unbound_from_its_runner_lists_no_background_work(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """No runner is left to report the shell ending, so clearing the binding clears the flag."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session["id"], "runner_old")
+    store.set_background_work_running(session["id"], True, runner_id="runner_old")
+
+    store.clear_runner_id(session["id"])
+
+    list_resp = await client.get("/v1/sessions")
+    row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+    assert row["background_work_running"] is False
+
+
+async def test_snapshot_names_the_agents_of_a_background_agent_hold(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A Claude turn waiting on its background agent reads ``running`` and names the agent.
+
+    Released headless ``-p`` clients stop polling on any status but ``running`` /
+    ``launching``, so the hold keeps the collapsed status and signals itself only
+    through the additive ``background_agents`` field. Any other ``waiting`` (an
+    SDK orchestrator parked on sub-agents) names no agents. The list row reads
+    ``running`` for both.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import BackgroundTaskInfo
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    background_agent = BackgroundTaskInfo(id="a1", type="subagent", description="Audit")
+    try:
+        sessions_module._publish_status(sid, "waiting", background_agents=[background_agent])
+        held = (await client.get(f"/v1/sessions/{sid}")).json()
+        list_resp = await client.get("/v1/sessions")
+        row = next(s for s in list_resp.json()["data"] if s["id"] == sid)
+
+        sessions_module._publish_status(sid, "waiting")
+        parked = (await client.get(f"/v1/sessions/{sid}")).json()
+
+        assert held["status"] == "running"
+        assert [(a["id"], a["description"]) for a in held["background_agents"]] == [
+            ("a1", "Audit")
+        ]
+        assert row["status"] == "running"
+        assert parked["status"] == "running"
+        assert parked.get("background_agents") is None
+    finally:
+        sessions_module._session_status_cache.pop(sid, None)
+        sessions_module._session_background_agents_cache.pop(sid, None)
+
+
+async def test_external_background_work_lists_tasks_for_the_composer(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner's task list publishes ``session.background_tasks`` and reaches the snapshot.
+
+    It publishes no status edge and leaves the sidebar flag alone; ``0`` clears it.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    async def report(count: int, commands: list[str]) -> dict[str, Any]:
+        """Post one task list and return the session snapshot after it."""
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_background_work",
+                "data": {
+                    "background_task_count": count,
+                    "background_tasks": [{"command": command} for command in commands],
+                },
+            },
+        )
+        assert resp.status_code == 202, resp.text
+        return (await client.get(f"/v1/sessions/{session['id']}")).json()
+
+    try:
+        flagged = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_background_work", "data": {"running": True}},
+        )
+        assert flagged.status_code == 202, flagged.text
+        published.clear()
+        listed = await report(1, ["npm run dev"])
+        cleared = await report(0, [])
+
+        assert listed["background_task_count"] == 1
+        assert [task["command"] for task in listed["background_tasks"]] == ["npm run dev"]
+        assert cleared.get("background_task_count") is None
+        assert [
+            (
+                event["type"],
+                event["background_task_count"],
+                [task["command"] for task in event["background_tasks"]],
+            )
+            for _, event in published
+        ] == [
+            ("session.background_tasks", 1, ["npm run dev"]),
+            ("session.background_tasks", 0, []),
+        ]
+        list_resp = await client.get("/v1/sessions")
+        row = next(s for s in list_resp.json()["data"] if s["id"] == session["id"])
+        assert row["background_work_running"] is True
+    finally:
+        sessions_module._session_background_task_count_cache.pop(session["id"], None)
+        sessions_module._session_background_tasks_cache.pop(session["id"], None)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"running": "yes"},
+        {"running": True, "reported_at": -1},
+        {"running": True, "reported_at": "1"},
+        {},
+        {"background_task_count": -1},
+        {"background_task_count": True},
+        {"running": True, "background_task_count": "1"},
+    ],
+)
+async def test_post_external_background_work_rejects_invalid_data(
+    client: httpx.AsyncClient, data: dict[str, Any]
+) -> None:
+    """A malformed flag, count or report time fails loud rather than setting either."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_background_work", "data": data},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "external_background_work" in resp.text
 
 
 # ── POST /v1/sessions/{id}/events external_session_superseded ─────
@@ -2510,6 +2871,8 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     items = items_resp.json()["data"]
     visible = next(item for item in items if item["type"] == "slash_command")
     meta = next(item for item in items if item["type"] == "message" and item.get("is_meta"))
+    # Explicit skill invocation marks even its hidden expansion as user-authored.
+    assert meta["user_authored"] is True
     assert visible["name"] == "grill-me"
     assert visible["kind"] == "skill"
     assert visible["arguments"] == "review this rollout"
@@ -4552,6 +4915,62 @@ async def test_list_session_items_pagination(
     assert len(page["data"]) <= 1
 
 
+async def test_list_session_items_filters_by_item_type(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``type`` keeps only items of that type, across pages; an unknown type is a 422."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    SqlAlchemyConversationStore(db_uri).append(
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            ),
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_1",
+                data=FunctionCallData(
+                    agent="test-agent", name="search", arguments="{}", call_id="call_1"
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_2",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "again"}]),
+            ),
+        ],
+    )
+    items_url = f"/v1/sessions/{session['id']}/items"
+
+    by_type = {
+        item_type: [
+            item["type"]
+            for item in (await client.get(items_url, params={"type": item_type})).json()["data"]
+        ]
+        for item_type in ("message", "function_call")
+    }
+    # The cursor of a filtered page continues with the next item of that type.
+    first = (await client.get(items_url, params={"type": "message", "limit": 1})).json()
+    second = (
+        await client.get(
+            items_url, params={"type": "message", "limit": 1, "after": first["last_id"]}
+        )
+    ).json()
+    bogus = await client.get(items_url, params={"type": "bogus"})
+
+    assert by_type == {"message": ["message", "message"], "function_call": ["function_call"]}
+    pages = [
+        ([item["content"][0]["text"] for item in page["data"]], page["has_more"])
+        for page in (first, second)
+    ]
+    assert pages == [(["hi"], True), (["again"], False)]
+    assert bogus.status_code == 422, bogus.text
+
+
 async def test_list_session_items_404_for_nonexistent(
     client: httpx.AsyncClient,
 ) -> None:
@@ -5522,12 +5941,14 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     assert relay_bindings == [(sid, "runner_recovered")]
 
 
+@pytest.mark.parametrize("wire_output", [None, "HOOK_FINAL", ""])
 async def test_post_external_session_status_idle_forwards_persisted_assistant_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    wire_output: str | None,
 ) -> None:
     """
-    Native idle status forwarding includes AP-persisted assistant text.
+    A confirmed native idle keeps the hook reply; otherwise persisted text fills it.
 
     The native forwarder posts transcript items to Omnigent server, then posts
     ``external_session_status: idle``. The runner's sub-agent registry
@@ -5592,9 +6013,14 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         assert item_resp.status_code == 202, item_resp.text
 
         forwarded.clear()
+        status_data: dict[str, Any] = {"status": "idle"}
+        if wire_output is not None:
+            # The Claude ``Stop`` edge carries its reply with ``turn_completed``.
+            status_data["output"] = wire_output
+            status_data["turn_completed"] = True
         status_resp = await client.post(
             f"/v1/sessions/{child['id']}/events",
-            json={"type": "external_session_status", "data": {"status": "idle"}},
+            json={"type": "external_session_status", "data": status_data},
         )
 
     assert status_resp.status_code == 202, status_resp.text
@@ -5603,7 +6029,11 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
             "path": f"/v1/sessions/{child['id']}/events",
             "body": {
                 "type": "external_session_status",
-                "data": {"status": "idle", "output": "AP_NATIVE_DONE"},
+                "data": (
+                    {"status": "idle", "output": "AP_NATIVE_DONE"}
+                    if wire_output is None
+                    else {"status": "idle", "output": wire_output, "turn_completed": True}
+                ),
                 "model_override": None,
                 "tools": None,
                 "created_by": None,
@@ -10630,6 +11060,7 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
         runner_router: object,
         *,
         conversation: Any = None,
+        for_control: bool = False,
     ) -> httpx.AsyncClient | None:
         """Resolve every session to the failing fake runner (or to none)."""
         assert conversation is None or conversation.id == session_id
@@ -10975,6 +11406,7 @@ async def test_interrupt_forward_failure_keeps_queued_native_messages_pending(
         runner_router: object,
         *,
         conversation: Any = None,
+        for_control: bool = False,
     ) -> httpx.AsyncClient | None:
         """Resolve every session to the failing fake runner (or to none)."""
         del session_id, runner_router, conversation
@@ -11557,6 +11989,7 @@ async def test_patch_approval_mode_forwards_and_persists_label(
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
 async def test_patch_approval_mode_requires_live_runner_before_persisting(
     client: httpx.AsyncClient,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     runner_status: int | None,
 ) -> None:
@@ -11603,10 +12036,25 @@ async def test_patch_approval_mode_requires_live_runner_before_persisting(
             },
         )
 
+        from omnigent.stores.conversation_store import FAMILY_PIN_LABEL_PREFIX
+        from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+        store = SqlAlchemyConversationStore(db_uri)
+        sibling = store.create_conversation(agent_id=agent["id"])
+        store.add_new_sibling(session["id"], sibling.id, user_id=None)
+        project_id = "a" * 32
+        store.set_conversation_project(session["id"], project_id)
         resp = await client.patch(
             f"/v1/sessions/{session['id']}",
-            json={"approval_mode": "full-access"},
+            json={
+                "approval_mode": "full-access",
+                "project_id": "",
+                "labels": {"omnigent.pinned": "1"},
+            },
         )
+        for member in store.get_session_family(session["id"]):
+            assert member.project_id == project_id
+            assert not any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in member.labels)
         snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     finally:
         if fake_runner is not None:

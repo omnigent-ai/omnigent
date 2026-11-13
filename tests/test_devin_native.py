@@ -17,6 +17,7 @@ from omnigent.harnesses.devin_native.bridge import (
     build_devin_launch_args,
     build_devin_mcp_server,
     build_devin_native_spawn_env,
+    build_devin_native_terminal_env,
     build_hook_config,
     canonical_devin_permission_mode,
     clear_agent_instructions_preamble,
@@ -54,6 +55,7 @@ from omnigent.harnesses.devin_native.main import (
     list_devin_cli_model_options,
     resolve_devin_launch_model,
 )
+from omnigent.native.native_policy_hook import TOOL_FAILED_PAYLOAD_KEY
 
 # A real pane capture from devin 3000.10.21 (200x50), trimmed. The composer sits
 # between two horizontal rules with the model/context status line below.
@@ -736,6 +738,23 @@ class TestSpawnEnv:
         assert env["HARNESS_DEVIN_NATIVE_REQUEST_SESSION_ID"] == "conv_abc123"
         assert Path(env["HARNESS_DEVIN_NATIVE_BRIDGE_DIR"]).is_dir()
 
+    @pytest.mark.usefixtures("_isolated_bridge_root")
+    def test_terminal_env_keeps_variables_forwarded_for_the_session(self) -> None:
+        env = build_devin_native_terminal_env(
+            "conv_abc123",
+            source_env={
+                "PATH": "/usr/bin",
+                "OMNIGENT_RUNNER_SESSION_ENV_NAMES": "ARCATERM_CAPABILITY,ARCATERM_PROJECTS_ROOT",
+                "ARCATERM_CAPABILITY": "capability-for-pane-1",
+                "ARCATERM_PROJECTS_ROOT": "",
+                "UNLISTED_SECRET": "nope",
+            },
+        )
+        assert env["ARCATERM_CAPABILITY"] == "capability-for-pane-1"
+        assert env["ARCATERM_PROJECTS_ROOT"] == ""
+        assert env["PATH"] == "/usr/bin"
+        assert "UNLISTED_SECRET" not in env
+
 
 class TestNormalizeToolResult:
     """Devin sends ``tool_response``; the shared policy seam reads ``tool_output``."""
@@ -751,6 +770,19 @@ class TestNormalizeToolResult:
             {"tool_response": {"success": False, "output": "", "error": "boom"}}
         )
         assert payload["tool_output"] == "boom"
+
+    def test_failure_is_flagged_for_result_policies(self) -> None:
+        payload = _normalize_tool_result(
+            {"tool_response": {"success": False, "output": "cat: x: No such file", "error": None}}
+        )
+        assert payload["tool_output"] == "cat: x: No such file"
+        assert payload[TOOL_FAILED_PAYLOAD_KEY] is True
+
+    def test_success_is_not_flagged(self) -> None:
+        payload = _normalize_tool_result(
+            {"tool_response": {"success": True, "output": "hi", "error": None}}
+        )
+        assert TOOL_FAILED_PAYLOAD_KEY not in payload
 
     def test_existing_tool_output_wins(self) -> None:
         payload = _normalize_tool_result({"tool_output": "kept", "tool_response": {"output": "x"}})
@@ -1105,6 +1137,58 @@ class TestUserConfigJsonc:
         assert _read_user_config(self._write(tmp_path, "{not json at all")) == {}
 
 
+@pytest.mark.parametrize(
+    ("server_url", "expected_trust_env"),
+    [
+        ("http://127.0.0.1:8787", False),
+        ("https://omnigents.example.databricksapps.com", True),
+    ],
+)
+def test_mirror_permission_request_bypasses_proxy_only_for_loopback(
+    monkeypatch: pytest.MonkeyPatch, server_url: str, expected_trust_env: bool
+) -> None:
+    """The approval mirror bypasses an ambient proxy only for a loopback relay."""
+    import httpx
+
+    from omnigent.harnesses.devin_native import hook as devin_hook
+
+    captured_trust_env: list[object] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object, trust_env: bool) -> None:
+            del headers, timeout
+            captured_trust_env.append(trust_env)
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, json: object = None) -> httpx.Response:
+            del json
+            return httpx.Response(
+                200,
+                text='{"hookSpecificOutput": {"decision": {"behavior": "allow"}}}',
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(devin_hook.httpx, "Client", _Client)
+    monkeypatch.setenv("_OMNIGENT_AUTH_HEADERS", json.dumps({"Authorization": "Bearer token"}))
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: lambda: "fresh",
+    )
+
+    verdict = devin_hook._mirror_permission_request(
+        {"hook_event_name": "PermissionRequest", "tool_name": "write"},
+        server_url=server_url,
+        session_id="conv_abc",
+    )
+    assert verdict == {"decision": "approve"}
+    assert captured_trust_env == [expected_trust_env]
+
+
 class TestPermissionRequestReauth:
     """Devin's approval card must survive the launch bearer expiring.
 
@@ -1126,7 +1210,9 @@ class TestPermissionRequestReauth:
         elicitation_ids: list[str] = []
 
         class _ScriptedClient:
-            def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            def __init__(
+                self, *, headers: dict[str, str], timeout: object, **_kwargs: object
+            ) -> None:
                 del timeout
                 self._headers = headers
 

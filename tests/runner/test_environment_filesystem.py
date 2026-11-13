@@ -437,6 +437,139 @@ async def test_edit_file(
     assert (workspace / "hello.txt").read_text() == "goodbye world"
 
 
+@pytest.mark.parametrize(
+    "saves,statuses",
+    [
+        pytest.param(
+            [
+                ("PATCH", {"old_text": "hello", "new_text": "goodbye"}),
+                ("PATCH", {"old_text": "goodbye", "new_text": "hello"}),
+            ],
+            [],
+            id="edit-reverted",
+        ),
+        pytest.param(
+            [("PUT", {"content": "changed"}), ("PUT", {"content": "hello world"})],
+            [],
+            id="save-reverted",
+        ),
+        pytest.param(
+            [
+                ("PUT", {"content": "one two"}),
+                ("PATCH", {"old_text": "one", "new_text": "hello"}),
+            ],
+            ["modified"],
+            id="partially-reverted",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_editor_save_restoring_the_original_leaves_changes(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    request: pytest.FixtureRequest,
+    saves: list[tuple[str, dict[str, str]]],
+    statuses: list[str],
+) -> None:
+    request.addfinalizer(registry._primary_envs["conv_test"].close)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    for step, (method, body) in enumerate(saves, start=1):
+        response = await client.request(method, f"{base}/filesystem/hello.txt", json=body)
+        assert response.status_code == 200, response.text
+        if step < len(saves):
+            assert (await client.get(f"{base}/changes")).json()["data"]
+
+    response = await client.get(f"{base}/changes")
+    assert [entry["status"] for entry in response.json()["data"]] == statuses
+
+
+@pytest.mark.asyncio
+async def test_editor_save_of_a_truncated_original_stays_in_changes(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request.addfinalizer(registry._primary_envs["conv_test"].close)
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", 5)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    response = await client.put(f"{base}/filesystem/hello.txt", json={"content": "hello"})
+    assert response.status_code == 200, response.text
+
+    changes = (await client.get(f"{base}/changes")).json()["data"]
+    assert [(entry["path"], entry["status"]) for entry in changes] == [("hello.txt", "modified")]
+    assert (await client.get(f"{base}/diff/hello.txt")).json()["before"] is None
+
+
+@pytest.mark.parametrize(
+    "other_content,saves",
+    [
+        pytest.param(
+            "hello world",
+            [(DEFAULT_ENVIRONMENT_ID, "changed"), ("terminal", "hello world")],
+            id="other-restores-the-same-text",
+        ),
+        pytest.param(
+            "elsewhere",
+            [("terminal", "changed"), (DEFAULT_ENVIRONMENT_ID, "elsewhere")],
+            id="other-saves-first",
+        ),
+        pytest.param(
+            "hello world",
+            [
+                (DEFAULT_ENVIRONMENT_ID, "changed"),
+                ("terminal", None),
+                (DEFAULT_ENVIRONMENT_ID, "hello world"),
+            ],
+            id="other-deletes",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_editor_save_in_another_environment_keeps_the_change(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    other_content: str,
+    saves: list[tuple[str, str | None]],
+) -> None:
+    request.addfinalizer(registry._primary_envs["conv_test"].close)
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    (other_root / "hello.txt").write_text(other_content)
+    other_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process", cwd=str(other_root), sandbox=OSEnvSandboxSpec(type="none")
+        )
+    )
+    assert other_env is not None
+    request.addfinalizer(other_env.close)
+    resolve = registry.resolve_environment
+    monkeypatch.setattr(
+        registry,
+        "resolve_environment",
+        lambda session_id, environment_id, agent_spec=None: (
+            other_env
+            if environment_id == "terminal"
+            else resolve(session_id, environment_id, agent_spec)
+        ),
+    )
+
+    base = "/v1/sessions/conv_test/resources/environments"
+    for environment_id, content in saves:
+        url = f"{base}/{environment_id}/filesystem/hello.txt"
+        if content is None:
+            response = await client.delete(url)
+        else:
+            response = await client.put(url, json={"content": content})
+        assert response.status_code == 200, response.text
+
+    changes = (await client.get(f"{base}/{DEFAULT_ENVIRONMENT_ID}/changes")).json()["data"]
+    assert [(entry["path"], entry["status"]) for entry in changes] == [("hello.txt", "modified")]
+
+
 @pytest.mark.asyncio
 async def test_delete_file(
     client: httpx.AsyncClient,
@@ -1759,6 +1892,41 @@ async def test_diff_endpoint_returns_null_before_for_new_file(
 
 
 @pytest.mark.asyncio
+async def test_intent_to_add_file_is_listed_and_diffed_as_created(tmp_path: Path) -> None:
+    """A ``git add -N`` file has no HEAD version, so Changes and diff must treat it as added."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / "README.md").write_text("# repo\n")
+    subprocess.run(["git", "add", "README.md"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    content = "".join(f"CASE_{index} = {index}\n" for index in range(5))
+    (ws / "suite").mkdir()
+    (ws / "suite" / "new_suite.py").write_text(content)
+    subprocess.run(
+        ["git", "add", "-N", "suite/new_suite.py"],
+        cwd=ws,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    base = f"/v1/sessions/conv_ita/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_ita") as client:
+        changes = (await client.get(f"{base}/changes")).json()["data"]
+        diff = (await client.get(f"{base}/diff/suite/new_suite.py")).json()
+
+    statuses = {entry["path"]: entry["status"] for entry in changes}
+    assert statuses.get("suite/new_suite.py") == "created", changes
+    assert diff["before"] is None, diff
+    assert diff["after"] == content, diff
+    assert "baseline_state" not in diff, diff
+
+
+@pytest.mark.asyncio
 async def test_diff_endpoint_returns_null_after_for_deleted_file(
     client_with_registry: httpx.AsyncClient,
 ) -> None:
@@ -1984,6 +2152,58 @@ async def test_content_search_live_workspace(
     assert not (workspace / "injected").exists()
 
 
+# The web panel's Whole word cases, shared with its unit test, run through real ripgrep.
+_WHOLE_WORD_FIXTURE = json.loads(
+    (
+        Path(__file__).resolve().parents[2]
+        / "web/src/lib/__fixtures__/contentSearchWholeWord.json"
+    ).read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    _WHOLE_WORD_FIXTURE["cases"],
+    ids=[case["name"] for case in _WHOLE_WORD_FIXTURE["cases"]],
+)
+async def test_content_search_whole_word_patterns(
+    client: httpx.AsyncClient, workspace: Path, case: dict[str, Any]
+) -> None:
+    (workspace / "words.txt").write_text(
+        "\n".join(_WHOLE_WORD_FIXTURE["corpus"]) + "\n", encoding="utf-8"
+    )
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/content-search",
+        params={
+            "q": case["pattern"],
+            "regex": str(case["sentRegex"]).lower(),
+            "case_sensitive": str(case["caseSensitive"]).lower(),
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert [match["line"] for match in response.json()["matches"]] == case["lines"]
+
+
+@pytest.mark.asyncio
+async def test_content_search_whole_word_reports_the_word_itself(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    (workspace / "words.txt").write_text("x(needle)y\ncafe\u0301 au lait\n", encoding="utf-8")
+    endpoint = "/v1/sessions/conv_test/resources/environments/default/content-search"
+    response = await client.get(endpoint, params={"q": r"\bneedle\b", "regex": "true"})
+    match = response.json()["matches"][0]
+    assert (match["match_start"], match["match_end"]) == (2, 8)
+    # The panel's own pattern classifies the accent in ripgrep; it must consume only the accent.
+    decomposed = next(
+        case for case in _WHOLE_WORD_FIXTURE["cases"] if case["name"] == "decomposed accent"
+    )
+    response = await client.get(endpoint, params={"q": decomposed["pattern"], "regex": "true"})
+    match = response.json()["matches"][0]
+    # Offsets are UTF-16 units: the combining accent is one more unit after "cafe".
+    assert (match["match_start"], match["match_end"]) == (0, 5)
+
+
 @pytest.mark.asyncio
 async def test_content_search_limits_errors_and_hidden_files(
     client: httpx.AsyncClient, workspace: Path
@@ -2026,9 +2246,7 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
     if mode != "missing":
         executable = tmp_path / "rg"
         body = (
-            "import os, time\n"
-            f"open({str(tmp_path / 'pid')!r}, 'w').write(str(os.getpid()))\n"
-            "time.sleep(60)\n"
+            "import time\ntime.sleep(60)\n"
             if mode == "timeout"
             else "print('x' * (2 * 1024 * 1024))\n"
         )
@@ -2037,9 +2255,14 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
     parameters = (
         "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\nglob_args = []\n"
     )
+    # Record the owned child's PID before the shortened timer can kill it.
     timer = (
         "import threading\noriginal_timer = threading.Timer\n"
-        "threading.Timer = lambda seconds, callback: original_timer(0.2, callback)\n"
+        "def shortened_timer(seconds, callback):\n"
+        f"    with open({str(tmp_path / 'pid')!r}, 'w') as marker:\n"
+        "        marker.write(str(process.pid))\n"
+        "    return original_timer(0.2, callback)\n"
+        "threading.Timer = shortened_timer\n"
     )
     completed = subprocess.run(
         [sys.executable, "-I", "-c", parameters + timer + _SEARCH_SCRIPT],
