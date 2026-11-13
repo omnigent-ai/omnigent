@@ -127,6 +127,8 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.conversation_store.activity_error import (
     LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
+    ActivityErrorSummary,
     fold_activity_error,
 )
 from omnigent.stores.conversation_store.overrides import (
@@ -3336,21 +3338,35 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param fresh_items: ``(position, item)`` for every inserted item, in order.
         :param stamp: The append's timestamp, e.g. ``1753900000``.
         """
-        value = fold_activity_error(item for _, item in fresh_items)
-        if value is None:
+        items = [item for _, item in fresh_items]
+        if fold_activity_error(items) is None:
             return
-        stored = session.scalar(
-            select(SqlConversationLabel.value).where(
-                SqlConversationLabel.workspace_id == current_workspace_id(),
-                SqlConversationLabel.conversation_id == conversation_id,
-                SqlConversationLabel.key == LATEST_ACTIVITY_ERROR_LABEL_KEY,
+        keys = (LATEST_ACTIVITY_ERROR_LABEL_KEY, LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY)
+        stored = dict(
+            session.execute(
+                select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key.in_(keys),
+                )
             )
+            .tuples()
+            .all()
         )
-        if stored == value:
-            return
-        _upsert_prepared_labels(
-            session, conversation_id, {LATEST_ACTIVITY_ERROR_LABEL_KEY: value}, stamp
+        previous_value = stored.get(LATEST_ACTIVITY_ERROR_LABEL_KEY)
+        previous = ActivityErrorSummary(
+            previous_value if previous_value in ("error", "disconnected") else "",
+            stored.get(LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY, ""),
         )
+        summary = fold_activity_error(items, previous)
+        assert summary is not None
+        labels = {
+            LATEST_ACTIVITY_ERROR_LABEL_KEY: summary.value,
+            LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY: summary.response_id,
+        }
+        changed = {key: value for key, value in labels.items() if stored.get(key) != value}
+        if changed:
+            _upsert_prepared_labels(session, conversation_id, changed, stamp)
 
     def list_projects(
         self,

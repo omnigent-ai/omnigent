@@ -38,7 +38,10 @@ from omnigent.session_import import (
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import ConversationUpdateResult
-from omnigent.stores.conversation_store.activity_error import LATEST_ACTIVITY_ERROR_LABEL_KEY
+from omnigent.stores.conversation_store.activity_error import (
+    LATEST_ACTIVITY_ERROR_LABEL_KEY,
+    LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -5378,8 +5381,13 @@ def test_fork_marks_source_workspace_failures_as_notices(
     assert original is not None
     assert original.workspace == "/missing-workspace" and original.host_id == host_id
     # The source's own latest item is still a fault; its fork drops the label.
-    assert original.labels == {**source_labels, LATEST_ACTIVITY_ERROR_LABEL_KEY: "error"}
+    assert original.labels == {
+        **source_labels,
+        LATEST_ACTIVITY_ERROR_LABEL_KEY: "error",
+        LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY: "failed_launch",
+    }
     assert LATEST_ACTIVITY_ERROR_LABEL_KEY not in fork.labels
+    assert LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY not in fork.labels
     assert len(conversation_store.search("source_workspace_missing", conversation_id=fork.id)) == 2
     assert conversation_store.search("source_workspace_missing", conversation_id=source.id) == []
 
