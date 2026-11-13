@@ -41,6 +41,15 @@ backend — no real provider creds.
   launch → setup page → type URL → Connect → land in the shell. Its `.webm` is
   the desktop journey footage.
 
+## Overriding main-process modules
+
+The app runs the bundle in `app/`, which has its own copy of every `src/`
+module, so reassigning exports of a `require`d `src/` module has no effect. A
+`-r` script instead calls `registerTestOverride(moduleName, (moduleExports) =>
+replacements)` from `src/testOverrides.js`; the main process applies it where
+it requires that module through `withTestOverrides`. Overrides are ignored when
+`app.isPackaged` is true.
+
 ## Prerequisites
 
 `electron` and `playwright` are `web/electron` devDependencies (Playwright is
@@ -51,6 +60,7 @@ the one with the `_electron` API). The fast `web-test` CI job installs with
 # From the repo root, once:
 pnpm --filter web run build          # build the SPA the server serves
 cd web/electron && pnpm install      # brings in electron + playwright
+pnpm run build:app                   # bundle the shell into app/ (rerun after src/ edits)
 ```
 
 On a headless CI box, wrap the run in `xvfb-run` so Electron has a display.
@@ -107,6 +117,7 @@ The same picker and fixtures run in headless Chromium in the regular UI CI suite
 # From the repository root after installing dependencies:
 pnpm --filter web run build
 pnpm --filter omnigent-desktop-electron run build:overlay
+pnpm --filter omnigent-desktop-electron run build:app
 OMNIGENT_PYTHON="$PWD/.venv/bin/python" \
   node --test --test-concurrency=1 web/electron/e2e/desktop_design_prompt.e2e.js
 ```

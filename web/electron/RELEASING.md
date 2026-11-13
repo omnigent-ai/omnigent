@@ -31,6 +31,8 @@ set -a; source web/electron/.env; set +a
 pnpm --dir web/electron run build:mac:release
 ```
 
+The package build scripts bundle `src/` into `app/` (`build:app`) before electron-builder runs; a build that calls electron-builder directly must run `pnpm --dir web/electron run build:app` first.
+
 **Do not use `build:mac` or `just electron-build` for a release.** Those make **Omnigent Dev** in `dist-dev/` and do not notarize. The release command makes **Omnigent** in `web/electron/dist/` for both x64 and arm64. Confirm the signing/notarization steps succeeded:
 
 ```bash

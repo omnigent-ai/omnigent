@@ -39,6 +39,8 @@ const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
 const { registerFolderChooser } = require("./folderChooser");
+const { ICON_PNG, pagePath, preloadPath } = require("./paths");
+const { withTestOverrides } = require("./testOverrides");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -63,7 +65,7 @@ const {
   PRE_MANIFEST_BASELINE,
   parseManifestAuth,
   sanitizeServerName,
-} = require("./url");
+} = withTestOverrides("url", require("./url"));
 const { parseOmnigentDeepLink, chooseDeepLinkStrategy, acceptCliDeepLink } = require("./deepLink");
 const {
   parseServerLabels,
@@ -76,7 +78,10 @@ const { registerWorkspaceRootBounce } = require("./workspace-root-bounce");
 const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner");
 const { createReturnBanner } = require("./return_banner");
 const { createReconnectOverlay } = require("./reconnect_overlay");
-const { createBrowserViewRegistry } = require("./browserViewRegistry");
+const { createBrowserViewRegistry } = withTestOverrides(
+  "browserViewRegistry",
+  require("./browserViewRegistry"),
+);
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
@@ -88,7 +93,7 @@ const {
   getDatabricksInternalFeaturesEnabled,
   getManagedServerNames,
   getManagedServerUrls,
-} = require("./managed_preferences");
+} = withTestOverrides("managed_preferences", require("./managed_preferences"));
 const arca = require("./arca");
 const arcaOnboarding = require("./arca_onboarding");
 const cliInstall = require("./cli_install");
@@ -130,7 +135,7 @@ const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
-const omnigentCli = require("./omnigent_cli");
+const omnigentCli = withTestOverrides("omnigent_cli", require("./omnigent_cli"));
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -138,21 +143,16 @@ const { diagnostics } = require("./diagnostics");
 const isHostThisMachine = createHostThisMachineChecker();
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
-const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
+const SETUP_PAGE = pagePath("setup");
 
 /** Shell-owned About page opened from the application menu. */
-const ABOUT_PAGE = path.join(__dirname, "..", "about", "index.html");
+const ABOUT_PAGE = pagePath("about");
 
 /** The setup page's file:// URL, for verifying IPC sender frames. */
 const SETUP_PAGE_URL = pathToFileURL(SETUP_PAGE);
 
 /** React server selector (built by web's `build:server-selector-v2`). */
-const SERVER_SELECTOR_V2_PAGE = path.join(
-  __dirname,
-  "..",
-  "server-selector-v2",
-  "server-selector-v2.html",
-);
+const SERVER_SELECTOR_V2_PAGE = pagePath("server-selector-v2", "server-selector-v2.html");
 const SERVER_SELECTOR_V2_PAGE_URL = pathToFileURL(SERVER_SELECTOR_V2_PAGE);
 
 /** True when OMNIGENT_SERVER_SELECTOR_V2 forces the wizard on (CI/dev override). */
@@ -278,11 +278,11 @@ function loadSetupPage(win, search = "") {
 }
 
 /** Absolute path to the bundled find-in-page bar page. */
-const FIND_PAGE = path.join(__dirname, "..", "find", "index.html");
+const FIND_PAGE = pagePath("find");
 // Built by web's `build:overlay` into electron/overlay/ (shipped by
 // electron-builder). Shell-owned so the update UI is independent of the
 // connected server's web-bundle version.
-const UPDATE_OVERLAY_PAGE = path.join(__dirname, "..", "overlay", "update-overlay.html");
+const UPDATE_OVERLAY_PAGE = pagePath("overlay", "update-overlay.html");
 
 /** The find bar's file:// URL, for verifying IPC sender frames. */
 const FIND_PAGE_URL = pathToFileURL(FIND_PAGE);
@@ -305,10 +305,7 @@ const ERR_BLOCKED_BY_CLIENT = -20;
  * No-op preload for OAuth popup windows — children must never inherit the
  * shell preload's IPC bridges. See popup_preload.js.
  */
-const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
-
-/** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
-const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
+const POPUP_PRELOAD = preloadPath("popup_preload");
 
 const isDevBuild = !app.isPackaged || omnigentBuild === "dev";
 const getUserDefault =
@@ -388,8 +385,8 @@ const arcaConnectFlow = createArcaConnectFlow({
 const sshConnectFlow = createSshConnectFlow({
   BrowserWindow,
   ipcMain,
-  pagePath: path.join(__dirname, "..", "ssh-connect", "index.html"),
-  preloadPath: path.join(__dirname, "ssh_connect_preload.js"),
+  pagePath: pagePath("ssh-connect"),
+  preloadPath: preloadPath("ssh_connect_preload"),
   startConnect: (serverUrl, destination, hooks) =>
     sshConnect.startSshConnect(serverUrl, destination, {
       hooks,
@@ -1766,7 +1763,7 @@ const aboutWindow = createAboutWindow({
   onDesktopDownloadStarted: (parent) => updateOverlay.suppress(parent),
   onClosed: (parent) => updateOverlay.unsuppress(parent),
   aboutPage: ABOUT_PAGE,
-  preloadPath: path.join(__dirname, "about_preload.js"),
+  preloadPath: preloadPath("about_preload"),
 });
 
 const connectionLoading = createConnectionLoading({ BrowserWindow });
@@ -1780,7 +1777,7 @@ const updateOverlay = createUpdateOverlay({
   updater,
   openAbout: (parent) => aboutWindow.open(parent),
   overlayPage: UPDATE_OVERLAY_PAGE,
-  preloadPath: path.join(__dirname, "update_overlay_preload.js"),
+  preloadPath: preloadPath("update_overlay_preload"),
 });
 
 // Shell-owned "return to your server?" banner: offered when a window has sat
@@ -1791,8 +1788,8 @@ const updateOverlay = createUpdateOverlay({
 const returnBanner = createReturnBanner({
   BrowserWindow,
   ipcMain,
-  bannerPage: path.join(__dirname, "..", "return-banner", "index.html"),
-  preloadPath: path.join(__dirname, "return_banner_preload.js"),
+  bannerPage: pagePath("return-banner"),
+  preloadPath: preloadPath("return_banner_preload"),
   onGoBack: (win) => awayWatches.get(win)?.reset(),
 });
 
@@ -1801,8 +1798,8 @@ const returnBanner = createReturnBanner({
 const reconnectOverlay = createReconnectOverlay({
   WebContentsView,
   ipcMain,
-  overlayPage: path.join(__dirname, "..", "reconnect-overlay", "index.html"),
-  preloadPath: path.join(__dirname, "reconnect_overlay_preload.js"),
+  overlayPage: pagePath("reconnect-overlay"),
+  preloadPath: preloadPath("reconnect_overlay_preload"),
   onCancel: (win) => stopReconnect(win),
 });
 
@@ -1810,8 +1807,8 @@ const browserPermissionStore = createBrowserPermissionStore({ loadSettings, save
 const browserPermissionPrompt = createBrowserPermissionPrompt({
   BrowserWindow,
   ipcMain,
-  promptPage: path.join(__dirname, "..", "browser-permission", "index.html"),
-  preloadPath: path.join(__dirname, "browser_permission_preload.js"),
+  promptPage: pagePath("browser-permission"),
+  preloadPath: preloadPath("browser_permission_preload"),
 });
 
 /** Per-window away-watch handles (win → {reset, dispose}); see away_banner.js. */
@@ -2691,7 +2688,7 @@ function createWindow(targetUrl, opts = {}) {
     webPreferences: {
       // Security: the SPA is remote/untrusted relative to the shell, so we
       // keep Node out of the renderer and isolate the preload's context.
-      preload: path.join(__dirname, "preload.js"),
+      preload: preloadPath("preload"),
       contextIsolation: true,
       nodeIntegration: false,
       // Packaged builds expose DevTools only after the macOS user explicitly
@@ -3029,7 +3026,7 @@ function openFindBar(target) {
     transparent: true,
     show: false,
     webPreferences: {
-      preload: path.join(__dirname, "find_preload.js"),
+      preload: preloadPath("find_preload"),
       contextIsolation: true,
       nodeIntegration: false,
     },
@@ -4353,7 +4350,7 @@ function browserRegistryForSender(event) {
   return windows.get(win)?.browserRegistry ?? null;
 }
 
-const WORKSPACE_PICKER_PAGE = path.join(__dirname, "..", "workspace-picker", "index.html");
+const WORKSPACE_PICKER_PAGE = pagePath("workspace-picker");
 
 /**
  * Show the searchable workspace picker (workspace-picker/index.html) as a modal
@@ -4401,7 +4398,7 @@ function pickWorkspaceForBridge(parent, workspaces, { signal } = {}) {
       maximizable: false,
       title: "Select a workspace",
       webPreferences: {
-        preload: path.join(__dirname, "workspace_picker_preload.js"),
+        preload: preloadPath("workspace_picker_preload"),
         contextIsolation: true,
         nodeIntegration: false,
       },

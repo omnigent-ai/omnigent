@@ -126,6 +126,8 @@ jobs:
           pnpm --dir editors/vscode run build
           pnpm --dir sdks/web-extension run type-check
           pnpm --dir examples/extensions/hello-page/web run build
+          pnpm --dir web/electron run typecheck
+          pnpm --dir web/electron run build:app
           node --test web/electron/test/*.test.js
 
       - name: Check formatting

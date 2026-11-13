@@ -32,7 +32,7 @@ const applicationsByWindow = new WeakMap();
 
 /** Repo root: web/electron/e2e → ../../.. */
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
-/** The Electron app package root (its package.json `main` is src/main.js). */
+/** The Electron app package root (its package.json `main` is the app/main.cjs bundle). */
 const APP_ROOT = path.resolve(__dirname, "..");
 /** The SPA the server serves; the Python suite builds it into here too. */
 const WEB_UI_DIST = path.join(REPO_ROOT, "omnigent", "server", "static", "web-ui");
@@ -398,10 +398,9 @@ async function launchDesktop(opts) {
   fs.writeFileSync(
     profileBootstrap,
     `require("electron").app.setPath("appData", ${JSON.stringify(userDataDir)});\n` +
-      `const mod = require(${JSON.stringify(path.join(APP_ROOT, "src/browserViewRegistry.js"))});\n` +
-      `const create = mod.createBrowserViewRegistry;\n` +
+      `const { registerTestOverride } = require(${JSON.stringify(path.join(APP_ROOT, "src/testOverrides.js"))});\n` +
       `global.omnigentTestBrowserRegistries = [];\n` +
-      `mod.createBrowserViewRegistry = (...args) => { const registry = create(...args); global.omnigentTestBrowserRegistries.push(registry); return registry; };\n`,
+      `registerTestOverride("browserViewRegistry", ({ createBrowserViewRegistry: create }) => ({ createBrowserViewRegistry: (...args) => { const registry = create(...args); global.omnigentTestBrowserRegistries.push(registry); return registry; } }));\n`,
   );
   const preloads = (opts.preload ?? []).flatMap((file) => ["-r", file]);
   const args = ["-r", profileBootstrap, ...preloads, APP_ROOT, `--user-data-dir=${userDataDir}`];

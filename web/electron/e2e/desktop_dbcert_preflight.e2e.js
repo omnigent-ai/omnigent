@@ -79,7 +79,9 @@ if (args[0] === "status") {
 const path = require("node:path");
 const src = ${JSON.stringify(path.join(APP_ROOT, "src"))};
 require(path.join(src, "managed_preferences")).getDatabricksInternalFeaturesEnabled = () => true;
-const urls = require(path.join(src, "url"));
+const { registerTestOverride } = require(path.join(src, "testOverrides.js"));
+const urls = {};
+registerTestOverride("url", () => urls);
 urls.isDatabricksManagedServerUrl = url => url === ${JSON.stringify(serverUrl)} || url === ${JSON.stringify(`${serverUrl}/`)};
 const arca = require(path.join(src, "arca"));
 arca.resolveArcaPath = () => null;
