@@ -44,8 +44,8 @@ def test_summary_chips_keep_names_and_actions_inside(
     font_size: int,
 ) -> None:
     """Reviewer logins stay readable and each chip's button stays inside it; narrow
-    rails stack Reviewers above Labels instead of squeezing them side by side, and a
-    roomy rail still shows each full review state."""
+    rails stack Reviewers above Labels and truncate a long review state, keeping its
+    full text in the tooltip, while a roomy rail still shows each full state."""
     chat = chat_session_contract
     api = f"/v1/sessions/{chat.session_id}"
     linked = {
@@ -129,13 +129,18 @@ def test_summary_chips_keep_names_and_actions_inside(
         name = chip.get_by_text(login, exact=True)
         expect(name).to_be_visible()
         assert name.evaluate(_FITS), login
-        if rail_width >= 480 and font_size == 14:
-            state = _STATE_LABELS[reviewer["state"]]
+        state = _STATE_LABELS[reviewer["state"]]
+        if rail_width < 480:
+            expect(chip.get_by_title(state, exact=True)).to_contain_text(state)
+        elif font_size == 14:
             assert chip.get_by_text(state, exact=True).evaluate(_FITS), state
         action = chip.get_by_role("button")
         expect(action).to_have_count(1)
         _assert_inside(action, chip)
         _assert_inside(chip, reviewers)
+    if rail_width < 480:
+        long_state = reviewers.get_by_text(_STATE_LABELS["CHANGES_REQUESTED"], exact=True)
+        assert long_state.evaluate("el => el.scrollWidth > el.clientWidth")
 
     for label in _LABELS:
         chip = labels.get_by_role("listitem").filter(has=page.get_by_text(label, exact=True))
