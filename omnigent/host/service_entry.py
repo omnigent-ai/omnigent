@@ -38,17 +38,15 @@ def _wait_while_workspace_is_served(server: str) -> None:
         time.sleep(_STANDBY_POLL_S)
 
 
-def main() -> int:
-    """Run the foreground host command and normalize permanent failures."""
-    parser = argparse.ArgumentParser(description="Omnigent host service")
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--server", help="Remote Omnigent server URL.")
-    mode.add_argument("--local", action="store_true", help="Run a local Omnigent server.")
-    args = parser.parse_args()
+def run(server: str) -> int:
+    """Run the foreground host command and normalize permanent failures.
 
+    :param server: Remote Omnigent server URL, e.g. ``"https://example.com"``,
+        or ``""`` for local mode.
+    :returns: Exit code for the service manager.
+    """
     from omnigent.cli import cli
 
-    server = "" if args.local else args.server
     try:
         if server:
             _wait_while_workspace_is_served(server)
@@ -69,6 +67,16 @@ def main() -> int:
         # stopped instead of entering a supervisor restart loop.
         return 0 if code == HOST_FATAL_EXIT_CODE else code
     return 0
+
+
+def main() -> int:
+    """Parse the service mode and run the host."""
+    parser = argparse.ArgumentParser(description="Omnigent host service")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--server", help="Remote Omnigent server URL.")
+    mode.add_argument("--local", action="store_true", help="Run a local Omnigent server.")
+    args = parser.parse_args()
+    return run("" if args.local else args.server)
 
 
 if __name__ == "__main__":

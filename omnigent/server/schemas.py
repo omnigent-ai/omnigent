@@ -1663,7 +1663,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
         registers the host under it and records it in the
         ``omnigent.sandbox.requested_host_id`` label, since the
         session's ``host_id`` stays null until the host binds. ``None``
-        lets the server mint one. JSON creates only, and not with
+        lets the server mint one. Not with
         ``parent_session_id`` (a child runs on its parent's host). An id
         naming an existing host, or sharing its ``managed-<first 8 hex>``
         name with one of the caller's hosts, fails with ``409``.
@@ -1993,7 +1993,9 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         binding token, writes the expected runner_id to the session
         row, and sends a ``host.launch_runner`` frame to the host.
         ``None`` for CLI-initiated sessions where the caller
-        manages runner spawning.
+        manages runner spawning. With ``host_type: "managed"`` it
+        instead names the NEW sandbox host (32 lowercase hex, as on
+        the JSON create) and is moved to ``requested_host_id``.
     :param workspace: Absolute path on the host where the runner
         should start, e.g. ``"/Users/corey/universe/src/foo"``.
         Required when ``host_id`` is set; validated against the
@@ -2038,6 +2040,8 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     reasoning_effort: str | None = None
     model_override: str | None = None
     host_id: str | None = None
+    # A managed create's ``host_id``, moved here at validation (mirrors SessionCreateRequest).
+    requested_host_id: SkipJsonSchema[str | None] = None
     workspace: str | None = None
     workspaces: list[str] | None = None
     git: SessionGitOptions | None = None
@@ -2056,6 +2060,23 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         if self.initial_input is not None and self.host_type != "managed":
             raise ValueError("initial_input requires host_type=managed")
         return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def _move_managed_host_id(cls, data: Any) -> Any:
+        """
+        Move a managed create's ``host_id`` into ``requested_host_id``.
+
+        :param data: The raw metadata object.
+        :returns: The metadata, with a managed ``host_id`` moved.
+        """
+        if (
+            isinstance(data, dict)
+            and data.get("host_type") == "managed"
+            and data.get("host_id") is not None
+        ):
+            return {**data, "host_id": None, "requested_host_id": data["host_id"]}
+        return data
 
     @model_validator(mode="after")
     def _check_managed_bundle_fields(self) -> SessionCreateMetadata:
@@ -2083,10 +2104,16 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
 
         if self.host_type == "managed":
-            if self.host_id is not None:
+            if self.requested_host_id is not None and not _MANAGED_HOST_ID_RE.fullmatch(
+                self.requested_host_id
+            ):
                 raise ValueError(
-                    "host_type 'managed' lets the server provision the host; "
-                    "host_id must not be set"
+                    "host_type 'managed' takes a host_id of 32 lowercase hex characters"
+                )
+            if self.requested_host_id is not None and self.parent_session_id is not None:
+                raise ValueError(
+                    "host_id does not apply to a managed child session; "
+                    "it runs on its parent's host"
                 )
             if self.git is not None:
                 raise ValueError("git worktrees require an existing external host")
@@ -2109,6 +2136,8 @@ class SessionCreateMetadata(_SandboxProfileSelection):
                         f"(optionally '#<branch>') in each workspace: {exc}"
                     ) from exc
             return self
+        if self.requested_host_id is not None:
+            raise ValueError("requested_host_id only applies to host_type 'managed'")
         if self.sandbox_provider is not None:
             raise ValueError(
                 "sandbox_provider only applies to host_type 'managed' — "
@@ -3127,9 +3156,7 @@ class SessionManagedHostRequest(BaseModel):
         provision (one of the server's ``sandbox_providers``); ``None``
         takes the server's first.
     :param host_id: Id for the new sandbox host, 32 lowercase hex
-        characters, sent only when ``GET /v1/info`` reports
-        ``request_managed_sandbox_host_id``; ``None`` lets the server
-        mint one.
+        characters; ``None`` lets the server mint one.
     :param workspace: Git repository URL (optionally ``#<branch>``) cloned
         into the sandbox as the session's working directory, e.g.
         ``"https://github.com/org/repo#main"``; ``None`` gives the session
@@ -3507,6 +3534,30 @@ class SessionList(BaseModel):
     page_boundary: SessionPageBoundary | None = None
 
 
+class AgentCost(BaseModel):
+    """
+    Display cost of one agent in a session tree.
+
+    :param id: Session id, e.g. ``"conv_child123"``.
+    :param cost_usd: Priced USD cost of this agent including its sub-agents
+        (the same total its own session reports), or ``None`` when nothing
+        in that subtree is priced.
+    """
+
+    id: str
+    cost_usd: float | None = None
+
+
+class AgentCostList(BaseModel):
+    """A page of costs for a session and its descendants; ``data`` lists ``AgentCost``."""
+
+    object: Literal["list"] = "list"
+    data: list[AgentCost] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
 class ChildSessionList(BaseModel):
     """Paginated list of child sessions; ``data`` is a page of ``ChildSessionSummary``."""
 
@@ -3818,10 +3869,12 @@ class GrantPermissionRequest(BaseModel):
         access subject to the server's public permission ceiling.
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage.
+    :param ensure_minimum: Preserve a stronger existing grant atomically.
     """
 
     user_id: str
     level: int = Field(ge=1, le=3)
+    ensure_minimum: bool = False
 
 
 class PermissionObject(BaseModel):

@@ -70,7 +70,7 @@ from omnigent.spec.types import (
     PolicySpec,
 )
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import MAX_GRANTS_PAGE_SIZE, PermissionStore
 
 
 class _PermissionListResponse(TypedDict):
@@ -108,7 +108,8 @@ def register_permissions_routes(
         """Grant or update a permission on a session.
 
         Requires manage-level access. Upserts the grant — can
-        upgrade or downgrade an existing level. Auto-creates the
+        upgrade or downgrade an existing level unless ``ensure_minimum``
+        preserves stronger access. Auto-creates the
         grantee user if they don't exist yet.
 
         :param request: The incoming FastAPI request (for auth).
@@ -154,12 +155,16 @@ def register_permissions_routes(
                 )
             await asyncio.to_thread(permission_store.ensure_user, body.user_id)
             perm = await asyncio.to_thread(
-                permission_store.grant, body.user_id, session_id, body.level
+                permission_store.grant,
+                body.user_id,
+                session_id,
+                body.level,
+                ensure_minimum=body.ensure_minimum,
             )
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
         _announce_session_added(body.user_id, session_id)
-        add_audit_attrs(target_user_id=body.user_id, level=body.level)
+        add_audit_attrs(target_user_id=body.user_id, level=perm.level)
         return PermissionObject(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
@@ -288,7 +293,7 @@ def register_permissions_routes(
     async def list_permissions(
         request: Request,
         session_id: str,
-        limit: int = Query(default=100, ge=1, le=1000),
+        limit: int = Query(default=100, ge=1, le=MAX_GRANTS_PAGE_SIZE),
         after: str | None = Query(default=None, description="Cursor: user_id to start after"),
     ) -> _PermissionListResponse:
         """List permission grants on a session with cursor pagination.

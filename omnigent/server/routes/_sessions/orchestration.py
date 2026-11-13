@@ -392,6 +392,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
 from omnigent.server.schemas import (
+    AgentCost,
     BackgroundTaskInfo,
     ChildSessionSummary,
     CreatedSessionResponse,
@@ -439,6 +440,7 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
+    SpawnTreeUsage,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -454,7 +456,7 @@ from omnigent.telemetry.events import NativeSessionUsageEvent as _TelNativeSessi
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
-from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_surface
+from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_session_surface
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -842,6 +844,7 @@ _pending_archive_stops: dict[str, asyncio.Task[None]] = {}
 # failure, not a sustained outage.
 _ARCHIVE_STOP_LOOKUP_ATTEMPTS = 3
 _ARCHIVE_STOP_LOOKUP_RETRY_S = 0.2
+_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S = 30.0
 # A session that archives itself keeps its runner until the turn that asked
 # ends. The wait is bounded so a turn that never settles still gets torn down.
 _SELF_ARCHIVE_TURN_POLL_S = 2.0
@@ -1047,6 +1050,28 @@ async def _archive_stop(
     _pending_archive_stops.pop(session_id, None)
 
     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
+    # Idle native workers retain processes too. Release only this session's
+    # resources so children sharing an ancestor's runner leave the ancestor up.
+    try:
+        runner_client = await _facade._get_runner_client(
+            session_id, runner_router, conversation=conv, for_control=True
+        )
+        if runner_client is not None:
+            # Tunnel transports ignore HTTPX timeouts; bound headers and body consumption.
+            response = await asyncio.wait_for(
+                runner_client.delete(
+                    f"/v1/sessions/{session_id}", timeout=_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S
+                ),
+                timeout=_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S,
+            )
+            response.raise_for_status()
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Archive runner-session teardown failed for %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
     if conv.host_id and conv.runner_id:
         try:
             # A sub-agent riding an ancestor's runner leaves it up for the owner.
@@ -1489,6 +1514,48 @@ def _publish_subtree_cost_to_ancestors(
         session_stream.publish(ancestor_id, event.model_dump(exclude_none=True))
 
 
+def _agent_costs(tree: Sequence[SpawnTreeUsage], session_id: str) -> list[AgentCost]:
+    """
+    Display costs for *session_id* and its descendants from one loaded tree.
+
+    An agent's cost is its priced subtree total, the figure its own session
+    displays, or ``None`` when nothing in that subtree is priced.
+
+    :param tree: The whole spawn tree, from
+        :meth:`ConversationStore.list_spawn_tree_usage`.
+    :param session_id: Subtree root to report, e.g. ``"conv_abc123"``.
+    :returns: One :class:`AgentCost` per subtree member, in tree order.
+    """
+    children: dict[str, list[SpawnTreeUsage]] = {}
+    for row in tree:
+        if row.parent_conversation_id is not None:
+            children.setdefault(row.parent_conversation_id, []).append(row)
+    # Breadth-first from the subtree root (cycle-safe): every row follows its parent.
+    walk = [row for row in tree if row.id == session_id]
+    members = {row.id for row in walk}
+    for row in walk:
+        for child in children.get(row.id, ()):
+            if child.id not in members:
+                members.add(child.id)
+                walk.append(child)
+    totals: dict[str, float] = {}
+    for row in reversed(walk):
+        cost = _priced_cost_for_display(row.session_usage)
+        if cost is not None:
+            totals[row.id] = totals.get(row.id, 0.0) + cost
+        parent_id = row.parent_conversation_id
+        if row.id != session_id and row.id in totals and parent_id is not None:
+            totals[parent_id] = totals.get(parent_id, 0.0) + totals[row.id]
+    return [AgentCost(id=row.id, cost_usd=totals.get(row.id)) for row in tree if row.id in members]
+
+
+class _UnresolvedHarness:
+    """Sentinel: the caller has not resolved the session harness yet."""
+
+
+_UNRESOLVED_HARNESS = _UnresolvedHarness()
+
+
 def _build_session_response(
     conv: Conversation,
     items: list[ConversationItem],
@@ -1513,6 +1580,7 @@ def _build_session_response(
     side_chat_sealed: bool = False,
     agent: Agent | None = None,
     background_agents: list[BackgroundTaskInfo] | None = None,
+    harness: str | _UnresolvedHarness | None = _UNRESOLVED_HARNESS,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1583,6 +1651,8 @@ def _build_session_response(
         ``None`` is treated as ``[]``.
     :param agent_store: Optional store used to resolve the session harness.
     :param agent_cache: Optional cache used to load the session harness spec.
+    :param harness: The session harness when the caller already resolved it,
+        e.g. ``"claude-sdk"``; resolved here from the agent spec otherwise.
     :param agent: The bound agent row when the caller already read it, so the
         harness resolution does not read it again.
     :returns: The :class:`SessionResponse` for the API.
@@ -1598,7 +1668,10 @@ def _build_session_response(
     # usage. Shared by the cost indicator and the per-model breakdown so
     # both read the same numbers.
     display_usage = subtree_usage if subtree_usage is not None else (conv.session_usage or {})
-    harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent)
+    if isinstance(harness, _UnresolvedHarness):
+        harness = _resolve_harness(
+            conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent
+        )
     native_usage_baseline = None
     if harness == "pi-native":
         own_usage = conv.session_usage or {}
@@ -12255,7 +12328,7 @@ async def _create_session_from_existing_agent(
     created_by_project_id: str | None = None,
     created_by_scheduled_task_id: str | None = None,
     created_by_labels: Mapping[str, str] | None = None,
-) -> tuple[SessionResponse, Conversation]:
+) -> tuple[SessionResponse, Conversation, SessionCreateInput]:
     """
     Create a session bound to an already-registered agent.
 
@@ -12291,19 +12364,22 @@ async def _create_session_from_existing_agent(
         any. A worker whose request carries no launch args runs in its permission mode.
     :param created_by_labels: That source's labels. A worker that picks no MCP
         services of its own starts with the source's.
-    :returns: The newly created session snapshot and its conversation row.
+    :returns: The newly created session snapshot, its conversation row, and
+        the request body after project defaults were applied.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
         fails authorization.
     """
     from omnigent.server.routes._session_create_validation import (
         resolve_project_session_create,
+        server_sandbox_providers,
     )
 
     project_resolution = await resolve_project_session_create(
         body=body,
         user_id=user_id,
         project_store=project_store,
+        launchable_sandbox_providers=server_sandbox_providers(request),
     )
     body = project_resolution.body
     project_id = project_resolution.project_id
@@ -12848,7 +12924,9 @@ async def _create_session_from_existing_agent(
         )
         try:
             validated_launch_args = (
-                _derive_terminal_launch_args_from_spec(sub_spec) if sub_spec is not None else None
+                _derive_terminal_launch_args_from_spec(sub_spec)
+                if sub_spec is not None and _spec_harness(sub_spec) == selected_harness
+                else None
             )
         except ValueError as exc:
             raise OmnigentError(
@@ -12918,7 +12996,11 @@ async def _create_session_from_existing_agent(
                 exc_info=True,
             )
 
-    if needs_launch_args_from_spec and own_spec is not None:
+    if (
+        needs_launch_args_from_spec
+        and own_spec is not None
+        and _spec_harness(own_spec) == selected_harness
+    ):
         try:
             validated_launch_args = _derive_terminal_launch_args_from_spec(
                 own_spec, headless_defaults=False
@@ -12940,9 +13022,11 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
-    client_surface = resolve_client_surface(
+    client_surface = resolve_session_surface(
         request.headers,
         parent_labels=_parent_for_routing.labels if _parent_for_routing is not None else None,
+        source_labels=created_by_labels,
+        requested_labels=initial_labels,
     )
     initial_labels[CLIENT_SURFACE_LABEL_KEY] = client_surface
     if created_by_session_id is not None:
@@ -13289,7 +13373,7 @@ async def _create_session_from_existing_agent(
         conversation=conv,
         request=request,
     )
-    return response, conv
+    return response, conv, body
 
 
 def _create_session_from_bundle(
@@ -13986,6 +14070,10 @@ async def _fetch_model_options(
     conv: Conversation,
     agent_store: AgentStore | None = None,
     agent: Agent | None = None,
+    *,
+    conversation_store: ConversationStore | None = None,
+    harness: str | _UnresolvedHarness | None = _UNRESOLVED_HARNESS,
+    agent_cache: AgentCache | None = None,
 ) -> list[dict[str, Any]]:
     """
     Resolve the Web UI model-picker options for a native session.
@@ -14018,27 +14106,59 @@ async def _fetch_model_options(
     :param conv: Conversation row whose labels identify the wrapper.
     :param agent_store: Optional store for the ACP spec lookup; resolves
         from the runtime globals when ``None``.
+    :param harness: The session harness when the caller already resolved it,
+        e.g. ``"acp"``; resolved here for sessions without a native wrapper
+        otherwise.
+    :param agent_cache: Cache the harness was resolved with, reused for the
+        ACP spec load; the runtime global cache when ``None``.
     :param agent: The bound agent row when the caller already read it, so the
         harness check does not read it again.
+    :param conversation_store: Store for resolving a child's inherited host in the background.
     :returns: Model options, or ``[]`` when the session has no model picker or
         the runner-owned options are not yet available.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
     if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
-        # pi-native's catalog is PUSHED by its extension (its live
-        # ``ctx.modelRegistry``), not fetched: that reflects the models pi
-        # actually loaded regardless of auth path (Omnigent provider OR pi's
-        # own ``/login``), so the picker populates even when no ``models.json``
-        # is written into the bridge dir. Empty until the extension posts
-        # ``external_model_options`` on session start.
-        return _pushed_model_options_cache.get(session_id, [])
+        # The extension's live registry is authoritative, including models
+        # authenticated through Pi's own login rather than Omnigent.
+        pushed = _pushed_model_options_cache.get(session_id)
+        if pushed is not None:
+            return pushed
+        # After server restart, refill from the host so a paused session can
+        # select a model before its extension wakes and pushes a fresh catalog.
+        if session_id not in _model_options_inflight:
+
+            async def _load_pi_host_options() -> None:
+                host_id = conv.host_id
+                if host_id is None and conversation_store is not None:
+                    host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+                if host_id is not None:
+                    await _load_model_options_from_host(session_id, host_id, "pi-native")
+
+            task = asyncio.create_task(_load_pi_host_options())
+            _model_options_inflight[session_id] = task
+
+            def _clear_pi_host_options_inflight(_task: asyncio.Task[None]) -> None:
+                _model_options_inflight.pop(session_id, None)
+
+            task.add_done_callback(_clear_pi_host_options_inflight)
+        return []
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
     if endpoint is None:
         # Generic ACP sessions carry no native wrapper label; their picker
         # serves the deployment's curated provider ``models:`` shortlist
         # resolved from the spec instead of a runner-owned catalog.
-        if _resolve_harness_impl_is_acp(conv, agent_store, agent=agent):
-            return await _load_acp_model_options(session_id, conv, agent_store, agent=agent)
+        from omnigent.harness_aliases import canonicalize_harness
+
+        is_acp = (
+            _resolve_harness_impl_is_acp(conv, agent_store, agent=agent)
+            if isinstance(harness, _UnresolvedHarness)
+            else canonicalize_harness(harness) == "acp"
+        )
+        if is_acp:
+            return await _load_acp_model_options(
+                session_id, conv, agent_store, agent=agent, agent_cache=agent_cache
+            )
         return []
     cached = _model_options_cache.get(session_id)
     if runner_client is None:
@@ -14248,6 +14368,8 @@ async def _load_acp_model_options(
     conv: Conversation,
     agent_store: AgentStore | None,
     agent: Agent | None = None,
+    *,
+    agent_cache: AgentCache | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve the curated picker options for a generic ACP session.
 
@@ -14263,6 +14385,8 @@ async def _load_acp_model_options(
     :param conv: Conversation row the options are resolved for.
     :param agent_store: Store for the bound-agent spec load; ``None`` falls
         back to the runtime global store.
+    :param agent_cache: Cache for the bundle load; ``None`` falls back to the
+        runtime global cache.
     :param agent: The bound agent row when the caller already read it, so the
         spec load does not read it again.
     :returns: Option dicts (``id`` / ``displayName`` / ``isDefault``), or
@@ -14277,8 +14401,12 @@ async def _load_acp_model_options(
         agent_store = _agent_store
     if agent_store is None:
         return []
-    # Callers without a prefetched row keep the loader's two-argument call shape.
-    loader_kwargs = {"agent": agent} if agent is not None else {}
+    # Preserve the loader's call shape for callers without prefetched state.
+    loader_kwargs: dict[str, Agent | AgentCache] = {}
+    if agent is not None:
+        loader_kwargs["agent"] = agent
+    if agent_cache is not None:
+        loader_kwargs["agent_cache"] = agent_cache
     spec = await asyncio.to_thread(
         _load_agent_spec_for_session, conv, agent_store, **loader_kwargs
     )
@@ -14711,6 +14839,11 @@ async def _get_session_snapshot(
 
     inference_configured = configured_snapshot(conv.inference_snapshot)
     inference_error = None
+    # Resolved once, off the event loop: the model picker and the response
+    # both need it, and resolving reads the agent row and its bundle.
+    harness = await asyncio.to_thread(
+        _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache, agent=agent
+    )
     if inference_configured and conv.inference_snapshot is not None:
         catalog = (
             await inference_service(request).catalog(conv.inference_snapshot)
@@ -14723,7 +14856,14 @@ async def _get_session_snapshot(
             llm_model = conv.model_override or catalog.get("default_model")
     else:
         model_options = await _fetch_model_options(
-            runner_client, session_id, conv, agent_store, agent=agent
+            runner_client,
+            session_id,
+            conv,
+            agent_store,
+            agent=agent,
+            conversation_store=conv_store,
+            harness=harness,
+            agent_cache=agent_cache,
         )
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
@@ -14804,6 +14944,7 @@ async def _get_session_snapshot(
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        harness=harness,
         agent=agent,
     )
     if request is not None:

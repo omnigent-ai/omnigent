@@ -33,6 +33,7 @@ from omnigent.runner.identity import (
 from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, CopyOnWriteEnvironment
 from omnigent.util.json_types import JsonValue
 
+from ._proc import run_isolated
 from .agent_env import strip_desktop_session_env
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
@@ -1937,7 +1938,7 @@ def _shell_impl(
     """
     argv = _shell_argv(shell_path, command)
     try:
-        completed = subprocess.run(
+        completed = run_isolated(
             argv,
             cwd=str(cwd),
             env=_child_shell_env(),
