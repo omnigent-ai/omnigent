@@ -874,9 +874,11 @@ async def test_managed_session_create_rejects_a_taken_host_id(
     assert env.conv_store.list_conversations(limit=100) == sessions_before
 
 
+@pytest.mark.parametrize("requested_host_id", [None, "0123456789abcdef0123456789abcdef"])
 async def test_managed_multipart_bundle_create_end_to_end(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
+    requested_host_id: str | None,
 ) -> None:
     """
     Multipart ``POST /v1/sessions`` with ``host_type="managed"`` uploads
@@ -885,7 +887,8 @@ async def test_managed_multipart_bundle_create_end_to_end(
     runner runs on the sandbox, so the same background launch as the JSON
     path binds the session to a sandbox host with a runner. Also confirms
     the caller owns the session (grant happens BEFORE the managed launch
-    is scheduled, so a launch failure can't orphan an unowned row).
+    is scheduled, so a launch failure can't orphan an unowned row). A
+    metadata ``host_id`` names the sandbox host, as on the JSON create.
     """
     env = managed_session_env
     monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
@@ -909,9 +912,12 @@ async def test_managed_multipart_bundle_create_end_to_end(
     install_fake_modal_launcher(monkeypatch, fake)
 
     bundle = build_agent_bundle(name="managed-multipart-e2e-agent")
+    metadata: dict[str, object] = {"host_type": "managed"}
+    if requested_host_id is not None:
+        metadata["host_id"] = requested_host_id
     resp = await env.client.post(
         "/v1/sessions",
-        data={"metadata": json.dumps({"host_type": "managed"})},
+        data={"metadata": json.dumps(metadata)},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     assert resp.status_code == 201, resp.text
@@ -924,6 +930,9 @@ async def test_managed_multipart_bundle_create_end_to_end(
     tunnels = [await future for future in host_futures]
     assert len(tunnels) == 1
     assert conv.host_id is not None
+    if requested_host_id is not None:
+        assert conv.host_id == requested_host_id
+    assert conv.labels.get("omnigent.sandbox.requested_host_id") == requested_host_id
     assert conv.workspace == "/root/workspace"
     assert conv.runner_id is not None
     assert conv.runner_id.startswith("runner_token_")
@@ -1347,9 +1356,12 @@ async def test_concurrent_sandbox_moves_launch_one_sandbox(
         lambda: (launch := tracker.get(session_id)) is not None and launch.settled.is_set()
     )
     assert len(fake.provisioned_names) == 1
+    # Failed inputs are recorded before the launch releases its move claim.
     await poll_until_async(
         lambda: (
             [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
+            and (current := env.conv_store.get_conversation(session_id)) is not None
+            and current.runner_id is None
         )
     )
     conv = env.conv_store.get_conversation(session_id)
