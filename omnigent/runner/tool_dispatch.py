@@ -5190,14 +5190,15 @@ async def _project_id_for_name(
     return project_id
 
 
-def _reminder_may_exist(tool_name: str, problem: str) -> str:
+def _reminder_may_exist(tool_name: str, problem: str, *, details: str | None = None) -> str:
     """An error for a create that may have been saved, so a retry doesn't duplicate it."""
-    return json.dumps(
-        {
-            "error": f"{tool_name}: {problem}. It may still have been created: check "
-            "sys_scheduled_task_list for a 'Reminder: ...' automation before setting it again."
-        }
-    )
+    error: dict[str, str] = {
+        "error": f"{tool_name}: {problem}. It may still have been created: check "
+        "sys_scheduled_task_list for a 'Reminder: ...' automation before setting it again."
+    }
+    if details is not None:
+        error["details"] = details
+    return json.dumps(error)
 
 
 _REMINDER_SESSION_PARAMS = {
@@ -5334,6 +5335,11 @@ async def _execute_reminder_set(
     except Exception as exc:  # noqa: BLE001
         # The server may have saved the reminder before its response was lost.
         return _reminder_may_exist(tool_name, f"the request to create the reminder failed ({exc})")
+    if resp.status_code >= 500:
+        # A gateway can answer 502 or 504 after the server saved the task.
+        return _reminder_may_exist(
+            tool_name, f"the server returned {resp.status_code}", details=resp.text[:1000]
+        )
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"server returned {resp.status_code}", "details": resp.text[:1000]}

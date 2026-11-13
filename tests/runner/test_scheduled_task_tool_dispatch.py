@@ -981,11 +981,14 @@ class _UnreadableResp(_Resp):
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_frozen_now")
-@pytest.mark.parametrize("fault", ["response_lost", "reply_unreadable"])
+@pytest.mark.parametrize("fault", ["response_lost", "reply_unreadable", "502", "504"])
 async def test_an_uncertain_create_says_the_reminder_may_exist(fault: str) -> None:
     """A create that may have been saved must not invite a duplicate on retry."""
     if fault == "reply_unreadable":
         client = _ReminderClient(_UnreadableResp(status_code=200))
+    elif fault.isdigit():
+        # A gateway can time out or fail after the server committed the task.
+        client = _ReminderClient(_Resp(status_code=int(fault), body={"detail": "upstream"}))
     else:
         client = _ReminderClient()
 
@@ -1004,6 +1007,9 @@ async def test_an_uncertain_create_says_the_reminder_may_exist(fault: str) -> No
     )
     assert "may still have been created" in out["error"]
     assert "sys_scheduled_task_list" in out["error"]
+    if fault.isdigit():
+        assert f"returned {fault}" in out["error"]
+        assert "upstream" in out["details"]
     # No usable task id came back, so nothing is deleted.
     assert not [call for call in client.calls if call[0] == "DELETE"]
 

@@ -18,6 +18,7 @@ in-process store.
 from __future__ import annotations
 
 import math
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -456,6 +457,11 @@ def resolve_reminder_time(args: dict[str, Any], now: datetime) -> datetime | str
             return f"'at' is not an ISO-8601 time: {raw!r}."
         if when.tzinfo is None or when.utcoffset() is None:
             return "'at' needs a UTC offset or 'Z', e.g. '2026-11-12T15:00:00-08:00'."
+        fraction = re.search(r"[.,](\d+)", raw)
+        if fraction is not None and fraction.group(1)[6:].strip("0"):
+            # fromisoformat drops digits past microseconds; keep the time from
+            # rounding down to a minute before the one asked for.
+            when += timedelta(microseconds=1)
     else:
         delay = args["delay_seconds"]
         # bool is an int subclass; reject it like sys_timer_set does.

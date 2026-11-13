@@ -866,15 +866,17 @@ async def test_the_list_leaves_reminders_out_unless_asked(
     reminder_id, automation_id = reminder.json()["id"], automation.json()["id"]
     assert await listed({}) == [automation_id]
     assert await listed({"kind": "automation"}) == [automation_id]
-    assert await listed({"kind": "reminder"}) == [reminder_id]
     assert await listed({"kind": "all"}) == sorted([reminder_id, automation_id])
     # A reminder left off the list still opens by id, for example from the Inbox.
     opened = await auth_client.get(f"/v1/scheduled-tasks/{reminder_id}", headers=_headers())
     assert opened.status_code == 200, opened.text
-    bad = await auth_client.get(
-        "/v1/scheduled-tasks", params={"kind": "trigger"}, headers=_headers()
-    )
-    assert bad.status_code == 422, bad.text
+    # No reminders-only view: the list reads every task, so a selective filter would
+    # need an indexed, paginated query.
+    for kind in ("reminder", "trigger"):
+        bad = await auth_client.get(
+            "/v1/scheduled-tasks", params={"kind": kind}, headers=_headers()
+        )
+        assert bad.status_code == 422, bad.text
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)

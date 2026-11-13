@@ -17338,7 +17338,7 @@
     },
     "/v1/scheduled-tasks": {
       "get": {
-        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* asks for `reminder` or `all`, so the\nreminders agents set for their own sessions stay off the Automations page.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
+        "description": "List the caller's scheduled tasks.\n\nLists automations unless *kind* is `all`, so the reminders agents set for\ntheir own sessions stay off the Automations page. There is no reminders-only\nview: this list reads every task the owner has, and a selective filter needs\nan indexed, paginated query first.\n\nLazy-on-read stale backstop: before returning, force-fail any of this\nowner's runs still `running` past the 6h max age (`incomplete`), so\na future Tasks-list \"last-run status\" badge never shows a stale orphan\nas `running`. Pure age check \u2014 one indexed, owner-scoped query for the\nowner's running runs, then a conditional `update_run`; NO per-run\nconversation I/O. Young in-flight runs are untouched, and completion of\na normal run is handled event-driven (the `_publish_status` hook), not\nhere.",
         "operationId": "list_scheduled_tasks_v1_scheduled_tasks_get",
         "parameters": [
           {
@@ -17349,7 +17349,6 @@
               "default": "automation",
               "enum": [
                 "automation",
-                "reminder",
                 "all"
               ],
               "title": "Kind",

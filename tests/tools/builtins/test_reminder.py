@@ -53,10 +53,18 @@ def test_at_is_converted_to_utc() -> None:
     assert when == datetime(2026, 11, 12, 23, 0, tzinfo=UTC)
     assert resolve_reminder_time({"at": "2026-11-12T23:00:00Z"}, _NOW) == when
     # Any part of a second past the minute rounds up to the next one.
-    for raw in ("2026-11-12T15:00:01-08:00", "2026-11-12T15:00:00.000001-08:00"):
+    for raw in (
+        "2026-11-12T15:00:01-08:00",
+        "2026-11-12T15:00:00.000001-08:00",
+        # Digits past microseconds, which fromisoformat drops, still round up.
+        "2026-11-12T15:00:00.0000001-08:00",
+        "2026-11-12T15:00:00,000000000004-08:00",
+    ):
         assert resolve_reminder_time({"at": raw}, _NOW) == datetime(
             2026, 11, 12, 23, 1, tzinfo=UTC
-        )
+        ), raw
+    # Zero digits past microseconds leave a whole minute alone.
+    assert resolve_reminder_time({"at": "2026-11-12T23:00:00.000000000Z"}, _NOW) == when
 
 
 @pytest.mark.parametrize(
