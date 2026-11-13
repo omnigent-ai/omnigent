@@ -79,6 +79,14 @@ async def _wait_for_model(
     pytest.fail(f"Claude did not report {expected!r}; terminal contents:\n{pane[-3000:]}")
 
 
+def _saved_model_matches(settings_path: Path, expected: str) -> bool:
+    try:
+        settings = json.loads(settings_path.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(settings, dict) and settings.get("model") == expected
+
+
 def _status_line_config(bridge_dir: Path) -> dict[str, str]:
     """Capture only this pane's model status in its own directory."""
     return {
@@ -250,9 +258,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                 )
                 assert response.status_code == 204, response.text
                 await _wait_for_model(bridge_dir, model, socket_path)
-                await poll_until_async(
-                    lambda: json.loads(settings_path.read_text()).get("model") == _INITIAL_MODEL
-                )
+                await poll_until_async(lambda: _saved_model_matches(settings_path, _INITIAL_MODEL))
                 assert _status_model_matches(bridge_dir, model)
             await asyncio.to_thread(bridge.inject_slash_command, bridge_dir, command="/model")
             (tmp_path / "open-model-picker.txt").write_text(await _wait_for_picker(socket_path))
@@ -262,9 +268,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
             )
             assert recovered.status_code == 204, recovered.text
             await _wait_for_model(bridge_dir, _TARGET_MODEL, socket_path)
-            await poll_until_async(
-                lambda: json.loads(settings_path.read_text()).get("model") == _INITIAL_MODEL
-            )
+            await poll_until_async(lambda: _saved_model_matches(settings_path, _INITIAL_MODEL))
             assert _status_model_matches(bridge_dir, _TARGET_MODEL)
             (tmp_path / "after-switch.txt").write_text(_capture_pane(socket_path))
             (tmp_path / "live-model.json").write_text(
