@@ -277,12 +277,17 @@ describe("BrowserPane focus requests", () => {
 describe("BrowserPane retained-view lifecycle", () => {
   it("does not reattach a view closed while the pane is hidden", async () => {
     let fireClosed: ((p: { conversationId: string; reason: string | null }) => void) | undefined;
+    let fireCreated: ((p: { conversationId: string }) => void) | undefined;
     const bridge = installBridge({
       browserHasView: vi
         .fn()
         .mockResolvedValue({ exists: true, url: "http://localhost:5173", isLoading: true }),
       onBrowserViewClosed: vi.fn((cb) => {
         fireClosed = cb;
+        return () => {};
+      }),
+      onBrowserViewCreated: vi.fn((cb) => {
+        fireCreated = cb;
         return () => {};
       }),
     });
@@ -299,6 +304,11 @@ describe("BrowserPane retained-view lifecycle", () => {
     expect(reload.querySelector("svg")).not.toHaveClass("animate-spin");
     expect(bridge.browserSetActive).not.toHaveBeenCalled();
     expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+
+    // A new view for the conversation starts without the closed page's spinner.
+    act(() => fireCreated?.({ conversationId: "conv_closed" }));
+    expect(reload).toBeEnabled();
+    expect(reload.querySelector("svg")).not.toHaveClass("animate-spin");
   });
 
   it("ignores an existence probe that arrives after the view was closed", async () => {
@@ -605,6 +615,52 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
     render(<BrowserPane conversationId="conv_slow" />);
     const reload = screen.getByRole("button", { name: /reload/i });
     await waitFor(() => expect(reload.querySelector("svg")).toHaveClass("animate-spin"));
+  });
+
+  it("keeps a live loading event over an older existence snapshot", async () => {
+    let resolveProbe: ((r: { exists: boolean; url: string; isLoading: boolean }) => void) | undefined;
+    let fireLoading: ((p: { conversationId: string; isLoading: boolean }) => void) | undefined;
+    installBridge({
+      browserHasView: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            resolveProbe = resolve;
+          }),
+      ),
+      onBrowserLoadingState: vi.fn((cb: typeof fireLoading) => {
+        fireLoading = cb;
+        return () => {};
+      }),
+    });
+    render(<BrowserPane conversationId="conv_race" />);
+    act(() => fireLoading?.({ conversationId: "conv_race", isLoading: false }));
+    await act(async () =>
+      resolveProbe?.({ exists: true, url: "https://example.com/done", isLoading: true }),
+    );
+
+    const reload = screen.getByRole("button", { name: /reload/i });
+    expect(reload).toBeEnabled();
+    expect(reload.querySelector("svg")).not.toHaveClass("animate-spin");
+  });
+
+  it("does not carry the spinner to another conversation", async () => {
+    let fireLoading: ((p: { conversationId: string; isLoading: boolean }) => void) | undefined;
+    installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://example.com" }),
+      onBrowserLoadingState: vi.fn((cb: typeof fireLoading) => {
+        fireLoading = cb;
+        return () => {};
+      }),
+    });
+    const { rerender } = render(<BrowserPane conversationId="conv_a" />);
+    const reload = screen.getByRole("button", { name: /reload/i });
+    await waitFor(() => expect(reload).toBeEnabled());
+    act(() => fireLoading?.({ conversationId: "conv_a", isLoading: true }));
+    expect(reload.querySelector("svg")).toHaveClass("animate-spin");
+
+    rerender(<BrowserPane conversationId="conv_b" />);
+    await waitFor(() => expect(reload).toBeEnabled());
+    expect(reload.querySelector("svg")).not.toHaveClass("animate-spin");
   });
 
   it("devtools button calls the open-devtools IPC", async () => {

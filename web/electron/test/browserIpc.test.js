@@ -1210,9 +1210,8 @@ describe("browserIpc — url live-tracking", () => {
 
   it("reports the page's loading state, starting with the load already under way", async () => {
     const { ipcMain, registry, sent, event } = setup({ conversationId: null });
-    let loading = true;
     const wc = makeWebContents();
-    wc.isLoading = () => loading;
+    wc.isLoading = () => true;
     registry.openOrNavigate = () => ({
       ok: true,
       created: true,
@@ -1226,7 +1225,6 @@ describe("browserIpc — url live-tracking", () => {
       sent.filter((s) => s.channel === "browser-loading-state").map((s) => s.payload);
     assert.deepEqual(loadingEvents(), [{ conversationId: "conv_1", isLoading: true }]);
 
-    loading = false;
     wc.emit("did-stop-loading");
     wc.emit("did-start-loading");
     assert.deepEqual(loadingEvents().slice(1), [

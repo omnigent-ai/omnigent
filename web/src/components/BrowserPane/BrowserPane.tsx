@@ -243,15 +243,16 @@ export function BrowserPane({
     if (!bridge) return;
     let cancelled = false;
     let viewChanged = false;
+    let loadingChanged = false;
 
-    // A newer lifecycle event takes precedence over this asynchronous snapshot.
+    // Newer lifecycle and loading events take precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
       if (!cancelled && !viewChanged && r?.exists) {
         setHasView(true);
         if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
-        setIsLoading(!!r.isLoading);
+        if (!loadingChanged) setIsLoading(!!r.isLoading);
       }
     });
 
@@ -268,11 +269,17 @@ export function BrowserPane({
       setCanGoForward(false);
       setIsLoading(false);
     });
+    const unsubLoading = bridge.onBrowserLoadingState?.((payload) => {
+      if (payload.conversationId !== conversationId) return;
+      loadingChanged = true;
+      setIsLoading(payload.isLoading);
+    });
     return () => {
       cancelled = true;
       setIsLoading(false);
       unsubCreated?.();
       unsubClosed?.();
+      unsubLoading?.();
     };
   }, [conversationId, browserSupported]);
 
@@ -293,14 +300,9 @@ export function BrowserPane({
       setCanGoBack(payload.canGoBack);
       setCanGoForward(payload.canGoForward);
     });
-    const unsubLoading = bridge.onBrowserLoadingState?.((payload) => {
-      if (payload.conversationId !== conversationId) return;
-      setIsLoading(payload.isLoading);
-    });
     return () => {
       unsubUrl?.();
       unsubNav?.();
-      unsubLoading?.();
     };
   }, [conversationId, browserSupported]);
 
