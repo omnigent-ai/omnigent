@@ -133,6 +133,13 @@ _MAX_SEEN_DELTA_KEYS = 5000
 # Seconds without transcript activity before reporting an idle observation.
 # This heuristic does not establish that the sub-agent has completed.
 _SUBAGENT_IDLE_THRESHOLD_S = 5.0
+# The gap allowed while the child's turn is still open (a tool runs or the model
+# is responding), so a long step doesn't flip it idle and back. Matches Claude's
+# longest Bash timeout, so a child that stops mid-tool still settles.
+_SUBAGENT_MID_TURN_IDLE_THRESHOLD_S = 600.0
+# Claude's tool that hands a sub-agent's report back and ends its turn.
+_SUBAGENT_HANDBACK_TOOL = "SubagentHandback"
+_SUBAGENT_INTERRUPT_PREFIX = "[Request interrupted by user"
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
@@ -653,6 +660,9 @@ class SubagentEntry:
         means no observation has been handled yet.
     :param delivery_error: Durable reason the mirrored transcript is
         incomplete. After inactivity it reports ``failed`` instead of idle.
+    :param mid_turn: Whether the forwarded items leave the child's turn open
+        (see :func:`_leaves_turn_open`), so inactivity waits for
+        ``_SUBAGENT_MID_TURN_IDLE_THRESHOLD_S``.
     """
 
     subagent_id: str
@@ -663,6 +673,7 @@ class SubagentEntry:
     last_activity_ts: float | None = None
     last_status: str | None = None
     delivery_error: str | None = None
+    mid_turn: bool = False
 
 
 @dataclass(frozen=True)
@@ -1822,6 +1833,7 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             delivery_error=(
                 row.get("delivery_error") if isinstance(row.get("delivery_error"), str) else None
             ),
+            mid_turn=row.get("mid_turn") is True,
         )
     return SubagentForwardState(subagents=entries)
 
@@ -1845,6 +1857,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
                 "delivery_error": entry.delivery_error,
+                "mid_turn": entry.mid_turn,
             }
             for entry in state.subagents.values()
         },
@@ -2197,6 +2210,31 @@ def _partition_subagent_batches(
     return batches
 
 
+def _leaves_turn_open(item: ClaudeTranscriptItem, *, open_before: bool) -> bool:
+    """Whether a child's turn is still open after this item.
+
+    Assistant text, a handback, and an interrupt end it; a tool result keeps
+    the state its call set.
+    """
+    if item.item_type == "function_call_output":
+        return open_before
+    if item.item_type == "function_call":
+        return item.data.get("name") != _SUBAGENT_HANDBACK_TOOL
+    if item.item_type != "message":
+        return True
+    if item.data.get("role") == "assistant":
+        return False
+    content = item.data.get("content")
+    return not (
+        isinstance(content, list)
+        and any(
+            isinstance(block, dict)
+            and str(block.get("text", "")).startswith(_SUBAGENT_INTERRUPT_PREFIX)
+            for block in content
+        )
+    )
+
+
 def _pending_items_from_records(
     result: TranscriptReadResult,
     seen: set[str],
@@ -2526,6 +2564,9 @@ async def _forward_one_subagent(
             source_id = pending_item.item.source_id
             seen.add(source_id)
             seen_source_ids.append(source_id)
+        mid_turn = new_entry.mid_turn
+        for pending_item in completed_items:
+            mid_turn = _leaves_turn_open(pending_item.item, open_before=mid_turn)
         completed_offsets = [
             pending_item.checkpoint_after
             for pending_item in completed_items
@@ -2536,22 +2577,26 @@ async def _forward_one_subagent(
             byte_offset=max(completed_offsets, default=new_entry.byte_offset),
             seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
             last_activity_ts=now if delivered else new_entry.last_activity_ts,
+            mid_turn=mid_turn,
         )
         await checkpoint.put(new_entry)
         if stop_after_batch:
             break
 
     delivery_pending = any(item.item.source_id not in seen for item in pending)
+    idle_threshold_s = (
+        _SUBAGENT_MID_TURN_IDLE_THRESHOLD_S if new_entry.mid_turn else _SUBAGENT_IDLE_THRESHOLD_S
+    )
     desired_status: str | None = None
     if had_item:
         desired_status = "running"
     elif (
         not delivery_pending
         and new_entry.last_activity_ts is not None
-        and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_THRESHOLD_S
+        and now - new_entry.last_activity_ts > idle_threshold_s
     ):
         # A transcript lull is an idle observation, not an authoritative
-        # completion: the child may still be in a long-running tool call.
+        # completion: the child may still be working on its reply.
         desired_status = "failed" if new_entry.delivery_error else "idle"
     if desired_status is None or desired_status == new_entry.last_status:
         return
