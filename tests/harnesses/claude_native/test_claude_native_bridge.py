@@ -7185,7 +7185,15 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
 
 
 @pytest.mark.parametrize(
-    "outcome", ["submitted", "unconfirmed", "enter timed out", "enter failed", "guard unavailable"]
+    "outcome",
+    [
+        "submitted",
+        "unconfirmed",
+        "enter timed out",
+        "enter failed",
+        "guard unavailable",
+        "settings unreadable",
+    ],
 )
 def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
@@ -7203,7 +7211,8 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     )
     settings_path = claude_native_bridge.read_user_settings_path(bridge_dir)
     state_dir = default_model_guard.state_directory(settings_path)
-    settings_path.write_text('{"model": "opus"}', encoding="utf-8")
+    initial_settings = "{incomplete" if outcome == "settings unreadable" else '{"model": "opus"}'
+    settings_path.write_text(initial_settings, encoding="utf-8")
     entered: list[bool] = []
     if outcome == "guard unavailable":
         state_dir.write_text("not a directory", encoding="utf-8")
@@ -7241,9 +7250,9 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     if outcome in ("unconfirmed", "enter timed out"):
         # The Enter may have reached the pane; its save can land afterwards.
         settings_path.write_text('{"model": "sonnet"}', encoding="utf-8")
-    if outcome == "guard unavailable":
+    if outcome in ("guard unavailable", "settings unreadable"):
         assert entered == []
-        assert json.loads(settings_path.read_text(encoding="utf-8")) == {"model": "opus"}
+        assert settings_path.read_text(encoding="utf-8") == initial_settings
         return
     default_model_guard.settle_default_model(settings_path, state_dir=state_dir)
 
