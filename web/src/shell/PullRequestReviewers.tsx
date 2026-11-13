@@ -130,14 +130,16 @@ function PullRequestReviewerRow({
         {reviewer.login}
       </span>
       {reviewer.kind === "team" && <span className="shrink-0 text-muted-foreground">(team)</span>}
+      {/* Takes only the room the login leaves, so the state truncates before the login. */}
       <span
+        title={stateLabel}
         className={cn(
-          "inline-flex shrink-0 items-center gap-1",
+          "inline-flex min-w-4 grow basis-0 items-center gap-1",
           edit ? "text-muted-foreground" : state.className,
         )}
       >
-        <StateIcon aria-hidden className={cn("size-3", edit && "animate-spin")} />
-        <span>{stateLabel}</span>
+        <StateIcon aria-hidden className={cn("size-3 shrink-0", edit && "animate-spin")} />
+        <span className="truncate">{stateLabel}</span>
       </span>
       {onToggle && !edit && (
         <PullRequestChipAction
