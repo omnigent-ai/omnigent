@@ -1,7 +1,10 @@
+import { WorkflowIcon } from "lucide-react";
+
 import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { Button } from "@/components/ui/button";
+import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import type { StepProgress } from "@/lib/sessionJournal";
-import { useNavigate } from "@/lib/routing";
+import { Link, useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { ProgressStrip } from "@/shell/TasksPanel";
 import { openTasksTab } from "@/store/sessionTasksActions";
@@ -57,6 +60,30 @@ export function RunGraphButton({
       onClick={onClick}
     >
       <FullscreenIcon />
+    </Button>
+  );
+}
+
+/** Opens the saved workflow a run follows, on the workflow's page. */
+export function RunWorkflowButton({ workflowId }: { workflowId: string }) {
+  const { workflows } = useSavedWorkflows();
+  const name = workflows.find((workflow) => workflow.id === workflowId)?.name;
+  const label = name ? `Open workflow “${name}”` : "Open the workflow";
+  return (
+    <Button
+      asChild
+      variant="ghost"
+      size="icon-sm"
+      className="z-10 shrink-0 text-muted-foreground hover:text-foreground"
+    >
+      <Link
+        to={`/workflows/${encodeURIComponent(workflowId)}`}
+        aria-label={label}
+        title={label}
+        data-testid="run-workflow-button"
+      >
+        <WorkflowIcon className="size-4" />
+      </Link>
     </Button>
   );
 }
