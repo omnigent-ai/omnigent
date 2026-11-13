@@ -477,7 +477,13 @@ export function GridSessionPane({
                       <>
                         {/* Status only; switching hosts stays in the full-screen view. */}
                         <HostBadge sessionId={sessionId} appearance="composer" readOnly />
-                        <GridPermissionPicker session={session} permissionLevel={permissionLevel} />
+                        <GridPermissionPicker
+                          session={session}
+                          permissionLevel={permissionLevel}
+                          unreachable={
+                            liveness.kind === "host_offline" || liveness.kind === "local_stranded"
+                          }
+                        />
                       </>
                     ),
                     trailing: session && <SideChatSettings session={session} fullSession />,
@@ -650,9 +656,12 @@ function useSharedSessionDraft(sessionId: string) {
 function GridPermissionPicker({
   session,
   permissionLevel,
+  unreachable,
 }: {
   session: Session;
   permissionLevel: number | null;
+  /** Its host is offline and a message can't wake it, as in the main composer. */
+  unreachable: boolean;
 }) {
   const state = useConversationEntryState(session.id);
   const [busy, setBusy] = useState(false);
@@ -667,7 +676,7 @@ function GridPermissionPicker({
       harness={state.sessionHarness}
       selectedValue={chip.value}
       options={chip.options}
-      disabled={!owner || busy}
+      disabled={!owner || unreachable || busy}
       disabledReason={owner ? undefined : "Only the session owner can change the permission mode"}
       onSelect={(mode) => {
         const store = useChatStore.getState();

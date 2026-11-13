@@ -38,6 +38,7 @@ import { updateSession } from "@/lib/sessionsApi";
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import { sideChatSettingsMutationKey, type SideChatModelSettings } from "@/lib/sideChat";
 import type { Session } from "@/lib/types";
+import { conversationRegistry } from "@/store/conversationRegistry";
 
 type SettingsUpdate = SideChatModelSettings & Pick<Session, "costControlModeOverride">;
 
@@ -96,6 +97,13 @@ export function SideChatSettings({
         ...previous,
         ...updated,
       }));
+      // A grid cell's session is also the main composer's; keep its live entry in step.
+      if (fullSession)
+        conversationRegistry.peek(session.id)?.setState({
+          sessionModelOverride: updated.modelOverride ?? null,
+          sessionReasoningEffort: updated.reasoningEffort ?? null,
+          costControlModeOverride: updated.costControlModeOverride ?? null,
+        });
     },
     onError: (cause) => {
       const message =
@@ -206,7 +214,8 @@ export function SideChatSettings({
                         ? { reasoningEffort: nextEffort }
                         : {}),
                       // A pinned model replaces Smart Routing, as in the main composer.
-                      ...(fullSession && session.costControlModeOverride === "on"
+                      ...(fullSession &&
+                      (state.costControlModeOverride ?? session.costControlModeOverride) === "on"
                         ? { costControlModeOverride: "off" as const }
                         : {}),
                     });

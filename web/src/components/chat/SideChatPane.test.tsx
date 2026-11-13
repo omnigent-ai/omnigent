@@ -190,9 +190,18 @@ describe("editing a sent side-chat message", () => {
     expect(send.mock.calls[0]![0]).toBe(withMention);
   });
 
-  it("asks before replacing the side chat's draft", async () => {
-    seedSentMessage();
-    const draft = { text: "", files: [], quotes: [{ id: "q", before: "", text: "quoted" }] };
+  it("asks before replacing the side chat's draft, dropping its tags", async () => {
+    // The recalled message names "@auth" as plain text; the discarded draft's tag must not claim it.
+    seedSentMessage("Why did @auth fail?");
+    const draft = {
+      text: "",
+      files: [],
+      quotes: [{ id: "q", before: "", text: "quoted" }],
+      mentions: {
+        files: [],
+        sessions: [{ id: "s_child", title: "auth", isSubagent: true, token: "@auth" }],
+      },
+    };
     useChatStore.setState({ sideChatComposers: { [childId]: draft } });
     renderPane(<SideChatPane childId={childId} />);
 
@@ -211,10 +220,16 @@ describe("editing a sent side-chat message", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
 
     await waitFor(() =>
-      expect(screen.getByTestId("side-chat-input")).toHaveValue("Why did this build fail?"),
+      expect(screen.getByTestId("side-chat-input")).toHaveValue("Why did @auth fail?"),
     );
-    expect(useChatStore.getState().sideChatComposers[childId]).toMatchObject({ quotes: [] });
+    expect(useChatStore.getState().sideChatComposers[childId]).toMatchObject({
+      quotes: [],
+      mentions: undefined,
+    });
     await waitFor(() => expect(screen.getByTestId("side-chat-input")).toHaveFocus());
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send.mock.calls[0]![0]).toBe("Why did @auth fail?");
   });
 
   it("is not offered in a read-only side chat", () => {

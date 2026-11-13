@@ -3985,9 +3985,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   setClaudePermissionMode: async (mode, sessionId) => {
     const conversationId = sessionId ?? get().conversationId;
     if (!conversationId) return;
-    const previous =
-      (sessionId ? conversationRegistry.peek(sessionId)?.getState() : get())
-        ?.claudePermissionMode ?? "";
+    const previous = (sessionId ? setterForState(sessionId) : get())?.claudePermissionMode ?? "";
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
     // Optimistic, then reconciled against the mode the server confirms the
@@ -4005,9 +4003,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   setCodexApprovalMode: async (mode, sessionId) => {
     const conversationId = sessionId ?? get().conversationId;
     if (!conversationId) return;
-    const previous =
-      (sessionId ? conversationRegistry.peek(sessionId)?.getState() : get())?.codexApprovalMode ??
-      "";
+    const previous = (sessionId ? setterForState(sessionId) : get())?.codexApprovalMode ?? "";
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
     // Optimistic, then reconciled against the mode the server confirms the

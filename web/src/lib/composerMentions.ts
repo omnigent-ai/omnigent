@@ -339,13 +339,14 @@ export function expandTaggedDraft<T extends { text: string; quotes: { before: st
   harness: string | null,
 ): T {
   if (!mentions) return draft;
-  const live = presentMentions(composerInlineMentions(mentions.files, mentions.sessions, harness), [
-    draft.text,
-    ...draft.quotes.map((quote) => quote.before),
-  ]);
+  const sessions = composerInlineMentions([], mentions.sessions, harness);
+  const live = presentMentions(
+    [...composerInlineMentions(mentions.files, [], harness), ...sessions],
+    [draft.text, ...draft.quotes.map((quote) => quote.before)],
+  );
   if (live.length === 0) return draft;
   const expand = (text: string) => expandMentionTokens(text, live);
-  const tagsSessions = live.some((mention) => mention.marker.startsWith("[Session: "));
+  const tagsSessions = sessions.some((mention) => live.includes(mention));
   return {
     ...draft,
     text: withSessionMentionHint(expand(draft.text), tagsSessions),

@@ -240,6 +240,7 @@ export function SideChatPane({
         text,
         files: [],
         quotes: [],
+        mentions: undefined,
         autoFocus: true,
       })),
     focusComposer: () =>

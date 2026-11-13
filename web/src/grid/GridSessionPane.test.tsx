@@ -53,6 +53,7 @@ const fixture = vi.hoisted(() => ({
   terminalPending: false,
   composerDisabled: false,
   hostOnline: undefined as boolean | undefined,
+  livenessKind: "online",
   failedChat: "",
   failedTerminal: "",
   renderError: new Error("Grid surface render failed"),
@@ -123,7 +124,7 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useBrowserAgentRelay", () => ({ useBrowserAgentRelay: () => {} }));
 vi.mock("@/hooks/useSessionLiveness", () => ({
   livenessRowFromSession: () => null,
-  useSessionLiveness: () => ({ kind: "online" }),
+  useSessionLiveness: () => ({ kind: fixture.livenessKind }),
 }));
 vi.mock("@/hooks/useChildSessions", () => ({ useChildSessions: () => ({ children: [] }) }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -235,6 +236,7 @@ afterEach(() => {
   fixture.terminalPending = false;
   fixture.composerDisabled = false;
   fixture.hostOnline = undefined;
+  fixture.livenessKind = "online";
   fixture.failedChat = "";
   fixture.failedTerminal = "";
   fixture.discardEdits = null;
@@ -249,15 +251,16 @@ it("keeps each cell's single-session draft and tags, and switches that session's
   const subagentTabDraft = { text: "Typed in a sub-agent tab", files: [] };
   useChatStore.getState().updateSideChatComposer("second", () => subagentTabDraft);
   document.title = "Single session";
-  const view = render(
+  const tree = () => (
     <MemoryRouter>
       <TooltipProvider>
         <RearrangeableGrid
           grid={{ id: "controls", layout: splitGrid("first", "first", "second", "right")! }}
         />
       </TooltipProvider>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+  const view = render(tree());
   expect(document.title).toBe("Test grid");
   expect(useChatStore.getState().sideChatComposers.second).toMatchObject({
     text: "Unsent idea",
@@ -283,6 +286,10 @@ it("keeps each cell's single-session draft and tags, and switches that session's
   await waitFor(() =>
     expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
   );
+  // Like the main composer, an unreachable session's chip can't switch modes.
+  fixture.livenessKind = "host_offline";
+  view.rerender(tree());
+  expect(second.getByRole("button", { name: "Permission mode: Manual" })).toBeDisabled();
   view.unmount();
   expect(document.title).toBe("Single session");
   // Leaving the grid hands the shared composer entry back untouched.
