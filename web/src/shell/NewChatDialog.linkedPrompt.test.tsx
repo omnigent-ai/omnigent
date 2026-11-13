@@ -122,7 +122,7 @@ function Landing({ visit }: { visit: number }) {
   return <NewChatLandingScreen key={visit} />;
 }
 
-const serverInfo = {
+const serverInfo: Partial<ServerInfo> = {
   accounts_enabled: false,
   single_user: false,
   login_url: null,
@@ -140,14 +140,14 @@ const serverInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
-} as ServerInfo;
+};
 
 function renderLanding() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(<Landing visit={1} />, {
     wrapper: ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={serverInfo}>
+        <CapabilitiesProvider info={serverInfo as ServerInfo}>
           <TooltipProvider>{children}</TooltipProvider>
         </CapabilitiesProvider>
       </QueryClientProvider>
