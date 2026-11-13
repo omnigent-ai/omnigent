@@ -11,6 +11,9 @@ import {
   workspaceStoryProjects,
 } from "./workspaceStoryFixtures";
 
+// Keep relative age labels stable as the calendar advances.
+const worktreeUpdatedAt = Math.floor(Date.now() / 1000) - 2 * 365 * 24 * 60 * 60;
+
 const projectEntries = [
   storyDirectory(`${workspaceStoryProjects}/api`),
   storyDirectory(`${workspaceStoryProjects}/app`),
@@ -67,21 +70,21 @@ const meta = {
                           branch: "agentic/layouts",
                           is_main: false,
                           detached: false,
-                          updated_at: 1_700_000_000,
+                          updated_at: worktreeUpdatedAt,
                         },
                         {
                           path: `${workspaceStoryHome}/worktrees/command-palette`,
                           branch: "feature/command-palette",
                           is_main: false,
                           detached: false,
-                          updated_at: 1_699_992_800,
+                          updated_at: worktreeUpdatedAt - 7200,
                         },
                         {
                           path: `${workspaceStoryHome}/worktrees/streaming-status`,
                           branch: "feature/streaming-status",
                           is_main: false,
                           detached: false,
-                          updated_at: 1_699_913_600,
+                          updated_at: worktreeUpdatedAt - 86_400,
                         },
                       ]),
                 ],
