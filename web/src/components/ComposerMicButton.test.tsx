@@ -270,6 +270,73 @@ describe("ComposerMicButton", () => {
     expect(showToastMock).not.toHaveBeenCalled();
   });
 
+  it("does not leave the mic silently dead when the recognizer never responds to start", async () => {
+    vi.useFakeTimers();
+    try {
+      render(<ComposerMicButton onTranscript={vi.fn()} />);
+      const button = screen.getByRole("button", { name: "Voice dictation" });
+
+      fireEvent.click(button);
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      fireEvent.click(button);
+
+      expect(
+        { toasts: showToastMock.mock.calls, startCalls: startSpy.mock.calls.length },
+        "a silent recognizer must yield an error toast or let the next tap retry",
+      ).not.toEqual({ toasts: [], startCalls: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports a recognizer that never responds to start and lets the next tap retry", async () => {
+    vi.useFakeTimers();
+    try {
+      render(<ComposerMicButton onTranscript={vi.fn()} />);
+      const button = screen.getByRole("button", { name: "Voice dictation" });
+
+      fireEvent.click(button);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(9_999);
+      });
+      expect(showToastMock).not.toHaveBeenCalled();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+
+      expect(stopSpy).toHaveBeenCalledTimes(1);
+      expect(showToastMock).toHaveBeenCalledWith("Voice input didn't start. Please try again.");
+      expect(button).toHaveAttribute("aria-pressed", "false");
+      fireEvent.click(button);
+      expect(startSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a take whose recognizer reports start", async () => {
+    vi.useFakeTimers();
+    try {
+      render(<ComposerMicButton onTranscript={vi.fn()} />);
+      const button = screen.getByRole("button", { name: "Voice dictation" });
+
+      fireEvent.click(button);
+      act(() => handlers.start?.({}));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+
+      expect(stopSpy).not.toHaveBeenCalled();
+      expect(showToastMock).not.toHaveBeenCalled();
+      expect(button).toHaveAttribute("aria-pressed", "true");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("shows the dictation chord in its tooltip only while the hotkey is enabled", async () => {
     const { unmount } = render(<ComposerMicButton onTranscript={vi.fn()} enableHotkey />);
     const tooltip = await hoverMicTooltip(screen.getByRole("button", { name: "Voice dictation" }));
@@ -875,6 +942,32 @@ describe("ComposerMicButton (server dictation)", () => {
     await clickMic(); // next take
     expect(startSpy).toHaveBeenCalledTimes(2);
     expect(sessionStartMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back when the recognizer never responds to start", async () => {
+    vi.useFakeTimers();
+    try {
+      render(
+        <CapabilitiesContext.Provider value={DICTATION_INFO}>
+          <ComposerMicButton onTranscript={vi.fn()} />
+        </CapabilitiesContext.Provider>,
+      );
+      const button = screen.getByRole("button", { name: "Voice dictation" });
+
+      fireEvent.click(button);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10_000);
+      });
+
+      expect(stopSpy).toHaveBeenCalledTimes(1);
+      expect(sessionStartMock).toHaveBeenCalledTimes(1);
+      expect(showToastMock).not.toHaveBeenCalled();
+      expect(button).toHaveAttribute("aria-pressed", "true");
+      act(() => handlers.end?.({}));
+      expect(button).toHaveAttribute("aria-pressed", "true");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reports a busy server distinctly from a broken one", async () => {

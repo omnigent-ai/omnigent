@@ -76,6 +76,9 @@ const WEB_SPEECH_IDLE_LIMIT_MS = 60_000;
 // rather than hearing silence; this many in a row ends the take with an error.
 const WEB_SPEECH_QUICK_END_MS = 1_000;
 const WEB_SPEECH_MAX_QUICK_ENDS = 3;
+// A recognizer still silent this long after start() is treated as hung, so the
+// take falls back or fails visibly instead of swallowing every later click.
+const WEB_SPEECH_START_TIMEOUT_MS = 10_000;
 
 export interface ComposerMicButtonProps {
   onTranscript: (text: string) => void;
@@ -183,6 +186,7 @@ export const ComposerMicButton = ({
   // Prevents rapid double-clicks from calling recognition.start() twice,
   // which throws InvalidStateError in Chrome.
   const transitionRef = useRef(false);
+  const startTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   // Server-take guard, deliberately separate from transitionRef: a failed
   // Web Speech attempt fires a late "end" event that resets transitionRef,
   // which must not unlock a second server take mid-handshake.
@@ -229,10 +233,15 @@ export const ComposerMicButton = ({
     // fallen back to the server; those stale events must not clobber the
     // server session's isListening/transition state.
     const serverTakeOwnsState = () => sessionRef.current !== null || serverBusyRef.current;
+    // Any recognizer event answers the pending click.
+    const settleClick = () => {
+      transitionRef.current = false;
+      clearTimeout(startTimeoutRef.current);
+    };
 
     const handleStart = () => {
       if (serverTakeOwnsState()) return;
-      transitionRef.current = false;
+      settleClick();
       const take = webSpeechTakeRef.current;
       // No take: the user stopped while a restart was starting; end follows.
       if (!take) return;
@@ -279,14 +288,14 @@ export const ComposerMicButton = ({
     };
     const handleEnd = () => {
       if (serverTakeOwnsState()) return;
-      transitionRef.current = false;
+      settleClick();
       if (restartTake()) return;
       webSpeechTakeRef.current = null;
       setIsListening(false);
     };
     const handleError = (event: Event) => {
       if (serverTakeOwnsState()) return;
-      transitionRef.current = false;
+      settleClick();
       const err = (event as SpeechRecognitionErrorEventLike).error;
       // "no-speech" is the browser's silence timeout: the end event that
       // follows restarts a live take. Any other error ends it.
@@ -340,6 +349,7 @@ export const ComposerMicButton = ({
       recognition.removeEventListener("end", handleEnd);
       recognition.removeEventListener("error", handleError);
       recognition.removeEventListener("result", handleResult);
+      clearTimeout(startTimeoutRef.current);
       webSpeechTakeRef.current = null;
       recognition.stop();
       recognitionRef.current = null;
@@ -569,6 +579,17 @@ export const ComposerMicButton = ({
           started: false,
         };
         recognition.start();
+        startTimeoutRef.current = setTimeout(() => {
+          webSpeechTakeRef.current = null;
+          transitionRef.current = false;
+          try {
+            recognition.stop();
+          } catch {
+            // A hung recognizer may reject stop(); the take is already dropped.
+          }
+          if (serverAvailableRef.current && !disabledRef.current) void toggleServerRef.current();
+          else reportError("Voice input didn't start. Please try again.");
+        }, WEB_SPEECH_START_TIMEOUT_MS);
       }
     } catch {
       // InvalidStateError from a double-call — drop the guard so the
@@ -584,6 +605,7 @@ export const ComposerMicButton = ({
     systemDictation,
     startMacDictation,
     toggleServer,
+    reportError,
   ]);
 
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
