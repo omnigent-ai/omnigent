@@ -10,6 +10,7 @@ startup-defect code. These are fast, layer-local guards for that split.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -345,11 +346,15 @@ def test_claude_early_exit_surfaces_classified_diagnosis(
     monkeypatch.setattr(instance, "last_exit_text", lambda: "Not logged in · Please run /login")
 
     payload = _native_terminal_start_error_payload(
-        TerminalExitedDuringLaunch(instance), "Claude", session_id="conv_1"
+        TerminalExitedDuringLaunch(instance),
+        "Claude",
+        session_id="conv_1",
+        fallback_diagnosis=launch_failure._LOGIN_SESSION_LOST,
     )
 
     message = payload["message"]
     assert "Agent isn't signed in" in message
+    assert "login session" not in message
     assert "no valid credentials" in message
     assert "/login" in message
     assert "Native Claude terminal failed to start" not in message
@@ -428,20 +433,40 @@ def test_claude_early_exit_output_gated_when_capture_disabled(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ensure", [False, True], ids=["startup", "reattach"])
+@pytest.mark.parametrize(
+    ("pane_text", "expected", "probe_calls"),
+    [
+        (None, "The host lost its macOS login session: ", 1),
+        ("Not logged in · Please run /login", "Agent isn't signed in: ", 0),
+    ],
+    ids=["withheld-output", "classified-output"],
+)
 async def test_launch_exit_probes_for_a_lost_login_session_off_the_event_loop(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ensure: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ensure: bool,
+    pane_text: str | None,
+    expected: str,
+    probe_calls: int,
 ) -> None:
-    """Both launch paths name a lost login session found by a probe off the event loop."""
-    probe_threads: list[int] = []
+    """Only unclassified launch exits are probed, off the event loop and outside ensure's lock."""
+    ensure_locks: dict[str, asyncio.Lock] = {}
+    probes: list[tuple[int, bool]] = []
 
     def _probe() -> launch_failure.FailureDiagnosis:
-        probe_threads.append(threading.get_ident())
+        probes.append((threading.get_ident(), ensure_locks["conv_1"].locked()))
         return launch_failure._LOGIN_SESSION_LOST
 
-    async def _exit_during_launch(*_args: object, **_kwargs: object) -> None:
-        raise _claude_exited_during_launch(tmp_path)
+    exc = _claude_exited_during_launch(tmp_path)
 
-    monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    async def _exit_during_launch(*_args: object, **_kwargs: object) -> None:
+        raise exc
+
+    if pane_text is None:
+        monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
+        monkeypatch.setattr(exc.instance, "last_exit_text", lambda: pane_text)
     monkeypatch.setattr(launch_failure, "diagnose_lost_login_session", _probe)
     monkeypatch.setattr(orchestration, "_auto_create_claude_terminal", _exit_during_launch)
     events: list[dict] = []
@@ -456,16 +481,20 @@ async def test_launch_exit_probes_for_a_lost_login_session_off_the_event_loop(
     )
 
     if ensure:
-        response = await _ensure_native_terminal("claude", ctx, ensure_locks={})
+        response = await _ensure_native_terminal("claude", ctx, ensure_locks=ensure_locks)
         assert response is not None
         error = json.loads(response.body)["error"]
     else:
-        assert await _launch_native_terminal("claude-native", ctx, ensure_locks={}) is False
+        launched = await _launch_native_terminal("claude-native", ctx, ensure_locks=ensure_locks)
+        assert launched is False
         error = next(event["error"] for event in events if event.get("status") == "failed")
 
-    assert error["message"].startswith("The host lost its macOS login session: ")
-    assert len(probe_threads) == 1
-    assert probe_threads[0] != threading.get_ident()
+    assert error["message"].startswith(expected), error["message"]
+    assert len(probes) == probe_calls
+    for probe_thread, lock_held in probes:
+        assert probe_thread != threading.get_ident()
+        if ensure:
+            assert not lock_held
 
 
 def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:

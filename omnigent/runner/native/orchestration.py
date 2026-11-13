@@ -8545,6 +8545,25 @@ def _native_terminal_configuration_message(exc: BaseException) -> str | None:
     return None
 
 
+def _classify_launch_exit(
+    instance: TerminalInstance,
+) -> tuple[str | None, FailureDiagnosis | None]:
+    """Return a launch exit's permitted output and the known failure it shows, if any."""
+    output: str | None = None
+    diagnosis = None
+    # A failed diagnostic read must not hide the known terminal-exit cause.
+    with contextlib.suppress(Exception):
+        from omnigent.runner.launch_failure import classify_terminal_failure
+
+        output = _startup_terminal_output(instance)
+        diagnosis = classify_terminal_failure(
+            command=instance.command,
+            exit_status=instance.last_exit_status(),
+            output=output,
+        )
+    return output, diagnosis
+
+
 def _native_terminal_start_error_payload(
     exc: BaseException,
     runtime_name: str,
@@ -8658,20 +8677,8 @@ def _native_terminal_start_error_payload(
     from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
     if isinstance(exc, TerminalExitedDuringLaunch):
-        # The exit status and captured output ride on the exception for every
-        # runtime. A failed diagnostic read must not hide the known
-        # terminal-exit cause.
-        output: str | None = None
-        diagnosis = None
-        with contextlib.suppress(Exception):
-            from omnigent.runner.launch_failure import classify_terminal_failure
-
-            output = _startup_terminal_output(exc.instance)
-            diagnosis = classify_terminal_failure(
-                command=exc.instance.command,
-                exit_status=exc.instance.last_exit_status(),
-                output=output,
-            )
+        # The exit status and captured output ride on the exception for every runtime.
+        output, diagnosis = _classify_launch_exit(exc.instance)
         if diagnosis is None:
             diagnosis = fallback_diagnosis
         if diagnosis is not None:
@@ -8741,11 +8748,13 @@ def _native_terminal_start_failure_context(exc: BaseException, error_id: str) ->
 
 
 async def _launch_exit_fallback_diagnosis(exc: BaseException) -> FailureDiagnosis | None:
-    """Probe a launch exit for a lost macOS login session off the event loop."""
+    """Probe an unclassified launch exit for a lost macOS login session off the event loop."""
     from omnigent.runner.launch_failure import diagnose_lost_login_session
     from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
     if not isinstance(exc, TerminalExitedDuringLaunch):
+        return None
+    if _classify_launch_exit(exc.instance)[1] is not None:
         return None
     with contextlib.suppress(Exception):
         return await asyncio.to_thread(diagnose_lost_login_session)
@@ -11136,13 +11145,15 @@ async def _ensure_native_terminal(
                         error_impact=ErrorImpact.BLOCKING.value,
                     ),
                 )
-            return _native_terminal_start_error_response(
-                exc,
-                agent.display_name,
-                session_id=ctx.session_id,
-                fallback_diagnosis=await _launch_exit_fallback_diagnosis(exc),
-            )
-        return respond(view)
+            launch_error = exc
+        else:
+            return respond(view)
+    return _native_terminal_start_error_response(
+        launch_error,
+        agent.display_name,
+        session_id=ctx.session_id,
+        fallback_diagnosis=await _launch_exit_fallback_diagnosis(launch_error),
+    )
 
 
 async def _claude_native_session_wants_rebuild(

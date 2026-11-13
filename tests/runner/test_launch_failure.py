@@ -176,6 +176,7 @@ def test_classifies_lost_macos_login_session(monkeypatch: pytest.MonkeyPatch) ->
     assert diagnosis.title == "The host lost its macOS login session"
     assert diagnosis.remediation is not None
     assert "host stop" in diagnosis.remediation
+    assert "host --background" in diagnosis.remediation
     assert "host enable" in diagnosis.remediation
 
 
@@ -206,7 +207,15 @@ def test_unknown_user_outside_macos_is_not_a_lost_login_session(
 def test_lost_login_session_probe_looks_up_the_user_in_a_child(
     monkeypatch: pytest.MonkeyPatch, platform: str, user_lookup: str, expected_title: str | None
 ) -> None:
+    children: list[object] = []
+    run_child = launch_failure.subprocess.run
+
+    def _spy_run(*args: object, **kwargs: object) -> object:
+        children.append(args)
+        return run_child(*args, **kwargs)
+
     monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(launch_failure.subprocess, "run", _spy_run)
     monkeypatch.setattr(
         launch_failure, "_USER_LOOKUP_PROBE", user_lookup + launch_failure._USER_LOOKUP_PROBE
     )
@@ -214,6 +223,7 @@ def test_lost_login_session_probe_looks_up_the_user_in_a_child(
     diagnosis = launch_failure.diagnose_lost_login_session()
 
     assert (diagnosis.title if diagnosis else None) == expected_title
+    assert len(children) == (1 if platform == "darwin" else 0)
 
 
 @pytest.mark.parametrize(
