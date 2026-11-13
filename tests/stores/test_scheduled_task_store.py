@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.scheduled.schedule import next_scheduled_time
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
@@ -57,6 +58,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         model_override="claude-opus-4-7",
         reasoning_effort="high",
         permission_mode="acceptEdits",
+        mcp_services=("github", "linear"),
         session_mode="continue",
         session_id=_uid("conv_abc"),
         workspace="/home/alice/repo",
@@ -76,6 +78,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
     assert task.permission_mode == "acceptEdits"
+    assert task.mcp_services == ("github", "linear")
     assert task.session_mode == "continue"
     assert task.session_id == _uid("conv_abc")
     assert task.workspace == "/home/alice/repo"
@@ -871,6 +874,85 @@ def test_update_omitting_overrides_leaves_them_unchanged(
     assert updated.model_override == "opus"
     assert updated.reasoning_effort == "high"
     assert updated.permission_mode == "acceptEdits"
+
+
+def test_update_mcp_services_replaces_clears_and_keeps(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A tuple replaces the services, ``()`` clears them, and omission keeps them."""
+    store.create(
+        scheduled_task_id=_uid("st_mcp"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        mcp_services=("github",),
+    )
+    kept = store.update(_uid("st_mcp"), name="renamed")
+    assert kept is not None
+    assert kept.mcp_services == ("github",)
+    replaced = store.update(_uid("st_mcp"), mcp_services=("slack", "linear"))
+    assert replaced is not None
+    assert replaced.mcp_services == ("slack", "linear")
+    cleared = store.update(_uid("st_mcp"), mcp_services=())
+    assert cleared is not None
+    assert cleared.mcp_services == ()
+    fetched = store.get(_uid("st_mcp"))
+    assert fetched is not None
+    assert fetched.mcp_services == ()
+
+
+def test_mcp_services_longer_than_the_column_are_rejected_on_every_write(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """SQLite does not enforce VARCHAR widths, so the store checks the encoded length."""
+    fits = ("x" * 4092,)  # JSON-encodes to exactly 4,096 characters
+    too_long = ("x" * 4093,)
+    common = {
+        "name": "n",
+        "prompt": "p",
+        "rrule": "FREQ=MINUTELY",
+        "user_id": "u",
+        "agent_id": _uid("ag"),
+        "timezone": "UTC",
+    }
+    created = store.create(scheduled_task_id=_uid("st_mcp_fit"), mcp_services=fits, **common)
+    assert created.mcp_services == fits
+    with pytest.raises(OmnigentError, match="Too many MCP services"):
+        store.create(scheduled_task_id=_uid("st_mcp_long"), mcp_services=too_long, **common)
+    assert store.get(_uid("st_mcp_long")) is None
+    with pytest.raises(OmnigentError, match="Too many MCP services"):
+        store.update(_uid("st_mcp_fit"), mcp_services=too_long)
+    kept = store.get(_uid("st_mcp_fit"))
+    assert kept is not None
+    assert kept.mcp_services == fits
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ({"agent_id": _uid("ag_b")}, {"mcp_services": ("github",)}),
+        ({"mcp_services": ("github",)}, {"agent_id": _uid("ag_b")}),
+    ],
+    ids=["agent-then-services", "services-then-agent"],
+)
+def test_update_from_a_stale_snapshot_conflicts_on_agent_or_mcp_changes(
+    store: SqlAlchemyScheduledTaskStore, first: dict[str, Any], second: dict[str, Any]
+) -> None:
+    """Services are validated against an agent, so neither may change under the other."""
+    snapshot = _session_task(store, "st_stale_mcp")
+    applied = store.update(snapshot.id, expected_schedule=snapshot, **first)
+    assert applied is not None
+
+    with pytest.raises(OmnigentError, match="Reload and try again") as raised:
+        store.update(snapshot.id, expected_schedule=snapshot, **second)
+
+    assert raised.value.code == ErrorCode.CONFLICT
+    saved = store.get(snapshot.id)
+    assert saved is not None
+    assert (saved.agent_id, saved.mcp_services) == (applied.agent_id, applied.mcp_services)
 
 
 def test_update_last_run_conversation_id_can_be_cleared_to_null(
@@ -2438,6 +2520,7 @@ def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
         ("model_override", "claude-opus"),
         ("reasoning_effort", "high"),
         ("permission_mode", "acceptEdits"),
+        ("mcp_services", ("github",)),
         ("project_id", _uid("proj")),
     ):
         edited = _session_task(store, f"st_adopt_edit_{name}", session_mode="continue")

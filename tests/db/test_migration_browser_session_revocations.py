@@ -24,7 +24,7 @@ from omnigent.db.utils import (
 )
 
 _TABLE = "browser_session_revocations"
-_PREVIOUS_HEAD = "a7d4c2e9f610"
+_PREVIOUS_HEAD = "27d16059fab9"
 # Past the 32-bit signed limit (2038-01-19), e.g. a login plus a long lifetime.
 _BEYOND_INT32 = 2**31 + 3600
 

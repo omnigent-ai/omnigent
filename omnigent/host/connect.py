@@ -76,6 +76,7 @@ from omnigent.host.frames import (
     RUNNER_LOG_TAIL_HEADING,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -140,6 +141,7 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
+    HostWorkspaceCallFrame,
     ImportSessionChunkingUnsupportedError,
     decode_host_frame,
     encode_host_frame,
@@ -148,6 +150,7 @@ from omnigent.host.frames import (
     parse_server_capabilities,
     workspace_missing_message,
 )
+from omnigent.host.git_clone import clone_repository
 from omnigent.host.git_worktree import (
     WorktreeError,
     create_worktree,
@@ -249,10 +252,27 @@ from omnigent.util.tunnel_limits import (
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
+    from omnigent.host.workspace_service import WorkspaceSocket
     from omnigent.workspace_fs import WorkspaceReader
 
 # Workspaces whose fs reader (and change registry) stay warm between requests.
 _FS_READER_CACHE_SIZE = 8
+
+
+def _workspace_direct_access_enabled() -> bool:
+    """Whether ``OMNIGENT_FEATURES`` turns on the host's workspace socket.
+
+    An unreadable feature list leaves the optional socket off rather than
+    stopping the host.
+    """
+    from omnigent.server.feature_flags import Feature, resolve_feature_flags
+
+    try:
+        return resolve_feature_flags().enabled(Feature.WORKSPACE_DIRECT_ACCESS)
+    except ValueError:
+        _logger.warning("OMNIGENT_FEATURES is invalid; workspace direct access is off")
+        return False
+
 
 # Older servers omit a create's timeout_s and wait 150 s for its reply; finish inside that.
 _LEGACY_SERVER_CREATE_BUDGET_S = 140.0
@@ -811,10 +831,11 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_HARNESS_STDERR_ENABLED",
         # Runner release flags must survive CLI -> daemon -> runner.
         "OMNIGENT_FEATURES",
-        # Idle-reap windows the runner reads at boot (``0`` disables reaping).
-        # Numeric tuning knobs, not secrets.
+        # Idle-reap windows and the human-wait hold the runner reads at boot
+        # (``0`` disables each). Numeric tuning knobs, not secrets.
         "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
         "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
+        "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S",
         # Opaque request-routing headers (dev/test): a JSON header map folded by
         # cli_auth.databricks_request_headers into every client→server connection
         # so a request pins to a specific server instance/replica. Must reach the
@@ -851,6 +872,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
+        # Keep the native-terminal idle-poll backoff kill switch (a non-secret
+        # boolean) readable by spawned runners, where the watcher reads it.
+        "OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
@@ -1106,15 +1130,6 @@ def _write_runner_inference_config(session_id: str, inference_config: dict[str, 
         with contextlib.suppress(FileNotFoundError):
             os.unlink(temp_name)
     return path
-
-
-def _is_utf8_encodable(text: str) -> bool:
-    """Return whether ``text`` has no surrogate-escaped bytes, so it encodes as UTF-8."""
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
 
 
 def _paginate_list_dir(
@@ -1490,6 +1505,8 @@ class HostProcess:
         # instead of waiting out the ~90s keepalive timeout. See run() /
         # _on_resume_from_suspend.
         self._suspend_task: asyncio.Task[None] | None = None
+        # The owner-only workspace API socket, when workspace_direct_access is on.
+        self._workspace_socket: WorkspaceSocket | None = None
         # Set by _on_resume_from_suspend when it aborts a live tunnel after a
         # detected resume; read+cleared in run()'s reconnect handler to force a
         # prompt reconnect (skip the backoff).
@@ -3203,9 +3220,11 @@ class HostProcess:
         # Walk every entry, classifying by target type. Per-entry
         # OSError → skip (e.g. dangling symlink) so the listing
         # surfaces real entries instead of failing wholesale.
+        from omnigent.workspace_fs import is_utf8_encodable
+
         entries: list[HostListDirEntry] = []
         for de in scanned:
-            if not _is_utf8_encodable(de.path):
+            if not is_utf8_encodable(de.path):
                 # A name that isn't valid UTF-8 comes back surrogate-escaped; it
                 # can't be sent as JSON or reopened by path, so skip it too.
                 continue
@@ -3823,6 +3842,44 @@ class HostProcess:
             ],
         )
 
+    async def _start_workspace_socket(self) -> WorkspaceSocket | None:
+        """Open the direct workspace socket when enabled and installed, else ``None``."""
+        if not _workspace_direct_access_enabled():
+            return None
+        try:
+            from omnigent.host.workspace_service import start_workspace_socket
+        except ImportError:
+            _logger.warning(
+                "workspace_direct_access needs `omnigent[workspace-api]`; direct access is off"
+            )
+            return None
+        return await start_workspace_socket(self._workspace_reader, host_id=self._identity.host_id)
+
+    def _workspace_reader(self, workspace: str) -> WorkspaceReader:
+        """Return the cached reader for an existing workspace directory.
+
+        Shared by tunnel fs requests and the direct workspace socket, so both
+        reuse one reader (and its change registry) per workspace. Blocking:
+        call it from a worker thread.
+
+        :param workspace: Expanded workspace path, e.g. ``"/home/me/project"``.
+        :returns: The workspace's reader.
+        """
+        from omnigent.runtime.filesystem_registry import detect_git_root
+        from omnigent.workspace_fs import WorkspaceReader
+
+        # A workspace can gain or lose its .git while the host is running.
+        repo_root = detect_git_root(Path(workspace))
+        with self._fs_readers_lock:
+            cached = self._fs_readers.get(workspace)
+            if cached is None or cached[0] != repo_root:
+                cached = (repo_root, WorkspaceReader(Path(workspace)))
+                self._fs_readers[workspace] = cached
+                while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
+                    self._fs_readers.popitem(last=False)
+            self._fs_readers.move_to_end(workspace)
+            return cached[1]
+
     def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
         """Serve a read-only workspace filesystem request from the host.
 
@@ -3840,12 +3897,7 @@ class HostProcess:
         """
         from pathlib import Path
 
-        from omnigent.runtime.filesystem_registry import detect_git_root
-        from omnigent.workspace_fs import (
-            WorkspaceReader,
-            WorkspaceReaderError,
-            read_repository_branches,
-        )
+        from omnigent.workspace_fs import WorkspaceReaderError, read_repository_branches
 
         try:
             expanded = os.path.expanduser(frame.workspace)
@@ -3879,17 +3931,7 @@ class HostProcess:
                     Path(expanded), cast("list[dict[str, str]]", params["repositories"])
                 )
             else:
-                # A workspace can gain or lose its .git while the host is running.
-                repo_root = detect_git_root(Path(expanded))
-                with self._fs_readers_lock:
-                    cached = self._fs_readers.get(expanded)
-                    if cached is None or cached[0] != repo_root:
-                        cached = (repo_root, WorkspaceReader(Path(expanded)))
-                        self._fs_readers[expanded] = cached
-                        while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
-                            self._fs_readers.popitem(last=False)
-                    self._fs_readers.move_to_end(expanded)
-                    reader = cached[1]
+                reader = self._workspace_reader(expanded)
                 with pr_resource.server_tracking(
                     params.get("server_tracked"), params.get("default_pr_url")
                 ):
@@ -5066,6 +5108,7 @@ class HostProcess:
         self._suspend_task = asyncio.create_task(
             watch_for_resume(self._on_resume_from_suspend), name="host-suspend-watch"
         )
+        self._workspace_socket = await self._start_workspace_socket()
         # Warm the runner zygote now: start() blocks on its one-time import
         # of the runner graph (~1-2s), which otherwise lands inside the first
         # session launch of the daemon's life. Best-effort — a failure
@@ -5278,6 +5321,9 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._suspend_task
                 self._suspend_task = None
+            if self._workspace_socket is not None:
+                await self._workspace_socket.stop()
+                self._workspace_socket = None
             if self._lifecycle_task is not None:
                 self._lifecycle_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -5395,10 +5441,16 @@ class HostProcess:
         # (no OpenSSL default cert path), which fails handshake verification.
         # ``ssl=None`` for ws:// is the library default (no TLS).
         ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
+        # websockets adds its own User-Agent on top of additional_headers; send only ours.
+        ws_headers = dict(headers)
+        from omnigent.telemetry.request_headers import pop_client_user_agent
+
+        user_agent = pop_client_user_agent(ws_headers)
         try:
             ws_cm = websockets.asyncio.client.connect(
                 url,
-                additional_headers=headers,
+                additional_headers=ws_headers,
+                user_agent_header=user_agent,
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
                 open_timeout=(
@@ -5725,6 +5777,8 @@ class HostProcess:
             installation_id=_tel_install_id,
             capabilities=list(HOST_CAPABILITIES),
             connection_id=connection_id,
+            workspace_socket=str(listener.path) if (listener := self._workspace_socket) else None,
+            workspace_token_key=listener.token_key if listener else None,
         )
         try:
             encoded_hello = self._encode_frame(hello)
@@ -6050,6 +6104,13 @@ class HostProcess:
         elif isinstance(frame, HostCreateDirFrame):
             create_dir_result = await asyncio.to_thread(self._handle_create_dir, frame)
             await self._send_text(ws, self._encode_frame(create_dir_result))
+        elif isinstance(frame, HostCloneRepositoryFrame):
+            # git runs for minutes; the owned-subprocess guard keeps the orphan
+            # reaper from collecting its exit status.
+            clone_result = await self._run_host_subprocess_in_thread(
+                lambda: clone_repository(frame)
+            )
+            await self._send_text(ws, self._encode_frame(clone_result))
         elif isinstance(frame, HostInstallHarnessFrame):
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
@@ -6117,6 +6178,12 @@ class HostProcess:
             )
         elif isinstance(frame, HostListWorktreesFrame):
             await self._send_text(ws, self._encode_frame(await self._handle_list_worktrees(frame)))
+        elif isinstance(frame, HostWorkspaceCallFrame):
+            from omnigent.host.workspace_service import serve_tunnel_call
+
+            # Reply per message so a long ReadFile stays within the server's per-reply timeout.
+            async for reply in serve_tunnel_call(self._workspace_reader, frame):
+                await self._send_text(ws, self._encode_frame(reply))
         elif isinstance(frame, HostFsRequestFrame):
             # Git status and directory walks can block, so run the read
             # off the event loop and reply when it completes.
@@ -6280,8 +6347,11 @@ def run_host_process(
         to stderr first.
     """
     from omnigent.cli_auth import pin_databricks_org_id
+    from omnigent.telemetry.request_headers import set_client_component
     from omnigent.util.server_url import ServerUrl, is_workspace_hosted_url
 
+    # Foreground (`omnigent host`) and daemon hosts both identify as the host.
+    set_client_component("host")
     if is_workspace_hosted_url(server_url):
         # Foreground hosts need the same snapshot as auto-launched daemons.
         # Pinning absence prevents later login metadata retargeting runners.

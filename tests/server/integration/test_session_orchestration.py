@@ -911,6 +911,51 @@ async def test_same_host_still_requires_host_ownership(auth_client, auth_app, pe
     assert permissions.list_for_user("alice") == before_grants
 
 
+async def test_same_host_creation_from_runner_keeps_source_surface(
+    auth_client, auth_app, peers, db_uri, monkeypatch
+) -> None:
+    """A web session's runner creates a same_host session, which is labeled web."""
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from omnigent.telemetry.request_headers import client_user_agent
+    from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _, _ = peers
+    host_id = "b" * 32
+    _register_online_host(auth_app, host_id, "alice")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(source["id"], host_id, workspace="/tmp")
+    store.set_labels(source["id"], {CLIENT_SURFACE_LABEL_KEY: "web"})
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    # The runner's own tool call carries the component User-Agent.
+    auth_client.headers["User-Agent"] = client_user_agent().replace(
+        "omnigent-cli/", "omnigent-runner/"
+    )
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": source["agent_id"], "placement": "same_host"}),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    created = store.get_conversation(result["conversation_id"])
+    assert created is not None, result
+    assert created.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
+
+
 @pytest.mark.parametrize(
     "child_manager,move_before_recheck,policy_denied,source_viewers",
     [
@@ -1131,6 +1176,13 @@ async def _upload_codex_worker(auth_client, sub_agents=None, **config) -> str:
             ["--dangerously-bypass-approvals-and-sandbox"],
             id="spec-without-request",
         ),
+        pytest.param(
+            "child",
+            None,
+            {"permission_mode": "approve-for-me"},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="spec-permission-mode",
+        ),
     ],
 )
 async def test_created_session_launches_in_the_requested_permission_mode(
@@ -1321,6 +1373,72 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
         )
         grants, _ = SqlAlchemyPermissionStore(db_uri).list_for_session(session_id)
         assert [g.user_id for g in grants] == ["alice"]
+    finally:
+        release.set()
+        await auth_app.state.startup_inputs.shutdown()
+
+
+class _ListLabelSelection:
+    """A deployment that records the whole selection in one JSON label."""
+
+    def validate(self, request, services, *, spec, user_id):
+        if "revoked" in services:
+            from omnigent.errors import ErrorCode, OmnigentError
+
+            raise OmnigentError("revoked", code=ErrorCode.FORBIDDEN)
+        return tuple(services)
+
+    def session_labels(self, services):
+        return {"deployment.mcp_services": json.dumps(list(services))}
+
+    def selected_services(self, labels):
+        return tuple(json.loads(labels.get("deployment.mcp_services", "[]")))
+
+
+@pytest.mark.parametrize(
+    ("source_services", "inherited"),
+    [(["github", "slack"], '["github", "slack"]'), (["github", "revoked"], None), ([], None)],
+    ids=["inherits", "unusable-service", "no-selection"],
+)
+async def test_managed_worker_starts_with_the_source_mcp_services(
+    auth_client, auth_app, peers, db_uri, monkeypatch, source_services, inherited
+):
+    import asyncio
+
+    from omnigent.server.managed_hosts import parse_sandbox_config
+    from omnigent.server.routes.sessions import routes_core
+
+    source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    if source_services:
+        store.set_labels(source["id"], {"deployment.mcp_services": json.dumps(source_services)})
+    auth_app.state.session_mcp_selection = _ListLabelSelection()
+    auth_app.state.sandbox_config = parse_sandbox_config(
+        {"server_url": "https://managed-test.example.com", "providers": [{"provider": "modal"}]}
+    )
+    launched = asyncio.Event()
+    release = asyncio.Event()
+
+    async def launch(**kwargs):
+        launched.set()
+        await release.wait()
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    try:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": source["agent_id"], "placement": "managed", "message": "Go"}
+                ),
+                server_client=auth_client,
+                conversation_id=source["id"],
+            )
+        )
+        assert "error" not in result, result
+        await asyncio.wait_for(launched.wait(), timeout=2)
+        labels = store.get_conversation(result["conversation_id"]).labels
+        assert labels.get("deployment.mcp_services") == inherited
     finally:
         release.set()
         await auth_app.state.startup_inputs.shutdown()
