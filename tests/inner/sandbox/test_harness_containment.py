@@ -238,12 +238,12 @@ def test_relative_policy_cwd_preserves_non_claude_workspace(
     [
         (harness, feature)
         for harness in _HARNESSES
-        for feature in ("fork", "cwd_conflict", "egress_rules")
+        for feature in ("cwd_conflict", "egress_rules")
         if feature != "egress_rules" or harness != "codex"
     ],
 )
 def test_harness_rejects_policy_features_it_cannot_honor(
-    harness: str, feature: str, tmp_path: Path
+    harness: str, feature: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     executable = tmp_path / "bin" / "agent"
     executable.parent.mkdir()
@@ -259,12 +259,14 @@ def test_harness_rejects_policy_features_it_cannot_honor(
     )
     if feature == "cwd_conflict":
         spec.cwd = str(tmp_path / "another-workspace")
-    elif feature == "fork":
-        spec.fork = True
-    message = "egress_rules" if feature == "egress_rules" else r"does not support|conflicts"
+    launcher = Mock(side_effect=AssertionError("Unsupported policy reached launcher creation"))
+    monkeypatch.setattr(sandbox, "create_exec_launcher", launcher)
+    monkeypatch.setattr(codex_worker, "create_exec_launcher", launcher)
+    message = "egress_rules" if feature == "egress_rules" else "conflicts"
     with pytest.raises(ValueError, match=message):
         with _prepared_launch(harness, executable, workspace, spec):
             pytest.fail(f"{harness} silently ignored {feature}")
+    launcher.assert_not_called()
 
 
 @pytest.mark.parametrize("harness", ["copilot", "cursor", "hermes"])
