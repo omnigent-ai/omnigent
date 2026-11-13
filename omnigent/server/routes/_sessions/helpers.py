@@ -2655,7 +2655,7 @@ def _persist_external_model_options(
     Stores into :data:`_pushed_model_options_cache` (which a browser reload
     does NOT clear — the extension only pushes on session start) and publishes
     ``session.model_options`` so open clients re-read the snapshot. An empty
-    list evicts the entry rather than caching nothing.
+    list is cached as an authoritative clear so host recovery cannot refill it.
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
@@ -2691,10 +2691,7 @@ def _persist_external_model_options(
                 "isDefault": bool(raw.get("isDefault", False)) if isinstance(raw, dict) else False,
             }
         )
-    if options:
-        _pushed_model_options_cache[session_id] = options
-    else:
-        _pushed_model_options_cache.pop(session_id, None)
+    _pushed_model_options_cache[session_id] = options
     _publish_model_options(session_id)
 
 
@@ -12834,7 +12831,7 @@ async def _load_model_options_from_host(
     if not options:
         return
     if harness == "pi-native":
-        # Do not clobber a catalog the extension pushed while we awaited.
+        # Respect a catalog or explicit clear the extension pushed while we awaited.
         _pushed_model_options_cache.setdefault(session_id, options)
         _publish_model_options(session_id)
         return

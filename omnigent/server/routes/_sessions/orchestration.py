@@ -14053,7 +14053,7 @@ async def _fetch_model_options(
         # The extension's live registry is authoritative, including models
         # authenticated through Pi's own login rather than Omnigent.
         pushed = _pushed_model_options_cache.get(session_id)
-        if pushed:
+        if pushed is not None:
             return pushed
         # After server restart, refill from the host so a paused session can
         # select a model before its extension wakes and pushes a fresh catalog.
