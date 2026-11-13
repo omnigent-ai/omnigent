@@ -4,6 +4,10 @@
 export const DATA_TABLE_MAX_ROWS = 1000;
 /** Characters of cell text the preview keeps, so wide rows can't exhaust memory. */
 export const DATA_TABLE_MAX_CHARS = 2_000_000;
+/** Columns the preview keeps; a row of delimiters can't widen every row past this. */
+export const DATA_TABLE_MAX_COLUMNS = 500;
+/** Cells the preview keeps, header and padding included, so a wide table keeps fewer rows. */
+export const DATA_TABLE_MAX_CELLS = 200_000;
 
 const DELIMITED_EXTENSIONS = new Set(["csv", "tsv"]);
 const CANDIDATE_DELIMITERS = [",", ";", "\t", "|"] as const;
@@ -16,6 +20,8 @@ export interface DataTable {
   rows: string[][];
   /** Data rows in the content, kept or not. */
   totalRows: number;
+  /** Fields in the content's widest row, kept or not. */
+  totalColumns: number;
   columnTypes: DataColumnType[];
   delimiter: string;
   /** How the bytes were decoded, e.g. "utf-8" or "windows-1252". */
@@ -89,6 +95,8 @@ export function detectDelimiter(text: string, path: string): string {
     const { records } = parseRecords(text, delimiter, {
       keepRecords: SNIFF_RECORDS,
       scanRecords: SNIFF_RECORDS,
+      keepFields: DATA_TABLE_MAX_COLUMNS,
+      keepChars: DATA_TABLE_MAX_CHARS,
     });
     const tally = new Map<number, number>();
     for (const fields of records) tally.set(fields.length, (tally.get(fields.length) ?? 0) + 1);
@@ -117,7 +125,8 @@ export function detectDelimiter(text: string, path: string): string {
  * Records are counted up to *scanRecords*. The first *keepRecords* are kept
  * while their field text fits in *keepChars*; the first record that doesn't
  * ends keeping, so the kept records are always a prefix. The first record is
- * kept whatever its size.
+ * kept, its text cut at *keepChars*. Each kept record keeps at most
+ * *keepFields* fields; *widest* counts every field of the kept records.
  */
 function parseRecords(
   text: string,
@@ -126,11 +135,17 @@ function parseRecords(
     keepRecords,
     keepChars = Number.POSITIVE_INFINITY,
     scanRecords = Number.POSITIVE_INFINITY,
-  }: { keepRecords: number; keepChars?: number; scanRecords?: number },
-): { records: string[][]; count: number } {
+    keepFields = Number.POSITIVE_INFINITY,
+  }: { keepRecords: number; keepChars?: number; scanRecords?: number; keepFields?: number },
+): { records: string[][]; count: number; widest: number } {
   const records: string[][] = [];
   let count = 0;
+  let widest = 0;
+  let fieldCount = 0;
   let keptChars = 0;
+  // Text of the current record's kept fields, and whether some was left out for the budget.
+  let recordChars = 0;
+  let recordOverflowed = false;
   // Past the kept records, fields are only counted, never built.
   let keeping = keepRecords > 0;
   let fields: string[] = [];
@@ -138,17 +153,29 @@ function parseRecords(
   let fieldHasChars = false;
   let inQuotes = false;
   let recordHasContent = false;
+  // Whether the field being read is kept: past *keepFields*, it is only counted.
+  const keepingField = () => keeping && fields.length < keepFields;
+  // Append to the field being read while the record's text fits what's left of the budget.
+  const append = (chars: string) => {
+    if (!keepingField()) return;
+    if (recordChars + field.length + chars.length > keepChars - keptChars) {
+      recordOverflowed = true;
+      return;
+    }
+    field += chars;
+  };
 
   const endRecord = () => {
     // A blank line, or the newline that ends the file, is not a record.
     if (recordHasContent || fieldHasChars) {
       count += 1;
       if (keeping) {
-        fields.push(field);
-        const size = fields.reduce((sum, value) => sum + value.length, 0);
-        if (records.length === 0 || keptChars + size <= keepChars) {
+        if (fields.length < keepFields) fields.push(field);
+        // The header is kept even cut short; any later record that overflows ends keeping.
+        if (records.length === 0 || !recordOverflowed) {
           records.push(fields);
-          keptChars += size;
+          keptChars += recordChars + field.length;
+          widest = Math.max(widest, fieldCount + 1);
           keeping = records.length < keepRecords;
         } else {
           keeping = false;
@@ -157,6 +184,9 @@ function parseRecords(
     }
     fields = [];
     field = "";
+    fieldCount = 0;
+    recordChars = 0;
+    recordOverflowed = false;
     fieldHasChars = false;
     recordHasContent = false;
   };
@@ -167,14 +197,14 @@ function parseRecords(
       if (char === '"') {
         if (text[i + 1] === '"') {
           fieldHasChars = true;
-          if (keeping) field += '"';
+          append('"');
           i += 1;
         } else {
           inQuotes = false;
         }
       } else {
         fieldHasChars = true;
-        if (keeping) field += char;
+        append(char);
       }
       continue;
     }
@@ -182,7 +212,11 @@ function parseRecords(
       inQuotes = true;
       recordHasContent = true;
     } else if (char === delimiter) {
-      if (keeping) fields.push(field);
+      if (keepingField()) {
+        fields.push(field);
+        recordChars += field.length;
+      }
+      fieldCount += 1;
       field = "";
       fieldHasChars = false;
       recordHasContent = true;
@@ -192,11 +226,11 @@ function parseRecords(
       if (count >= scanRecords) break;
     } else {
       fieldHasChars = true;
-      if (keeping) field += char;
+      append(char);
     }
   }
   if ((fieldHasChars || recordHasContent) && count < scanRecords) endRecord();
-  return { records, count };
+  return { records, count, widest };
 }
 
 const NUMBER_PATTERN = /^[-+]?(\d{1,3}(,\d{3})+|\d+)?(\.\d+)?([eE][-+]?\d+)?%?$/;
@@ -255,13 +289,16 @@ export function compareCells(a: string, b: string, type: DataColumnType): number
  */
 export function parseDataTable(text: string, path: string, encoding = "utf-8"): DataTable | null {
   const delimiter = detectDelimiter(text, path);
-  const { records, count } = parseRecords(text, delimiter, {
+  const { records, count, widest } = parseRecords(text, delimiter, {
     keepRecords: DATA_TABLE_MAX_ROWS + 1,
     keepChars: DATA_TABLE_MAX_CHARS,
+    keepFields: DATA_TABLE_MAX_COLUMNS,
   });
   if (records.length === 0) return null;
-  const [header, ...rows] = records;
-  const width = Math.max(header.length, ...rows.map((row) => row.length));
+  const [header, ...parsedRows] = records;
+  const width = Math.max(header.length, ...parsedRows.map((row) => row.length));
+  // Padding fills every kept row to the widest one, so wide tables keep fewer rows.
+  const rows = parsedRows.slice(0, Math.max(1, Math.floor(DATA_TABLE_MAX_CELLS / width) - 1));
   const columns = Array.from(
     { length: width },
     (_, index) => header[index] ?? `column ${index + 1}`,
@@ -273,6 +310,7 @@ export function parseDataTable(text: string, path: string, encoding = "utf-8"): 
     header: columns,
     rows: padded,
     totalRows: count - 1,
+    totalColumns: widest,
     columnTypes: columns.map((_, index) => inferColumnType(padded.map((row) => row[index]))),
     delimiter,
     encoding,

@@ -387,6 +387,11 @@ function PreviewWithSearch({
   // A table re-renders its rows on sort and filter without new content, so it
   // says when find must look again.
   const [tableRowsVersion, setTableRowsVersion] = useState(0);
+  // New content (even emptied, with no rows left to report) also invalidates find.
+  const tableSearchVersion = useMemo(
+    () => [content, tableRowsVersion],
+    [content, tableRowsVersion],
+  );
   const handleTableRowsChange = useCallback(
     () => setTableRowsVersion((version) => version + 1),
     [],
@@ -394,7 +399,7 @@ function PreviewWithSearch({
   const bar = (
     <PreviewSearchBar
       containerRef={previewRef}
-      contentVersion={kind === "table" ? tableRowsVersion : content}
+      contentVersion={kind === "table" ? tableSearchVersion : content}
       open={searchOpen}
       onClose={onSearchHandled}
       inputRef={searchInputRef}
