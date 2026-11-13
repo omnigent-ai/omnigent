@@ -597,6 +597,7 @@ _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 _TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
+_SETTINGS_BOUNDARY_FILE = "claude-settings-boundary.json"
 _CALLER_SETTINGS_MAX_BYTES = 1024 * 1024
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
@@ -3228,19 +3229,14 @@ def augment_claude_args(
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
     )
-    from omnigent.mcp_disabled_servers import apply_claude_settings
-
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
     if not defer_caller_settings:
         args, caller_settings = _pop_caller_settings(args, workspace=workspace)
         if caller_settings:
             hook_settings = _merge_caller_settings(hook_settings, caller_settings, bridge_dir)
-    hook_settings = apply_claude_settings(
-        hook_settings, executor="claude-native", active_harnesses=active_harnesses
-    )
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
-    _write_json_file(settings_path, hook_settings)
+    _write_invocation_settings(settings_path, hook_settings, active_harnesses=active_harnesses)
     from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
     if claude_code_managed_mcp_present():
@@ -3528,6 +3524,55 @@ def _pop_caller_settings(
     return kept, found
 
 
+def record_claude_settings_boundary(
+    bridge_dir: Path, args: list[str], *, claude_args_start: int
+) -> None:
+    """Record the framework-resolved Claude boundary without persisting argument values."""
+    _write_json_file(
+        bridge_dir / _SETTINGS_BOUNDARY_FILE,
+        {
+            "start": claude_args_start,
+            "digest": hashlib.sha256(json.dumps(args).encode()).hexdigest(),
+        },
+    )
+
+
+def _claude_settings_boundary(bridge_dir: Path, args: list[str]) -> int:
+    """Require a recorded launch boundary to match the actual terminal arguments."""
+    _ensure_secure_dir(bridge_dir)
+    try:
+        boundary = json.loads(
+            _read_caller_settings(bridge_dir / _SETTINGS_BOUNDARY_FILE, nofollow=True)
+        )
+    except FileNotFoundError:
+        return 0
+    if not isinstance(boundary, dict):
+        raise ValueError("Claude settings launch boundary is invalid")
+    start = boundary.get("start")
+    if (
+        type(start) is not int
+        or not 0 <= start <= len(args)
+        or boundary.get("digest") != hashlib.sha256(json.dumps(args).encode()).hexdigest()
+    ):
+        raise ValueError("Claude settings launch boundary does not match terminal arguments")
+    return start
+
+
+def _write_invocation_settings(
+    path: Path,
+    settings: dict[str, Any],
+    *,
+    active_harnesses: Collection[str] | None,
+) -> None:
+    """Apply saved MCP denials before persisting baseline or merged settings."""
+    from omnigent.mcp_disabled_servers import apply_claude_settings
+
+    settings = apply_claude_settings(
+        settings, executor="claude-native", active_harnesses=active_harnesses
+    )
+    _write_json_file(path, settings)
+
+
 async def finalize_claude_caller_settings(
     instance: TerminalInstance,
     *,
@@ -3540,9 +3585,8 @@ async def finalize_claude_caller_settings(
     existing helper under an active sandbox; unsandboxed panes use bounded reads.
     The separate framework baseline is opened without following a symlink.
     """
-    from omnigent.mcp_disabled_servers import apply_claude_settings
-
-    args = instance.args
+    start = await asyncio.to_thread(_claude_settings_boundary, bridge_dir, instance.args)
+    prefix, args = instance.args[:start], instance.args[start:]
     environment = instance.os_env
     if environment is None:
         raise ValueError("caller settings require the terminal filesystem environment")
@@ -3598,11 +3642,8 @@ async def finalize_claude_caller_settings(
         if not isinstance(baseline, dict):
             raise ValueError("required bridge settings are unavailable under the terminal policy")
         settings = _merge_caller_settings(baseline, callers, bridge_dir)
-        settings = apply_claude_settings(
-            settings, executor="claude-native", active_harnesses=active_harnesses
-        )
-        _write_json_file(settings_path, settings)
-    instance.args = kept
+        _write_invocation_settings(settings_path, settings, active_harnesses=active_harnesses)
+    instance.args = [*prefix, *kept]
 
 
 def _merge_caller_settings(
@@ -3657,6 +3698,13 @@ def _merge_caller_settings(
                     else:
                         permissions[name] = rules
                 merged[key] = permissions
+            elif (
+                key == "deniedMcpServers"
+                and index == len(callers)
+                and isinstance(value, list)
+                and isinstance(previous, list)
+            ):
+                merged[key] = [*previous, *(entry for entry in value if entry not in previous)]
             elif isinstance(value, dict) and isinstance(previous, dict):
                 merged[key] = {**previous, **value}
             else:

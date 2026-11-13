@@ -5018,7 +5018,7 @@ def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> Non
     assert disallowed == ["Bash", "Edit"]
 
 
-async def _finalize_test_claude_args(args, *, bridge_dir, os_env_spec):
+async def _finalize_test_claude_args(args, *, bridge_dir, os_env_spec, active_harnesses=None):
     from omnigent.inner.datamodel import TerminalEnvSpec
     from omnigent.inner.terminal import create_terminal_instance
 
@@ -5027,7 +5027,7 @@ async def _finalize_test_claude_args(args, *, bridge_dir, os_env_spec):
     )
     try:
         await claude_native_bridge.finalize_claude_caller_settings(
-            created.instance, bridge_dir=bridge_dir
+            created.instance, bridge_dir=bridge_dir, active_harnesses=active_harnesses
         )
         return created.instance.args
     finally:
@@ -5035,13 +5035,8 @@ async def _finalize_test_claude_args(args, *, bridge_dir, os_env_spec):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "relative_path,filesystem_mode",
-    [(False, "none"), (True, "none"), (True, "default"), (True, "fork")],
-    ids=["absolute", "workspace-relative", "default-policy", "forked-workspace"],
-)
 async def test_augment_claude_args_merges_caller_settings(
-    tmp_path: Path, relative_path: bool, filesystem_mode: str, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
     A caller ``--settings`` is merged into the invocation settings, not dropped.
@@ -5092,7 +5087,7 @@ async def test_augment_claude_args_merges_caller_settings(
             "--name",
             "seat-1",
             "--settings",
-            caller_file.name if relative_path else str(caller_file),
+            str(caller_file),
             "--settings=" + json.dumps(later),
         ),
         bridge_dir=bridge_dir,
@@ -5108,8 +5103,7 @@ async def test_augment_claude_args_merges_caller_settings(
         os_env_spec=OSEnvSpec(
             type="caller_process",
             cwd=str(tmp_path),
-            sandbox=None if filesystem_mode == "default" else OSEnvSandboxSpec(type="none"),
-            fork=filesystem_mode == "fork",
+            sandbox=OSEnvSandboxSpec(type="none"),
         ),
     )
 
@@ -5137,6 +5131,38 @@ async def test_augment_claude_args_merges_caller_settings(
     assert settings["statusLine"]["padding"] == 3
     for event, entries in baseline["hooks"].items():
         assert all(entry in settings["hooks"][event] for entry in entries)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filesystem_mode", ["none", "default", "fork"])
+async def test_caller_settings_resolve_terminal_workspace(
+    tmp_path: Path, filesystem_mode: str
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "settings.json").write_text('{"env":{"FROM_WORKSPACE":"yes","ORDER":"file"}}')
+    args = augment_claude_args(
+        ("--settings", "settings.json", '--settings={"env":{"ORDER":"inline"}}'),
+        bridge_dir=tmp_path,
+        defer_caller_settings=True,
+    )
+    args = await _finalize_test_claude_args(
+        args,
+        bridge_dir=tmp_path,
+        os_env_spec=OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=None if filesystem_mode == "default" else OSEnvSandboxSpec(type="none"),
+            fork=filesystem_mode == "fork",
+        ),
+    )
+    settings = _load_invocation_settings(args)
+    assert args.count("--settings") == 1
+    assert settings["env"]["FROM_WORKSPACE"] == "yes"
+    assert settings["env"]["ORDER"] == "inline"
+    assert settings["hooks"]["UserPromptSubmit"]
 
 
 def test_augment_claude_args_preserves_settings_like_option_values(tmp_path: Path) -> None:
@@ -5181,7 +5207,6 @@ def test_augment_claude_args_rejects_settings_that_disable_bridge_hooks(
         assert settings["hooks"]["UserPromptSubmit"]
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("contents", "inline"),
     [
@@ -5222,7 +5247,7 @@ def test_augment_claude_args_rejects_settings_that_disable_bridge_hooks(
         "fifo",
     ],
 )
-async def test_augment_claude_args_passes_unreadable_caller_settings_through(
+def test_pop_caller_settings_passes_unreadable_inputs_through(
     tmp_path: Path, contents: bytes | str | None, inline: bool
 ) -> None:
     """A ``--settings`` value that is not a readable JSON object is left to Claude."""
@@ -5233,24 +5258,13 @@ async def test_augment_claude_args_passes_unreadable_caller_settings_through(
         Path(missing).write_bytes(contents)
 
     value = contents.decode() if inline and isinstance(contents, bytes) else missing
-    args = augment_claude_args(
-        ("--settings", value), bridge_dir=tmp_path, defer_caller_settings=True
+    args, settings = claude_native_bridge._pop_caller_settings(
+        ["--settings", value],
+        workspace=tmp_path,
+        read_file=claude_native_bridge._read_caller_settings,
     )
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-
-    args = await _finalize_test_claude_args(
-        args,
-        bridge_dir=tmp_path,
-        os_env_spec=OSEnvSpec(
-            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
-        ),
-    )
-
-    assert args[:2] == ["--settings", value]
-    assert args.count("--settings") == 2
-    settings = _load_invocation_settings(args[2:])
-    assert "nested" not in settings
-    json.dumps(settings, allow_nan=False)
+    assert args == ["--settings", value]
+    assert settings == []
 
 
 @pytest.mark.asyncio
@@ -5338,7 +5352,14 @@ async def test_caller_settings_follow_terminal_filesystem_policy(
     original_read = claude_native_bridge._read_caller_settings
 
     def unexpected_runner_read(path: Path, *, nofollow: bool = False) -> str:
-        assert path == bridge_dir / "claude-settings.json" and nofollow
+        assert (
+            path
+            in {
+                bridge_dir / "claude-settings.json",
+                bridge_dir / "claude-settings-boundary.json",
+            }
+            and nofollow
+        )
         return original_read(path, nofollow=nofollow)
 
     monkeypatch.setattr(claude_native_bridge, "_read_caller_settings", unexpected_runner_read)
@@ -18384,9 +18405,12 @@ def test_read_tmux_target_rejects_invalid_payloads(tmp_path: Path) -> None:
     assert claude_native_bridge.read_tmux_target(bridge_dir) is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deferred", [False, True])
 @pytest.mark.parametrize("saved", [False, True])
 @pytest.mark.parametrize("active", [None, [], ["claude"]])
-def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved):
+async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved, deferred):
+    from omnigent.inner.datamodel import OSEnvSpec
     from tests._helpers.mcp_disabled_servers import launch_activation
 
     active = launch_activation(active)
@@ -18403,9 +18427,30 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
         "--model",
         "test-model",
         "--settings",
+        json.dumps({"deniedMcpServers": [{"serverName": "earlier-caller"}]}),
+        "--settings",
         json.dumps({"deniedMcpServers": [caller_denial]}),
     )
-    original_args = augment_claude_args(caller_args, bridge_dir=bridge_dir)
+
+    async def build_args(active_harnesses=None):
+        args = augment_claude_args(
+            caller_args,
+            bridge_dir=bridge_dir,
+            active_harnesses=active_harnesses,
+            defer_caller_settings=deferred,
+        )
+        if deferred:
+            args = await _finalize_test_claude_args(
+                args,
+                bridge_dir=bridge_dir,
+                active_harnesses=active_harnesses,
+                os_env_spec=OSEnvSpec(
+                    type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+                ),
+            )
+        return args
+
+    original_args = await build_args()
     settings_path = Path(original_args[original_args.index("--settings") + 1])
     original = settings_path.read_bytes()
     if saved:
@@ -18413,9 +18458,12 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
     with patch(
         "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
     ) as hook:
-        args = augment_claude_args(caller_args, bridge_dir=bridge_dir, active_harnesses=active)
-    hook.assert_called_once()
-    assert hook.call_args.kwargs == {"executor": "claude-native", "active_harnesses": active}
+        args = await build_args(active)
+    assert hook.call_count == (2 if deferred else 1)
+    assert all(
+        call.kwargs == {"executor": "claude-native", "active_harnesses": active}
+        for call in hook.call_args_list
+    )
     assert args == original_args
     if active and saved:
         assert json.loads(settings_path.read_bytes()) == {

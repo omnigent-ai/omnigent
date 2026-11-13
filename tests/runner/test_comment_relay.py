@@ -1906,13 +1906,16 @@ async def test_failed_launch_rolls_back_only_new_relay(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("disable_hooks", [False, True])
+@pytest.mark.parametrize(
+    "mode", ["plain", "disable-hooks", "wrapped", "delimiter", "mismatch", "unreadable"]
+)
 async def test_cli_caller_settings_finalize_under_terminal_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, disable_hooks: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     from omnigent.harnesses.claude_native.main import _claude_terminal_request
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
+    disable_hooks = mode == "disable-hooks"
     agent_id = "settings-agent"
     session_id = f"conv_{uuid.uuid4().hex[:12]}"
     spec = _spec_without_terminals()
@@ -1927,12 +1930,27 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
             {"env": {"ORDER": "file", "FROM_FILE": "yes"}, "disableAllHooks": disable_hooks}
         )
     )
+    if mode == "unreadable":
+        settings_file.write_text("{")
     monkeypatch.chdir(tmp_path)
+    if mode == "wrapped":
+        monkeypatch.setattr(
+            "omnigent.harnesses.claude_native.main.resolve_claude_launch",
+            lambda command, args: ("isaac", ["claude", "--", *args]),
+        )
+    caller_args = ("--settings", str(settings_file), '--settings={"env":{"ORDER":"inline"}}')
+    if mode == "delimiter":
+        caller_args = ("--", *caller_args)
     body = _claude_terminal_request(
-        ("--settings", str(settings_file), '--settings={"env":{"ORDER":"inline"}}'),
+        caller_args,
         command="claude",
         bridge_dir=bridge_dir,
     )
+    boundary = (bridge_dir / "claude-settings-boundary.json").read_text()
+    assert str(settings_file) not in boundary
+    assert "ORDER" not in boundary
+    if mode == "mismatch":
+        body["spec"]["args"].append("changed-after-preparation")
     # The CLI has not consumed files before the runner selects its policy.
     assert str(settings_file) in body["spec"]["args"]
     baseline = json.loads((bridge_dir / "claude-settings.json").read_text())
@@ -1974,7 +1992,7 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
             response = await client.post(
                 f"/v1/sessions/{session_id}/resources/terminals", json=body
             )
-            if disable_hooks:
+            if mode in {"disable-hooks", "mismatch"}:
                 assert response.status_code == 500, response.text
                 assert response.json()["error"]["code"] == "terminal_launch_failed"
                 assert not finalized
@@ -1982,11 +2000,21 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
             else:
                 assert response.status_code == 200, response.text
                 assert len(finalized) == 1
-                assert str(settings_file) not in finalized[0]
                 settings = json.loads((bridge_dir / "claude-settings.json").read_text())
-                assert settings["env"]["FROM_FILE"] == "yes"
-                assert settings["env"]["ORDER"] == "inline"
-                assert settings["hooks"] == baseline["hooks"]
+                if mode == "delimiter":
+                    assert finalized[0] == body["spec"]["args"]
+                    assert settings == baseline
+                else:
+                    if mode == "unreadable":
+                        assert str(settings_file) in finalized[0]
+                        assert "FROM_FILE" not in settings["env"]
+                    else:
+                        assert str(settings_file) not in finalized[0]
+                        assert settings["env"]["FROM_FILE"] == "yes"
+                    assert settings["env"]["ORDER"] == "inline"
+                    assert settings["hooks"] == baseline["hooks"]
+                if mode == "wrapped":
+                    assert finalized[0][:2] == ["claude", "--"]
             await client.delete(f"/v1/sessions/{session_id}")
     finally:
         shutil.rmtree(bridge_dir, ignore_errors=True)

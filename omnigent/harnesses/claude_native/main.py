@@ -7022,7 +7022,13 @@ def _claude_terminal_request(
     # Let a registered launcher plugin (e.g. a wrapper such as isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by
     # default. See omnigent.claude_launcher.
+    augmented_args = args
     command, args = resolve_claude_launch(command, args)
+    claude_args_start = (
+        len(args) - len(augmented_args)
+        if augmented_args and args[-len(augmented_args) :] == augmented_args
+        else 0
+    )
     spec: _JsonObject = {
         "command": command,
         "args": args,
@@ -7060,7 +7066,12 @@ def _claude_terminal_request(
         ]
         env_args = [part for var in unset_env_vars for part in ("-u", var)]
         spec["command"] = "env"
-        spec["args"] = [*env_args, command, *args]
+        args = [*env_args, command, *args]
+        spec["args"] = args
+        claude_args_start += len(env_args) + 1
+    from omnigent.harnesses.claude_native.bridge import record_claude_settings_boundary
+
+    record_claude_settings_boundary(bridge_dir, args, claude_args_start=claude_args_start)
     return {
         "terminal": _TERMINAL_NAME,
         "session_key": _TERMINAL_SESSION_KEY,

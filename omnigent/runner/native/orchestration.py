@@ -9960,6 +9960,18 @@ async def _auto_create_claude_terminal(
             "claude-native", default="claude", cfg=_harness_cfg
         )
         launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
+        from omnigent.harnesses.claude_native.bridge import record_claude_settings_boundary
+
+        configured_prefix = launch_args[: len(launch_args) - len(claude_args)]
+        claude_args_start = 0
+        if Path(launch_command).name not in {"claude", "claude.exe"}:
+            if configured_prefix[:1] == ["--"]:
+                claude_args_start = 1
+            elif configured_prefix[:2] == ["claude", "--"]:
+                claude_args_start = 2
+        record_claude_settings_boundary(
+            bridge_dir, launch_args, claude_args_start=claude_args_start
+        )
         # Validate the binary this terminal will actually spawn: ``launch_command``
         # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
         # name resolves against this process's inherited PATH (same lookup tmux's

@@ -1349,6 +1349,7 @@ async def _auto_create_claude_terminal_for_test(
     workspace: Path,
     registry: object,
     publish_event: object | None = None,
+    harness_config: dict[str, object] | None = None,
 ) -> None:
     """
     Run ``_auto_create_claude_terminal`` with host config and diagnostics stubbed.
@@ -1368,7 +1369,9 @@ async def _auto_create_claude_terminal_for_test(
     from omnigent.runner.native import orchestration
 
     monkeypatch.setattr("omnigent.inference_config.load_runtime_inference_config", dict)
-    monkeypatch.setattr("omnigent.config.load_effective_config", dict)
+    monkeypatch.setattr(
+        "omnigent.config.load_effective_config", lambda **_kwargs: harness_config or {}
+    )
     monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
     monkeypatch.setattr(diagnostics, "ClaudeDebugLogFollower", lambda _: Mock())
     await orchestration._auto_create_claude_terminal(
@@ -1380,6 +1383,82 @@ async def _auto_create_claude_terminal_for_test(
         auth_token_factory=lambda: None,
         resolve_launch_config=AsyncMock(return_value=None),
     )
+
+
+@pytest.mark.parametrize(
+    "command,prefix",
+    [
+        ("isaac", ["--"]),
+        ("isaac", ["claude", "--"]),
+        ("isaac", ["--", "--settings", '{"env":{"ORDER":"configured","CONFIG_ONLY":"yes"}}']),
+        ("claude", ["--settings", '{"env":{"ORDER":"configured","CONFIG_ONLY":"yes"}}']),
+    ],
+    ids=[
+        "configured-wrapper",
+        "configured-subcommand-wrapper",
+        "wrapper-claude-settings",
+        "configured-claude-settings",
+    ],
+)
+async def test_auto_create_claude_settings_preserve_configured_argument_boundary(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, command: str, prefix: list[str]
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+    from omnigent.inner.terminal import create_terminal_instance
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    session_id = "conv_configured_settings"
+    registry = Mock(spec=SessionResourceRegistry)
+    monkeypatch.setattr(
+        orchestration,
+        "_build_claude_native_base_args",
+        lambda **_kwargs: ('--settings={"env":{"ORDER":"caller"}}',),
+    )
+    monkeypatch.setattr(bridge, "ensure_claude_workspace_trusted", lambda *_args, **_kwargs: None)
+
+    async def prepare_before_launch(**kwargs):
+        assert kwargs["spec"].command == command
+        assert kwargs["spec"].args[: len(prefix)] == prefix
+        created = create_terminal_instance(
+            "claude",
+            "main",
+            TerminalEnvSpec(
+                args=kwargs["spec"].args,
+                os_env=OSEnvSpec(cwd=str(bridge_dir), sandbox=OSEnvSandboxSpec(type="none")),
+            ),
+        )
+        try:
+            await kwargs["prepare_terminal"](created.instance)
+            settings = json.loads(
+                (
+                    bridge.bridge_dir_for_conversation_id(session_id) / "claude-settings.json"
+                ).read_text()
+            )
+            assert settings["env"]["ORDER"] == "caller"
+            assert settings["hooks"]["UserPromptSubmit"]
+            if command == "isaac":
+                boundary = prefix.index("--") + 1
+                assert created.instance.args[:boundary] == prefix[:boundary]
+            if "--settings" in prefix:
+                assert settings["env"]["CONFIG_ONLY"] == "yes"
+            assert created.instance.args.count("--settings") == 1
+        finally:
+            await created.instance.close()
+        raise RuntimeError("stop after prepared settings")
+
+    registry.launch_required_terminal.side_effect = prepare_before_launch
+    with pytest.raises(RuntimeError, match="stop after prepared settings"):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch,
+            session_id=session_id,
+            workspace=bridge_dir,
+            registry=registry,
+            harness_config={"harness": {"claude-native": {"command": command, "args": prefix}}},
+        )
 
 
 async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
