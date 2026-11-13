@@ -419,8 +419,20 @@ async def test_executor_error_terminates_with_response_failed(
     [
         (
             "{not-json",
-            "HARNESS_ANTIGRAVITY_OS_ENV must contain a valid OS environment policy",
-            "ValueError",
+            "The requested sandbox policy is invalid.",
+            "HarnessSandboxValidationError",
+            None,
+        ),
+        (
+            '{"fork": "/private/host/scan"}',
+            "The requested sandbox policy is invalid.",
+            "HarnessSandboxValidationError",
+            None,
+        ),
+        (
+            '{"/private/host/scan": true}',
+            "The requested sandbox policy is invalid.",
+            "HarnessSandboxValidationError",
             None,
         ),
         (
@@ -442,7 +454,14 @@ async def test_executor_error_terminates_with_response_failed(
             "qwen",
         ),
     ],
-    ids=["invalid-policy", "unsupported-policy", "backend-error", "non-claude-launcher-error"],
+    ids=[
+        "invalid-policy",
+        "invalid-schema",
+        "unknown-field",
+        "unsupported-policy",
+        "backend-error",
+        "non-claude-launcher-error",
+    ],
 )
 async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry(
     monkeypatch: pytest.MonkeyPatch,
@@ -459,6 +478,7 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
 
     from omnigent.inner import antigravity_harness
     from omnigent.inner.executor import MockExecutor, TextChunk, TurnComplete
+    from omnigent.runner import app as runner_app_module
     from omnigent.runner import create_runner_app
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from tests.runner.conftest import _drain_session_event_queue, _FakeProcessManager
@@ -472,7 +492,7 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
     monkeypatch.setattr(antigravity_harness, "AntigravityExecutor", constructor)
     policy_env = "HARNESS_ANTIGRAVITY_OS_ENV"
     builder = antigravity_harness._build_antigravity_executor
-    private_diagnostic = "/private/host/toolchain/unfinished-scan-directory"
+    private_diagnostic = "/private/host/scan"
     if preparation_harness == "claude-sdk":
         from omnigent.inner import claude_sdk_executor
         from omnigent.inner.os_env_serialization import resolve_harness_os_env
@@ -546,6 +566,8 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
 
     monkeypatch.setenv(policy_env, policy)
     factory = Mock(wraps=builder)
+    monkeypatch.setattr(runner_app_module, "_session_event_queues_ref", {})
+    monkeypatch.setattr(runner_app_module, "_session_histories_ref", {})
     session_id = "conv_factory_policy_retry"
     adapter = ExecutorAdapter(executor_factory=factory, session_key=session_id)
     app = adapter.build()
@@ -585,7 +607,7 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
             assert failed["error"]["code"] == error_code
             assert message in failed["error"]["message"]
             assert private_diagnostic not in json.dumps([event.data for event in failed_events])
-            if error_code == "HarnessSandboxPreparationError":
+            if error_code == "HarnessSandboxPreparationError" or private_diagnostic in policy:
                 assert private_diagnostic in caplog.text
             queued = _drain_session_event_queue(runner.state.session_event_queues.get(session_id))
             queued_failures = [event for event in queued if event["type"] == "response.failed"]

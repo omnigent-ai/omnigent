@@ -94,6 +94,8 @@ def _prepared_launch(
         for fault in ("cwd", "resolve", "unsupported", "backend", "launcher", "inactive")
         for harness in _HARNESSES
         if fault != "backend" or harness in ("claude-sdk", "codex")
+        # Codex resolution rollback has a dedicated worker-preflight scenario.
+        if (harness, fault) != ("codex", "resolve")
     ]
     + [pytest.param("codex", "backend-oserror", id="backend-oserror-codex")],
 )
@@ -318,6 +320,8 @@ def test_relative_policy_cwd_preserves_non_claude_workspace(
         for harness in _HARNESSES
         for feature in ("cwd_conflict", "egress_rules", "credential_proxy")
         if feature == "cwd_conflict" or harness != "codex"
+        # Claude's successful-wrap scenario also exercises cwd conflicts.
+        if (harness, feature) != ("claude-sdk", "cwd_conflict")
     ],
 )
 def test_harness_rejects_policy_features_it_cannot_honor(

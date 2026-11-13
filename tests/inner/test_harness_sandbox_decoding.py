@@ -27,7 +27,7 @@ from omnigent.inner.datamodel import (
 )
 from omnigent.inner.os_env import _build_credential_proxy_parent_env
 from omnigent.inner.os_env_serialization import resolve_harness_os_env
-from omnigent.inner.sandbox import resolve_sandbox
+from omnigent.inner.sandbox import HarnessSandboxValidationError, resolve_sandbox
 from omnigent.runtime.workflow import _serialize_os_env
 
 _HARNESSES = {
@@ -210,7 +210,7 @@ def test_shared_decoder_rejects_malformed_os_policy(
     payload: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("TEST_HARNESS_OS_ENV", payload)
-    with pytest.raises(ValueError):
+    with pytest.raises(HarnessSandboxValidationError):
         resolve_harness_os_env("TEST_HARNESS_OS_ENV")
 
 

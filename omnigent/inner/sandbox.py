@@ -533,6 +533,7 @@ class HarnessSandboxValidationError(ValueError):
     """A policy rejection with fixed client guidance separate from diagnostic details."""
 
     _GUIDANCE: ClassVar[dict[str, str]] = {
+        "decode": "The requested sandbox policy is invalid. Check its configuration and retry.",
         "type": "The selected harness supports only os_env.type=caller_process.",
         "fork": "The selected harness does not support os_env.fork.",
         "start_in_scratch": "The selected harness does not support os_env.start_in_scratch.",

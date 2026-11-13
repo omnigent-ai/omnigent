@@ -212,7 +212,12 @@ async def test_direct_stream_selection_builds_policy_environment(
 @pytest.mark.parametrize(
     "spawn_env", [[], "invalid", {"HARNESS_PI_MODEL": 1}, {"HARNESS_PI_MODEL": "bad\u0000model"}]
 )
-async def test_direct_stream_rejects_invalid_compatible_environment(spawn_env: object) -> None:
+def test_compatible_stream_spawn_env_rejects_invalid_environment(spawn_env: object) -> None:
+    with pytest.raises(ValueError):
+        runner_app_module._compatible_stream_spawn_env("pi", spawn_env)
+
+
+async def test_direct_stream_rejects_invalid_compatible_environment() -> None:
     manager = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(process_manager=manager, server_client=NullServerClient())
     async with _runner_client(app) as client:
@@ -223,7 +228,7 @@ async def test_direct_stream_rejects_invalid_compatible_environment(spawn_env: o
                 "role": "user",
                 "content": [],
                 "harness": "pi",
-                "spawn_env": spawn_env,
+                "spawn_env": {"HARNESS_PI_MODEL": "bad\u0000model"},
             },
         )
     assert response.status_code == 400, response.text
