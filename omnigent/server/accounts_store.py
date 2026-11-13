@@ -33,6 +33,7 @@ from omnigent.db.db_models import (
     SqlPreference,
     SqlProject,
     SqlScheduledTask,
+    SqlScheduledTaskShare,
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
@@ -119,6 +120,19 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
             SqlScheduledTask.state != encode_scheduled_task_state("deleted"),
         )
         .values(state=encode_scheduled_task_state("deleted"), next_run_at=None, updated_at=now)
+    )
+    # After the task rows are locked, the order grant writers take. Includes tasks
+    # already marked deleted.
+    session.execute(
+        delete(SqlScheduledTaskShare).where(
+            SqlScheduledTaskShare.workspace_id == workspace_id,
+            SqlScheduledTaskShare.scheduled_task_id.in_(
+                select(SqlScheduledTask.id).where(
+                    SqlScheduledTask.workspace_id == workspace_id,
+                    SqlScheduledTask.user_id == user_id,
+                )
+            ),
+        )
     )
     session.execute(
         update(SqlDeviceGrant)
@@ -461,8 +475,10 @@ class SqlAlchemyAccountStore:
         refusing to remove the last admin.
 
         In the same transaction as the tombstone this also removes
-        the user's ``session_permissions`` rows, marks their scheduled
-        tasks ``deleted`` (so the scheduler never fires them again),
+        the user's ``session_permissions`` rows and the scheduled task
+        grants they hold, marks their scheduled tasks ``deleted`` (so
+        the scheduler never fires them again) and removes those tasks'
+        grants,
         revokes their device/refresh grants (so no further access tokens
         can be minted), and deletes or tombstones their hosts (so an
         unattended run has nowhere to land). Because everything shares
@@ -504,6 +520,13 @@ class SqlAlchemyAccountStore:
                 )
             )
             _revoke_durable_authority(session, user_id, now=int(time.time()))
+            # After the user's own tasks are locked above, so grant rows follow task rows.
+            session.execute(
+                delete(SqlScheduledTaskShare).where(
+                    SqlScheduledTaskShare.workspace_id == current_workspace_id(),
+                    SqlScheduledTaskShare.user_id == user_id,
+                )
+            )
             session.execute(
                 delete(SqlPreference).where(
                     SqlPreference.workspace_id == current_workspace_id(),

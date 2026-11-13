@@ -3,12 +3,17 @@
 Each grant is a ``(user_id, conversation_id, level)`` triple where
 level is an integer: 1=read, 2=edit, 3=manage. The ``"__public__"``
 sentinel user ID represents public link access, capped by the live server policy.
+
+Scheduled tasks (automations) have grants of the same shape, keyed by
+``scheduled_task_id``. Stores opt in through
+:attr:`PermissionStore.supports_scheduled_task_grants`.
 """
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
-from omnigent.entities import Account, ResolvedAccess, SessionPermission
+from omnigent.entities import Account, ResolvedAccess, ScheduledTaskPermission, SessionPermission
+from omnigent.errors import ErrorCode, OmnigentError
 
 
 class PermissionStore(ABC):
@@ -313,3 +318,99 @@ class PermissionStore(ABC):
             ``FORBIDDEN`` for a refused grant.
         """
         return list(grants)
+
+    # ── Scheduled task grants ─────────────────────────────────────────────
+    # The defaults suit a store that cannot persist these grants: it holds none,
+    # refuses new ones and deletes nothing.
+
+    @property
+    def supports_scheduled_task_grants(self) -> bool:
+        """Whether this store persists scheduled task grants.
+
+        Callers hide automation sharing when this is ``False``, the default.
+        """
+        return False
+
+    def grant_for_scheduled_task(
+        self,
+        user_id: str,  # noqa: ARG002
+        scheduled_task_id: str,  # noqa: ARG002
+        level: int,  # noqa: ARG002
+    ) -> ScheduledTaskPermission:
+        """Upsert a grant on a scheduled task, as :meth:`grant` does on a session.
+
+        Overwrites the level of an existing grant. As for session grants, the
+        caller authorizes the request and calls :meth:`ensure_user` first. The
+        task's owner is implicit and holds no grant.
+
+        :param user_id: The grantee, a user or group, e.g. ``"alice@example.com"``.
+        :param scheduled_task_id: The task to grant access to.
+        :param level: Numeric permission level (1=read, 2=edit, 3=manage).
+        :returns: The resulting :class:`ScheduledTaskPermission`.
+        :raises OmnigentError: ``NOT_FOUND`` when the task is missing or deleted,
+            or ``FORBIDDEN`` when the store does not support scheduled task grants.
+        """
+        raise OmnigentError(
+            "Sharing automations is not supported by this server.",
+            code=ErrorCode.FORBIDDEN,
+        )
+
+    def revoke_for_scheduled_task(
+        self,
+        user_id: str,  # noqa: ARG002
+        scheduled_task_id: str,  # noqa: ARG002
+    ) -> bool:
+        """Remove a grant on a scheduled task, as :meth:`revoke` does on a session.
+
+        :param user_id: The grantee to revoke, e.g. ``"alice@example.com"``.
+        :param scheduled_task_id: The task to revoke access from.
+        :returns: ``True`` if a grant was deleted, ``False`` if none existed.
+        """
+        return False
+
+    def list_for_scheduled_task(
+        self,
+        scheduled_task_id: str,  # noqa: ARG002
+        *,
+        limit: int = 100,  # noqa: ARG002
+        after_user_id: str | None = None,  # noqa: ARG002
+    ) -> tuple[list[ScheduledTaskPermission], str | None]:
+        """Return a scheduled task's grants with cursor pagination.
+
+        Pages exactly like :meth:`list_for_session`.
+
+        :param scheduled_task_id: The task to query.
+        :param limit: Max grants to return (default 100).
+        :param after_user_id: Exclusive cursor — return grants with
+            user_id > this value.
+        :returns: Tuple of (grants ordered by user_id, next_cursor). next_cursor
+            is the user_id to pass as after_user_id, or None on the last page.
+        """
+        return [], None
+
+    def resolve_scheduled_task_access(
+        self,
+        principals: Sequence[str],  # noqa: ARG002
+        scheduled_task_id: str,  # noqa: ARG002
+    ) -> int | None:
+        """Return the highest level any of *principals* holds on a scheduled task.
+
+        Reads grants only: owner and admin rules are the caller's.
+
+        :param principals: The caller's user ID and any groups they belong to,
+            e.g. ``["alice@example.com"]``.
+        :param scheduled_task_id: The task to resolve.
+        :returns: The highest granted level, or ``None`` when no principal has a grant.
+        """
+        return None
+
+    def delete_for_scheduled_task(self, scheduled_task_id: str) -> int:  # noqa: ARG002
+        """Delete every grant on a scheduled task.
+
+        Call after the task is deleted, so a concurrent grant sees the deletion
+        and is refused instead of leaving a grant behind.
+
+        :param scheduled_task_id: The deleted task.
+        :returns: The number of grants deleted.
+        """
+        return 0

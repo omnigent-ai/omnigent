@@ -35,6 +35,7 @@ def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) 
         for write in (
             lambda: permissions.ensure_user("alice"),
             lambda: permissions.grant("alice", uuid.uuid4().hex, 3),
+            lambda: permissions.grant_for_scheduled_task("alice", uuid.uuid4().hex, 1),
             lambda: HostStore(db_uri).upsert_on_connect(uuid.uuid4().hex, "laptop", "alice"),
             lambda: DeviceGrantStore(db_uri).create_redeemed_grant(
                 "late-grant",
@@ -304,6 +305,42 @@ def test_username_reuse_does_not_inherit_connections_projects_or_spending(db_uri
                 projects.save_order(order, user_id="alice")
 
 
+def _create_task(db_uri: str, owner: str) -> str:
+    return (
+        SqlAlchemyScheduledTaskStore(db_uri)
+        .create(uuid.uuid4().hex, "job", "hello", "FREQ=DAILY", owner, uuid.uuid4().hex, "UTC")
+        .id
+    )
+
+
+def test_deletion_removes_automation_grants_held_and_owned(db_uri: str) -> None:
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("carol")
+    owned, owned_deleted, other = (
+        _create_task(db_uri, owner) for owner in ("alice", "alice", "dave")
+    )
+    for task_id, grantee in (
+        (owned, "carol"),
+        (owned_deleted, "carol"),
+        (other, "alice"),
+        (other, "carol"),
+    ):
+        permissions.grant_for_scheduled_task(grantee, task_id, 1)
+    # Marking a task deleted leaves its grants in place.
+    assert SqlAlchemyScheduledTaskStore(db_uri).update(owned_deleted, state="deleted")
+
+    assert accounts.delete_user("alice") is True
+    for task_id in (owned, owned_deleted):
+        assert permissions.list_for_scheduled_task(task_id) == ([], None)
+    assert [grant.user_id for grant in permissions.list_for_scheduled_task(other)[0]] == ["carol"]
+    with pytest.raises(OmnigentError, match="revoked"):
+        permissions.grant_for_scheduled_task("alice", other, 1)
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert permissions.resolve_scheduled_task_access(["alice"], other) is None
+
+
 def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str) -> None:
     from sqlalchemy import select
     from sqlalchemy.orm import Session
@@ -496,6 +533,61 @@ def test_budget_writes_serialize_with_deletion(db_uri, monkeypatch, writer_name,
         "cost_usd": 0.0,
         "ask_approved_usd": 0.0,
     }
+
+
+@pytest.mark.parametrize("delete_first", [False, True])
+def test_automation_grant_serializes_with_owner_deletion(db_uri, monkeypatch, delete_first):
+    from omnigent.stores.permission_store import sqlalchemy_store as permission_module
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("carol")
+    task_id = _create_task(db_uri, "alice")
+    permissions.grant_for_scheduled_task("carol", task_id, 1)
+    reached, resume, second_started = Event(), Event(), Event()
+    # Pause each writer once it holds the task row: deletion after it tombstones the
+    # task, the grant before it writes the grant row the deletion also removes.
+    module, name = (
+        (accounts_module, "_revoke_durable_authority")
+        if delete_first
+        else (permission_module, "_lock_live_scheduled_task")
+    )
+    original = getattr(module, name)
+
+    def paused_lock(*args, **kwargs):
+        result = original(*args, **kwargs)
+        reached.set()
+        assert resume.wait(10)
+        return result
+
+    monkeypatch.setattr(module, name, paused_lock)
+
+    def grant():
+        return permissions.grant_for_scheduled_task("carol", task_id, 2)
+
+    def second():
+        second_started.set()
+        return grant() if delete_first else accounts.delete_user("alice")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(accounts.delete_user, "alice") if delete_first else pool.submit(grant)
+        try:
+            assert reached.wait(10)
+            waiting = pool.submit(second)
+            assert second_started.wait(10)
+            with pytest.raises(TimeoutError):
+                waiting.result(timeout=0.1)
+        finally:
+            resume.set()
+        first.result(timeout=10)
+        if delete_first:
+            with pytest.raises(OmnigentError) as caught:
+                waiting.result(timeout=10)
+            assert caught.value.code == ErrorCode.NOT_FOUND
+        else:
+            assert waiting.result(timeout=10) is True
+    assert permissions.list_for_scheduled_task(task_id) == ([], None)
 
 
 def test_unbound_saved_authority_cannot_acquire_new_account(db_uri: str) -> None:
@@ -833,11 +925,12 @@ def test_target_scope_preserves_actor_and_target_checks(db_uri, revoked_user):
         accounts.create_user_with_password(user_id, "replacement-hash")
     with account_authority_scope(actor.id, actor.account_generation):
         with target_account_scope(target.id, target.account_generation):
-            with pytest.raises(OmnigentError, match="revoked") as caught:
-                permissions.grant(target.id, uuid.uuid4().hex, 1)
-            assert caught.value.code == (
-                ErrorCode.CONFLICT if revoked_user == "target" else ErrorCode.UNAUTHORIZED
-            )
+            for grant in (permissions.grant, permissions.grant_for_scheduled_task):
+                with pytest.raises(OmnigentError, match="revoked") as caught:
+                    grant(target.id, uuid.uuid4().hex, 1)
+                assert caught.value.code == (
+                    ErrorCode.CONFLICT if revoked_user == "target" else ErrorCode.UNAUTHORIZED
+                )
     with account_authority_scope(actor.id, accounts.get_user(actor.id).account_generation):
         with target_account_scope(target.id, accounts.get_user(target.id).account_generation):
             permissions.ensure_user(target.id)
@@ -862,10 +955,13 @@ def test_target_without_registration_cannot_acquire_new_account(db_uri, existing
             if existing_external_user:
                 assert accounts.delete_user("target") is True
             accounts.create_user_with_password("target", "new-password-hash")
-            with pytest.raises(OmnigentError, match="revoked"):
-                permissions.ensure_user("target")
-            with pytest.raises(OmnigentError, match="revoked"):
-                permissions.grant("target", uuid.uuid4().hex, 1)
+            for write in (
+                lambda: permissions.ensure_user("target"),
+                lambda: permissions.grant("target", uuid.uuid4().hex, 1),
+                lambda: permissions.grant_for_scheduled_task("target", uuid.uuid4().hex, 1),
+            ):
+                with pytest.raises(OmnigentError, match="revoked"):
+                    write()
 
 
 @pytest.mark.parametrize("change", ["host_owner", "session_owner", "host", "runner", "permission"])

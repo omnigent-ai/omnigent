@@ -6,10 +6,10 @@ import collections
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import cast
 
-from sqlalchemy import delete, exists, literal, select, update
+from sqlalchemy import delete, exists, func, literal, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -18,15 +18,26 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.account_authority import account_generation, require_active_account
-from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
+from omnigent.db.db_models import (
+    SqlScheduledTask,
+    SqlScheduledTaskShare,
+    SqlSessionPermission,
+    SqlUser,
+    current_workspace_id,
+)
+from omnigent.db.enum_codecs import encode_scheduled_task_state
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
     run_write_transaction,
 )
-from omnigent.entities import Account, ResolvedAccess, SessionPermission
+from omnigent.entities import Account, ResolvedAccess, ScheduledTaskPermission, SessionPermission
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
+    LEVEL_READ,
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
     effective_admin,
@@ -38,6 +49,11 @@ from omnigent.stores.permission_store import PermissionStore
 # actors. Mirrors accounts_store._HIDDEN_LIST_USERS so the admin user
 # list is identical across auth modes.
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
+
+# The owner of a scheduled task is implicit, so its grants stop below LEVEL_OWNER.
+_SCHEDULED_TASK_GRANT_LEVELS = frozenset({LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE})
+# Width of scheduled_task_shares.user_id, which SQLite does not enforce.
+_GRANTEE_ID_MAX_CHARS = 128
 
 # Short-lived cache of resolve_access() results. The per-event access-control
 # check on a busy session otherwise re-reads session_permissions + users on
@@ -125,6 +141,72 @@ def _to_entity(row: SqlSessionPermission) -> SessionPermission:
     )
 
 
+def _upsert_grant(
+    dialect: str,
+    model: type[SqlSessionPermission] | type[SqlScheduledTaskShare],
+    key: dict[str, str],
+    level: int,
+) -> Insert:
+    """Build an insert of one grant row that overwrites the level of an existing row.
+
+    :param key: The row's primary key columns other than ``workspace_id``.
+    """
+    key_columns = ["workspace_id", *key]
+    if dialect == "sqlite":
+        return (
+            sqlite_insert(model)
+            .values(**key, level=level)
+            .on_conflict_do_update(index_elements=key_columns, set_={"level": level})
+        )
+    if dialect == "mysql":
+        return mysql_insert(model).values(**key, level=level).on_duplicate_key_update(level=level)
+    return (
+        pg_insert(model)
+        .values(**key, level=level)
+        .on_conflict_do_update(index_elements=key_columns, set_={"level": level})
+    )
+
+
+def _require_storable_scheduled_task_grant(user_id: str, level: int) -> None:
+    """Refuse a grant the share table would reject or store silently on SQLite."""
+    if len(user_id) > _GRANTEE_ID_MAX_CHARS:
+        raise OmnigentError(
+            f"A grantee ID may be at most {_GRANTEE_ID_MAX_CHARS} characters.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if level not in _SCHEDULED_TASK_GRANT_LEVELS:
+        raise OmnigentError(
+            f"Invalid automation permission level {level!r}.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
+def _lock_live_scheduled_task(session: Session, scheduled_task_id: str) -> None:
+    """Lock a task's row before its grant rows, the order account deletion also takes.
+
+    A task deleted before the lock refuses the grant, so none outlives it.
+    """
+    state = session.execute(
+        select(SqlScheduledTask.state)
+        .where(
+            SqlScheduledTask.workspace_id == current_workspace_id(),
+            SqlScheduledTask.id == scheduled_task_id,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if state is None or state == encode_scheduled_task_state("deleted"):
+        raise OmnigentError("Automation not found", code=ErrorCode.NOT_FOUND)
+
+
+def _to_scheduled_task_permission(row: SqlScheduledTaskShare) -> ScheduledTaskPermission:
+    """Convert a :class:`SqlScheduledTaskShare` ORM row to a domain entity."""
+    return ScheduledTaskPermission(
+        user_id=row.user_id,
+        scheduled_task_id=row.scheduled_task_id,
+        level=row.level,
+    )
+
+
 class SqlAlchemyPermissionStore(PermissionStore):
     """SQLAlchemy-backed implementation of :class:`PermissionStore`.
 
@@ -183,38 +265,14 @@ class SqlAlchemyPermissionStore(PermissionStore):
 
         def write(session: Session) -> None:
             require_active_account(session, user_id)
-            dialect = self._engine.dialect.name
-            values = {
-                "user_id": user_id,
-                "conversation_id": conversation_id,
-                "level": level,
-            }
-            stmt: Insert
-            if dialect == "sqlite":
-                stmt = (
-                    sqlite_insert(SqlSessionPermission)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "user_id", "conversation_id"],
-                        set_={"level": level},
-                    )
+            session.execute(
+                _upsert_grant(
+                    self._engine.dialect.name,
+                    SqlSessionPermission,
+                    {"user_id": user_id, "conversation_id": conversation_id},
+                    level,
                 )
-            elif dialect == "mysql":
-                stmt = (
-                    mysql_insert(SqlSessionPermission)
-                    .values(**values)
-                    .on_duplicate_key_update(level=level)
-                )
-            else:
-                stmt = (
-                    pg_insert(SqlSessionPermission)
-                    .values(**values)
-                    .on_conflict_do_update(
-                        index_elements=["workspace_id", "user_id", "conversation_id"],
-                        set_={"level": level},
-                    )
-                )
-            session.execute(stmt)
+            )
             session.flush()
 
         run_write_transaction(
@@ -683,3 +741,127 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     )
                 )
             ).scalar_one()
+
+    # ── Scheduled task grants ─────────────────────────────────────────────
+
+    @property
+    def supports_scheduled_task_grants(self) -> bool:
+        """Grants persist in ``scheduled_task_shares``. See base class."""
+        return True
+
+    def grant_for_scheduled_task(
+        self,
+        user_id: str,
+        scheduled_task_id: str,
+        level: int,
+    ) -> ScheduledTaskPermission:
+        """Upsert a scheduled task grant. See base class for contract.
+
+        Locks the accounts, then the task, then the grant row.
+
+        :raises OmnigentError: ``INVALID_INPUT`` for an over-wide ID or a level
+            outside read, edit and manage; ``NOT_FOUND`` when the task is missing
+            or deleted; the account errors of :meth:`grant`.
+        """
+        _require_storable_scheduled_task_grant(user_id, level)
+
+        def write(session: Session) -> None:
+            require_active_account(session, user_id)
+            _lock_live_scheduled_task(session, scheduled_task_id)
+            session.execute(
+                _upsert_grant(
+                    self._engine.dialect.name,
+                    SqlScheduledTaskShare,
+                    {"scheduled_task_id": scheduled_task_id, "user_id": user_id},
+                    level,
+                )
+            )
+
+        run_write_transaction(self._session_immediate, "grant_scheduled_task_permission", write)
+        return ScheduledTaskPermission(
+            user_id=user_id,
+            scheduled_task_id=scheduled_task_id,
+            level=level,
+        )
+
+    def revoke_for_scheduled_task(self, user_id: str, scheduled_task_id: str) -> bool:
+        """Remove a scheduled task grant. See base class for contract."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    delete(SqlScheduledTaskShare).where(
+                        SqlScheduledTaskShare.workspace_id == current_workspace_id(),
+                        SqlScheduledTaskShare.scheduled_task_id == scheduled_task_id,
+                        SqlScheduledTaskShare.user_id == user_id,
+                    )
+                ),
+            )
+            return result.rowcount > 0
+
+        return run_write_transaction(
+            self._session_immediate, "revoke_scheduled_task_permission", write
+        )
+
+    def list_for_scheduled_task(
+        self,
+        scheduled_task_id: str,
+        *,
+        limit: int = 100,
+        after_user_id: str | None = None,
+    ) -> tuple[list[ScheduledTaskPermission], str | None]:
+        """Return a scheduled task's grants with cursor pagination. See base class."""
+        with self._session("list_scheduled_task_permissions") as session:
+            stmt = (
+                select(SqlScheduledTaskShare)
+                .where(
+                    SqlScheduledTaskShare.workspace_id == current_workspace_id(),
+                    SqlScheduledTaskShare.scheduled_task_id == scheduled_task_id,
+                )
+                .order_by(SqlScheduledTaskShare.user_id.asc())
+                .limit(limit + 1)
+            )
+            if after_user_id is not None:
+                stmt = stmt.where(SqlScheduledTaskShare.user_id > after_user_id)
+            grants = [_to_scheduled_task_permission(r) for r in session.execute(stmt).scalars()]
+        if len(grants) > limit:
+            grants = grants[:limit]
+            return grants, grants[-1].user_id
+        return grants, None
+
+    def resolve_scheduled_task_access(
+        self,
+        principals: Sequence[str],
+        scheduled_task_id: str,
+    ) -> int | None:
+        """Return the highest level any principal holds. See base class for contract."""
+        if not principals:
+            return None
+        with self._session("resolve_scheduled_task_access") as session:
+            return session.execute(
+                select(func.max(SqlScheduledTaskShare.level)).where(
+                    SqlScheduledTaskShare.workspace_id == current_workspace_id(),
+                    SqlScheduledTaskShare.scheduled_task_id == scheduled_task_id,
+                    SqlScheduledTaskShare.user_id.in_(list(principals)),
+                )
+            ).scalar_one()
+
+    def delete_for_scheduled_task(self, scheduled_task_id: str) -> int:
+        """Delete every grant on a scheduled task. See base class for contract."""
+
+        def write(session: Session) -> int:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    delete(SqlScheduledTaskShare).where(
+                        SqlScheduledTaskShare.workspace_id == current_workspace_id(),
+                        SqlScheduledTaskShare.scheduled_task_id == scheduled_task_id,
+                    )
+                ),
+            )
+            return result.rowcount
+
+        return run_write_transaction(
+            self._session_immediate, "delete_scheduled_task_permissions", write
+        )
