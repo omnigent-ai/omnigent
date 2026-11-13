@@ -38,7 +38,9 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
+  useWorkspaceServeable,
 } from "./useWorkspaceChangedFiles";
+import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
 
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -179,9 +181,27 @@ function FileSearchProbe({
 function FileSearchTruncatedProbe({ id, query }: { id: string; query: string }) {
   const { data } = useWorkspaceFileSearch(id, query);
   return (
-    <output data-testid="truncated">
-      {data === undefined ? "pending" : String(data.truncated)}
-    </output>
+    <>
+      <output data-testid="truncated">
+        {data === undefined ? "pending" : String(data.truncated)}
+      </output>
+      <output data-testid="has-more">
+        {data === undefined ? "pending" : String(data.hasMore)}
+      </output>
+    </>
+  );
+}
+
+/** Go to File's status for a live search, as its dialog derives it. */
+function GoToFileStatusProbe({ id, query }: { id: string; query: string }) {
+  const search = useWorkspaceFileSearch(id, query);
+  const serveable = useWorkspaceServeable(id);
+  const state = goToFileSearchState({ ...search, query, searchedQuery: query, serveable });
+  return (
+    <>
+      <output data-testid="phase">{state.phase}</output>
+      <output data-testid="message">{goToFileStatusMessage(state, query, 0)}</output>
+    </>
   );
 }
 
@@ -248,6 +268,21 @@ afterEach(() => {
 });
 
 describe("useWorkspaceChangedFiles gating", () => {
+  it("preserves optional repository identity and workspace-relative paths", async () => {
+    onlineMock.mockReturnValue(true);
+    const entries = [
+      { path: "api/app.py", name: "app.py", repository_root: "api" },
+      { path: "notes.md", name: "notes.md" },
+    ].map((entry) => ({ ...entry, status: "modified", bytes: 12, modified_at: null }));
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse({ object: "list", data: entries, has_more: false }));
+    const { result } = renderHook(() => useWorkspaceChangedFiles("conv_repos"), { wrapper: Wrap });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.data).toMatchObject(entries);
+    expect(result.current.data?.data[1].repository_root).toBeUndefined();
+  });
+
   it("does not fetch when the runner is offline and the host is also down", async () => {
     onlineMock.mockReturnValue(false);
     hostOnlineMock.mockReturnValue(false);
@@ -762,6 +797,95 @@ describe("useWorkspaceFileSearch truncation", () => {
     );
 
     await waitFor(() => expect(screen.getByTestId("truncated")).toHaveTextContent("true"));
+    expect(screen.getByTestId("has-more")).toHaveTextContent("false");
+  });
+
+  it("reports has_more separately, so a full result page isn't shown as complete", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(
+      jsonResponse({ object: "list", data: [], has_more: true, truncated: false }),
+    );
+
+    render(
+      <Wrap>
+        <FileSearchTruncatedProbe id="conv_live" query="src" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("has-more")).toHaveTextContent("true"));
+    expect(screen.getByTestId("truncated")).toHaveTextContent("false");
+  });
+});
+
+describe("Go to File status from a live search", () => {
+  // Liveness can lag: the runner may be gone, or the session may have no OS
+  // environment, while the health signal still reads online or unknown.
+  const unavailableText = "This session's files aren't available right now.";
+
+  it("says the files are unavailable, not that nothing matched, on a 404 while online", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(new Response(null, { status: 404 }));
+
+    render(
+      <Wrap>
+        <GoToFileStatusProbe id="conv_live" query="readme" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("phase")).toHaveTextContent("unavailable"));
+    expect(screen.getByTestId("message")).toHaveTextContent(unavailableText);
+  });
+
+  it("says the files are unavailable on a runner_unavailable 503 while liveness is unknown", async () => {
+    onlineMock.mockReturnValue(undefined);
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    render(
+      <Wrap>
+        <GoToFileStatusProbe id="conv_live" query="readme" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("phase")).toHaveTextContent("unavailable"));
+    expect(screen.getByTestId("message")).toHaveTextContent(unavailableText);
+  });
+
+  it("says nothing matched only when the workspace answered with no files", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    render(
+      <Wrap>
+        <GoToFileStatusProbe id="conv_live" query="readme" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("phase")).toHaveTextContent("settled"));
+    expect(screen.getByTestId("message")).toHaveTextContent("No files match “readme”.");
+  });
+
+  it("cancels a search request that a newer query replaced", async () => {
+    onlineMock.mockReturnValue(true);
+    const signals: AbortSignal[] = [];
+    fetchMock.mockImplementation((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.signal) signals.push(init.signal);
+      return new Promise<Response>(() => {});
+    });
+
+    const { rerender } = render(
+      <Wrap>
+        <FileSearchTruncatedProbe id="conv_live" query="ap" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(signals).toHaveLength(1));
+    rerender(
+      <Wrap>
+        <FileSearchTruncatedProbe id="conv_live" query="app" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(signals).toHaveLength(2));
+    await waitFor(() => expect(signals[0].aborted).toBe(true));
+    expect(signals[1].aborted).toBe(false);
   });
 });
 
@@ -1026,7 +1150,7 @@ function FileExistenceProbe({
 }) {
   const result = useWorkspaceFileExists(id, path, trusted);
   useEffect(() => {
-    onResult(result);
+    onResult({ exists: result.exists, settled: result.settled });
   }, [result, onResult]);
   return null;
 }
@@ -1180,6 +1304,27 @@ describe("useWorkspaceFileExists", () => {
     expect(results.length).toBeGreaterThan(0);
     expect(results).not.toContain(true);
     expect(results.at(-1)).toBe(false);
+  });
+
+  it("reports a listed folder as a directory, not as a verified-absent file", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [
+          dirEntry("experimental/data/mobile-touch-targets", "directory"),
+          dirEntry("experimental/data/notes.md"),
+        ],
+        has_more: false,
+      }),
+    );
+    const { result } = renderHook(
+      () => useWorkspaceFileExists("conv_1", "experimental/data/mobile-touch-targets", true),
+      { wrapper: Wrap },
+    );
+
+    await waitFor(() => expect(result.current.settled).toBe(true));
+    expect(result.current).toEqual({ exists: false, isDirectory: true, settled: true });
+    expect(fetchMock.mock.calls[0][0]).toContain("/filesystem/experimental/data?");
   });
 
   it("reports false (and 404-tolerant) when the parent directory is missing", async () => {

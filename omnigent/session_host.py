@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
-from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, databricks_request_headers
+from omnigent.cli_auth import (
+    OMNIGENT_SLICE_KEY_HEADER,
+    UNKEYED_REQUEST_EXTENSION,
+    databricks_request_headers,
+)
 
 _session_hosts: dict[str, str] = {}
 
@@ -25,11 +29,32 @@ def get_session_host(session_id: str) -> str | None:
     return _session_hosts.get(session_id)
 
 
+def session_routing_headers(url: str) -> dict[str, str]:
+    """Return the observed session owner's routing headers for HTTP or WS."""
+    parsed = urlsplit(url)
+    base_path, separator, route = parsed.path.partition("/v1/sessions/")
+    host_id = get_session_host(unquote(route.split("/")[0])) if separator else None
+    if host_id is None:
+        return {}
+    scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
+    base_url = parsed._replace(scheme=scheme, path=base_path, query="", fragment="").geturl()
+    return databricks_request_headers(base_url, host_id=host_id)
+
+
+async def route_known_session_request(request: httpx.Request) -> None:
+    """Prefer an observed session owner over the caller's default host."""
+    if not request.extensions.get(UNKEYED_REQUEST_EXTENSION):
+        request.headers.update(session_routing_headers(str(request.url)))
+
+
 async def route_session_request(request: httpx.Request) -> None:
     """Route a session request by its host without changing shared client headers."""
     path = request.url.raw_path.split(b"?", 1)[0].decode("ascii")
     base_path, separator, route = path.partition("/v1/sessions")
     if not separator or (route and not route.startswith("/")):
+        return
+    if request.extensions.get(UNKEYED_REQUEST_EXTENSION):
+        request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
         return
     host_id = None
     if (

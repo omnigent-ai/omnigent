@@ -47,6 +47,25 @@ def test_github_events_share_one_v2_workflow() -> None:
     assert "if: always() && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'" in reusable
 
 
+def test_v2_mirrors_priority_onto_linked_prs() -> None:
+    intake = (WORKFLOWS / "issue-triage.yml").read_text()
+    response = (WORKFLOWS / "needs-info-response.yml").read_text()
+    reusable = (WORKFLOWS / "issue-prioritization-v2.yml").read_text()
+    grading, sync = reusable.split("  sync-linked-prs:", 1)
+
+    assert "needs: prioritize" in sync
+    assert (
+        "if: ${{ !cancelled() && inputs.apply && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true' }}"
+    ) in sync
+    assert "ISSUE_NUMBER: ${{ inputs.issue_number }}" in sync
+    assert "pull-requests: write" in sync
+    assert "pull-requests" not in grading
+    # A called workflow cannot exceed its caller's token, so a caller without
+    # this grant fails every V2 run at startup.
+    for caller in (intake.split("  prioritize-v2:", 1)[1], response):
+        assert "pull-requests: write" in caller
+
+
 def test_v2_still_runs_when_legacy_intake_fails() -> None:
     intake = (WORKFLOWS / "issue-triage.yml").read_text()
     prioritize = intake.split("  prioritize-v2:", 1)[1]

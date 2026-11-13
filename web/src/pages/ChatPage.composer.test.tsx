@@ -1,9 +1,16 @@
+import { formatLocalReviewComments } from "@/lib/localReviewComments";
+import { requestLocalReviewContext, updateLocalReviewContext } from "@/lib/localReviewContext";
 import { create } from "zustand";
+import { SHIFT_KEY } from "@/components/KeyboardShortcut";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
+import type * as UseSessionLiveMcpServersModule from "@/hooks/useSessionLiveMcpServers";
+import type * as UseAgentsModule from "@/hooks/useAgents";
+import type { Agent } from "@/hooks/useAgents";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
@@ -14,8 +21,9 @@ import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { setSessionHost } from "@/lib/sessionHost";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -31,14 +39,22 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
+import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
 import {
   getSessionModelLabelCacheKey,
   readSessionModelLabelCache,
 } from "@/lib/sessionModelLabelCache";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import { ApiError } from "@/lib/sessionsApi";
+import * as sessionsApi from "@/lib/sessionsApi";
+import * as filesApi from "@/lib/filesApi";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+import {
+  MobileHeaderControlsProvider,
+  MobileHeaderControlsSlot,
+} from "@/shell/MobileHeaderControlsSlot";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -49,8 +65,21 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
     ...actual,
     useWorkspaceAllFiles: () => ({ data: undefined }),
     useWorkspaceDirectory: () => ({ data: undefined }),
+    useWorkspaceFileSearch: () => ({ data: undefined }),
   };
 });
+// The "@" menu's session rows read the sidebar cache and a search query; these
+// tests don't open it, so stub the source like the workspace hooks above.
+vi.mock("@/hooks/useSessionMentionEntries", () => ({
+  MENTION_SEARCH_DEBOUNCE_MS: 300,
+  useSessionMentionEntries: () => [],
+}));
+
+// The /mcp panel's registry read and popup sign-in; the MCP cases script both.
+vi.mock("@/lib/mcpRegistry", () => ({
+  registryRequest: vi.fn(),
+  authorizeRegistryService: vi.fn(),
+}));
 
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so bare Composer renders don't need a QueryClientProvider.
@@ -133,6 +162,7 @@ const { composerSessionSnapshot } = vi.hoisted(() => ({
     workspace: null as string | null,
     labels: {} as Record<string, string>,
     gitBranch: null as string | null,
+    sideChatAllowed: null as boolean | null,
   },
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
@@ -147,6 +177,41 @@ vi.mock("@/hooks/useHosts", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHostsModule>()),
   useHosts: () => ({ data: [] }),
 }));
+const { hostMcpQueryMock } = vi.hoisted(() => ({
+  hostMcpQueryMock: vi.fn(() => ({
+    data: [] as UseHarnessInventoryModule.HostMcpServer[] | undefined,
+    isLoading: false,
+    isError: false,
+  })),
+}));
+vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseHarnessInventoryModule>()),
+  useHostMcpServers: hostMcpQueryMock,
+}));
+const { liveMcpQueryMock, liveMcpReconnectMock } = vi.hoisted(() => ({
+  liveMcpQueryMock: vi.fn(() => ({
+    data: undefined as UseSessionLiveMcpServersModule.SessionLiveMcpServers | undefined,
+    isError: false,
+  })),
+  liveMcpReconnectMock: vi.fn(() => ({
+    reconnect: vi.fn(),
+    reconnectingName: null as string | null,
+    error: null as UseSessionLiveMcpServersModule.LiveMcpReconnectError | null,
+    clearError: vi.fn(),
+  })),
+}));
+vi.mock("@/hooks/useSessionLiveMcpServers", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSessionLiveMcpServersModule>()),
+  useSessionLiveMcpServers: liveMcpQueryMock,
+  useReconnectLiveMcpServer: liveMcpReconnectMock,
+}));
+const { sessionAgentQueryMock } = vi.hoisted(() => ({
+  sessionAgentQueryMock: vi.fn(() => ({ data: undefined as Agent | undefined, isError: false })),
+}));
+vi.mock("@/hooks/useAgents", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseAgentsModule>()),
+  useSessionAgent: sessionAgentQueryMock,
+}));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionHostOnline: () => undefined,
@@ -160,7 +225,9 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     pi: "Pi",
     antigravity: "Antigravity",
     copilot: "Copilot",
+    grok: "Grok Build",
   }),
+  useFileMentionHarnesses: () => new Set<string>(),
 }));
 vi.mock("@/lib/goalApi", async (importOriginal) => ({
   ...(await importOriginal<typeof GoalApiModule>()),
@@ -172,6 +239,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, computeIsWorking } from "./ChatPage";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
+import { withSessionMentionHint } from "@/lib/composerMentions";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -270,6 +338,23 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
     (key) => key.textContent ?? "",
   );
 }
+
+describe("Composer focus handle", () => {
+  it("takes focus for typing, unless disabled or read-only", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { rerender } = render(<Composer {...composerProps()} ref={ref} />);
+    act(() => ref.current?.focus());
+    expect(textarea()).toHaveFocus();
+
+    textarea().blur();
+    rerender(<Composer {...composerProps({ disabled: true })} ref={ref} />);
+    act(() => ref.current?.focus());
+    expect(textarea()).not.toHaveFocus();
+    rerender(<Composer {...composerProps({ permissionLevel: 1 })} ref={ref} />);
+    act(() => ref.current?.focus());
+    expect(textarea()).not.toHaveFocus();
+  });
+});
 
 describe("Composer Escape interrupt", () => {
   beforeEach(() => {
@@ -380,6 +465,23 @@ describe("Composer session drafts", () => {
     await waitFor(() => expect(textarea()).toHaveValue("draft during startup"));
     expect(getSessionDraft("temp:draft")).toBeUndefined();
     expect(getSessionDraft("conv_real")?.text).toBe("draft during startup");
+  });
+
+  it("focuses the composer on a switch unless an inline rename has focus", () => {
+    render(<Composer {...composerProps()} />);
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    expect(textarea()).toHaveFocus();
+
+    const rename = document.createElement("input");
+    rename.setAttribute("data-inline-rename", "");
+    document.body.append(rename);
+    try {
+      rename.focus();
+      act(() => useChatStore.setState({ conversationId: "conv_draft" }));
+      expect(rename).toHaveFocus();
+    } finally {
+      rename.remove();
+    }
   });
 
   it("restores attached files when switching back to a conversation", async () => {
@@ -538,6 +640,64 @@ describe("Composer growth layout", () => {
     );
     expect(ta.parentElement).toHaveClass("overflow-hidden");
   });
+
+  it("publishes mobile overlay height only when it changes and clears it on unmount", () => {
+    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === "(max-width: 767.98px)",
+    }));
+    let height = 48;
+    const getRect = HTMLElement.prototype.getBoundingClientRect;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      return this instanceof HTMLFormElement
+        ? { ...getRect.call(this), height }
+        : getRect.call(this);
+    });
+    let notifyResize = () => {};
+    const disconnect = vi.fn();
+    const OriginalObserver = ResizeObserver;
+    vi.stubGlobal(
+      "ResizeObserver",
+      class extends OriginalObserver {
+        constructor(callback: ResizeObserverCallback) {
+          super(callback);
+          this.observe = (element) => {
+            if (element instanceof HTMLFormElement) {
+              notifyResize = () => callback([], this);
+              this.disconnect = disconnect;
+            }
+          };
+        }
+      },
+    );
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    const onGrowth = vi.fn();
+    const view = render(
+      <div data-chat-surface data-testid="chat-surface">
+        <Composer {...composerProps({ onViewportShrinkPinScroll: onGrowth })} />
+      </div>,
+    );
+    const surface = screen.getByTestId("chat-surface");
+    expect(surface.style.getPropertyValue("--session-composer-height")).toBe("48px");
+    onGrowth.mockClear();
+    act(notifyResize);
+    expect(onGrowth).not.toHaveBeenCalled();
+    height = 112;
+    act(notifyResize);
+    expect(surface.style.getPropertyValue("--session-composer-height")).toBe("112px");
+    expect(onGrowth).toHaveBeenCalledOnce();
+    act(notifyResize);
+    expect(onGrowth).toHaveBeenCalledOnce();
+    view.unmount();
+    expect(disconnect).toHaveBeenCalledOnce();
+    expect(surface.style.getPropertyValue("--session-composer-height")).toBe("");
+  });
 });
 
 describe("Composer send shortcut", () => {
@@ -691,6 +851,8 @@ describe("Composer send shortcut", () => {
     const tooltip = await screen.findByRole("tooltip");
 
     expect(within(tooltip).getByText("Send")).toBeInTheDocument();
+    expect(tooltip).toHaveClass("menu-surface", "bg-popover", "text-popover-foreground");
+    expect(tooltip).not.toHaveClass("bg-slate-900", "text-slate-100");
     expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
   });
 
@@ -764,6 +926,104 @@ describe("Composer Claude goal control", () => {
     fireEvent.click(screen.getByTestId("goal-start"));
 
     expect(onSend).toHaveBeenCalledWith("/goal Finish the implementation and pass tests");
+  });
+});
+
+describe("Composer goal slash command", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_goal", sessionHarness: "codex-native", skills: [] });
+    vi.mocked(getGoal).mockResolvedValue({ goal: null });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.mocked(getGoal).mockReset();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["codex-native", { showGoalControl: true }],
+    ["codex", { showPollyCodexGoalControl: true }],
+    ["claude-sdk", { showClaudeGoalControl: true }],
+  ] as const)(
+    "opens the existing Goal dialog for bare /goal in %s",
+    async (sessionHarness, controls) => {
+      const onSend = vi.fn();
+      const onSendSlashCommand = vi.fn();
+      useChatStore.setState({ sessionHarness });
+      renderWithTooltips(
+        <Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />,
+      );
+      fireEvent.change(textarea(), { target: { value: "/goal" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      expect(await screen.findByRole("dialog", { name: "Goal" })).toBeInTheDocument();
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onSendSlashCommand).not.toHaveBeenCalled();
+      expect(textarea().value).toBe("");
+    },
+  );
+
+  it.each([
+    ["codex-native", { showGoalControl: true }],
+    ["codex", { showPollyCodexGoalControl: true }],
+    ["claude-sdk", { showClaudeGoalControl: true }],
+  ] as const)(
+    "opens Goal from the %s slash menu with a same-named skill",
+    async (sessionHarness, controls) => {
+      const onSend = vi.fn();
+      const onSendSlashCommand = vi.fn();
+      setComposerState({
+        sessionHarness,
+        skills: [{ name: "goal", description: "Project goal skill", display_name: "Project goal" }],
+      });
+      renderWithTooltips(
+        <Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />,
+      );
+      fireEvent.change(textarea(), { target: { value: "/go" } });
+      if (sessionHarness === "codex-native") {
+        expect(screen.getByRole("button", { name: /^\$goal/ })).toBeInTheDocument();
+      }
+      fireEvent.click(
+        screen.getByRole("button", { name: /^\/goal\s*View or set the goal for this session$/ }),
+      );
+      expect(await screen.findByRole("dialog", { name: "Goal" })).toBeInTheDocument();
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onSendSlashCommand).not.toHaveBeenCalled();
+      expect(textarea().value).toBe("");
+    },
+  );
+
+  it("sends the full goal objective as a message rather than a skill invocation", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    useChatStore.setState({ sessionHarness: "codex" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({ onSend, onSendSlashCommand, showPollyCodexGoalControl: true })}
+      />,
+    );
+    fireEvent.change(textarea(), {
+      target: { value: "/goal Finish the implementation and pass all tests" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(onSend.mock.calls[0]?.[0]).toBe("/goal Finish the implementation and pass all tests");
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Goal" })).toBeNull();
+  });
+
+  it("preserves a same-named skill when no Goal control is supported", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    setComposerState({
+      sessionHarness: "claude-sdk",
+      skills: [{ name: "goal", description: "Project goal skill" }],
+    });
+    renderWithTooltips(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    fireEvent.change(textarea(), { target: { value: "/goal" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(onSendSlashCommand).toHaveBeenCalledWith("goal", "");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Goal" })).toBeNull();
   });
 });
 
@@ -1015,6 +1275,229 @@ describe("Composer slash-command menu", () => {
     expect(props.onSend).not.toHaveBeenCalled();
   });
 
+  /** Render the composer for a *harness* session on a server reporting *advertised*. */
+  function renderSessionComposer(
+    harness: "claude-native" | "codex-native" | "claude-sdk",
+    advertised: Partial<typeof FALLBACK_SERVER_INFO> | "loading",
+  ) {
+    const { sessionHarness } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness }));
+    useChatStore.setState({ sessionHarness: harness });
+    const props = composerProps({ isNativeWrapper: harness !== "claude-sdk" });
+    render(
+      <CapabilitiesProvider
+        info={advertised === "loading" ? "loading" : { ...FALLBACK_SERVER_INFO, ...advertised }}
+      >
+        <Composer {...props} />
+      </CapabilitiesProvider>,
+    );
+    return props;
+  }
+
+  function renderClearComposer(
+    harness: "claude-native" | "codex-native" | "claude-sdk",
+    advertised: Partial<typeof FALLBACK_SERVER_INFO> | "loading",
+  ) {
+    const props = renderSessionComposer(harness, advertised);
+    const clearContext = vi.spyOn(useChatStore.getState(), "clearContext").mockResolvedValue();
+    fireEvent.change(textarea(), { target: { value: "/cle" } });
+    return { clearContext, onSend: props.onSend };
+  }
+
+  // Which harness and server combinations offer /clear is unit-tested on
+  // composerOffersClear (ChatPage.test.ts); these cover the composer's entry points.
+  const sdkClear = { session_event_types: ["message", "clear"], session_claude_sdk_clear: true };
+  it.each([
+    ["claude-native", "the menu", { session_event_types: ["message", "clear"] }, null],
+    ["claude-sdk", "the menu", sdkClear, null],
+    ["claude-sdk", "a typed command", sdkClear, null],
+    ["claude-sdk", "a typed command", sdkClear, "Stop the current turn before running /clear."],
+  ] as const)(
+    "%s /clear from %s runs the clear control when the server accepts it (refused: %s)",
+    async (harness, entry, advertised, refusal) => {
+      const { clearContext, onSend } = renderClearComposer(harness, advertised);
+      if (refusal !== null) clearContext.mockRejectedValueOnce(new Error(refusal));
+      if (entry === "the menu") {
+        fireEvent.click(screen.getByTestId("slash-menu-item-clear"));
+      } else {
+        fireEvent.change(textarea(), { target: { value: "/clear" } });
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+      }
+      expect(clearContext).toHaveBeenCalledOnce();
+      // Refused or not, /clear is never sent to the agent as text.
+      expect(onSend).not.toHaveBeenCalled();
+      if (refusal !== null) expect(await screen.findByText(refusal)).toBeVisible();
+    },
+  );
+
+  it.each([
+    // An older server lists "clear" for native sessions but can't clear claude-sdk.
+    ["claude-sdk", { session_event_types: ["message", "clear"] }],
+    ["claude-native", "loading"],
+  ] as const)("%s sends a typed /clear as text when server info is %o", (harness, advertised) => {
+    const { clearContext, onSend } = renderClearComposer(harness, advertised);
+    expect(screen.queryByTestId("slash-menu-item-clear")).toBeNull();
+    fireEvent.change(textarea(), { target: { value: "/clear" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(clearContext).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledExactlyOnceWith("/clear", undefined);
+  });
+
+  function renderRewindComposer(
+    harness: "claude-native" | "claude-sdk" | "codex-native",
+    advertised: Partial<typeof FALLBACK_SERVER_INFO>,
+  ) {
+    const prompts = vi.spyOn(sessionsApi, "fetchRewindPrompts").mockResolvedValue({
+      prompts: [
+        { itemId: "msg_second", text: "Add parser tests" },
+        { itemId: "msg_first", text: "Write the parser" },
+      ],
+      olderCursor: null,
+    });
+    const props = renderSessionComposer(harness, advertised);
+    const rewindToPrompt = vi.spyOn(useChatStore.getState(), "rewindToPrompt");
+    return { prompts, rewindToPrompt, onSend: props.onSend };
+  }
+
+  // Which harnesses offer /rewind is ChatPage.test.ts's gating matrix; the
+  // other /rewind cases here run claude-sdk, so this one runs the native wrapper.
+  it("/rewind lists the prompts and rewinds to the chosen one", async () => {
+    const { prompts, rewindToPrompt, onSend } = renderRewindComposer("claude-native", {
+      session_rewind: true,
+    });
+    rewindToPrompt.mockResolvedValue();
+    fireEvent.change(textarea(), { target: { value: "/rew" } });
+    fireEvent.click(screen.getByTestId("slash-menu-item-rewind"));
+
+    const picker = await screen.findByTestId("rewind-picker");
+    expect(prompts).toHaveBeenCalledWith("conv_test", expect.any(AbortSignal));
+    const rows = await within(picker).findAllByTestId("rewind-prompt");
+    expect(rows.map((row) => row.textContent)).toEqual(["Add parser tests", "Write the parser"]);
+    fireEvent.click(rows[1]);
+
+    expect(rewindToPrompt).toHaveBeenCalledExactlyOnceWith("msg_first");
+    await waitFor(() => expect(screen.queryByTestId("rewind-picker")).toBeNull());
+    expect(textarea()).toHaveValue("");
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("/rewind shows a failed rewind under the composer", async () => {
+    const { rewindToPrompt } = renderRewindComposer("claude-sdk", { session_rewind: true });
+    rewindToPrompt.mockRejectedValue(new Error("Stop the current turn before running /rewind."));
+    fireEvent.change(textarea(), { target: { value: "/rewind" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    fireEvent.click((await screen.findAllByTestId("rewind-prompt"))[0]);
+
+    expect(await screen.findByText("Stop the current turn before running /rewind.")).toBeTruthy();
+  });
+
+  it.each(["untouched", "typed", "sent", "erased-then-left", "edited-while-downloading"] as const)(
+    "/rewind fills the new session's composer when the redirect lands first (%s)",
+    async (edit) => {
+      onTestFinished(() => {
+        clearSessionDrafts();
+        useChatStore.setState({ rewindPrefill: null });
+      });
+      renderRewindComposer("claude-sdk", { session_rewind: true });
+      let respond!: (rewound: Awaited<ReturnType<typeof sessionsApi.rewindSession>>) => void;
+      vi.spyOn(sessionsApi, "rewindSession").mockReturnValue(
+        new Promise((resolve) => {
+          respond = resolve;
+        }),
+      );
+      const diagram = new File(["png"], "diagram.png", { type: "image/png" });
+      let downloaded!: (file: File) => void;
+      const download = vi.spyOn(filesApi, "downloadSessionFile").mockReturnValue(
+        new Promise((resolve) => {
+          downloaded = resolve;
+        }),
+      );
+      fireEvent.change(textarea(), { target: { value: "/rewind" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      fireEvent.click((await screen.findAllByTestId("rewind-prompt"))[1]!);
+
+      // The source's stream redirects before the rewind responds, so the page
+      // opens the new session's composer first.
+      act(() =>
+        handleSessionEvent({
+          type: "session_superseded",
+          conversationId: "conv_test",
+          targetConversationId: "conv_new",
+          reason: "rewind",
+        }),
+      );
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_new");
+      cleanup();
+      act(() =>
+        useChatStore.setState({ conversationId: "conv_new", redirectToConversationId: null }),
+      );
+      const destination = composerProps();
+      render(
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, session_rewind: true }}>
+          <Composer {...destination} />
+        </CapabilitiesProvider>,
+      );
+      expect(textarea()).toHaveValue("");
+      const typedBeforeResponse = !["untouched", "edited-while-downloading"].includes(edit);
+      if (typedBeforeResponse) fireEvent.change(textarea(), { target: { value: "My own words" } });
+      if (edit === "sent") fireEvent.keyDown(textarea(), { key: "Enter" });
+      if (edit === "erased-then-left") {
+        fireEvent.change(textarea(), { target: { value: "" } });
+        act(() => useChatStore.setState({ conversationId: "conv_other" }));
+      }
+
+      await act(async () =>
+        respond({
+          sessionId: "conv_new",
+          prompt: "Write the parser",
+          attachmentsIncomplete: false,
+          attachments: [{ type: "input_image", fileId: "file_new", filename: "diagram.png" }],
+        }),
+      );
+      // The text comes in while the attachment is still downloading.
+      if (edit === "untouched" || edit === "edited-while-downloading") {
+        await waitFor(() => expect(textarea()).toHaveValue("Write the parser"));
+        expect(screen.queryByAltText("diagram.png")).toBeNull();
+      }
+      if (edit === "edited-while-downloading")
+        fireEvent.change(textarea(), { target: { value: "Write the parser, then test it" } });
+      // The attachment arrives last, while the user may be in another chat.
+      await act(async () => downloaded(diagram));
+      if (edit === "erased-then-left")
+        act(() => useChatStore.setState({ conversationId: "conv_new" }));
+
+      // A destination the user already touched gets neither the prompt nor its files.
+      if (typedBeforeResponse) expect(download).not.toHaveBeenCalled();
+      else expect(download).toHaveBeenCalledExactlyOnceWith("conv_new", "file_new", "diagram.png");
+      await waitFor(() => expect(useChatStore.getState().rewindPrefill).toBeNull());
+      const expected = {
+        untouched: "Write the parser",
+        typed: "My own words",
+        sent: "",
+        "erased-then-left": "",
+        "edited-while-downloading": "Write the parser, then test it",
+      };
+      expect(textarea()).toHaveValue(expected[edit]);
+      expect(destination.onSend).toHaveBeenCalledTimes(edit === "sent" ? 1 : 0);
+      if (edit === "untouched") expect(screen.getByAltText("diagram.png")).toBeTruthy();
+      else expect(screen.queryByAltText("diagram.png")).toBeNull();
+    },
+  );
+
+  it.each([
+    ["claude-sdk", {}],
+    ["codex-native", { session_rewind: true }],
+  ] as const)("%s sends a typed /rewind as text when server info is %o", (harness, advertised) => {
+    const { prompts, onSend } = renderRewindComposer(harness, advertised);
+    fireEvent.change(textarea(), { target: { value: "/rew" } });
+    expect(screen.queryByTestId("slash-menu-item-rewind")).toBeNull();
+    fireEvent.change(textarea(), { target: { value: "/rewind" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(screen.queryByTestId("rewind-picker")).toBeNull();
+    expect(prompts).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledExactlyOnceWith("/rewind", undefined);
+  });
+
   it("Tab completes a match found only mid-name (exercises menuMatches, not just the render filter)", () => {
     render(<Composer {...composerProps()} />);
     const ta = textarea();
@@ -1167,6 +1650,107 @@ describe("Composer slash-command submit routing", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it("keeps a skill in the composer while an offline Arca reconnects, then sends it", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    const onShowReconnectHelp = vi.fn();
+    const handlers = { onSend, onSendSlashCommand, onShowReconnectHelp };
+    const { rerender } = render(
+      <Composer {...composerProps({ ...handlers, unreachable: true, sendReconnectsArca: true })} />,
+    );
+    fireEvent.change(textarea(), { target: { value: "/deslop fix the bug" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+    expect(onShowReconnectHelp).toHaveBeenCalledOnce();
+    expect(textarea().value).toBe("/deslop fix the bug");
+    expect(screen.getByText("Send this command again once Arca is back online.")).toBeTruthy();
+
+    // Arca is back: the same command now runs.
+    rerender(<Composer {...composerProps(handlers)} />);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith("deslop", "fix the bug");
+  });
+
+  it.each([
+    ["a skill in a native session", "/deslop fix the bug"],
+    ["unknown slash text", "/foo bar"],
+  ])("sends %s as a message while an offline Arca reconnects", (_kind, text) => {
+    const onSend = vi.fn();
+    const onShowReconnectHelp = vi.fn();
+    render(
+      <Composer
+        {...composerProps({
+          onSend,
+          onShowReconnectHelp,
+          unreachable: true,
+          sendReconnectsArca: true,
+        })}
+      />,
+    );
+    fireEvent.change(textarea(), { target: { value: text } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    // ChatPage's onSend queues it for the host, like any other message.
+    expect(onSend).toHaveBeenCalledExactlyOnceWith(text, undefined);
+    expect(onShowReconnectHelp).not.toHaveBeenCalled();
+    expect(screen.queryByText("Send this command again once Arca is back online.")).toBeNull();
+  });
+
+  it("doesn't steer the queue with Mod+Enter while an offline Arca reconnects", () => {
+    const realSteerAll = useChatStore.getState().steerAllQueuedMessages;
+    const steerAll = vi.fn();
+    useChatStore.setState({ steerAllQueuedMessages: steerAll });
+    try {
+      const onSend = vi.fn();
+      render(
+        <Composer {...composerProps({ onSend, unreachable: true, sendReconnectsArca: true })} />,
+      );
+      fireEvent.change(textarea(), { target: { value: "hi" } });
+      fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+
+      expect(onSend).toHaveBeenCalledExactlyOnceWith("hi", undefined);
+      expect(steerAll).not.toHaveBeenCalled();
+    } finally {
+      useChatStore.setState({ steerAllQueuedMessages: realSteerAll });
+    }
+  });
+
+  it("keeps /clear in the composer while an offline Arca reconnects, then runs it", () => {
+    const realClearContext = useChatStore.getState().clearContext;
+    const clearContext = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ sessionHarness: "claude-native", clearContext });
+    try {
+      const onShowReconnectHelp = vi.fn();
+      const info = { ...FALLBACK_SERVER_INFO, session_event_types: ["clear"] };
+      const { rerender } = render(
+        <CapabilitiesProvider info={info}>
+          <Composer
+            {...composerProps({ onShowReconnectHelp, unreachable: true, sendReconnectsArca: true })}
+          />
+        </CapabilitiesProvider>,
+      );
+      fireEvent.change(textarea(), { target: { value: "/clear" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(clearContext).not.toHaveBeenCalled();
+      expect(onShowReconnectHelp).toHaveBeenCalledOnce();
+      // The menu completes the command, so it stays ready to send.
+      expect(textarea().value.trim()).toBe("/clear");
+
+      rerender(
+        <CapabilitiesProvider info={info}>
+          <Composer {...composerProps({ onShowReconnectHelp })} />
+        </CapabilitiesProvider>,
+      );
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(clearContext).toHaveBeenCalledOnce();
+    } finally {
+      useChatStore.setState({ clearContext: realClearContext });
+    }
+  });
+
   it("routes a skill whose name contains spaces, with and without args", () => {
     // SKILL.md frontmatter names may carry spaces and parentheses; the
     // catalog's full name must match, not just the first token.
@@ -1207,6 +1791,47 @@ describe("Composer slash-command submit routing", () => {
     expect(onSendSlashCommand).toHaveBeenCalledExactlyOnceWith(name, "for this module");
     expect(onSend).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["openai-agents", { session_rewind: true, session_claude_sdk_clear: true }],
+    ["claude-sdk", {}],
+  ] as const)(
+    "%s runs a custom /rewind or /clear when the built-in is off (server info %o)",
+    (harness, advertised) => {
+      useChatStore.setState({ sessionHarness: harness });
+      setComposerState({
+        conversationId: "conv_test",
+        skills: [
+          { name: "rewind", description: "Project rewind helper" },
+          { name: "clear", description: "Project clear helper" },
+        ],
+      });
+      const onSend = vi.fn();
+      const onSendSlashCommand = vi.fn();
+      render(
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...advertised }}>
+          <Composer {...composerProps({ onSend, onSendSlashCommand })} />
+        </CapabilitiesProvider>,
+      );
+      // A typed command, then the menu's selection (which fills "/rewind ").
+      fireEvent.change(textarea(), { target: { value: "/rewind " } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      fireEvent.change(textarea(), { target: { value: "/rew" } });
+      fireEvent.click(screen.getByTestId("slash-menu-item-rewind"));
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      fireEvent.change(textarea(), { target: { value: "/clear " } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(onSendSlashCommand.mock.calls).toEqual([
+        ["rewind", ""],
+        ["rewind", ""],
+        ["clear", ""],
+      ]);
+      expect(screen.queryByTestId("rewind-picker")).toBeNull();
+      expect(screen.queryByText(/is not supported for this agent type/)).toBeNull();
+      expect(onSend).not.toHaveBeenCalled();
+    },
+  );
 
   it("prefers a multi-word skill over a built-in matching only its first word", () => {
     const name = "Help Desk";
@@ -2209,6 +2834,30 @@ describe("Composer model/effort label", () => {
     expect(label()).toHaveTextContent("Polly (Pi)");
   });
 
+  it("shows the harness identity, not the spec pin, for an own-auth ACP session", () => {
+    // Grok Build runs its own model, so the snapshot leaves llmModel null until
+    // the agent reports one. The spec's pinned model must not appear.
+    useChatStore.setState({
+      sessionModelOverride: null,
+      sessionReasoningEffort: null,
+      llmModel: null,
+      sessionHarness: "grok",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "pinned" }],
+          selectedAgentId: "a1",
+          modelPickerKind: null,
+          showModels: false,
+          showEffort: false,
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Grok Build");
+    expect(label()).not.toHaveTextContent("gpt-4o-mini");
+  });
+
   it("names the vendor, not the Task subagent_type, on a Claude Code sub-agent", () => {
     // A claude-native sub-agent child has no model of its own, so the label
     // takes the identity fallback. Its `subAgentName` is Claude's own
@@ -2728,7 +3377,7 @@ describe("Composer shared visible controls", () => {
     { permissionLevel: 4, enabled: true },
   ])(
     "lets only the owner change the permission mode (level $permissionLevel)",
-    ({ permissionLevel, enabled }) => {
+    async ({ permissionLevel, enabled }) => {
       useChatStore.setState({
         conversationId: "owner-only-permissions",
         codexApprovalMode: "ask-for-approval",
@@ -2745,8 +3394,8 @@ describe("Composer shared visible controls", () => {
         return;
       }
       expect(chip).toBeDisabled();
-      expect(chip).toHaveAttribute(
-        "title",
+      fireEvent.pointerMove(chip.parentElement!, { pointerType: "mouse" });
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(
         "Only the session owner can change the permission mode",
       );
       fireEvent.keyDown(chip, { key: "ArrowDown" });
@@ -2770,6 +3419,463 @@ describe("Composer shared visible controls", () => {
   });
 });
 
+describe("Composer permission-mode shortcut", () => {
+  beforeEach(() => {
+    const {
+      conversationId,
+      sessionHarness,
+      claudePermissionMode,
+      codexApprovalMode,
+      setClaudePermissionMode,
+      setCodexApprovalMode,
+    } = useChatStore.getState();
+    // Zustand copies spies into later states, so restore both identity and setters.
+    onTestFinished(() =>
+      useChatStore.setState({
+        conversationId,
+        sessionHarness,
+        claudePermissionMode,
+        codexApprovalMode,
+        setClaudePermissionMode,
+        setCodexApprovalMode,
+      }),
+    );
+  });
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+    clearSessionDrafts();
+  });
+
+  /**
+   * Spy on the Claude setter. By default the store lands on the requested mode;
+   * *answer* can instead throw, or land on another mode, for a given request.
+   */
+  function spyClaudeSetter(answer: (mode: string, call: number) => string | Error = (m) => m) {
+    let call = 0;
+    return vi
+      .spyOn(useChatStore.getState(), "setClaudePermissionMode")
+      .mockImplementation(async (mode) => {
+        const outcome = answer(mode, call++);
+        if (outcome instanceof Error) throw outcome;
+        useChatStore.setState({ claudePermissionMode: outcome });
+      });
+  }
+  const refuseAuto = (mode: string) =>
+    mode === "auto"
+      ? new ApiError("Could not switch to auto mode", 503, "runner_unavailable")
+      : mode;
+
+  function renderClaudeSession(conversationId: string, mode = "default") {
+    useChatStore.setState({
+      conversationId,
+      sessionHarness: "claude-native",
+      claudePermissionMode: mode,
+    });
+    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+    return textarea();
+  }
+  const chip = () => screen.getByTestId("composer-permission-chip");
+  const pressShiftTab = (input: HTMLElement) =>
+    fireEvent.keyDown(input, { key: "Tab", shiftKey: true });
+  const settled = () => waitFor(() => expect(chip()).toBeEnabled());
+  const cycleTo = async (label: string) => {
+    pressShiftTab(textarea());
+    await waitFor(() => expect(chip()).toHaveTextContent(label));
+    await settled();
+  };
+
+  it.each([
+    ["enabled", false, [SHIFT_KEY, "Tab"]],
+    ["disabled", true, []],
+  ])(
+    "lists Shift+Tab on the chip only while the composer is %s",
+    async (_state, disabled, keys) => {
+      useChatStore.setState({
+        conversationId: `chip-${String(disabled)}`,
+        sessionHarness: "claude-native",
+        claudePermissionMode: "default",
+      });
+      renderWithTooltips(
+        <Composer {...composerProps({ showClaudePermissionMode: true, disabled })} />,
+      );
+      fireEvent.pointerMove(chip(), { pointerType: "mouse" });
+      expect(tooltipKeys(await screen.findByRole("tooltip"))).toEqual(keys);
+    },
+  );
+
+  it("cycles a Claude session's mode with Shift+Tab and keeps the draft focused", async () => {
+    const setMode = spyClaudeSetter();
+    const input = renderClaudeSession("cycle-claude");
+    input.focus();
+    fireEvent.change(input, { target: { value: "half-written prompt" } });
+    expect(input).toHaveAttribute("aria-keyshortcuts", "Shift+Tab");
+
+    expect(pressShiftTab(input)).toBe(false);
+    await waitFor(() => expect(chip()).toHaveTextContent("Auto"));
+    await settled();
+    pressShiftTab(input);
+    await waitFor(() => expect(chip()).toHaveTextContent("Accept edits"));
+
+    expect(setMode.mock.calls.map(([mode]) => mode)).toEqual(["auto", "acceptEdits"]);
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("half-written prompt");
+  });
+
+  it("holds Shift+Tab without a second request while a change is in flight", async () => {
+    let finish: () => void = () => {};
+    const setMode = vi.spyOn(useChatStore.getState(), "setClaudePermissionMode").mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const input = renderClaudeSession("cycle-in-flight");
+
+    pressShiftTab(input);
+    await waitFor(() => expect(chip()).toBeDisabled());
+    expect(input).not.toHaveAttribute("aria-keyshortcuts");
+    expect(pressShiftTab(input)).toBe(false);
+    expect(setMode).toHaveBeenCalledTimes(1);
+    finish();
+    await settled();
+    expect(input).toHaveAttribute("aria-keyshortcuts", "Shift+Tab");
+  });
+
+  it("moves past a mode the server refused on the next press", async () => {
+    const setMode = spyClaudeSetter(refuseAuto);
+    const input = renderClaudeSession("cycle-refused");
+
+    pressShiftTab(input);
+    expect(await screen.findByText("Could not switch to auto mode")).toBeInTheDocument();
+    await settled();
+    pressShiftTab(input);
+    await waitFor(() => expect(chip()).toHaveTextContent("Accept edits"));
+    expect(setMode.mock.calls.map(([mode]) => mode)).toEqual(["auto", "acceptEdits"]);
+  });
+
+  it("moves past a mode the server confirmed as a different one", async () => {
+    const setMode = spyClaudeSetter((mode) => (mode === "auto" ? "default" : mode));
+    const input = renderClaudeSession("cycle-downgraded");
+
+    pressShiftTab(input);
+    await waitFor(() => expect(setMode).toHaveBeenCalledTimes(1));
+    await settled();
+    expect(chip()).toHaveTextContent("Manual");
+    pressShiftTab(input);
+    await waitFor(() => expect(chip()).toHaveTextContent("Accept edits"));
+    expect(setMode.mock.calls.map(([mode]) => mode)).toEqual(["auto", "acceptEdits"]);
+  });
+
+  it("reaches a failed mode again on the next lap", async () => {
+    const setMode = spyClaudeSetter((mode, call) =>
+      call === 0 ? new TypeError("Failed to fetch") : mode,
+    );
+    const input = renderClaudeSession("cycle-next-lap");
+
+    pressShiftTab(input);
+    expect(await screen.findByText("Failed to fetch")).toBeInTheDocument();
+    const step = async (label: string) => {
+      await settled();
+      pressShiftTab(input);
+      await waitFor(() => expect(chip()).toHaveTextContent(label));
+    };
+    await step("Accept edits");
+    await step("Plan");
+    await step("Manual");
+    await step("Auto");
+    expect(setMode.mock.calls.map(([mode]) => mode)).toEqual([
+      "auto",
+      "acceptEdits",
+      "plan",
+      "default",
+      "auto",
+    ]);
+  });
+
+  it("starts from the selected mode again after a menu change", async () => {
+    const setMode = spyClaudeSetter((mode, call) => (call === 0 ? refuseAuto(mode) : mode));
+    const input = renderClaudeSession("cycle-menu-reset");
+    const pick = async (mode: string) => {
+      fireEvent.keyDown(chip(), { key: "ArrowDown" });
+      fireEvent.click(screen.getByTestId(`composer-permission-option-${mode}`));
+      await settled();
+    };
+
+    pressShiftTab(input);
+    await screen.findByText("Could not switch to auto mode");
+    await settled();
+    await pick("plan");
+    await pick("default");
+    pressShiftTab(input);
+    await waitFor(() => expect(chip()).toHaveTextContent("Auto"));
+    expect(setMode.mock.calls.map(([mode]) => mode)).toEqual(["auto", "plan", "default", "auto"]);
+  });
+
+  it("cycles through every Codex mode, including Full Access, and wraps", async () => {
+    useChatStore.setState({
+      conversationId: "cycle-codex",
+      sessionHarness: "codex-native",
+      codexApprovalMode: "approve-for-me",
+    });
+    const setApproval = vi
+      .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+      .mockImplementation(async (mode) => {
+        useChatStore.setState({ codexApprovalMode: mode });
+      });
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+
+    await cycleTo("Full Access");
+    await cycleTo("Ask for approval");
+    await cycleTo("Approve for me");
+    expect(setApproval.mock.calls.map(([mode]) => mode)).toEqual([
+      "full-access",
+      "ask-for-approval",
+      "approve-for-me",
+    ]);
+  });
+
+  it("moves past a failed Codex mode to Full Access on the next press", async () => {
+    useChatStore.setState({
+      conversationId: "cycle-codex-retry",
+      sessionHarness: "codex-native",
+      codexApprovalMode: "ask-for-approval",
+    });
+    let call = 0;
+    const setApproval = vi
+      .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+      .mockImplementation(async (mode) => {
+        if (call++ === 0) throw new ApiError("Runner refused", 503, "runner_unavailable");
+        useChatStore.setState({ codexApprovalMode: mode });
+      });
+    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
+
+    pressShiftTab(textarea());
+    await screen.findByText("Runner refused");
+    await settled();
+    expect(pressShiftTab(textarea())).toBe(false);
+    await waitFor(() => expect(chip()).toHaveTextContent("Full Access"));
+    expect(setApproval.mock.calls.map(([mode]) => mode)).toEqual(["approve-for-me", "full-access"]);
+  });
+
+  it.each([
+    { name: "a read-only Codex session", harness: "codex-native", codex: "read-only" },
+    { name: "a Claude session in Don't ask", harness: "claude-native", claude: "dontAsk" },
+  ])("leaves the mode alone in $name, which the chip can't switch back to", (session) => {
+    useChatStore.setState({
+      conversationId: "cycle-off-menu",
+      sessionHarness: session.harness,
+      claudePermissionMode: session.claude ?? "",
+      codexApprovalMode: session.codex ?? "",
+    });
+    const setMode = spyClaudeSetter();
+    const setApproval = vi.spyOn(useChatStore.getState(), "setCodexApprovalMode");
+    renderWithTooltips(
+      <Composer
+        {...composerProps(
+          session.codex ? { showCodexApprovalMode: true } : { showClaudePermissionMode: true },
+        )}
+      />,
+    );
+
+    expect(textarea()).not.toHaveAttribute("aria-keyshortcuts");
+    expect(pressShiftTab(textarea())).toBe(true);
+    expect(setMode).not.toHaveBeenCalled();
+    expect(setApproval).not.toHaveBeenCalled();
+  });
+
+  it("cycles through every Devin mode, including Dangerous, and wraps", async () => {
+    useChatStore.setState({
+      conversationId: "cycle-devin",
+      sessionHarness: "devin-native",
+      claudePermissionMode: "smart",
+    });
+    const setMode = spyClaudeSetter();
+    renderWithTooltips(
+      <Composer {...composerProps({ showClaudePermissionMode: true, modelPickerKind: "devin" })} />,
+    );
+
+    await cycleTo("Dangerous");
+    await cycleTo("Normal");
+    await cycleTo("Accept edits");
+    await cycleTo("Smart");
+    expect(setMode.mock.calls.map(([mode]) => mode)).toEqual([
+      "dangerous",
+      "normal",
+      "accept-edits",
+      "smart",
+    ]);
+  });
+
+  it("leaves Shift+Tab to an open slash menu", () => {
+    const setMode = spyClaudeSetter();
+    const input = renderClaudeSession("cycle-slash");
+    fireEvent.change(input, { target: { value: "/n" } });
+    expect(activeRow()).not.toBeNull();
+
+    expect(pressShiftTab(input)).toBe(false);
+    expect(input).toHaveValue("/new ");
+    expect(setMode).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "a session without a permission control", props: {} },
+    { name: "a viewer", props: { showClaudePermissionMode: true, permissionLevel: 2 } },
+    {
+      name: "a read-only session",
+      props: { showClaudePermissionMode: true, readOnlyReason: "Session is read-only" },
+    },
+    {
+      name: "an unreachable session",
+      props: { showClaudePermissionMode: true, unreachable: true },
+    },
+  ])("leaves Shift+Tab to the browser for $name", ({ props }) => {
+    useChatStore.setState({
+      conversationId: "cycle-inert",
+      sessionHarness: "claude-native",
+      claudePermissionMode: "default",
+    });
+    const setMode = spyClaudeSetter();
+    renderWithTooltips(<Composer {...composerProps(props)} />);
+
+    expect(textarea()).not.toHaveAttribute("aria-keyshortcuts");
+    expect(pressShiftTab(textarea())).toBe(true);
+    expect(setMode).not.toHaveBeenCalled();
+  });
+
+  describe("/permissions", () => {
+    function renderPermissionSession(harness: string, props: Parameters<typeof composerProps>[0]) {
+      useChatStore.setState({
+        conversationId: `permissions-${harness}`,
+        sessionHarness: harness,
+        claudePermissionMode: harness === "devin-native" ? "normal" : "default",
+        codexApprovalMode: "ask-for-approval",
+      });
+      const onSend = vi.fn();
+      renderWithTooltips(<Composer {...composerProps({ onSend, ...props })} />);
+      return onSend;
+    }
+    const renderCodexSession = (props: Parameters<typeof composerProps>[0] = {}) =>
+      renderPermissionSession("codex-native", { showCodexApprovalMode: true, ...props });
+
+    const sendButton = () => screen.getByRole("button", { name: "Send" });
+
+    it("opens the Codex approval-mode control on submit without sending", async () => {
+      const setMode = spyClaudeSetter();
+      const setApproval = vi
+        .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+        .mockResolvedValue(undefined);
+      const onSend = renderCodexSession();
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      // Send skips the slash menu, which would otherwise take the Enter.
+      fireEvent.click(sendButton());
+
+      expect(onSend).not.toHaveBeenCalled();
+      expect(textarea()).toHaveValue("");
+      expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
+      fireEvent.click(screen.getByTestId("composer-permission-option-full-access"));
+      await waitFor(() => expect(setApproval).toHaveBeenCalledWith("full-access"));
+      expect(setMode).not.toHaveBeenCalled();
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("lists /permissions and opens the control from the slash menu", async () => {
+      const onSend = renderCodexSession();
+      fireEvent.change(textarea(), { target: { value: "/perm" } });
+      expect(screen.getByTestId("slash-menu-item-permissions")).toHaveTextContent(
+        "/permissionsChange the approval mode for this session",
+      );
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
+      expect(textarea()).toHaveValue("");
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("refuses to reopen the control while a change is in flight", async () => {
+      let finish: () => void = () => {};
+      const setApproval = vi
+        .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+        .mockImplementation(
+          () =>
+            new Promise<void>((resolve) => {
+              finish = resolve;
+            }),
+        );
+      const onSend = renderCodexSession();
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.click(sendButton());
+      fireEvent.click(await screen.findByTestId("composer-permission-option-approve-for-me"));
+      await waitFor(() => expect(screen.getByTestId("composer-permission-chip")).toBeDisabled());
+
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.click(sendButton());
+      expect(screen.getByText("The permission mode can't be changed right now")).toBeVisible();
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+      expect(onSend).not.toHaveBeenCalled();
+      expect(setApproval).toHaveBeenCalledTimes(1);
+      finish();
+      await waitFor(() => expect(screen.getByTestId("composer-permission-chip")).toBeEnabled());
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.click(sendButton());
+      expect(await screen.findByTestId("composer-permission-menu")).toBeVisible();
+      expect(textarea()).toHaveValue("");
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    // Claude's /permissions edits tool rules, not the mode; Devin has no confirmed equivalent.
+    it.each([
+      {
+        name: "claude-native",
+        harness: "claude-native",
+        props: { showClaudePermissionMode: true },
+      },
+      {
+        name: "devin-native",
+        harness: "devin-native",
+        props: { showClaudePermissionMode: true, modelPickerKind: "devin" as const },
+      },
+      { name: "claude-sdk", harness: "claude-sdk", props: {} },
+    ])("is not listed, and stays plain text, on $name", ({ harness, props }) => {
+      const setMode = spyClaudeSetter();
+      const onSend = renderPermissionSession(harness, props);
+      fireEvent.change(textarea(), { target: { value: "/" } });
+      expect(screen.getByTestId("slash-menu-item-help")).toBeInTheDocument();
+      expect(screen.queryByTestId("slash-menu-item-permissions")).toBeNull();
+
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.click(sendButton());
+      expect(onSend).toHaveBeenCalledWith("/permissions", undefined);
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+      expect(setMode).not.toHaveBeenCalled();
+    });
+
+    it("explains why a non-owner can't open the control and sends nothing", () => {
+      const onSend = renderCodexSession({ permissionLevel: 3 });
+      fireEvent.change(textarea(), { target: { value: "/permissions" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(
+        screen.getByText("Only the session owner can change the permission mode"),
+      ).toBeVisible();
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("rejects arguments without opening the control or sending", () => {
+      const onSend = renderCodexSession();
+      fireEvent.change(textarea(), { target: { value: "/permissions full-access" } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+
+      expect(screen.getByText("/permissions does not accept arguments")).toBeVisible();
+      expect(screen.queryByTestId("composer-permission-menu")).toBeNull();
+      expect(onSend).not.toHaveBeenCalled();
+    });
+  });
+});
+
 describe("Composer background tasks", () => {
   beforeEach(() => {
     clearSessionDrafts();
@@ -2788,32 +3894,51 @@ describe("Composer background tasks", () => {
     clearSessionDrafts();
   });
 
-  it("shows a running monitor in the workspace bar after foreground work ends", () => {
-    useChatStore.setState({
-      backgroundTaskCount: 1,
-      backgroundTasks: [
-        {
-          id: "monitor-ci",
-          type: "shell",
-          status: "running",
-          description: "Watch PR checks",
-          command: "gh pr checks 123 --watch",
-        },
-      ],
-    });
-    renderWithTooltips(<Composer {...composerProps()} />);
+  it.each([false, true])(
+    "keeps a running monitor reachable after foreground work ends (mobile=%s)",
+    (mobile) => {
+      const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+      const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...mediaQuery,
+        media: query,
+        matches: mobile && query === "(max-width: 767.98px)",
+      }));
+      onTestFinished(() => matchMedia.mockRestore());
+      useChatStore.setState({
+        backgroundTaskCount: 1,
+        backgroundTasks: [
+          {
+            id: "monitor-ci",
+            type: "shell",
+            status: "running",
+            description: "Watch PR checks",
+            command: "gh pr checks 123 --watch",
+          },
+        ],
+      });
+      renderWithTooltips(
+        <MobileHeaderControlsProvider>
+          <MobileHeaderControlsSlot sessionId="conv_background_tasks" />
+          <Composer {...composerProps()} />
+        </MobileHeaderControlsProvider>,
+      );
 
-    const workspace = screen.getByTestId("composer-workspace-controls");
-    const trigger = within(workspace).getByRole("button", {
-      name: "1 background task still running",
-    });
-    expect(trigger).toHaveTextContent("1");
-    expect(screen.queryByTestId("subagent-task-pill")).toBeNull();
-    fireEvent.click(trigger);
-    const dialog = screen.getByRole("dialog", { name: "1 background task" });
-    expect(dialog).toHaveTextContent("Watch PR checks");
-    expect(dialog).toHaveTextContent("gh pr checks 123 --watch");
-  });
+      const controls = screen.getByTestId(
+        mobile ? "mobile-header-controls-slot" : "composer-workspace-controls",
+      );
+      const trigger = within(controls).getByRole("button", {
+        name: "1 background task still running",
+      });
+      expect(screen.getAllByTestId("background-task-pill")).toHaveLength(1);
+      if (mobile) expect(screen.queryByTestId("composer-workspace-controls")).toBeNull();
+      expect(trigger).toHaveTextContent("1");
+      expect(screen.queryByTestId("subagent-task-pill")).toBeNull();
+      fireEvent.click(trigger);
+      const dialog = screen.getByRole("dialog", { name: "1 background task" });
+      expect(dialog).toHaveTextContent("Watch PR checks");
+      expect(dialog).toHaveTextContent("gh pr checks 123 --watch");
+    },
+  );
 
   it("shows live task counts and removes the control when all tasks finish", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
@@ -2945,6 +4070,906 @@ describe("Composer effort slash-command visibility", () => {
   });
 });
 
+describe("Composer MCP status command", () => {
+  let previous: ChatState;
+
+  beforeEach(() => {
+    previous = useChatStore.getState();
+    setComposerState({ conversationId: "conv_mcp", boundAgentId: null, skills: [] });
+  });
+
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState(previous, true);
+    composerSessionSnapshot.hostId = null;
+    hostMcpQueryMock.mockReset();
+    hostMcpQueryMock.mockReturnValue({ data: [], isLoading: false, isError: false });
+    sessionAgentQueryMock.mockReset();
+    sessionAgentQueryMock.mockReturnValue({ data: undefined, isError: false });
+    liveMcpQueryMock.mockReset();
+    liveMcpQueryMock.mockReturnValue({ data: undefined, isError: false });
+    liveMcpReconnectMock.mockReset();
+    liveMcpReconnectMock.mockReturnValue({
+      reconnect: vi.fn(),
+      reconnectingName: null,
+      error: null,
+      clearError: vi.fn(),
+    });
+  });
+
+  it("shows the effective session MCPs in a read-only panel", () => {
+    setComposerState({
+      boundAgentId: "agent_mcp",
+      skills: [{ name: "mcp-builder", description: "Build MCP servers" }],
+    });
+    const onSendSlashCommand = vi.fn();
+    render(
+      <MemoryRouter>
+        <Composer
+          {...composerProps({
+            agents: [
+              {
+                id: "agent_mcp",
+                name: "MCP agent",
+                mcp_servers: [
+                  { name: "github", transport: "http", description: "GitHub tools" },
+                  { name: "local-files", transport: "stdio" },
+                ],
+              },
+              {
+                id: "wrong_agent",
+                name: "Wrong agent",
+                mcp_servers: [{ name: "wrong-server", transport: "stdio" }],
+              },
+            ],
+            selectedAgentId: "wrong_agent",
+            onSendSlashCommand,
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    fireEvent.click(screen.getByTestId("slash-menu-item-mcp"));
+
+    expect(textarea()).toHaveValue("/mcp");
+    const panel = screen.getByTestId("mcp-server-menu");
+    expect(panel).toHaveTextContent("Enabled for this session");
+    expect(panel).toHaveTextContent("github");
+    expect(panel).toHaveTextContent("GitHub tools");
+    expect(panel).toHaveTextContent("local-files");
+    expect(panel).not.toHaveTextContent("wrong-server");
+    expect(within(panel).getByRole("link", { name: "Go to Settings" })).toHaveAttribute(
+      "href",
+      "/settings/harnesses",
+    );
+
+    fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(textarea()).toHaveValue("/mcp");
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  /** What the composer told the inventory hook to do about re-reading, given its data. */
+  function hostPollInterval(servers: UseHarnessInventoryModule.HostMcpServer[]): number | false {
+    const calls = hostMcpQueryMock.mock.calls as unknown as unknown[][];
+    const decide = calls.at(-1)?.[2];
+    if (typeof decide !== "function") throw new Error("no refetch decision passed");
+    return (decide as (s: UseHarnessInventoryModule.HostMcpServer[]) => number | false)(servers);
+  }
+
+  const trackerService = {
+    id: "tracker",
+    title: "Tracker",
+    description: "Work tracker tools",
+    auth: "oauth" as const,
+    connected: false,
+    tools: ["search"],
+    connect_provider: "mcp-tracker",
+  };
+
+  function renderWithRegistry(agentServers: { name: string; transport: string }[]) {
+    setComposerState({ boundAgentId: "agent_registry" });
+    return render(
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, enabled_connections: ["mcp"] }}>
+        <MemoryRouter>
+          <Composer
+            {...composerProps({
+              agents: [{ id: "agent_registry", name: "Registry agent", mcp_servers: agentServers }],
+              selectedAgentId: "agent_registry",
+            })}
+          />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it("marks a registry service that needs sign-in and signs it in from the panel", async () => {
+    vi.mocked(registryRequest).mockReset();
+    vi.mocked(authorizeRegistryService).mockReset();
+    vi.mocked(registryRequest).mockResolvedValue({ data: [trackerService] });
+    let finishSignIn!: () => void;
+    vi.mocked(authorizeRegistryService).mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishSignIn = resolve;
+      }),
+    );
+    renderWithRegistry([
+      { name: "tracker", transport: "registry" },
+      { name: "local-files", transport: "stdio" },
+    ]);
+
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    const tracker = await screen.findByTestId("mcp-server-row-tracker");
+    expect(tracker).toHaveTextContent("Work tracker tools");
+    expect(tracker).toHaveTextContent("Sign-in required");
+    // A custom server has no account state and no action.
+    expect(screen.getByTestId("mcp-server-row-local-files")).not.toHaveTextContent("Sign-in");
+    expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(authorizeRegistryService).toHaveBeenCalledWith(
+      trackerService,
+      expect.any(AbortSignal),
+      undefined,
+    );
+    expect(await screen.findByRole("button", { name: "Signing in…" })).toBeDisabled();
+
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [{ ...trackerService, connected: true }],
+    });
+    await act(async () => finishSignIn());
+    await waitFor(() =>
+      expect(screen.getByTestId("mcp-server-row-tracker")).toHaveTextContent("Connected"),
+    );
+    expect(screen.queryByRole("button", { name: /Sign/ })).toBeNull();
+  });
+
+  it("reports a cancelled sign-in on the row and lets the user retry", async () => {
+    vi.mocked(registryRequest).mockReset();
+    vi.mocked(authorizeRegistryService).mockReset();
+    vi.mocked(registryRequest).mockResolvedValue({ data: [trackerService] });
+    vi.mocked(authorizeRegistryService).mockRejectedValue(
+      new Error("Sign-in cancelled. Try again when ready."),
+    );
+    renderWithRegistry([{ name: "tracker", transport: "registry" }]);
+
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Sign in" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Sign-in cancelled");
+    expect(screen.getByRole("button", { name: "Sign in" })).not.toBeDisabled();
+  });
+
+  it.each(["bearer", "databricks"] as const)(
+    "sends a %s service to Settings instead of a popup",
+    async (auth) => {
+      vi.mocked(registryRequest).mockReset();
+      vi.mocked(registryRequest).mockResolvedValue({
+        data: [{ ...trackerService, id: "wiki", auth }],
+      });
+      renderWithRegistry([{ name: "wiki", transport: "registry" }]);
+      fireEvent.change(textarea(), { target: { value: "/mcp" } });
+      expect(await screen.findByRole("link", { name: "Sign in from Settings" })).toHaveAttribute(
+        "href",
+        "/settings/mcp",
+      );
+      expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+    },
+  );
+
+  it("does not reuse the previous open's catalog when /mcp is reopened", async () => {
+    vi.mocked(registryRequest).mockReset();
+    vi.mocked(registryRequest).mockResolvedValue({ data: [trackerService] });
+    renderWithRegistry([{ name: "tracker", transport: "registry" }]);
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+
+    fireEvent.change(textarea(), { target: { value: "" } });
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    // The account may have been connected from Settings since the last open, so
+    // nothing from it is shown, not even for the frame before the new read lands.
+    expect(screen.getByTestId("mcp-server-row-tracker")).not.toHaveTextContent("Sign-in required");
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+  });
+
+  it("does not greet the next open with a sign-in that failed after the panel closed", async () => {
+    vi.mocked(registryRequest).mockReset();
+    vi.mocked(authorizeRegistryService).mockReset();
+    vi.mocked(registryRequest).mockResolvedValue({ data: [trackerService] });
+    let rejectPopup!: (error: Error) => void;
+    vi.mocked(authorizeRegistryService).mockReturnValue(
+      new Promise<void>((_resolve, reject) => {
+        rejectPopup = reject;
+      }),
+    );
+    renderWithRegistry([{ name: "tracker", transport: "registry" }]);
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Sign in" }));
+
+    fireEvent.change(textarea(), { target: { value: "" } });
+    await act(async () => {
+      rejectPopup(new Error("Sign-in cancelled. Try again when ready."));
+    });
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    await screen.findByTestId("mcp-server-row-tracker");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("shows no account state until a catalog read from this open has landed", () => {
+    vi.mocked(registryRequest).mockReset();
+    // Still in flight: a state left from an earlier open would offer a popup
+    // the user may have already completed in Settings.
+    vi.mocked(registryRequest).mockReturnValue(new Promise(() => {}));
+    renderWithRegistry([{ name: "tracker", transport: "registry" }]);
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    const row = screen.getByTestId("mcp-server-row-tracker");
+    expect(row).not.toHaveTextContent("Sign-in required");
+    expect(row).not.toHaveTextContent("Connected");
+    expect(row).not.toHaveTextContent("Not available");
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+  });
+
+  it("marks a registry server the loaded catalog no longer lists as unavailable", async () => {
+    vi.mocked(registryRequest).mockReset();
+    vi.mocked(registryRequest).mockResolvedValue({ data: [trackerService] });
+    renderWithRegistry([
+      { name: "tracker", transport: "registry" },
+      { name: "retired", transport: "registry" },
+    ]);
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    expect(await screen.findByTestId("mcp-server-row-retired")).toHaveTextContent(
+      "Not available to your account",
+    );
+    expect(screen.getByTestId("mcp-server-row-tracker")).toHaveTextContent("Sign-in required");
+  });
+
+  it("reports a catalog that could not be read without hiding the rows", async () => {
+    vi.mocked(registryRequest).mockReset();
+    vi.mocked(registryRequest).mockRejectedValue(new Error("registry down"));
+    renderWithRegistry([{ name: "tracker", transport: "registry" }]);
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Couldn’t check MCP service connections.",
+    );
+    expect(screen.getByTestId("mcp-server-row-tracker")).not.toHaveTextContent("Sign-in");
+  });
+
+  it("does not read the registry when the server has it off", () => {
+    vi.mocked(registryRequest).mockReset();
+    setComposerState({ boundAgentId: "agent_registry" });
+    render(
+      <MemoryRouter>
+        <Composer
+          {...composerProps({
+            agents: [
+              {
+                id: "agent_registry",
+                name: "Registry agent",
+                mcp_servers: [{ name: "tracker", transport: "registry" }],
+              },
+            ],
+            selectedAgentId: "agent_registry",
+          })}
+        />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    expect(screen.getByTestId("mcp-server-row-tracker")).not.toHaveTextContent("Sign-in");
+    expect(registryRequest).not.toHaveBeenCalled();
+  });
+
+  it("does not read the registry when no row is a registry service", () => {
+    vi.mocked(registryRequest).mockReset();
+    renderWithRegistry([{ name: "local-files", transport: "stdio" }]);
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    expect(screen.getByTestId("mcp-server-row-local-files")).toBeInTheDocument();
+    expect(registryRequest).not.toHaveBeenCalled();
+  });
+
+  it("shows an empty state and stays absent before the session starts", () => {
+    setComposerState({ boundAgentId: "agent_empty" });
+    const { unmount } = render(
+      <MemoryRouter>
+        <Composer
+          {...composerProps({
+            agents: [{ id: "agent_empty", name: "Empty agent", mcp_servers: [] }],
+            selectedAgentId: "agent_empty",
+          })}
+        />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "No MCP servers enabled for this session.",
+    );
+    unmount();
+
+    setComposerState({ conversationId: null });
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    expect(screen.queryByTestId("slash-menu-item-mcp")).toBeNull();
+  });
+
+  it("shows native MCPs and navigates to their harness settings without blurring", async () => {
+    const user = userEvent.setup();
+    function Location() {
+      const location = useLocation();
+      return (
+        <output data-testid="location">
+          {location.pathname}
+          {location.search}
+        </output>
+      );
+    }
+    composerSessionSnapshot.hostId = "host_native";
+    setComposerState({ boundAgentId: "agent_native", sessionHarness: "codex-native" });
+    hostMcpQueryMock.mockReturnValue({
+      data: [
+        {
+          name: "docs",
+          harness: "codex",
+          transport: "http",
+          scope: "user",
+          url_host: "docs.example.com",
+        },
+        {
+          name: "host-only",
+          harness: "codex",
+          transport: "stdio",
+          scope: "user",
+        },
+        {
+          name: "github",
+          harness: "claude",
+          transport: "stdio",
+          scope: "user",
+        },
+      ],
+      isLoading: false,
+      isError: false,
+    });
+    render(
+      <MemoryRouter>
+        <Location />
+        <Composer
+          {...composerProps({
+            agents: [
+              {
+                id: "agent_native",
+                name: "Native agent",
+                mcp_servers: [
+                  { name: "docs", transport: "http", description: "Agent docs" },
+                  { name: "agent-only", transport: "stdio" },
+                ],
+              },
+            ],
+          })}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    const panel = screen.getByTestId("mcp-server-menu");
+    expect(panel).toHaveTextContent("docs");
+    expect(panel).toHaveTextContent("Agent docs");
+    expect(panel).not.toHaveTextContent("docs.example.com");
+    expect(panel).toHaveTextContent("host-only");
+    expect(panel).toHaveTextContent("agent-only");
+    expect(panel).not.toHaveTextContent("github");
+    expect(hostMcpQueryMock).toHaveBeenCalledWith("host_native", true, expect.any(Function));
+    await user.click(textarea());
+    await user.pointer({ target: panel, keys: "[MouseLeft>]" });
+    expect(textarea()).toHaveFocus();
+    await user.pointer({ keys: "[/MouseLeft]" });
+    await user.click(within(panel).getByRole("link", { name: "Go to Settings" }));
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      "/settings/harnesses/codex-native?host=host_native",
+    );
+  });
+
+  it.each([false, true])(
+    "distinguishes host loading and errors without hiding agent MCPs: %j",
+    (hasAgentServers) => {
+      const mcpServers = hasAgentServers
+        ? [{ name: "known-agent-server", transport: "stdio" as const }]
+        : [];
+      composerSessionSnapshot.hostId = "host_native";
+      setComposerState({ boundAgentId: "agent_native", sessionHarness: "codex-native" });
+      hostMcpQueryMock.mockReturnValue({ data: undefined, isLoading: true, isError: false });
+      const props = composerProps({
+        agents: [{ id: "agent_native", name: "Native agent", mcp_servers: mcpServers }],
+      });
+      const { unmount } = render(
+        <MemoryRouter>
+          <Composer {...props} />
+        </MemoryRouter>,
+      );
+      fireEvent.change(textarea(), { target: { value: "/mcp" } });
+      expect(screen.getByRole("status")).toHaveTextContent("Loading MCP servers…");
+      if (mcpServers.length)
+        expect(screen.getByTestId("mcp-server-menu")).toHaveTextContent("known-agent-server");
+      unmount();
+
+      hostMcpQueryMock.mockReturnValue({ data: undefined, isLoading: false, isError: true });
+      render(
+        <MemoryRouter>
+          <Composer
+            {...composerProps({
+              agents: [
+                {
+                  id: "agent_native",
+                  name: "Native agent",
+                  mcp_servers: [{ name: "known-agent-server", transport: "stdio" }],
+                },
+              ],
+            })}
+          />
+        </MemoryRouter>,
+      );
+      fireEvent.change(textarea(), { target: { value: "/mcp" } });
+      const panel = screen.getByTestId("mcp-server-menu");
+      expect(panel).toHaveTextContent("known-agent-server");
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Couldn’t load MCP servers from this session’s host.",
+      );
+    },
+  );
+
+  it("shows a host server's reported account state and polls while sign-in is due", () => {
+    composerSessionSnapshot.hostId = "host_native";
+    setComposerState({ boundAgentId: "agent_native", sessionHarness: "claude-native" });
+    const hostRows = [
+      {
+        name: "github",
+        harness: "claude",
+        transport: "stdio",
+        scope: "user",
+        auth_status: "connected",
+      },
+      {
+        name: "linear",
+        harness: "claude",
+        transport: "http",
+        scope: "user",
+        url_host: "mcp.linear.app",
+        auth_status: "sign_in_required",
+        sign_in_url: "https://auth.example.com/start?state=abc",
+      },
+      { name: "local-files", harness: "claude", transport: "stdio", scope: "user" },
+    ] satisfies UseHarnessInventoryModule.HostMcpServer[];
+    hostMcpQueryMock.mockReturnValue({ data: hostRows, isLoading: false, isError: false });
+    const { rerender } = render(
+      <MemoryRouter>
+        <Composer
+          {...composerProps({
+            agents: [{ id: "agent_native", name: "Native agent", mcp_servers: [] }],
+          })}
+        />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    expect(screen.getByTestId("mcp-server-row-github")).toHaveTextContent("Connected");
+    const linear = screen.getByTestId("mcp-server-row-linear");
+    expect(linear).toHaveTextContent("Sign-in required");
+    // The host's own sign-in page opens in a new tab; nothing runs in the composer.
+    const signIn = within(linear).getByRole("link", { name: "Sign in" });
+    expect(signIn).toHaveAttribute("href", "https://auth.example.com/start?state=abc");
+    expect(signIn).toHaveAttribute("target", "_blank");
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+    expect(screen.getByTestId("mcp-server-row-local-files")).not.toHaveTextContent("Sign-in");
+    expect(hostPollInterval(hostRows)).toBe(5000);
+
+    // Once the host reports the account connected, the row follows and polling stops.
+    const connected = hostRows.map((row) =>
+      row.name === "linear" ? { ...row, auth_status: "connected", sign_in_url: null } : row,
+    ) satisfies UseHarnessInventoryModule.HostMcpServer[];
+    hostMcpQueryMock.mockReturnValue({ data: connected, isLoading: false, isError: false });
+    rerender(
+      <MemoryRouter>
+        <Composer
+          {...composerProps({
+            agents: [{ id: "agent_native", name: "Native agent", mcp_servers: [] }],
+          })}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("mcp-server-row-linear")).toHaveTextContent("Connected");
+    expect(screen.queryByRole("link", { name: "Sign in" })).toBeNull();
+    expect(hostPollInterval(connected)).toBe(false);
+
+    // Closing the panel disables the read, so a pending sign-in stops polling too.
+    fireEvent.change(textarea(), { target: { value: "" } });
+    expect(hostMcpQueryMock).toHaveBeenLastCalledWith("host_native", false, expect.any(Function));
+  });
+
+  it.each([
+    { loadsUserSettings: undefined, agentLoaded: true, agentFailed: false, userRowShown: true },
+    // `skills: none` runs claude-sdk with no setting sources: only managed servers load.
+    { loadsUserSettings: false, agentLoaded: true, agentFailed: false, userRowShown: false },
+    // The session's agent is still loading.
+    { loadsUserSettings: undefined, agentLoaded: false, agentFailed: false, userRowShown: false },
+    // Its request failed: managed servers only, with a status saying why.
+    { loadsUserSettings: undefined, agentLoaded: false, agentFailed: true, userRowShown: false },
+    // A failed refetch keeps the earlier agent's data: still managed only, with the status.
+    { loadsUserSettings: undefined, agentLoaded: true, agentFailed: true, userRowShown: false },
+  ])(
+    "lists the host's Claude servers in a claude-sdk session: %j",
+    ({ loadsUserSettings, agentLoaded, agentFailed, userRowShown }) => {
+      composerSessionSnapshot.hostId = "host_sdk";
+      setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
+      const agent = {
+        id: "agent_sdk",
+        name: "SDK agent",
+        mcp_servers: [],
+        loads_user_settings: loadsUserSettings,
+      };
+      sessionAgentQueryMock.mockReturnValue({
+        data: agentLoaded ? agent : undefined,
+        isError: agentFailed,
+      });
+      const hostRows = [
+        {
+          name: "corp-tools",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          managed: true,
+          auth_status: "connected",
+        },
+        {
+          name: "linear",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "sign_in_required",
+          sign_in_url: "https://auth.example.com/start",
+        },
+        { name: "codex-only", harness: "codex", transport: "stdio", scope: "user" },
+      ] satisfies UseHarnessInventoryModule.HostMcpServer[];
+      hostMcpQueryMock.mockReturnValue({ data: hostRows, isLoading: false, isError: false });
+      render(
+        <MemoryRouter>
+          <Composer {...composerProps({ agents: [agent] })} />
+        </MemoryRouter>,
+      );
+      fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+      expect(hostMcpQueryMock).toHaveBeenCalledWith("host_sdk", true, expect.any(Function));
+      expect(screen.getByTestId("mcp-server-row-corp-tools")).toHaveTextContent("Connected");
+      expect(screen.queryByTestId("mcp-server-row-linear") !== null).toBe(userRowShown);
+      expect(screen.queryByTestId("mcp-server-row-codex-only")).toBeNull();
+      expect(
+        screen.queryByText(
+          "Couldn’t load this session’s agent, so only managed MCP servers are shown.",
+        ) !== null,
+      ).toBe(agentFailed);
+      expect(
+        screen.queryByText(
+          "Loading this session’s agent; only managed MCP servers are shown so far.",
+        ) !== null,
+      ).toBe(!agentLoaded && !agentFailed);
+      expect(screen.getByRole("link", { name: "Go to Settings" })).toHaveAttribute(
+        "href",
+        "/settings/harnesses/claude-native?host=host_sdk",
+      );
+      // A hidden row awaiting sign-in does not keep the panel polling.
+      expect(hostPollInterval(hostRows)).toBe(userRowShown ? 5000 : false);
+      // A managed row awaiting sign-in polls whether or not user rows show.
+      const managedSignIn = { ...hostRows[0], auth_status: "sign_in_required" as const };
+      expect(hostPollInterval([managedSignIn])).toBe(5000);
+      expect(sessionAgentQueryMock).toHaveBeenCalledWith("conv_mcp");
+    },
+  );
+
+  it("shows the claude-sdk harness's live connections and reconnects by its name", () => {
+    composerSessionSnapshot.hostId = "host_sdk";
+    setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
+    const agent = {
+      id: "agent_sdk",
+      name: "SDK agent",
+      mcp_servers: [{ name: "glean", transport: "http" as const, description: "Agent glean" }],
+    };
+    sessionAgentQueryMock.mockReturnValue({ data: agent, isError: false });
+    hostMcpQueryMock.mockReturnValue({
+      data: [
+        { name: "search", harness: "claude", plugin: "tools", transport: "http", scope: "user" },
+        { name: "search", harness: "claude", plugin: "crm", transport: "http", scope: "user" },
+        {
+          name: "wiki",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "connected",
+        },
+        { name: "glean", harness: "claude", transport: "http", scope: "user" },
+        {
+          name: "mail",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "connected",
+        },
+      ],
+      isLoading: false,
+      isError: false,
+    });
+    liveMcpQueryMock.mockReturnValue({
+      data: {
+        live: true,
+        servers: [
+          { name: "plugin:tools:search", status: "failed", error: "token expired" },
+          { name: "plugin:crm:search", status: "connected" },
+          { name: "search", status: "pending", scope: "user" },
+          { name: "wiki", status: "needs-auth" },
+          { name: "glean", status: "connected" },
+          { name: "project-db", status: "connected", scope: "project" },
+        ],
+      },
+      isError: false,
+    });
+    const reconnect = vi.fn();
+    liveMcpReconnectMock.mockReturnValue({
+      reconnect,
+      reconnectingName: null,
+      error: null,
+      clearError: vi.fn(),
+    });
+    const { rerender } = render(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [agent] })} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    expect(liveMcpQueryMock).toHaveBeenLastCalledWith("conv_mcp", true);
+    // Each plugin's host row matches the CLI's prefixed name, and the CLI's own
+    // unprefixed "search" keeps a row of its own.
+    expect(
+      screen.getAllByTestId("mcp-live-status-search").map((status) => status.textContent),
+    ).toEqual([
+      "In this session: Failed: token expired",
+      "In this session: Connected",
+      "In this session: Connecting…",
+    ]);
+    expect(screen.getByTestId("mcp-server-row-wiki")).toHaveTextContent("Account: Connected");
+    expect(screen.getByTestId("mcp-live-status-wiki")).toHaveTextContent("Needs sign-in");
+    // Servers only the CLI loaded still show.
+    expect(screen.getByTestId("mcp-live-status-project-db")).toHaveTextContent("Connected");
+    // An agent server sharing a host name is a different endpoint and gets no live state.
+    expect(screen.getByTestId("mcp-server-row-glean")).toHaveTextContent("Agent glean");
+    expect(screen.queryByTestId("mcp-live-status-glean")).toBeNull();
+    // A signed-in host server the CLI did not load is not shown as simply connected.
+    expect(screen.getByTestId("mcp-server-row-mail")).toHaveTextContent("Account: Connected");
+    expect(screen.getByTestId("mcp-live-status-mail")).toHaveTextContent("Not loaded");
+    expect(screen.queryByTestId("mcp-reconnect-mail")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("mcp-reconnect-search"));
+    expect(reconnect).toHaveBeenCalledWith("plugin:tools:search");
+
+    // A failed re-read keeps its last data, which no longer counts as live.
+    liveMcpQueryMock.mockReturnValue({ ...liveMcpQueryMock(), isError: true });
+    rerender(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [agent] })} />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("mcp-live-status-wiki")).toBeNull();
+    expect(screen.queryByTestId("mcp-reconnect-search")).toBeNull();
+
+    // A refused reconnect whose follow-up status read failed still shows the refusal.
+    liveMcpQueryMock.mockReturnValue({
+      data: { live: false, reason: "unavailable", servers: [] },
+      isError: false,
+    });
+    liveMcpReconnectMock.mockReturnValue({
+      reconnect,
+      reconnectingName: null,
+      error: { name: "plugin:tools:search", message: "token expired" },
+      clearError: vi.fn(),
+    });
+    rerender(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [agent] })} />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("mcp-live-status-search")).toBeNull();
+    expect(screen.getByTestId("mcp-reconnect-error")).toHaveTextContent(
+      "Reconnecting plugin:tools:search failed: token expired",
+    );
+  });
+
+  it("notes why a claude-sdk session shows no live state", () => {
+    const data = { live: false, reason: "not_running" as const, servers: [] };
+    composerSessionSnapshot.hostId = "host_sdk";
+    setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
+    const agent = { id: "agent_sdk", name: "SDK agent", mcp_servers: [] };
+    sessionAgentQueryMock.mockReturnValue({ data: agent, isError: false });
+    liveMcpQueryMock.mockReturnValue({ data, isError: false });
+    render(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [agent] })} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Live connection status appears once this session’s agent is running; send a message to start it.",
+    );
+  });
+
+  it("does not ask a native harness for live MCP connections", () => {
+    composerSessionSnapshot.hostId = "host_native";
+    setComposerState({ boundAgentId: "agent_native", sessionHarness: "claude-native" });
+    render(
+      <MemoryRouter>
+        <Composer {...composerProps({ agents: [] })} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+    expect(liveMcpQueryMock).toHaveBeenLastCalledWith("conv_mcp", false);
+  });
+
+  it("shows only the agent's servers in a claude-sdk session with no host", () => {
+    setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
+    render(
+      <MemoryRouter>
+        <Composer
+          {...composerProps({
+            agents: [
+              {
+                id: "agent_sdk",
+                name: "SDK agent",
+                mcp_servers: [{ name: "github", transport: "http", description: "GitHub tools" }],
+              },
+            ],
+          })}
+        />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    expect(screen.getByTestId("mcp-server-row-github")).toHaveTextContent("GitHub tools");
+    expect(screen.queryByText(/Host MCP servers unavailable/)).toBeNull();
+    expect(hostMcpQueryMock).toHaveBeenLastCalledWith(null, false, expect.any(Function));
+  });
+
+  it("does not lend a host server's account state to an agent server of the same name", () => {
+    composerSessionSnapshot.hostId = "host_native";
+    setComposerState({ boundAgentId: "agent_native", sessionHarness: "claude-native" });
+    hostMcpQueryMock.mockReturnValue({
+      data: [
+        {
+          name: "linear",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "sign_in_required",
+          sign_in_url: "https://auth.example.com/start",
+        },
+      ] satisfies UseHarnessInventoryModule.HostMcpServer[],
+      isLoading: false,
+      isError: false,
+    });
+    render(
+      <MemoryRouter>
+        <Composer
+          {...composerProps({
+            agents: [
+              {
+                id: "agent_native",
+                name: "Native agent",
+                mcp_servers: [{ name: "linear", transport: "http", description: "Agent linear" }],
+              },
+            ],
+          })}
+        />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    const row = screen.getByTestId("mcp-server-row-linear");
+    expect(row).toHaveTextContent("Agent linear");
+    // Same name, possibly a different endpoint: a Sign in here could send the user
+    // to the wrong service, so the row reports nothing.
+    expect(row).not.toHaveTextContent("Sign-in required");
+    expect(within(row).queryByRole("link", { name: "Sign in" })).toBeNull();
+  });
+
+  it("ignores a host sign-in page that is not an http(s) URL", () => {
+    composerSessionSnapshot.hostId = "host_native";
+    setComposerState({ boundAgentId: "agent_native", sessionHarness: "claude-native" });
+    hostMcpQueryMock.mockReturnValue({
+      data: [
+        {
+          name: "linear",
+          harness: "claude",
+          transport: "http",
+          scope: "user",
+          auth_status: "sign_in_required",
+          // Rejected host-side and at the decoder; this is the last gate before href.
+          sign_in_url: "javascript:alert(1)",
+        },
+      ] as unknown as UseHarnessInventoryModule.HostMcpServer[],
+      isLoading: false,
+      isError: false,
+    });
+    render(
+      <MemoryRouter>
+        <Composer
+          {...composerProps({
+            agents: [{ id: "agent_native", name: "Native agent", mcp_servers: [] }],
+          })}
+        />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp" } });
+
+    const row = screen.getByTestId("mcp-server-row-linear");
+    expect(row).toHaveTextContent("Sign-in required");
+    expect(within(row).queryByRole("link", { name: "Sign in" })).toBeNull();
+  });
+
+  it.each(["claude-native", "codex-native", "cursor-native"] as const)(
+    "keeps host status unknown until a routing host is available for %s",
+    (harness) => {
+      setComposerState({ boundAgentId: "agent_native", sessionHarness: harness });
+      hostMcpQueryMock.mockReturnValue({ data: undefined, isLoading: false, isError: false });
+      const { rerender } = render(
+        <MemoryRouter>
+          <Composer
+            {...composerProps({
+              agents: [
+                {
+                  id: "agent_native",
+                  name: "Native agent",
+                  mcp_servers: [{ name: "known-agent-server", transport: "stdio" }],
+                },
+              ],
+            })}
+          />
+        </MemoryRouter>,
+      );
+      fireEvent.change(textarea(), { target: { value: "/mcp" } });
+      const panel = screen.getByTestId("mcp-server-menu");
+      expect(panel).toHaveTextContent("known-agent-server");
+      expect(panel).toHaveTextContent("Host MCP servers unavailable");
+      expect(panel).not.toHaveTextContent("No MCP servers enabled");
+      expect(hostMcpQueryMock).toHaveBeenLastCalledWith(null, true, expect.any(Function));
+      rerender(
+        <MemoryRouter>
+          <Composer {...composerProps({ agents: [] })} />
+        </MemoryRouter>,
+      );
+      expect(panel).not.toHaveTextContent("known-agent-server");
+      expect(panel).toHaveTextContent("Host MCP servers unavailable");
+      expect(panel).not.toHaveTextContent("No MCP servers enabled");
+
+      hostMcpQueryMock.mockReturnValue({ data: undefined, isLoading: true, isError: false });
+      act(() => setSessionHost("conv_mcp", "late-host"));
+      expect(hostMcpQueryMock).toHaveBeenLastCalledWith("late-host", true, expect.any(Function));
+      expect(panel).toHaveTextContent("Loading MCP servers…");
+      expect(panel).not.toHaveTextContent("Host MCP servers unavailable");
+      act(() => setSessionHost("conv_mcp", null));
+    },
+  );
+
+  it("shows usage feedback for unsupported arguments", () => {
+    render(
+      <MemoryRouter>
+        <Composer {...composerProps()} />
+      </MemoryRouter>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/mcp list" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(screen.getByText("Usage: /mcp")).toBeInTheDocument();
+  });
+});
+
 describe("Composer Codex Plan-mode control", () => {
   const realSetCodexPlanMode = useChatStore.getState().setCodexPlanMode;
 
@@ -2987,7 +5012,6 @@ describe("Composer Codex Plan-mode control", () => {
   it("keeps Plan in the shared menu instead of a separate toolbar button", () => {
     renderWithTooltips(<Composer {...composerProps({ showCodexPlanMode: true })} />);
 
-    expect(screen.getByTestId("composer-action-row")).toHaveClass("@container/composer-actions");
     expect(screen.queryByRole("button", { name: "Enter Plan mode" })).toBeNull();
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     expect(screen.getByRole("menuitem", { name: "Enter Plan mode" })).toBeInTheDocument();
@@ -3564,6 +5588,20 @@ describe("Composer placeholder", () => {
     expect(textarea().disabled).toBe(true);
     expect(textarea().placeholder).toMatch(/reconnect below/i);
   });
+
+  it.each([
+    ["ready", false, "Send a message to reconnect Arca…"],
+    ["still loading agents", true, "Waiting for agents…"],
+  ])(
+    "lets an offline Arca session type and says sending reconnects it: %s",
+    (_state, disabled, placeholder) => {
+      render(
+        <Composer {...composerProps({ unreachable: true, sendReconnectsArca: true, disabled })} />,
+      );
+      expect(textarea().disabled).toBe(disabled);
+      expect(textarea().placeholder).toBe(placeholder);
+    },
+  );
 });
 
 // A pending elicitation parks the agent's turn server-side on the verdict
@@ -3679,15 +5717,23 @@ describe("Composer pending elicitation", () => {
     expect(onSend).toHaveBeenCalledWith("carry on", undefined);
   });
 
-  it("ignores mirrored sub-agent elicitations addressed to a child session", () => {
-    // A child's prompt mirrored into this chat doesn't park THIS session's
-    // turn — inbox talk-back to the parent must keep working.
-    useChatStore.setState({ blocks: [elicitationBlock({ targetSessionId: "conv_child" })] });
+  // Neither card parks THIS session's turn: a child's prompt mirrored into
+  // this chat, or a question the agent keeps working past.
+  it.each([
+    [
+      "mirrored sub-agent elicitations addressed to a child session",
+      "conv_mirrored",
+      { targetSessionId: "conv_child" },
+    ],
+    ["non-blocking question cards", "conv_non_blocking", { isBlocking: false as const }],
+  ])("ignores %s", (_case, conversationId, overrides) => {
+    useChatStore.setState({ conversationId, blocks: [elicitationBlock(overrides)] });
     const onSend = vi.fn();
     render(<Composer {...composerProps({ onSend })} />);
     const ta = textarea();
 
     expect(ta.disabled).toBe(false);
+    expect(ta.placeholder).not.toBe("Respond to the pending request above to continue");
     fireEvent.change(ta, { target: { value: "status update please" } });
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("status update please", undefined);
@@ -3809,6 +5855,16 @@ describe("Composer reply quotes", () => {
     act(() => ref.current?.appendReplyQuote("Not editable"));
     expect(textarea()).toHaveValue("");
     expect(hasSessionDraft("conv_test")).toBe(false);
+  });
+
+  it("inserts into an unreachable composer whose send reconnects Arca", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(
+      <Composer {...composerProps({ unreachable: true, sendReconnectsArca: true })} ref={ref} />,
+    );
+    act(() => ref.current?.appendReplyQuote("Quoted while offline"));
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Quoted while offline");
+    expect(hasSessionDraft("conv_test")).toBe(true);
   });
 
   it("removes a quote without stealing focus or reinserting it on rerender", () => {
@@ -4001,6 +6057,109 @@ describe("Composer reply quotes", () => {
     expect(textarea()).toHaveValue(before + tail);
   });
 
+  it("shows Esc in the Interrupt button tooltip while a turn is running", async () => {
+    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Interrupt" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Interrupt");
+    expect(tooltipKeys(tooltip)).toEqual(["Esc"]);
+  });
+
+  it("drops Esc from the Interrupt tooltip while dictation listens, which takes Esc", async () => {
+    const recognizer: { start?: () => void } = {};
+    vi.stubGlobal(
+      "SpeechRecognition",
+      class {
+        lang = "en-US";
+        continuous = false;
+        interimResults = false;
+        start = vi.fn();
+        stop = vi.fn();
+        abort = vi.fn();
+        addEventListener(type: string, handler: () => void) {
+          if (type === "start") recognizer.start = handler;
+        }
+        removeEventListener() {}
+      },
+    );
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    const props = composerProps({ status: "streaming", isWorking: true });
+    renderWithTooltips(<Composer {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => recognizer.start?.());
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Interrupt" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Interrupt");
+    expect(tooltipKeys(tooltip)).toEqual([]);
+
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).not.toHaveBeenCalled();
+  });
+
+  it("drops Esc from the Interrupt tooltip while the composer is disabled", async () => {
+    renderWithTooltips(
+      <Composer {...composerProps({ status: "streaming", isWorking: true, disabled: true })} />,
+    );
+    expect(textarea()).toBeDisabled();
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Interrupt" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Interrupt");
+    expect(tooltipKeys(tooltip)).toEqual([]);
+  });
+
+  it("shows the ↑ hint only on the queue tail that an empty composer's ↑ recalls", async () => {
+    useChatStore.setState({
+      status: "streaming",
+      sessionStatus: "running",
+      queuedMessages: [
+        { queueId: "q_1", conversationId: "conv_test", text: "first queued" },
+        { queueId: "q_2", conversationId: "conv_test", text: "second queued" },
+      ],
+    });
+    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    const edits = screen.getAllByRole("button", { name: "Edit queued message" });
+    fireEvent.pointerMove(edits[1]!, { pointerType: "mouse" });
+    expect(tooltipKeys(await screen.findByRole("tooltip"))).toEqual(["↑"]);
+  });
+
+  it("drops the ↑ hint while the composer holds text, since ↑ then moves the caret", async () => {
+    useChatStore.setState({
+      status: "streaming",
+      sessionStatus: "running",
+      queuedMessages: [{ queueId: "q_1", conversationId: "conv_test", text: "queued" }],
+    });
+    renderWithTooltips(<Composer {...composerProps({ status: "streaming", isWorking: true })} />);
+    fireEvent.change(textarea(), { target: { value: "typing" } });
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Edit queued message" }), {
+      pointerType: "mouse",
+    });
+    expect(tooltipKeys(await screen.findByRole("tooltip"))).toEqual([]);
+  });
+
+  it("drops the ↑ hint while the composer is disabled, since it can't take ↑", async () => {
+    useChatStore.setState({
+      status: "streaming",
+      sessionStatus: "running",
+      queuedMessages: [{ queueId: "q_1", conversationId: "conv_test", text: "queued" }],
+    });
+    renderWithTooltips(
+      <Composer {...composerProps({ status: "streaming", isWorking: true, disabled: true })} />,
+    );
+    expect(textarea()).toBeDisabled();
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Edit queued message" }), {
+      pointerType: "mouse",
+    });
+    expect(tooltipKeys(await screen.findByRole("tooltip"))).toEqual([]);
+  });
+
   it("recalls actual cards from history without reclassifying authored Markdown", () => {
     const props = composerProps();
     const ref = createRef<ComponentRef<typeof Composer>>();
@@ -4033,8 +6192,6 @@ describe("Composer reply quotes", () => {
       JSON.stringify([{ text: serializeReplyDraft(replyDraft), replyDraft }]),
     );
     render(<Composer {...composerProps()} />);
-    fireEvent.change(textarea(), { target: { value: "Draft from before recall" } });
-    textarea().setSelectionRange(0, 0);
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
     fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
     const edited = "Introduction\n\nAnswer to keep";
@@ -4048,12 +6205,13 @@ describe("Composer reply quotes", () => {
   it("exits history recall on the first manual text edit", () => {
     localStorage.setItem("omnigent:prompt-history:conv_test", JSON.stringify(["Older prompt"]));
     render(<Composer {...composerProps()} />);
-    fireEvent.change(textarea(), { target: { value: "Draft from before recall" } });
-    textarea().setSelectionRange(0, 0);
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
     expect(textarea()).toHaveValue("Older prompt");
     const edited = "My edited prompt";
     fireEvent.change(textarea(), { target: { value: edited } });
+    textarea().setSelectionRange(0, 0);
+    expect(fireEvent.keyDown(textarea(), { key: "ArrowUp" })).toBe(true);
+    expect(textarea()).toHaveValue(edited);
     textarea().setSelectionRange(edited.length, edited.length);
     fireEvent.keyDown(textarea(), { key: "ArrowDown" });
     expect(textarea()).toHaveValue(edited);
@@ -4212,6 +6370,48 @@ describe("Composer reply quotes", () => {
     expect(useChatStore.getState().restoredSendDraft).toBeNull();
   });
 
+  it.each<[string, StoredReplyDraft | undefined, string]>([
+    ["a message", undefined, "also check the docs\n\nrun the linter next"],
+    [
+      "a reply",
+      {
+        version: 1,
+        quotes: [{ before: "", text: "the failing test" }],
+        text: "run the linter next",
+      },
+      "also check the docs\n\n> the failing test\n\nrun the linter next",
+    ],
+  ])(
+    "adds %s recovered on load after the draft the reload kept, sending neither",
+    async (_, replyDraft, joined) => {
+      setSessionDraft("conv_test", { text: "also check the docs", files: [] });
+      const props = composerProps();
+      render(<Composer {...props} />);
+      expect(textarea()).toHaveValue("also check the docs");
+
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text: replyDraft ? serializeReplyDraft(replyDraft) : "run the linter next",
+            files: [],
+            stableId: "stable_queued",
+            ...(replyDraft ? { replyDraft } : {}),
+            serverRefused: false,
+            recovered: true,
+          },
+        }),
+      );
+
+      expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(replyDraft ? 1 : 0);
+      expect(props.onSend).not.toHaveBeenCalled();
+      // The joined text is a new message, kept for another reload.
+      expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+      expect(useChatStore.getState().restoredSendDraft).toBeNull();
+      await waitFor(() => expect(getSessionDraft("conv_test")?.text).toBe(joined));
+    },
+  );
+
   it("drops a failed-send draft whose message already committed under its stable id", () => {
     const stableId = "e".repeat(32);
     render(<Composer {...composerProps()} />);
@@ -4338,6 +6538,149 @@ describe("Composer reply quotes", () => {
     },
   );
 
+  it("preserves review context through legacy edits and a failed deletion, then sends or removes it", async () => {
+    const props = composerProps();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <Composer {...props} ref={ref} />
+      </QueryClientProvider>,
+    );
+    act(() => ref.current?.appendReplyQuote("Existing quote"));
+    fireEvent.change(textarea(), { target: { value: "My instructions" } });
+    const comment = {
+      id: "123",
+      conversation_id: "conv_test",
+      path: "src/example.ts",
+      start_index: 0,
+      end_index: 0,
+      body: "Preserve the public API.",
+      status: "draft" as const,
+      created_at: 1,
+      updated_at: 1,
+      anchor_content: null,
+      created_by: null,
+      anchor_metadata: {
+        pr_url: "https://github.com/acme/repo/pull/1",
+        side: "RIGHT" as const,
+        line: 12,
+        start_line: null,
+        head_sha: "a".repeat(40),
+        base_sha: "b".repeat(40),
+      },
+    };
+    act(() => requestLocalReviewContext({ ...comment, conversation_id: "other-session" }));
+    expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
+    act(() => requestLocalReviewContext(comment));
+    expect(
+      screen.getByLabelText("Open local review comment src/example.ts:12 (new)"),
+    ).toBeInTheDocument();
+    expect(textarea()).toHaveValue("My instructions");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Existing quote");
+    expect(props.onSend).not.toHaveBeenCalled();
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    act(() =>
+      updateLocalReviewContext({ ...comment, body: "Updated review", anchor_metadata: undefined }),
+    );
+    expect(
+      screen.getByLabelText("Open local review comment src/example.ts:12 (new)"),
+    ).toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain('"id": "123"');
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain("Updated review");
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain("[Attached: src/example.ts]");
+    const [sentText, , sentReply] = vi.mocked(props.onSend).mock.calls[0]!;
+    expect(serializeReplyDraft(sentReply!)).toBe(sentText);
+    expect(sentText.indexOf("My instructions")).toBeLessThan(
+      sentText.indexOf("```local-review-comment"),
+    );
+    expect(sentText).not.toContain("Please address these local review comments:");
+    expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
+    act(() => requestLocalReviewContext(comment));
+    act(() => ref.current?.appendReplyQuote("Keep this quote"));
+    fireEvent.change(textarea(), { target: { value: "Keep these instructions" } });
+    const attachment = new File(["notes"], "notes.txt", { type: "text/plain" });
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [attachment] },
+    });
+    const draft = getSessionDraft("conv_test");
+    expect(draft?.files).toEqual([attachment]);
+    const request = vi.spyOn(identity, "authenticatedFetch");
+    request.mockRejectedValueOnce(new TypeError("Network error"));
+    request.mockResolvedValueOnce(new Response(null, { status: 404 }));
+    const error = vi.spyOn(toast, "error");
+    fireEvent.click(screen.getByLabelText("Delete local review comment src/example.ts:12 (new)"));
+    await waitFor(() =>
+      expect(error).toHaveBeenCalledWith("Couldn't delete comment: Network error"),
+    );
+    expect(
+      screen.getByLabelText("Open local review comment src/example.ts:12 (new)"),
+    ).toBeInTheDocument();
+    expect(getSessionDraft("conv_test")).toEqual(draft);
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Delete local review comment src/example.ts:12 (new)"),
+      ).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByLabelText("Delete local review comment src/example.ts:12 (new)"));
+    await waitFor(() =>
+      expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument(),
+    );
+    expect(request).toHaveBeenLastCalledWith("/v1/sessions/conv_test/comments/123", {
+      method: "DELETE",
+    });
+    expect(getSessionDraft("conv_test")).toEqual({ ...draft, reviewComments: [] });
+    expect(textarea()).toHaveValue("Keep these instructions");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Keep this quote");
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+    act(() => requestLocalReviewContext({ ...comment, id: "456" }));
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toContain('"id": "456"');
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).not.toContain('"id": "123"');
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[1]).toEqual([attachment]);
+
+    const batch = [
+      { ...comment, id: "789" },
+      {
+        ...comment,
+        id: "1011",
+        body: "Keep the old behavior for this range.",
+        anchor_metadata: { ...comment.anchor_metadata, side: "LEFT" as const, start_line: 7 },
+      },
+    ];
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByTestId("composer-reply-quote")).not.toBeInTheDocument();
+    expect(screen.queryByText("notes.txt")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    act(() => batch.forEach(requestLocalReviewContext));
+    expect(screen.getAllByLabelText(/Open local review comment/)).toHaveLength(2);
+    expect(props.onSend).toHaveBeenCalledTimes(2);
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(send).toBeEnabled();
+    fireEvent.click(send);
+    expect(props.onSend).toHaveBeenNthCalledWith(3, formatLocalReviewComments(batch), undefined);
+    expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+
+    for (const quote of [false, true]) {
+      fireEvent.change(textarea(), { target: { value: "Only explain the changes" } });
+      if (quote) act(() => ref.current?.appendReplyQuote("Quoted context"));
+      act(() => requestLocalReviewContext(comment));
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      const [message, , reply] = vi.mocked(props.onSend).mock.lastCall!;
+      expect(message).toBe(
+        `Only explain the changes${quote ? "\n\n> Quoted context" : ""}\n\n${formatLocalReviewComments([comment], { includeInstruction: false })}`,
+      );
+      if (reply) expect(serializeReplyDraft(reply)).toBe(message);
+    }
+  });
+
   it("keeps mention markers in the structured payload used to restore a failed send", () => {
     const props = composerProps();
     const ref = createRef<ComponentRef<typeof Composer>>();
@@ -4352,7 +6695,8 @@ describe("Composer reply quotes", () => {
     fireEvent.change(textarea(), { target: { value: "My answer" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     const [text, , replyDraft] = vi.mocked(props.onSend).mock.calls[0]!;
-    expect(text).toBe("[Attached file: src/example.ts]\n\n> Actual card\n\nMy answer");
+    // The drained file is an inline token, so its marker keeps the token's trailing space.
+    expect(text).toBe("[Attached file: src/example.ts] \n\n> Actual card\n\nMy answer");
     expect(serializeReplyDraft(replyDraft!)).toBe(text);
     act(() =>
       useChatStore.setState({
@@ -4361,7 +6705,7 @@ describe("Composer reply quotes", () => {
     );
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Actual card");
     expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue(
-      "[Attached file: src/example.ts]\n\n",
+      "[Attached file: src/example.ts] ",
     );
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toBe(text);
@@ -4380,6 +6724,101 @@ describe("Composer reply quotes", () => {
       quotes: [{ before: "", text: "Explain /help" }],
       text: "/help",
     });
+  });
+});
+
+describe("Composer side-chat entry points", () => {
+  beforeEach(() => {
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [],
+      sessionHarness: "openai-agents",
+      sideChatToOpen: null,
+      sideChatDrafts: {},
+      sideChatComposers: {},
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    composerSessionSnapshot.sideChatAllowed = null;
+    vi.restoreAllMocks();
+  });
+
+  // An admin has owner level, but only the root session's owner starts side chats.
+  it.each([
+    [true, true],
+    [false, false],
+  ])("follow the server's side_chat_allowed=%s at owner level", (allowed, offered) => {
+    composerSessionSnapshot.sideChatAllowed = allowed;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+
+    fireEvent.change(textarea(), { target: { value: "/side" } });
+    expect(screen.queryByTestId("slash-menu-item-side") !== null).toBe(offered);
+    fireEvent.change(textarea(), { target: { value: "" } });
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    expect(screen.queryByTestId("composer-side-chat-action") !== null).toBe(offered);
+  });
+
+  it("opens a focused pending tab after the add menu closes", async () => {
+    const authenticatedFetch = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockImplementation(() => new Promise<Response>(() => {}));
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+
+    await waitFor(() => expect(useChatStore.getState().sideChatToOpen).not.toBeNull());
+    const { sideChatToOpen, sideChatComposers, sideChatDrafts } = useChatStore.getState();
+    expect(sideChatToOpen).toEqual({
+      childId: expect.stringMatching(/^pending:/),
+      parentId: "conv_test",
+    });
+    expect(sideChatComposers[sideChatToOpen!.childId]).toMatchObject({ autoFocus: true });
+    expect(sideChatDrafts[sideChatToOpen!.childId]).toBeUndefined();
+    expect(textarea()).toHaveValue("");
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
+  it("does not open a side chat after its parent changes while the menu closes", async () => {
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    const trigger = screen.getByRole("button", { name: "Add" });
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    const restoredTriggerFocus = vi.fn();
+    trigger.addEventListener("focus", restoredTriggerFocus);
+
+    try {
+      fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+      act(() => useChatStore.setState({ conversationId: "conv_other" }));
+      await waitFor(() => expect(restoredTriggerFocus).toHaveBeenCalled());
+      await act(
+        () =>
+          new Promise<void>((resolve) => {
+            requestAnimationFrame(() => resolve());
+          }),
+      );
+
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      expect(useChatStore.getState().sideChatComposers).toEqual({});
+    } finally {
+      trigger.removeEventListener("focus", restoredTriggerFocus);
+    }
+  });
+
+  it("focuses the native side-chat question after the add menu closes", async () => {
+    const user = userEvent.setup();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+
+    await waitFor(() => expect(textarea()).toHaveValue("/side "));
+    expect(textarea()).toHaveFocus();
+    await user.keyboard("question");
+    expect(textarea()).toHaveValue("/side question");
   });
 });
 
@@ -4432,17 +6871,56 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
       render(<Composer {...composerProps()} ref={ref} />);
 
       act(() => ref.current?.startSideChat("first selection"));
+      act(() =>
+        useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+          ...current,
+          text: "first answer",
+        })),
+      );
       act(() => ref.current?.startSideChat("second selection"));
 
       expect(useChatStore.getState().sideChatToOpen).toBeNull();
       expect(useChatStore.getState().sideChatComposers[childId]).toEqual({
-        text: "my question",
+        text: "",
         files: [],
-        quotes: ["first selection", "second selection"],
+        quotes: [
+          { id: expect.any(String), before: "my question", text: "first selection" },
+          { id: expect.any(String), before: "first answer", text: "second selection" },
+        ],
       });
       expect(textarea()).toHaveValue("");
     },
   );
+
+  it("interleaves replies to parent selections before starting a side chat", () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    act(() => ref.current?.startSideChat("First passage"));
+    const childId = useChatStore.getState().sideChatToOpen!.childId;
+    const pane = (
+      <QueryClientProvider client={new QueryClient()}>
+        <SideChatPane childId={childId} selectionParentId="conv_test" onStart={onStart} />
+      </QueryClientProvider>
+    );
+    const view = render(pane);
+    fireEvent.change(screen.getByTestId("side-chat-input"), {
+      target: { value: "First answer" },
+    });
+    act(() => ref.current?.startSideChat("Second passage"));
+    const between = screen.getByRole("textbox", { name: "Reply text before quote 2" });
+    expect(between).toHaveValue("First answer");
+    fireEvent.change(between, { target: { value: "Edited first answer" } });
+    fireEvent.change(screen.getByTestId("side-chat-input"), {
+      target: { value: "Second answer" },
+    });
+    view.unmount();
+    render(pane);
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(onStart).toHaveBeenCalledExactlyOnceWith(
+      "> First passage\n\nEdited first answer\n\n> Second passage\n\nSecond answer",
+    );
+  });
 
   it("keeps a selection made during side-chat creation in a new pending tab", async () => {
     let resolveStart!: () => void;
@@ -4671,8 +7149,8 @@ describe("Composer file-attachment focus", () => {
 });
 
 // Paste mirrors drop on the in-session composer: files on the clipboard attach
-// instead of inserting as text, while a plain-text paste is left to the
-// browser. Same contract as the landing composer's paste suite.
+// instead of inserting as text, while plain text is inserted as typed input.
+// Same contract as the landing composer's paste suite.
 describe("Composer paste", () => {
   beforeEach(() => {
     setComposerState({ conversationId: "conv_test", skills: [] });
@@ -4702,14 +7180,15 @@ describe("Composer paste", () => {
     for (const file of files) {
       items.push({ kind: "file", type: file.type, getAsFile: () => file });
     }
-    return { clipboardData: { items } };
+    const getData = (type: string) => (type === "text/plain" ? (text ?? "") : "");
+    return { clipboardData: { items, getData } };
   }
 
-  it("leaves a text-only paste to the browser", () => {
+  it("inserts a text-only paste as typed input", () => {
     render(<Composer {...composerProps()} />);
-    expect(fireEvent.paste(textarea(), pastePayload({ text: "hello world" }))).toBe(true);
+    expect(fireEvent.paste(textarea(), pastePayload({ text: "hello world" }))).toBe(false);
     expect(screen.queryByText(/can't be attached/)).toBeNull();
-    expect(textarea().value).toBe("");
+    expect(textarea().value).toBe("hello world");
   });
 
   it("attaches a pasted file instead of inserting it as text", () => {
@@ -4958,34 +7437,42 @@ describe("Composer — queued-message flush gating", () => {
   // drain the queue while the session is unreachable — flushing would POST
   // into a void, bypassing onSend's reconnect dialog. It must drain once
   // reachable again.
-  it("holds the queue while unreachable, then flushes when reachable", async () => {
-    const sendSpy = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({
-      conversationId: "conv_test",
-      boundAgentId: "agent_xyz",
-      status: "idle",
-      sessionStatus: "idle",
-      send: sendSpy,
-      queuedMessages: [{ queueId: "q_1", text: "held", conversationId: "conv_test" }],
-    });
+  it.each([
+    [false, "idle"],
+    [true, "failed"],
+  ] as const)(
+    "holds the queue while unreachable (sending reconnects Arca: %s, session %s), then flushes when reachable",
+    async (sendReconnectsArca, sessionStatus) => {
+      const sendSpy = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({
+        conversationId: "conv_test",
+        boundAgentId: "agent_xyz",
+        status: "idle",
+        sessionStatus,
+        send: sendSpy,
+        queuedMessages: [{ queueId: "q_1", text: "held", conversationId: "conv_test" }],
+      });
 
-    // Idle + a waiting head, but unreachable → the effect must not flush.
-    // Wrapped in TooltipProvider since the queued-message strip renders the
-    // steer button's tooltip.
-    const { rerender } = renderWithTooltips(<Composer {...composerProps({ unreachable: true })} />);
-    await waitFor(() => expect(sendSpy).not.toHaveBeenCalled());
-    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+      // Idle + a waiting head, but unreachable → the effect must not flush.
+      // Wrapped in TooltipProvider since the queued-message strip renders the
+      // steer button's tooltip.
+      const { rerender } = renderWithTooltips(
+        <Composer {...composerProps({ unreachable: true, sendReconnectsArca })} />,
+      );
+      await waitFor(() => expect(sendSpy).not.toHaveBeenCalled());
+      expect(useChatStore.getState().queuedMessages).toHaveLength(1);
 
-    // Becomes reachable → the effect re-fires and drains the head.
-    rerender(
-      <TooltipProvider>
-        <Composer {...composerProps({ unreachable: false })} />
-      </TooltipProvider>,
-    );
-    await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
-    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
-    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
-  });
+      // Becomes reachable → the effect re-fires and drains the head.
+      rerender(
+        <TooltipProvider>
+          <Composer {...composerProps({ unreachable: false })} />
+        </TooltipProvider>,
+      );
+      await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
+      expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
+      expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+    },
+  );
 });
 
 describe("Composer — editing queued messages", () => {
@@ -5153,7 +7640,8 @@ describe("Composer — editing queued messages", () => {
       }),
     );
     if (quoted) act(() => ref.current?.appendReplyQuote("Quoted answer"));
-    fireEvent.change(textarea(), { target: { value: QUEUED_TEXT } });
+    // Keep the drained inline token: deleting it would untag the file.
+    fireEvent.change(textarea(), { target: { value: textarea().value + QUEUED_TEXT } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     const original = useChatStore.getState().queuedMessages[0]!;
     expect(original.text).toContain("[Attached file: src/example.ts]");
@@ -5204,17 +7692,38 @@ describe("Composer — editing queued messages", () => {
     expect(props.onSend).toHaveBeenCalledWith(QUEUED_TEXT, [file]);
   });
 
-  it("browsing history over a non-empty draft leaves the queued row alone", async () => {
+  it.each(["half-typed draft", "first line\nsecond line", " \n "])(
+    "ArrowUp preserves the draft %j and leaves the queued row alone",
+    (draft) => {
+      appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+      renderWithTooltips(<Composer {...composerProps()} />);
+
+      const ta = textarea();
+      fireEvent.change(ta, { target: { value: draft } });
+      ta.setSelectionRange(0, 0);
+      expect(fireEvent.keyDown(ta, { key: "ArrowUp" })).toBe(true);
+
+      expect(ta).toHaveValue(draft);
+      expect(getSessionDraft(CONV)?.text).toBe(draft);
+      expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    },
+  );
+
+  it("keeps a recalled queued message as an editable draft", () => {
     appendPromptHistoryEntry(QUEUED_TEXT, CONV);
     renderWithTooltips(<Composer {...composerProps()} />);
 
     const ta = textarea();
-    fireEvent.change(ta, { target: { value: "half-typed draft" } });
-    ta.setSelectionRange(0, 0);
     fireEvent.keyDown(ta, { key: "ArrowUp" });
+    expect(ta).toHaveValue(QUEUED_TEXT);
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
 
-    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
-    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    ta.setSelectionRange(0, 0);
+    expect(fireEvent.keyDown(ta, { key: "ArrowUp" })).toBe(true);
+    ta.setSelectionRange(QUEUED_TEXT.length, QUEUED_TEXT.length);
+    expect(fireEvent.keyDown(ta, { key: "ArrowDown" })).toBe(true);
+
+    expect(ta).toHaveValue(QUEUED_TEXT);
   });
 
   it("leaves another conversation's identically-worded queued row alone", async () => {
@@ -5231,11 +7740,163 @@ describe("Composer — editing queued messages", () => {
   });
 });
 
+describe("Composer — editing a sent message", () => {
+  const CONV = "conv_edit_sent";
+  const sentMessage = { text: "Summarize these [Attached: src/app.ts]" };
+  const toasts: unknown[] = [];
+  const recordToast = (event: Event) => toasts.push((event as CustomEvent).detail.content);
+
+  beforeEach(() => {
+    clearSessionDrafts();
+    // A running turn, which Edit must not stop.
+    useChatStore.setState({
+      conversationId: CONV,
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "running",
+      queuedMessages: [],
+    });
+    toasts.length = 0;
+    window.addEventListener("omnigent:toast", recordToast);
+  });
+
+  afterEach(() => {
+    window.removeEventListener("omnigent:toast", recordToast);
+    cleanup();
+  });
+
+  it("copies the text and @-tags into an empty composer and sends it as a new message", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ isWorking: true });
+    renderWithTooltips(<Composer {...props} ref={ref} />);
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+
+    // The sent marker comes back as the file's tag token.
+    expect(textarea()).toHaveValue("Summarize these @src/app.ts");
+    expect(textarea()).toHaveFocus();
+    expect(props.onStop).not.toHaveBeenCalled();
+
+    fireEvent.change(textarea(), { target: { value: "Summarize these, briefly, @src/app.ts" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(props.onSend).toHaveBeenCalledTimes(1);
+    const [sentText, sentFiles] = vi.mocked(props.onSend).mock.calls[0]! as [
+      string,
+      File[] | undefined,
+    ];
+    expect(sentText).toContain("Summarize these, briefly,");
+    expect(sentText).toContain("src/app.ts");
+    expect(sentFiles).toBeUndefined();
+  });
+
+  it("keeps a file and a session with the same name as separate tags", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    renderWithTooltips(<Composer {...props} ref={ref} />);
+    const session = '[Session: "README.md" id=sess_readme subagent=no]';
+    const sent = withSessionMentionHint(`compare [Attached: README.md] with ${session}`, true);
+
+    act(() => ref.current?.editSentMessage({ text: sent }));
+
+    expect(textarea()).toHaveValue("compare @README.md (file) with @README.md");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    const [sentText] = vi.mocked(props.onSend).mock.calls[0]! as [string];
+    expect(sentText.match(/\[Attached(?: file)?: README\.md\]/g)).toHaveLength(1);
+    expect(sentText.split(session)).toHaveLength(2);
+  });
+
+  it("asks before replacing a draft, keeping it unless the user confirms", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Keep draft" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("half-written thought");
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", { name: "Replace draft" }),
+    );
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("Summarize these @src/app.ts");
+    expect(textarea()).toHaveFocus();
+    expect(toasts).toEqual([]);
+  });
+
+  it("treats an attachment-only draft as a draft, and replacing it drops the attachment", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    const draftFile = new File(["draft"], "draft.txt", { type: "text/plain" });
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [draftFile] },
+    });
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
+
+    await waitFor(() => expect(textarea()).toHaveValue("Summarize these @src/app.ts"));
+    expect(screen.queryByText("draft.txt")).toBeNull();
+  });
+
+  it("dismisses a pending confirmation when the conversation changes", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+    act(() => ref.current?.editSentMessage(sentMessage));
+    await screen.findByRole("dialog", { name: "Replace your draft?" });
+
+    act(() => useChatStore.setState({ conversationId: "conv_other" }));
+    act(() => useChatStore.setState({ conversationId: CONV }));
+
+    await act(async () => {});
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(textarea()).toHaveValue("half-written thought");
+  });
+
+  it("says so when the composer stops taking input before Replace draft", async () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { rerender } = renderWithTooltips(<Composer {...composerProps()} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "half-written thought" } });
+    act(() => ref.current?.editSentMessage(sentMessage));
+    const dialog = await screen.findByRole("dialog", { name: "Replace your draft?" });
+
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ disabled: true })} ref={ref} />
+      </TooltipProvider>,
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Replace draft" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(textarea()).toHaveValue("half-written thought");
+    expect(toasts).toEqual(["The composer can't take a message right now."]);
+  });
+
+  it("ignores Edit while the composer is disabled", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...composerProps({ disabled: true })} ref={ref} />);
+
+    act(() => ref.current?.editSentMessage(sentMessage));
+
+    expect(textarea()).toHaveValue("");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(toasts).toEqual(["The composer can't take a message right now."]);
+  });
+});
+
 describe("Composer config gear", () => {
   beforeEach(() => {
     setComposerState({
       conversationId: "conv_test",
       skills: [],
+      isNativeTerminalSession: false,
       sessionModelOverride: null,
       llmModel: null,
       nativeVendorOwnsModel: false,
@@ -5252,6 +7913,198 @@ describe("Composer config gear", () => {
   });
 
   const gear = () => document.querySelector('[data-testid="composer-config-gear"]');
+
+  describe("deferred cycle shortcuts", () => {
+    beforeEach(() => {
+      const previous = useChatStore.getState();
+      onTestFinished(() => useChatStore.setState(previous, true));
+      vi.useFakeTimers();
+      useChatStore.setState({
+        setModel: vi.fn().mockResolvedValue(undefined),
+        setEffort: vi.fn().mockResolvedValue(undefined),
+        llmModel: "fable",
+        sessionReasoningEffort: "medium",
+        codexModelOptions: CLAUDE_MODEL_OPTIONS,
+      });
+    });
+    afterEach(() => vi.useRealTimers());
+
+    const cycle = (code: "KeyM" | "KeyE" = "KeyM") =>
+      fireEvent.keyDown(textarea(), { code, ctrlKey: true, altKey: true });
+    const props = () =>
+      composerProps({
+        status: "streaming",
+        isWorking: true,
+        showModels: true,
+        modelPickerKind: "claude",
+        codexModelOptions: CLAUDE_MODEL_OPTIONS,
+      });
+
+    it.each(["two idle seconds", "Enter"])(
+      "previews every model in a burst and applies only the final choice after %s",
+      async (confirmation) => {
+        const composer = props();
+        const { setModel, setEffort } = useChatStore.getState();
+        renderWithTooltips(<Composer {...composer} />);
+        const input = textarea();
+        fireEvent.change(input, { target: { value: "unfinished follow-up" } });
+        act(() => input.focus());
+
+        for (const model of ["opus", "sonnet", "sonnet_5"]) {
+          act(() => vi.advanceTimersByTime(500));
+          cycle();
+          expect(screen.getByTestId(`composer-agent-model-${model}`)).toHaveAttribute(
+            "aria-checked",
+            "true",
+          );
+          expect(setModel).not.toHaveBeenCalled();
+          expect(setEffort).not.toHaveBeenCalled();
+        }
+        if (confirmation === "Enter") {
+          await act(async () => fireEvent.keyDown(input, { key: "Enter", code: "Enter" }));
+        } else {
+          await act(() => vi.advanceTimersByTimeAsync(1_999));
+          expect(setModel).not.toHaveBeenCalled();
+          await act(() => vi.advanceTimersByTimeAsync(1));
+        }
+        expect(setModel).toHaveBeenCalledExactlyOnceWith("sonnet_5", { expectConfirmation: true });
+        expect(setEffort).not.toHaveBeenCalled();
+        expect(input).toHaveFocus();
+        expect(input).toHaveValue("unfinished follow-up");
+        expect(composer.onSend).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(["wrap", "Escape", "navigation", "read-only", "unreachable", "unmount"])(
+      "does not apply a pending choice after %s",
+      async (action) => {
+        const composer = props();
+        const { setModel, setEffort } = useChatStore.getState();
+        const view = renderWithTooltips(<Composer {...composer} />);
+        act(() => textarea().focus());
+        cycle();
+        if (action === "wrap") {
+          for (let remaining = 1; remaining < CLAUDE_MODEL_OPTIONS.length; remaining++) cycle();
+          expect(screen.getByTestId("composer-agent-model-fable")).toHaveAttribute(
+            "aria-checked",
+            "true",
+          );
+        } else if (action === "Escape") {
+          cycle("KeyE");
+          fireEvent.keyDown(textarea(), { key: "Escape", code: "Escape" });
+          expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+          expect(composer.onStop).not.toHaveBeenCalled();
+          expect(textarea()).toHaveFocus();
+        } else if (action === "navigation") {
+          act(() => useChatStore.setState({ conversationId: "another-session" }));
+        } else if (action === "read-only" || action === "unreachable") {
+          view.rerender(
+            <TooltipProvider>
+              <Composer
+                {...composer}
+                permissionLevel={action === "read-only" ? 1 : null}
+                unreachable={action === "unreachable"}
+              />
+            </TooltipProvider>,
+          );
+          expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+        } else {
+          view.unmount();
+        }
+        await act(() => vi.advanceTimersByTimeAsync(3_000));
+        expect(setModel).not.toHaveBeenCalled();
+        expect(setEffort).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(["confirmed", "refused", "navigated"])(
+      "cycles the draft model's effort ladder and waits for the model to be %s",
+      async (outcome) => {
+        const options = [
+          {
+            id: "primary",
+            displayName: "Primary",
+            supportedReasoningEfforts: ["low", "medium", "high"].map((reasoningEffort) => ({
+              reasoningEffort,
+            })),
+          },
+          {
+            id: "alternate",
+            displayName: "Alternate",
+            supportedReasoningEfforts: ["medium", "high", "xhigh"].map((reasoningEffort) => ({
+              reasoningEffort,
+            })),
+          },
+        ];
+        let settleModel: () => void = () => {};
+        const setModel = vi.fn(
+          () =>
+            new Promise<void>((resolve, reject) => {
+              settleModel =
+                outcome === "refused" ? () => reject(new Error("Model refused")) : resolve;
+            }),
+        );
+        const setEffort = vi.fn().mockResolvedValue(undefined);
+        useChatStore.setState({
+          setModel,
+          setEffort,
+          llmModel: "primary",
+          codexModelOptions: options,
+        });
+        renderWithTooltips(
+          <Composer {...props()} modelPickerKind="codex" codexModelOptions={options} />,
+        );
+        cycle();
+        cycle("KeyE");
+        cycle("KeyE");
+        expect(screen.getByTestId("composer-agent-effort-xhigh")).toHaveAttribute(
+          "aria-checked",
+          "true",
+        );
+        expect(screen.queryByTestId("composer-agent-effort-low")).toBeNull();
+        expect(setModel).not.toHaveBeenCalled();
+        expect(setEffort).not.toHaveBeenCalled();
+        await act(() => vi.advanceTimersByTimeAsync(2_000));
+        cycle();
+        cycle("KeyE");
+        expect(setModel).toHaveBeenCalledExactlyOnceWith("alternate", { expectConfirmation: true });
+        expect(setEffort).not.toHaveBeenCalled();
+        await act(async () => {
+          if (outcome === "confirmed") useChatStore.setState({ llmModel: "alternate" });
+          if (outcome === "navigated") useChatStore.setState({ conversationId: "another-session" });
+          settleModel();
+        });
+        if (outcome === "confirmed") expect(setEffort).toHaveBeenCalledExactlyOnceWith("xhigh");
+        else expect(setEffort).not.toHaveBeenCalled();
+      },
+    );
+  });
+
+  it.each([{ permissionLevel: 1 }, { unreachable: true }])(
+    "ignores model and effort shortcuts when the config is disabled: %j",
+    (overrides) => {
+      const previous = useChatStore.getState();
+      onTestFinished(() => useChatStore.setState(previous, true));
+      const setModel = vi.fn();
+      const setEffort = vi.fn();
+      useChatStore.setState({ setModel, setEffort });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: CLAUDE_MODEL_OPTIONS,
+            ...overrides,
+          })}
+        />,
+      );
+      fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, altKey: true });
+      fireEvent.keyDown(window, { code: "KeyE", ctrlKey: true, altKey: true });
+      expect(setModel).not.toHaveBeenCalled();
+      expect(setEffort).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+    },
+  );
 
   it("renders when the session has a switchable knob (effort)", () => {
     renderWithTooltips(<Composer {...composerProps({ showEffort: true })} />);
@@ -5890,34 +8743,107 @@ describe("Composer config gear", () => {
     expect(calls).toEqual(["model", "effort"]);
   });
 
-  it("leaves no lingering error indicator when a session config update fails", async () => {
-    const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
-    const options = [
-      { id: "opus", model: "opus", displayName: "Opus" },
-      { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
-    ] as never;
-    useChatStore.setState({ setModel, codexModelOptions: options });
-    renderWithTooltips(
-      <Composer
-        {...composerProps({
-          showModels: true,
-          modelPickerKind: "claude",
-          codexModelOptions: options,
-        })}
-      />,
-    );
+  it.each([
+    { runnerOnline: false, explained: true },
+    { runnerOnline: true, explained: false },
+  ])(
+    "explains a model pick held open by a session wake (runnerOnline=$runnerOnline)",
+    async ({ runnerOnline, explained }) => {
+      // The server wakes a disconnected native session before switching its model,
+      // so the locked picker must say why it is waiting.
+      let resolveModel: () => void = () => {};
+      const setModel = vi.fn().mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveModel = resolve;
+          }),
+      );
+      const options = [
+        { id: "opus", model: "opus", displayName: "Opus" },
+        { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
+      ] as never;
+      // Native by harness alone: a custom agent on a native harness has no wrapper label.
+      useChatStore.setState({
+        setModel,
+        isNativeTerminalSession: true,
+        codexModelOptions: options,
+      });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: options,
+            runnerOnline,
+          })}
+        />,
+      );
+      await openSessionModels();
+      fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
+      await waitFor(() => expect(setModel).toHaveBeenCalled());
+      const notice = screen.queryByTestId("composer-agent-starting-session");
+      if (explained) expect(notice).toHaveTextContent("Starting the session to switch models…");
+      else expect(notice).toBeNull();
 
-    await openSessionModels();
-    fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
-    await waitFor(() =>
-      expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
-    );
-    await waitFor(() =>
-      expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
-    );
-    expect(screen.queryByTestId("composer-config-error")).not.toBeInTheDocument();
-    expect(screen.queryByText("Host stopped responding")).not.toBeInTheDocument();
-  });
+      act(() => resolveModel());
+      await waitFor(() =>
+        expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
+      );
+      expect(screen.queryByTestId("composer-agent-starting-session")).toBeNull();
+    },
+  );
+
+  it.each(["menu", "shortcut"])(
+    "leaves no lingering error indicator when a %s config update fails",
+    async (entry) => {
+      if (entry === "shortcut") {
+        vi.useFakeTimers();
+        onTestFinished(() => {
+          vi.useRealTimers();
+        });
+      }
+      const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
+      const options = [
+        { id: "opus", model: "opus", displayName: "Opus" },
+        { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
+      ] as never;
+      useChatStore.setState({ setModel, codexModelOptions: options, llmModel: "opus" });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: options,
+          })}
+        />,
+      );
+
+      if (entry === "menu") {
+        await openSessionModels();
+        fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
+      } else {
+        textarea().focus();
+        fireEvent.keyDown(textarea(), { code: "KeyM", ctrlKey: true, altKey: true });
+        expect(setModel).not.toHaveBeenCalled();
+        await act(() => vi.advanceTimersByTimeAsync(2_000));
+      }
+      expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true });
+      if (entry === "menu") {
+        await waitFor(() =>
+          expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
+        );
+      } else {
+        expect(screen.getByTestId("composer-agent-model-opus")).toHaveAttribute(
+          "aria-checked",
+          "true",
+        );
+        expect(textarea()).toHaveFocus();
+        expect(screen.getByTestId("composer-agent-config-value")).toHaveTextContent("Opus");
+      }
+      expect(screen.queryByTestId("composer-config-error")).not.toBeInTheDocument();
+      expect(screen.queryByText("Host stopped responding")).not.toBeInTheDocument();
+    },
+  );
 
   it("recomputes the Codex effort ladder after a confirmed model change and drops an unsupported level", async () => {
     // Codex advertises a per-model effort ladder. Drafting a lower-ceiling

@@ -16,3 +16,8 @@ export const SIDEBAR_OPEN_MENU_HIGHLIGHT =
 // background and flash when the mouse enters them.
 export const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
+// Sessions shown in the displayed grid get half the active highlight.
+export const SIDEBAR_GRID_MEMBER_HIGHLIGHT =
+  "bg-[var(--sidebar-active)]/50 hover:bg-[var(--sidebar-active)]/50 dark:hover:bg-[var(--sidebar-active)]/50";
+// The focused grid pane's row adds an inset ring on top.
+export const SIDEBAR_GRID_SELECTED_RING = "ring-1 ring-inset ring-brand-accent/50";
