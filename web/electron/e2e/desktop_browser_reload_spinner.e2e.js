@@ -1,6 +1,6 @@
-// The embedded browser's Reload icon spins until the reloaded page arrives.
-// A localhost fixture holds each response until the test releases it, so the
-// spinner is checked while the request is pending. See e2e/README.md to run.
+// The embedded browser's Reload icon spins until the reloaded page arrives or
+// fails. A localhost fixture holds each response until the test releases or
+// drops it, so the pending state is checked. See e2e/README.md to run.
 
 "use strict";
 
@@ -24,15 +24,23 @@ const RECORDING_HOLD_MS = 3_000;
 
 /** A localhost page server that holds each response until `release()`. */
 async function startHeldPageFixture() {
-  const state = { requests: 0, held: [] };
+  const state = { requests: 0, held: [], failing: false };
   const server = http.createServer((request, response) => {
     if (request.url !== "/") {
       response.writeHead(404).end();
       return;
     }
     state.requests += 1;
+    if (state.failing) {
+      response.destroy();
+      return;
+    }
     const loadNumber = state.requests;
-    state.held.push(() => {
+    state.held.push((fail) => {
+      if (fail) {
+        response.destroy();
+        return;
+      }
       response.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         "Cache-Control": "no-store",
@@ -50,7 +58,15 @@ async function startHeldPageFixture() {
     url: `http://localhost:${server.address().port}/`,
     state,
     release: () => {
-      for (const respond of state.held.splice(0)) respond();
+      for (const respond of state.held.splice(0)) respond(false);
+    },
+    /** Drops held and later connections, including Chromium's retry, until `recover()`. */
+    fail: () => {
+      state.failing = true;
+      for (const respond of state.held.splice(0)) respond(true);
+    },
+    recover: () => {
+      state.failing = false;
     },
     close: () =>
       new Promise((resolve) => {
@@ -172,6 +188,25 @@ describe(
       mark("reloaded, stopped");
       assert.equal(await reload.getAttribute("aria-busy"), "false");
       await holdForRecording(2_500);
+    });
+
+    it("stops spinning when a reload fails", { timeout: 60_000 }, async () => {
+      const pane = desktop.window.locator("[data-browser-pane-conversation]");
+      const reload = pane.getByRole("button", { name: "Reload", exact: true });
+      const spinning = pane.locator('button[aria-label="Reload"] svg.animate-spin');
+      const requestsBefore = fixture.state.requests;
+      await reload.click();
+      await eventually(
+        () => fixture.state.requests === requestsBefore + 1 && fixture.state.held.length === 1,
+        "failing reload request held by the server",
+      );
+      await spinning.waitFor({ timeout: 5_000 });
+
+      fixture.fail();
+      await spinning.waitFor({ state: "detached", timeout: 10_000 });
+      fixture.recover();
+      assert.equal(await reload.getAttribute("aria-busy"), "false");
+      assert.equal(await reload.isEnabled(), true, "a failed page can be reloaded again");
     });
   },
 );
