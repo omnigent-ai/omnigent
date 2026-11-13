@@ -200,8 +200,9 @@ from omnigent.stores.user_settings_store import (
 from omnigent.util.event_loop_watchdog import monitor_event_loop
 
 if TYPE_CHECKING:
-    from omnigent.entities import Conversation
+    from omnigent.entities import Agent, Conversation
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
 
 _logger = logging.getLogger(__name__)
 
@@ -312,6 +313,9 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_mcp_services: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
+    # Scheduled-task runs drop a trigger prompt's ``<!-- omnigent-trigger ... -->`` header
+    # before dispatch; older servers would send it to the model.
+    scheduled_task_trigger_headers: bool = True
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
@@ -1170,6 +1174,62 @@ def _warn_on_empty_picker_restriction(
         )
 
 
+def _retired_builtin_agent_names(
+    agent_store: AgentStore, agent_cache: Any, owned: frozenset[str]
+) -> frozenset[str]:
+    """
+    Name the built-in rows an earlier version seeded that no current seeding owns.
+
+    A built-in row has a server-scope id derived from its name
+    (:func:`~omnigent.db.utils.builtin_agent_id`), which no other agent gets.
+    An operator's ``acp:`` agent is never one, even while its config can't be
+    read, and neither is a row whose bundle can't be read.
+
+    :param agent_store: Store for agent metadata.
+    :param agent_cache: Cache for loaded agent specs.
+    :param owned: Names this boot's seeding owns, e.g. ``{"polly", "devin-acp"}``.
+    :returns: The retired names, e.g. ``{"devin"}``.
+    """
+    from omnigent.db.utils import builtin_agent_id
+
+    retired: set[str] = set()
+    after: str | None = None
+    while True:
+        page = agent_store.list(limit=100, after=after, order="asc")
+        retired.update(
+            agent.name
+            for agent in page.data
+            if agent.session_id is None
+            and agent.id == builtin_agent_id(agent.name)
+            and agent.name not in owned
+            and not _may_be_operator_acp_agent(agent, agent_cache)
+        )
+        if not page.has_more or page.last_id is None:
+            return frozenset(retired)
+        after = page.last_id
+
+
+def _may_be_operator_acp_agent(agent: "Agent", agent_cache: Any) -> bool:
+    """
+    Whether a stored built-in row is an operator's ``acp:<slug>`` agent, or might be.
+
+    Packaged ACP rows run on their catalog id (e.g. ``devin``); configured ones
+    run on ``acp:<slug>``. A bundle that can't be read can't be told apart.
+
+    :param agent: The stored row.
+    :param agent_cache: Cache for loaded agent specs.
+    :returns: ``True`` unless its bundle loads and runs on another harness.
+    """
+    try:
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+    except Exception:
+        _logger.debug("could not read the bundle of built-in row %r", agent.name, exc_info=True)
+        return True
+    return loaded.spec.executor.harness_kind.startswith("acp:")
+
+
 def _ensure_default_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
@@ -1187,8 +1247,10 @@ def _ensure_default_agents(
     ``OMNIGENT_SEEDED_AGENTS`` trims the packaged roster. Each helper
     returns the packaged names it owns (seeded or not), so whatever the
     allowlist leaves out is returned here and hidden from ``GET /v1/agents``
-    by the caller that stores it. A row seeded by an earlier boot is
-    suppressed rather than deleted: sessions look their agent up by
+    by the caller that stores it. A built-in row an earlier version seeded,
+    which no helper or configured ACP agent owns any more, counts as packaged
+    too. A row seeded by an earlier boot is suppressed rather than deleted:
+    sessions look their agent up by
     ``conversations.agent_id``, so dropping the row would leave them without one.
 
     Extras from ``OMNIGENT_BUILTIN_AGENT_DIRS`` are deliberately outside
@@ -1210,6 +1272,13 @@ def _ensure_default_agents(
     extras = _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
     if allowlist is None:
         return frozenset()
+    # Configured ACP agents and listed extras use built-in IDs but remain
+    # operator-owned, even when an extra fails to seed.
+    operator_owned = frozenset(agent.slug for agent in _configured_acp_agents()[0])
+    operator_owned |= _listed_extra_builtin_agent_names()
+    packaged |= _retired_builtin_agent_names(
+        agent_store, agent_cache, packaged | extras | operator_owned
+    )
     unknown = allowlist - packaged
     if unknown:
         _logger.warning(
@@ -1239,6 +1308,20 @@ def _ensure_default_agents(
 # or an e2e fixture — ship custom always-available agents (e.g. a plain
 # claude-sdk chat agent that a fork can switch into).
 _EXTRA_BUILTIN_AGENTS_ENV = "OMNIGENT_BUILTIN_AGENT_DIRS"
+
+
+def _listed_extra_builtin_agent_names() -> frozenset[str]:
+    """
+    Name every agent :data:`_EXTRA_BUILTIN_AGENTS_ENV` lists, seeded or not.
+
+    A path that is missing this boot may still name a row an earlier boot
+    seeded, as its stem (``house.yaml`` → ``house``) or directory name.
+
+    :returns: Candidate names, e.g. ``{"house", "house.yaml"}``.
+    """
+    raw = os.environ.get(_EXTRA_BUILTIN_AGENTS_ENV, "")
+    entries = [Path(entry.strip()) for entry in raw.split(os.pathsep) if entry.strip()]
+    return frozenset({entry.stem for entry in entries} | {entry.name for entry in entries})
 
 
 def _ensure_extra_builtin_agents(
@@ -1432,6 +1515,24 @@ def _build_acp_bundle(*, harness: str, name: str) -> bytes:
         return _tar_gz_dir(bundle_dir)
 
 
+def _configured_acp_agents() -> tuple[list["AcpAgentEntry"], frozenset[str]]:
+    """
+    Read the operator's ``acp:`` agents and the builtin ACP rows they shadow.
+
+    :returns: The configured agents, and the builtin ACP row keys they claim,
+        e.g. ``([AcpAgentEntry(slug="devin", ...)], {"devin"})``; empty when
+        the ``acp:`` block is unreadable, which must never break startup.
+    """
+    try:
+        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
+
+        configured = list(acp_agents())
+        return configured, shadowed_builtin_acp_rows(configured)
+    except Exception:
+        _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
+        return [], frozenset()
+
+
 def _ensure_default_acp_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
@@ -1479,15 +1580,7 @@ def _ensure_default_acp_agents(
     owned: set[str] = set()
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
-    try:
-        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
-
-        configured = list(acp_agents())
-        shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:  # a malformed acp: block must never break startup
-        _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
-        configured = []
-        shadowed = frozenset()
+    configured, shadowed = _configured_acp_agents()
     for agent in configured:
         # Key the built-in by the slug, not the display label: agent names must be
         # ``[a-zA-Z0-9_-]+`` (the spec validator rejects spaces/dots), and a label
@@ -1742,10 +1835,10 @@ def create_app(
     :param permission_store: Store for session-level access grants.
         ``None`` disables permission checks (all access allowed).
     :param scheduled_task_store: Store backing the recurring-task
-        scheduler. When provided, the FastAPI lifespan
-        starts an :class:`ScheduledTaskScheduler` that arms a timer per
-        active task and fires the injected ``on_fire`` callback on
-        schedule. ``None`` disables the scheduler entirely.
+        scheduler. When provided, the FastAPI lifespan starts the database
+        scheduler (:class:`PersistentTaskScheduler`), or with automations_v2 off,
+        a :class:`ScheduledTaskScheduler` that arms a timer per active task.
+        ``None`` disables the scheduler entirely, in either mode.
     :param preference_store: Optional shared-preference API; no launcher adoption.
     :param automations: Whether this request's caller can use automations. A static
         bool or a zero-arg callable resolved per request; ``None`` enables them.
@@ -1916,12 +2009,8 @@ def create_app(
         else mcp_disabled_servers
     )
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
-    if automations_v2_enabled:
-        if scheduled_task_store is None:
-            raise ValueError(
-                "automations_v2 requires a scheduled task store. Pass scheduled_task_store "
-                "to create_app(), or leave automations_v2 disabled until scheduling is configured."
-            )
+    # Without a store there are no automations, so neither mode starts a scheduler.
+    if automations_v2_enabled and scheduled_task_store is not None:
         if not isinstance(scheduled_task_store, ScheduledTaskDispatchStore):
             raise TypeError(
                 "The configured scheduled task store does not implement the operations needed "
@@ -2440,14 +2529,13 @@ def create_app(
                 transfer_from_host_id,
                 require_account_owner=runner_account_store is not None,
             )
-        from omnigent.host.frames import CAP_MCP_REGISTRY
-        from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+        from omnigent.server.runtime_compatibility import require_session_runtime_support
 
         connection = host_registry.get(host_id)
-        if connection is not None and CAP_MCP_REGISTRY not in connection.hello.capabilities:
+        if connection is not None:
             conv = conversation_store.get_conversation(session_id)
             if conv is not None:
-                require_session_registry_mcp_support(
+                require_session_runtime_support(
                     conv,
                     connection.hello.capabilities,
                     component="host",
@@ -4889,8 +4977,10 @@ def create_app(
                             "_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id
                         )
                         try:
-                            routed = runner_router.client_for_session_resources(
-                                conv.id, conversation=conv
+                            routed = await asyncio.to_thread(
+                                runner_router.client_for_session_resources,
+                                conv.id,
+                                conversation=conv,
                             )
                         except OmnigentError as exc:
                             if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.WRONG_REPLICA):

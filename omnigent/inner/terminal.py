@@ -61,6 +61,7 @@ from .sandbox import (
     with_additional_write_roots,
     with_denied_unix_sockets,
 )
+from .tcp_egress import TcpEgressBroker, apply_tcp_egress_env, start_tcp_egress_broker
 from .terminal_clipboard import TerminalClipboardBridge
 from .terminal_lifecycle import (
     TERMINAL_INSTANCE_ID_ENV,
@@ -683,6 +684,7 @@ def _clone_sandbox_spec(sandbox: OSEnvSandboxSpec | None) -> OSEnvSandboxSpec | 
         ),
         egress_rules=list(sandbox.egress_rules) if sandbox.egress_rules is not None else None,
         git_ssh=list(sandbox.git_ssh) if sandbox.git_ssh is not None else None,
+        tcp_egress=list(sandbox.tcp_egress) if sandbox.tcp_egress is not None else None,
     )
 
 
@@ -1035,7 +1037,7 @@ def build_terminal_os_env_spec(
         if sandbox.requires_network_enforcement:
             raise ValueError(
                 "sandbox_override is not allowed on a terminal whose "
-                "effective sandbox declares egress_rules or git_ssh: overriding "
+                "effective sandbox declares egress_rules, git_ssh, or tcp_egress: overriding "
                 "to 'none' would drop hard network "
                 "enforcement while network policy remains as inert "
                 "decoration on the policy."
@@ -1133,6 +1135,9 @@ class TerminalInstance:
     _git_ssh_broker: GitSshBroker | None = field(default=None, repr=False)
     _git_ssh_tmpdir: Path | None = field(default=None, repr=False)
     _launch_command_tmpdir: Path | None = field(default=None, init=False, repr=False)
+    _tcp_egress_broker: TcpEgressBroker | None = field(default=None, repr=False)
+    _tcp_egress_tmpdir: Path | None = field(default=None, repr=False)
+    _resource_cleanup_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _clipboard_bridge: TerminalClipboardBridge | None = field(default=None, init=False, repr=False)
     _idle_task: asyncio.Task[None] | None = field(default=None, repr=False)
     # Threaded idle-watcher state. Mirrors :attr:`_idle_task` but for
@@ -1635,7 +1640,7 @@ class TerminalInstance:
         try:
             await self._launch_impl(cwd=cwd)
         except BaseException:
-            self._stop_network_brokers()
+            await asyncio.to_thread(self._stop_network_brokers)
             cleanup_private_tmpdir(self._launch_command_tmpdir)
             self._launch_command_tmpdir = None
             raise
@@ -1690,18 +1695,16 @@ class TerminalInstance:
                 sandbox_for_launcher = self._bootstrap_egress_proxy(sandbox_for_launcher, env)
             if sandbox_for_launcher.git_ssh:
                 sandbox_for_launcher = self._bootstrap_git_ssh(sandbox_for_launcher, env)
+            if sandbox_for_launcher.tcp_egress:
+                sandbox_for_launcher = self._bootstrap_tcp_egress(sandbox_for_launcher, env)
             cli_path = shutil.which(self.command) or self.command
-            try:
-                if sandbox_for_launcher.copy_on_write_namespace:
-                    host_cwd = "/"
-                    launcher_path = create_exec_launcher(
-                        cli_path, sandbox_for_launcher, cwd=effective_cwd
-                    )
-                else:
-                    launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
-            except Exception:
-                self._stop_git_ssh()
-                raise
+            if sandbox_for_launcher.copy_on_write_namespace:
+                host_cwd = "/"
+                launcher_path = create_exec_launcher(
+                    cli_path, sandbox_for_launcher, cwd=effective_cwd
+                )
+            else:
+                launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
@@ -1807,7 +1810,6 @@ class TerminalInstance:
         except BaseException:
             if self._clipboard_bridge is not None:
                 await asyncio.to_thread(self._clipboard_bridge.close)
-            self._stop_git_ssh()
             raise
 
         self.running = True
@@ -1996,6 +1998,28 @@ class TerminalInstance:
             cleanup_private_tmpdir(self._git_ssh_tmpdir)
             self._git_ssh_tmpdir = None
 
+    def _bootstrap_tcp_egress(self, sandbox: SandboxPolicy, env: dict[str, str]) -> SandboxPolicy:
+        routes = sandbox.tcp_egress
+        assert routes is not None
+        self._tcp_egress_tmpdir = create_private_tmpdir()
+        sandbox = with_additional_write_roots(sandbox, [self._tcp_egress_tmpdir])
+        self._tcp_egress_broker = start_tcp_egress_broker(routes, self._tcp_egress_tmpdir)
+        apply_tcp_egress_env(env, self._tcp_egress_broker)
+        return replace(sandbox, tcp_egress_socket_path=str(self._tcp_egress_broker.socket_path))
+
+    def _stop_tcp_egress(self) -> None:
+        if self._tcp_egress_broker is not None:
+            try:
+                self._tcp_egress_broker.stop()
+            except Exception:
+                logger.exception(
+                    "TCP egress broker stop failed for terminal %s:%s", self.name, self.session_key
+                )
+            self._tcp_egress_broker = None
+        if self._tcp_egress_tmpdir is not None:
+            cleanup_private_tmpdir(self._tcp_egress_tmpdir)
+            self._tcp_egress_tmpdir = None
+
     def _stop_network_brokers(self) -> None:
         if self._egress_handle is not None:
             try:
@@ -2009,6 +2033,7 @@ class TerminalInstance:
             cleanup_private_tmpdir(self._egress_tmpdir)
             self._egress_tmpdir = None
         self._stop_git_ssh()
+        self._stop_tcp_egress()
 
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
@@ -2027,38 +2052,45 @@ class TerminalInstance:
                 )
         except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent cleanup.
             logger.debug("Terminal cleanup telemetry failed (%s)", type(exc).__name__)
-        # Cancel both idle-watcher variants first so they don't race
-        # the socket teardown. Order doesn't matter — they're
-        # independent.
-        await self._stop_idle_watcher()
-        self._stop_idle_watcher_thread()
+        try:
+            # Cancel both idle-watcher variants first so they don't race
+            # the socket teardown. Order doesn't matter — they're
+            # independent.
+            await self._stop_idle_watcher()
+            self._stop_idle_watcher_thread()
 
-        # The watcher and is_alive() both set ``running=False`` when they
-        # observe a failure. A private socket can still belong to a live tmux
-        # server (or a remain-on-exit pane), so cleanup must not trust that
-        # advisory flag before issuing kill-server.
-        if self.running or self.socket_path.exists():
-            with contextlib.suppress(RuntimeError):
-                await self._tmux("kill-server")
-        self.running = False
+            # The watcher and is_alive() both set ``running=False`` when they
+            # observe a failure. A private socket can still belong to a live tmux
+            # server (or a remain-on-exit pane), so cleanup must not trust that
+            # advisory flag before issuing kill-server.
+            if self.running or self.socket_path.exists():
+                with contextlib.suppress(RuntimeError):
+                    await self._tmux("kill-server")
+            self.running = False
 
-        if self._clipboard_bridge is not None:
-            await asyncio.to_thread(self._clipboard_bridge.close)
+            if self._clipboard_bridge is not None:
+                await asyncio.to_thread(self._clipboard_bridge.close)
 
-        if self.os_env is not None:
-            self.os_env.close()
+        finally:
+            if self._resource_cleanup_task is None or self._resource_cleanup_task.done():
+                self._resource_cleanup_task = asyncio.create_task(
+                    asyncio.to_thread(self._close_resources)
+                )
+            await asyncio.shield(self._resource_cleanup_task)
 
-        # Stop the egress proxy + clean up its scratch tmpdir.
-        # Order: stop first so the proxy isn't listening on a
-        # socket inside a soon-to-be-deleted dir, then remove the
-        # tmpdir.
-        self._stop_network_brokers()
-        cleanup_private_tmpdir(self._launch_command_tmpdir)
-        self._launch_command_tmpdir = None
-
-        # Clean up the private dir (contains socket + fork).
-        if self.private_dir.exists():
-            shutil.rmtree(self.private_dir, ignore_errors=True)
+    def _close_resources(self) -> None:
+        """Finish revocation and file cleanup even if the async owner times out."""
+        try:
+            self._stop_network_brokers()
+        finally:
+            cleanup_private_tmpdir(self._launch_command_tmpdir)
+            self._launch_command_tmpdir = None
+            try:
+                if self.os_env is not None:
+                    self.os_env.close()
+            finally:
+                if self.private_dir.exists():
+                    shutil.rmtree(self.private_dir, ignore_errors=True)
 
     def start_idle_watcher(
         self,

@@ -200,9 +200,13 @@ implements them separately, so a fix for one harness does not reach the others.
   with connected/auth/timeout/unreachable/unsupported and mixed-version states.
 
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
-- `harness-settings-navigation`: Harnesses is always available in Settings and
-  through direct links. The import review modal's See more opens Harnesses and
-  dismisses the modal. Import sessions contains only session imports.
+- `harness-settings-navigation`: Harnesses is available in Settings and through
+  direct links. On a deployment that trims built-ins with
+  `OMNIGENT_SEEDED_AGENTS`, it lists only harnesses whose agent is kept or that
+  a pickable agent runs on; a direct link to another one shows the grid, and
+  Settings drops Harnesses when none is left. The import review modal's See
+  more opens Harnesses and dismisses the modal. Import sessions contains only
+  session imports.
 
 ## How to get to it (user POV)
 

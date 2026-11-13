@@ -2301,7 +2301,11 @@ async def test_launch_long_command_cleans_up_on_failure(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+        ),
     )
     expected = {"exit": RuntimeError, "spawn": OSError, "cancelled": asyncio.CancelledError}[
         failure
@@ -2385,7 +2389,11 @@ async def test_launch_discards_previous_exit_diagnostics_before_starting(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+        ),
     )
     if launch_fails:
         with pytest.raises(RuntimeError, match="tmux launch failed"):
@@ -2420,7 +2428,11 @@ async def test_launch_replaces_inherited_correlation_and_resets_only_for_new_lau
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+        ),
     )
 
     await instance.launch()
@@ -2468,7 +2480,11 @@ async def test_failed_launch_telemetry_does_not_block_or_reuse_parent_identity(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+        ),
     )
     await instance.launch()
     assert instance.running
@@ -3187,7 +3203,13 @@ async def test_terminal_desktop_session_follows_sandbox_policy(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=terminal_mod.asyncio.subprocess),
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+            create_task=asyncio.create_task,
+            shield=asyncio.shield,
+        ),
     )
     monkeypatch.setattr(terminal_mod, "create_exec_launcher", lambda *_: "/test/launcher")
     instance = TerminalInstance(

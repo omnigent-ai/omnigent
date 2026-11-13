@@ -7,7 +7,6 @@ import logging
 import uuid
 from collections.abc import Callable
 from functools import partial
-from operator import ge, gt, le, lt
 from typing import Any, cast
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
@@ -36,6 +35,7 @@ from omnigent.db.enum_codecs import (
     encode_scheduled_task_session_mode,
     encode_scheduled_task_state,
 )
+from omnigent.db.keyset import keyset_after
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -1111,20 +1111,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         descending: bool = False,
     ) -> ColumnElement[bool]:
         """MySQL needs scalar ranges to seek past a composite cursor."""
-        compare = lt if descending else gt
-        compare_inclusive = le if descending else ge
-        if self._engine.dialect.name != "mysql":
-            return (compare_inclusive if inclusive else compare)(tuple_(*columns), cursor)
-        return or_(
-            *(
-                and_(
-                    *(columns[previous] == cursor[previous] for previous in range(index)),
-                    (compare_inclusive if inclusive and index == len(columns) - 1 else compare)(
-                        column, cursor[index]
-                    ),
-                )
-                for index, column in enumerate(columns)
-            )
+        return keyset_after(
+            self._engine.dialect.name,
+            columns,
+            cursor,
+            inclusive=inclusive,
+            descending=descending,
         )
 
     def _refresh_schedule(self, row: SqlScheduledTask, after: int) -> None:
