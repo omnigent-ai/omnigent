@@ -336,7 +336,9 @@ def _probe_server(server_url: str) -> httpx.Response | None:
         lets the in-sandbox login surface the real connectivity error.
     """
     try:
-        return httpx.get(f"{server_url}/v1/me", timeout=10.0)
+        from omnigent.telemetry.request_headers import client_identity_headers
+
+        return httpx.get(f"{server_url}/v1/me", headers=client_identity_headers(), timeout=10.0)
     except httpx.HTTPError:
         return None
 

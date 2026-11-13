@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from ._client import SDK_USER_AGENT
+
 if TYPE_CHECKING:
     from ._client import OmnigentClient
 
@@ -151,7 +153,9 @@ class LocalServer:
                     f"Server exited with code {self._proc.returncode}.\n{out[-3000:]}"
                 )
             try:
-                resp = httpx.get(f"{self.base_url}/health", timeout=2.0)
+                resp = httpx.get(
+                    f"{self.base_url}/health", headers={"User-Agent": SDK_USER_AGENT}, timeout=2.0
+                )
                 if resp.status_code == 200:
                     return
             except httpx.ConnectError:

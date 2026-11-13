@@ -706,7 +706,7 @@ describe("SwitchHostDialog", () => {
 
     it("defaults to an empty sandbox when no other host is online", async () => {
       onlyOriginHostOnline();
-      renderDialog({ ...SANDBOX_SERVER, request_managed_sandbox_host_id: false });
+      renderDialog(SANDBOX_SERVER);
 
       expect(screen.queryByTestId("switch-host-no-targets")).toBeNull();
       await waitFor(() =>
@@ -718,6 +718,7 @@ describe("SwitchHostDialog", () => {
       expect(launchManagedHostMock).toHaveBeenCalledWith("conv_1", {
         provider: "modal",
         workspace: null,
+        hostId: expect.stringMatching(/^[0-9a-f]{32}$/),
       });
     });
 
