@@ -32,6 +32,8 @@ _LOOKUP_TIMEOUT = dict.fromkeys(
     ("connect", "read", "write", "pool"), SESSION_HOST_LOOKUP_TIMEOUT_S
 )
 _BODY_HEADERS = frozenset({"content-length", "content-type", "transfer-encoding"})
+# Ingress falls back to this query parameter when the slice-key header is absent.
+_SLICE_KEY_QUERY_PARAM = "omnigent_slice_key"
 
 _session_hosts: dict[str, str] = {}
 
@@ -123,6 +125,7 @@ def is_wrong_replica(response: httpx.Response) -> bool:
 
 def address_request(request: httpx.Request, base_url: str, host_id: str) -> None:
     """Key one request to a host, or send it keyless when host_id is empty."""
+    request.url = request.url.copy_remove_param(_SLICE_KEY_QUERY_PARAM)
     request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
     request.headers.update(databricks_request_headers(base_url, host_id=host_id))
     request.extensions[REQUEST_HOST_EXTENSION] = host_id

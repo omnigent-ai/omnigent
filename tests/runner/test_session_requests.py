@@ -65,7 +65,10 @@ class Replicas:
         self.wrong_replicas = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
-        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        # Like ingress: the header wins, then the query parameter.
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER) or request.url.params.get(
+            "omnigent_slice_key"
+        )
         if is_lookup(request):
             self.lookups.append(request)
             session_id = request.url.path.rsplit("/", 1)[-1]
@@ -151,11 +154,13 @@ async def test_refusal_naming_the_host_retries_on_it_without_a_lookup():
 @pytest.mark.asyncio
 async def test_refusal_naming_no_key_resends_keyless_without_a_lookup():
     replicas = Replicas(None, named=None)
+    params = {"omnigent_slice_key": TARGET_HOST, "keep": "1"}
     async with make_client(replicas) as client:
-        response = await client.post(EVENTS, json=PAYLOAD)
+        response = await client.post(EVENTS, params=params, json=PAYLOAD)
     assert response.status_code == 202
     assert replicas.sends == [RUNNER_HOST, None]
     assert replicas.lookups == []
+    assert dict(response.request.url.params) == {"keep": "1"}
 
 
 @pytest.mark.asyncio
