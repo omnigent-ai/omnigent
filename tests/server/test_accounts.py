@@ -571,6 +571,9 @@ def test_runner_token_accepted_on_runner_routes(
         ("PATCH", "/v1/sessions/conv_bound/resources/new-resource", None),
         ("POST", f"/v1/runners/{_RUNNER}/future-route", None),
         ("GET", "/v1/sessions/conv_other", None),
+        ("GET", "/v1/sessions/conv_bound/", None),
+        ("GET", "/v1/sessions/conv_bound%2Fconv_other", None),
+        ("GET", "/v1/sessions/conv_bound%5Cconv_other", None),
         ("POST", "/v1/sessions/conv_other/resources/environments/env/shell", None),
         ("GET", "/v1/hosts", None),
         ("GET", "/v1/hosts/host_1/filesystem", None),
@@ -660,6 +663,10 @@ def test_runner_child_cursor_expires(monkeypatch):
     monkeypatch.setattr("cryptography.fernet.time.time", lambda: now)
     cursor = confinement.child_cursor("parent", "hidden-child")
     assert confinement.child_cursor("parent", cursor, decode=True) == "hidden-child"
+    other_runner = RunnerTokenConfinement("runner_other", None, b"cursor-test-secret")
+    with pytest.raises(OmnigentError) as denied:
+        other_runner.child_cursor("parent", cursor, decode=True)
+    assert denied.value.code == ErrorCode.STALE_CURSOR
     now += 3601
     with pytest.raises(OmnigentError) as denied:
         confinement.child_cursor("parent", cursor, decode=True)
