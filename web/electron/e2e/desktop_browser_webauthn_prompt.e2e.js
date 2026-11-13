@@ -56,7 +56,7 @@ it(
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-webauthn-"));
     const recordDir = RECORDING
       ? process.env.OMNIGENT_DESKTOP_RECORD_DIR
-      : fs.mkdtempSync(path.join(os.tmpdir(), "omni-webauthn-recordings-"));
+      : path.join(scratch, "recordings");
     const fixture = http.createServer((_request, response) => {
       response.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
       response.end(VERIFY_PAGE);

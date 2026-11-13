@@ -115,6 +115,7 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
       let finished = false;
       const close = () => finish("dismiss");
       const hidden = () => finish(appClosedChoice(kind));
+      const failed = () => finish(kind === "security-key" ? "failed" : "dismiss");
       const position = () => {
         if (!parent.isDestroyed() && !popup.isDestroyed()) {
           popup.setBounds(promptBounds(parent.getContentBounds(), getAnchorBounds()));
@@ -151,7 +152,7 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
       // The security-key notice reports a request still in progress, so focus moving to
       // another app, the page or another conversation leaves it open.
       if (kind === "permission") popup.on("blur", close);
-      popup.webContents.on("render-process-gone", hidden);
+      popup.webContents.on("render-process-gone", failed);
       popup.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
       popup.webContents.on("will-navigate", (event) => event.preventDefault());
       popup.webContents.on("will-frame-navigate", (event) => event.preventDefault());
@@ -162,7 +163,7 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
         position();
         popup.show();
       });
-      void popup.loadFile(promptPage).catch(hidden);
+      void popup.loadFile(promptPage).catch(failed);
     });
     if (prompts.has(parent)) prompts.get(parent).result = result;
     return result;

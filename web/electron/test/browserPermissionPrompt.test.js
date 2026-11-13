@@ -239,6 +239,7 @@ describe("browser permission popover", () => {
         ipc: new EventEmitter(),
         mainFrame: {},
         getURL: () => `${ORIGIN}/verify`,
+        isDestroyed: () => false,
       });
       let visible = true;
       attachSecurityKeyNotice(contents, {
@@ -294,12 +295,23 @@ describe("browser permission popover", () => {
       assert.equal(h.windows.length, beforeFailure, "renderer failure waits before retrying");
       await wait();
       assert.equal(h.windows.length, beforeFailure + 1);
-      assert.equal(h.windows.at(-1).destroyed, true, "failed page load is suppressed");
+      assert.equal(h.windows.at(-1).destroyed, true, "failed page load closes the popup");
       await wait();
-      assert.equal(h.windows.length, beforeFailure + 2, "each failed load waits before retrying");
+      assert.equal(h.windows.length, beforeFailure + 1, "repeated failures increase the delay");
+      await wait();
+      assert.equal(h.windows.length, beforeFailure + 2);
+      mock.timers.tick(SHOW_DELAY_MS * 100);
+      await tick();
+      assert.equal(h.windows.length, beforeFailure + 2, "three failures exhaust this request");
       failedLoad.mock.restore();
+      contents.ipc.emit(PENDING_CHANNEL, { senderFrame: contents.mainFrame }, false);
+      contents.ipc.emit(PENDING_CHANNEL, { senderFrame: contents.mainFrame }, true);
       await wait();
-      assert.equal(h.windows.length, beforeFailure + 3, "notice recovers after load succeeds");
+      assert.equal(
+        h.windows.length,
+        beforeFailure + 3,
+        "a new request can recover after load succeeds",
+      );
       h.windows.at(-1).emit("blur");
       await wait();
       assert.equal(h.windows.at(-1).destroyed, false, "focus leaving keeps the notice");

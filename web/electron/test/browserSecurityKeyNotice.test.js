@@ -19,6 +19,7 @@ function harness({ url = PAGE, canPrompt = () => true, launch } = {}) {
     ipc: new EventEmitter(),
     mainFrame: { url },
     getURL: () => currentUrl,
+    isDestroyed: () => false,
   });
   const prompts = [];
   const opened = [];
@@ -59,7 +60,10 @@ function harness({ url = PAGE, canPrompt = () => true, launch } = {}) {
 
 describe("security-key notice for embedded browser pages", () => {
   beforeEach(() => mock.timers.enable({ apis: ["setTimeout"] }));
-  afterEach(() => mock.timers.reset());
+  afterEach(() => {
+    mock.restoreAll();
+    mock.timers.reset();
+  });
 
   it("shows while the page waits on a security key and hides once the request settles", async () => {
     const h = harness();
@@ -109,6 +113,7 @@ describe("security-key notice for embedded browser pages", () => {
     ],
   ]) {
     it(`offers the notice again when opening the system browser ${name}`, async () => {
+      const warning = mock.method(console, "warn", () => {});
       const h = harness({ launch });
       h.report(true);
       await h.wait();
@@ -116,6 +121,27 @@ describe("security-key notice for embedded browser pages", () => {
       await flush();
       assert.deepEqual(h.opened, [PAGE]);
       assert.equal(h.prompts.length, 2);
+      assert.equal(warning.mock.callCount(), 1);
+      let rejectLaunch;
+      const closing = harness({
+        launch: () =>
+          new Promise((_resolve, reject) => {
+            rejectLaunch = reject;
+          }),
+      });
+      closing.report(true);
+      await closing.wait();
+      closing.prompts[0].choose("open-in-browser");
+      await flush();
+      closing.contents.emit("destroyed");
+      const getURL = mock.method(closing.contents, "getURL", () => {
+        throw new Error("view destroyed");
+      });
+      rejectLaunch(new Error("late launch failure"));
+      await flush();
+      assert.equal(closing.prompts.length, 1);
+      assert.equal(warning.mock.callCount(), 2);
+      assert.equal(getURL.mock.callCount(), 0);
     });
   }
 
