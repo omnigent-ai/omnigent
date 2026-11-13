@@ -192,6 +192,56 @@ async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store, rrule) ->
         assert len(fired) == 1
 
 
+async def test_a_pending_reminder_survives_a_restart_and_fires_once(db_uri, store) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from omnigent.tools.builtins.scheduled_tasks import reminder_rrule
+
+    when = (datetime.now(UTC) + timedelta(hours=2)).replace(second=0, microsecond=0)
+    task = _task(
+        store,
+        rrule=reminder_rrule(when),
+        session_mode="continue",
+        session_id=uuid.uuid4().hex,
+        kind="reminder",
+    )
+    assert task.next_run_at == int(when.timestamp())
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(lease.run)
+        await lease.attach_session(snapshot.session_id)
+        await lease.finish("running")
+
+    def restarted(clock: FakeClock) -> PersistentTaskScheduler:
+        # A new process: a fresh store and scheduler over the same database.
+        fresh = SqlAlchemyScheduledTaskStore(db_uri)
+        fresh.configure_dispatch(True)
+        return PersistentTaskScheduler(fresh, fire, AsyncMock(), now=clock.now)
+
+    clock = FakeClock(task.next_run_at - 60)
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert fired == []
+
+    clock.advance(120)
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert [run.scheduled_at for run in fired] == [task.next_run_at]
+    saved = store.get(task.id)
+    assert (saved.state, saved.next_run_at, saved.kind) == ("completed", None, "reminder")
+
+    # Another restart a year later, when the rule's date comes round again, replays nothing.
+    clock.advance(366 * 86400)
+    scheduler = restarted(clock)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert len(fired) == 1
+    assert len(store.list_runs(task.id)[0]) == 1
+
+
 async def test_scan_pages_past_unowned_tasks_and_ownership_errors(
     store, caplog, monkeypatch
 ) -> None:

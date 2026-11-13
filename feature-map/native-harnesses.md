@@ -1457,9 +1457,9 @@ covers the prompt, `::test_reminder_approval_shows_the_resolved_time_whatever_th
 covers padded and long-fraction times, and `::test_reminder_approval_denies_a_time_the_tool_would_reject`
 and `::test_ask_on_scheduled_task_change_denies_a_reminder_without_message` cover
 the denies. For a human check in an isolated instance
-started with `OMNIGENT_FEATURES=automations_v2,one_time_automations` (the database
-scheduler plus one-time automations, both off by default; without them the tool
-refuses), ask a native session to remind it in two minutes. Reject the approval and
+started with `OMNIGENT_FEATURES=one_time_automations` (one-time automations are
+off by default; the database scheduler, `automations_v2`, is on by default; without
+either the tool refuses), ask a native session to remind it in two minutes. Reject the approval and
 confirm no `Reminder: ...` automation appears. Ask again, approve, and confirm
 one appears, that the message arrives as a new turn about two minutes later,
 and that the automation is then `completed`.

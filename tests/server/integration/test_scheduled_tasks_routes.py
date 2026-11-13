@@ -829,8 +829,52 @@ async def test_the_reminder_tools_request_continues_its_session(
     assert (task.session_mode, task.session_id, task.kind) == ("continue", session_id, "reminder")
     assert task.agent_id == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
     assert (task.permission_mode, task.state, task.next_run_at) == (None, "active", fire_at)
-    listed = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
-    assert [t["kind"] for t in listed["scheduled_tasks"]] == ["reminder"]
+
+
+@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
+async def test_the_list_leaves_reminders_out_unless_asked(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _owned_session(db_uri)
+    rule, fire_at = _one_time_rule_in(hours=2)
+    reminder = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": "Reminder: check CI",
+            "prompt": "check CI",
+            "rrule": rule,
+            "timezone": "UTC",
+            "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+            "session_mode": "continue",
+            "session_id": session_id,
+            "kind": "reminder",
+            "first_run_at": fire_at,
+        },
+        headers=_headers(),
+    )
+    assert reminder.status_code == 200, reminder.text
+    automation = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert automation.status_code == 200, automation.text
+
+    async def listed(params: dict[str, str]) -> list[str]:
+        resp = await auth_client.get("/v1/scheduled-tasks", params=params, headers=_headers())
+        assert resp.status_code == 200, resp.text
+        return sorted(t["id"] for t in resp.json()["scheduled_tasks"])
+
+    reminder_id, automation_id = reminder.json()["id"], automation.json()["id"]
+    assert await listed({}) == [automation_id]
+    assert await listed({"kind": "automation"}) == [automation_id]
+    assert await listed({"kind": "reminder"}) == [reminder_id]
+    assert await listed({"kind": "all"}) == sorted([reminder_id, automation_id])
+    # A reminder left off the list still opens by id, for example from the Inbox.
+    opened = await auth_client.get(f"/v1/scheduled-tasks/{reminder_id}", headers=_headers())
+    assert opened.status_code == 200, opened.text
+    bad = await auth_client.get(
+        "/v1/scheduled-tasks", params={"kind": "trigger"}, headers=_headers()
+    )
+    assert bad.status_code == 422, bad.text
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)

@@ -1108,8 +1108,14 @@ def create_scheduled_tasks_router(
         )
 
     @router.get("/scheduled-tasks")
-    async def list_scheduled_tasks(request: Request) -> dict[str, list[dict[str, Any]]]:
+    async def list_scheduled_tasks(
+        request: Request,
+        kind: Literal["automation", "reminder", "all"] = Query(default="automation"),
+    ) -> dict[str, list[dict[str, Any]]]:
         """List the caller's scheduled tasks.
+
+        Lists automations unless *kind* asks for ``reminder`` or ``all``, so the
+        reminders agents set for their own sessions stay off the Automations page.
 
         Lazy-on-read stale backstop: before returning, force-fail any of this
         owner's runs still ``running`` past the 6h max age (``incomplete``), so
@@ -1122,7 +1128,11 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
+        tasks = [
+            t
+            for t in store.list(owner_user_id=owner_id)
+            if _owns_task(t, owner_id) and kind in ("all", t.kind)
+        ]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
         # Force-fail stale orphans FIRST so the completion badge below reports a

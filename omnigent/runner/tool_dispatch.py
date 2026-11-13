@@ -5425,7 +5425,11 @@ async def _execute_scheduled_task_tool(
                     }
                 )
         if tool_name == "sys_scheduled_task_list":
-            resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
+            # Includes reminders, which the list leaves out by default, so an agent
+            # can find one to cancel.
+            resp = await server_client.get(
+                "/v1/scheduled-tasks", params={"kind": "all"}, timeout=30.0
+            )
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
             refusal = await _scheduled_task_session_fields_refusal(

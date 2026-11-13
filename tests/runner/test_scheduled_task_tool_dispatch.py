@@ -76,8 +76,10 @@ class _RecordingClient:
             body={"scheduled_task_projects": True, "scheduled_task_session_modes": True}
         )
 
-    async def get(self, url: str, *, timeout: object = None) -> _Resp:
-        self.calls.append(("GET", url, None))
+    async def get(
+        self, url: str, *, params: dict[str, str] | None = None, timeout: object = None
+    ) -> _Resp:
+        self.calls.append(("GET", url, params))
         return self._info if url == "/v1/info" else self._response
 
     async def post(
@@ -307,7 +309,8 @@ async def test_mcp_services_reach_a_server_that_supports_them() -> None:
 async def test_list_gets() -> None:
     client = _RecordingClient(_Resp(body={"scheduled_tasks": []}))
     out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=client)
-    assert client.calls[0] == ("GET", "/v1/scheduled-tasks", None)
+    # Reminders are left out of the list by default; an agent needs them to cancel one.
+    assert client.calls[0] == ("GET", "/v1/scheduled-tasks", {"kind": "all"})
     assert json.loads(out) == {"scheduled_tasks": []}
 
 
