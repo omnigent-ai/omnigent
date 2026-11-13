@@ -263,8 +263,8 @@ class ToolEnvironmentLease:
     async def release(self, *, reusable: bool) -> None:
         """End the call's hold; close the environment unless it stays reusable.
 
-        :param reusable: ``False`` after a failed or cancelled call, whose
-            helper may still be running the abandoned request.
+        :param reusable: ``False`` after shell, failed or cancelled calls,
+            whose descendants may still be running.
         """
         await self.registry._release_tool_environment(self, reusable=reusable)
 

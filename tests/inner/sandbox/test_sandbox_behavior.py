@@ -605,6 +605,102 @@ def test_sandbox_helper_survives_sequential_requests(
     assert len(scratch_dirs) == (1 if declares_stability else 5)
 
 
+@pytest.mark.asyncio
+async def test_runner_shell_retires_helper_and_owned_background_processes(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+    sandbox_pythonpath_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed shell request closes its Linux tool-helper namespace before return."""
+    import asyncio
+
+    import psutil
+
+    from omnigent.inner.os_env import CallerProcessOSEnvironment
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.spec.types import AgentSpec
+    from tests._helpers.polling import poll_until_async
+
+    passthrough_name = "TEST_HARMLESS_PASSTHROUGH"
+    monkeypatch.setenv(passthrough_name, "enabled")
+    sandbox_spec = active_sandbox_spec_factory(
+        env_passthrough=[passthrough_name], write_paths=[str(tmp_path)]
+    )
+    if sandbox_spec.type != "linux_bwrap":
+        pytest.skip("Complete descendant retirement here depends on a Linux PID namespace")
+    spec = OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=sandbox_spec)
+    registry = SessionResourceRegistry()
+    session_id = "conv_shell_retirement"
+    task: asyncio.Task[str] | None = None
+    (tmp_path / "note.txt").write_text("owned test workspace")
+    try:
+        lease = await registry.lease_tool_environment(session_id, spec)
+        assert lease is not None
+        await lease.environment.read("note.txt")
+        assert isinstance(lease.environment, CallerProcessOSEnvironment)
+        helper = lease.environment._helper._proc
+        assert helper is not None
+        allowed = await lease.environment.shell('printf "%s" "$TEST_HARMLESS_PASSTHROUGH"')
+        assert allowed["stdout"] == "enabled"
+        await lease.release(reusable=True)
+        spec.sandbox = active_sandbox_spec_factory(write_paths=[str(tmp_path)])
+        replacement = await registry.lease_tool_environment(session_id, spec)
+        assert replacement is not None and replacement is not lease
+        assert helper.poll() is not None
+        await replacement.environment.read("note.txt")
+        assert isinstance(replacement.environment, CallerProcessOSEnvironment)
+        helper = replacement.environment._helper._proc
+        assert helper is not None
+        await replacement.release(reusable=True)
+        task = asyncio.create_task(
+            _execute_os_env_tool(
+                "sys_os_shell",
+                {
+                    "command": (
+                        'printf "%s" "$TEST_HARMLESS_PASSTHROUGH"; '
+                        "sleep 30 >/dev/null 2>&1 & echo ready > started; "
+                        "while [ ! -f release ]; do sleep 0.01; done"
+                    ),
+                    "timeout": 10,
+                },
+                agent_spec=AgentSpec(spec_version=1, os_env=spec),
+                conversation_id=session_id,
+                resource_registry=registry,
+            )
+        )
+        await poll_until_async((tmp_path / "started").exists, timeout_s=5)
+        descendants = psutil.Process(helper.pid).children(recursive=True)
+        sleepers = []
+        for process in descendants:
+            try:
+                if process.cmdline() == ["sleep", "30"]:
+                    sleepers.append(process)
+            except psutil.NoSuchProcess:
+                pass
+        assert sleepers
+        (tmp_path / "release").touch()
+        result = json.loads(await task)
+        assert result["exit_code"] == 0
+        assert result["stdout"] == ""
+        assert helper.poll() is not None
+
+        def stopped(process: psutil.Process) -> bool:
+            try:
+                return not process.is_running() or process.status() == psutil.STATUS_ZOMBIE
+            except psutil.NoSuchProcess:
+                return True
+
+        await poll_until_async(lambda: all(stopped(p) for p in descendants), timeout_s=5)
+    finally:
+        (tmp_path / "release").touch()
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await registry.cleanup_session(session_id)
+
+
 def test_sandbox_hides_dotfiles_created_after_helper_start(
     tmp_path: Path,
     active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],

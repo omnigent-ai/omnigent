@@ -2780,17 +2780,27 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
 async def _os_env_helper_pid(
     registry: SessionResourceRegistry, spec: AgentSpec, session_id: str
 ) -> int:
-    """Return the pid of the helper that ran a ``sys_os_shell`` call."""
+    """Start the helper with a file read and inspect its process without running a shell."""
+    from omnigent.inner.os_env import CallerProcessOSEnvironment
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
-    shell = await _execute_os_env_tool(
-        "sys_os_shell",
-        {"command": "echo $PPID"},
+    await _execute_os_env_tool(
+        "sys_os_read",
+        {"path": "note.txt"},
         agent_spec=spec,
         conversation_id=session_id,
         resource_registry=registry,
     )
-    return int(json.loads(shell)["stdout"])
+    assert spec.os_env is not None
+    lease = await registry.lease_tool_environment(session_id, spec.os_env)
+    assert lease is not None
+    try:
+        assert isinstance(lease.environment, CallerProcessOSEnvironment)
+        proc = lease.environment._helper._proc
+        assert proc is not None
+        return proc.pid
+    finally:
+        await lease.release(reusable=True)
 
 
 def _process_exists(pid: int) -> bool:
@@ -2874,8 +2884,11 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             assert shell_result["exit_code"] == 0
             cwd, pid = shell_result["stdout"].split()
             assert Path(cwd).resolve() == root.resolve()
-            # Every call in the session ran in the one helper process.
+            # File calls stayed warm; the shell used that helper and then retired it.
             assert int(pid) == helper_pid
+            assert not _process_exists(helper_pid)
+            replacement = await _os_env_helper_pid(registry, spec, "conv_runner_os_env_test")
+            assert replacement != helper_pid
 
         finally:
             await registry.cleanup_session("conv_runner_os_env_test")
@@ -2883,7 +2896,9 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runner_os_env_helper_restarts_and_keys_on_spec(tmp_path: Path) -> None:
+async def test_runner_os_env_helper_restarts_and_keys_on_spec(
+    tmp_path: Path,
+) -> None:
     """A crashed helper restarts; a changed spec, another session or a timeout gets a new one."""
     import signal
 
@@ -2917,6 +2932,18 @@ async def test_runner_os_env_helper_restarts_and_keys_on_spec(tmp_path: Path) ->
         moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
         assert moved != restarted
         assert not _process_exists(restarted)
+
+        # An env-only spec change at the same cwd replaces the helper in both directions.
+        passthrough_name = "TEST_HARMLESS_PASSTHROUGH"
+        env_spec = agent(tmp_path / "b")
+        assert env_spec.os_env is not None and env_spec.os_env.sandbox is not None
+        env_spec.os_env.sandbox.env_passthrough = [passthrough_name]
+        with_env = await _os_env_helper_pid(registry, env_spec, "conv_a")
+        assert with_env != moved
+        assert not _process_exists(moved)
+        moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
+        assert moved != with_env
+        assert not _process_exists(with_env)
 
         # The same spec whose cwd symlink now points elsewhere is a different workspace.
         (tmp_path / "c").mkdir()

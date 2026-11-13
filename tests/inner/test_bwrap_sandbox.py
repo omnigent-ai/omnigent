@@ -521,6 +521,49 @@ def test_launch_fingerprint_tracks_granted_roots_but_not_scratch(
     assert backend.launch_fingerprint(argv, policy, cwd) != refreshed
 
 
+@pytest.mark.parametrize("inside_mask", [False, True])
+def test_launch_fingerprint_tracks_interpreter_mounts(tmp_path: Path, inside_mask: bool) -> None:
+    """Implicit interpreter grants track directory replacement and symlink retargeting."""
+    from omnigent.inner.bwrap_sandbox import (
+        _ensure_executable_visible,
+        _interpreter_reexpose_after_mask,
+    )
+
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+    installs = cwd / ".local" if inside_mask else tmp_path / "installs"
+    version = installs / "version-a"
+    (version / "bin").mkdir(parents=True)
+    (version / "bin" / "python").touch()
+    current = installs / "current"
+    current.symlink_to(version, target_is_directory=True)
+    argv = [str(current / "bin" / "python")]
+    if inside_mask:
+        assert not _ensure_executable_visible(argv, cwd)
+        assert _interpreter_reexpose_after_mask(argv, [installs])
+    else:
+        assert _ensure_executable_visible(argv, cwd)
+
+    backend = _make_backend()
+    policy = _make_policy(cwd)
+    launched = backend.launch_fingerprint(argv, policy, cwd)
+    (version / "bin" / "ordinary-content").touch()
+    assert backend.launch_fingerprint(argv, policy, cwd) == launched
+
+    version.rename(installs / "previous")
+    (version / "bin").mkdir(parents=True)
+    (version / "bin" / "python").touch()
+    replaced = backend.launch_fingerprint(argv, policy, cwd)
+    assert replaced != launched
+
+    other = installs / "version-b"
+    (other / "bin").mkdir(parents=True)
+    (other / "bin" / "python").touch()
+    current.unlink()
+    current.symlink_to(other, target_is_directory=True)
+    assert backend.launch_fingerprint(argv, policy, cwd) != replaced
+
+
 def test_wrap_launcher_argv_includes_required_mounts_and_chdir(
     tmp_path: Path,
 ) -> None:

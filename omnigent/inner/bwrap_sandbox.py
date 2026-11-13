@@ -408,7 +408,15 @@ class BwrapSandboxBackend(SandboxBackend):
             *_default_readonly_bind_sources(),
         ]
         roots = [_path_identity(root, follow_symlinks=True) for root in granted]
-        return masks, _mount_target_identities(masks), roots
+        interpreter_binds = _ensure_executable_visible(argv, cwd_resolved)
+        interpreter_binds += _interpreter_reexpose_after_mask(argv, _tmpfs_mask_dirs(masks))
+        return (
+            masks,
+            _mount_target_identities(masks),
+            roots,
+            interpreter_binds,
+            _mount_target_identities(interpreter_binds),
+        )
 
     def wrap_launcher_argv(
         self,
