@@ -378,7 +378,7 @@ _PROMPT_SCAN_TAIL_LINES = 5
 # and selection prompts (MCP approval, API-key approval, folder trust, rewind,
 # ``/model``) all end in an "Enter to … · Esc to …" variant.
 _DIALOG_FOOTER_RE = re.compile(
-    r"enter to (confirm|continue)|press enter to continue|esc to (cancel|exit|reject)",
+    r"enterto(confirm|continue)|pressentertocontinue|escto(cancel|exit|reject)",
     re.IGNORECASE,
 )
 # Lines scanned for a dialog when no box rule anchors the region.
@@ -7900,13 +7900,14 @@ def _terminal_dialog_headline(pane: str) -> str | None:
     lines = [line for line in pane.splitlines() if line.strip()]
     last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
     region = lines[last_rule + 1 :] if last_rule is not None else lines[-_DIALOG_SCAN_TAIL_LINES:]
-    footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
-    if footer is None:
+    # Narrow terminals can wrap inside a footer word as well as between words.
+    footer = "".join("".join(region).split())
+    if _DIALOG_FOOTER_RE.search(footer) is None:
         return None
     has_selector = any(
         line.strip().lstrip("│ ").startswith(_CLAUDE_PROMPT_GLYPH) for line in region
     )
-    if not has_selector and "press enter" not in footer.lower():
+    if not has_selector and "pressenter" not in footer.lower():
         return None
     return " ".join(region[0].strip().strip("│").split())[:120]
 

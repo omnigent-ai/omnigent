@@ -60,6 +60,18 @@ _SETTINGS_WARNING = f"""\
 """
 
 
+@pytest.fixture(
+    params=[
+        "Enter to confirm · Esc to cancel",
+        "Enter to\nconfirm · Esc to\ncancel",
+        "Enter to con\nfirm · Esc to can\ncel",
+    ],
+    ids=["single-row-footer", "wrapped-words", "split-words"],
+)
+def dialog_footer(request: pytest.FixtureRequest) -> str:
+    return request.param
+
+
 class _Clock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -100,9 +112,10 @@ def _show(monkeypatch: pytest.MonkeyPatch, pane: str) -> list[tuple[str, ...]]:
     "pane", [_SETTINGS_ERROR, _FOLDER_TRUST], ids=["settings-error", "folder-trust"]
 )
 def test_the_reclaim_leaves_a_dialog_escape_would_quit(
-    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str, dialog_footer: str
 ) -> None:
     """No key reaches the pane; the dialog is handed back as an overlay."""
+    pane = pane.replace("Enter to confirm · Esc to cancel", dialog_footer)
     sent = _show(monkeypatch, pane)
 
     surface = claude_native_bridge._restore_occupied_input(
@@ -130,7 +143,7 @@ def test_a_settings_warning_is_still_dismissed(
     "pane", [_SETTINGS_ERROR, _FOLDER_TRUST], ids=["settings-error", "folder-trust"]
 )
 def test_a_message_behind_such_a_dialog_is_reported_not_escaped(
-    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str, dialog_footer: str
 ) -> None:
     """
     The message is refused with the dialog's name and Claude Code keeps running.
@@ -138,6 +151,7 @@ def test_a_message_behind_such_a_dialog_is_reported_not_escaped(
     On main the reclaim's Escape quit Claude Code, and the readiness gate then
     timed out on an empty pane after about a second.
     """
+    pane = pane.replace("Enter to confirm · Esc to cancel", dialog_footer)
     sent = _show(monkeypatch, pane)
 
     with pytest.raises(ClaudeTerminalDialog, match="waiting for an answer in its terminal"):
@@ -147,9 +161,10 @@ def test_a_message_behind_such_a_dialog_is_reported_not_escaped(
 
 
 def test_a_settings_command_behind_such_a_dialog_is_refused_without_a_key(
-    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, dialog_footer: str
 ) -> None:
-    sent = _show(monkeypatch, _SETTINGS_ERROR)
+    pane = _SETTINGS_ERROR.replace("Enter to confirm · Esc to cancel", dialog_footer)
+    sent = _show(monkeypatch, pane)
 
     # The command waits for the prompt like a message, so the readiness gate names the dialog.
     with pytest.raises(
@@ -165,5 +180,6 @@ def test_a_settings_command_behind_such_a_dialog_is_refused_without_a_key(
     [(_SETTINGS_ERROR, True), (_FOLDER_TRUST, True), (_SETTINGS_WARNING, False), ("", False)],
     ids=["settings-error", "folder-trust", "settings-warning", "empty"],
 )
-def test_escape_quits_claude(pane: str, expected: bool) -> None:
+def test_escape_quits_claude(pane: str, expected: bool, dialog_footer: str) -> None:
+    pane = pane.replace("Enter to confirm · Esc to cancel", dialog_footer)
     assert claude_native_bridge._escape_quits_claude(pane) is expected
