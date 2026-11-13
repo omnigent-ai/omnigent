@@ -95,7 +95,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "arca_shutdown_warnings": False,
         "import_review": False,
         "sidebar_grouping_ui": True,
-        "workspace_content_search": False,
+        "workspace_content_search": True,
         "grid_sessions_display_ui": False,
         "automations_v2": True,
         "splittable_terminal_view_ui": False,
