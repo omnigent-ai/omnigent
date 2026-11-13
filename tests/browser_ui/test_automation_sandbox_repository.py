@@ -184,8 +184,6 @@ def test_automation_sandbox_repository(
         page.get_by_role("option", name="Browser host", exact=True).click()
         for trigger_id, role in (
             ("task-host-trigger", "listbox"),
-            ("task-model-trigger", "listbox"),
-            ("task-effort-trigger", "listbox"),
             ("task-permission-trigger", "listbox"),
             ("task-project-trigger", "menu"),
             ("new-chat-landing-agent-select", "menu"),
@@ -339,7 +337,20 @@ def test_reused_automation_settings(
         note = page.get_by_test_id("task-session-settings-note")
         note.scroll_into_view_if_needed()
         expect(note).to_contain_text("This automation continues in an existing session")
-        expect(page.get_by_test_id("task-model-trigger")).to_be_disabled()
+        # The picker's model flyout is locked to the existing session too.
+        page.get_by_test_id("task-agent-picker").get_by_test_id(
+            "new-chat-landing-agent-select"
+        ).click()
+        page.locator(
+            '[data-harness-menu-row][data-active="true"] '
+            '[data-testid^="new-chat-landing-agent-config-"]'
+        ).click()
+        expect(page.get_by_test_id("task-picker-session-locked")).to_be_visible()
+        expect(page.get_by_test_id("task-agent-model-default")).to_be_disabled()
+        # One Escape closes the whole agent menu, flyout included.
+        page.keyboard.press("Escape")
+        expect(page.get_by_role("menu")).to_have_count(0)
+        expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
         if trigger:
             expect(note).to_contain_text("each match starts a new worker")
             page.get_by_role("button", name="Edit worker instructions", exact=True).click()

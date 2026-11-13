@@ -69,6 +69,13 @@ import {
 } from "@/components/scheduled/triggerTemplates";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
+import {
+  ComposerConfigSections,
+  type ComposerConfigSection,
+} from "@/components/composer/ComposerConfigSections";
+import { nativeAgentHasModelSettings } from "@/lib/nativeCodingAgents";
+import { harnessReadinessOnHost } from "@/lib/harnessSetup";
 import { ProjectPicker, ProjectRowIcon } from "@/shell/ProjectPicker";
 import { useProjects, useResolveOrCreateProjectId } from "@/hooks/useConversations";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
@@ -115,7 +122,7 @@ import { useSession } from "@/hooks/useSession";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import type { AutomationSourceSession } from "@/lib/automationFromSession";
-import type { Session } from "@/lib/types";
+import type { NativeModelOption, Session } from "@/lib/types";
 
 const PROVIDER_DEFAULT = "provider-default";
 const DEFAULT_AUTOMATION_PROJECT = "Omnigent Automation";
@@ -385,6 +392,12 @@ export function CreateScheduledTaskDialog({
   const sourcePrefilledRef = useRef(false);
 
   function handleSelectAgent(agent: AvailableAgent) {
+    // The picker's Edit row re-selects the current agent before opening its settings,
+    // so picking the agent already in use must keep the unsaved model, effort and permission.
+    if (agent.id === effectiveAgentId) {
+      setPickedAgentId(agent.id);
+      return;
+    }
     sourcePrefilledRef.current = true;
     setPickedAgentId(agent.id);
     // Settings belong to their harness. Returning to the edited task's agent
@@ -834,7 +847,14 @@ export function CreateScheduledTaskDialog({
     editingTask?.executionTarget === "managed_sandbox"
       ? sandboxMode
       : !sandboxMode && hostId === (editingTask?.hostId ?? "");
-  const showAdvanced = supportsModel || supportsPermission;
+  // Model and effort live in the agent picker, as in the composer; Advanced keeps permissions.
+  // A saved agent that curation hides has no picker row, so its model and effort stay in
+  // Advanced.
+  const hasLaunchSettings = supportsModel || harnessSettings.efforts.length > 0;
+  const selectedInPicker = agentList.some((agent) => agent.id === effectiveAgentId);
+  const pickerHasLaunchSettings = hasLaunchSettings && selectedInPicker;
+  const advancedHasLaunchSettings = hasLaunchSettings && !selectedInPicker;
+  const showAdvanced = supportsPermission || advancedHasLaunchSettings;
   // From a session: start from its model, effort and permission mode once its
   // snapshot and the harness options are known; unattended rules still apply.
   useEffect(() => {
@@ -1030,11 +1050,17 @@ export function CreateScheduledTaskDialog({
   const summaryModel = editingWorkerSettings ? (workerSettings?.model ?? "") : displayedModel;
   const summaryEffort = editingWorkerSettings ? (workerSettings?.effort ?? "") : displayedEffort;
   const summaryPermission = editingWorkerSettings ? "" : displayedPermission;
+  // Model and effort are summarized here only where Advanced holds them.
+  const summaryHasLaunchSettings = editingWorkerSettings || advancedHasLaunchSettings;
   const overrideSummary = [
-    summarySettings.models.find((option) => option.id === summaryModel)?.displayName ??
-      summaryModel,
-    summarySettings.efforts.find((option) => option.value === summaryEffort)?.label ??
-      summaryEffort,
+    summaryHasLaunchSettings
+      ? (summarySettings.models.find((option) => option.id === summaryModel)?.displayName ??
+        summaryModel)
+      : null,
+    summaryHasLaunchSettings
+      ? (summarySettings.efforts.find((option) => option.value === summaryEffort)?.label ??
+        summaryEffort)
+      : null,
     summarySettings.permissions.find((option) => option.value === summaryPermission)?.label ??
       summaryPermission,
     !triggerMode && schedule.end ? "End limit" : null,
@@ -1042,6 +1068,105 @@ export function CreateScheduledTaskDialog({
   ]
     .filter(Boolean)
     .join(" · ");
+  // The agent picker's Edit flyout, built from the same option lists as the composer's.
+  // Catalog rows carry their option so long catalogs get the composer's search and groups.
+  const pickerModelChoices: { id: string; label: string; option?: NativeModelOption }[] =
+    harnessSettings.models.map((option) => ({
+      id: option.id,
+      label: option.displayName ?? option.id,
+      option,
+    }));
+  if (displayedModel && !pickerModelChoices.some((option) => option.id === displayedModel)) {
+    pickerModelChoices.push({ id: displayedModel, label: displayedModel });
+  }
+  const pickerEffortChoices = [...harnessSettings.efforts];
+  if (displayedEffort && !pickerEffortChoices.some((option) => option.value === displayedEffort)) {
+    pickerEffortChoices.push({ value: displayedEffort, label: displayedEffort });
+  }
+  const pickerLockedNote = reusesExistingSession ? (
+    <div
+      className="whitespace-normal px-2 py-1 text-xs text-muted-foreground"
+      data-testid="task-picker-session-locked"
+    >
+      Set by the existing session.
+    </div>
+  ) : null;
+  const pickerModelSection: ComposerConfigSection | undefined = supportsModel
+    ? {
+        testId: "task-agent-models",
+        header: "Models",
+        leading: (
+          <>
+            {pickerLockedNote}
+            {harnessSettings.catalogMessage && (
+              <div className="whitespace-normal px-2 py-1 text-xs text-muted-foreground">
+                {harnessSettings.catalogMessage}
+              </div>
+            )}
+          </>
+        ),
+        choices: [{ id: "", label: "Default" }, ...pickerModelChoices].map((choice) => ({
+          key: choice.id || "__default__",
+          label: choice.label,
+          checked: displayedModel === choice.id,
+          disabled: reusesExistingSession,
+          onSelect: () => handleModelChange(choice.id),
+          testId: `task-agent-model-${choice.id || "default"}`,
+          modelOption: "option" in choice ? choice.option : undefined,
+        })),
+      }
+    : undefined;
+  const pickerEffortSection: ComposerConfigSection | undefined =
+    pickerEffortChoices.length > 0
+      ? {
+          testId: "task-agent-efforts",
+          header: harnessSettings.harness === "pi-native" ? "Thinking level" : "Effort",
+          leading: supportsModel ? undefined : pickerLockedNote,
+          choices: [{ value: "", label: "Default" }, ...pickerEffortChoices].map((option) => ({
+            key: option.value || "__default__",
+            label: option.label,
+            checked: displayedEffort === option.value,
+            disabled: reusesExistingSession,
+            onSelect: () => {
+              sourcePrefilledRef.current = true;
+              setPickedEffort(option.value);
+            },
+            testId: `task-agent-effort-${option.value || "default"}`,
+          })),
+        }
+      : undefined;
+  const pickerConfigContent = pickerHasLaunchSettings ? (
+    <ComposerConfigSections models={pickerModelSection} efforts={pickerEffortSection} />
+  ) : null;
+  // Like the composer's trigger: the picked model (or the catalog default) and effort.
+  const catalogDefaultModel = harnessSettings.models.find((option) => option.isDefault);
+  const pickedModelLabel =
+    pickerModelChoices.find((option) => option.id === displayedModel)?.label ?? displayedModel;
+  // The picker hides the model of an unavailable harness; without a model it names the agent.
+  const pickerHost = sandboxMode ? undefined : badgeHost;
+  const selectedReadiness = harnessReadinessOnHost(selectedAgent?.harness, pickerHost);
+  const selectedUnavailableOnHost =
+    selectedAgent !== undefined &&
+    !selectedReadiness.selectable &&
+    selectedReadiness.fallbackRelevant;
+  const showTriggerModel = supportsModel && !selectedUnavailableOnHost;
+  const pickerTriggerDetails: { label: string; value: string }[] = [];
+  if (showTriggerModel && displayedModel) {
+    pickerTriggerDetails.push({ label: "Model", value: pickedModelLabel });
+  } else if (showTriggerModel && catalogDefaultModel) {
+    pickerTriggerDetails.push({
+      label: "Model",
+      value: `Default (${catalogDefaultModel.displayName ?? catalogDefaultModel.id})`,
+    });
+  }
+  if (pickerEffortSection) {
+    pickerTriggerDetails.push({
+      label: pickerEffortSection.header === "Thinking level" ? "Thinking level" : "Effort",
+      value:
+        pickerEffortChoices.find((option) => option.value === displayedEffort)?.label ??
+        (displayedEffort || "Default"),
+    });
+  }
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
@@ -1537,7 +1662,20 @@ export function CreateScheduledTaskDialog({
                             curation.restrictToAgentNames.size > 0 ? agentList : undefined
                           }
                           // Sandboxes provision their own harnesses; host badges only apply to hosts.
-                          host={sandboxMode ? undefined : badgeHost}
+                          host={pickerHost}
+                          // Runs start later, so saved settings stay editable while the
+                          // harness is unavailable on the host.
+                          configurableWhenUnavailable
+                          triggerDetails={pickerTriggerDetails}
+                          triggerIcon={
+                            selectedAgent ? <ComposerAgentIcon agent={selectedAgent} /> : undefined
+                          }
+                          selectedConfigContent={pickerConfigContent}
+                          isEntryConfigurable={(agent) =>
+                            agent.id === effectiveAgentId
+                              ? pickerHasLaunchSettings
+                              : nativeAgentHasModelSettings(agent)
+                          }
                           onSelectAgent={handleSelectAgent}
                           pendingAgent={null}
                           pendingAgentId="__unused_pending_agent__"
@@ -1933,7 +2071,7 @@ export function CreateScheduledTaskDialog({
                         <>
                           {!showAdvanced && (
                             <p className="text-sm text-muted-foreground">
-                              Uses this agent&apos;s default model, effort, and permission settings
+                              Uses this agent&apos;s default permission settings
                             </p>
                           )}
 
@@ -1947,26 +2085,29 @@ export function CreateScheduledTaskDialog({
                             </p>
                           )}
                           {/* Each harness exposes only the launch settings it supports. */}
-                          {showAdvanced && (
-                            <div data-testid="task-model-effort-field">
-                              <ModelEffortFields
-                                model={displayedModel}
-                                effort={displayedEffort}
-                                permissionMode={displayedPermission}
-                                settings={harnessSettings}
-                                disabled={curationPending || reusesExistingSession}
-                                onModelChange={handleModelChange}
-                                onEffortChange={(effort) => {
-                                  sourcePrefilledRef.current = true;
-                                  setPickedEffort(effort);
-                                }}
-                                onPermissionModeChange={(mode) => {
-                                  sourcePrefilledRef.current = true;
-                                  setPickedPermission(mode);
-                                  setPermissionPicked(true);
-                                }}
-                                onSelectOpenChange={handleSelectOpenChange}
-                              />
+                          {(showAdvanced || (reusesExistingSession && hasLaunchSettings)) && (
+                            <div data-testid="task-launch-settings-field">
+                              {showAdvanced && (
+                                <ModelEffortFields
+                                  permissionOnly={!advancedHasLaunchSettings}
+                                  model={displayedModel}
+                                  effort={displayedEffort}
+                                  permissionMode={displayedPermission}
+                                  settings={harnessSettings}
+                                  disabled={curationPending || reusesExistingSession}
+                                  onModelChange={handleModelChange}
+                                  onEffortChange={(effort) => {
+                                    sourcePrefilledRef.current = true;
+                                    setPickedEffort(effort);
+                                  }}
+                                  onPermissionModeChange={(mode) => {
+                                    sourcePrefilledRef.current = true;
+                                    setPickedPermission(mode);
+                                    setPermissionPicked(true);
+                                  }}
+                                  onSelectOpenChange={handleSelectOpenChange}
+                                />
+                              )}
                               {reusesExistingSession ? (
                                 <div
                                   className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-foreground"

@@ -102,6 +102,8 @@ function renderPicker(props: {
   hasAgents?: boolean;
   host?: Host;
   onPrefetchEntries?: (ids: string[]) => void;
+  configurableWhenUnavailable?: boolean;
+  onSelectAgent?: (agent: AvailableAgent) => void;
 }) {
   const picker = (open = props.open, openNonce = props.openNonce) => (
     <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
@@ -123,7 +125,8 @@ function renderPicker(props: {
             agentLabel={props.agentLabel ?? "Picker"}
             hasAgents={props.hasAgents ?? true}
             host={props.host ?? readyHost}
-            onSelectAgent={() => undefined}
+            onSelectAgent={props.onSelectAgent ?? (() => undefined)}
+            configurableWhenUnavailable={props.configurableWhenUnavailable}
             pendingAgent={null}
             pendingAgentId="pending-agent"
             onSelectPending={() => undefined}
@@ -363,6 +366,117 @@ describe("a curated New Chat picker", () => {
     expect(screen.getByText("Harnesses")).toBeVisible();
     // Creating stays reachable, in the submenu that groups custom agents.
     expect(screen.getByTestId("new-chat-landing-custom-agents")).toBeVisible();
+  });
+
+  describe("an unavailable selected harness", () => {
+    const codexMissing: Host = {
+      ...readyHost,
+      configured_harnesses: { ...readyHost.configured_harnesses, "codex-native": "binary-missing" },
+    };
+    const config = <button type="button">Configured model</button>;
+
+    it("hides its settings by default", async () => {
+      renderPicker({
+        harnessEntries: [claude, codex],
+        effectiveAgentId: codex.id,
+        host: codexMissing,
+        selectedConfigContent: config,
+      });
+      await openPicker();
+
+      expect(screen.getByTestId(`new-chat-landing-agent-${codex.id}`)).toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+      expect(screen.queryByTestId(`new-chat-landing-agent-config-${codex.id}`)).toBeNull();
+    });
+
+    it("keeps its settings editable when configurableWhenUnavailable is set", async () => {
+      const onSelectAgent = vi.fn();
+      renderPicker({
+        harnessEntries: [claude, codex],
+        agentEntries: [polly],
+        effectiveAgentId: codex.id,
+        host: {
+          ...codexMissing,
+          configured_harnesses: {
+            ...codexMissing.configured_harnesses,
+            "claude-native": "binary-missing",
+          },
+        },
+        selectedConfigContent: config,
+        configurableWhenUnavailable: true,
+        onSelectAgent,
+      });
+      await openPicker();
+
+      const codexRow = screen.getByTestId(`new-chat-landing-agent-${codex.id}`);
+      expect(codexRow).toHaveAttribute("aria-disabled", "true");
+      expect(screen.getByTestId(`new-chat-landing-agent-warning-${codex.id}`)).toBeInTheDocument();
+      // Another unavailable entry offers no Edit: opening it would select it.
+      expect(screen.queryByTestId(`new-chat-landing-agent-config-${claude.id}`)).toBeNull();
+      // Clicking the row itself still doesn't select it.
+      await userEvent.click(codexRow);
+      expect(onSelectAgent).not.toHaveBeenCalled();
+
+      await userEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${codex.id}`));
+      expect(await screen.findByRole("button", { name: "Configured model" })).toBeVisible();
+    });
+
+    it("opens an unavailable selected entry's settings page on mobile", async () => {
+      // useIsMobileViewport reads a max-width media query.
+      const realMatchMedia = window.matchMedia;
+      window.matchMedia = ((query: string) => ({
+        matches: /max-width/.test(query),
+        media: query,
+        onchange: null,
+        addListener: () => {},
+        removeListener: () => {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        dispatchEvent: () => false,
+      })) as typeof window.matchMedia;
+      try {
+        const onSelectAgent = vi.fn();
+        renderPicker({
+          harnessEntries: [claude, codex],
+          effectiveAgentId: codex.id,
+          host: codexMissing,
+          selectedConfigContent: config,
+          configurableWhenUnavailable: true,
+          onSelectAgent,
+        });
+        await openPicker();
+
+        await userEvent.click(screen.getByTestId(`new-chat-landing-agent-${codex.id}`));
+        expect(screen.queryByRole("button", { name: "Configured model" })).not.toBeInTheDocument();
+        await userEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${codex.id}`));
+        expect(await screen.findByRole("button", { name: "Configured model" })).toBeVisible();
+      } finally {
+        window.matchMedia = realMatchMedia;
+      }
+    });
+
+    it("opens an unavailable selected entry's settings from the keyboard without selecting it", async () => {
+      const onSelectAgent = vi.fn();
+      renderPicker({
+        harnessEntries: [claude, codex],
+        effectiveAgentId: codex.id,
+        host: codexMissing,
+        selectedConfigContent: config,
+        configurableWhenUnavailable: true,
+        onSelectAgent,
+      });
+      await openPicker();
+
+      screen.getByTestId(`new-chat-landing-agent-${codex.id}`).focus();
+      await userEvent.keyboard("{Enter}");
+      expect(onSelectAgent).not.toHaveBeenCalled();
+      expect(screen.queryByRole("button", { name: "Configured model" })).not.toBeInTheDocument();
+
+      await userEvent.keyboard("{ArrowRight}");
+      expect(await screen.findByRole("button", { name: "Configured model" })).toBeVisible();
+    });
   });
 
   describe("with unconfigured harnesses hidden", () => {
