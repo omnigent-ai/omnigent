@@ -2,7 +2,7 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const { EventEmitter } = require("node:events");
+const { EventEmitter, getEventListeners } = require("node:events");
 const { pathToFileURL } = require("node:url");
 const path = require("node:path");
 const fs = require("node:fs");
@@ -311,6 +311,29 @@ describe("browser permission popover", () => {
     await h.wait();
     assert.equal(h.windows.length, 2, "the notice returns after navigation");
   });
+
+  for (const cancellation of ["abort", "parent-close"]) {
+    it(`dismisses a notice waiting for shell navigation on ${cancellation}`, async () => {
+      const h = harness();
+      h.parent.loadingMainFrame = true;
+      const result = h.show({ kind: "security-key" });
+      assert.equal(h.parent.webContents.listenerCount("did-stop-loading"), 1);
+      assert.equal(h.parent.listenerCount("closed"), 1);
+      assert.equal(getEventListeners(h.abort.signal, "abort").length, 1);
+
+      if (cancellation === "abort") h.abort.abort();
+      else h.parent.destroy();
+
+      assert.equal(await result, "dismiss");
+      assert.equal(h.parent.webContents.listenerCount("did-stop-loading"), 0);
+      assert.equal(h.parent.listenerCount("closed"), 0);
+      assert.equal(getEventListeners(h.abort.signal, "abort").length, 0);
+      h.parent.loadingMainFrame = false;
+      h.parent.webContents.emit("did-stop-loading");
+      await tick();
+      assert.equal(h.windows.length, 0, "navigation completion cannot reopen a cancelled notice");
+    });
+  }
 
   it("backs off failed security-key popups and resets the budget for a new request", async (t) => {
     const h = await securityKeyHarness(t);

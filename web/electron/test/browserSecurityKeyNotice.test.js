@@ -305,28 +305,20 @@ describe("security-key notice for embedded browser pages", () => {
     assert.deepEqual(h.opened, []);
   });
 
-  it("shows once a hidden pane can prompt while the request still waits", async () => {
-    let visible = false;
-    const h = harness({ canPrompt: () => visible });
-    h.report(true);
-    await h.wait();
-    await h.wait();
-    assert.equal(h.prompts.length, 0);
-    visible = true;
-    await h.wait();
-    assert.equal(h.prompts.length, 1);
-  });
-
-  it("stops waiting for a hidden pane once the request settles", async () => {
-    let visible = false;
-    const h = harness({ canPrompt: () => visible });
-    h.report(true);
-    await h.wait();
-    h.report(false);
-    visible = true;
-    await h.wait();
-    assert.equal(h.prompts.length, 0);
-  });
+  for (const settled of [false, true]) {
+    it(`handles a hidden pane becoming visible after the request ${settled ? "settles" : "keeps waiting"}`, async () => {
+      let visible = false;
+      const h = harness({ canPrompt: () => visible });
+      h.report(true);
+      await h.wait();
+      await h.wait();
+      assert.equal(h.prompts.length, 0);
+      if (settled) h.report(false);
+      visible = true;
+      await h.wait();
+      assert.equal(h.prompts.length, settled ? 0 : 1);
+    });
+  }
 
   for (const [name, options, frame] of [
     ["a non-web page", { url: "file:///tmp/verify.html" }],
