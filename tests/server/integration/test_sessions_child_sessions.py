@@ -134,7 +134,7 @@ async def test_child_sessions_404_for_nonexistent_session(
 # ── Agent costs ──────────────────────────────────────────
 
 
-async def test_agent_costs_report_subtree_totals(
+async def test_agent_costs_report_subtree_totals_and_parent_estimates(
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
@@ -143,8 +143,12 @@ async def test_agent_costs_report_subtree_totals(
     codex = _seed_child(conv_store=store, parent_id=session["id"], title="codex:a")
     grandchild = _seed_child(conv_store=store, parent_id=codex.id, title="codex:b")
     free = _seed_child(conv_store=store, parent_id=session["id"], title="worker:c")
-    unpriced = _seed_child(conv_store=store, parent_id=session["id"], title="worker:d")
-    store.set_session_usage(session["id"], {"total_cost_usd": 1.0})
+    mirror = _seed_child(conv_store=store, parent_id=session["id"], title="Explore:d")
+    unpriced = _seed_child(conv_store=store, parent_id=session["id"], title="worker:e")
+    store.set_session_usage(
+        session["id"],
+        {"total_cost_usd": 1.0, "subagent_costs_usd": {mirror.id: 0.25, codex.id: 9.0}},
+    )
     store.set_session_usage(codex.id, {"total_cost_usd": 0.5})
     store.set_session_usage(grandchild.id, {"total_cost_usd": 0.25})
     store.set_session_usage(free.id, {"total_cost_usd": 0.0})
@@ -152,14 +156,16 @@ async def test_agent_costs_report_subtree_totals(
     resp = await client.get(f"/v1/sessions/{session['id']}/agent_costs")
 
     assert resp.status_code == 200
-    assert {row["id"]: row["cost_usd"] for row in resp.json()["data"]} == {
-        # Own and descendant spend, as each session's own total reports it.
-        session["id"]: 1.75,
-        codex.id: 0.75,
-        grandchild.id: 0.25,
-        # A known zero stays zero; nothing priced stays unknown.
-        free.id: 0.0,
-        unpriced.id: None,
+    assert {row["id"]: (row["cost_usd"], row["estimated"]) for row in resp.json()["data"]} == {
+        # Own and descendant spend; the parent-reported estimate is never added.
+        session["id"]: (1.75, False),
+        # A priced cost wins over any estimate.
+        codex.id: (0.75, False),
+        grandchild.id: (0.25, False),
+        # A known zero stays zero; nothing priced falls back to the parent's estimate.
+        free.id: (0.0, False),
+        mirror.id: (0.25, True),
+        unpriced.id: (None, False),
     }
     child_resp = await client.get(f"/v1/sessions/{codex.id}/agent_costs")
     assert {row["id"] for row in child_resp.json()["data"]} == {codex.id, grandchild.id}

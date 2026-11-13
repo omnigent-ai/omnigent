@@ -1,18 +1,26 @@
 import { useQuery, type QueryClient } from "@tanstack/react-query";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
+import { formatSessionCostUsd } from "@/lib/formatCost";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { isStaleCursorResponse, useChildSessions } from "./useChildSessions";
 
 interface AgentCostPageWire {
-  data: { id: string; cost_usd?: number | null }[];
+  data: { id: string; cost_usd?: number | null; estimated?: boolean }[];
   last_id?: string | null;
   has_more?: boolean;
 }
 
-/** USD cost of each agent including its sub-agents, keyed by session id; `null` when unpriced. */
-export type AgentCosts = Map<string, number | null>;
+/** Display cost of one agent: its total including sub-agents, or a parent estimate. */
+export interface AgentCost {
+  costUsd: number | null;
+  /** A parent-reported transcript estimate that the parent's total already includes. */
+  estimated: boolean;
+}
+
+/** Agent costs keyed by session id. */
+export type AgentCosts = Map<string, AgentCost>;
 
 const AGENT_COSTS_QUERY_PREFIX = ["agent_costs"] as const;
 const AGENT_COSTS_POLL_MS = 15_000;
@@ -38,7 +46,9 @@ async function fetchAgentCostPages(
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const page = (await res.json()) as AgentCostPageWire;
-  for (const row of page.data) costs.set(row.id, row.cost_usd ?? null);
+  for (const row of page.data) {
+    costs.set(row.id, { costUsd: row.cost_usd ?? null, estimated: row.estimated === true });
+  }
   return page.has_more && page.last_id
     ? fetchAgentCostPages(sessionId, page.last_id, costs, restarted)
     : costs;
@@ -90,4 +100,10 @@ export function useAgentCosts(sessionId: string | null) {
     refetchInterval: (query) =>
       working && query.state.data !== null ? AGENT_COSTS_POLL_MS : false,
   });
+}
+
+/** Short cost label, e.g. `"$0.42"`, `"~$0.10"` for an estimate, `null` when unknown. */
+export function agentCostLabel(cost: AgentCost | undefined): string | null {
+  if (typeof cost?.costUsd !== "number") return null;
+  return `${cost.estimated ? "~" : ""}${formatSessionCostUsd(cost.costUsd)}`;
 }

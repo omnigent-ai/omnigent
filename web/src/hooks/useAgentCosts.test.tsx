@@ -70,7 +70,7 @@ describe("useAgentCosts", () => {
           JSON.stringify(
             url.searchParams.get("after") === null
               ? { data: [{ id: "conv_root", cost_usd: 1 }], last_id: "conv_root", has_more: true }
-              : { data: [{ id: "conv_child", cost_usd: null }], has_more: false },
+              : { data: [{ id: "conv_child", cost_usd: 0.2, estimated: true }], has_more: false },
           ),
         ),
       false,
@@ -80,8 +80,8 @@ describe("useAgentCosts", () => {
     await waitFor(() => expect(result.current.data?.size).toBe(2));
     expect(result.current.data).toEqual(
       new Map([
-        ["conv_root", 1],
-        ["conv_child", null],
+        ["conv_root", { costUsd: 1, estimated: false }],
+        ["conv_child", { costUsd: 0.2, estimated: true }],
       ]),
     );
     expect(costRequests().map((url) => url.searchParams.get("after"))).toEqual([null, "conv_root"]);
@@ -103,7 +103,7 @@ describe("useAgentCosts", () => {
     }, false);
     const { result } = renderCosts(true);
 
-    await waitFor(() => expect(result.current.data?.get("conv_child")).toBe(0.2));
+    await waitFor(() => expect(result.current.data?.get("conv_child")?.costUsd).toBe(0.2));
     expect(costRequests().map((url) => url.searchParams.get("after"))).toEqual([
       null,
       "conv_root",

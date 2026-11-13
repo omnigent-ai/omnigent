@@ -1,3 +1,4 @@
+import type { AgentCosts } from "@/hooks/useAgentCosts";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { ContentSearchPanel } from "./ContentSearchPanel";
@@ -31,6 +32,8 @@ export interface AppShellWorkspacePanelsProps {
   filesPanelSort: ChangedSort;
   handleFilesSortChange: (sort: ChangedSort) => void;
   rootSessionId: string | null;
+  /** Agent display costs for the Agents drawer, keyed by session id. */
+  agentCosts?: AgentCosts;
   subagentsPanelOpen: boolean;
   setSubagentsPanelOpen: (open: boolean) => void;
   shellsPanelOpen: boolean;
@@ -71,6 +74,7 @@ export function AppShellWorkspacePanels({
   filesPanelSort,
   handleFilesSortChange,
   rootSessionId,
+  agentCosts,
   subagentsPanelOpen,
   setSubagentsPanelOpen,
   shellsPanelOpen,
@@ -135,7 +139,11 @@ export function AppShellWorkspacePanels({
           onClose={() => setSubagentsPanelOpen(false)}
           testId="subagents-panel-drawer"
         >
-          <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+          <SubagentsPanel
+            conversationId={conversationId}
+            rootSessionId={rootSessionId}
+            costs={agentCosts}
+          />
         </MobilePanelDrawer>
       )}
       {conversationId && (

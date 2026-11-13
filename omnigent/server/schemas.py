@@ -3540,12 +3540,15 @@ class AgentCost(BaseModel):
 
     :param id: Session id, e.g. ``"conv_child123"``.
     :param cost_usd: Priced USD cost of this agent including its sub-agents
-        (the same total its own session reports), or ``None`` when nothing
-        in that subtree is priced.
+        (the same total its own session reports), or the parent harness's
+        estimate when ``estimated``. ``None`` when nothing is priced.
+    :param estimated: ``True`` when ``cost_usd`` is a parent-reported
+        transcript estimate that the parent's total already includes.
     """
 
     id: str
     cost_usd: float | None = None
+    estimated: bool = False
 
 
 class AgentCostList(BaseModel):

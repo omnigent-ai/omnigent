@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
+import type { AgentCost } from "@/hooks/useAgentCosts";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
@@ -64,10 +65,11 @@ function renderPanel({
   conversationId = "conv_parent",
   rootSessionId = "conv_parent",
   initialEntries,
-}: RenderOptions & { initialEntries?: string[] } = {}) {
+  costs,
+}: RenderOptions & { initialEntries?: string[]; costs?: Map<string, AgentCost> } = {}) {
   return render(
     <MemoryRouter initialEntries={initialEntries}>
-      <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+      <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} costs={costs} />
     </MemoryRouter>,
   );
 }
@@ -170,6 +172,28 @@ function CurrentPath() {
 }
 
 describe("SubagentsPanel", () => {
+  it("shows each agent's cost, marking estimates, and omits unknown costs", () => {
+    mockChildTree({
+      conv_parent: [childInfo({ id: "conv_a" }), childInfo({ id: "conv_b" })],
+      conv_a: [childInfo({ id: "conv_c" })],
+    });
+    const { container } = renderPanel({
+      costs: new Map([
+        ["conv_parent", { costUsd: 1.5, estimated: false }],
+        ["conv_a", { costUsd: 0.4, estimated: false }],
+        ["conv_b", { costUsd: null, estimated: false }],
+        ["conv_c", { costUsd: 0.25, estimated: true }],
+      ]),
+    });
+
+    const costOf = (element: Element | null) =>
+      element?.querySelector('[data-testid="subagent-cost"]')?.textContent ?? null;
+    expect(costOf(screen.getByTestId("subagent-main-row"))).toBe("$1.50");
+    expect(costOf(childRow(container, "conv_a"))).toBe("$0.40");
+    expect(costOf(childRow(container, "conv_b"))).toBeNull();
+    expect(costOf(childRow(container, "conv_c"))).toBe("~$0.25");
+  });
+
   it("always renders a 'main' row linking to the root session", () => {
     // No children at all — the panel still shows the main link so
     // the user always has a path back to the parent.
