@@ -183,6 +183,31 @@ async def test_a_sync_reads_every_page_of_the_sessions_grants(
     }
 
 
+@pytest.mark.parametrize("level", [LEVEL_EDIT, LEVEL_MANAGE])
+async def test_a_share_made_after_the_sessions_grants_were_read_is_not_lowered(
+    permissions, task, announced, monkeypatch, level
+) -> None:
+    session = _session(permissions, **{RESERVED_USER_LOCAL: LEVEL_OWNER})
+    list_page = permissions.list_for_session
+
+    def share_by_hand_once_read(session_id: str, **kwargs: Any) -> Any:
+        grants = list_page(session_id, **kwargs)
+        # The owner shares with Alice by hand after the sync has read the grants.
+        permissions.grant("alice@example.com", session_id, level)
+        return grants
+
+    monkeypatch.setattr(permissions, "list_for_session", share_by_hand_once_read)
+    await _sync(permissions, task, session)
+    monkeypatch.setattr(permissions, "list_for_session", list_page)
+
+    assert _levels(permissions, session.id) == {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        "alice@example.com": level,
+        "bob@example.com": LEVEL_READ,
+    }
+    assert announced == [("bob@example.com", session.id)]
+
+
 async def test_a_sync_never_revokes_an_owner_grant_or_the_automation_owner(
     permissions, task
 ) -> None:

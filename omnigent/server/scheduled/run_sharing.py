@@ -111,7 +111,7 @@ async def _apply_task_grants(
                     grant.user_id,
                     session.id,
                 )
-    # Anyone with access already holds at least Read, so skipping them never lowers a grant.
+    # Anyone with access already holds at least Read, so there is nothing to add for them.
     holders = {grant.user_id for grant in existing}
     missing = [grant for grant in listed if grant.user_id not in holders]
     if not missing:
@@ -131,8 +131,11 @@ async def _apply_task_grants(
     for grant in missing:
         try:
             await asyncio.to_thread(permission_store.ensure_user, grant.user_id)
-            # Automations grant Read only; see SCHEDULED_TASK_GRANT_LEVELS.
-            await asyncio.to_thread(permission_store.grant, grant.user_id, session.id, LEVEL_READ)
+            # Automations grant Read only (SCHEDULED_TASK_GRANT_LEVELS). A share made
+            # since the session's grants were read is kept, never lowered.
+            written = await asyncio.to_thread(
+                permission_store.grant_if_absent, grant.user_id, session.id, LEVEL_READ
+            )
         except Exception:
             _logger.exception(
                 "automation %s: could not share session %s with %r",
@@ -141,7 +144,8 @@ async def _apply_task_grants(
                 grant.user_id,
             )
             continue
-        _announce_session_added(grant.user_id, session.id)
+        if written:
+            _announce_session_added(grant.user_id, session.id)
 
 
 async def _share_best_effort(

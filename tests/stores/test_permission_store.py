@@ -15,12 +15,14 @@ import uuid
 import pytest
 from sqlalchemy import event
 
+from omnigent.db.account_authority import account_checks_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import ScheduledTaskPermission, SessionPermission
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server import session_sharing
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_LOCAL,
@@ -192,6 +194,61 @@ def test_grant_upsert_downgrades_level(store: SqlAlchemyPermissionStore, db_uri:
     fetched = store.get("dave@test.com", conv_id)
     assert fetched is not None
     assert fetched.level == 1, f"Expected persisted level 1 after downgrade, got {fetched.level}."
+
+
+@pytest.mark.parametrize("implementation", ["store", "default"])
+@pytest.mark.parametrize("held", [None, LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE])
+def test_grant_if_absent_writes_only_a_missing_grant(
+    store: SqlAlchemyPermissionStore, db_uri: str, implementation: str, held: int | None
+) -> None:
+    """Adds a grant when the grantee has none and never changes an existing one.
+
+    ``default`` runs the base class's read-then-grant fallback on the same store.
+    """
+    owner = SqlAlchemyPermissionStore if implementation == "store" else PermissionStore
+    _ensure_user(store, "erin@test.com")
+    _ensure_user(store, RESERVED_USER_PUBLIC)
+    conv_id = _create_conversation(db_uri)
+    store.grant(RESERVED_USER_PUBLIC, conv_id, LEVEL_READ)
+    if held is not None:
+        store.grant("erin@test.com", conv_id, held)
+    # Cache Erin's access, which a written grant must evict.
+    assert store.resolve_access("erin@test.com", conv_id).user_grant_level == held
+
+    written = owner.grant_if_absent(store, "erin@test.com", conv_id, LEVEL_READ)
+
+    assert written is (held is None)
+    expected = held if held is not None else LEVEL_READ
+    assert store.get("erin@test.com", conv_id) == SessionPermission(
+        "erin@test.com", conv_id, expected
+    )
+    assert store.resolve_access("erin@test.com", conv_id).user_grant_level == expected
+
+
+def test_grant_if_absent_keeps_a_grant_committed_after_its_check(
+    store: SqlAlchemyPermissionStore, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The insert keeps a row a concurrent writer committed after the existence check."""
+    if store._engine.dialect.name in ("sqlite", "mysql"):
+        pytest.skip("SQLite's write lock and MySQL's gap lock block the concurrent grant")
+    _ensure_user(store, "erin@test.com")
+    conv_id = _create_conversation(db_uri)
+    build_insert = permission_module._upsert_grant
+
+    def grant_by_hand_first(*args: object, **kwargs: object) -> object:
+        monkeypatch.setattr(permission_module, "_upsert_grant", build_insert)
+        # Commits on its own connection while the call's transaction is open.
+        SqlAlchemyPermissionStore(db_uri).grant("erin@test.com", conv_id, LEVEL_EDIT)
+        return build_insert(*args, **kwargs)
+
+    monkeypatch.setattr(permission_module, "_upsert_grant", grant_by_hand_first)
+    # Without account checks, as under external auth, no account lock orders the writers.
+    with account_checks_scope(False):
+        store.grant_if_absent("erin@test.com", conv_id, LEVEL_READ)
+
+    assert store.get("erin@test.com", conv_id) == SessionPermission(
+        "erin@test.com", conv_id, LEVEL_EDIT
+    )
 
 
 def test_grant_with_public_sentinel(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
