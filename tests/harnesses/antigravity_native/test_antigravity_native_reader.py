@@ -58,7 +58,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from omnigent.harnesses.antigravity_native import reader
+from omnigent.harnesses.antigravity_native import bridge, reader
 from omnigent.harnesses.antigravity_native.bridge import (
     agy_gemini_dir,
     read_bridge_state,
@@ -3865,24 +3865,27 @@ def test_placeholder_recovery_keeps_waiting_without_a_typed_cascade(
 
 
 @pytest.mark.parametrize(
-    "written_during_scan",
+    ("session_id", "conversation_id"),
     [
-        pytest.param(_OTHER_CASCADE, id="cold-start-bound-a-real-id"),
-        pytest.param("agy_conv_relaunch", id="recreated-terminal-reseeded-the-placeholder"),
+        pytest.param(_SESSION_ID, _OTHER_CASCADE, id="cold-start-bound-a-real-id"),
+        pytest.param(
+            _SESSION_ID, "agy_conv_relaunch", id="recreated-terminal-reseeded-the-placeholder"
+        ),
+        pytest.param("conv_other_session", "agy_conv_placeholder", id="session-changed"),
     ],
 )
 def test_placeholder_recovery_keeps_state_written_during_the_scan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, written_during_scan: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, session_id: str, conversation_id: str
 ) -> None:
     """State that changed while the scan ran is kept: a racing cold-start's real
-    id, or a recreated terminal's new placeholder. Nothing is adopted."""
+    id, a recreated terminal's new placeholder, or another session. Nothing is adopted."""
     bridge_dir = _placeholder_bridge_dir(tmp_path)
     _own_conversation_db(bridge_dir, _CASCADE_ID)
     monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
 
     def _scan_while_state_changes(_port: int) -> dict[str, Any]:
         (bridge_dir / "state.json").write_text(
-            json.dumps({"session_id": _SESSION_ID, "conversation_id": written_during_scan}),
+            json.dumps({"session_id": session_id, "conversation_id": conversation_id}),
             encoding="utf-8",
         )
         return _typed_body(_CASCADE_ID)
@@ -3892,15 +3895,16 @@ def test_placeholder_recovery_keeps_state_written_during_the_scan(
     assert reader._recover_placeholder_cascade(bridge_dir) is None
     state = read_bridge_state(bridge_dir)
     assert state is not None
-    assert state.conversation_id == written_during_scan
+    assert (state.session_id, state.conversation_id) == (session_id, conversation_id)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failed_writes", [0, 1], ids=["first-write-ok", "first-write-fails"])
 async def test_discover_records_an_adoption_before_the_port_resolves(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_writes: int
 ) -> None:
-    """The adopted cascade reaches ``on_adopted`` as soon as it is persisted: the
-    resume-id record is attempted right after adoption, before port resolution."""
+    """The adopted cascade reaches ``on_adopted`` once, right after it is persisted
+    and before port resolution; a failed state write is retried, not fatal."""
     bridge_dir = _placeholder_bridge_dir(tmp_path)
     _own_conversation_db(bridge_dir, _CASCADE_ID)
     monkeypatch.setattr(reader, "resolve_cold_start_agy_rpc_port", lambda _s, _t, **_kwargs: _PORT)
@@ -3911,17 +3915,28 @@ async def test_discover_records_an_adoption_before_the_port_resolves(
     monkeypatch.setattr(reader, "_candidate_agy_rpc_ports", lambda: [_PORT])
     monkeypatch.setattr(reader, "_conversation_matches", lambda _port, _cid: False)
     monkeypatch.setattr(reader, "_sleep", _no_sleep)
-    adopted: list[str] = []
+    monkeypatch.setattr(reader, "_PLACEHOLDER_RECOVERY_INTERVAL_S", 0.0)
+    real_write = bridge.write_bridge_state
+    write_failures = [OSError("Too many open files")] * failed_writes
+
+    def _write(bridge_path: Path, state: bridge.AntigravityNativeBridgeState) -> None:
+        if write_failures:
+            raise write_failures.pop()
+        real_write(bridge_path, state)
+
+    monkeypatch.setattr(bridge, "write_bridge_state", _write)
+    adopted: list[tuple[str, str | None]] = []
 
     async def _on_adopted(cascade_id: str) -> None:
-        adopted.append(cascade_id)
+        persisted = read_bridge_state(bridge_dir)
+        adopted.append((cascade_id, persisted.conversation_id if persisted else None))
 
     result = await reader._discover(
         bridge_dir, poll_interval_s=0.0, stop=_stop_after(2), on_adopted=_on_adopted
     )
 
     assert result is None
-    assert adopted == [_CASCADE_ID]
+    assert adopted == [(_CASCADE_ID, _CASCADE_ID)]
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.conversation_id == _CASCADE_ID

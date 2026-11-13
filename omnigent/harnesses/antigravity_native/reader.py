@@ -929,7 +929,19 @@ def _recover_placeholder_cascade(
         return None
     # The scan took seconds: a cold-start may have bound a real id, or a recreated
     # terminal reseeded the placeholder. Write only over the state this scan read.
-    if not update_conversation_id(bridge_dir, cascade_id, expected_state=state):
+    try:
+        adopted = update_conversation_id(bridge_dir, cascade_id, expected_state=state)
+    except OSError as exc:
+        # A transient write failure must not end discovery; the next round retries.
+        _logger.warning(
+            "agy placeholder recovery: could not persist cascade %s; retrying next "
+            "round: bridge_dir=%s error=%r",
+            cascade_id,
+            bridge_dir,
+            exc,
+        )
+        return None
+    if not adopted:
         return None
     _logger.info(
         "agy reader adopted the TUI-minted cascade past a stale placeholder "
