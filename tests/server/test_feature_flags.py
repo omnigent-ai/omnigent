@@ -172,16 +172,8 @@ def test_webfonts_is_a_frontend_visible_feature() -> None:
 
     assert flags.enabled(Feature.WEBFONTS)
     assert flags.frontend_dict()["webfonts"] is True
-    assert flags.enabled_names() == (
-        "claude_osc_status",
-        "codex_plan_at_launch",
-        "custom_agents_settings_ui",
-        "peer_session_messaging",
-        "session_orchestration",
-        "sibling_sessions",
-        "sidebar_grouping_ui",
-        "webfonts",
-    )
+    defaults = resolve_feature_flags({}).enabled_features
+    assert flags.enabled_features == defaults | {Feature.WEBFONTS}
 
 
 def test_arca_shutdown_warnings_are_frontend_visible() -> None:
