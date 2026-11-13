@@ -13,7 +13,15 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
 import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
-import { launchManagedHost, launchRunner, stopSession, updateSession } from "@/lib/sessionsApi";
+import {
+  getSessionSlim,
+  launchManagedHost,
+  launchRunner,
+  stopSession,
+  updateSession,
+} from "@/lib/sessionsApi";
+import { getSessionHost, setSessionHost } from "@/lib/sessionHost";
+import { SLICE_KEY_HEADER } from "@/lib/routingKey";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { handleSessionEvent } from "@/store/chatStore";
@@ -76,6 +84,7 @@ vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
 }));
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsApiModule>()),
+  getSessionSlim: vi.fn(),
   launchManagedHost: vi.fn(),
   launchRunner: vi.fn(),
   stopSession: vi.fn(),
@@ -124,6 +133,7 @@ const useHostsMock = vi.mocked(useHosts);
 const fetchHostsMock = vi.mocked(fetchHosts);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const launchRunnerMock = vi.mocked(launchRunner);
+const getSessionSlimMock = vi.mocked(getSessionSlim);
 const stopSessionMock = vi.mocked(stopSession);
 const launchManagedHostMock = vi.mocked(launchManagedHost);
 const updateSessionMock = vi.mocked(updateSession);
@@ -183,6 +193,9 @@ beforeEach(() => {
   fetchHostsMock.mockReset();
   useHostFilesystemMock.mockReset();
   launchRunnerMock.mockReset();
+  getSessionSlimMock.mockReset().mockResolvedValue({
+    hostId: "host_old",
+  } as Awaited<ReturnType<typeof getSessionSlim>>);
   stopSessionMock.mockReset().mockResolvedValue({ queued: false });
   launchManagedHostMock.mockReset();
   updateSessionMock.mockReset();
@@ -210,6 +223,9 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   conversationRegistry.clear();
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+  setSessionHost("conv_1", null);
 });
 
 describe("SwitchHostDialog", () => {
@@ -496,42 +512,120 @@ describe("SwitchHostDialog", () => {
     },
   );
 
-  it("requires Stop on recovery while the session refresh still shows an offline origin", async () => {
-    const hosts = [
-      { host_id: "host_old", name: "laptop", owner: "alice", status: "offline" as const },
-      { host_id: "host_new", name: "workstation", owner: "alice", status: "online" as const },
-    ];
-    useHostsMock.mockReturnValue({ data: hosts } as unknown as ReturnType<typeof useHosts>);
-    fetchHostsMock.mockResolvedValue(hosts);
-    launchRunnerMock.mockRejectedValueOnce(new Error("launch response lost"));
-    const client = renderDialog();
-    vi.spyOn(client, "invalidateQueries").mockImplementation(() => new Promise<void>(() => {}));
-    const button = await screen.findByTestId("switch-host-button");
-    await waitFor(() => expect(button).toBeEnabled());
-    fireEvent.click(button);
-    await screen.findByText(/launch response lost/);
-    expect(stopSessionMock).not.toHaveBeenCalled();
-    expect(updateSessionMock).toHaveBeenCalledTimes(1);
+  it.each([
+    { reopen: false, failure: "stop" },
+    { reopen: true, failure: "stop" },
+    { reopen: true, failure: "lookup" },
+    { reopen: true, failure: null },
+  ] as const)(
+    "requires Stop on recovery with a stale offline origin ($reopen, $failure)",
+    async ({ reopen, failure }) => {
+      const hosts = [
+        { host_id: "host_old", name: "laptop", owner: "alice", status: "offline" as const },
+        { host_id: "host_new", name: "workstation", owner: "alice", status: "online" as const },
+      ];
+      useHostsMock.mockReturnValue({ data: hosts } as unknown as ReturnType<typeof useHosts>);
+      fetchHostsMock.mockResolvedValue(hosts);
+      vi.mocked(useSession).mockReturnValue({
+        session: { hostId: "host_old" } as Awaited<ReturnType<typeof getSessionSlim>>,
+        isLoading: false,
+        error: null,
+      });
+      const api = await vi.importActual<typeof SessionsApiModule>("@/lib/sessionsApi");
+      getSessionSlimMock.mockImplementation(api.getSessionSlim);
+      stopSessionMock.mockImplementation(api.stopSession);
+      vi.stubEnv("VITE_DATABRICKS_WORKSPACE", "true");
+      setSessionHost("conv_1", "host_old");
+      let boundHost = "host_old";
+      let resolveRequest!: (response: Response) => void;
+      let rejectRequest!: (reason: Error) => void;
+      const pendingRequest = new Promise<Response>((resolve, reject) => {
+        resolveRequest = resolve;
+        rejectRequest = reject;
+      });
+      const stopHosts: (string | null)[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string, init?: RequestInit) => {
+          if (url.startsWith("/v1/sessions/conv_1?")) {
+            if (boundHost === "host_new" && failure === "lookup") return pendingRequest;
+            return Response.json({
+              id: "conv_1",
+              agent_id: "agent_1",
+              created_at: 0,
+              status: "running",
+              host_id: boundHost,
+              runner_id: boundHost === "host_old" ? "runner_old" : "runner_new",
+            });
+          }
+          expect(url).toBe("/v1/sessions/conv_1/events");
+          const hostId = new Headers(init?.headers).get(SLICE_KEY_HEADER);
+          stopHosts.push(hostId);
+          // A, B and the unkeyed default have separate replica-local tunnels.
+          if (hostId !== boundHost)
+            return Response.json({ error: { code: "wrong_replica" } }, { status: 400 });
+          return pendingRequest;
+        }),
+      );
+      launchRunnerMock.mockImplementationOnce(async () => {
+        boundHost = "host_new";
+        throw new Error("launch response lost");
+      });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const onOpenChange = vi.fn();
+      const dialog = (
+        <QueryClientProvider client={client}>
+          <SwitchHostDialog
+            open
+            onOpenChange={onOpenChange}
+            sessionId="conv_1"
+            currentHostId="host_old"
+          />
+        </QueryClientProvider>
+      );
+      const view = render(dialog);
+      vi.spyOn(client, "invalidateQueries").mockImplementation(() => new Promise<void>(() => {}));
+      let button = await screen.findByTestId("switch-host-button");
+      await waitFor(() => expect(button).toBeEnabled());
+      fireEvent.click(button);
+      await screen.findByText(/launch response lost/);
+      expect(stopSessionMock).not.toHaveBeenCalled();
+      expect(updateSessionMock).toHaveBeenCalledTimes(1);
+      expect(getSessionHost("conv_1")).toBe("host_old");
 
-    let rejectStop!: (reason: Error) => void;
-    stopSessionMock.mockReturnValueOnce(
-      new Promise((_resolve, reject) => {
-        rejectStop = reject;
-      }),
-    );
-    await waitFor(() => expect(button).toBeEnabled());
-    fireEvent.click(button);
-    await waitFor(() => expect(stopSessionMock).toHaveBeenCalledTimes(1));
-    expect(updateSessionMock).toHaveBeenCalledTimes(1);
-    expect(launchRunnerMock).toHaveBeenCalledTimes(1);
-    await act(async () => rejectStop(new Error("Current runner unreachable")));
-    expect(await screen.findByTestId("switch-host-error")).toHaveTextContent(
-      "Current runner unreachable",
-    );
-    expect(updateSessionMock).toHaveBeenCalledTimes(1);
-    expect(launchRunnerMock).toHaveBeenCalledTimes(1);
-    expect(fetchHostsMock).toHaveBeenCalledTimes(1);
-  });
+      if (reopen) {
+        fireEvent.click(screen.getByRole("button", { name: "Close" }));
+        expect(onOpenChange).toHaveBeenCalledWith(false);
+        view.unmount();
+        render(dialog);
+        button = await screen.findByTestId("switch-host-button");
+      }
+      await waitFor(() => expect(button).toBeEnabled());
+      fireEvent.click(button);
+      await waitFor(() => expect(getSessionSlimMock).toHaveBeenCalledTimes(2));
+      if (failure !== "lookup") {
+        await waitFor(() => expect(stopHosts).toEqual(["host_new"]));
+        expect(getSessionHost("conv_1")).toBe("host_new");
+      } else expect(stopSessionMock).not.toHaveBeenCalled();
+      expect(updateSessionMock).toHaveBeenCalledTimes(1);
+      expect(launchRunnerMock).toHaveBeenCalledTimes(1);
+      if (failure === null) {
+        await act(async () => resolveRequest(Response.json({ queued: false })));
+        await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(2));
+        expect(updateSessionMock).toHaveBeenCalledTimes(2);
+        expect(stopSessionMock.mock.invocationCallOrder[0]).toBeLessThan(
+          updateSessionMock.mock.invocationCallOrder[1],
+        );
+      } else {
+        const detail = failure === "stop" ? "Current runner unreachable" : "Session refresh failed";
+        await act(async () => rejectRequest(new Error(detail)));
+        expect(await screen.findByTestId("switch-host-error")).toHaveTextContent(detail);
+        expect(updateSessionMock).toHaveBeenCalledTimes(1);
+        expect(launchRunnerMock).toHaveBeenCalledTimes(1);
+      }
+      expect(fetchHostsMock).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it.each(["stop", "release"] as const)(
     "stops the refreshed binding and reports a retry %s failure",
@@ -561,6 +655,9 @@ describe("SwitchHostDialog", () => {
           { host_id: "host_new", name: "linux-box", owner: "alice", status: "online" },
         ],
       } as unknown as ReturnType<typeof useHosts>);
+      getSessionSlimMock.mockResolvedValue({ hostId: "host_new" } as Awaited<
+        ReturnType<typeof getSessionSlim>
+      >);
       view.rerender(dialog("host_new"));
       const failedRequest = failure === "stop" ? stopSessionMock : updateSessionMock;
       failedRequest.mockRejectedValueOnce(new Error("retry failed"));

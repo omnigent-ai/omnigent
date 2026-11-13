@@ -35,7 +35,13 @@ import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import { managedSandboxHostId } from "@/lib/managedSandboxHost";
 import { composeSandboxWorkspace, sandboxRepoProblem } from "@/lib/sandboxRepositories";
-import { launchManagedHost, launchRunner, stopSession, updateSession } from "@/lib/sessionsApi";
+import {
+  getSessionSlim,
+  launchManagedHost,
+  launchRunner,
+  stopSession,
+  updateSession,
+} from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import { captureLaunchStatus, useChatStore } from "@/store/chatStore";
 
@@ -297,16 +303,24 @@ function SupportedSwitchHostDialog({
     let stopped = false;
     let released = false;
     try {
-      // A lost launch response can leave a new runner bound. Each retry stops
-      // the current binding before releasing it, even after an earlier release.
-      const currentHost = hosts?.find((host) => host.host_id === currentHostId);
-      // Recovery must Stop even if a delayed session refresh still names the
-      // offline origin. Only the initial move can use the offline exception.
+      // A launch can land before its response or cache refresh. Resolve the
+      // current binding and routing affinity before Stop or an offline exemption.
+      let boundHostId: string | null;
+      try {
+        boundHostId = (await getSessionSlim(sessionId)).hostId ?? null;
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : "Session lookup failed.";
+        throw new Error(
+          `Couldn't refresh the session's current host. Check your connection and try again. ${detail}`,
+          { cause: e },
+        );
+      }
+      const currentHost = hosts?.find((host) => host.host_id === boundHostId);
       let confirmedOffline = false;
       if (!originAvailable && currentHost?.status === "offline") {
         try {
           confirmedOffline = (await fetchHosts(true)).some(
-            (host) => host.host_id === currentHostId && host.status === "offline",
+            (host) => host.host_id === boundHostId && host.status === "offline",
           );
         } catch (e) {
           const detail = e instanceof Error ? e.message : "Host lookup failed.";
