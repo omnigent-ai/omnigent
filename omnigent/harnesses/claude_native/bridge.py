@@ -7887,8 +7887,9 @@ def _terminal_dialog_headline(pane: str) -> str | None:
     selector row and the footer inside the region below the last box rule
     (the pane tail when no rule is drawn). A pane echoing such text above a
     live composer never qualifies, because the composer row is found first.
-    Boxed prompts without that footer (tool permission prompts, the effort
-    dialog) are left to their own paths.
+    Cache-change confirmations can omit the footer; their title and numbered
+    Yes/No controls below a rule identify them instead. Tool permission
+    prompts are left to their own path.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: The dialog's first line, e.g.
@@ -7898,10 +7899,26 @@ def _terminal_dialog_headline(pane: str) -> str | None:
     if not pane.strip() or _composer_row(pane) is not None:
         return None
     lines = [line for line in pane.splitlines() if line.strip()]
-    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
+    last_rule = max(
+        (
+            i
+            for i, line in enumerate(lines)
+            if _is_box_rule(line) or line.strip().startswith("▔▔▔")
+        ),
+        default=None,
+    )
     region = lines[last_rule + 1 :] if last_rule is not None else lines[-_DIALOG_SCAN_TAIL_LINES:]
     footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
     if footer is None:
+        # Newer confirmations draw a top rule and choices without a key footer.
+        if last_rule is not None and region and region[0].strip() in _CONFIRM_DIALOG_HINTS:
+            choices = "\n".join(region[1:])
+            if (
+                re.search(r"(?m)^\s*❯\s*[12]\.\s", choices)
+                and re.search(r"(?m)^\s*(?:❯\s*)?1\.\s+Yes\b", choices)
+                and re.search(r"(?m)^\s*(?:❯\s*)?2\.\s+No\b", choices)
+            ):
+                return region[0].strip()
         return None
     has_selector = any(
         line.strip().lstrip("│ ").startswith(_CLAUDE_PROMPT_GLYPH) for line in region

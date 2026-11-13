@@ -630,6 +630,11 @@ Cross-harness journeys:
   terminal while a question is pending, send an unrelated Chat message, then
   answer the question and verify that the held message arrives once.
 
+  A model-switch confirmation without a key footer is covered by
+  `tests/harnesses/claude_native/test_claude_native_copy_mode.py::test_footerless_model_confirmation_holds_input_until_answered`.
+  Its real tmux stand-in verifies that Chat and settings delivery leave the
+  choice untouched, then accept one message after an explicit terminal answer.
+
 - **Antigravity permission choices (Chat and Inbox):**
   `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`
   uses a recorded permission prompt and the real server to check both choices
