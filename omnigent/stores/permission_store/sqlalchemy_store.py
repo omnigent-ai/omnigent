@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from functools import partial
 from typing import TypeVar, cast
 
-from sqlalchemy import String, delete, exists, func, literal, select, update
+from sqlalchemy import String, case, delete, exists, func, literal, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -150,24 +150,32 @@ def _upsert_grant(
     model: type[SqlSessionPermission] | type[SqlScheduledTaskShare],
     key: dict[str, str],
     level: int,
+    *,
+    ensure_minimum: bool = False,
 ) -> Insert:
-    """Build an insert of one grant row that overwrites the level of an existing row.
+    """Build a grant upsert, replacing the level unless stronger access is preserved.
 
     :param key: The row's primary key columns other than ``workspace_id``.
+    :param ensure_minimum: Atomically retain the higher existing or requested level.
     """
     key_columns = ["workspace_id", *key]
+    next_level = case((model.level < level, level), else_=model.level) if ensure_minimum else level
     if dialect == "sqlite":
         return (
             sqlite_insert(model)
             .values(**key, level=level)
-            .on_conflict_do_update(index_elements=key_columns, set_={"level": level})
+            .on_conflict_do_update(index_elements=key_columns, set_={"level": next_level})
         )
     if dialect == "mysql":
-        return mysql_insert(model).values(**key, level=level).on_duplicate_key_update(level=level)
+        return (
+            mysql_insert(model)
+            .values(**key, level=level)
+            .on_duplicate_key_update(level=next_level)
+        )
     return (
         pg_insert(model)
         .values(**key, level=level)
-        .on_conflict_do_update(index_elements=key_columns, set_={"level": level})
+        .on_conflict_do_update(index_elements=key_columns, set_={"level": next_level})
     )
 
 
@@ -467,10 +475,12 @@ class SqlAlchemyPermissionStore(PermissionStore):
         user_id: str,
         conversation_id: str,
         level: int,
+        *,
+        ensure_minimum: bool = False,
     ) -> SessionPermission:
         """Upsert a permission grant. See base class for contract."""
 
-        def write(session: Session) -> None:
+        def write(session: Session) -> int:
             require_active_account(session, user_id)
             session.execute(
                 _upsert_grant(
@@ -478,11 +488,21 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     SqlSessionPermission,
                     {"user_id": user_id, "conversation_id": conversation_id},
                     level,
+                    ensure_minimum=ensure_minimum,
                 )
             )
             session.flush()
+            if ensure_minimum:
+                return session.execute(
+                    select(SqlSessionPermission.level).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == user_id,
+                        SqlSessionPermission.conversation_id == conversation_id,
+                    )
+                ).scalar_one()
+            return level
 
-        run_write_transaction(
+        granted_level = run_write_transaction(
             self._session_immediate,
             "grant_permission",
             write,
@@ -492,7 +512,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         return SessionPermission(
             user_id=user_id,
             conversation_id=conversation_id,
-            level=level,
+            level=granted_level,
         )
 
     def revoke(self, user_id: str, conversation_id: str) -> bool:
