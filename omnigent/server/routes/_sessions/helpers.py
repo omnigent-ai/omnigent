@@ -1270,8 +1270,8 @@ def _signal_harness_elicitation_resolved_by_id(
     _prune_pre_resolved_harness_elicitations()
     parked = _harness_parked_elicitations.get(elicitation_id)
     if parked is None:
-        severed = _harness_severed_elicitations.get(elicitation_id)
-        if severed is not None and severed.session_id == session_id:
+        severed = _harness_severed_elicitations.get((session_id, elicitation_id))
+        if severed is not None:
             # Its woken deferred clear publishes the resolved card.
             severed.resolved_elsewhere.set()
         _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(

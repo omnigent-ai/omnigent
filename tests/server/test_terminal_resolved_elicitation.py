@@ -358,8 +358,8 @@ async def test_store_fallback_resolves_prompt_whose_call_another_replica_mirrore
     )
     if severed:
         for elicitation_id in ("e_q", "e_other"):
-            _harness_severed_elicitations[elicitation_id] = _harness_parked_elicitations.pop(
-                elicitation_id
+            _harness_severed_elicitations[(session_id, elicitation_id)] = (
+                _harness_parked_elicitations.pop(elicitation_id)
             )
     output = _function_call_output_item("toolu_q")
 

@@ -666,7 +666,7 @@ async def _publish_and_wait_for_harness_elicitation(
             # waits expire if no new hook arrives within the grace period.
             awaiting_repark = not settled and elicitation_id not in _harness_elicitation_registry
             if awaiting_repark:
-                _harness_severed_elicitations[elicitation_id] = parked
+                _harness_severed_elicitations[(session_id, elicitation_id)] = parked
             _schedule_deferred_elicitation_clear(
                 session_id,
                 elicitation_id,
@@ -698,9 +698,8 @@ def _release_severed_harness_elicitation(session_id: str, elicitation_id: str) -
         card, e.g. ``"elicit_claude_0f3a..."``.
     :returns: None.
     """
-    severed = _harness_severed_elicitations.get(elicitation_id)
-    if severed is not None and severed.session_id == session_id:
-        _harness_severed_elicitations.pop(elicitation_id, None)
+    severed = _harness_severed_elicitations.pop((session_id, elicitation_id), None)
+    if severed is not None:
         severed.resolved_elsewhere.set()
 
 
@@ -762,9 +761,9 @@ def _schedule_deferred_elicitation_clear(
             finally:
                 grace_task.cancel()
                 woken_task.cancel()
-        if _harness_severed_elicitations.get(elicitation_id) is not severed:
+        if _harness_severed_elicitations.get((session_id, elicitation_id)) is not severed:
             return  # A re-park or a later severed wait owns the card.
-        _harness_severed_elicitations.pop(elicitation_id, None)
+        _harness_severed_elicitations.pop((session_id, elicitation_id), None)
         if elicitation_id in _harness_elicitation_registry:
             # Re-parked — the new wait owns the eventual clear.
             return

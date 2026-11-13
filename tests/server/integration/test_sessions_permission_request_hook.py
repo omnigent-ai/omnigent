@@ -2304,7 +2304,9 @@ async def test_permission_request_hook_clears_index_on_client_disconnect(
         "_HARNESS_ELICITATION_REPARK_GRACE_S",
         1.0,
     )
-    monkeypatch.setattr(sessions_route, "_HARNESS_QUESTION_REPARK_GRACE_S", 1.0)
+    if elicitation_id is not None:
+        # Other cases keep the long question grace, so wrongly getting it times out below.
+        monkeypatch.setattr(sessions_route, "_HARNESS_QUESTION_REPARK_GRACE_S", 1.0)
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, "test-permission-disconnect")
     session_id = await _create_session(client, agent["id"])
@@ -2352,7 +2354,7 @@ async def test_permission_request_hook_clears_index_on_client_disconnect(
     assert resolved.get("reason") == "unanswered", resolved
     if elicitation_id is not None:
         assert resolved["elicitation_id"] == elicitation_id
-    assert resolved["elicitation_id"] not in _harness_severed_elicitations
+    assert (session_id, resolved["elicitation_id"]) not in _harness_severed_elicitations
     assert pending_elicitations.count_for(session_id) == 0, (
         f"index should clear after the un-re-parked grace, got "
         f"{pending_elicitations.count_for(session_id)!r}"
@@ -2651,6 +2653,53 @@ async def test_permission_hook_rejects_reattach_id_owned_by_other_session(
     assert verdict.status_code == 202, verdict.text
     resp_a = await hook_task
     assert resp_a.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+
+
+async def test_severed_cards_sharing_a_reattach_id_each_expire(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Once session A's wait has ended, session B may reuse its re-attach id.
+    With both waits severed, each session's card still expires after its grace.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    async def _disconnect_immediately(_request: Any) -> None:
+        return
+
+    monkeypatch.setattr(sessions_route, "_poll_request_disconnect", _disconnect_immediately)
+    monkeypatch.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.5)
+    pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(client, "test-permission-severed-id-reuse")
+    session_ids = [await _create_session(client, agent["id"]) for _ in range(2)]
+    payload = {
+        **(await _claude_permission_payload()),
+        "_omnigent_elicitation_id": _REATTACH_ELICITATION_ID,
+    }
+    collectors = [await start_session_stream_collector(session_id) for session_id in session_ids]
+    try:
+        for session_id in session_ids:
+            severed = await client.post(
+                f"/v1/sessions/{session_id}/hooks/permission-request",
+                json=payload,
+            )
+            assert severed.status_code == 200, severed.text
+            assert severed.content == b""
+        for session_id, collector in zip(session_ids, collectors, strict=True):
+            async with asyncio.timeout(5):
+                resolved = await collector.next_event()
+                while resolved["type"] != "response.elicitation_resolved":
+                    resolved = await collector.next_event()
+            assert resolved["elicitation_id"] == _REATTACH_ELICITATION_ID
+            assert resolved.get("reason") == "unanswered", resolved
+            assert pending_elicitations.count_for(session_id) == 0
+    finally:
+        for task in set(sessions_route._deferred_elicitation_clear_tasks):
+            await asyncio.wait_for(task, timeout=5.0)
+        for collector in collectors:
+            await collector.stop()
+        pending_elicitations.reset_for_tests()
 
 
 async def test_codex_mcp_elicitation_hook_accept_round_trip(
@@ -4545,7 +4594,7 @@ async def test_codex_resolved_event_clears_severed_card(
         request_event = await collector.next_event()
         assert request_event["type"] == "response.elicitation_request"
         elicitation_id = request_event["elicitation_id"]
-        assert elicitation_id in _harness_severed_elicitations
+        assert (session_id, elicitation_id) in _harness_severed_elicitations
 
         resolved_resp = await client.post(
             f"/v1/sessions/{session_id}/events",

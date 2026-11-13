@@ -112,9 +112,10 @@ _harness_parked_elicitations: WorkspaceScopedCache[str, _ParkedHarnessElicitatio
     WorkspaceScopedCache()
 )
 
-# Maps ``elicitation_id`` to the state of a wait that ended without an answer
-# while its card is kept for the re-park grace. Popped on re-park or clear.
-_harness_severed_elicitations: WorkspaceScopedCache[str, _ParkedHarnessElicitation] = (
+# Maps ``(session_id, elicitation_id)`` to the state of a wait that ended without
+# an answer while its card is kept for the re-park grace. Popped on re-park or
+# clear. Session-keyed so another session reusing the id cannot strand this card.
+_harness_severed_elicitations: WorkspaceScopedCache[tuple[str, str], _ParkedHarnessElicitation] = (
     WorkspaceScopedCache()
 )
 
