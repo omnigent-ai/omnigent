@@ -260,7 +260,8 @@ async def test_static_key_file_lives_until_its_cached_client_closes(
     constructed: list[object] = []
 
     class Client:
-        def __init__(self, _options: SimpleNamespace) -> None:
+        def __init__(self, options: SimpleNamespace) -> None:
+            assert json.loads(options.settings)["existing"] is True
             constructed.append(self)
 
         async def connect(self) -> None:
