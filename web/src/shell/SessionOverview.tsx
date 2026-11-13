@@ -1,5 +1,5 @@
-// WIP(session_overview): first cut with the session total and per-model usage;
-// sub-agent costs come later.
+// WIP(session_overview): first cut with the session total, per-model usage and
+// direct sub-agents.
 
 import { useSyncExternalStore } from "react";
 import { XIcon } from "lucide-react";
@@ -8,6 +8,7 @@ import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/componen
 import { Spinner } from "@/components/ui/spinner";
 import { formatSessionCostUsd } from "@/lib/formatCost";
 import { useChatStore } from "@/store/chatStore";
+import { SessionOverviewSubagents } from "./SessionOverviewSubagents";
 
 // Tailwind's `xl` breakpoint: wide enough to dock the overview beside chat.
 const WIDE_QUERY = "(min-width: 1280px)";
@@ -89,6 +90,7 @@ export function SessionOverview({ onClose }: { onClose: () => void }) {
         {usageByModel != null && Object.keys(usageByModel).length > 0 && (
           <ModelUsageBreakdown usageByModel={usageByModel} />
         )}
+        <SessionOverviewSubagents />
       </CardContent>
     </Card>
   );

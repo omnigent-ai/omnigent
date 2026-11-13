@@ -334,6 +334,24 @@ class SessionConnectivity:
 
 
 @dataclass(frozen=True)
+class SpawnTreeUsage:
+    """
+    One spawn-tree member's place in the tree and its own recorded usage.
+
+    Returned by :meth:`ConversationStore.list_spawn_tree_usage` for cost
+    roll-ups that need neither labels nor content.
+
+    :param id: Conversation id.
+    :param parent_conversation_id: Parent id, or ``None`` for the root.
+    :param session_usage: This conversation's own ``session_usage`` document.
+    """
+
+    id: str
+    parent_conversation_id: str | None
+    session_usage: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class SessionActivity:
     """
     When a session last changed and what it is doing now.
@@ -2052,6 +2070,36 @@ class ConversationStore(ABC):
             data=rows,
             first_id=rows[0].id if rows else None,
             last_id=rows[-1].id if rows else None,
+            has_more=page.has_more,
+        )
+
+    def list_spawn_tree_usage(
+        self, root_conversation_id: str, *, limit: int
+    ) -> PagedList[SpawnTreeUsage]:
+        """Read one spawn tree's hierarchy and usage in a single bounded read.
+
+        Like :meth:`list_spawn_tree` but without labels or other row data, so
+        *limit* bounds all the work. ``has_more`` means the tree holds more
+        than *limit* rows; rows come in id order.
+
+        :param root_conversation_id: Root of the spawn tree.
+        :param limit: Maximum conversations to return.
+        :returns: The tree's members with their parent and own usage.
+        """
+        page = self.list_conversations(
+            limit=limit,
+            kind=None,
+            include_archived=True,
+            root_conversation_id=root_conversation_id,
+            order="asc",
+            sort_by="id",
+        )
+        return PagedList(
+            data=[
+                SpawnTreeUsage(c.id, c.parent_conversation_id, c.session_usage) for c in page.data
+            ],
+            first_id=page.first_id,
+            last_id=page.last_id,
             has_more=page.has_more,
         )
 

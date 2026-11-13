@@ -131,6 +131,72 @@ async def test_child_sessions_404_for_nonexistent_session(
     assert resp.status_code == 404
 
 
+# ── Agent costs ──────────────────────────────────────────
+
+
+async def test_agent_costs_report_subtree_totals(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    session = await _create_parent_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    codex = _seed_child(conv_store=store, parent_id=session["id"], title="codex:a")
+    grandchild = _seed_child(conv_store=store, parent_id=codex.id, title="codex:b")
+    unpriced = _seed_child(conv_store=store, parent_id=session["id"], title="worker:c")
+    store.set_session_usage(session["id"], {"total_cost_usd": 1.0})
+    store.set_session_usage(codex.id, {"total_cost_usd": 0.5})
+    store.set_session_usage(grandchild.id, {"total_cost_usd": 0.0})
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/agent_costs")
+
+    assert resp.status_code == 200
+    assert {row["id"]: row["cost_usd"] for row in resp.json()["data"]} == {
+        # Own and descendant spend, as each session's own total reports it.
+        session["id"]: 1.5,
+        codex.id: 0.5,
+        # A known zero stays zero; nothing priced stays unknown.
+        grandchild.id: 0.0,
+        unpriced.id: None,
+    }
+    child_resp = await client.get(f"/v1/sessions/{codex.id}/agent_costs")
+    assert {row["id"] for row in child_resp.json()["data"]} == {codex.id, grandchild.id}
+    missing = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/agent_costs")
+    assert missing.status_code == 404
+
+
+async def test_agent_costs_paginate_and_bound_the_tree_read(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes.sessions import routes_items
+
+    session = await _create_parent_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    for name in ("a", "b"):
+        _seed_child(conv_store=store, parent_id=session["id"], title=f"worker:{name}")
+    url = f"/v1/sessions/{session['id']}/agent_costs"
+
+    pages: list[dict[str, Any]] = []
+    after: str | None = None
+    while not pages or pages[-1]["has_more"]:
+        params = {"limit": 2, **({"after": after} if after else {})}
+        pages.append((await client.get(url, params=params)).json())
+        after = pages[-1]["last_id"]
+    assert [len(page["data"]) for page in pages] == [2, 1]
+    assert len({row["id"] for page in pages for row in page["data"]}) == 3
+    stale = await client.get(url, params={"after": "ad563e906854634c49e1a6fd2fbb31d4"})
+    assert (stale.status_code, stale.json()["error"]["code"]) == (400, "stale_cursor")
+
+    # A tree past the read cap reports no costs rather than reading it all, and a
+    # continuation across that growth restarts instead of ending early.
+    monkeypatch.setattr(routes_items, "_SPAWN_TREE_READ_CAP", 1)
+    capped = (await client.get(url)).json()
+    assert (capped["data"], capped["has_more"]) == ([], False)
+    grown = await client.get(url, params={"after": pages[0]["last_id"]})
+    assert (grown.status_code, grown.json()["error"]["code"]) == (400, "stale_cursor")
+
+
 # ── Empty ────────────────────────────────────────────────
 
 
