@@ -208,20 +208,27 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("instruction_spec", "env_denylist", "expected_env_unset"),
+    ("instruction_spec", "env_denylist", "expected_env_unset", "memory_guidance"),
     [
-        ("missing", None, []),
+        ("missing", None, [], None),
         (
             "missing",
             " OPENAI_API_KEY,ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY, ",
             ["ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"],
+            None,
         ),
-        ("empty", None, []),
-        ("raw", None, []),
-        ("resolved", None, []),
-        ("resolved-replace", None, []),
-        ("sdk-missing-replace", None, []),
-        ("resolved-sdk-empty-replace", None, []),
+        ("empty", None, [], None),
+        ("raw", None, [], None),
+        ("resolved", None, [], None),
+        ("resolved-replace", None, [], None),
+        ("sdk-missing-replace", None, [], None),
+        ("resolved-sdk-empty-replace", None, [], None),
+        # Memory guidance follows the startup instructions in both prompt modes,
+        # and replace mode still refuses to launch without author instructions.
+        ("resolved", None, [], "MEMORY GUIDANCE"),
+        ("resolved-replace", None, [], "MEMORY GUIDANCE"),
+        ("sdk-missing-replace", None, [], "MEMORY GUIDANCE"),
+        ("resolved-sdk-empty-replace", None, [], "MEMORY GUIDANCE"),
     ],
 )
 async def test_auto_create_pi_terminal_launches_required_terminal(
@@ -230,6 +237,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     env_denylist: str | None,
     expected_env_unset: list[str],
     instruction_spec: str,
+    memory_guidance: str | None,
 ) -> None:
     """Launch a required terminal with session-local authored instructions.
 
@@ -242,6 +250,13 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     import omnigent.runner.app as runner_app_mod
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    async def _memory_guidance(*_args: Any) -> str | None:
+        return memory_guidance
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration.memory_startup_guidance", _memory_guidance
+    )
     if env_denylist is None:
         monkeypatch.delenv("OMNIGENT_PI_ENV_UNSET", raising=False)
     else:
@@ -402,6 +417,8 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         if instruction_spec in {"raw", "resolved", "resolved-replace"}
         else WORKSPACE_IMAGE_INSTRUCTION
     )
+    if memory_guidance is not None:
+        expected = f"{expected}\n\n{memory_guidance}"
     assert path.read_text() == expected
     assert instructions not in args
 

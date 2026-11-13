@@ -25,6 +25,7 @@ tool_groups:
   agent_discovery: false
   projects: false
   journal: false
+  memory: false
 
 async: false
 
