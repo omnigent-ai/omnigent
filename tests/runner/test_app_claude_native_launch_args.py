@@ -22,9 +22,6 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.harnesses.claude_native.bridge import (
-    claude_user_settings_path as real_claude_user_settings_path,
-)
 from omnigent.harnesses.claude_native.main import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
@@ -1414,10 +1411,6 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/runner/claude")
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", record_seed
-    )
-    # The real resolver, in place of the suite-wide temp path.
-    monkeypatch.setattr(
-        claude_native_bridge, "claude_user_settings_path", real_claude_user_settings_path
     )
     monkeypatch.setattr(
         claude_native_bridge,

@@ -41,9 +41,9 @@ _INITIAL_MODEL = os.environ.get(
 _TARGET_MODEL = os.environ.get("OMNIGENT_E2E_CLAUDE_TARGET_MODEL", "system.ai.glm-5-3")
 
 
-def _capture_pane(socket_path: Path) -> str:
+def _capture_pane(socket_path: Path, target: str = "model-switch:0.0") -> str:
     return subprocess.run(
-        ["tmux", "-S", str(socket_path), "capture-pane", "-p", "-t", "model-switch:0.0"],
+        ["tmux", "-S", str(socket_path), "capture-pane", "-p", "-t", target],
         capture_output=True,
         text=True,
         timeout=5,
@@ -67,14 +67,32 @@ def _status_model_matches(bridge_dir: Path, expected: str) -> bool:
     return actual is not None and actual.removesuffix("[1m]") == expected.removesuffix("[1m]")
 
 
-async def _wait_for_model(bridge_dir: Path, expected: str, socket_path: Path) -> None:
+async def _wait_for_model(
+    bridge_dir: Path, expected: str, socket_path: Path, target: str = "model-switch:0.0"
+) -> None:
     deadline = asyncio.get_running_loop().time() + 30
     while asyncio.get_running_loop().time() < deadline:
         if _status_model_matches(bridge_dir, expected):
             return
         await asyncio.sleep(0.1)
-    pane = _capture_pane(socket_path)
+    pane = _capture_pane(socket_path, target)
     pytest.fail(f"Claude did not report {expected!r}; terminal contents:\n{pane[-3000:]}")
+
+
+def _status_line_config(bridge_dir: Path) -> dict[str, str]:
+    """Capture only this pane's model status in its own directory."""
+    return {
+        "type": "command",
+        "command": shlex.join(
+            [
+                sys.executable,
+                "-m",
+                "omnigent.harnesses.claude_native.status",
+                "--bridge-dir",
+                str(bridge_dir),
+            ]
+        ),
+    }
 
 
 async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
@@ -130,18 +148,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                         {"model": _TARGET_MODEL, "label": "Managed target"},
                     ],
                 },
-                "statusLine": {
-                    "type": "command",
-                    "command": shlex.join(
-                        [
-                            sys.executable,
-                            "-m",
-                            "omnigent.harnesses.claude_native.status",
-                            "--bridge-dir",
-                            str(bridge_dir),
-                        ]
-                    ),
-                },
+                "statusLine": _status_line_config(bridge_dir),
             }
         )
     )
@@ -267,8 +274,14 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                 json.dumps({"model": json.loads(settings_path.read_text())["model"]})
             )
 
-        # A new standalone pane has no session model override.
-        standalone = [command[0], *command[3:]]
+        # A statusLine-only override leaves the saved model as the fresh pane's default.
+        fresh_bridge_dir = tmp_path / "fresh-bridge"
+        fresh_bridge_dir.mkdir()
+        fresh_settings = tmp_path / "fresh-settings.json"
+        fresh_settings.write_text(
+            json.dumps({"statusLine": _status_line_config(fresh_bridge_dir)})
+        )
+        standalone = [command[0], "--settings", str(fresh_settings), *command[5:]]
         subprocess.run(
             [
                 "tmux",
@@ -287,26 +300,15 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
             check=True,
             timeout=10,
         )
-        await _wait_for_model(bridge_dir, _INITIAL_MODEL, socket_path)
-        fresh_pane = subprocess.run(
-            [
-                "tmux",
-                "-S",
-                str(socket_path),
-                "capture-pane",
-                "-p",
-                "-t",
-                "model-switch:fresh-default",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-        ).stdout
+        await _wait_for_model(
+            fresh_bridge_dir, _INITIAL_MODEL, socket_path, "model-switch:fresh-default"
+        )
+        fresh_pane = _capture_pane(socket_path, "model-switch:fresh-default")
         (tmp_path / "fresh-session.txt").write_text(fresh_pane)
         (tmp_path / "fresh-model.json").write_text(
-            json.dumps({"model": bridge.read_claude_status_model(bridge_dir)})
+            json.dumps({"model": bridge.read_claude_status_model(fresh_bridge_dir)})
         )
+        assert _status_model_matches(bridge_dir, _TARGET_MODEL)
         assert json.loads(settings_path.read_text())["model"] == _INITIAL_MODEL
     finally:
         subprocess.run(
