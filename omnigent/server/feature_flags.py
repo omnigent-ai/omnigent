@@ -49,7 +49,7 @@ class Feature(StrEnum):
     SESSION_OVERVIEW = "session_overview"
     PROJECT_REPOSITORY_CREATION = "project_repository_creation"
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
-    WORKSPACE_API = "workspace_api"
+    WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
 
 
 @dataclass(frozen=True)
@@ -237,7 +237,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         frontend_visible=False,
     ),
     FeatureDefinition(
-        feature=Feature.WORKSPACE_API,
+        feature=Feature.WORKSPACE_API_SERVER_ACCESS,
         description="Serve the workspace API through the server, answered by the session's host",
         owner="server",
         review_by_release="0.27.0",

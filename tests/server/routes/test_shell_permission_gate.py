@@ -306,7 +306,7 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
             {
                 Feature.WORKSPACE_CONTENT_SEARCH,
                 Feature.WORKSPACE_DIRECT_ACCESS,
-                Feature.WORKSPACE_API,
+                Feature.WORKSPACE_API_SERVER_ACCESS,
             }
         )
     )

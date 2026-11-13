@@ -2824,7 +2824,7 @@ def register_resources_routes(
         so the client's fetch re-addresses it; other refusals are Connect errors.
         """
         flags = getattr(request.app.state, "feature_flags", FeatureFlags())
-        if not flags.enabled(Feature.WORKSPACE_API):
+        if not flags.enabled(Feature.WORKSPACE_API_SERVER_ACCESS):
             raise HTTPException(status_code=404, detail="The workspace API is disabled")
         try:
             from connectrpc.code import Code

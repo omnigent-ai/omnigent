@@ -174,7 +174,7 @@ def _server_app(
             lambda _host: WrongReplicaError("host is on another replica", host_id="host_ws"),
         )
     if flag:
-        app.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_API}))
+        app.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_API_SERVER_ACCESS}))
     router = create_sessions_router(
         store,  # type: ignore[arg-type]
         _StubAgentStore(),  # type: ignore[arg-type]
