@@ -1,11 +1,12 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import type { PropsWithChildren } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { invalidateAgentCosts, useAgentCosts } from "./useAgentCosts";
+import { childSessionsQueryKey } from "./useChildSessions";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 
@@ -30,8 +31,20 @@ function costRequests(): URL[] {
     .filter((url) => url.pathname.endsWith("/agent_costs"));
 }
 
+function routeCosts(costs: () => Response, childBusy: boolean) {
+  vi.mocked(authenticatedFetch).mockImplementation(async (input) =>
+    String(input).includes("/child_sessions")
+      ? new Response(JSON.stringify({ data: [{ id: "conv_child", busy: childBusy }] }))
+      : costs(),
+  );
+}
+
 beforeEach(() => {
   vi.mocked(authenticatedFetch).mockReset();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("useAgentCosts", () => {
@@ -63,19 +76,37 @@ describe("useAgentCosts", () => {
     expect(costRequests().map((url) => url.searchParams.get("after"))).toEqual([null, "conv_root"]);
   });
 
-  it("treats a missing endpoint as unsupported and stops asking", async () => {
-    vi.mocked(authenticatedFetch).mockImplementation(async (input) =>
-      String(input).includes("/child_sessions")
-        ? new Response('{"data":[{"id":"conv_child","busy":true}]}')
-        : new Response("", { status: 404 }),
-    );
+  it("treats a missing route as unsupported and stops asking", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    routeCosts(() => new Response('{"detail":"Not Found"}', { status: 404 }), true);
     const { client, result } = renderCosts(true);
 
     await waitFor(() => expect(result.current.data).toBeNull());
     expect(result.current.isError).toBe(false);
     invalidateAgentCosts(client);
     // A busy child would otherwise poll; an unsupported server is not asked again.
-    expect(client.getQueryState(["agent_costs", "conv_root"])?.isInvalidated).toBe(false);
+    await vi.advanceTimersByTimeAsync(40_000);
     expect(costRequests()).toHaveLength(1);
+  });
+
+  it("keeps a missing session an error rather than an unsupported server", async () => {
+    routeCosts(() => new Response('{"error":{"code":"not_found"}}', { status: 404 }), false);
+    const { result } = renderCosts(true);
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.data).toBeUndefined();
+  });
+
+  it("polls while a child works and stops once it settles", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    routeCosts(() => new Response('{"data":[]}'), true);
+    const { client, result } = renderCosts(true);
+    await waitFor(() => expect(result.current.data?.size).toBe(0));
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    await waitFor(() => expect(costRequests()).toHaveLength(2));
+    client.setQueryData(childSessionsQueryKey("conv_root"), [{ id: "conv_child", busy: false }]);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(costRequests()).toHaveLength(2);
   });
 });

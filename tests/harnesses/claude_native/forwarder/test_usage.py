@@ -549,9 +549,13 @@ async def test_forward_session_cost_attaches_changed_subagent_estimates(
     )
     dedupe = forwarder._ForwardDedupeState()
     posted: list[dict[str, Any]] = []
+    fail_next = {"value": False}
 
     def handler(request: httpx.Request) -> httpx.Response:
         posted.append(json.loads(request.content)["data"])
+        if fail_next["value"]:
+            fail_next["value"] = False
+            return httpx.Response(500, request=request)
         return httpx.Response(200, json={})
 
     async with httpx.AsyncClient(
@@ -584,6 +588,16 @@ async def test_forward_session_cost_attaches_changed_subagent_estimates(
         await run()
         assert "subagent_costs_usd" not in posted[-1]
         assert len(posted) == 3
+        # A failed post is not delivery: the retry carries the estimate again.
+        estimates["value"] = {"conv_child": 0.4}
+        status_box["value"] = 0.7
+        fail_next["value"] = True
+        await run()
+        dedupe.cost_retry_not_before = 0.0  # skip the backoff wait
+        await run()
+        assert [post.get("subagent_costs_usd") for post in posted[-2:]] == [
+            {"conv_child": pytest.approx(0.4)}
+        ] * 2
 
 
 @pytest.mark.asyncio

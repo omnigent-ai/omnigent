@@ -23,6 +23,10 @@ const AGENT_COSTS_QUERY_PREFIX = ["agent_costs"] as const;
 const AGENT_COSTS_POLL_MS = 15_000;
 const AGENT_COSTS_PAGE_SIZE = "1000";
 
+function isOmnigentError(body: unknown): boolean {
+  return typeof body === "object" && body !== null && "error" in body;
+}
+
 async function fetchAgentCostPages(
   sessionId: string,
   after: string | null,
@@ -33,8 +37,9 @@ async function fetchAgentCostPages(
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/agent_costs?${params.toString()}`,
   );
-  // A server without the route (older, or a rolled-back backend) has no breakdown.
-  if (res.status === 404) return null;
+  // A missing route (older or rolled-back server) answers 404 without the Omnigent
+  // error envelope that a missing or hidden session carries; only it is unsupported.
+  if (res.status === 404 && !isOmnigentError(await res.json().catch(() => null))) return null;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const page = (await res.json()) as AgentCostPageWire;
   for (const row of page.data) {
@@ -53,12 +58,23 @@ export function fetchAgentCosts(sessionId: string): Promise<Map<string, AgentCos
   return fetchAgentCostPages(sessionId, null, new Map());
 }
 
-/** Refetch mounted breakdowns after a cost moved, skipping unsupported servers. */
+const AGENT_COSTS_REFRESH_MS = 2_000;
+const pendingRefreshes = new WeakSet<QueryClient>();
+
+/**
+ * Refetch mounted breakdowns after a cost moved, skipping unsupported servers.
+ * Calls within {@link AGENT_COSTS_REFRESH_MS} coalesce into one trailing refetch.
+ */
 export function invalidateAgentCosts(queryClient: QueryClient): void {
-  void queryClient.invalidateQueries({
-    queryKey: AGENT_COSTS_QUERY_PREFIX,
-    predicate: (query) => query.state.data !== null,
-  });
+  if (pendingRefreshes.has(queryClient)) return;
+  pendingRefreshes.add(queryClient);
+  setTimeout(() => {
+    pendingRefreshes.delete(queryClient);
+    void queryClient.invalidateQueries({
+      queryKey: AGENT_COSTS_QUERY_PREFIX,
+      predicate: (query) => query.state.data !== null,
+    });
+  }, AGENT_COSTS_REFRESH_MS);
 }
 
 /**

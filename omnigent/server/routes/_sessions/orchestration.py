@@ -127,7 +127,6 @@ from omnigent.runtime.policies.approval import (
     resolve_ask_timeout,
 )
 from omnigent.runtime.policies.builder import (
-    _subtree_conversation_ids,
     _sum_subtree_usage,
     ancestor_ids_from_tree,
     load_session_tree,
@@ -441,6 +440,7 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
+    SpawnTreeUsage,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -1491,7 +1491,7 @@ def _publish_subtree_cost_to_ancestors(
         session_stream.publish(ancestor_id, event.model_dump(exclude_none=True))
 
 
-def _agent_costs(tree: list[Conversation], session_id: str) -> list[AgentCost]:
+def _agent_costs(tree: Sequence[SpawnTreeUsage], session_id: str) -> list[AgentCost]:
     """
     Display costs for *session_id* and its descendants from one loaded tree.
 
@@ -1499,23 +1499,26 @@ def _agent_costs(tree: list[Conversation], session_id: str) -> list[AgentCost]:
     displays. An agent with nothing priced falls back to its parent's
     display-only ``subagent_costs_usd`` estimate, which no ancestor sums.
 
-    :param tree: Every conversation in the spawn tree, from
-        :func:`load_session_tree`.
+    :param tree: The whole spawn tree, from
+        :meth:`ConversationStore.list_spawn_tree_usage`.
     :param session_id: Subtree root to report, e.g. ``"conv_abc123"``.
     :returns: One :class:`AgentCost` per subtree member, in tree order.
     """
     rows = {row.id: row for row in tree}
     totals: dict[str, float] = {}
+    members: set[str] = set()
     for row in tree:
         cost = _priced_cost_for_display(row.session_usage)
         node: str | None = row.id
         seen: set[str] = set()
-        # Add each priced own cost to the row and every ancestor, guarding cycles.
-        while cost is not None and node in rows and node not in seen:
+        # Walk up to the root (cycle-safe), adding this row's priced cost to each ancestor.
+        while node in rows and node not in seen:
             seen.add(node)
-            totals[node] = totals.get(node, 0.0) + cost
+            if cost is not None:
+                totals[node] = totals.get(node, 0.0) + cost
+            if node == session_id:
+                members.add(row.id)
             node = rows[node].parent_conversation_id
-    members = _subtree_conversation_ids(tree, session_id)
     result: list[AgentCost] = []
     for row in tree:
         if row.id not in members:
@@ -1999,8 +2002,10 @@ async def _persist_relay_reported_model(
     )
 
 
-# Sub-agent estimates kept per session; bounds a client-written usage row.
-_MAX_SUBAGENT_COSTS = 1000
+# Estimates kept per session. 200 × (32-hex id + 6-decimal float) stays near 12 KB of
+# JSON, far below the 64 KB usage column, so they never fail the authoritative write.
+_MAX_SUBAGENT_COSTS = 200
+_CONVERSATION_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
 def _subagent_costs_from_report(data: dict[str, Any]) -> dict[str, float]:
@@ -2011,22 +2016,29 @@ def _subagent_costs_from_report(data: dict[str, Any]) -> dict[str, float]:
     rather than failing the report whose authoritative costs it rides along.
 
     :param data: The ``external_session_usage`` event ``data`` dict.
-    :returns: ``{child_id: usd}`` for non-empty ids with finite non-negative
-        numbers; empty when the key is absent or holds no such entry.
+    :returns: ``{child_id: usd}`` for conversation ids with finite
+        non-negative numbers, rounded to 6 decimals; empty when the key is
+        absent or holds no such entry.
     """
     raw = data.get("subagent_costs_usd")
     if not isinstance(raw, dict):
         return {}
-    return {
-        child_id: float(value)
-        for child_id, value in raw.items()
-        if isinstance(child_id, str)
-        and child_id
-        and isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and value >= 0
-    }
+    costs: dict[str, float] = {}
+    for child_id, value in raw.items():
+        if (
+            not isinstance(child_id, str)
+            or not _CONVERSATION_ID_RE.fullmatch(child_id)
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+        ):
+            continue
+        try:
+            cost = float(value)
+        except OverflowError:  # an integer too large for a float
+            continue
+        if math.isfinite(cost) and cost >= 0:
+            costs[child_id] = round(cost, 6)
+    return costs
 
 
 def _persist_native_cumulative_usage(

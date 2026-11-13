@@ -10,11 +10,13 @@ double-counted the shared baseline once the active model changed).
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from omnigent.errors import OmnigentError
 from omnigent.llms.context_window import ModelPricing
-from omnigent.runtime.policies.builder import load_session_tree, load_session_usage
+from omnigent.runtime.policies.builder import load_session_usage
 from omnigent.server.routes._sessions.orchestration import (
     _agent_costs,
     _persist_native_cumulative_usage,
@@ -25,6 +27,8 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 
 # Agent ids are stored as 16-byte uuids, so tests use a valid 32-char hex id.
 _AGENT_ID = "0123456789abcdef0123456789abcdef"
+_CHILD = "c" * 32
+_OTHER_CHILD = "d" * 32
 
 
 def _usage(store: SqlAlchemyConversationStore, conv_id: str) -> dict:
@@ -86,18 +90,17 @@ def test_subagent_cost_estimates_stay_display_only(db_uri: str) -> None:
     # A lower estimate keeps the maximum; a new child merges in.
     _persist_native_cumulative_usage(
         parent.id,
-        {"policy_cost_usd": 1.2, "subagent_costs_usd": {child.id: 0.3, "conv_other": 0.1}},
+        {"policy_cost_usd": 1.2, "subagent_costs_usd": {child.id: 0.3, _OTHER_CHILD: 0.1}},
         store,
     )
 
     usage = _usage(store, parent.id)
-    assert usage["subagent_costs_usd"] == {child.id: 0.4, "conv_other": 0.1}
+    assert usage["subagent_costs_usd"] == {child.id: 0.4, _OTHER_CHILD: 0.1}
     # The parent's bill already includes the child's spend; nothing adds it again.
     assert usage["total_cost_usd"] == 1.0
     assert load_session_usage(parent.id, store)["total_cost_usd"] == 1.0
-    costs = {
-        cost.id: cost for cost in _agent_costs(load_session_tree(parent.id, store), parent.id)
-    }
+    tree = store.list_spawn_tree_usage(parent.id, limit=10).data
+    costs = {cost.id: cost for cost in _agent_costs(tree, parent.id)}
     assert (costs[parent.id].cost_usd, costs[parent.id].estimated) == (1.0, False)
     assert (costs[child.id].cost_usd, costs[child.id].estimated) == (0.4, True)
 
@@ -106,10 +109,13 @@ def test_subagent_cost_estimates_stay_display_only(db_uri: str) -> None:
     ("estimates", "kept"),
     [
         ([0.1], {}),
-        ({"conv_x": -1, "conv_ok": 0.1}, {"conv_ok": 0.1}),
-        ({"conv_x": float("nan")}, {}),
-        ({"conv_x": True}, {}),
-        ({"": 0.1}, {}),
+        ({_OTHER_CHILD: -1, _CHILD: 0.1}, {_CHILD: 0.1}),
+        ({_OTHER_CHILD: float("nan")}, {}),
+        ({_OTHER_CHILD: True}, {}),
+        # Too large for a float: dropped rather than raising OverflowError.
+        ({_OTHER_CHILD: 10**400}, {}),
+        # Only conversation ids are stored, which bounds each key's size.
+        ({"conv_child": 0.1, "f" * 256: 0.1}, {}),
     ],
 )
 def test_malformed_subagent_estimates_never_block_authoritative_costs(
@@ -130,25 +136,27 @@ def test_malformed_subagent_estimates_never_block_authoritative_costs(
 def test_subagent_estimates_past_the_cap_keep_costs_advancing(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="claude", agent_id=_AGENT_ID)
-    full = {f"conv_{index}": 0.1 for index in range(1000)}
+    # The largest stored entries: full-length ids and long fractional costs.
+    full = {f"{index:032x}": 123456789.123456 for index in range(200)}
     _persist_native_cumulative_usage(
         conv.id, {"cumulative_cost_usd": 1.0, "subagent_costs_usd": full}, store
     )
-    # One more child than the cap: oversized in the request, and new to a full map.
     _persist_native_cumulative_usage(
         conv.id,
         {
             "cumulative_cost_usd": 2.0,
             "policy_cost_usd": 2.0,
-            "subagent_costs_usd": {**full, "conv_0": 0.5, "conv_new": 0.2},
+            "subagent_costs_usd": {**full, f"{0:032x}": 123456790.5, _OTHER_CHILD: 0.2},
         },
         store,
     )
     usage = _usage(store, conv.id)
     assert (usage["total_cost_usd"], usage["policy_cost_usd"]) == (2.0, 2.0)
-    assert len(usage["subagent_costs_usd"]) == 1000
-    assert usage["subagent_costs_usd"]["conv_0"] == 0.5
-    assert "conv_new" not in usage["subagent_costs_usd"]
+    assert len(usage["subagent_costs_usd"]) == 200
+    assert usage["subagent_costs_usd"][f"{0:032x}"] == 123456790.5
+    assert _OTHER_CHILD not in usage["subagent_costs_usd"]
+    # Even uncompressed, a full map stays far inside MySQL's 65,535-byte usage column.
+    assert len(json.dumps(usage)) < 20_000
 
 
 def test_per_model_cost_sums_across_model_switch(db_uri: str) -> None:

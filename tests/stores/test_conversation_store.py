@@ -10015,6 +10015,45 @@ def test_spawn_tree_read_examines_rows_through_the_root_index(
             assert "TEMP B-TREE" not in plan, plan
 
 
+def test_spawn_tree_usage_reads_hierarchy_and_usage_without_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from sqlalchemy import event
+
+    root = conversation_store.create_conversation(labels={"note": "x" * 100})
+    children = [
+        conversation_store.create_conversation(
+            kind="sub_agent", parent_conversation_id=root.id, labels={"note": "y"}
+        )
+        for _ in range(3)
+    ]
+    conversation_store.set_session_usage(children[0].id, {"total_cost_usd": 0.5})
+    statements: list[str] = []
+
+    def capture(conn: Any, cursor: Any, statement: str, *_: Any) -> None:
+        statements.append(statement)
+
+    engines = {conversation_store._conv_engine, conversation_store._engine}
+    for engine in engines:
+        event.listen(engine, "before_cursor_execute", capture)
+    try:
+        full = conversation_store.list_spawn_tree_usage(root.id, limit=10)
+        capped = conversation_store.list_spawn_tree_usage(root.id, limit=2)
+    finally:
+        for engine in engines:
+            event.remove(engine, "before_cursor_execute", capture)
+
+    by_id = {row.id: row for row in full.data}
+    assert set(by_id) == {root.id, *(child.id for child in children)} and not full.has_more
+    assert by_id[root.id].parent_conversation_id is None
+    assert by_id[children[0].id].parent_conversation_id == root.id
+    assert by_id[children[0].id].session_usage == {"total_cost_usd": 0.5}
+    assert by_id[children[1].id].session_usage == {}
+    assert len(capped.data) == 2 and capped.has_more
+    # Labels can grow without bound per conversation, so this read never loads them.
+    assert statements and not any("conversation_labels" in s for s in statements)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("split_database", [False, True])
 @pytest.mark.parametrize("user_id", ["alice", "a" * 112])

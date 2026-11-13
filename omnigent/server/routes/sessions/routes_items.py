@@ -247,9 +247,9 @@ def register_items_routes(
         """
         List display costs for a session and the sub-agents beneath it.
 
-        Subtree totals come from one spawn-tree read bounded like
-        ``child_sessions?descendants=true``; a tree past that cap reports no
-        costs. READ on the session covers its descendants, as for
+        Subtree totals come from one spawn-tree read (ids, parents and usage
+        only) bounded like ``child_sessions?descendants=true``; a tree past
+        that cap reports no costs. READ on the session covers its descendants, as for
         ``child_sessions``.
 
         :param request: Inbound HTTP request carrying the caller identity.
@@ -258,7 +258,8 @@ def register_items_routes(
         :param after: Id of the last agent of the previous page, or ``None``.
         :returns: A page of :class:`AgentCostList` in spawn-tree order.
         :raises OmnigentError: 403 without READ; 404 when no session exists.
-        :raises StaleCursorError: If *after* is not an agent of the subtree.
+        :raises StaleCursorError: If *after* is not an agent of the subtree, or
+            the tree outgrew the read cap since the page it came from.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -270,12 +271,15 @@ def register_items_routes(
         if conv is None:
             raise _session_not_found()
         tree = await asyncio.to_thread(
-            conversation_store.list_spawn_tree,
+            conversation_store.list_spawn_tree_usage,
             conv.root_conversation_id or conv.id,
             # The tree's root row plus up to the cap of sub-agents.
             limit=_SPAWN_TREE_READ_CAP + 1,
         )
         if tree.has_more:
+            if after is not None:
+                # The tree outgrew one read since the first page: the client restarts.
+                raise StaleCursorError(after)
             # Subtree totals need the whole tree, so an oversized one reports none.
             return AgentCostList()
         costs = _agent_costs(tree.data, session_id)

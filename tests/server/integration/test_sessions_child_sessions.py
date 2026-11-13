@@ -194,10 +194,13 @@ async def test_agent_costs_paginate_and_bound_the_tree_read(
     stale = await client.get(url, params={"after": "ad563e906854634c49e1a6fd2fbb31d4"})
     assert (stale.status_code, stale.json()["error"]["code"]) == (400, "stale_cursor")
 
-    # A tree past the read cap reports no costs rather than reading it all.
+    # A tree past the read cap reports no costs rather than reading it all, and a
+    # continuation across that growth restarts instead of ending early.
     monkeypatch.setattr(routes_items, "_SPAWN_TREE_READ_CAP", 1)
     capped = (await client.get(url)).json()
     assert (capped["data"], capped["has_more"]) == ([], False)
+    grown = await client.get(url, params={"after": pages[0]["last_id"]})
+    assert (grown.status_code, grown.json()["error"]["code"]) == (400, "stale_cursor")
 
 
 # ── Empty ────────────────────────────────────────────────

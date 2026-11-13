@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import type { AgentCost } from "@/hooks/useAgentCosts";
 import {
   buildTree,
   childActivity,
@@ -28,6 +29,7 @@ vi.mock("./SubagentsGraphView", () => ({
       data-testid="subagents-graph-view"
       data-conversation-id={props.conversationId}
       data-root-session-id={props.rootSessionId}
+      data-cost-ids={[...((props.costs as Map<string, unknown> | undefined)?.keys() ?? [])].join()}
     />
   ),
 }));
@@ -109,12 +111,15 @@ function defaultSession(): ReturnType<typeof useSession> {
   };
 }
 
-function renderPanel(opts: { conversationId?: string; rootSessionId?: string } = {}) {
+function renderPanel(
+  opts: { conversationId?: string; rootSessionId?: string; costs?: Map<string, AgentCost> } = {},
+) {
   return render(
     <MemoryRouter>
       <SubagentsPanel
         conversationId={opts.conversationId ?? "conv_root"}
         rootSessionId={opts.rootSessionId ?? "conv_root"}
+        costs={opts.costs}
       />
     </MemoryRouter>,
   );
@@ -677,18 +682,23 @@ describe("SubagentsPanel view-mode toggle", () => {
     expect(screen.queryByTestId("subagents-graph-view")).toBeNull();
   });
 
-  it("passes conversationId and rootSessionId to the graph view", async () => {
+  it("passes conversationId, rootSessionId and costs to the graph view", async () => {
     mockChildTree({
       conv_root: [childInfo({ id: "c1", tool: "researcher" })],
     });
 
-    renderPanel({ conversationId: "conv_child", rootSessionId: "conv_root" });
+    renderPanel({
+      conversationId: "conv_child",
+      rootSessionId: "conv_root",
+      costs: new Map([["c1", { costUsd: 0.4, estimated: false }]]),
+    });
 
     fireEvent.click(screen.getByTestId("view-mode-graph"));
 
     const graph = await screen.findByTestId("subagents-graph-view");
     expect(graph).toHaveAttribute("data-conversation-id", "conv_child");
     expect(graph).toHaveAttribute("data-root-session-id", "conv_root");
+    expect(graph).toHaveAttribute("data-cost-ids", "c1");
   });
 
   it("preserves the toggle bar across both views", async () => {
