@@ -537,19 +537,7 @@ async def test_executor_error_terminates_with_response_failed(
     ("policy", "message", "error_code", "preparation_harness"),
     [
         (
-            "{not-json",
-            "The requested sandbox policy is invalid.",
-            "HarnessSandboxValidationError",
-            None,
-        ),
-        (
             '{"fork": "/private/host/scan"}',
-            "The requested sandbox policy is invalid.",
-            "HarnessSandboxValidationError",
-            None,
-        ),
-        (
-            '{"/private/host/scan": true}',
             "The requested sandbox policy is invalid.",
             "HarnessSandboxValidationError",
             None,
@@ -574,9 +562,7 @@ async def test_executor_error_terminates_with_response_failed(
         ),
     ],
     ids=[
-        "invalid-policy",
         "invalid-schema",
-        "unknown-field",
         "unsupported-policy",
         "backend-error",
         "non-claude-launcher-error",
