@@ -55,9 +55,10 @@ every server as it starts. It does this only while Claude Code is idle: not duri
 (including one typed in the terminal), while background agents or shells are running,
 while a question or dialog waits for an answer or its launcher waits for a sign-in,
 within 15 seconds of input or output in the terminal, or while someone has it open in a
-terminal on the host. When a `claude` server that read `sign_in_required` as the terminal
-started reads `connected`, the next message restarts Claude Code before it is delivered,
-if it is idle; otherwise a later message does. `/mcp` lists such a server as failed with
+terminal on the host or the runner can't tell whether they do. When a `claude` server that
+read `sign_in_required` as the terminal started reads `connected`, the next message restarts
+Claude Code before it is delivered, if it is idle; otherwise a later message does. A message
+queued during a turn is delivered as that turn ends, without a restart. `/mcp` lists such a server as failed with
 **Reconnect**, which restarts Claude Code at once when it is idle and otherwise says why it
 waits; it restarts nothing for a server that doesn't need it. Anything typed but not sent
 in the terminal is lost by a restart.

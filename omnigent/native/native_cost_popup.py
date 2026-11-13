@@ -164,24 +164,29 @@ def _tmux_window_activity_at(socket_path: str, tmux_target: str) -> float | None
         return None
 
 
-def _tmux_last_client_input_at(socket_path: str, tmux_target: str) -> float | None:
-    """
-    Epoch seconds of the last human input on a regular tmux client of *tmux_target*.
+# How tmux says a socket has no server, or the server no such session: nothing attached.
+_TMUX_NO_TARGET_ERRORS = (
+    "no server running",
+    "can't find session",
+    "(No such file or directory)",
+    "(Connection refused)",
+    "(File name too long)",
+)
 
-    tmux advances a regular (terminal) client's ``client_activity`` when it
-    attaches and on every keypress — never for idle time, pane output, or a
-    resize — so it is direct evidence that someone is driving the pane from a
-    CLI attach. Control-mode clients (the web attach bridge, ``tmux -C``) never
-    advance it after attaching, even while forwarding keystrokes, so they are
-    skipped; the bridge stamps its own interactions on the terminal instance.
+
+def _tmux_regular_client_activity(socket_path: str, tmux_target: str) -> list[float] | None:
+    """
+    The ``client_activity`` of each regular tmux client attached to *tmux_target*.
+
+    Control-mode clients (the web attach bridge, ``tmux -C``) are left out.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux target whose session's clients to inspect, e.g.
         ``"main"``.
-    :returns: Epoch seconds of the newest attach-or-keypress across regular
-        attached clients, or ``None`` when none is attached, the tmux
-        server/target is gone, or the output is unparseable.
+    :returns: Epoch seconds per regular client, e.g. ``[1700000000.0]``; ``[]``
+        when none is attached or tmux reports the server or session gone;
+        ``None`` when tmux could not be asked or its answer can't be read.
     """
     import subprocess
 
@@ -205,18 +210,58 @@ def _tmux_last_client_input_at(socket_path: str, tmux_target: str) -> float | No
     except (subprocess.SubprocessError, OSError):
         return None
     if proc.returncode != 0:
-        return None
-    newest: float | None = None
+        stderr = proc.stderr or ""
+        return [] if any(error in stderr for error in _TMUX_NO_TARGET_ERRORS) else None
+    activity: list[float] = []
     for line in proc.stdout.splitlines():
         fields = line.split()
-        if len(fields) != 2 or fields[0] != "0":
+        if len(fields) != 2 or fields[0] not in ("0", "1"):
+            return None
+        if fields[0] != "0":
             continue
         try:
-            activity_at = float(fields[1])
+            activity.append(float(fields[1]))
         except ValueError:
             return None
-        newest = activity_at if newest is None else max(newest, activity_at)
-    return newest
+    return activity
+
+
+def _tmux_last_client_input_at(socket_path: str, tmux_target: str) -> float | None:
+    """
+    Epoch seconds of the last human input on a regular tmux client of *tmux_target*.
+
+    tmux advances a regular (terminal) client's ``client_activity`` when it
+    attaches and on every keypress — never for idle time, pane output, or a
+    resize — so it is direct evidence that someone is driving the pane from a
+    CLI attach. Control-mode clients (the web attach bridge, ``tmux -C``) never
+    advance it after attaching, even while forwarding keystrokes, so they are
+    skipped; the bridge stamps its own interactions on the terminal instance.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux target whose session's clients to inspect, e.g.
+        ``"main"``.
+    :returns: Epoch seconds of the newest attach-or-keypress across regular
+        attached clients, or ``None`` when none is attached, the tmux
+        server/target is gone, or the output is unparseable.
+    """
+    activity = _tmux_regular_client_activity(socket_path, tmux_target)
+    return max(activity) if activity else None
+
+
+def _tmux_client_attached(socket_path: str, tmux_target: str) -> bool | None:
+    """
+    Whether a regular tmux client, e.g. a CLI ``omnigent claude``, is attached to *tmux_target*.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux target whose session's clients to inspect, e.g.
+        ``"main"``.
+    :returns: ``True`` or ``False`` as tmux reports it, or ``None`` when that
+        can't be told (tmux failed, timed out, or answered unreadably).
+    """
+    activity = _tmux_regular_client_activity(socket_path, tmux_target)
+    return None if activity is None else bool(activity)
 
 
 def launch_cost_popup(
