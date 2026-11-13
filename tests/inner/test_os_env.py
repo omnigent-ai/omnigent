@@ -216,6 +216,8 @@ def test_shell_impl_child_lifetime(tmp_path: Path, command_kind: str, timed_out:
         )
 
         assert result["timed_out"] is timed_out
+        assert result["stdout"] == ""
+        assert result["stderr"] == ""
         pid = int(pid_file.read_text())
         deadline = time.monotonic() + 2
         while timed_out and process_alive(pid) and time.monotonic() < deadline:
