@@ -103,7 +103,7 @@ function friendlyCloneError(error: unknown): string {
     return "This host is too old to clone repositories. Update omnigent on it and try again.";
   }
   if (message.includes("already exists")) {
-    return "That destination already exists. Choose a different folder name.";
+    return "That destination already exists. It may be a checkout from an earlier attempt: create a folder project from it, or choose a different folder name.";
   }
   if (message.includes("lost contact")) {
     return "The host stopped responding during the clone. The clone may have finished, so check the destination before retrying.";

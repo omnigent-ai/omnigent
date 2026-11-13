@@ -384,8 +384,6 @@ class ServerInfoResponse(BaseModel):
     # An agent's create that names a project other than its source's project makes a
     # standalone session; older servers refuse it while sibling sessions are on.
     sibling_other_project_standalone: bool = False
-    # A project may save a repository and sandbox provider; older servers ignore
-    # the saved repository, so the New project dialog keeps folder-only.
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
