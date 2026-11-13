@@ -55,6 +55,8 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -285,7 +287,8 @@ def _model_usage_from_step(step: dict[str, object]) -> dict[str, object] | None:
     :param step: One RPC step dict.
     :returns: A dict with any of ``cumulative_input_tokens`` /
         ``cumulative_output_tokens`` / ``cumulative_cache_read_input_tokens`` /
-        ``model`` (raw enum), or ``None`` when the step carries no usage.
+        ``context_tokens`` / ``model`` (raw enum), or ``None`` when the step
+        carries no usage.
     """
     if step.get("type") != _TYPE_PLANNER_RESPONSE or step.get("status") != _STATUS_DONE:
         return None
@@ -298,7 +301,7 @@ def _model_usage_from_step(step: dict[str, object]) -> dict[str, object] | None:
 
     def _to_int(val: object) -> int:
         """Parse a string-encoded int defensively; return 0 on failure."""
-        if isinstance(val, int):
+        if isinstance(val, int) and not isinstance(val, bool):
             return val
         if isinstance(val, str):
             try:
@@ -308,9 +311,10 @@ def _model_usage_from_step(step: dict[str, object]) -> dict[str, object] | None:
         return 0
 
     data: dict[str, object] = {}
-    input_tokens = _to_int(raw_usage.get("inputTokens"))
-    output_tokens = _to_int(raw_usage.get("outputTokens"))
-    cache_read = _to_int(raw_usage.get("cacheReadTokens"))
+    input_tokens = max(0, _to_int(raw_usage.get("inputTokens")))
+    output_tokens = max(0, _to_int(raw_usage.get("outputTokens")))
+    cache_read = max(0, _to_int(raw_usage.get("cacheReadTokens")))
+    cache_creation = max(0, _to_int(raw_usage.get("cacheCreationTokens")))
     model_enum = raw_usage.get("model")
 
     if input_tokens > 0:
@@ -319,6 +323,11 @@ def _model_usage_from_step(step: dict[str, object]) -> dict[str, object] | None:
         data["cumulative_output_tokens"] = output_tokens
     if cache_read > 0:
         data["cumulative_cache_read_input_tokens"] = cache_read
+    # agy splits uncached inputTokens from cacheReadTokens per call; sum all input
+    # buckets so context_tokens reflects total active prompt window occupancy.
+    context_tokens = input_tokens + cache_read + cache_creation
+    if context_tokens > 0:
+        data["context_tokens"] = context_tokens
     if isinstance(model_enum, str) and model_enum:
         data["model"] = model_enum  # resolved to displayName by caller
 
@@ -362,6 +371,94 @@ def _requested_model_enum_from_step(step: dict[str, object]) -> str | None:
     return model if isinstance(model, str) and model else None
 
 
+_PAREN_TIER_RE = re.compile(r"\s*\([^)]*\)\s*")
+_NON_MODEL_CHARS_RE = re.compile(r"[^a-z0-9.]+")
+_CATALOG_WINDOW_FIELDS = ("maxContextTokens", "contextWindow", "maxInputTokens")
+
+
+def _catalog_entries_for_model(
+    model_enum: str, catalog: dict[str, object]
+) -> list[tuple[str | None, dict[str, object]]]:
+    """Return matching ``(catalog_key, entry)`` pairs for ``model_enum``."""
+    models = catalog.get("models")
+    if not isinstance(models, dict):
+        return []
+    matches: list[tuple[str | None, dict[str, object]]] = []
+    seen_ids: set[int] = set()
+    for key, entry in models.items():
+        if isinstance(entry, dict) and entry.get("model") == model_enum:
+            matches.append((key if isinstance(key, str) else None, entry))
+            seen_ids.add(id(entry))
+    direct = models.get(model_enum)
+    if isinstance(direct, dict) and id(direct) not in seen_ids:
+        matches.append((model_enum, direct))
+    return matches
+
+
+def _display_name_model_candidates(display_name: str) -> list[str]:
+    """Derive model-catalog lookup slugs from a human-readable agy ``displayName``."""
+    stripped = _PAREN_TIER_RE.sub(" ", display_name).strip().lower()
+    slug = _NON_MODEL_CHARS_RE.sub("-", stripped).strip("-")
+    if not slug:
+        return []
+    bases = [slug]
+    if "." in slug:
+        hyphenated = slug.replace(".", "-")
+        # Anthropic catalog ids hyphenate minor versions ("claude-sonnet-4-5"),
+        # whereas Gemini entries preserve dots ("gemini-2.5-pro").
+        bases = [hyphenated, slug] if slug.startswith("claude-") else [slug, hyphenated]
+    candidates: list[str] = []
+    for base in bases:
+        candidates.append(base)
+        if not base.endswith("-preview"):
+            candidates.append(f"{base}-preview")
+    return candidates
+
+
+def _resolve_context_window_sync(model_enum: str, catalog: dict[str, object]) -> int | None:
+    """Resolve ``model_enum``'s context window from catalog metadata or shared model tables."""
+    from omnigent.llms.context_window import find_model_context_window
+
+    if os.environ.get("AP_CONTEXT_WINDOW_OVERRIDE") is not None:
+        override = find_model_context_window(model_enum)
+        return (
+            override
+            if isinstance(override, int) and not isinstance(override, bool) and override > 0
+            else None
+        )
+
+    entries = _catalog_entries_for_model(model_enum, catalog)
+    for _, entry in entries:
+        for field_name in _CATALOG_WINDOW_FIELDS:
+            raw_limit = entry.get(field_name)
+            if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0:
+                return raw_limit
+
+    candidates: list[str] = []
+
+    def _add_candidate(candidate: str) -> None:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    _add_candidate(model_enum)
+    for key, entry in entries:
+        if key:
+            _add_candidate(key)
+        display = entry.get("displayName")
+        if isinstance(display, str) and display:
+            for slug in _display_name_model_candidates(display):
+                _add_candidate(slug)
+    if " " in model_enum or "(" in model_enum:
+        for slug in _display_name_model_candidates(model_enum):
+            _add_candidate(slug)
+
+    for candidate in candidates:
+        window = find_model_context_window(candidate)
+        if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+            return window
+    return None
+
+
 def _resolve_display_name(model_enum: str, catalog: dict[str, object]) -> str:
     """
     Resolve a model enum to its human-readable ``displayName``.
@@ -377,16 +474,10 @@ def _resolve_display_name(model_enum: str, catalog: dict[str, object]) -> str:
     :returns: The ``displayName`` string, e.g. ``"Gemini 2.5 Flash"``, or the
         raw enum as a fallback.
     """
-    models = catalog.get("models")
-    if not isinstance(models, dict):
-        return model_enum
-    for entry in models.values():
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("model") == model_enum:
-            display = entry.get("displayName")
-            if isinstance(display, str) and display:
-                return display
+    for _, entry in _catalog_entries_for_model(model_enum, catalog):
+        display = entry.get("displayName")
+        if isinstance(display, str) and display:
+            return display
     return model_enum
 
 
@@ -1254,6 +1345,8 @@ class _ReaderState:
     :param model_catalog: Cached result of ``GetAvailableModels`` for this
         reader run (fetched once on first model-change detection; ``None``
         until needed).
+    :param model_context_windows: Cached context-window size (or ``None`` when
+        unknown) per agy model enum for this reader run.
     :param port: Validated connect-RPC port used for lazy catalog fetch.
     :param cumulative_input_tokens: Running session total of input tokens
         accumulated across all PLANNER_RESPONSE DONE steps this run. The server
@@ -1296,6 +1389,7 @@ class _ReaderState:
     turn_active: bool = False
     posted_model_enum: str | None = None
     model_catalog: dict[str, object] | None = None
+    model_context_windows: dict[str, int | None] = field(default_factory=dict)
     port: int = 0
     cumulative_input_tokens: int = 0
     cumulative_output_tokens: int = 0
@@ -2606,6 +2700,30 @@ async def _post_external_elicitation_resolved(
     )
 
 
+async def _resolve_model_context_window(
+    model_enum: str,
+    catalog: dict[str, object],
+    state: _ReaderState,
+) -> int | None:
+    """Resolve and cache ``model_enum``'s context window without blocking the loop."""
+    if model_enum not in state.model_context_windows:
+        try:
+            window = await asyncio.to_thread(_resolve_context_window_sync, model_enum, catalog)
+        except Exception:
+            _logger.warning(
+                "agy RPC reader: context-window lookup failed for %s",
+                model_enum,
+                exc_info=True,
+            )
+            return None
+        # Only cache a miss once GetAvailableModels succeeded so a transient
+        # catalog error on an early turn recovers on later turns.
+        if window is not None or state.model_catalog is not None:
+            state.model_context_windows[model_enum] = window
+        return window
+    return state.model_context_windows[model_enum]
+
+
 async def _maybe_emit_session_usage(
     step: dict[str, object],
     *,
@@ -2621,9 +2739,9 @@ async def _maybe_emit_session_usage(
     IS the new session total, and the server prices the per-turn delta as
     (new − old). agy's ``step.metadata.modelUsage`` fields are PER-MODEL-CALL
     (not cumulative), so we accumulate them in ``state`` and emit the running
-    totals. This matches codex's behaviour (``tokenUsage.total`` is a cumulative
-    thread-wide counter, forwarded as SET values by
-    :class:`~omnigent.harnesses.codex_native.forwarder._SessionUsageCoalescer`).
+    totals. ``context_tokens`` and ``context_window`` reflect the latest call's
+    active context fill so the web composer context ring tracks current window
+    occupancy.
 
     NOTE: ``state.cumulative_*`` accumulators are zeroed at reader-run start; a
     T-G /clear rotation rebinds with a fresh ``_ReaderState`` (``supervise_reader``
@@ -2646,7 +2764,7 @@ async def _maybe_emit_session_usage(
     def _int_field(d: dict[str, object], key: str) -> int:
         """Return ``d[key]`` as an int, or 0 when absent / not an int."""
         val = d.get(key, 0)
-        return val if isinstance(val, int) else 0
+        return val if isinstance(val, int) and not isinstance(val, bool) else 0
 
     # Accumulate per-call values into running session totals (SET semantics).
     state.cumulative_input_tokens += _int_field(per_call, "cumulative_input_tokens")
@@ -2654,13 +2772,17 @@ async def _maybe_emit_session_usage(
     state.cumulative_cache_read_input_tokens += _int_field(
         per_call, "cumulative_cache_read_input_tokens"
     )
-    # Resolve the raw model enum to a displayName if the catalog is available.
+    context_tokens = _int_field(per_call, "context_tokens")
+    # Resolve the raw model enum to a displayName and context window via catalog.
     model_enum = per_call.get("model")
     display_name: str | None = None
+    context_window: int | None = None
     if isinstance(model_enum, str) and model_enum:
         catalog = await _ensure_catalog(state)
         display_name = _resolve_display_name(model_enum, catalog)
-    # Build the cumulative payload (SET-semantics running totals).
+        context_window = await _resolve_model_context_window(model_enum, catalog, state)
+    # Build the usage payload: cumulative counters use SET running totals while
+    # context_tokens / context_window reflect the latest model call's occupancy.
     payload: dict[str, object] = {}
     if state.cumulative_input_tokens > 0:
         payload["cumulative_input_tokens"] = state.cumulative_input_tokens
@@ -2668,6 +2790,10 @@ async def _maybe_emit_session_usage(
         payload["cumulative_output_tokens"] = state.cumulative_output_tokens
     if state.cumulative_cache_read_input_tokens > 0:
         payload["cumulative_cache_read_input_tokens"] = state.cumulative_cache_read_input_tokens
+    if context_tokens > 0:
+        payload["context_tokens"] = context_tokens
+    if context_window is not None:
+        payload["context_window"] = context_window
     if display_name is not None:
         payload["model"] = display_name
     if not payload:
@@ -2733,9 +2859,8 @@ async def _ensure_catalog(state: _ReaderState) -> dict[str, object]:
     """
     Return the cached ``GetAvailableModels`` catalog, fetching it when needed.
 
-    Fetched at most once per reader run; stored in ``state.model_catalog``.
-    Falls back to an empty dict on error so a catalog failure never kills the
-    telemetry path (the display-name resolver falls back to the raw enum).
+    Cached once fetched successfully; transient errors return an empty dict
+    without poisoning the cache so later turns can retry once ``agy`` responds.
 
     :param state: Per-run shared trackers.
     :returns: The catalog dict (possibly empty on fetch failure).
@@ -2750,7 +2875,7 @@ async def _ensure_catalog(state: _ReaderState) -> dict[str, object]:
             "model display names will fall back to raw enums",
             exc_info=True,
         )
-        catalog = {}
+        return {}
     state.model_catalog = catalog
     return catalog
 
@@ -3126,11 +3251,15 @@ async def _rotate_session_for_cascade(
             raise RuntimeError(f"session {old_session_id!r} has no agent_id")
         runner_id = old.get("runner_id")
         raw_labels = old.get("labels")
-        labels = (
+        labels: dict[str, str] = (
             {str(key): str(value) for key, value in raw_labels.items()}
             if isinstance(raw_labels, dict)
             else {}
         )
+        # Drop per-conversation occupancy labels so a fresh /clear session
+        # starts empty instead of inheriting the prior conversation's ring.
+        labels.pop("omnigent.last_context_tokens", None)
+        labels.pop("omnigent.last_context_window", None)
         # Inherit the old session's bridge-id so the new session resolves to the
         # SAME bridge_dir; only fall back to stamping the old session id when the
         # label is somehow absent (keeps a deterministic, non-empty bridge id).
