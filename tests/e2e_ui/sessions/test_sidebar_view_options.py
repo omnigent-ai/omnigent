@@ -1,4 +1,4 @@
-"""Sidebar view options and the session tooltip's GitHub rows, with ``sidebar_grouping_ui`` on.
+"""Sidebar view options and the session tooltip's GitHub rows.
 
 The session list and GitHub resource are stubbed with ``page.route`` so the
 grouping is deterministic; everything else comes from the live server.
@@ -12,8 +12,6 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.sync_api import Locator, Page, Route, WebSocketRoute, expect
-
-from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
 
 _RUNNING = f"{1:032x}"
 _AWAITING = f"{2:032x}"
@@ -77,7 +75,6 @@ def _serve_sessions(route: Route) -> None:
 def stubbed_sidebar(page: Page, request: pytest.FixtureRequest) -> str:
     """Open the home page with the stubbed session list; return the base URL."""
     base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
-    enable_grouping_ui(page)
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", _serve_sessions)
     page.goto(base_url)
@@ -287,7 +284,6 @@ def test_tooltip_fetches_repo_and_pr_only_when_opened(
 
     # Register every route BEFORE navigating, so an eager fetch during mount is
     # counted — otherwise the empty-request assertion can't detect it.
-    enable_grouping_ui(page)
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", _serve_sessions)
     page.route("**/v1/sessions/*/resources/github*", serve_github)
@@ -318,10 +314,10 @@ def test_tooltip_fetches_repo_and_pr_only_when_opened(
     assert all(f"/v1/sessions/{_IDLE}/" in url for url in github_requests)
 
 
-def test_created_ordering_persists_and_flag_off_uses_updated(
+def test_created_ordering_persists_across_reload(
     page: Page, stubbed_sidebar: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The selected order reaches the API, survives reload, and is ignored with the flag off."""
+    """The selected order reaches the API and survives reload."""
     requests: list[str] = []
     page.on(
         "request",
@@ -370,13 +366,3 @@ def test_created_ordering_persists_and_flag_off_uses_updated(
     page.keyboard.press("Escape")
     page.reload()
     expect(links).to_have_text(["Idle session", "Awaiting session", "Running session"])
-    enable_grouping_ui(page, enabled=False)
-    requests.clear()
-    page.reload()
-    expect(links).to_have_text(["Idle session", "Running session", "Awaiting session"])
-    assert requests and all("sort_by=updated_at" in url for url in requests)
-    filter_button = page.get_by_role("button", name="Filter sessions", exact=True)
-    filter_button.hover()
-    expect(page.get_by_role("tooltip")).to_have_text("Filter sessions")
-    filter_button.click()
-    expect(page.get_by_test_id("session-ordering-menu")).to_have_count(0)

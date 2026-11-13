@@ -1,6 +1,6 @@
 /** Standard mounted Sidebar with a fresh query cache for each test; `setOpen` rerenders it. */
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -43,4 +43,26 @@ export function renderSidebar(
   );
   const view = render(tree(props.open ?? true));
   return { ...view, setOpen: (open: boolean) => view.rerender(tree(open)) };
+}
+
+/** Open the session filter funnel's Display submenu, which lists the filters. */
+export function openSessionFilters() {
+  fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+    button: 0,
+    ctrlKey: false,
+    pointerType: "mouse",
+  });
+  fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
+}
+
+/** Pick a session filter from the funnel. */
+export function selectSessionFilter(value: "all" | "mine" | "shared" | "archived") {
+  openSessionFilters();
+  fireEvent.click(screen.getByTestId(`session-filter-${value}`));
+}
+
+/** Enter selection mode from the Projects header, which selects every list together. */
+export function selectSessionsFromProjects() {
+  const projects = screen.getByRole("button", { name: "Projects" }).closest("section")!;
+  fireEvent.click(within(projects).getByTestId("toggle-selection-mode"));
 }

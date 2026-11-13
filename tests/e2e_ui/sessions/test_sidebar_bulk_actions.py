@@ -1,16 +1,15 @@
 """Browser e2e for bulk session actions in the sidebar.
 
-Selection is scoped: the ``data-testid="toggle-selection-mode"`` icon on the
-**Sessions** header selects the flat session list, while the Projects header
-kebab's "Select sessions" item (``data-testid="projects-select-sessions"``)
-selects the sessions nested inside project folders. Once active, each row in
-the targeted scope renders a leading checkbox (``SquareCheckIcon`` /
-``SquareIcon``) and clicking the row toggles selection instead of navigating.
+The ``data-testid="toggle-selection-mode"`` icon on the **Projects** header
+selects project folders, Shared and Sessions rows together (the Shared filter
+and grouped views put it on their first list instead). Once active, each row
+renders a leading checkbox (``SquareCheckIcon`` / ``SquareIcon``) and clicking
+the row toggles selection instead of navigating.
 
-A single-pill ``BulkActionBar`` renders directly under the header of the
-targeted section: an Exit (X) button, an "N selected" count, and icon-only
-Archive + Delete actions (Archive shows by default but is disabled until an
-archivable session is selected; Delete likewise).
+A single-pill ``BulkActionBar`` renders directly under that header: an Exit
+(X) button, an "N selected" count, and icon-only Archive + Delete actions
+(Archive shows by default but is disabled until an archivable session is
+selected; Delete likewise).
 
 These tests drive the full round-trip: enter selection mode → select
 sessions → perform a bulk action → verify the server-side effect is
@@ -25,12 +24,13 @@ import uuid
 import httpx
 from playwright.sync_api import Locator, Page, expect
 
-from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
+from tests.e2e_ui.sessions._sidebar_helpers import open_session_filters
 
 # Longer than the tooltip's 600 ms hover delay (TooltipProvider in
 # web/src/components/ui/tooltip.tsx) and the 600 ms menu-close guard
 # (web/src/hooks/useMenuGuardedTooltip.ts), so a late tooltip cannot slip past.
 TOOLTIP_SETTLE_MS = 1000
+_FILTER_LABEL = "Group, sort, and filter sessions"
 
 
 def _row_link(page: Page, title: str) -> Locator:
@@ -64,48 +64,48 @@ def test_session_header_action_visibility(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Filter stays visible while Select reveals on hover or keyboard focus."""
+    """The Projects header's filter stays visible while Select reveals on hover or focus."""
     base_url, session_id = seeded_session
     title = f"e2e-header-actions-{uuid.uuid4().hex[:8]}"
-    # The Sessions-header filter button exists only with sidebar_grouping_ui off.
-    enable_grouping_ui(page, enabled=False)
     _set_title(base_url, session_id, title)
 
     page.set_viewport_size({"width": 1280, "height": 800})
     page.goto(f"{base_url}/c/{session_id}")
 
     expect(_row_link(page, title)).to_be_visible()
-    sessions_header = page.get_by_role("button", name="Sessions", exact=True)
-    filter_sessions = page.get_by_role("button", name="Filter sessions")
-    new_session = page.get_by_test_id("sessions-new-session")
+    projects_header = page.get_by_role("button", name="Projects", exact=True)
+    filter_sessions = page.get_by_role("button", name=_FILTER_LABEL)
     select_sessions = page.get_by_test_id("toggle-selection-mode")
-    actions_wrapper = select_sessions.locator("..").locator("..")
+    actions_wrapper = select_sessions.locator(
+        "xpath=ancestor::*[contains(@class, 'md:opacity-0')][1]"
+    )
 
     expect(filter_sessions).to_be_visible()
     expect(filter_sessions).to_have_css("opacity", "1")
     expect(actions_wrapper).to_have_css("opacity", "0")
 
     filter_sessions.hover()
-    expect(page.get_by_role("tooltip")).to_have_text("Filter sessions")
+    expect(page.get_by_role("tooltip")).to_have_text(_FILTER_LABEL)
     page.mouse.move(800, 700)
     expect(actions_wrapper).to_have_css("opacity", "0")
 
-    sessions_header.hover()
+    projects_header.hover()
     expect(actions_wrapper).to_have_css("opacity", "1")
 
     page.mouse.move(800, 700)
     expect(actions_wrapper).to_have_css("opacity", "0")
-    sessions_header.focus()
-    page.keyboard.press("Tab")
-    expect(new_session).to_be_focused()
-    expect(actions_wrapper).to_have_css("opacity", "1")
-    page.keyboard.press("Tab")
+    projects_header.focus()
+    for _ in range(6):
+        page.keyboard.press("Tab")
+        if select_sessions.evaluate("element => element === document.activeElement"):
+            break
     expect(select_sessions).to_be_focused()
+    expect(actions_wrapper).to_have_css("opacity", "1")
 
     select_sessions.click()
     expect(page.get_by_role("button", name="Exit selection mode")).to_be_visible()
     expect(filter_sessions).to_be_visible()
-    filter_sessions.click()
+    open_session_filters(page)
     expect(page.get_by_test_id("session-filter-all")).to_be_visible()
 
 
@@ -116,17 +116,15 @@ def test_filter_tooltip_stays_hidden_after_choosing_an_option(
     """Choosing a filter option closes the menu without the icon's tooltip appearing."""
     base_url, session_id = seeded_session
     title = f"e2e-filter-tooltip-{uuid.uuid4().hex[:8]}"
-    # The Sessions-header filter button exists only with sidebar_grouping_ui off.
-    enable_grouping_ui(page, enabled=False)
     _set_title(base_url, session_id, title)
 
     page.set_viewport_size({"width": 1280, "height": 800})
     page.goto(f"{base_url}/c/{session_id}")
     expect(_row_link(page, title)).to_be_visible()
 
-    filter_sessions = page.get_by_role("button", name="Filter sessions")
+    filter_sessions = page.get_by_role("button", name=_FILTER_LABEL)
     tooltip = page.get_by_role("tooltip")
-    filter_sessions.click()
+    open_session_filters(page)
     all_option = page.get_by_test_id("session-filter-all")
     expect(all_option).to_be_visible()
     all_option.click()
@@ -137,7 +135,7 @@ def test_filter_tooltip_stays_hidden_after_choosing_an_option(
     expect(tooltip).to_have_count(0)
 
     filter_sessions.hover()
-    expect(tooltip).to_have_text("Filter sessions")
+    expect(tooltip).to_have_text(_FILTER_LABEL)
 
 
 def test_bulk_archive_moves_session_to_archived(

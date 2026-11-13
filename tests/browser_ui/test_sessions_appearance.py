@@ -86,7 +86,6 @@ def test_custom_order_keeps_the_list_and_commits_on_drop(
     browser_contract: BrowserContract,
 ) -> None:
     """Custom keeps the Updated list, moves a row only on drop, and adds new sessions above."""
-    appearance_features["sidebar_grouping_ui"] = True
     sessions = [
         {
             "id": f"{index + 1:032x}",
@@ -182,19 +181,12 @@ def test_custom_order_keeps_the_list_and_commits_on_drop(
     page.reload()
     expect(rows).to_have_text([*titles("New session"), *custom])
 
-    appearance_features["sidebar_grouping_ui"] = False
-    page.reload()
-    expect(rows).to_have_text(
-        titles("New session", "Quiet session", "Busy session", "Recent session")
-    )
-
 
 @pytest.mark.parametrize("in_project", [False, True], ids=["sessions", "project"])
 @pytest.mark.parametrize("show_harness", [False, True], ids=["titles-only", "harness-icons"])
 def test_family_chevron_keeps_top_level_rows_in_one_column(
     page: Page,
     appearance_url: str,
-    appearance_features: dict[str, bool],
     browser_contract: BrowserContract,
     in_project: bool,
     show_harness: bool,
@@ -202,7 +194,6 @@ def test_family_chevron_keeps_top_level_rows_in_one_column(
     """Top-level rows share one column; the in-row chevron aligns a parent with its members."""
     project = "Example project"
     if show_harness:
-        appearance_features["sidebar_grouping_ui"] = True
         page.add_init_script(
             "localStorage.setItem('omnigent:sidebar-view', JSON.stringify("
             "{grouping: 'default', ordering: 'updated', show: ['harness']}))"

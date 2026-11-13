@@ -1,5 +1,9 @@
 import { conversationPage } from "@/test/sidebarMockHelpers";
-import { renderSidebar } from "@/test/sidebarTestHelpers";
+import {
+  renderSidebar,
+  selectSessionFilter,
+  selectSessionsFromProjects,
+} from "@/test/sidebarTestHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -176,11 +180,7 @@ describe("Sidebar shift-click selection", () => {
       );
 
       if (project) {
-        fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
-          button: 0,
-          ctrlKey: false,
-        });
-        fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+        selectSessionsFromProjects();
       } else {
         fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
       }
@@ -258,7 +258,7 @@ describe("Sidebar shift-click selection", () => {
     });
   });
 
-  it("selects sessions within projects (not the flat list) from the Projects kebab", async () => {
+  it("shift-selects a range of project sessions from the Projects header", async () => {
     // Project "Alpha" has 3 sessions; the flat list has 2 unfiled chats.
     projectsMock.push("Alpha");
     const sessions = [
@@ -270,16 +270,12 @@ describe("Sidebar shift-click selection", () => {
     ];
     mockConversations(sessions);
     // Selection mode preserves the current expansion; seed Alpha expanded so
-    // its sessions are visible (the kebab no longer auto-expands folders).
+    // its sessions are visible.
     localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
     renderSidebar();
 
-    // Enter selection mode via the Projects header kebab → project scope.
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    // Enter selection mode from the Projects header.
+    selectSessionsFromProjects();
 
     // Shift-select across the project sessions: p1 anchor → p3 selects p1..p3.
     fireEvent.click(await screen.findByRole("link", { name: "p1" }));
@@ -287,11 +283,6 @@ describe("Sidebar shift-click selection", () => {
     await waitFor(() => {
       expect(screen.getByText("3 selected")).toBeInTheDocument();
     });
-
-    // A flat-list chat is NOT selectable in project scope: clicking it does not
-    // grow the selection (it has no checkbox and its link stays a navigation).
-    fireEvent.click(screen.getByRole("link", { name: "c1" }), { shiftKey: true });
-    expect(screen.getByText("3 selected")).toBeInTheDocument();
   });
 
   it("resolves a folder session outside the global window for shift-select AND bulk archive", async () => {
@@ -315,11 +306,7 @@ describe("Sidebar shift-click selection", () => {
     localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
     renderSidebar();
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    selectSessionsFromProjects();
 
     // Shift-select p1 → p3: the range must span all three (including the
     // out-of-window p3), not collapse to a single toggle.
@@ -360,11 +347,7 @@ describe("Sidebar shift-click selection", () => {
       );
       renderSidebar();
 
-      fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
-        button: 0,
-        ctrlKey: false,
-      });
-      fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+      selectSessionsFromProjects();
       fireEvent.click(await screen.findByRole("link", { name: "a0" }));
       fireEvent.click(screen.getByRole("link", { name: "b0" }), { shiftKey: true });
 
@@ -397,11 +380,7 @@ describe("Sidebar shift-click selection", () => {
     fireEvent.click(screen.getByRole("button", { name: "Beta" }));
     expect(screen.queryByRole("link", { name: "b0" })).toBeNull();
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    selectSessionsFromProjects();
     fireEvent.click(await screen.findByRole("link", { name: "a0" }));
     fireEvent.click(screen.getByRole("link", { name: "g0" }), { shiftKey: true });
     await waitFor(() => {
@@ -425,11 +404,7 @@ describe("Sidebar shift-click selection", () => {
     localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Alpha"]));
     renderSidebar();
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    selectSessionsFromProjects();
     fireEvent.click(await screen.findByRole("link", { name: "a4" }));
     // A newer session lands on top; the next render pushes a4 behind Show more.
     projectSessionsMock.current["Alpha"] = [filed("a_new", 200), ...rows];
@@ -508,12 +483,7 @@ describe("Sidebar shift-click selection", () => {
 
     // Mixed ownership only shows on "All sessions"; the default "My sessions"
     // filter hides the shared row, so switch to All before selecting.
-    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
-      button: 0,
-      ctrlKey: false,
-      pointerType: "mouse",
-    });
-    fireEvent.click(screen.getByTestId("session-filter-all"));
+    selectSessionFilter("all");
 
     fireEvent.click(screen.getByRole("button", { name: /select/i }));
 

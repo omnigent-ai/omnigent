@@ -1,4 +1,4 @@
-import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { renderSidebar, selectSessionFilter } from "@/test/sidebarTestHelpers";
 import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -47,12 +47,7 @@ function mockConversations(conversations: Conversation[]) {
 /** Pick a scope from the Sessions heading's filter menu. */
 function switchTo(testId: "sidebar-tab-mine" | "sidebar-tab-shared") {
   const value = testId === "sidebar-tab-mine" ? "mine" : "shared";
-  fireEvent.pointerDown(screen.getByTestId("session-filter"), {
-    button: 0,
-    ctrlKey: false,
-    pointerType: "mouse",
-  });
-  fireEvent.click(screen.getByTestId(`session-filter-${value}`));
+  selectSessionFilter(value);
 }
 
 beforeEach(() => {

@@ -115,7 +115,7 @@ describe("bulk-action bar layout", () => {
   });
 
   it.each([
-    ["session-filter", "Filter sessions"],
+    ["session-filter", "Group, sort, and filter sessions"],
     ["toggle-selection-mode", "Exit selection"],
     ["bulk-mark-unread", "Mark as unread"],
     ["bulk-archive", "Archive"],
@@ -152,8 +152,11 @@ describe("bulk-action bar layout", () => {
   const menuTooltipCases: [string, string, (menu: HTMLElement) => void][] = [
     [
       "session-filter",
-      "Filter sessions",
-      () => fireEvent.click(screen.getByTestId("session-filter-all")),
+      "Group, sort, and filter sessions",
+      () => {
+        fireEvent.keyDown(screen.getByTestId("session-display-menu"), { key: "ArrowRight" });
+        fireEvent.click(screen.getByTestId("session-filter-all"));
+      },
     ],
     [
       "bulk-move-to-project",

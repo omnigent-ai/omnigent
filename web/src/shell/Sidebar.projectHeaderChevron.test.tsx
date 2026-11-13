@@ -141,7 +141,7 @@ describe("project folder header icon/chevron", () => {
     expect(newSession.querySelector("svg")).toHaveClass("text-muted-foreground");
   });
 
-  it("shows a left-aligned empty-project message and new-session action", () => {
+  it("shows a centered empty-project message and new-session action", () => {
     renderSidebar();
     fireEvent.click(headerButton("My Project"));
 
@@ -161,7 +161,8 @@ describe("project folder header icon/chevron", () => {
       "md:py-1",
       "justify-center",
       "rounded-[var(--radius-otto-button)]",
-      "text-left",
+      "items-center",
+      "text-center",
       "text-muted-foreground",
     );
     expect(empty).not.toHaveClass(
@@ -169,8 +170,7 @@ describe("project folder header icon/chevron", () => {
       "mr-2",
       "border",
       "border-dashed",
-      "items-center",
-      "text-center",
+      "text-left",
       "px-0",
       "pb-2",
       "md:pb-2",

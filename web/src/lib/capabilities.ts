@@ -61,7 +61,6 @@ export type FeatureKey =
   | "harness_install"
   | "canvas"
   | "import_review"
-  | "sidebar_grouping_ui"
   | "workspace_content_search"
   | "grid_sessions_display_ui"
   | "automations_v2"
