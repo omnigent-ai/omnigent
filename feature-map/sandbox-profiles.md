@@ -81,6 +81,9 @@ integration evidence separately; the browser test does not exercise them.
   authorized and saved like an explicit pick. `GET /v1/sandbox-profiles` reports it as
   `default_profile_ids`, and the composer and fork dialog preselect it when nothing else
   is chosen.
+- The composer starts on the profile last picked on that provider (saved on pick, per
+  provider in `localStorage`), resolved by id on its current revision, ahead of the
+  default. A profile the provider no longer lists falls back to the default.
 - Discovery is scoped to the selected provider so unrelated outages do not block
   ordinary launches. Listing is advisory; the server reauthorizes selection.
 - A stale or revoked choice requires explicit reselection. Saved sessions cannot
@@ -102,6 +105,13 @@ integration evidence separately; the browser test does not exercise them.
   so it keeps the source's `omnigent.sandbox.*` labels: a relaunch re-clones
   the same repositories and routes by the same host id. No history or files
   are copied, and a fork that cannot be bound is deleted again.
+  claude-sdk and Claude Code native `/rewind` continue the same way, in a fork
+  holding the history before the chosen prompt and the source's files. Both
+  reauthorize the source's accepted profile on the continuation, so with no
+  live runner it still wakes the sandbox after the source is deleted; a
+  profile revoked since it was accepted refuses the command with a 403 and
+  leaves no continuation
+  (`tests/server/integration/test_sandbox_profile_launch.py::test_offline_clear_continuation_keeps_the_accepted_profile`).
 - Missing sandboxes use the bound session's reference for replacement. Legacy host
   recovery rejects histories over 200 sessions; use controller lookup for larger
   histories. Runner-host discovery and reconnect liveness have a separate limit

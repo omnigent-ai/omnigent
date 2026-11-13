@@ -983,10 +983,20 @@ async def test_provider_attribution_probes_only_when_codex_may_pick_the_provider
 ) -> None:
     from omnigent.harnesses.codex_native import app_server
 
+    codex_home = tmp_path / "home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    monkeypatch.setattr(
+        "omnigent.databricks_ai_gateway.DATABRICKS_TRUSTED_HOST_SUFFIXES", (".example.test",)
+    )
+    config_path.write_text(
+        '[model_providers.inactive_gateway]\nname = ""\n'
+        'base_url = "https://gateway.example.test/ai-gateway/codex/v1"\n'
+    )
     started = AsyncMock(side_effect=OSError("probe started"))
     monkeypatch.setattr(app_server, "_start_codex_model_discovery_process", started)
     result = await app_server.prepare_codex_provider_config(
-        tmp_path / "home",
+        codex_home,
         overrides,
         codex_path="/codex",
         cwd=tmp_path,
@@ -995,3 +1005,7 @@ async def test_provider_attribution_probes_only_when_codex_may_pick_the_provider
     )
     assert result == overrides
     assert started.await_count == int(probed)
+    assert (
+        tomllib.loads(config_path.read_text())["model_providers"]["inactive_gateway"]["name"]
+        == "inactive_gateway"
+    )

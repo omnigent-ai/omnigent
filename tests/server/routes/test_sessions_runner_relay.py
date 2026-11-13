@@ -186,6 +186,7 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     assert request.method == "GET"
     assert request.url.path == "/v1/sessions/a7f039e9f1311474878eb7d4699c1013/stream"
     assert request.url.params["accepts_inferred_status"] == "true"
+    assert request.url.params["accepts_input_only_failures"] == "true"
     assert SCHEDULED_RUN_HEADER not in request.headers
 
 
@@ -3628,6 +3629,80 @@ async def test_offline_sweep_preserves_cause_when_session_rebound_mid_sweep(
     finally:
         session_live_state.configure(None)
         sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("snapshot_age", "current_age", "transferred"),
+    [
+        (60, 0, True),
+        (None, 0, True),
+        (0, 0, False),
+        (3600, 1800, False),
+        (60, None, False),
+    ],
+    ids=["renewed", "first-heartbeat", "unchanged", "expired-renewal", "cleared"],
+)
+async def test_offline_sweep_preserves_runner_renewed_on_another_replica(
+    db_uri: str,
+    snapshot_age: int | None,
+    current_age: int | None,
+    transferred: bool,
+) -> None:
+    """A fresh heartbeat after the sweep snapshot belongs to the adopting replica."""
+    import time
+
+    from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runner_id = "runner-remote-renewal"
+    conv = store.create_conversation(runner_id=runner_id)
+    store.set_session_live_status(conv.id, "running")
+    now = int(time.time())
+    if snapshot_age is not None:
+        store.touch_runner_liveness([runner_id], now=now - snapshot_age)
+    snapshot = store.get_conversation(conv.id)
+    assert snapshot is not None
+    # Another replica's connection leaves this replica's caches unchanged.
+    if current_age is None:
+        store.clear_runner_liveness(runner_id)
+    else:
+        store.touch_runner_liveness([runner_id], now=now - current_age)
+    sessions_module._session_status_cache[conv.id] = "running"
+    sessions_module._session_active_response_cache[conv.id] = "response-remote-renewal"
+    session_live_state.configure(store)
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [snapshot],
+                ErrorDetail(
+                    code="runner_disconnected", message="Runner disconnected unexpectedly."
+                ),
+                store,
+            )
+            session_live_state.submit("drain", lambda: None).result(timeout=10)
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        failures = [row for row in rows if row["event_name"] == "session_turn_failed"]
+        if transferred:
+            assert refreshed.live_status == "running"
+            assert sessions_module._last_task_error_from_labels(refreshed.labels) is None
+            assert conv.id not in sessions_module._session_status_cache
+            assert conv.id not in sessions_module._session_active_response_cache
+            assert not failures
+        else:
+            assert refreshed.live_status == "failed"
+            assert sessions_module._session_status_cache.get(conv.id) == "failed"
+            assert sessions_module._last_task_error_from_labels(refreshed.labels) is not None
+            assert len(failures) == 1
+    finally:
+        session_live_state.configure(None)
+        sessions_module._session_status_cache.pop(conv.id, None)
+        sessions_module._session_active_response_cache.pop(conv.id, None)
         session_stream.close(conv.id)
 
 

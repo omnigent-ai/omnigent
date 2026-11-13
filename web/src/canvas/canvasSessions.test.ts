@@ -85,6 +85,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
   vi.useRealTimers();
 });
 
@@ -372,8 +373,8 @@ describe("useCanvasSessions", () => {
     );
     expect(keys).toEqual(
       expect.arrayContaining([
-        expect.stringMatching(/:server-a:me$/),
-        expect.stringMatching(/:server-b:me$/),
+        expect.stringMatching(/:server-a:me:true$/),
+        expect.stringMatching(/:server-b:me:true$/),
       ]),
     );
   });
@@ -438,9 +439,10 @@ describe("useCanvasSessions", () => {
     });
   });
 
-  it("waits for identity before restoring only owned rows from a legacy reload cache", async () => {
+  it.each([true, false])("restores owned rows only for matching view %s", async (enabled) => {
+    if (!enabled) document.cookie = "omnigent_admin_view=off; Path=/";
     window.sessionStorage.setItem(
-      "omnigent:canvas-sessions:server-a:me",
+      "omnigent:canvas-sessions:server-a:me:true",
       JSON.stringify({
         version: 1,
         sessions: [
@@ -463,13 +465,18 @@ describe("useCanvasSessions", () => {
     });
 
     // Do not flash the short preview while the persisted cache's viewer resolves.
-    expect(reloaded.result.current).toMatchObject({ sessions: [], loaded: false });
+    expect(reloaded.result.current.sessions.map((row) => row.id)).toEqual(
+      enabled ? [] : ["preview"],
+    );
+    expect(reloaded.result.current.loaded).toBe(!enabled);
     await waitFor(() =>
-      expect(reloaded.result.current.sessions.map((row) => row.id)).toEqual(["a", "b"]),
+      expect(reloaded.result.current.sessions.map((row) => row.id)).toEqual(
+        enabled ? ["a", "b"] : ["preview"],
+      ),
     );
     expect(reloaded.result.current).toMatchObject({
       loaded: true,
-      complete: true,
+      complete: enabled,
       networkConfirmed: false,
     });
   });
@@ -501,7 +508,7 @@ describe("useCanvasSessions", () => {
       window.sessionStorage.key(index),
     );
     expect(keys).toHaveLength(1);
-    expect(keys[0]).toMatch(/:me$/);
+    expect(keys[0]).toMatch(/:me:true$/);
     expect(keys[0]).not.toContain(":anonymous");
   });
 

@@ -65,11 +65,16 @@ from omnigent.server.scheduled.harness_settings import (
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.telemetry import log_task_created
+from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
 from omnigent.server.session_orchestration import require_owned_session
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
-from omnigent.stores.scheduled_task_store import AutomationFailure, ScheduledTaskStore
+from omnigent.stores.scheduled_task_store import (
+    AutomationFailure,
+    ScheduledTaskStore,
+    encode_mcp_services,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -87,7 +92,7 @@ _SOURCE_SESSION_CONTINUE_MSG = (
 )
 # A continued session cannot follow a change to these, so the next run starts a new one.
 _SESSION_BOUND_FIELDS = frozenset(
-    {"agent_id", "host_id", "workspace", "base_branch", "execution_target"}
+    {"agent_id", "host_id", "workspace", "base_branch", "execution_target", "mcp_services"}
 )
 
 
@@ -112,6 +117,9 @@ class CreateScheduledTaskRequest(BaseModel):
     reasoning_effort: str | None = None
     # Native-harness permission or execution mode; validated against the agent.
     permission_mode: str | None = None
+    # MCP services every session the task creates starts with, as the
+    # deployment's service names; validated against the owner's connections.
+    mcp_services: list[str] = Field(default_factory=list, max_length=MAX_SESSION_MCP_SERVICES)
     max_cost_usd: float | None = Field(default=None, gt=0)
     # "continue" sends every run's prompt into one session: ``session_id`` when
     # given, else the session the first run creates.
@@ -163,6 +171,8 @@ class UpdateScheduledTaskRequest(BaseModel):
     model_override: str | None = None
     reasoning_effort: str | None = None
     permission_mode: str | None = None
+    # Replaces the task's MCP services; [] clears them.
+    mcp_services: list[str] | None = Field(default=None, max_length=MAX_SESSION_MCP_SERVICES)
     max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
     session_mode: Literal["new", "continue"] | None = None
     # Null makes a continue-mode task's next run start a new session.
@@ -244,6 +254,7 @@ def _to_response(
         "model_override": task.model_override,
         "reasoning_effort": task.reasoning_effort,
         "permission_mode": task.permission_mode,
+        "mcp_services": list(task.mcp_services),
         "max_cost_usd": task.max_cost_usd,
         "session_mode": task.session_mode,
         "session_id": task.session_id,
@@ -262,6 +273,11 @@ def _to_response(
     }
 
 
+# Bounds each run's free-text failure detail in run lists; the session transcript
+# keeps the same cap for a launch failure's reason.
+_RUN_ERROR_DETAIL_MAX_CHARS = 1000
+
+
 def _run_to_response(
     run: ScheduledTaskRun,
     *,
@@ -274,8 +290,10 @@ def _run_to_response(
 ) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
 
-    Excludes the free-text ``error`` blob (never SQL-queried, potentially
-    large); ``error_code`` carries the queryable failure classification.
+    ``error_code`` carries the queryable failure classification. The free-text
+    ``error`` is sent as ``error_detail``, capped at
+    :data:`_RUN_ERROR_DETAIL_MAX_CHARS`, so the run list can say why a run failed,
+    e.g. the sandbox provider's recovery steps for a sandbox that never connected.
 
     :param conversation_updated_at: The conversation's ``updated_at`` epoch
         seconds, or ``None`` for runs without a conversation. Embedded so the
@@ -304,6 +322,7 @@ def _run_to_response(
         "fired_at": run.fired_at,
         "finished_at": run.finished_at,
         "error_code": run.error_code,
+        "error_detail": run.error[:_RUN_ERROR_DETAIL_MAX_CHARS] if run.error else None,
         "conversation_updated_at": conversation_updated_at,
         "conversation_status": conversation_status,
         "viewer_last_seen": viewer_last_seen,
@@ -593,6 +612,34 @@ def create_scheduled_tasks_router(
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
 
+    async def _validated_mcp_services(
+        request: Request, services: list[str], agent: Agent, owner: str
+    ) -> tuple[str, ...]:
+        """Check *services* with the deployment's session MCP selection."""
+        if not services:
+            return ()
+        spec = None
+        if agent_cache is not None:
+            try:
+                spec = (
+                    await asyncio.to_thread(
+                        agent_cache.load,
+                        agent.id,
+                        agent.bundle_location,
+                        expand_env=agent.operator_authored,
+                    )
+                ).spec
+            except (KeyError, AttributeError, ValueError, ImportError, OSError):
+                # The fire path reports an unloadable agent; skip only the spec check.
+                spec = None
+        selection = session_mcp_selection(request.app.state)
+        validated = await asyncio.to_thread(
+            selection.validate, request, services, spec=spec, user_id=owner
+        )
+        # Rejects a list too long for the column before anything is written.
+        encode_mcp_services(validated)
+        return validated
+
     async def _require_continuable(request: Request, task: ScheduledTask) -> Conversation:
         """Return a picked session *task* can continue; reject it otherwise, hiding one
         the owner cannot see."""
@@ -615,6 +662,24 @@ def create_scheduled_tasks_router(
         raise OmnigentError(
             f"cannot continue this session: {reason}", code=ErrorCode.INVALID_INPUT
         )
+
+    def _require_mcp_services_fit_session(
+        request: Request, session: Conversation, services: tuple[str, ...]
+    ) -> None:
+        """Reject saved *services* the continued *session* does not run.
+
+        Continuing reuses the session as it is, so a run could not add them. An
+        empty selection asks for nothing beyond what the session already has.
+        """
+        if not services:
+            return
+        running = session_mcp_selection(request.app.state).selected_services(session.labels)
+        if set(services) != set(running):
+            raise OmnigentError(
+                "The picked session runs different MCP services. Select the ones it "
+                "runs, or start a new session on every run.",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
     async def _require_source_session(source_id: str, owner: str) -> tuple[Conversation, str]:
         """A session *owner* can start an automation from, hiding one they can't see.
@@ -870,6 +935,7 @@ def create_scheduled_tasks_router(
         source: Conversation | None = None
         source_up_to = ""
         carry = False
+        mcp_services = await _validated_mcp_services(request, body.mcp_services, agent, owner)
         if body.session_id is not None:
             # A picked session keeps the agent it runs, so the task takes no copy.
             bound = agent
@@ -893,6 +959,7 @@ def create_scheduled_tasks_router(
                     session_id=body.session_id,
                 ),
             )
+            _require_mcp_services_fit_session(request, picked, mcp_services)
             # The session cannot move, so the task routes every run to its host.
             if host_id is None and body.execution_target != "managed_sandbox":
                 host_id = picked.host_id
@@ -931,6 +998,7 @@ def create_scheduled_tasks_router(
                 model_override=model_override,
                 reasoning_effort=reasoning_effort,
                 permission_mode=permission_mode,
+                mcp_services=mcp_services,
                 max_cost_usd=body.max_cost_usd,
                 session_mode=body.session_mode,
                 session_id=body.session_id,
@@ -1232,6 +1300,8 @@ def create_scheduled_tasks_router(
         fields = body.model_dump(exclude_unset=True)
         if fields.get("session_mode") is None:
             fields.pop("session_mode", None)
+        if fields.get("mcp_services") is None:
+            fields.pop("mcp_services", None)
         target_session_mode = fields.get("session_mode", existing.session_mode)
         target_execution = fields.get("execution_target") or existing.execution_target
         if body.rrule is not None or {"session_mode", "execution_target"}.intersection(fields):
@@ -1284,6 +1354,21 @@ def create_scheduled_tasks_router(
                     agent=agent,
                     agent_cache=agent_cache,
                 )
+        if "mcp_services" in fields or (agent_changed and existing.mcp_services):
+            # A rebound agent must still accept the services the task keeps.
+            mcp_agent = await validate_session_agent(
+                user_id=owner_id,
+                agent_id=target_agent_id,
+                agent_store=agent_store,
+                permission_store=permission_store,
+                conversation_store=conversation_store,
+            )
+            fields["mcp_services"] = await _validated_mcp_services(
+                request,
+                list(fields.get("mcp_services", existing.mcp_services)),
+                mcp_agent,
+                owner,
+            )
         switching_to_managed = target_execution == "managed_sandbox"
         if not switching_to_managed and "workspace" in fields and fields["workspace"] is None:
             # Target-dependent validation retains the schema's original 422 response.
@@ -1373,6 +1458,9 @@ def create_scheduled_tasks_router(
         )
         if fields.get("session_id") is not None:
             picked = await _require_continuable(request, continuing)
+            _require_mcp_services_fit_session(
+                request, picked, fields.get("mcp_services", existing.mcp_services)
+            )
             # The session cannot move, so the task routes every run to its host.
             if (
                 fields.get("host_id", existing.host_id) is None

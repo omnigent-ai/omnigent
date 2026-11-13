@@ -50,6 +50,7 @@ from omnigent.cli_config import (
     _credential_label,
     _isolated_databricks_cfg,
     _print_credentials_by_harness,
+    _repair_invalid_provider_entries,
     _run_configure_databricks,
     _run_configure_harnesses_interactive,
     _warn_missing_harness_dependencies,
@@ -12333,8 +12334,8 @@ def setup(internal_beta: bool) -> None:
         return
 
     # --no-internal-beta: validate existing providers before entering the
-    # picker so malformed user config is reported as an actionable CLI error,
-    # not an application crash from the picker's ambient-adoption step.
+    # picker. Interactive runs can repair or remove malformed entries; other runs
+    # get an actionable CLI error, not a crash from the picker's ambient adoption.
     from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.onboarding.provider_config import load_providers
 
@@ -12343,8 +12344,11 @@ def setup(internal_beta: bool) -> None:
     except OmnigentError as exc:
         if exc.code != ErrorCode.INVALID_INPUT:
             raise
-        path = _display_config_path(_effective_global_config_path())
-        raise click.ClickException(f"Invalid provider configuration in {path}: {exc}") from None
+        if not (_stdin_is_tty() and _repair_invalid_provider_entries()):
+            path = _display_config_path(_effective_global_config_path())
+            raise click.ClickException(
+                f"Invalid provider configuration in {path}: {exc}"
+            ) from None
 
     # The picker warns about missing Node/tmux itself, configures
     # providers/defaults, and returns; the user then starts a session with
