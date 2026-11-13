@@ -491,10 +491,10 @@ _SEND_KEYS_LITERAL_CHARS_PER_CALL = 1024
 # resets it), so idle/exit edges can be reported up to one backed-off interval late.
 _IDLE_POLL_BACKOFF_AFTER_SECONDS = 2.0
 _IDLE_POLL_BACKOFF_FACTOR = 2.0
-# Cap growth per watcher relative to its base so the fast claude-native watcher
-# (0.2s base) tops out well below the generic ceiling.
+# Growth stops at the lesser of this multiple of the base and the global cap, so
+# every watcher's quiet interval tops out at the same 2s.
 _IDLE_POLL_BACKOFF_MAX_MULTIPLE = 10.0
-_IDLE_POLL_MAX_INTERVAL_SECONDS = 5.0
+_IDLE_POLL_MAX_INTERVAL_SECONDS = 2.0
 
 # Hold the base cadence this long after an output-expecting wake (a turn
 # starting) so the setup lull before the first output does not immediately

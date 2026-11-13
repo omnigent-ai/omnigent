@@ -1303,11 +1303,9 @@ class _StubDetector:
 
 def test_next_idle_poll_interval_grows_toward_capped_ceiling() -> None:
     """Backoff grows geometrically but never past the per-base ceiling."""
-    # Generic 1s base: the absolute 5s cap bounds growth.
+    # Generic 1s base: the global 2s cap bounds growth.
     assert terminal_mod._next_idle_poll_interval(1.0, 1.0) == 2.0
-    assert terminal_mod._next_idle_poll_interval(2.0, 1.0) == 4.0
-    assert terminal_mod._next_idle_poll_interval(4.0, 1.0) == 5.0
-    assert terminal_mod._next_idle_poll_interval(5.0, 1.0) == 5.0
+    assert terminal_mod._next_idle_poll_interval(2.0, 1.0) == 2.0
     # Fast 0.2s claude-native base: base * max-multiple (2s) bounds growth.
     assert terminal_mod._next_idle_poll_interval(0.2, 0.2) == pytest.approx(0.4)
     assert terminal_mod._next_idle_poll_interval(1.6, 0.2) == pytest.approx(2.0)
@@ -1389,11 +1387,11 @@ def test_next_watch_interval_backs_off_only_when_fully_quiet(
             "now": 100.0,
         }
         base.update(kwargs)
-        return instance._next_watch_interval(4.0, 1.0, **base)  # type: ignore[arg-type]
+        return instance._next_watch_interval(1.0, 1.0, **base)  # type: ignore[arg-type]
 
-    # Fully quiet and allowed → grows one step.
-    assert interval() == 5.0
-    assert interval(backoff_allowed=lambda: True) == 5.0
+    # Fully quiet and allowed → grows one step, capped at the global 2s.
+    assert interval() == 2.0
+    assert interval(backoff_allowed=lambda: True) == 2.0
     # Any "not idle" signal pins the base cadence.
     assert interval(detector=_StubDetector(changed=True, quiescent=True)) == 1.0
     assert interval(detector=_StubDetector(changed=False, quiescent=False)) == 1.0
