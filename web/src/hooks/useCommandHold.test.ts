@@ -6,7 +6,9 @@ import {
   useCommandHoldTracking,
 } from "./useCommandHold";
 
-type Modifiers = Partial<Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey">>;
+type Modifiers = Partial<
+  Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "repeat">
+>;
 
 /** Mounts the tracker and reads `held` through a subscriber, as the sidebar hints do. */
 function renderTracking(isMac: boolean, altJoinsHold = true) {
@@ -233,6 +235,24 @@ describe("useCommandHoldTracking on macOS", () => {
     expect(result.current).toBe(true);
   });
 
+  it("keeps the reveal deadline when Shift joins during the delay", () => {
+    const { result } = renderTracking(true);
+    key("keydown", "Meta", MAC_COMMAND);
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    key("keydown", "Shift", { metaKey: true, shiftKey: true });
+
+    act(() => {
+      vi.advanceTimersByTime(COMMAND_HOLD_REVEAL_DELAY_MS - 301);
+    });
+    expect(result.current).toBe(false);
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(result.current).toBe(true);
+  });
+
   it.each([
     ["Shift in a browser tab", "Shift", { metaKey: true, shiftKey: true }, true],
     ["Shift in the desktop app", "Shift", { metaKey: true, shiftKey: true }, false],
@@ -453,6 +473,24 @@ describe("useCommandHoldTracking after a canceled hold", () => {
       expect(result.current).toBe(true);
     },
   );
+});
+
+describe("useCommandHoldTracking after a missed command keyup", () => {
+  it("stays hidden on a repeated command keydown but recovers on a fresh press", () => {
+    const { result } = renderTracking(false);
+    key("keydown", "Control", OTHER_COMMAND);
+    key("keydown", "c", OTHER_COMMAND);
+    key("keyup", "c", OTHER_COMMAND);
+
+    key("keydown", "Control", { ...OTHER_COMMAND, repeat: true });
+    elapseRevealDelay();
+    expect(result.current).toBe(false);
+
+    // The Ctrl keyup was swallowed, so the next press arrives without one.
+    key("keydown", "Control", OTHER_COMMAND);
+    elapseRevealDelay();
+    expect(result.current).toBe(true);
+  });
 });
 
 describe("useCommandHoldTracking window focus", () => {

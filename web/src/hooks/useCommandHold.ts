@@ -44,8 +44,8 @@ export function useCommandHoldTracking(
     const heldKeys = new Set<string>();
     const chordKeys = new Set<string>();
     const keyId = (e: globalThis.KeyboardEvent): string => e.code || e.key;
-    // A hold canceled by another key stays canceled until the command key is released,
-    // so a joining modifier pressed afterwards cannot revive it.
+    // A hold canceled by another key stays canceled until the command key is released or
+    // pressed afresh, so a joining modifier pressed afterwards cannot revive it.
     let holdCanceled = false;
 
     const clearHold = (): void => {
@@ -70,6 +70,8 @@ export function useCommandHoldTracking(
       return !altGraph;
     };
     const onKeyDown = (e: globalThis.KeyboardEvent): void => {
+      // A fresh command-key press means its release was missed, so start a new hold.
+      if (e.key === commandKey && !e.repeat) holdCanceled = false;
       const joinsHold = joiningKeys.has(e.key);
       // The physical modifier, not shortcut eligibility: ⌃⌘K still drops K's keyup.
       const commandDown = isMac ? e.metaKey : e.ctrlKey;
