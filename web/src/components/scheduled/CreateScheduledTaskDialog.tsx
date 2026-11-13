@@ -1265,7 +1265,12 @@ export function CreateScheduledTaskDialog({
     authorizing: mcpSigningIn,
     error: mcpSignInError,
     clearError: clearMcpSignInError,
+    cancel: cancelMcpSignIn,
   } = useRegistrySignIn(mcpCatalog.refresh);
+  // The dialog stays mounted between drafts, so a sign-in must not outlive its own.
+  useEffect(() => {
+    if (!open) cancelMcpSignIn();
+  }, [open, cancelMcpSignIn]);
   // A trigger reads its source through that service's MCP, when the server offers one.
   const triggerMcp =
     mcpPickerShown && trigger !== null && !reusesExistingSession

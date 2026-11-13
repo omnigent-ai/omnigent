@@ -12,6 +12,7 @@ import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 import React from "react";
 import userEvent from "@testing-library/user-event";
 import {
+  act,
   cleanup,
   fireEvent,
   render as renderBase,
@@ -6531,19 +6532,19 @@ describe("CreateScheduledTaskDialog MCP services", () => {
     expect(updateMutateAsync.mock.calls[0][0].input.mcpServices).toEqual(expected);
   });
 
+  const triggerInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    features: { session_orchestration: true },
+    scheduled_task_session_modes: true,
+    scheduled_task_trigger_headers: true,
+    scheduled_task_mcp_services: true,
+    enabled_connections: ["mcp"],
+  };
+
   function renderTrigger(source: "slack" | "jira", services: RegistryService[]) {
     vi.mocked(registryRequest).mockResolvedValue({ data: services });
     return render(
-      <CapabilitiesProvider
-        info={{
-          ...SERVER_INFO_OFFLINE_FALLBACK,
-          features: { session_orchestration: true },
-          scheduled_task_session_modes: true,
-          scheduled_task_trigger_headers: true,
-          scheduled_task_mcp_services: true,
-          enabled_connections: ["mcp"],
-        }}
-      >
+      <CapabilitiesProvider info={triggerInfo}>
         <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialTrigger={source} />
       </CapabilitiesProvider>,
     );
@@ -6609,6 +6610,38 @@ describe("CreateScheduledTaskDialog MCP services", () => {
     await waitFor(() =>
       expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("MCPs · 1"),
     );
+    expect(screen.queryByTestId("task-trigger-mcp-sign-in-error")).not.toBeInTheDocument();
+  });
+
+  it("drops a trigger sign-in still pending when its draft closes", async () => {
+    let finish!: () => void;
+    vi.mocked(authorizeRegistryService).mockImplementation(
+      (_service, signal) =>
+        new Promise<void>((done, reject) => {
+          finish = done;
+          signal.addEventListener("abort", () => reject(new Error("Sign-in cancelled.")), {
+            once: true,
+          });
+        }),
+    );
+    const view = renderTrigger("slack", [github, { ...slack, connected: false }]);
+    fireEvent.click(await screen.findByTestId("task-trigger-mcp-add"));
+    expect(screen.getByTestId("task-trigger-mcp-add")).toHaveTextContent("Signing in to Slack");
+
+    const reopen = (open: boolean) =>
+      view.rerender(
+        <CapabilitiesProvider info={triggerInfo}>
+          <CreateScheduledTaskDialog open={open} onOpenChange={vi.fn()} initialTrigger="slack" />
+        </CapabilitiesProvider>,
+      );
+    reopen(false);
+    reopen(true);
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, slack] });
+    await act(async () => finish());
+
+    // The new draft neither gains the old draft's service nor waits on its sign-in.
+    expect(await screen.findByTestId("task-trigger-mcp-add")).toHaveTextContent("Add Slack MCP");
+    expect(await mcpTrigger()).toHaveTextContent("No MCPs");
     expect(screen.queryByTestId("task-trigger-mcp-sign-in-error")).not.toBeInTheDocument();
   });
 
