@@ -600,6 +600,49 @@ def test_mcp_http_with_stdio_field_invalid() -> None:
     assert any("not allowed when transport is 'http'" in e.message for e in result.errors)
 
 
+def test_mcp_auth_command_validation() -> None:
+    """Validator enforces non-empty HTTP-only ``auth_command``."""
+    ok_spec = _minimal_spec(
+        mcp_servers=[
+            MCPServerConfig(
+                name="ok",
+                transport="http",
+                url="https://mcp.example.com/mcp",
+                auth_command="printf %s tok",
+            )
+        ]
+    )
+    assert validate(ok_spec).valid
+
+    blank_spec = _minimal_spec(
+        mcp_servers=[
+            MCPServerConfig(
+                name="blank",
+                transport="http",
+                url="https://mcp.example.com/mcp",
+                auth_command="   ",
+            )
+        ]
+    )
+    blank_res = validate(blank_spec)
+    assert not blank_res.valid
+    assert any("non-empty command string" in e.message for e in blank_res.errors)
+
+    stdio_spec = _minimal_spec(
+        mcp_servers=[
+            MCPServerConfig(
+                name="local",
+                transport="stdio",
+                command="npx",
+                auth_command="printf %s tok",
+            )
+        ]
+    )
+    stdio_res = validate(stdio_spec)
+    assert not stdio_res.valid
+    assert any("not allowed when transport is 'stdio'" in e.message for e in stdio_res.errors)
+
+
 # ---------------------------------------------------------------------------
 # os_env sandbox combo checks.
 # ---------------------------------------------------------------------------

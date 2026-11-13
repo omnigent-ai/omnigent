@@ -287,6 +287,24 @@ async def test_shared_server_reused_across_different_specs(
     assert len(snapshot["specs"]) == 2
 
 
+def test_compute_hashes_include_auth_command() -> None:
+    """Changing ``auth_command`` changes both spec and server hashes."""
+    cfg_a = MCPServerConfig(
+        name="jira",
+        transport="http",
+        url="https://mcp.example.com/mcp",
+        auth_command="token-helper --a",
+    )
+    cfg_b = MCPServerConfig(
+        name="jira",
+        transport="http",
+        url="https://mcp.example.com/mcp",
+        auth_command="token-helper --b",
+    )
+    assert compute_server_hash(cfg_a) != compute_server_hash(cfg_b)
+    assert compute_spec_hash([cfg_a]) != compute_spec_hash([cfg_b])
+
+
 @pytest.mark.asyncio
 async def test_invalid_tool_name_is_filtered(
     patch_connection: dict[str, Any],

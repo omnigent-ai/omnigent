@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
 import shlex
+import signal
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, suppress
@@ -67,6 +69,84 @@ _ReadStream = MemoryObjectReceiveStream[SessionMessage | Exception]
 _WriteStream = MemoryObjectSendStream[SessionMessage]
 
 _logger = logging.getLogger(__name__)
+
+CredentialResolver = Callable[
+    [MCPServerConfig, str | None],
+    Mapping[str, str] | Awaitable[Mapping[str, str] | None] | None,
+]
+
+_DEFAULT_AUTH_COMMAND_TIMEOUT_S = 15.0
+
+
+def _digest_str(value: str | None) -> str:
+    """Return a short sha256 digest of *value*, or empty string if None."""
+    if value is None:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+async def _run_mcp_auth_command(
+    auth_command: str,
+    *,
+    server_name: str,
+    user_id: str | None = None,
+    timeout_s: float = _DEFAULT_AUTH_COMMAND_TIMEOUT_S,
+) -> str:
+    """Execute ``auth_command`` and return its stripped stdout bearer token.
+
+    Runs ``/bin/sh -c`` with runner auth secrets stripped and
+    ``OMNIGENT_MCP_SERVER_NAME`` / ``OMNIGENT_MCP_USER_ID`` populated.
+    Fails closed on timeout, non-zero exit, or empty output.
+    """
+    env = strip_runner_auth_secrets(os.environ)
+    env["OMNIGENT_MCP_SERVER_NAME"] = server_name
+    if user_id is not None:
+        env["OMNIGENT_MCP_USER_ID"] = user_id
+    else:
+        env.pop("OMNIGENT_MCP_USER_ID", None)
+
+    proc = await asyncio.create_subprocess_exec(
+        "/bin/sh",
+        "-c",
+        auth_command,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout_s,
+        )
+    except TimeoutError as exc:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with suppress(Exception):
+            await proc.communicate()
+        raise RuntimeError(
+            f"MCP server '{server_name}' auth_command timed out after {timeout_s}s"
+        ) from exc
+    except BaseException:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with suppress(Exception):
+            await proc.wait()
+        raise
+
+    if proc.returncode != 0:
+        err_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+        detail = f": {err_text[:200]}" if err_text else ""
+        raise RuntimeError(
+            f"MCP server '{server_name}' auth_command failed with exit code "
+            f"{proc.returncode}{detail}"
+        )
+
+    token = stdout_bytes.decode("utf-8", errors="replace").strip()
+    if not token:
+        raise RuntimeError(f"MCP server '{server_name}' auth_command produced empty output")
+    return token
 
 
 # Default retry policy for MCP connection-level reconnection
@@ -379,7 +459,12 @@ def _mapping_digest(mapping: Mapping[str, str] | None) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _cache_key(config: MCPServerConfig, cwd: Path | None = None) -> str:
+def _cache_key(
+    config: MCPServerConfig,
+    cwd: Path | None = None,
+    *,
+    user_id: str | None = None,
+) -> str:
     """
     Build a stable cache key for an MCP server config + stdio cwd.
 
@@ -387,39 +472,46 @@ def _cache_key(config: MCPServerConfig, cwd: Path | None = None) -> str:
     observe — anything that can change what ``tools/list`` returns.
     For stdio that is the spawned command line (``command`` /
     ``args`` / ``cwd``) and the ``env`` overlay; for HTTP it is the
-    ``url`` and the request identity (``headers``, and
-    ``databricks_profile``, which resolves to an Authorization
-    header at connect() time). A server may register different
-    tools depending on any of these (an env-gated read-only mode, a
-    remote server that scopes tools per principal), and two configs
-    differing in one must never share a cached tools/list — the
-    second would silently inherit the first's tool surface until
-    the TTL expires. Fields the CLIENT applies after the response
-    (the ``tools:`` allowlist, ``timeout`` / ``retry``,
-    ``description``) stay out so same-server configs keep sharing
-    one entry. When adding a config field, decide which side of
+    ``url`` and the request identity (``headers``,
+    ``databricks_profile``, ``auth_command``, and ``user_id``). A server
+    may register different tools depending on any of these (an
+    env-gated read-only mode, a remote server that scopes tools per
+    principal), and two configs or users differing in one must never
+    share a cached tools/list — the second would silently inherit the
+    first's tool surface until the TTL expires. Fields the CLIENT
+    applies after the response (the ``tools:`` allowlist, ``timeout`` /
+    ``retry``, ``description``) stay out so same-server configs keep
+    sharing one entry. When adding a config field, decide which side of
     that line it falls on.
 
-    The env / headers maps are folded in as a digest, not verbatim:
-    they routinely carry secrets, and cache keys end up in logs.
+    The env / headers maps, ``auth_command``, and ``user_id`` are folded
+    in as digests, not verbatim: they may carry secrets or identifiers,
+    and cache keys end up in logs.
 
     :param config: The MCP server configuration.
     :param cwd: Optional stdio subprocess working directory;
         relative ``command`` paths resolve against it.
+    :param user_id: Optional calling user identifier scoping the cache.
     :returns: A string suitable as a dict key.
     """
+    user_part = _digest_str(user_id)
     if config.transport == "stdio":
         args_part = shlex.join(config.args) if config.args else ""
         cwd_part = "" if cwd is None else str(cwd)
         env_part = _mapping_digest(config.env)
-        return f"stdio:{config.name}:{config.command}:{args_part}:{cwd_part}:{env_part}"
+        base = f"stdio:{config.name}:{config.command}:{args_part}:{cwd_part}:{env_part}"
+        return f"{base}:{user_part}" if user_part else base
     headers_part = _mapping_digest(config.headers)
     # databricks_profile resolves to an Authorization header at
     # connect() time, so it is an identity field even though the
     # static ``headers`` map doesn't show it. A profile name is not
     # a secret; keyed verbatim.
     profile_part = config.databricks_profile or ""
-    return f"http:{config.name}:{config.url}:{profile_part}:{headers_part}"
+    auth_cmd_part = _digest_str(config.auth_command)
+    return (
+        f"http:{config.name}:{config.url}:{profile_part}:"
+        f"{headers_part}:{auth_cmd_part}:{user_part}"
+    )
 
 
 def clear_discovery_cache() -> None:
@@ -519,6 +611,9 @@ class McpServerConnection:
     elicitation_callback: Callable[[str, ElicitRequestParams], Awaitable[ElicitResult]] | None = (
         field(default=None, repr=False)
     )
+    user_id: str | None = None
+    credential_resolver: CredentialResolver | None = field(default=None, repr=False)
+    auth_command_timeout_s: float = _DEFAULT_AUTH_COMMAND_TIMEOUT_S
     # Guards concurrent tool calls so ``_active_session_id`` is
     # safe to read in the elicitation handler (which runs on the
     # SDK's receive-loop task, not the caller's task).
@@ -989,7 +1084,7 @@ class McpServerConnection:
         :returns: Cached tool list or ``None`` if expired or
             absent.
         """
-        key = _cache_key(self.config, self.cwd)
+        key = _cache_key(self.config, self.cwd, user_id=self.user_id)
         # TTLCache lacks type stubs, so .get() returns Any.
         result: list[McpToolDef] | None = _discovery_cache.get(key)
         return result
@@ -1003,7 +1098,7 @@ class McpServerConnection:
 
         :param tools: The freshly discovered tool definitions.
         """
-        key = _cache_key(self.config, self.cwd)
+        key = _cache_key(self.config, self.cwd, user_id=self.user_id)
         _discovery_cache[key] = tools
 
     def _record_transport_error(self, exc: BaseException) -> None:
@@ -1124,7 +1219,7 @@ class McpServerConnection:
             headers=headers,
             auth=auth,
             event_hooks={
-                "request": [self._stamp_request_serial],
+                "request": [self._stamp_request_serial, self._apply_per_request_auth],
                 "response": [self._record_response_stream],
             },
         )
@@ -1183,7 +1278,7 @@ class McpServerConnection:
                 "validator should have caught this"
             )
         timeout = self.config.timeout
-        headers = self._resolve_http_headers()
+        headers = await self._resolve_http_headers()
         if self.http_transport == "sse" or (
             self.http_transport == "auto" and _is_sse_endpoint(self.config.url)
         ):
@@ -1212,23 +1307,58 @@ class McpServerConnection:
             )
             return await self._open_sse_transport(stack, timeout, headers)
 
-    def _resolve_http_headers(self) -> dict[str, str] | None:
+    async def _resolve_dynamic_auth_headers(self) -> dict[str, str]:
+        """Resolve per-connection and per-request HTTP headers from auth hooks."""
+        dynamic: dict[str, str] = {}
+        if self.config.auth_command is not None:
+            token = await _run_mcp_auth_command(
+                self.config.auth_command,
+                server_name=self.config.name,
+                user_id=self.user_id,
+                timeout_s=self.auth_command_timeout_s,
+            )
+            dynamic["Authorization"] = f"Bearer {token}"
+        if self.credential_resolver is not None:
+            resolved = self.credential_resolver(self.config, self.user_id)
+            if inspect.isawaitable(resolved):
+                resolved = await resolved
+            if resolved is not None:
+                for key, value in resolved.items():
+                    dynamic[str(key)] = str(value)
+        return dynamic
+
+    async def _apply_per_request_auth(self, request: httpx.Request) -> None:
+        """Refresh dynamic auth headers before each outbound HTTP request."""
+        if self.config.auth_command is None and self.credential_resolver is None:
+            return
+        # Initial connect() resolves headers immediately beforehand; skip
+        # re-invoking during the initial handshake until ready.
+        if self._ready_future is not None and not self._ready_future.done():
+            return
+        dynamic = await self._resolve_dynamic_auth_headers()
+        for key, value in dynamic.items():
+            request.headers[key] = value
+
+    async def _resolve_http_headers(self) -> dict[str, str] | None:
         """
         Build the HTTP headers for the MCP connection.
 
         Merges explicit ``headers`` from the config with a
-        Databricks OAuth token when ``databricks_profile`` is set.
-        The token is resolved fresh on each call so reconnects
-        pick up rotated credentials.
+        Databricks OAuth token when ``databricks_profile`` is set, plus
+        per-user/per-request credentials from ``auth_command`` and
+        ``credential_resolver``.
 
         :returns: Merged headers dict, or ``None`` if no headers
-            are needed (empty config headers and no profile).
+            are needed.
         """
         merged = dict(self.config.headers) if self.config.headers else {}
         if self.config.databricks_profile is not None:
             token = _resolve_databricks_token(self.config.databricks_profile)
             # Explicit Authorization header wins — don't overwrite.
             merged.setdefault("Authorization", f"Bearer {token}")
+        dynamic = await self._resolve_dynamic_auth_headers()
+        if dynamic:
+            merged.update(dynamic)
         return merged or None
 
     async def _open_streamable_http_transport(
