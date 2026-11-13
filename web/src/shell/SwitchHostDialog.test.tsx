@@ -28,7 +28,7 @@ import { handleSessionEvent } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 
 // Heavy children have their own suites; stub them so this one stays on the
-// dialog's two-call move and its recovery from a half-finished switch.
+// dialog's move sequence and its recovery from a half-finished switch.
 vi.mock("./WorkspacePathField", () => ({
   WorkspacePathField: ({
     value,
@@ -450,9 +450,13 @@ describe("SwitchHostDialog", () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: terminalsQueryKey("conv_1") });
   });
 
-  it.each(["release", "launch"] as const)(
-    "offers the origin host again when %s fails after stopping",
-    async (failure) => {
+  it.each([
+    ["release", "online"],
+    ["launch", "online"],
+    ["release", "offline"],
+  ] as const)(
+    "offers the origin host again when %s fails after stopping and the origin is %s",
+    async (failure, originStatus) => {
       const failedRequest = failure === "release" ? updateSessionMock : launchRunnerMock;
       failedRequest.mockRejectedValueOnce(new Error("move request failed"));
       const client = renderDialog();
@@ -481,31 +485,56 @@ describe("SwitchHostDialog", () => {
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", "conv_1"] });
       expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
 
-      let finishStop!: () => void;
-      stopSessionMock.mockReturnValueOnce(
-        new Promise((resolve) => {
-          finishStop = () => resolve({ queued: false });
-        }),
-      );
       fireEvent.change(screen.getByTestId("mock-host-select"), { target: { value: "host_old" } });
+      let finishRetry!: () => void;
+      const recoveryHostId = originStatus === "offline" ? "host_new" : "host_old";
+      if (originStatus === "offline") {
+        const hosts = [
+          { host_id: "host_old", name: "laptop", owner: "alice", status: "offline" as const },
+          { host_id: "host_new", name: "workstation", owner: "alice", status: "online" as const },
+        ];
+        useHostsMock.mockReturnValue({ data: hosts } as unknown as ReturnType<typeof useHosts>);
+        fetchHostsMock.mockReturnValueOnce(
+          new Promise((resolve) => {
+            finishRetry = () => resolve(hosts);
+          }),
+        );
+        stopSessionMock.mockRejectedValue(new Error("Original host disconnected"));
+        fireEvent.change(screen.getByTestId("mock-host-select"), {
+          target: { value: recoveryHostId },
+        });
+      } else {
+        stopSessionMock.mockReturnValueOnce(
+          new Promise((resolve) => {
+            finishRetry = () => resolve({ queued: false });
+          }),
+        );
+      }
+      await waitFor(() => expect(button).toBeEnabled());
       fireEvent.click(button);
-      await waitFor(() => expect(stopSessionMock).toHaveBeenCalledTimes(2));
-      expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
-      expect(screen.getByTestId("mock-host-select")).toHaveValue("host_old");
+      if (originStatus === "offline") {
+        await waitFor(() => expect(fetchHostsMock).toHaveBeenCalledWith(true));
+        expect(stopSessionMock).toHaveBeenCalledTimes(1);
+      } else {
+        await waitFor(() => expect(stopSessionMock).toHaveBeenCalledTimes(2));
+        expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
+      }
+      expect(screen.getByTestId("mock-host-select")).toHaveValue(recoveryHostId);
       expect(updateSessionMock).toHaveBeenCalledTimes(1);
-      await act(async () => finishStop());
+      await act(async () => finishRetry());
       await waitFor(() =>
         expect(launchRunnerMock).toHaveBeenLastCalledWith(
-          "host_old",
+          recoveryHostId,
           "conv_1",
           "/Users/alice/repo",
         ),
       );
-      expect(stopSessionMock).toHaveBeenCalledTimes(2);
+      expect(stopSessionMock).toHaveBeenCalledTimes(originStatus === "offline" ? 1 : 2);
       expect(updateSessionMock).toHaveBeenCalledTimes(2);
-      expect(stopSessionMock.mock.invocationCallOrder[1]).toBeLessThan(
-        updateSessionMock.mock.invocationCallOrder[1],
-      );
+      if (originStatus === "online")
+        expect(stopSessionMock.mock.invocationCallOrder[1]).toBeLessThan(
+          updateSessionMock.mock.invocationCallOrder[1],
+        );
       expect(updateSessionMock.mock.invocationCallOrder[1]).toBeLessThan(
         launchRunnerMock.mock.invocationCallOrder.at(-1)!,
       );

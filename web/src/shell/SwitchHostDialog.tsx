@@ -317,7 +317,7 @@ function SupportedSwitchHostDialog({
       }
       const currentHost = hosts?.find((host) => host.host_id === boundHostId);
       let confirmedOffline = false;
-      if (!originAvailable && currentHost?.status === "offline") {
+      if (currentHost?.status === "offline") {
         try {
           confirmedOffline = (await fetchHosts(true)).some(
             (host) => host.host_id === boundHostId && host.status === "offline",
