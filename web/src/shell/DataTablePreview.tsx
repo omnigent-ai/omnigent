@@ -102,7 +102,7 @@ export function DataTablePreview({
   );
 }
 
-function DataTableView({
+export function DataTableView({
   table,
   path,
   truncated,
@@ -258,7 +258,7 @@ function DataTableView({
         <span data-testid="data-table-summary">
           {rowCount} · {table.totalColumns.toLocaleString()}{" "}
           {table.totalColumns === 1 ? "column" : "columns"}
-          {table.encoding !== "utf-8" ? ` · ${table.encoding}` : ""}
+          {table.description ? ` · ${table.description}` : ""}
         </span>
         {filtered && <span>{visibleRows.length.toLocaleString()} matching</span>}
         {selected && selectedIndex >= 0 && (
