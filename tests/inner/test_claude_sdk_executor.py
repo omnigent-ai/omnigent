@@ -1187,10 +1187,13 @@ class TestConstructor(unittest.TestCase):
                 {
                     "claude-fable-5": "gw-claude-fable-5",
                     "claude-opus-4-7": "gw-claude-opus-4-7",
+                    "claude-opus-4.7": "gw-claude-opus-4-7",
                     "claude-opus-4-8": "gw-claude-opus-4-8",
+                    "claude-opus-4.8": "gw-claude-opus-4-8",
                     "claude-opus-5": "gw-claude-opus-5",
                     "claude-sonnet-5": "gw-claude-sonnet-5",
                     "claude-haiku-4-5": "gw-claude-haiku-4-5",
+                    "claude-haiku-4.5": "gw-claude-haiku-4-5",
                 },
             )
 
@@ -1311,7 +1314,10 @@ class TestConstructor(unittest.TestCase):
                 )
             self.assertEqual(
                 captured["settings"]["modelOverrides"],
-                {"claude-opus-4-8": "gw-claude-opus-4-8"},
+                {
+                    "claude-opus-4-8": "gw-claude-opus-4-8",
+                    "claude-opus-4.8": "gw-claude-opus-4-8",
+                },
             )
 
         _run(_t())
@@ -2065,6 +2071,7 @@ class TestGatewayModelVocabulary(unittest.TestCase):
             vocabulary.model_overrides,
             {
                 "claude-opus-4-8": "databricks-claude-opus-4-8",
+                "claude-opus-4.8": "databricks-claude-opus-4-8",
                 "claude-fable-5": "databricks-claude-fable-5",
             },
         )
@@ -2144,7 +2151,13 @@ class TestGatewayModelVocabulary(unittest.TestCase):
         with patch("omnigent.models.model_catalog.listing_for_provider", return_value=listing):
             overrides = _run(executor._apply_gateway_model_vocabulary(env, "printf tok"))
         self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gw-claude-opus-5")
-        self.assertEqual(overrides, {"claude-opus-4-8": "gw-claude-opus-4-8"})
+        self.assertEqual(
+            overrides,
+            {
+                "claude-opus-4-8": "gw-claude-opus-4-8",
+                "claude-opus-4.8": "gw-claude-opus-4-8",
+            },
+        )
 
     def test_settings_payload_carries_helper_and_rewrites(self):
         from omnigent.inner.claude_sdk_executor import _claude_settings_payload
