@@ -583,9 +583,12 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
         // Settle a fetched list (not a local patch) against frames that
         // arrived while it was in flight; see settleFetchedChildSessions.
         if (event.type === "updated" && typeof key[1] === "string") {
-          if (event.action.type === "fetch") childFrames.fetchStarted.set(key[1], Date.now());
-          else if (event.action.type === "success" && !event.action.manual) {
-            settleFetchedChildSessions(queryClient, childFrames, key[1]);
+          if (event.action.type === "fetch") {
+            childFrames.fetchStarted.set(key[1], { at: Date.now() });
+          } else if (event.action.type === "success" && !event.action.manual) {
+            if (settleFetchedChildSessions(queryClient, childFrames, key[1])) {
+              childRefetcher.schedule(key[1]);
+            }
           } else if (event.action.type === "error") childFrames.fetchStarted.delete(key[1]);
         }
       }

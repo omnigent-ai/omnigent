@@ -400,7 +400,7 @@ describe("settleFetchedChildSessions", () => {
     const client = new QueryClient();
     const state = createChildFrameState();
     client.setQueryData(childSessionsQueryKey("conv_p"), [child("c1")]);
-    state.fetchStarted.set("conv_p", 1_000);
+    state.fetchStarted.set("conv_p", { at: 1_000 });
     applyFrameToChildSessions(
       client,
       [frameRow("c1", "conv_p", { own_status: "running" })],
@@ -416,6 +416,31 @@ describe("settleFetchedChildSessions", () => {
     expect(state.fetchStarted.has("conv_p")).toBe(false);
   });
 
+  it("asks for a reconcile when a count streamed during the fetch disagrees with the list", () => {
+    const client = new QueryClient();
+    const state = createChildFrameState();
+    client.setQueryData(childSessionsQueryKey("conv_p"), []);
+    state.fetchStarted.set("conv_p", { at: 1_000 });
+    applyFrameToChildSessions(client, [frameRow("conv_p", "", { child_session_count: 1 })], state, {
+      now: 1_500,
+    });
+
+    expect(settleFetchedChildSessions(client, state, "conv_p")).toBe(true);
+    expect(state.counts.get("conv_p")).toBe(1);
+  });
+
+  it("does not ask for a reconcile when the fetched list matches the streamed count", () => {
+    const client = new QueryClient();
+    const state = createChildFrameState();
+    client.setQueryData(childSessionsQueryKey("conv_p"), [child("c1")]);
+    state.fetchStarted.set("conv_p", { at: 1_000 });
+    applyFrameToChildSessions(client, [frameRow("conv_p", "", { child_session_count: 1 })], state, {
+      now: 1_500,
+    });
+
+    expect(settleFetchedChildSessions(client, state, "conv_p")).toBe(false);
+  });
+
   it("keeps the fetched row over a frame from before the fetch", () => {
     const client = new QueryClient();
     const state = createChildFrameState();
@@ -426,7 +451,7 @@ describe("settleFetchedChildSessions", () => {
       state,
       { now: 500 },
     );
-    state.fetchStarted.set("conv_p", 1_000);
+    state.fetchStarted.set("conv_p", { at: 1_000 });
     client.setQueryData(childSessionsQueryKey("conv_p"), [child("c1", { busy: false })]);
     const fetched = rows(client, "conv_p");
 

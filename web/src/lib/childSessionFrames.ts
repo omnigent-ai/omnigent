@@ -34,8 +34,8 @@ export interface ChildFrameState {
   labels: Map<string, string>;
   /** Latest frame row per child and when it arrived. */
   frames: Map<string, { item: SessionListWireItem; at: number }>;
-  /** When each list's in-flight fetch started, by parent id. */
-  fetchStarted: Map<string, number>;
+  /** In-flight list fetches by parent id: when each started, and the newest count streamed since. */
+  fetchStarted: Map<string, { at: number; count?: number }>;
   /** Parents whose list must refetch now, not after the coalescing delay. */
   immediate: Set<string>;
 }
@@ -209,6 +209,8 @@ export function applyFrameToChildSessions(
     if (typeof count === "number") {
       const previous = state.counts.get(item.id);
       state.counts.set(item.id, count);
+      const flight = state.fetchStarted.get(item.id);
+      if (flight) flight.count = count;
       if (previous !== undefined && previous !== count && listCached) refetch.add(item.id);
     } else if (snapshot && listCached) {
       refetch.add(item.id);
@@ -270,25 +272,33 @@ export function applyFrameToChildSessions(
  *
  * Seeds the parent's child-count baseline from the list's length, so a
  * sub-agent created between the fetch and the next frame triggers a refetch.
+ * A count streamed during the fetch is newer than the response: it is kept,
+ * and disagreement with the list returns true so the caller reconciles once.
  * Then re-applies frame rows that arrived while the fetch was in flight: the
  * response may predate them, and the stream won't resend an unchanged row.
  *
  * @param queryClient - The app QueryClient.
  * @param state - Frame-handler state; the parent's fetch start is consumed.
  * @param parentId - Session whose list was fetched, e.g. ``"conv_parent"``.
+ * @returns Whether the list must be refetched to match the newer count.
  */
 export function settleFetchedChildSessions(
   queryClient: QueryClient,
   state: ChildFrameState,
   parentId: string,
-): void {
+): boolean {
   const key = childSessionsQueryKey(parentId);
   const rows = queryClient.getQueryData<ChildSessionInfo[]>(key);
-  const startedAt = state.fetchStarted.get(parentId);
+  const flight = state.fetchStarted.get(parentId);
   state.fetchStarted.delete(parentId);
-  if (!Array.isArray(rows)) return;
-  if (rows.length < CHILD_SESSIONS_PAGE_LIMIT) state.counts.set(parentId, rows.length);
-  if (startedAt === undefined) return;
+  if (!Array.isArray(rows)) return false;
+  const shortPage = rows.length < CHILD_SESSIONS_PAGE_LIMIT;
+  const observed = flight?.count;
+  if (observed !== undefined) state.counts.set(parentId, observed);
+  else if (shortPage) state.counts.set(parentId, rows.length);
+  const reconcile = observed !== undefined && shortPage && observed !== rows.length;
+  if (flight === undefined) return false;
+  const startedAt = flight.at;
   const next: ChildSessionInfo[] = [];
   for (const row of rows) {
     const frame = state.frames.get(row.id);
@@ -300,6 +310,7 @@ export function settleFetchedChildSessions(
   }
   const changed = next.length !== rows.length || next.some((row, index) => row !== rows[index]);
   if (changed) queryClient.setQueryData<ChildSessionInfo[]>(key, next);
+  return reconcile;
 }
 
 /**

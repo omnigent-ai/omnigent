@@ -1183,8 +1183,16 @@ describe("SessionUpdatesProvider list invalidation", () => {
     seedConversations(client, ["conv_a"]);
     renderProvider(client, ["/"]);
     const row = (id: string) => ({ id, busy: false, pending_elicitations_count: 0 });
-    let fetched = [row("child_1")];
-    const queryFn = vi.fn(async () => fetched);
+    let resolveFirst: (rows: ReturnType<typeof row>[]) => void = () => {};
+    const queryFn = vi
+      .fn<() => Promise<ReturnType<typeof row>[]>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockResolvedValue([row("child_1")]);
     const observer = new QueryObserver(client, {
       queryKey: childSessionsQueryKey("conv_a"),
       queryFn,
@@ -1192,19 +1200,19 @@ describe("SessionUpdatesProvider list invalidation", () => {
     });
     const unsubscribe = observer.subscribe(() => {});
     try {
-      await waitFor(() => expect(observer.getCurrentResult().isSuccess).toBe(true));
-      // A native sub-agent is created after the fetch; the first frame for
-      // the parent already counts it.
-      fetched = [row("child_2"), row("child_1")];
+      await waitFor(() => expect(queryFn).toHaveBeenCalledTimes(1));
+      // A native sub-agent is created while the first fetch is in flight; the
+      // parent's frame counts it before the stale empty response resolves.
       act(() =>
         frameHandler()({
           type: "snapshot",
-          items: [{ ...conv("conv_a"), own_status: "running", child_session_count: 2 }],
+          items: [{ ...conv("conv_a"), own_status: "running", child_session_count: 1 }],
         }),
       );
+      resolveFirst([]);
       await waitFor(() => expect(queryFn).toHaveBeenCalledTimes(2), { timeout: 3_000 });
       await waitFor(() =>
-        expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toHaveLength(2),
+        expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([row("child_1")]),
       );
     } finally {
       unsubscribe();
