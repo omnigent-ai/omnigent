@@ -6486,10 +6486,11 @@ describe("CreateScheduledTaskDialog MCP services", () => {
     expect(mutateAsync.mock.calls[0][0].mcpServices).toEqual(["github"]);
   });
 
-  it("starts a new automation from the services last picked for a new chat", async () => {
+  it("starts a new automation with no services, whatever a new chat last picked", async () => {
     localStorage.setItem("omnigent:last-mcp-services", JSON.stringify(["github"]));
     renderWithRegistry(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
-    expect(await mcpSwitch("GitHub")).toBeChecked();
+    expect(await mcpSwitch("GitHub")).not.toBeChecked();
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
   });
 
   it("blocks saving until every selected service is signed in", async () => {
@@ -6536,6 +6537,7 @@ describe("CreateScheduledTaskDialog MCP services", () => {
       <CapabilitiesProvider
         info={{
           ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { session_orchestration: true },
           scheduled_task_session_modes: true,
           scheduled_task_trigger_headers: true,
           scheduled_task_mcp_services: true,
@@ -6548,22 +6550,27 @@ describe("CreateScheduledTaskDialog MCP services", () => {
   }
   const slack: RegistryService = { ...github, id: "slack", title: "Slack" };
 
-  it("turns on a trigger's MCP service the owner is signed in to, once", async () => {
-    renderTrigger("slack", [github, slack]);
-    const chip = screen.getByTestId("task-mcp-services-trigger");
-    await waitFor(() => expect(chip).toHaveTextContent("MCPs · 1"));
-    expect(screen.getByTestId("task-trigger-mcp-note")).toHaveTextContent("Uses Slack MCP");
+  it("leaves the services alone when a trigger is picked or switched", async () => {
+    renderTrigger("slack", [github, slack, { ...github, id: "jira", title: "Jira" }]);
+    const add = await screen.findByTestId("task-trigger-mcp-add");
+    const chip = await mcpTrigger();
+    // A signed-in service is offered, not turned on.
+    expect(add).toHaveTextContent("Add Slack MCP");
+    expect(chip).toHaveTextContent("No MCPs");
     expect(screen.queryByTestId("task-trigger-tools-note")).not.toBeInTheDocument();
 
-    // Turning it off sticks, and offers the same way back as a signed-out service.
-    fireEvent.click(await mcpSwitch("Slack"));
-    await waitFor(() => expect(chip).toHaveTextContent("No MCPs"));
-    fireEvent.click(screen.getByTestId("task-mcp-services-trigger"));
-    const add = screen.getByTestId("task-trigger-mcp-add");
-    expect(add).toHaveTextContent("Add Slack MCP");
     fireEvent.click(add);
     await waitFor(() => expect(chip).toHaveTextContent("MCPs · 1"));
+    expect(screen.getByTestId("task-trigger-mcp-note")).toHaveTextContent("Uses Slack MCP");
     expect(authorizeRegistryService).not.toHaveBeenCalled();
+
+    // Switching triggers keeps what the owner added, and offers the new trigger's service.
+    fireEvent.keyDown(screen.getByTestId("task-trigger-type"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: /Jira/ }));
+    await waitFor(() =>
+      expect(screen.getByTestId("task-trigger-mcp-add")).toHaveTextContent("Add Jira MCP"),
+    );
+    expect(chip).toHaveTextContent("MCPs · 1");
   });
 
   it("signs in to a trigger's MCP service from the trigger without blocking the save", async () => {

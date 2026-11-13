@@ -177,12 +177,15 @@ to customize.
   supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
 - **MCP services:** when the server's MCP registry is on and `/v1/info` reports
-  `scheduled_task_mcp_services`, an MCPs chip follows Run on, Agent, and
-  Permissions. It opens the new-chat service list and its sign-in. A new
-  automation starts from the services last picked for a new chat. Create stays
-  disabled while a picked service needs sign-in or the list can't load. An edit
-  that keeps a continued session locks the chip, since that session keeps its
-  services.
+  `scheduled_task_mcp_services`, Advanced has an MCP services row that opens
+  the new-chat service list and its sign-in. A new automation starts with none,
+  and picking or switching triggers never changes them. A trigger whose
+  service is in the catalog shows "Uses <service> MCP" when it is selected,
+  otherwise a yellow "Add <service> MCP" button that signs in if needed (or
+  opens MCP settings for a pasted-token service) and selects it. Create stays
+  disabled, and Advanced opens, while a selected service needs sign-in or the
+  list can't load. An edit that keeps a continued session locks the row, since
+  that session keeps its services.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
   preserve a continued session when the repository is unchanged or a legacy

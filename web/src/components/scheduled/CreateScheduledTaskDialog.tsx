@@ -99,7 +99,6 @@ import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { McpRegistryPicker } from "@/components/McpRegistry";
 import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
-import { readLastMcpServices } from "@/lib/mcpPreferences";
 import { withBasePath } from "@/lib/basePath";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
@@ -681,8 +680,7 @@ export function CreateScheduledTaskDialog({
         setSandboxMode(false);
         setProjectChoice(null);
         setPickedProjectId(null);
-        // Start from the services the owner last picked for a new chat.
-        setMcpServices(readLastMcpServices());
+        setMcpServices([]);
       }
       setError(null);
     }
@@ -1273,19 +1271,7 @@ export function CreateScheduledTaskDialog({
     mcpPickerShown && trigger !== null && !reusesExistingSession
       ? triggerMcpService(trigger, mcpCatalog.services)
       : undefined;
-  // Picking a trigger turns its service on once, if the owner is already signed in;
-  // turning it off afterwards sticks.
-  const preselectedTrigger = useRef<string | null>(null);
-  useEffect(() => {
-    if (!open) {
-      preselectedTrigger.current = null;
-      return;
-    }
-    if (isEdit || triggerMcp === undefined || !triggerMcp.connected) return;
-    if (preselectedTrigger.current === trigger) return;
-    preselectedTrigger.current = trigger;
-    toggleMcpService(triggerMcp.id, true);
-  }, [open, isEdit, trigger, triggerMcp]);
+  // The owner adds a trigger's service; picking or switching triggers never changes them.
   const triggerMcpNote: TriggerMcpService | undefined =
     triggerMcp === undefined
       ? undefined
