@@ -2131,6 +2131,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "goose",
         "hermes",
         "host",
+        "host-service-entry",
         "import",
         "integration",
         "_internal",

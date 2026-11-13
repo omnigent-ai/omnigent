@@ -561,9 +561,12 @@ def test_host_service_entry_runs_the_service_host(
 
     monkeypatch.setattr("omnigent.host.service_entry.run", _run)
 
-    result = CliRunner().invoke(cli, ["host-service-entry", *args])
+    monkeypatch.setattr(sys, "argv", ["omnigent", "host-service-entry", *args])
 
-    assert result.exit_code == exit_code, result.output
+    with pytest.raises(SystemExit) as result:
+        cli_module.main()
+
+    assert result.value.code == exit_code
     assert started == servers
 
 
