@@ -165,6 +165,12 @@ implements them separately, so a fix for one harness does not reach the others.
   composer's Plan row; see `plan-mode` in [composer.md](./composer.md).
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
+- `claude-rewind`: Claude Code native `/rewind` from the web composer (see
+  `slash-rewind` in [composer.md](./composer.md)) opens a new session whose own
+  Claude pane resumes a transcript rebuilt from the kept items. The original
+  session's pane is neither rewound nor stopped: it keeps the full
+  conversation, a message sent there resumes it, and otherwise it closes on
+  idle reap. Unlike a native `/clear`, the terminal does not move to the new session.
 - `idle-reap`: a finished native pane left alone past the idle window closes
   with its forwarder, helper server and tool relay; the next message brings it
   back with the conversation. Kimi is exempt; live work and open prompts stay.
@@ -194,9 +200,13 @@ implements them separately, so a fix for one harness does not reach the others.
   with connected/auth/timeout/unreachable/unsupported and mixed-version states.
 
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
-- `harness-settings-navigation`: Harnesses is always available in Settings and
-  through direct links. The import review modal's See more opens Harnesses and
-  dismisses the modal. Import sessions contains only session imports.
+- `harness-settings-navigation`: Harnesses is available in Settings and through
+  direct links. On a deployment that trims built-ins with
+  `OMNIGENT_SEEDED_AGENTS`, it lists only harnesses whose agent is kept or that
+  a pickable agent runs on; a direct link to another one shows the grid, and
+  Settings drops Harnesses when none is left. The import review modal's See
+  more opens Harnesses and dismisses the modal. Import sessions contains only
+  session imports.
 
 ## How to get to it (user POV)
 

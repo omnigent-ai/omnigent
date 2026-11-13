@@ -82,6 +82,8 @@ import {
   OLDER_HISTORY_PAGE_ITEMS,
   openSessionStream,
   postEvent,
+  rewindSession,
+  type RewindAttachment,
   SIGN_IN_EXPIRED_CODE,
   type SessionItemsPage,
   updateSession,
@@ -111,6 +113,7 @@ import {
 } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { invalidateAgentCosts } from "@/hooks/useAgentCosts";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
@@ -123,7 +126,13 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
-import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  getSessionDraft,
+  sessionDraftRevision,
+  sessionDraftWasWritten,
+  setSessionDraft,
+  type SessionDraft,
+} from "@/lib/sessionDrafts";
 import {
   forgetUnsentSend,
   peekQueuedSends,
@@ -159,7 +168,7 @@ import type {
   Session,
   SessionStatus,
 } from "@/lib/types";
-import { uploadFile } from "@/lib/filesApi";
+import { downloadSessionFile, uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
@@ -1057,6 +1066,8 @@ export interface ConversationState {
    * tokens, total cost) is derived from this map on the frontend.
    */
   sessionUsageByModel: Record<string, ModelUsage> | null;
+  /** True while this conversation's first separate usage read is in flight. */
+  sessionUsageLoading: boolean;
   /**
    * Worktree branch checked out for the active session, surfaced in the
    * composer status line. Seeded from the session snapshot on bind
@@ -1198,6 +1209,12 @@ export interface AppChatState {
    * the old conversation renders the persisted notice instead.
    */
   redirectToConversationId: string | null;
+  /**
+   * The prompt `/rewind` returned for its new session's composer. The
+   * composer can open before the rewind responds (the stream redirect may win),
+   * so an open, untouched composer for that session takes it, then clears it.
+   */
+  rewindPrefill: (SessionDraft & { conversationId: string }) | null;
   /**
    * Side-chat child to open as a soft tab in the Workspace rail, or null.
    * `AppShell` observes it, opens/selects that child's side-chat tab on the
@@ -1467,6 +1484,12 @@ export interface ChatActions {
   /** Run the harness's /clear; the view follows the session that continues the work. */
   clearContext: () => Promise<void>;
   /**
+   * Rewind the active session to just before the prompt `itemId`: the server
+   * forks the earlier history onto the same machine, and this opens the fork
+   * with the prompt back in its composer.
+   */
+  rewindToPrompt: (itemId: string) => Promise<void>;
+  /**
    * Refetch runner-backed session state for the active conversation.
    *
    * Used when a native runner comes online after being unreachable: the
@@ -1517,6 +1540,10 @@ conversationRegistry.subscribeDisposed((id) => {
 
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
+// An entry's latest first usage read: only it clears `sessionUsageLoading`. Once a read
+// settles, later background reads keep the known answer on screen.
+const firstSessionUsageHydration = new WeakMap<ConversationEntry, AbortController>();
+const settledSessionUsage = new WeakSet<ConversationEntry>();
 const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; models: number }>();
 
 // Snapshot reconciliation must teach the already-running stream pump which
@@ -1940,6 +1967,49 @@ async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBl
   return block;
 }
 
+/** Build a file from a base64 `data:` URI, e.g. an image or document a prompt carried inline. */
+function fileFromDataUri(dataUri: string, filename: string): File {
+  const match = dataUri.match(/^data:([^;,]+)(?:;[^;,]+=[^;,]*)*;base64,(.*)$/s);
+  if (!match) throw new Error("Not a base64 data URI");
+  const binary = atob(match[2]!);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new File([bytes], filename, { type: match[1] });
+}
+
+/** Downloads rewind attachments, reuses copied file IDs, and warns about failed downloads. */
+async function rewindAttachmentFiles(
+  sessionId: string,
+  attachments: readonly RewindAttachment[],
+): Promise<File[]> {
+  const downloads = await Promise.all(
+    attachments.map(async (attachment) => {
+      try {
+        // An inline attachment has no stored copy; it uploads on send like a new one.
+        const inline = attachment.imageUrl ?? attachment.fileData;
+        if (inline) return fileFromDataUri(inline, attachment.filename);
+        if (!attachment.fileId) return null;
+        const file = await downloadSessionFile(sessionId, attachment.fileId, attachment.filename);
+        const block: ContentBlock = {
+          type: attachment.type,
+          file_id: attachment.fileId,
+          filename: attachment.filename,
+        };
+        uploadedFileBlockCache.set(file, new Map([[sessionId, block]]));
+        return file;
+      } catch (err) {
+        console.warn("Couldn't restore a rewound prompt's attachment", err);
+        return null;
+      }
+    }),
+  );
+  const missing = attachments.filter((_attachment, index) => downloads[index] === null);
+  if (missing.length > 0) {
+    const names = missing.map((attachment) => attachment.filename).join(", ");
+    toast.warning(`Couldn't restore ${names} to the composer. Attach again to send.`);
+  }
+  return downloads.filter((file): file is File => file !== null);
+}
+
 async function uploadFileBlocks(
   sessionId: string,
   files: readonly File[],
@@ -2204,6 +2274,7 @@ function cachedEffortFamilyForSession(
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
   conversationId: null,
   redirectToConversationId: null,
+  rewindPrefill: null,
   blocks: [],
   pendingUserMessages: [],
   settledShellInputs: [],
@@ -2257,6 +2328,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   tokensUsed: null,
   sessionCostUsd: null,
   sessionUsageByModel: null,
+  sessionUsageLoading: false,
   gitBranch: null,
   todos: [],
   codexModelOptions: [],
@@ -3685,6 +3757,34 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     );
   },
 
+  rewindToPrompt: async (itemId) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const rewound = await rewindSession(conversationId, itemId);
+    if (rewound.attachmentsIncomplete) {
+      toast.warning("Some attachments couldn't be restored. Attach them again before sending.");
+    }
+    const target = rewound.sessionId;
+    // A draft the user has edited, cleared or sent in the new session since
+    // it opened, here or offscreen, wins over the prompt.
+    const untouched = !sessionDraftWasWritten(target);
+    const text: SessionDraft = { text: rewound.prompt, files: [] };
+    if (untouched) setSessionDraft(target, text);
+    useChatStore.setState((s) => ({
+      ...(untouched ? { rewindPrefill: { ...text, conversationId: target } } : {}),
+      ...(s.conversationId === conversationId ? { redirectToConversationId: target } : {}),
+    }));
+    if (!untouched || rewound.attachments.length === 0) return;
+    // The text is in; the attachments follow once they download, unless the
+    // draft has changed since.
+    const revision = sessionDraftRevision(target);
+    const files = await rewindAttachmentFiles(target, rewound.attachments);
+    if (files.length === 0 || sessionDraftRevision(target) !== revision) return;
+    const draft: SessionDraft = { ...text, files };
+    setSessionDraft(target, draft);
+    useChatStore.setState({ rewindPrefill: { ...draft, conversationId: target } });
+  },
+
   refreshSessionState: async (conversationId) => {
     const id = conversationId ?? get().conversationId;
     if (!id) return;
@@ -4571,6 +4671,17 @@ function scheduleEntryFlush(id: string): void {
   });
 }
 conversationRegistry.subscribe(scheduleEntryFlush);
+// A moved total (live event, usage read or reconnect) means some agent's cost moved.
+useChatStore.subscribe((state, previous) => {
+  if (
+    queryClient === null ||
+    state.conversationId !== previous.conversationId ||
+    state.sessionCostUsd === previous.sessionCostUsd
+  ) {
+    return;
+  }
+  invalidateAgentCosts(queryClient);
+});
 // Queue edits (release, delete, reorder, a failed send's return) land on the root, not the entry.
 useChatStore.subscribe((state, previous) => {
   if (state.queuedMessages === previous.queuedMessages) return;
@@ -5515,6 +5626,10 @@ async function hydrateSessionUsage(id: string): Promise<void> {
     return;
   }
   sessionUsageHydrations.add(controller);
+  if (!settledSessionUsage.has(entry)) {
+    firstSessionUsageHydration.set(entry, controller);
+    entrySetter(entry)({ sessionUsageLoading: true });
+  }
   const revisionsBeforeFetch = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
   try {
     const usage = await getSessionUsage(id, { signal: controller.signal });
@@ -5542,6 +5657,11 @@ async function hydrateSessionUsage(id: string): Promise<void> {
     // Usage is optional display data; retain known totals or leave them unknown.
   } finally {
     sessionUsageHydrations.delete(controller);
+    if (firstSessionUsageHydration.get(entry) === controller) {
+      firstSessionUsageHydration.delete(entry);
+      if (!controller.signal.aborted) settledSessionUsage.add(entry);
+      entrySetter(entry)({ sessionUsageLoading: false });
+    }
   }
 }
 

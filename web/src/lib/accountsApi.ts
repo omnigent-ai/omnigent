@@ -22,7 +22,7 @@ import { withRoutingKey } from "./host";
 
 /** Standalone `/auth/*` fetch carrying both routing and browser activity context. */
 function accountsFetch(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(withBasePath(path), withActivityAge(withRoutingKey(init)));
+  return fetch(withBasePath(path), withActivityAge(withRoutingKey(init, { hostless: true })));
 }
 
 /** Body of POST /auth/login. */

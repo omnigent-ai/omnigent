@@ -109,6 +109,26 @@ describe("routing key", () => {
     expect(routed.withRoutingKey({ method: "GET" }, { unkeyed: true })).toEqual({ method: "GET" });
   });
 
+  it("keys a hostless request by the modal host once it resolves", async () => {
+    vi.resetModules();
+    const sessionHost = await import("./sessionHost");
+    const host = await import("./host");
+    host.setOmnigentHostConfig({
+      fetcher: vi.fn().mockResolvedValue(new Response(null, { status: 200 })),
+    });
+    sessionHost.setSessionHost("session-a", "host_modal");
+    const keyOf = (init?: RequestInit) =>
+      new Headers(host.withRoutingKey(init, { hostless: true })?.headers).get(
+        "X-Databricks-Omnigent-Slice-Key",
+      );
+    expect(keyOf()).toMatch(/^[0-9a-f]{32}$/);
+    sessionHost.resolveModalHost(["host_modal"]);
+    expect(keyOf()).toBe("host_modal");
+    expect(host.resolveWebSocketUrl("/v1/sessions/updates", { hostless: true })).toContain(
+      "omnigent_slice_key=host_modal",
+    );
+  });
+
   it("adds the client key to a WebSocket path that carries none", async () => {
     const { withRoutingKeyParam, resolveWebSocketUrl: routedWebSocketUrl } = await routedHost();
     expect(routedWebSocketUrl("/v1/dictation/stream")).toMatch(

@@ -127,6 +127,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
+import { managedSandboxHostId } from "@/lib/managedSandboxHost";
 import { randomUUID } from "@/lib/randomUUID";
 import { sessionRoutingHostId, setSessionHost } from "@/lib/sessionHost";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
@@ -213,11 +214,12 @@ import {
   initialPrefillState,
   prefillDone,
   projectPrefillStep,
+  projectRepository,
   withProjectLaunchDefaults,
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
-import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
+import { getCliServerUrl, getOmnigentHostConfig, getOmnigentServerIdentity } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import {
@@ -2115,6 +2117,8 @@ export function AgentHarnessPicker({
 // Drafts survive navigation within this page load, with one slot per source.
 // Successful creation clears only its slot; a page refresh starts clean.
 interface LandingDraft {
+  /** Parked at prompt-link consumption: the composer keeps it in step with edits. */
+  fromLink?: boolean;
   mcpRegistryServices: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
   // A draft restored under a DIFFERENT project only brings back its text and
@@ -2169,6 +2173,113 @@ function writeLandingDraft(state: LandingDraftState, draft: LandingDraft | null)
 // design, which would otherwise leak between tests).
 export function resetLandingDraft(): void {
   landingDrafts.clear();
+  submittedKeptPromptIds.clear();
+}
+
+// An embedding host can remount or reload the page right after the composer
+// strips `?prompt=`, and a remount renders before the old composer parks its
+// draft, so the consumed prompt is parked at once and kept briefly here.
+const LINKED_PROMPT_TTL_MS = 60_000;
+
+// Kept prompts whose create is in flight in this document: another composer
+// must not restore them, but a failed create hands them back (and a reload
+// starts with an empty set, so recovery still works).
+const submittedKeptPromptIds = new Set<string>();
+
+interface KeptLinkedPrompt {
+  /** Identifies this consumption; `at` only drives expiry. */
+  id: string;
+  text: string;
+  at: number;
+}
+
+// Scoped to the server and composer (sibling partition); nothing is kept
+// without a server identity. A known viewer mismatch drops it, but identity
+// resolves after first render, so an unknown viewer is not tied to it.
+function linkedPromptStorageKey(siblingSourceId: string | null): string | null {
+  const server = getOmnigentServerIdentity();
+  return server === null
+    ? null
+    : `omnigent:linked-prompt:${JSON.stringify([server, siblingSourceId])}`;
+}
+
+function keepLinkedPrompt(siblingSourceId: string | null, text: string): KeptLinkedPrompt | null {
+  const key = linkedPromptStorageKey(siblingSourceId);
+  if (key === null) return null;
+  const kept = {
+    id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+    text,
+    at: Date.now(),
+  };
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ ...kept, user: getCurrentUserId() }));
+  } catch {
+    // Nothing was kept for this prompt, and an older one must not outlive it.
+    try {
+      sessionStorage.removeItem(key);
+    } catch {
+      // Storage is unusable; only the reload case is lost.
+    }
+    return null;
+  }
+  return kept;
+}
+
+function parseKeptLinkedPrompt(raw: string | null): (KeptLinkedPrompt & { user?: unknown }) | null {
+  if (raw === null) return null;
+  const kept: unknown = JSON.parse(raw);
+  return typeof kept === "object" &&
+    kept !== null &&
+    "id" in kept &&
+    "text" in kept &&
+    "at" in kept &&
+    typeof kept.id === "string" &&
+    typeof kept.text === "string" &&
+    typeof kept.at === "number"
+    ? { id: kept.id, text: kept.text, at: kept.at, user: "user" in kept ? kept.user : undefined }
+    : null;
+}
+
+function readKeptLinkedPrompt(siblingSourceId: string | null): KeptLinkedPrompt | null {
+  const key = linkedPromptStorageKey(siblingSourceId);
+  if (key === null) return null;
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (raw === null) return null;
+    const kept = parseKeptLinkedPrompt(raw);
+    const viewer = getCurrentUserId();
+    if (
+      kept !== null &&
+      kept.text.trim() !== "" &&
+      Date.now() - kept.at < LINKED_PROMPT_TTL_MS &&
+      !(viewer !== null && typeof kept.user === "string" && kept.user !== viewer)
+    ) {
+      if (submittedKeptPromptIds.has(kept.id)) return null;
+      return { id: kept.id, text: kept.text, at: kept.at };
+    }
+    sessionStorage.removeItem(key);
+  } catch {
+    // Unreadable storage means there is nothing to restore.
+  }
+  return null;
+}
+
+/** Forget the kept prompt; with `owned`, only if it is still that record. */
+function forgetKeptLinkedPrompt(
+  siblingSourceId: string | null,
+  owned: KeptLinkedPrompt | null,
+): void {
+  const key = linkedPromptStorageKey(siblingSourceId);
+  if (key === null) return;
+  try {
+    if (owned !== null) {
+      const stored = parseKeptLinkedPrompt(sessionStorage.getItem(key));
+      if (stored === null || stored.id !== owned.id) return;
+    }
+    sessionStorage.removeItem(key);
+  } catch {
+    // Nothing was kept.
+  }
 }
 
 function NewChatWorkspaceControls({
@@ -2358,6 +2469,8 @@ function NewChatLandingContent({
           useWorktree: c.use_worktree,
           model: c.model,
           effort: c.effort,
+          sandboxProvider: c.sandbox_provider,
+          repository: projectRepository(c.repository),
         }
       : {};
     return withProjectLaunchDefaults(stored, projectLaunch);
@@ -2490,12 +2603,35 @@ function NewChatLandingContent({
           autoSeededBranch: "",
         };
 
+  // Restore from storage only without a parked draft. A parked draft with the
+  // same text takes over cleanup of the kept copy; a different one (e.g. a
+  // failed create's recovered text) supersedes it.
+  const [keptLinkedPrompt] = useState(() =>
+    handoff === null && !linkedPrompt?.trim() ? readKeptLinkedPrompt(siblingSourceId) : null,
+  );
+  const restoresKeptLinkedPrompt = keptLinkedPrompt !== null && landingDraft === null;
+  const [ownsKeptLinkedPrompt] = useState(
+    () => restoresKeptLinkedPrompt || landingDraft?.message === keptLinkedPrompt?.text,
+  );
+  const keptLinkedRef = useRef<KeptLinkedPrompt | null>(
+    ownsKeptLinkedPrompt ? keptLinkedPrompt : null,
+  );
+  const submittedLinkedPromptRef = useRef<KeptLinkedPrompt | null>(null);
+  // A prompt restored from storage joins the same lifecycle as a consumed link.
+  const syncsParkedDraftRef = useRef(landingDraft?.fromLink === true || restoresKeptLinkedPrompt);
+  useEffect(() => {
+    if (keptLinkedPrompt !== null && !ownsKeptLinkedPrompt) {
+      forgetKeptLinkedPrompt(siblingSourceId, keptLinkedPrompt);
+    }
+  }, [keptLinkedPrompt, ownsKeptLinkedPrompt, siblingSourceId]);
   // A handoff or prompt link replaces the parked draft's text, and with it the
   // tags that text's tokens pointed at.
-  const restoresDraftText = handoff === null && !linkedPrompt?.trim();
+  const restoresDraftText = handoff === null && !linkedPrompt?.trim() && !restoresKeptLinkedPrompt;
   const [message, setMessage] = useState<string>(() => {
     if (handoff !== null) return handoff.text;
-    return linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? "");
+    if (linkedPrompt?.trim()) return linkedPrompt;
+    if (restoresKeptLinkedPrompt) return keptLinkedPrompt?.text ?? "";
+    return restoredDraft?.message ?? "";
   });
   // Filled in once the mention browser below owns the tags.
   const clearTaggedMentionsRef = useRef<() => void>(() => {});
@@ -2504,6 +2640,19 @@ function NewChatLandingContent({
     if (linkedPrompt?.trim()) {
       setMessage(linkedPrompt);
       clearTaggedMentionsRef.current();
+      // The link's text is literal, so the parked copy carries none of the old tags.
+      writeLandingDraft(draftState, {
+        ...draftRef.current,
+        message: linkedPrompt,
+        mentions: undefined,
+        fromLink: true,
+      });
+      syncsParkedDraftRef.current = true;
+      keptLinkedRef.current = keepLinkedPrompt(siblingSourceId, linkedPrompt);
+    } else if (handoff !== null) {
+      // The handoff replaced the draft, so a prompt kept for this composer is stale.
+      keptLinkedRef.current = null;
+      forgetKeptLinkedPrompt(siblingSourceId, null);
     }
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
@@ -2511,7 +2660,30 @@ function NewChatLandingContent({
     remaining.delete(NEW_SESSION_HANDOFF_PARAM);
     forgetNewSessionHandoff(handoffToken);
     replaceSearchParams(remaining);
-  }, [linkedPrompt, handoffToken, searchParams, replaceSearchParams]);
+  }, [
+    linkedPrompt,
+    handoffToken,
+    handoff,
+    searchParams,
+    replaceSearchParams,
+    draftState,
+    siblingSourceId,
+  ]);
+  // Once the user acts on the prompt, a reload must not bring the link's text
+  // back over their work. Any change to the text counts (typing, dictation,
+  // slash completion, clearing).
+  useEffect(() => {
+    const kept = keptLinkedRef.current;
+    if (kept === null || message === kept.text) return;
+    keptLinkedRef.current = null;
+    forgetKeptLinkedPrompt(siblingSourceId, kept);
+  }, [message, siblingSourceId]);
+  // A draft parked at link consumption is the only copy a same-commit remount can
+  // read, so it follows every edit; a submitted draft stays spent.
+  useEffect(() => {
+    if (!syncsParkedDraftRef.current || submittedRef.current) return;
+    writeLandingDraft(draftState, { ...draftRef.current, fromLink: true });
+  }, [message, draftState]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -5047,7 +5219,16 @@ function NewChatLandingContent({
     const { writes } = step;
     if (writes.selectSandbox) {
       setSandboxSelected(true);
-      setSandboxProvider(defaultSandboxProvider());
+      // A stored provider the server no longer offers falls back to the default.
+      const storedProvider = writes.sandboxProvider;
+      setSandboxProvider(
+        storedProvider !== undefined && sandboxProviderRows.includes(storedProvider)
+          ? storedProvider
+          : defaultSandboxProvider(),
+      );
+    }
+    if (writes.sandboxRepos !== undefined) {
+      setSandboxRepoSelections(writes.sandboxRepos);
     }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
@@ -5089,6 +5270,7 @@ function NewChatLandingContent({
     prefillConfig,
     projectLaunch,
     defaultSandboxProvider,
+    sandboxProviderRows,
   ]);
 
   // Nested agents reuse their source checkout unless a new worktree is explicitly chosen.
@@ -5884,6 +6066,10 @@ function NewChatLandingContent({
   // dropped it on the strength of the submit.
   function returnDraftToUser(temporaryConversationId?: string) {
     submittedRef.current = false;
+    if (submittedLinkedPromptRef.current !== null) {
+      submittedKeptPromptIds.delete(submittedLinkedPromptRef.current.id);
+      submittedLinkedPromptRef.current = null;
+    }
     submittedDraftRevisionRef.current = null;
     removeNestedSessionDraft(queryClient, nestedProvisional.id);
     if (siblingSource && onScreenRef.current) {
@@ -5910,6 +6096,9 @@ function NewChatLandingContent({
   }
 
   async function handleCreate() {
+    // Captured before any await: a newer prompt link can replace the kept record
+    // while an earlier submit is still waiting on a pre-create check.
+    const submittedLinkedPrompt = keptLinkedRef.current;
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
@@ -6002,8 +6191,12 @@ function NewChatLandingContent({
         if (needsDbcert) return;
       }
       // Spend the draft only once provisioning starts, after the laptop credential check.
+      // A composer remounted in this commit would otherwise restore the submitted text.
+      if (draftState.draft !== null) writeLandingDraft(draftState, null);
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
+      submittedLinkedPromptRef.current = submittedLinkedPrompt;
+      if (submittedLinkedPrompt !== null) submittedKeptPromptIds.add(submittedLinkedPrompt.id);
       if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
@@ -6203,7 +6396,7 @@ function NewChatLandingContent({
         const metadata: Parameters<typeof createBundledSession>[1] = { labels: createLabels };
         if (siblingSourceId) metadata.sibling_source_id = siblingSourceId;
         if (sandboxSelected) {
-          // Multipart creates allocate their host server-side; they cannot reserve a host ID.
+          // Bundle creates send no host id until the server's multipart host_id is deployed.
           metadata.host_type = "managed";
           metadata.workspaces = composeSandboxWorkspaces(sandboxRepoSelections);
           if (sandboxProvider !== null) metadata.sandbox_provider = sandboxProvider;
@@ -6297,6 +6490,7 @@ function NewChatLandingContent({
         const matchOwnCreate = (item: SessionListWireItem) =>
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
+        const managedHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
         const createPayload = JSON.stringify({
           ...(siblingSourceId ? { sibling_source_id: siblingSourceId } : {}),
           ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
@@ -6329,9 +6523,7 @@ function NewChatLandingContent({
                   : {}),
                 // The new sandbox host's id, in the server's minted shape;
                 // keys the create and the session's requests until it binds.
-                ...(info !== "loading" && info.request_managed_sandbox_host_id
-                  ? { host_id: randomUUID().replace(/-/g, "") }
-                  : {}),
+                ...(managedHostId ? { host_id: managedHostId } : {}),
                 ...(sandboxPreviewEnabled && sandboxModels.data?.configuration_revision
                   ? {
                       inference_configuration_revision: sandboxModels.data.configuration_revision,
@@ -6591,6 +6783,11 @@ function NewChatLandingContent({
       appendPromptHistoryEntry(initialPrompt, data.id);
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
+      if (submittedLinkedPrompt !== null) {
+        if (keptLinkedRef.current === submittedLinkedPrompt) keptLinkedRef.current = null;
+        forgetKeptLinkedPrompt(siblingSourceId, submittedLinkedPrompt);
+        submittedKeptPromptIds.delete(submittedLinkedPrompt.id);
+      }
       if (submittedDraftRevisionRef.current === draftState.revision) {
         writeLandingDraft(draftState, null);
       }
@@ -8193,7 +8390,7 @@ function NewChatLandingContent({
             ? async (bundle) => {
                 const installed = await installAgentBundle(bundle);
                 try {
-                  const mine = await queryClient.fetchQuery({
+                  const { agents: mine } = await queryClient.fetchQuery({
                     queryKey: USER_AGENTS_QUERY_KEY,
                     queryFn: fetchUserAgents,
                     staleTime: 0,
