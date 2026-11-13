@@ -40,7 +40,6 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
-import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/scheduled/Label";
@@ -1894,30 +1893,48 @@ export function CreateScheduledTaskDialog({
                         >
                           {trigger !== null && editingTask === null && (
                             <div
-                              className="flex min-h-9 flex-col gap-2 py-2"
+                              className="flex min-h-9 items-center justify-between gap-4 py-px"
                               data-testid="task-trigger-session-mode-field"
                             >
-                              <div className="flex items-center justify-between gap-4">
-                                <Label htmlFor="task-trigger-session-mode">
-                                  Start a new session for each match
-                                </Label>
-                                <Switch
-                                  id="task-trigger-session-mode"
-                                  checked={triggerTaskSessionMode === "new"}
-                                  onCheckedChange={(checked) =>
-                                    setTriggerTaskSessionMode(checked ? "new" : "continue")
-                                  }
-                                  data-testid="task-trigger-session-mode"
-                                  componentId="tasks.scheduled.trigger_session_mode"
-                                />
-                              </div>
-                              {triggerTaskSessionMode === "continue" && (
-                                <p className="text-sm text-muted-foreground">
-                                  Every match goes to one task session, started on the first match,
-                                  so it keeps its context across matches. Archiving it starts a new
-                                  one on the next match.
-                                </p>
-                              )}
+                              <span className="text-ui text-muted-foreground">
+                                Session continuity
+                              </span>
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <ComposerHarnessTrigger
+                                    label="Session continuity"
+                                    model={
+                                      triggerTaskSessionMode === "new"
+                                        ? "New session for each match"
+                                        : "One task session for all matches"
+                                    }
+                                    icon={<RefreshCwIcon className="size-4 shrink-0" />}
+                                    className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                    data-testid="task-trigger-session-mode"
+                                  />
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align="end" className="w-80">
+                                  <DropdownMenuRadioGroup
+                                    value={triggerTaskSessionMode}
+                                    onValueChange={(value) =>
+                                      setTriggerTaskSessionMode(value as TriggerTaskSessionMode)
+                                    }
+                                  >
+                                    <DropdownMenuRadioItem value="new">
+                                      New session for each match
+                                    </DropdownMenuRadioItem>
+                                    <DropdownMenuRadioItem value="continue">
+                                      <span className="flex flex-col gap-0.5">
+                                        <span>One task session for all matches</span>
+                                        <span className="text-sm text-muted-foreground">
+                                          Started on the first match, so it keeps its context across
+                                          matches. Archiving it starts a new one on the next match.
+                                        </span>
+                                      </span>
+                                    </DropdownMenuRadioItem>
+                                  </DropdownMenuRadioGroup>
+                                </DropdownMenuContent>
+                              </DropdownMenu>
                             </div>
                           )}
                           {/* A trigger keeps one session: the mode switch stays hidden, but an edit can restart it. */}

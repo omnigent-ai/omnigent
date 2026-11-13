@@ -367,6 +367,12 @@ function openAutomationSection(name: AutomationSectionName) {
   }
 }
 
+/** Pick how a new trigger's matches map to sessions in Advanced settings. */
+function chooseTriggerSessionMode(label: "New session for each match" | "One task session") {
+  fireEvent.keyDown(screen.getByTestId("task-trigger-session-mode"), { key: "Enter" });
+  fireEvent.click(screen.getByRole("menuitemradio", { name: new RegExp(`^${label}`) }));
+}
+
 function closeTopLevelPopovers() {
   for (const testId of ["task-schedule-trigger", "task-ending-trigger"]) {
     const trigger = screen.queryByTestId(testId);
@@ -3463,15 +3469,15 @@ describe("automation trigger type", () => {
 
   it("keeps the task session choice when switching integrations", async () => {
     render(dialog());
-    const toggle = () => screen.getByRole("switch", { name: "Start a new session for each match" });
+    const sessionMode = () => screen.getByTestId("task-trigger-session-mode");
     await choose("Jira");
-    fireEvent.click(toggle());
+    chooseTriggerSessionMode("One task session");
     await choose("Slack");
-    expect(toggle()).not.toBeChecked();
+    expect(sessionMode()).toHaveTextContent("One task session for all matches");
     await choose("Schedule");
     expect(screen.queryByTestId("task-trigger-session-mode-field")).not.toBeInTheDocument();
     await choose("Slack");
-    expect(toggle()).not.toBeChecked();
+    expect(sessionMode()).toHaveTextContent("One task session for all matches");
     type("task-trigger-scope", "support");
     type("task-trigger-instructions", "Answer the question.");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
@@ -4020,17 +4026,21 @@ describe("CreateScheduledTaskDialog trigger template", () => {
   it("starts a session per match unless advanced settings use one task session", async () => {
     renderTrigger("jira");
     fillJira();
-    const toggle = screen.getByRole("switch", { name: "Start a new session for each match" });
-    expect(toggle).toBeChecked();
+    const sessionMode = screen.getByTestId("task-trigger-session-mode");
+    expect(screen.getByTestId("task-trigger-session-mode-field")).toHaveTextContent(
+      "Session continuity",
+    );
+    expect(sessionMode).toHaveTextContent("New session for each match");
     expect(screen.getByLabelText("Instructions for each session")).toHaveValue("Triage it.");
     expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
     expect(screen.queryByTestId("task-schedule-trigger")).not.toBeInTheDocument();
 
-    fireEvent.click(toggle);
-    expect(toggle).not.toBeChecked();
-    expect(screen.getByTestId("task-trigger-session-mode-field")).toHaveTextContent(
-      "Every match goes to one task session, started on the first match, so it keeps its context across matches.",
-    );
+    fireEvent.keyDown(sessionMode, { key: "Enter" });
+    expect(
+      screen.getByRole("menuitemradio", { name: /^One task session for all matches/ }),
+    ).toHaveTextContent("Started on the first match, so it keeps its context across matches.");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /^One task session/ }));
+    expect(sessionMode).toHaveTextContent("One task session for all matches");
     expect(screen.getByLabelText("Instructions for the task session")).toHaveValue("Triage it.");
     expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
     expect(screen.queryByTestId("task-schedule-trigger")).not.toBeInTheDocument();
