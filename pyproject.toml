@@ -123,6 +123,9 @@ dependencies = [
     # runtime guarantee allows a newer runtime (7.x) to load older gencode, so
     # a plain install stays on 6.x and an antigravity install upgrades to 7.x.
     "protobuf>=6,<8",
+    # Connect RPC server and client for the workspace API
+    # (omnigent/api/workspace/v1alpha1/workspace.proto). Pre-1.0: pin minor.
+    "connectrpc>=0.13,<0.14",
     # RFC 5545 recurrence rules for the scheduled-task scheduler
     # (omnigent/server/scheduled/rrule.py). Imported at module top and pulled
     # onto the core server boot path via app.py; previously only a transitive
@@ -341,8 +344,8 @@ lint = [
     "ruff>=0.6",
     "pyrefly==1.1.1",
     "pre-commit>=3.5",
-    # protoc + the well-known-type protos, for regenerating the routing API
-    # bindings (omnigent/api/routing/v1/routing_pb2.*). Bundles its own compiler so no
+    # protoc + the well-known-type protos, for regenerating the API bindings
+    # (omnigent/api/**/*_pb2.*; see scripts/gen_protobuf.py). Bundles its own compiler so no
     # system protoc is needed. Capped below 1.83 so the bundled libprotoc emits
     # protobuf 6.x gencode; routing_pb2 must stay at gencode 6.x because
     # cwsandbox/modal installs are pinned to a protobuf 6.x runtime and the
@@ -350,6 +353,9 @@ lint = [
     # (antigravity) also loads 6.x gencode under the forward-compat guarantee,
     # so 6.x gencode satisfies all install forks.
     "grpcio-tools>=1.68,<=1.81.1",
+    # protoc plugin for the Connect RPC stubs (omnigent/api/**/*_connect.py).
+    # Keep in step with the connectrpc runtime pin.
+    "protoc-gen-connectrpc>=0.13,<0.14",
 ]
 test = [
     "pytest>=7.0",
@@ -575,6 +581,7 @@ extend-exclude = [
     # Protobuf-generated code (DO NOT EDIT); not ours to restyle.
     "omnigent/api/**/*_pb2.py",
     "omnigent/api/**/*_pb2.pyi",
+    "omnigent/api/**/*_connect.py",
 ]
 
 [tool.ruff.format]
