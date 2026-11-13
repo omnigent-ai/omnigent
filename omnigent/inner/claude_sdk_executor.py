@@ -84,6 +84,7 @@ from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from ._subprocess_lifecycle import close_anyio_subprocess_transport
 from .async_utils import run_sync_on_thread
 from .claude_gateway_shim import DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES, ClaudeGatewayShim
+from .claude_sdk_key_file import PrivateStaticKeyFile
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
     Executor,
@@ -1071,6 +1072,7 @@ class _ManagedMcpRelay:
 class _ClaudeClientState:
     client: _ClaudeClient
     model: str | None
+    static_key_file: PrivateStaticKeyFile | None = None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
@@ -1110,10 +1112,15 @@ def _recording_consents(
 
 
 async def _close_managed_mcp_relay(state: _ClaudeClientState) -> None:
-    """Release a gone CLI's relay and launcher; the relay's shutdown blocks briefly."""
+    """Release a gone CLI's auxiliary resources; relay shutdown blocks briefly."""
     relay, launcher = state.mcp_relay, state.cli_launcher
+    key_file, state.static_key_file = state.static_key_file, None
     state.mcp_relay = state.cli_launcher = None
-    await asyncio.to_thread(_release_client_cli, relay, launcher)
+    try:
+        if key_file is not None:
+            key_file.close()
+    finally:
+        await asyncio.to_thread(_release_client_cli, relay, launcher)
 
 
 def _release_client_cli(relay: _ManagedMcpRelay | None, launcher: str | None) -> None:
@@ -1645,11 +1652,10 @@ def _claude_settings_payload(
     return json.dumps(settings, separators=(",", ":")) if settings else None
 
 
-# Static gateway helpers use POSIX printf; Windows uses an encoded operand.
-# Quote-free code stays literal in both cmd.exe and sh. Binary UTF-8 output
-# preserves key bytes without Windows newline or console-codepage conversion.
+# The helper carries only a path; the client owns the private credential file.
 _STATIC_API_KEY_HELPER_CODE = (
-    "import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.argv[1],validate=True))"
+    "import base64,pathlib,sys;sys.stdout.buffer.write("
+    "pathlib.Path(base64.b64decode(sys.argv[1]).decode()).read_bytes())"
 )
 
 # Characters that would be reinterpreted by cmd.exe (``%`` / ``!`` expansion)
@@ -1682,16 +1688,14 @@ def _static_printf_secret(command: str | None) -> str | None:
     return secret
 
 
-def _windows_static_key_helper_command(python_executable: str | None, secret: str) -> str | None:
-    """Build a Windows helper with the key encoded in its existing settings operand.
+def _windows_static_key_helper_command(
+    python_executable: str | None, key_path: pathlib.Path
+) -> str | None:
+    """Build a Windows helper whose only operand encodes the private file path.
 
-    :param python_executable: Absolute interpreter path, e.g.
-        ``"C:\\\\Program Files\\\\Python312\\\\python.exe"``.
-    :param secret: Literal credential; encoding handles shell quoting, not secrecy.
-    :returns: ``"<python>" -I -S -c "<code>" <base64-key>``, or ``None`` when
-        the interpreter path is empty or contains characters that cmd.exe or
-        POSIX sh would reinterpret inside double quotes (including a UNC
-        ``\\\\`` prefix, which sh collapses inside double quotes).
+    :param python_executable: Interpreter path; shell-expanding paths are rejected.
+    :param key_path: Client-owned credential file, never the credential itself.
+    :returns: A command carrying only code and a path, or None for an unsafe interpreter.
     """
     if not python_executable:
         return None
@@ -1699,10 +1703,8 @@ def _windows_static_key_helper_command(python_executable: str | None, secret: st
         return None
     if "\\\\" in python_executable:
         return None
-    return (
-        f'"{python_executable}" -I -S -c "{_STATIC_API_KEY_HELPER_CODE}" '
-        f"{base64.b64encode(secret.encode()).decode('ascii')}"
-    )
+    encoded_path = base64.b64encode(str(key_path).encode("utf-8")).decode("ascii")
+    return f'"{python_executable}" -I -S -c "{_STATIC_API_KEY_HELPER_CODE}" {encoded_path}'
 
 
 def _platform_safe_api_key_helper(
@@ -1711,20 +1713,12 @@ def _platform_safe_api_key_helper(
     is_windows: bool | None = None,
     python_executable: str | None = None,
 ) -> tuple[str | None, str | None]:
-    """Make a static-key apiKeyHelper runnable by Claude Code on Windows.
+    """Defer supported Windows static helpers until their client owns a key file.
 
-    On non-Windows platforms, or for any command that is not Omnigent's exact
-    static ``printf`` form, the command is returned unchanged. Like the
-    original helper, settings contain the credential; tools do not inherit
-    a new credential environment variable.
-
-    :param command: The apiKeyHelper command, or ``None``.
-    :param is_windows: Platform override for tests; ``None`` uses
-        :data:`omnigent._platform.IS_WINDOWS`.
-    :param python_executable: Interpreter override for tests; ``None`` uses
-        :data:`sys.executable`.
-    :returns: ``(helper_command, static_key)``. ``static_key`` is the
-        resolved key only when the Windows rewrite was applied, else ``None``.
+    :param command: Generated static helper or a dynamic command.
+    :param is_windows: Platform override for tests.
+    :param python_executable: Interpreter override for tests.
+    :returns: Unchanged command, or (None, static key) for deferred setup.
     """
     windows = IS_WINDOWS if is_windows is None else is_windows
     if not windows or not command:
@@ -1732,17 +1726,14 @@ def _platform_safe_api_key_helper(
     secret = _static_printf_secret(command)
     if secret is None:
         return command, None
-    helper = _windows_static_key_helper_command(
-        sys.executable if python_executable is None else python_executable, secret
-    )
-    if helper is None:
-        # Never log the command itself: it carries the key.
+    interpreter = sys.executable if python_executable is None else python_executable
+    if _windows_static_key_helper_command(interpreter, pathlib.Path("key")) is None:
         logger.warning(
             "claude-sdk: static API key apiKeyHelper could not be made "
             "Windows-safe (unusable Python interpreter path); leaving it unchanged"
         )
         return command, None
-    return helper, secret
+    return None, secret
 
 
 def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
@@ -2536,6 +2527,7 @@ class ClaudeSDKExecutor(Executor):
         session_key: str,
         options: SdkOptions,
         model: str | None,
+        static_api_key: str | None = None,
     ) -> _ClaudeClient:
         state = self._clients.get(session_key)
         if state is None:
@@ -2552,7 +2544,23 @@ class ClaudeSDKExecutor(Executor):
                     original_stderr(line)
 
             options.stderr = _tee_stderr
-            client = sdk.ClaudeSDKClient(options)
+            key_file = None
+            try:
+                if static_api_key is not None:
+                    key_file = PrivateStaticKeyFile(static_api_key)
+                    settings = json.loads(getattr(options, "settings", None) or "{}")
+                    helper = _windows_static_key_helper_command(sys.executable, key_file.path)
+                    if helper is None:
+                        raise RuntimeError("Claude SDK helper interpreter is unavailable")
+                    settings["apiKeyHelper"] = helper
+                    options.settings = json.dumps(settings, separators=(",", ":"))
+                client = sdk.ClaudeSDKClient(options)
+            except BaseException:
+                options.stderr = original_stderr
+                if key_file is not None:
+                    key_file.close()
+                raise
+            connected = False
             try:
                 # CLAUDECODE must be absent (not just empty) in the child
                 # env — otherwise the claude cli reports a nested-session
@@ -2586,8 +2594,8 @@ class ClaudeSDKExecutor(Executor):
                             _unset_env_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
                         )
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
+                connected = True
             except TimeoutError as exc:
-                await self._force_close_client(client)
                 tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
                 detail = tail or "(no CLI stderr captured)"
                 logger.warning(
@@ -2606,7 +2614,6 @@ class ClaudeSDKExecutor(Executor):
                 # the error message is useful rather than just "Command failed
                 # with exit code 1; Check stderr output for details".
                 await asyncio.sleep(0.1)
-                await self._force_close_client(client)
                 tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
                 detail = tail or "(no CLI stderr captured)"
                 logger.error(
@@ -2622,12 +2629,19 @@ class ClaudeSDKExecutor(Executor):
                 # directly to the original callback and ``connect_stderr``
                 # can be GC'd instead of growing for the session lifetime.
                 options.stderr = original_stderr
+                if not connected:
+                    try:
+                        await self._force_close_client(client)
+                    finally:
+                        if key_file is not None:
+                            key_file.close()
             current_task: asyncio.Task[None] | None = cast(
                 "asyncio.Task[None] | None", asyncio.current_task()
             )
             state = _ClaudeClientState(
                 client=client,
                 model=model,
+                static_key_file=key_file,
                 loop=asyncio.get_running_loop(),
                 task=current_task,
                 effort=getattr(options, "effort", None),
@@ -3999,6 +4013,7 @@ class ClaudeSDKExecutor(Executor):
                 session_key=session_key,
                 options=options,
                 model=model,
+                **({"static_api_key": static_api_key} if static_api_key is not None else {}),
             )
         except BaseException:
             await asyncio.to_thread(_release_client_cli, mcp_relay, cli_launcher)

@@ -2270,6 +2270,9 @@ class TestSystemMessages(unittest.TestCase):
                 patch.object(
                     ex.model_catalog, "listing_for_provider", return_value=listing
                 ) as lister,
+                patch.object(
+                    ex, "PrivateStaticKeyFile", wraps=ex.PrivateStaticKeyFile
+                ) as create_key,
             ):
                 executor = ClaudeSDKExecutor(
                     gateway=True,
@@ -2277,33 +2280,49 @@ class TestSystemMessages(unittest.TestCase):
                     base_url_override="https://host/ai-gateway/anthropic",
                     gateway_auth_command="printf token",
                 )
-                events = [
-                    e
-                    async for e in executor.run_turn(
-                        [{"role": "user", "content": "hello"}],
-                        [],
-                        "",
-                    )
-                ]
-            self.assertEqual(len(events), 1)
-            lister.assert_called_once()
-            discovered.append(lister.call_args.args[0])
-            # The gateway path routes the CLI through the local shim
-            # (which restores thinking.display); record its target and
-            # shut it down inside the loop that started it.
-            self.assertIsNotNone(executor._gateway_shim)
-            shim_upstream["base_url"] = executor._gateway_shim.base_url
-            shim_upstream["upstream"] = executor._gateway_shim._upstream_base_url
-            await executor._gateway_shim.aclose()
+                credential_file = None
+                try:
+                    for _turn in range(2):
+                        events = [
+                            e
+                            async for e in executor.run_turn(
+                                [{"role": "user", "content": "hello"}],
+                                [],
+                                "",
+                            )
+                        ]
+                        self.assertEqual(len(events), 1)
+                        state = executor._clients["default"]
+                        if windows_static:
+                            helper = json.loads(captured_options[0].settings)["apiKeyHelper"]
+                            operand = helper.rsplit(" ", 1)[1]
+                            path = Path(base64.b64decode(operand, validate=True).decode("utf-8"))
+                            self.assertEqual(path.read_bytes(), token.encode("utf-8"))
+                            self.assertEqual(state.static_key_file.path, path)
+                            if credential_file is not None:
+                                self.assertEqual(path, credential_file)
+                            credential_file = path
+                        else:
+                            self.assertIsNone(state.static_key_file)
+                    self.assertEqual(create_key.call_count, int(windows_static))
+                    lister.assert_called_once()
+                    discovered.append(lister.call_args.args[0])
+                    self.assertIsNotNone(executor._gateway_shim)
+                    shim_upstream["base_url"] = executor._gateway_shim.base_url
+                    shim_upstream["upstream"] = executor._gateway_shim._upstream_base_url
+                finally:
+                    await executor.close()
+                if credential_file is not None:
+                    self.assertFalse(credential_file.parent.exists())
 
         _run(_t())
 
         self.assertEqual(len(captured_options), 1)
         settings = json.loads(captured_options[0].settings)
         if windows_static:
-            self.assertEqual(
-                settings["apiKeyHelper"],
-                ex._windows_static_key_helper_command(sys.executable, token),
+            self.assertNotIn(token, captured_options[0].settings)
+            self.assertNotIn(
+                base64.b64encode(token.encode()).decode(), captured_options[0].settings
             )
             self.assertNotIn(token, captured_options[0].env.values())
             self.assertNotIn("OMNIGENT_CLAUDE_SDK_HELPER_STATIC_KEY", captured_options[0].env)

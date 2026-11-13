@@ -1,39 +1,26 @@
-"""Regression tests for Windows-safe Claude SDK static-key apiKeyHelper.
-
-Tests are offline: no network, real credentials, or Claude/Omnigent inference.
-Every token below is a dummy string.
-
-What is covered:
-
-* Recognition of Omnigent's exact ``printf %s <shlex.quote(key)>`` form,
-  including tokens with shell-special characters, and rejection of anything
-  else (dynamic commands, shell-expanding look-alikes, trailing syntax).
-* POSIX: helper command is returned unchanged.
-* Windows (simulated via ``is_windows=True``): the helper is rewritten to an
-  interpreter-based command with a shell-safe encoded key operand. The
-  credential stays in settings instead of entering the child environment.
-  Dynamic commands are untouched; unsafe interpreter paths fall back.
-* Real execution of the rewritten helper under POSIX ``sh`` (runs on POSIX
-  only) and under ``cmd.exe /d /s /c`` (runs on Windows only).
-
-Validation limit: the cmd.exe execution test only runs on a Windows host, and
-none of these tests exercise the actual Claude Code CLI's apiKeyHelper
-launcher (its shell selection on Windows is not verifiable from this repo).
-"""
+"""Offline helper tests; shell cases do not exercise Claude Code's launcher."""
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from omnigent.inner import claude_sdk_executor as ex
+from omnigent.inner import claude_sdk_key_file as key_files
+from omnigent.inner.claude_sdk_key_file import PrivateStaticKeyFile
 
 _FAKE_WIN_PYTHON = r"C:\Program Files\Python312\python.exe"
 
@@ -108,21 +95,11 @@ def test_posix_helper_unchanged(command: str | None) -> None:
 # ── Windows (simulated): rewrite ─────────────────────────────────────────
 
 
-@pytest.mark.parametrize("token", DUMMY_TOKENS)
-def test_windows_static_helper_uses_shell_safe_settings_operand(token: str) -> None:
-    helper, static_key = ex._platform_safe_api_key_helper(
+def test_windows_static_helper_is_deferred_until_client_creation() -> None:
+    token = "dummy-key"
+    assert ex._platform_safe_api_key_helper(
         _static_cmd(token), is_windows=True, python_executable=_FAKE_WIN_PYTHON
-    )
-    assert helper is not None
-    assert static_key == token
-    encoded = helper.rsplit(" ", 1)[1]
-    assert base64.b64decode(encoded, validate=True).decode() == token
-    # Encoding only protects shell syntax. Settings still contain the credential.
-    for ch in ("'", "%", "!", "$", "`", "^", "&", "|", "<", ">"):
-        assert ch not in helper
-    payload = ex._claude_settings_payload(helper, {})
-    assert payload is not None
-    assert encoded in payload
+    ) == (None, token)
 
 
 @pytest.mark.parametrize(
@@ -168,48 +145,170 @@ def test_windows_unsafe_python_path_falls_back(
     assert token not in caplog.text
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["constructor", "connect", "timeout", "cancel"])
+async def test_failed_client_creation_removes_its_static_key_file(
+    outcome: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(key_files.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(ex, "_CONNECT_TIMEOUT_SECONDS", 0.1)
+    paths: list[Path] = []
+    connecting = asyncio.Event()
+
+    class Client:
+        def __init__(self, options: SimpleNamespace) -> None:
+            operand = json.loads(options.settings)["apiKeyHelper"].rsplit(" ", 1)[1]
+            path = Path(base64.b64decode(operand, validate=True).decode("utf-8"))
+            assert path.read_bytes() == b"dummy-lifecycle-key"
+            paths.append(path)
+            if outcome == "constructor":
+                raise RuntimeError("constructor failed")
+
+        async def connect(self) -> None:
+            connecting.set()
+            if outcome == "connect":
+                raise RuntimeError("connect failed")
+            await asyncio.Event().wait()
+
+    executor = ex.ClaudeSDKExecutor()
+
+    async def force_close(_client: Client) -> None:
+        assert paths[0].exists(), "keep the key until the failed CLI has stopped"
+
+    close = AsyncMock(side_effect=force_close)
+    monkeypatch.setattr(executor, "_force_close_client", close)
+    options = SimpleNamespace(stderr=None, settings=None)
+    create = asyncio.create_task(
+        executor._get_or_create_client(
+            SimpleNamespace(ClaudeSDKClient=Client),
+            session_key="failed",
+            options=options,
+            model=None,
+            static_api_key="dummy-lifecycle-key",
+        )
+    )
+    if outcome == "cancel":
+        await asyncio.wait_for(connecting.wait(), timeout=5)
+        create.cancel()
+    expected = (
+        asyncio.CancelledError
+        if outcome == "cancel"
+        else TimeoutError
+        if outcome == "timeout"
+        else RuntimeError
+    )
+    with pytest.raises(expected):
+        await create
+    assert paths and not paths[0].parent.exists()
+    assert not list(tmp_path.glob("omnigent-claude-key-*"))
+    assert not executor._clients
+    assert options.stderr is None
+    assert close.await_count == int(outcome != "constructor")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_mode", ["disconnect", "force", "evict"])
+async def test_static_key_file_lives_until_its_cached_client_closes(
+    close_mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(key_files.tempfile, "gettempdir", lambda: str(tmp_path))
+    constructed: list[object] = []
+
+    class Client:
+        def __init__(self, _options: SimpleNamespace) -> None:
+            constructed.append(self)
+
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            assert key_file.path.exists()
+
+    executor = ex.ClaudeSDKExecutor()
+    sdk = SimpleNamespace(ClaudeSDKClient=Client)
+    kwargs = {"session_key": "cached", "model": None, "static_api_key": "dummy-cached-key"}
+    first = await executor._get_or_create_client(
+        sdk, options=SimpleNamespace(stderr=None, settings='{"existing":true}'), **kwargs
+    )
+    state = executor._clients["cached"]
+    key_file = state.static_key_file
+    assert key_file is not None
+    try:
+        reused = await executor._get_or_create_client(
+            sdk, options=SimpleNamespace(stderr=None, settings=None), **kwargs
+        )
+        assert reused is first and constructed == [first]
+        assert key_file.path.read_bytes() == b"dummy-cached-key"
+        assert len(list(tmp_path.glob("omnigent-claude-key-*"))) == 1
+
+        async def force_close(_client: Client) -> None:
+            assert key_file.path.exists()
+
+        close = AsyncMock(side_effect=force_close)
+        monkeypatch.setattr(executor, "_force_close_client", close)
+        if close_mode == "evict":
+            executor._evict_client_on_cancel("cached")
+            await asyncio.gather(*executor._cancel_close_tasks)
+        else:
+            if close_mode == "force":
+                state.loop = object()
+            await executor.close_session("cached")
+        assert close.await_count == 1
+        assert not executor._clients
+        assert not key_file.directory.exists()
+        assert state.static_key_file is None
+    finally:
+        await executor.close()
+        key_file.close()
+
+
 # ── real execution of the rewritten helper (offline, local interpreter) ──
 
 
-def _helper_for_this_interpreter(token: str) -> tuple[str, dict[str, str]]:
-    helper = ex._windows_static_key_helper_command(sys.executable, token)
-    if helper is None:
-        pytest.skip("sys.executable path contains characters the helper rejects")
-    child_env = dict(os.environ)
-    return helper, child_env
+@contextmanager
+def _helper_for_this_interpreter(token: str) -> Iterator[str]:
+    key_file = PrivateStaticKeyFile(token)
+    try:
+        helper = ex._windows_static_key_helper_command(sys.executable, key_file.path)
+        if helper is None:
+            pytest.skip("sys.executable path contains characters the helper rejects")
+        yield helper
+    finally:
+        key_file.close()
+
+
+_EXECUTION_TOKENS = [DUMMY_TOKENS[0], " | ".join(DUMMY_TOKENS[1:])]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX sh execution test")
-@pytest.mark.parametrize("token", DUMMY_TOKENS)
+@pytest.mark.parametrize("token", _EXECUTION_TOKENS)
 def test_rewritten_helper_prints_exact_key_under_posix_sh(token: str) -> None:
-    helper, child_env = _helper_for_this_interpreter(token)
-    sh = shutil.which("sh") or "/bin/sh"
-    result = subprocess.run(
-        [sh, "-c", helper], env=child_env, capture_output=True, timeout=30, check=True
-    )
-    assert result.stdout.decode("utf-8") == token
+    with _helper_for_this_interpreter(token) as helper:
+        result = subprocess.run(
+            [shutil.which("sh") or "/bin/sh", "-c", helper],
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+    assert result.stdout == token.encode("utf-8")
 
 
 @pytest.mark.skipif(os.name != "nt", reason="cmd.exe execution test (Windows only)")
-@pytest.mark.parametrize("token", DUMMY_TOKENS)
+@pytest.mark.parametrize("token", _EXECUTION_TOKENS)
 def test_rewritten_helper_prints_exact_key_under_cmd_exe(token: str) -> None:
-    helper, child_env = _helper_for_this_interpreter(token)
-    comspec = os.environ.get("COMSPEC", "cmd.exe")
-    # A raw command-line string (not a list) so Python does not re-quote it;
-    # mirrors Node's ``cmd.exe /d /s /c "<command>"`` shell invocation.
-    result = subprocess.run(
-        f'"{comspec}" /d /s /c "{helper}"',
-        env=child_env,
-        capture_output=True,
-        timeout=30,
-        check=True,
-    )
-    assert result.stdout.decode("utf-8") == token
+    with _helper_for_this_interpreter(token) as helper:
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        result = subprocess.run(
+            f'"{comspec}" /d /s /c "{helper}"',
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+    assert result.stdout == token.encode("utf-8")
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows interpreter-path test")
 def test_windows_helper_uses_interpreter_path_with_spaces(tmp_path: Path) -> None:
-    """Execute through cmd.exe with a real interpreter in a spaced path."""
     venv = tmp_path / "helper interpreter"
     subprocess.run(
         [sys.executable, "-m", "venv", "--without-pip", str(venv)],
@@ -217,17 +316,81 @@ def test_windows_helper_uses_interpreter_path_with_spaces(tmp_path: Path) -> Non
         capture_output=True,
         timeout=60,
     )
-    helper = ex._windows_static_key_helper_command(
-        str(venv / "Scripts" / "python.exe"), "dummy-quoted-path-key"
-    )
-    assert helper is not None
-    child_env = dict(os.environ)
-    comspec = os.environ.get("COMSPEC", "cmd.exe")
-    result = subprocess.run(
-        f'"{comspec}" /d /s /c "{helper}"',
-        env=child_env,
-        capture_output=True,
-        timeout=30,
-        check=True,
-    )
-    assert result.stdout == b"dummy-quoted-path-key"
+    key_file = PrivateStaticKeyFile("dummy-quoted-path-key")
+    try:
+        helper = ex._windows_static_key_helper_command(
+            str(venv / "Scripts" / "python.exe"), key_file.path
+        )
+        assert helper is not None
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        result = subprocess.run(
+            f'"{comspec}" /d /s /c "{helper}"',
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        assert result.stdout == b"dummy-quoted-path-key"
+    finally:
+        key_file.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows ACL verification")
+def test_windows_key_file_has_a_protected_current_user_acl() -> None:
+    key_file = PrivateStaticKeyFile("dummy-acl-key")
+    script = """
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$sidType = [System.Security.Principal.SecurityIdentifier]
+foreach ($path in @($env:OMNI_TEST_KEY_DIRECTORY, $env:OMNI_TEST_KEY_PATH)) {
+    $acl = Get-Acl -LiteralPath $path
+    $rules = @($acl.Access)
+    if (!$acl.AreAccessRulesProtected -or $rules.Count -ne 1) { throw 'ACL is not private' }
+    if ($acl.GetOwner($sidType).Value -ne $sid) { throw 'Wrong owner' }
+    if ($rules[0].IdentityReference.Translate($sidType).Value -ne $sid) {
+        throw 'Wrong principal'
+    }
+    if ($rules[0].AccessControlType -ne 'Allow' -or
+        $rules[0].FileSystemRights -ne 'FullControl') { throw 'Wrong rights' }
+}
+Write-Output 'owner-only ACL verified'
+"""
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            env={
+                **os.environ,
+                "OMNI_TEST_KEY_DIRECTORY": str(key_file.directory),
+                "OMNI_TEST_KEY_PATH": str(key_file.path),
+            },
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        assert b"owner-only ACL verified" in result.stdout
+        assert key_file.path.read_bytes() == b"dummy-acl-key"
+    finally:
+        key_file.close()
+    assert not key_file.directory.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows ACL failure handling")
+@pytest.mark.parametrize("reject_directory", [True, False])
+def test_windows_key_file_cleans_up_when_permissions_cannot_be_verified(
+    reject_directory: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(key_files.tempfile, "gettempdir", lambda: str(tmp_path))
+    verify = key_files._WindowsOwnerAcl.verify
+    checked: list[Path] = []
+
+    def refuse(acl, path: Path, *, directory: bool, handle: int | None = None) -> None:
+        if directory == reject_directory:
+            checked.append(path)
+            if not directory:
+                assert path.stat().st_size == 0
+            raise OSError("permissions unavailable")
+        verify(acl, path, directory=directory, handle=handle)
+
+    monkeypatch.setattr(key_files._WindowsOwnerAcl, "verify", refuse)
+    with pytest.raises(RuntimeError, match="Could not create a private"):
+        PrivateStaticKeyFile("dummy-unwritten-key")
+    assert checked
+    assert not list(tmp_path.glob("omnigent-claude-key-*"))
