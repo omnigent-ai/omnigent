@@ -188,6 +188,12 @@ Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit
 
 `POST /v1/scheduled-tasks/{id}/run` fires a task immediately and returns 202. It does not disturb the recurring schedule, which makes it the way to test a new automation without waiting for its next occurrence.
 
+## Sharing
+
+With `automations_v2`, an automation's owner can share it with users and groups at read access; `/v1/info` reports `scheduled_task_sharing: true` when the server can store these grants. `GET /v1/scheduled-tasks/{id}/permissions` lists the grants, paged like a session's (`limit` 1–1,000 and `after`). `PUT` on the same path with `{"user_id": ..., "level": 1}` adds one, and `DELETE /v1/scheduled-tasks/{id}/permissions/{user_id}` removes one. Only the owner may call them; anyone else gets 404. The owner and `__public__` cannot be granted, and the server's sharing mode applies. Agent tools cannot call these routes, and cannot change the session, host, workspace or execution target of a shared automation.
+
+Each run shares the session it creates with the automation's grantees. A `continue` automation that is shared with anyone manages its session's sharing: each run, grant and removal leaves the session shared with exactly the automation's grantees, plus its owner and any public access. For a session the automation's first run created, `GET /v1/sessions/{id}/permissions` names the automation in `managed_by_automation`; a session picked with `session_id` is not named. Sessions of earlier runs of a `new` automation keep their grants when someone is removed.
+
 ## API reference
 
 | Method | Path | Purpose |
@@ -199,6 +205,9 @@ Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit
 | `DELETE` | `/v1/scheduled-tasks/{id}` | Delete a task. |
 | `POST` | `/v1/scheduled-tasks/{id}/run` | Run now (202). |
 | `GET` | `/v1/scheduled-tasks/{id}/runs` | Run history. |
+| `GET` | `/v1/scheduled-tasks/{id}/permissions` | List who the task is shared with. |
+| `PUT` | `/v1/scheduled-tasks/{id}/permissions` | Share the task with a user or group. |
+| `DELETE` | `/v1/scheduled-tasks/{id}/permissions/{user_id}` | Stop sharing the task with them. |
 
 A task response carries `id`, `name`, `prompt`, `rrule`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `session_mode`, `session_id`, `source_session_id`, `workspace`, `host_id`, `execution_target`, `project_id`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.
 

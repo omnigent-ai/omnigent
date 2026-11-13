@@ -39,6 +39,14 @@ def read_all_grants(
     return grants
 
 
+def scheduled_task_sharing_unsupported() -> OmnigentError:
+    """The error for sharing an automation where the server cannot store its grants."""
+    return OmnigentError(
+        "Sharing automations is not supported by this server.",
+        code=ErrorCode.FORBIDDEN,
+    )
+
+
 class PermissionStore(ABC):
     """Abstract base for session permission persistence.
 
@@ -365,6 +373,18 @@ class PermissionStore(ABC):
         """
         return list(grants)
 
+    def display_names(self, user_ids: Sequence[str]) -> dict[str, str]:
+        """Return a display name for each grantee ID, resolved in one batch.
+
+        The default returns each ID unchanged. Stores whose canonical IDs are not
+        readable names (see :meth:`validate_grants`) override this.
+
+        :param user_ids: Grantee IDs as the store returns them, e.g.
+            ``["alice@example.com"]``.
+        :returns: A name for every ID in *user_ids*.
+        """
+        return {user_id: user_id for user_id in user_ids}
+
     # ── Scheduled task grants ─────────────────────────────────────────────
     # The defaults suit a store that cannot persist these grants: it holds none,
     # refuses new ones and deletes nothing.
@@ -399,10 +419,7 @@ class PermissionStore(ABC):
             or a level outside the allowlist; ``NOT_FOUND`` when the task is missing
             or deleted; ``FORBIDDEN`` when the store does not support these grants.
         """
-        raise OmnigentError(
-            "Sharing automations is not supported by this server.",
-            code=ErrorCode.FORBIDDEN,
-        )
+        raise scheduled_task_sharing_unsupported()
 
     def revoke_for_scheduled_task(
         self,
