@@ -46,6 +46,7 @@ from omnigent.native.elicitation_reattach import (
 from omnigent.runtime import session_stream
 from omnigent.server._elicitation_registry import (
     _harness_pre_resolved_elicitations,
+    _harness_severed_elicitations,
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
@@ -2244,11 +2245,19 @@ async def test_pre_resolved_elicitation_tombstones_prune_expired_and_excess(
         _harness_pre_resolved_elicitations.clear()
 
 
-@pytest.mark.parametrize("tool_name", ["Bash", "AskUserQuestion"])
+_REATTACH_ELICITATION_ID = f"elicit_claude_{'ab' * 16}"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "elicitation_id"),
+    [("Bash", None), ("AskUserQuestion", None), ("AskUserQuestion", _REATTACH_ELICITATION_ID)],
+    ids=["approval", "question-without-id", "question-with-id"],
+)
 async def test_permission_request_hook_clears_index_on_client_disconnect(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     tool_name: str,
+    elicitation_id: str | None,
 ) -> None:
     """
     When the upstream client (Claude) closes its HTTP connection
@@ -2259,7 +2268,8 @@ async def test_permission_request_hook_clears_index_on_client_disconnect(
     A severed connection is ambiguous (TUI answered vs proxy cut an
     idle long-poll), so the clear waits out the grace instead of
     wiping a card the hook's retry is about to re-park. A question
-    without a hook-supplied id can never re-park, so it keeps this grace.
+    without a hook-supplied id can never re-park, so it keeps this grace;
+    one with an id expires the same way after its own, longer grace.
 
     The disconnect is simulated by patching the polling helper rather
     than wiring a real TCP teardown through the in-process ASGI
@@ -2294,21 +2304,25 @@ async def test_permission_request_hook_clears_index_on_client_disconnect(
         "_HARNESS_ELICITATION_REPARK_GRACE_S",
         1.0,
     )
+    monkeypatch.setattr(sessions_route, "_HARNESS_QUESTION_REPARK_GRACE_S", 1.0)
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, "test-permission-disconnect")
     session_id = await _create_session(client, agent["id"])
     payload = await _claude_permission_payload(tool_name=tool_name)
+    if elicitation_id is not None:
+        payload["_omnigent_elicitation_id"] = elicitation_id
 
-    async def _drain_until_resolved() -> None:
+    async def _drain_until_resolved() -> dict[str, Any]:
         """
         Wait for the deferred ``response.elicitation_resolved`` publish.
 
-        :returns: None.
+        :returns: The resolved event.
         """
         async with asyncio.timeout(3.0):
             async for event in session_stream.subscribe(session_id):
                 if event.get("type") == "response.elicitation_resolved":
-                    return
+                    return event
+        raise AssertionError("session stream ended before the deferred clear")
 
     drain_task = asyncio.create_task(_drain_until_resolved())
     await asyncio.sleep(0.05)
@@ -2331,17 +2345,19 @@ async def test_permission_request_hook_clears_index_on_client_disconnect(
         f"index should survive the disconnect until the grace elapses, "
         f"got {pending_elicitations.count_for(session_id)!r}"
     )
+    assert len(_harness_severed_elicitations) == 1
     # After the grace passes with no re-park, the deferred clear must
     # fire so badges don't stick when the hook died for real.
-    await drain_task
+    resolved = await drain_task
+    assert resolved.get("reason") == "unanswered", resolved
+    if elicitation_id is not None:
+        assert resolved["elicitation_id"] == elicitation_id
+    assert resolved["elicitation_id"] not in _harness_severed_elicitations
     assert pending_elicitations.count_for(session_id) == 0, (
         f"index should clear after the un-re-parked grace, got "
         f"{pending_elicitations.count_for(session_id)!r}"
     )
     pending_elicitations.reset_for_tests()
-
-
-_REATTACH_ELICITATION_ID = f"elicit_claude_{'ab' * 16}"
 
 
 @pytest.mark.parametrize(
@@ -2553,16 +2569,17 @@ async def test_permission_hook_verdict_during_gap_honored_on_repark(
     # "allow" proves the gap verdict was honored; an empty body here
     # would mean the tombstone was dropped and the click lost.
     assert body["hookSpecificOutput"]["decision"]["behavior"] == "allow"
-    # The question's grace is unpatched, so this finishes only if the verdict ended it.
-    for task in set(sessions_route._deferred_elicitation_clear_tasks):
-        await asyncio.wait_for(task, timeout=5.0)
-    resolved = []
-    while not collector.queue.empty():
-        event = collector.queue.get_nowait()
-        if event.get("type") == "response.elicitation_resolved":
-            resolved.append(event)
-    await collector.stop()
-    assert [event.get("reason") for event in resolved] == [None], resolved
+    try:
+        resolved = await collector.next_event()
+        while resolved["type"] != "response.elicitation_resolved":
+            resolved = await collector.next_event()
+        assert "reason" not in resolved, resolved
+        # The question's grace is unpatched, so this finishes only if the verdict ended it.
+        for task in set(sessions_route._deferred_elicitation_clear_tasks):
+            await asyncio.wait_for(task, timeout=5.0)
+        await collector.assert_no_event(within=0.2)
+    finally:
+        await collector.stop()
     pending_elicitations.reset_for_tests()
 
 
@@ -4022,6 +4039,8 @@ async def test_gated_tool_output_clears_severed_question_card(
     # Answered in the terminal, so the card must not claim the prompt expired.
     assert "reason" not in resolved, resolved
     assert pending_elicitations.count_for(session_id) == 0
+    for task in set(sessions_route._deferred_elicitation_clear_tasks):
+        await asyncio.wait_for(task, timeout=5.0)
     pending_elicitations.reset_for_tests()
 
 

@@ -2819,11 +2819,11 @@ async def _resolve_elicitation(
                 )
                 _prune_pre_resolved_harness_elicitations()
     elif harness_future is None and isinstance(elicitation_id, str) and elicitation_id:
+        # The resolved fan-out below clears the card, so a severed wait no longer holds it.
+        _release_severed_harness_elicitation(session_id, elicitation_id)
         # Nothing parked (severed long-poll mid-retry, or a runner-side
         # id that just ages out) — tombstone the verdict so a re-park
         # returns it; consume is session-checked, so no cross-session use.
-        # The resolved fan-out below clears the card, so a severed wait no longer holds it.
-        _release_severed_harness_elicitation(session_id, elicitation_id)
         result_payload = {k: v for k, v in data.items() if k != "elicitation_id"}
         try:
             pre_resolved = ElicitationResult.model_validate(result_payload)
