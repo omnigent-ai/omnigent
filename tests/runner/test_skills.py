@@ -752,3 +752,54 @@ async def test_codex_bundle_skill_not_duplicated_when_dir_differs_from_name(
     names = resp.json()["available"]
     # Exactly one entry for the skill (no phantom dir-named duplicate).
     assert names.count("triage") + names.count("sra--triage") == 1
+
+
+@pytest.mark.parametrize("harness", ["claude-sdk", "claude-native", "codex-native"])
+@pytest.mark.parametrize("retained", [False, True])
+@pytest.mark.asyncio
+async def test_skill_context_reaches_harness_before_executor_history_selection(harness, retained):
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from omnigent.tools.builtins.load_skill import format_skill_meta_text
+    from tests.runner.conftest import (
+        _FakeProcessManager,
+        _runner_client,
+        _ScriptedHarnessClient,
+        _sse,
+    )
+    from tests.runner.helpers import NullServerClient
+
+    skill = SkillSpec(name="review", description="Review", content="Instruction sentinel. " * 20)
+    first = format_skill_meta_text(skill, "first")
+    second = format_skill_meta_text(skill, "second")
+    messages = [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
+        for text in ((first, second) if retained else (second,))
+    ]
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "r1"}}),
+            _sse({"type": "response.completed", "response": {"id": "r1"}}),
+        ]
+    )
+
+    async def resolve(agent_id, session_id=None):
+        return AgentSpec(
+            spec_version=1,
+            name="test",
+            executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+        )
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),
+        spec_resolver=resolve,
+        server_client=NullServerClient(),
+    )
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_context/events",
+            params={"stream": "true"},
+            json={"type": "message", "role": "user", "agent_id": "ag_test", "content": messages},
+        )
+        assert response.status_code == 200, response.text
+    assert len(harness_client.posted_bodies) == 1
+    assert harness_client.posted_bodies[0]["content"] == messages

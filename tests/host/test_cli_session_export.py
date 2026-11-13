@@ -99,6 +99,62 @@ def test_session_export_writes_jsonl(tmp_path: Path) -> None:
 
 
 @respx.mock
+def test_session_export_import_preserves_skill_content(tmp_path: Path) -> None:
+    from omnigent.server.schemas import SessionCreateRequest
+
+    content = [
+        {
+            "type": "input_text",
+            "text": (
+                "<skill>\n<name>review</name>\nReview.\n</skill>\n\n"
+                "<user_request>\nkeep  these α arguments\n</user_request>"
+            ),
+        },
+        {"type": "input_image", "image_url": "data:image/png;base64,aW1hZ2U="},
+    ]
+    expansion = {
+        **_ITEMS_PAGE["data"][0],
+        "content": content,
+        "is_meta": True,
+        "user_authored": True,
+        "skill_expansion": True,
+    }
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
+        return_value=httpx.Response(200, json={**_SESSION_META, "agent_id": "ag_abc"})
+    )
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123/items").mock(
+        return_value=httpx.Response(200, json={**_ITEMS_PAGE, "data": [expansion]})
+    )
+
+    imported: list[SessionCreateRequest] = []
+
+    def create(request: httpx.Request) -> httpx.Response:
+        imported.append(SessionCreateRequest.model_validate_json(request.content))
+        return httpx.Response(201, json={"id": "conv_new"})
+
+    respx.post(f"{_BASE}/v1/sessions").mock(side_effect=create)
+    path = tmp_path / "transcript.jsonl"
+    runner = CliRunner()
+    exported = runner.invoke(
+        cli, ["session", "export", "--id", "conv_abc123", "--output", str(path), "--server", _BASE]
+    )
+    assert exported.exit_code == 0, exported.output
+    assert json.loads(path.read_text().splitlines()[1])["skill_expansion"] is True
+
+    result = runner.invoke(cli, ["session", "import", "--input", str(path), "--server", _BASE])
+    assert result.exit_code == 0, result.exception or result.output
+    assert "Imported 1 item(s) into conv_new" in result.output
+    assert len(imported) == 1
+    assert len(imported[0].initial_items) == 1
+    assert imported[0].initial_items[0].data == {
+        "role": "user",
+        "content": content,
+        "is_meta": True,
+        "user_authored": True,
+    }
+
+
+@respx.mock
 def test_session_export_spog_url_sends_workspace_selector(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

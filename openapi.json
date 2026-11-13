@@ -4796,6 +4796,18 @@
             "title": "Role",
             "type": "string"
           },
+          "skill_expansion": {
+            "anyOf": [
+              {
+                "const": true,
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skill Expansion"
+          },
           "startup_options": {
             "anyOf": [
               {
@@ -9329,6 +9341,18 @@
             ],
             "title": "Role",
             "type": "string"
+          },
+          "skill_expansion": {
+            "anyOf": [
+              {
+                "const": true,
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skill Expansion"
           },
           "startup_options": {
             "anyOf": [

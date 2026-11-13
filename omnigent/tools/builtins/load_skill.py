@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
+from omnigent.util.json_types import JsonObject
 
 
 class LoadSkillTool(Tool):
@@ -320,3 +322,67 @@ def format_skill_meta_text(skill: SkillSpec, arguments: str) -> str:
     if arguments:
         lines.extend(["", "<user_request>", arguments, "</user_request>"])
     return "\n".join(lines)
+
+
+def reuse_skill_context(messages: Sequence[JsonObject]) -> list[JsonObject]:
+    """Shorten repeated skill expansions within one complete outgoing input.
+
+    Keep durable history intact. Only an identical preceding user expansion in
+    this input permits reuse; a changed body or path becomes the new reference.
+    Callers must exclude native sessions, whose live context belongs to the CLI.
+    """
+    latest: dict[str, str] = {}
+
+    def shorten(text: str) -> str:
+        if not text.startswith("<skill>\n"):
+            return text
+        if not text.startswith("<skill>\n<name>") or text.count("\n</skill>") != 1:
+            latest.clear()
+            return text
+        name, separator, _ = text.removeprefix("<skill>\n<name>").partition("</name>\n")
+        if not separator or not name or "\n" in name:
+            latest.clear()
+            return text
+        instructions, _, arguments = text.rpartition("\n</skill>")
+        if arguments and not (
+            arguments.startswith("\n\n<user_request>\n")
+            and arguments.endswith("\n</user_request>")
+        ):
+            latest.clear()
+            return text
+        previous = latest.get(name)
+        latest[name] = instructions
+        if previous != instructions:
+            return text
+        reference = (
+            f"<skill_invocation>\n<name>{name}</name>\n"
+            "Apply the skill instructions already present in this conversation.\n"
+            f"</skill_invocation>{arguments}"
+        )
+        return reference if len(reference.encode("utf-8")) < len(text.encode("utf-8")) else text
+
+    result: list[JsonObject] = []
+    for message in messages:
+        if (
+            message.get("type", "message") != "message"
+            or message.get("role") != "user"
+            or message.get("skill_expansion") is not True
+        ):
+            result.append(message)
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            result.append({**message, "content": shorten(content)})
+        elif isinstance(content, list):
+            blocks = [
+                {**block, "text": shorten(block["text"])}
+                if isinstance(block, dict)
+                and block.get("type") in ("input_text", "text", "output_text")
+                and isinstance(block.get("text"), str)
+                else block
+                for block in content
+            ]
+            result.append({**message, "content": blocks})
+        else:
+            result.append(message)
+    return result

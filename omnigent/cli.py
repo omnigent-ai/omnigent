@@ -7686,6 +7686,8 @@ def _import_item_payload(item: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(item_type, str) or not item_type:
         raise click.ClickException(f"Export item is missing a 'type': {item!r}")
     raw = {key: value for key, value in item.items() if key not in _IMPORT_ITEM_ENVELOPE_FIELDS}
+    if item_type == "message":
+        raw.pop("skill_expansion", None)
     # Reverse the agent→model alias only for types that actually use it, so a
     # genuine ``model`` field on other types (compaction, routing_decision) is
     # preserved rather than corrupted.
