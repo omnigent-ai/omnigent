@@ -2616,23 +2616,23 @@ def test_supervise_forwarder_fails_pending_mcp_startup_when_stream_ends(
     from omnigent.harnesses.codex_native.bridge import read_mcp_startup
 
     _seed_pending_mcp_startup(tmp_path)
-    ap_events: list[dict[str, Any]] = []
+    posted: list[tuple[str, dict[str, Any]]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        ap_events.append(json.loads(request.content))
-        return httpx.Response(200)
-
-    asyncio.run(_supervise_test_forwarder(tmp_path, _FakeCodexAppServerClient(), handler=handler))
+    asyncio.run(
+        _supervise_test_forwarder(
+            tmp_path, _FakeCodexAppServerClient(), handler=_make_omnigent_handler(posted)
+        )
+    )
 
     expected = {
         "omnigent": {"status": "ready", "error": None},
         "jira": {
             "status": "failed",
-            "error": "Codex app-server stopped before MCP startup finished",
+            "error": "Codex app-server connection ended before MCP startup finished",
         },
     }
     assert read_mcp_startup(tmp_path) == expected
-    assert [event["data"] for event in ap_events if event["type"] == "external_mcp_startup"] == [
+    assert [body["data"] for _path, body in posted if body["type"] == "external_mcp_startup"] == [
         {"servers": expected}
     ]
 
@@ -2662,7 +2662,7 @@ def test_supervise_forwarder_cleans_up_when_the_mcp_failure_post_fails(
 
     failed_jira = {
         "status": "failed",
-        "error": "Codex app-server stopped before MCP startup finished",
+        "error": "Codex app-server connection ended before MCP startup finished",
     }
     assert [
         (servers["jira"], kwargs["max_attempts"], kwargs["timeout"])

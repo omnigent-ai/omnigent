@@ -1621,7 +1621,7 @@ def fail_pending_mcp_startup(
 
     :param bridge_dir: Native Codex bridge directory.
     :param error: Failure detail recorded on each pending server, e.g.
-        ``"Codex app-server stopped before MCP startup finished"``.
+        ``"Codex app-server connection ended before MCP startup finished"``.
     :returns: ``(map_after, changed)`` — the updated map and whether any
         entry was marked failed.
     """

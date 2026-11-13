@@ -5849,7 +5849,7 @@ async def _settle_mcp_startup(
     await _post_mcp_startup(client, session_id, servers)
 
 
-_MCP_STARTUP_FORWARDER_EXIT_ERROR = "Codex app-server stopped before MCP startup finished"
+_MCP_STARTUP_FORWARDER_EXIT_ERROR = "Codex app-server connection ended before MCP startup finished"
 # The runner stops the app-server only after the forwarder returns, so this
 # best-effort post gets one short attempt instead of the default retries.
 _MCP_STARTUP_FORWARDER_EXIT_POST_TIMEOUT_SECONDS = 5.0
