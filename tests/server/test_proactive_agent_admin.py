@@ -6,6 +6,7 @@ import io
 import tarfile
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -24,6 +25,11 @@ from tests.server.test_proactive_agent import _app, _create_session
 async def client(db_uri: str, tmp_path: Path) -> AsyncIterator[httpx.AsyncClient]:
     app = _app(db_uri, tmp_path, enabled=True)
     app.state.seed_builtin_agents()
+    # automations_v2 is on by default, so Run now records a run with the
+    # scheduler; the legacy fire path stays available for tests that turn it off.
+    app.state.scheduled_task_scheduler = SimpleNamespace(
+        run_now=AsyncMock(return_value=SimpleNamespace(id="run-1"))
+    )
     app.state.scheduled_task_run_now = AsyncMock(return_value=True)
     # The same directory _app stores bundles in.
     app.state.test_artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
@@ -105,10 +111,10 @@ async def test_run_now_starts_named_users_tasks_and_reports_the_rest(
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["started"] == [
-        {"user_id": "local", "task_id": proactive_task_id(None), "run_id": None}
+        {"user_id": "local", "task_id": proactive_task_id(None), "run_id": "run-1"}
     ]
     assert resp.json()["skipped"] == [{"user_id": "nobody@example.com", "reason": "no_task"}]
-    app.state.scheduled_task_run_now.assert_awaited_once()
+    app.state.scheduled_task_scheduler.run_now.assert_awaited_once()
 
     ProactiveAgentSettingsStore(db_uri).set_user_enabled("local", False)
     off = await client.post("/v1/proactive-agent/runs", json={"users": ["local"]})
@@ -118,6 +124,9 @@ async def test_run_now_starts_named_users_tasks_and_reports_the_rest(
 async def test_run_now_for_everyone(client: httpx.AsyncClient) -> None:
     app: Any = client.app  # type: ignore[attr-defined]
     await _create_session(client)
+    # Only the legacy fire path reports an in-flight run; the scheduler records
+    # every request as its own run.
+    app.state.scheduled_task_dispatch_enabled = False
     app.state.scheduled_task_run_now.return_value = False
 
     resp = await client.post("/v1/proactive-agent/runs", json={"users": ["*"]})
