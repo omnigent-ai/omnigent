@@ -3155,6 +3155,11 @@ function ComposerImpl(
   const showGoal =
     composerSessionId !== null &&
     (showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl);
+  const menuSkills = useMemo(
+    () =>
+      showGoal && skillPrefix === "/" ? skills.filter((skill) => skill.name !== "goal") : skills,
+    [skills, showGoal, skillPrefix],
+  );
   // The built-ins this session offers; a gated-off one leaves a same-named
   // custom command to run as a skill.
   const offeredBuiltinCommands = useMemo(
@@ -3192,9 +3197,9 @@ function ComposerImpl(
   const skillCommands = useMemo(
     () =>
       Object.fromEntries(
-        skills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
+        menuSkills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
       ),
-    [skills, skillPrefix],
+    [menuSkills, skillPrefix],
   );
   const slashCommands = useMemo(
     () => ({ ...offeredBuiltinCommands, ...skillCommands }),
@@ -3206,8 +3211,15 @@ function ComposerImpl(
   // existing fill/execute split.
   const slashCommandsWithArgs = useMemo(
     () =>
-      buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw, showSide, skillPrefix),
-    [skills, showEffort, showModel, showBtw, showSide, skillPrefix],
+      buildSlashCommandWithArgsSet(
+        menuSkills,
+        showEffort,
+        showModel,
+        showBtw,
+        showSide,
+        skillPrefix,
+      ),
+    [menuSkills, showEffort, showModel, showBtw, showSide, skillPrefix],
   );
 
   // Suggest names until a space starts the arguments; exclude file paths.
@@ -3750,7 +3762,10 @@ function ComposerImpl(
     }
   };
 
-  const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
+  const skillLabels = useMemo(
+    () => skillDisplayNames(menuSkills, skillPrefix),
+    [menuSkills, skillPrefix],
+  );
   const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
   const registryEnabled =
     composerServerInfo !== "loading" && !!composerServerInfo.enabled_connections?.includes("mcp");

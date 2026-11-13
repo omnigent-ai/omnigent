@@ -932,6 +932,7 @@ describe("Composer Claude goal control", () => {
 describe("Composer goal slash command", () => {
   beforeEach(() => {
     setComposerState({ conversationId: "conv_goal", sessionHarness: "codex-native", skills: [] });
+    vi.mocked(getGoal).mockResolvedValue({ goal: null });
   });
 
   afterEach(() => {
@@ -941,36 +942,58 @@ describe("Composer goal slash command", () => {
   });
 
   it.each([
-    { showGoalControl: true },
-    { showPollyCodexGoalControl: true },
-    { showClaudeGoalControl: true },
-  ])("opens the existing Goal dialog for bare /goal with %j", async (controls) => {
-    const onSend = vi.fn();
-    vi.mocked(getGoal).mockResolvedValue({ goal: null });
-    useChatStore.setState({ conversationId: "conv_goal", sessionHarness: "codex-native" });
-    renderWithTooltips(<Composer {...composerProps({ onSend, ...controls })} />);
-    fireEvent.change(textarea(), { target: { value: "/goal" } });
-    fireEvent.click(screen.getByRole("button", { name: "Send" }));
-    expect(await screen.findByRole("dialog", { name: "Goal" })).toBeInTheDocument();
-    expect(onSend).not.toHaveBeenCalled();
-    expect(textarea().value).toBe("");
-  });
+    ["codex-native", { showGoalControl: true }],
+    ["codex", { showPollyCodexGoalControl: true }],
+    ["claude-sdk", { showClaudeGoalControl: true }],
+  ] as const)(
+    "opens the existing Goal dialog for bare /goal in %s",
+    async (sessionHarness, controls) => {
+      const onSend = vi.fn();
+      const onSendSlashCommand = vi.fn();
+      useChatStore.setState({ sessionHarness });
+      renderWithTooltips(
+        <Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />,
+      );
+      fireEvent.change(textarea(), { target: { value: "/goal" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      expect(await screen.findByRole("dialog", { name: "Goal" })).toBeInTheDocument();
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onSendSlashCommand).not.toHaveBeenCalled();
+      expect(textarea().value).toBe("");
+    },
+  );
 
-  it("opens the native Goal dialog from the slash menu", async () => {
-    const onSend = vi.fn();
-    vi.mocked(getGoal).mockResolvedValue({ goal: null });
-    useChatStore.setState({ conversationId: "conv_goal", sessionHarness: "codex-native" });
-    renderWithTooltips(<Composer {...composerProps({ onSend, showGoalControl: true })} />);
-    fireEvent.change(textarea(), { target: { value: "/go" } });
-    fireEvent.click(screen.getByTestId("slash-menu-item-goal"));
-    expect(await screen.findByRole("dialog", { name: "Goal" })).toBeInTheDocument();
-    expect(onSend).not.toHaveBeenCalled();
-  });
+  it.each([
+    ["codex-native", { showGoalControl: true }],
+    ["codex", { showPollyCodexGoalControl: true }],
+    ["claude-sdk", { showClaudeGoalControl: true }],
+  ] as const)(
+    "opens Goal from the %s slash menu with a same-named skill",
+    async (sessionHarness, controls) => {
+      const onSend = vi.fn();
+      const onSendSlashCommand = vi.fn();
+      setComposerState({
+        sessionHarness,
+        skills: [{ name: "goal", description: "Project goal skill", display_name: "Project goal" }],
+      });
+      renderWithTooltips(
+        <Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />,
+      );
+      fireEvent.change(textarea(), { target: { value: "/go" } });
+      fireEvent.click(
+        screen.getByRole("button", { name: /^\/goal\s*View or set the goal for this session$/ }),
+      );
+      expect(await screen.findByRole("dialog", { name: "Goal" })).toBeInTheDocument();
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onSendSlashCommand).not.toHaveBeenCalled();
+      expect(textarea().value).toBe("");
+    },
+  );
 
   it("sends the full goal objective as a message rather than a skill invocation", () => {
     const onSend = vi.fn();
     const onSendSlashCommand = vi.fn();
-    useChatStore.setState({ conversationId: "conv_goal", sessionHarness: "codex" });
+    useChatStore.setState({ sessionHarness: "codex" });
     renderWithTooltips(
       <Composer
         {...composerProps({ onSend, onSendSlashCommand, showPollyCodexGoalControl: true })}
@@ -989,7 +1012,6 @@ describe("Composer goal slash command", () => {
     const onSend = vi.fn();
     const onSendSlashCommand = vi.fn();
     setComposerState({
-      conversationId: "conv_goal",
       sessionHarness: "claude-sdk",
       skills: [{ name: "goal", description: "Project goal skill" }],
     });
