@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from omnigent.errors import ErrorCategory
@@ -152,6 +154,37 @@ def test_classifies_missing_binary_by_output() -> None:
     )
     assert diagnosis is not None
     assert diagnosis.title == "Agent command not found"
+
+
+def test_classifies_lost_macos_login_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    diagnosis = classify_terminal_failure(
+        command="claude",
+        exit_status=1,
+        output="failed to get current user: user: unknown userid 502",
+    )
+
+    assert diagnosis is not None
+    assert diagnosis.title == "The host lost its macOS login session"
+    assert diagnosis.remediation is not None
+    assert "host stop" in diagnosis.remediation
+    assert "host enable" in diagnosis.remediation
+
+
+def test_unknown_user_outside_macos_is_not_a_lost_login_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A container uid without a passwd entry fails the same lookup on Linux.
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    diagnosis = classify_terminal_failure(
+        command="claude",
+        exit_status=1,
+        output="failed to get current user: user: unknown userid 1000680000",
+    )
+
+    assert diagnosis is None
 
 
 @pytest.mark.parametrize(

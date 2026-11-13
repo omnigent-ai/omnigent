@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -26,6 +27,7 @@ from omnigent.harnesses.codex_native.app_server import CodexModelProviderMissing
 from omnigent.harnesses.codex_native.launch_args import CodexTransportArgsError
 from omnigent.inference_config import ModelNotAllowedError, inference_config_scope
 from omnigent.inner.terminal import TerminalInstance, TmuxUnavailableError
+from omnigent.runner import launch_failure
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
     _NATIVE_TERMINAL_START_FAILED_CODE,
@@ -45,6 +47,12 @@ _SHORT_MODELS = tuple(f"system.ai.gpt-5-{minor}-sol" for minor in range(1, 6))
 _LONG_MODELS = tuple(
     f"gateway/openai/gpt-5-{minor}-codex-max-preview-2026" for minor in range(1, 6)
 )
+# Prepended to the user-lookup probe so its child sees a known or unknown user.
+_KNOWN_USER = "import pwd\npwd.getpwuid = lambda uid: None\n"
+_UNKNOWN_USER = (
+    "import pwd\ndef _unknown(uid):\n    raise KeyError(uid)\npwd.getpwuid = _unknown\n"
+)
+_GENERIC_CLAUDE_EXIT = "Claude terminal exited with status 1 before becoming available."
 
 
 def test_missing_session_agent_classified_as_lifecycle_condition() -> None:
@@ -378,11 +386,27 @@ def test_pi_early_exit_without_match_falls_back_to_exit_summary(
     assert "Native Pi terminal failed to start" not in message
 
 
+@pytest.mark.parametrize(
+    ("platform", "user_lookup", "expected"),
+    [
+        ("linux", _UNKNOWN_USER, _GENERIC_CLAUDE_EXIT),
+        ("darwin", _KNOWN_USER, _GENERIC_CLAUDE_EXIT),
+        ("darwin", _UNKNOWN_USER, "The host lost its macOS login session: "),
+    ],
+    ids=["linux-skips-user-lookup", "macos-known-user", "macos-unknown-user"],
+)
 def test_claude_early_exit_output_gated_when_capture_disabled(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, platform: str, user_lookup: str, expected: str
 ) -> None:
-    """With stderr capture disabled, a non-Codex exit reads no pane output."""
+    """With stderr capture disabled, a non-Codex exit reads no pane output.
+
+    A macOS host still names a lost login session, found by a child's user lookup.
+    """
     monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(
+        launch_failure, "_USER_LOOKUP_PROBE", user_lookup + launch_failure._USER_LOOKUP_PROBE
+    )
     instance = TerminalInstance(
         name="claude",
         session_key="main",
@@ -399,7 +423,7 @@ def test_claude_early_exit_output_gated_when_capture_disabled(
     )
 
     message = payload["message"]
-    assert "Claude terminal exited with status 1 before becoming available." in message
+    assert message.startswith(expected), message
     assert "startup terminal output:" not in message
     read_output.assert_not_called()
 

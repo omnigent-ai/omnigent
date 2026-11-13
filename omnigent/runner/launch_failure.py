@@ -16,6 +16,8 @@ covers them all. A new harness quirk becomes one entry in
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -37,6 +39,7 @@ __all__ = [
     "diagnose_codex_compaction_model_failure",
     "diagnose_codex_model_rejection",
     "diagnose_codex_provider_auth_failure",
+    "diagnose_lost_login_session",
     "diagnose_model_unavailable",
     "is_codex_provider_auth_failure",
 ]
@@ -155,6 +158,31 @@ _BACKGROUND_SESSION_REFUSAL = re.compile(
     re.DOTALL,
 )
 
+# --- macOS login session ended under the host ---------------------------------
+# A host kept running across a macOS logout can no longer look up its own user;
+# Go CLIs report "failed to get current user: user: unknown userid 502".
+_LOST_LOGIN_SESSION_MARKERS = ("unknown userid", "failed to get current user")
+_USER_LOOKUP_FAILED_EXIT = 3
+_USER_LOOKUP_PROBE = (
+    "import os, pwd, sys\n"
+    "try:\n    pwd.getpwuid(os.getuid())\n"
+    f"except KeyError:\n    sys.exit({_USER_LOOKUP_FAILED_EXIT})\n"
+)
+_USER_LOOKUP_PROBE_TIMEOUT_S = 2.0
+
+_LOGIN_SESSION_LOST = FailureDiagnosis(
+    title="The host lost its macOS login session",
+    cause=(
+        "The agent CLI couldn't look up the current user, which happens when the host "
+        "keeps running after macOS logs you out."
+    ),
+    remediation=(
+        f"Restart the host: run `{cli_invocation()} host stop`, then "
+        f"`{cli_invocation()} host --background`, or run `{cli_invocation()} host enable` "
+        "so macOS restarts it at each login."
+    ),
+)
+
 
 # Ordered most-specific first: the root case also reads like a permission /
 # auth problem, and a broken install like a missing binary, so they must win
@@ -203,6 +231,11 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "output), stop it with `claude stop <session-id>`, then retry."
             ),
         ),
+    ),
+    _TerminalMatcher(
+        "login_session_lost",
+        lambda s: sys.platform == "darwin" and s.output_contains_any(_LOST_LOGIN_SESSION_MARKERS),
+        _LOGIN_SESSION_LOST,
     ),
     _TerminalMatcher(
         "missing_binary",
@@ -314,6 +347,30 @@ def classify_terminal_failure(
     for matcher in _TERMINAL_EXIT_MATCHERS:
         if matcher.predicate(signal):
             return matcher.diagnosis
+    return None
+
+
+def diagnose_lost_login_session() -> FailureDiagnosis | None:
+    """Check whether a new child of this macOS host can still look up its user.
+
+    A launch exit whose output is withheld has nothing to classify, so this
+    probes the condition directly in a child, which inherits the host's session.
+
+    :returns: The lost-login-session diagnosis when the lookup fails, else
+        ``None`` (including off macOS and when the probe cannot run).
+    """
+    if sys.platform == "darwin":
+        try:
+            probe = subprocess.run(
+                [sys.executable, "-I", "-S", "-c", _USER_LOOKUP_PROBE],
+                capture_output=True,
+                timeout=_USER_LOOKUP_PROBE_TIMEOUT_S,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if probe.returncode == _USER_LOOKUP_FAILED_EXIT:
+            return _LOGIN_SESSION_LOST
     return None
 
 

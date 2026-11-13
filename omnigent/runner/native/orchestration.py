@@ -8665,6 +8665,10 @@ def _native_terminal_start_error_payload(
                 exit_status=exc.instance.last_exit_status(),
                 output=output,
             )
+        if diagnosis is None:
+            from omnigent.runner.launch_failure import diagnose_lost_login_session
+
+            diagnosis = diagnose_lost_login_session()
         if diagnosis is not None:
             message = f"{diagnosis.title}: {diagnosis.cause}"
             if diagnosis.remediation:
