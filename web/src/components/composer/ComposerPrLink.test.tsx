@@ -278,9 +278,26 @@ describe("ComposerPrLink", () => {
     });
     await user.tab();
     expect(firstRow).toHaveFocus();
+    await user.tab({ shift: true });
+    expect(trigger).toHaveFocus();
+    await user.tab();
+    await user.tab();
+    expect(titled).toHaveFocus();
+    await user.tab();
+    expect(within(rows[1]).getByRole("button")).toHaveFocus();
+    await user.tab();
+    expect(untitled).toHaveFocus();
+    await user.tab();
+    expect(within(rows[2]).getByRole("button")).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Next composer control" })).toHaveFocus();
+    await user.tab({ shift: true });
+    await screen.findByTestId("composer-pr-preview");
+    await user.tab();
     await user.keyboard("{Enter}");
     expect(onOpen).toHaveBeenLastCalledWith(prs[0].url);
     await waitFor(() => expect(screen.queryByTestId("composer-pr-preview")).toBeNull());
+    expect(trigger).toHaveFocus();
 
     fireEvent.focus(trigger);
     await screen.findByTestId("composer-pr-preview");

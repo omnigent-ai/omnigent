@@ -107,6 +107,7 @@ export function ComposerPrLink({
 }) {
   const isCoarsePointer = useIsCoarsePointer();
   const [previewOpen, setPreviewOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
   // Status belongs to a known PR; lookup and setup errors remain in the GitHub tab.
   if (prCount <= 0 || !onOpen) return null;
@@ -146,6 +147,7 @@ export function ComposerPrLink({
 
   const trigger = (
     <button
+      ref={triggerRef}
       type="button"
       data-testid="composer-pr-link"
       data-pr-status={status}
@@ -202,8 +204,24 @@ export function ComposerPrLink({
           sideOffset={4}
           align="start"
           collisionPadding={16}
+          onEscapeKeyDown={() => triggerRef.current?.focus()}
+          onKeyDown={(event) => {
+            if (event.key !== "Tab") return;
+            const controls = event.currentTarget.querySelectorAll<HTMLElement>("button, a[href]");
+            const edge = event.shiftKey ? controls[0] : controls[controls.length - 1];
+            if (event.target === edge) {
+              if (event.shiftKey) event.preventDefault();
+              // Native Tab resumes from the trigger, beside the next composer control.
+              triggerRef.current?.focus();
+            }
+          }}
           onBlur={(event) => {
-            if (!event.currentTarget.contains(event.relatedTarget)) setPreviewOpen(false);
+            if (
+              event.relatedTarget !== triggerRef.current &&
+              !event.currentTarget.contains(event.relatedTarget)
+            ) {
+              setPreviewOpen(false);
+            }
           }}
           className="block w-96 max-w-[calc(100vw-2rem)] p-0 shadow-menu ring-1 ring-foreground/10"
         >
@@ -234,6 +252,7 @@ export function ComposerPrLink({
                         <button
                           type="button"
                           onClick={() => {
+                            triggerRef.current?.focus();
                             setPreviewOpen(false);
                             onOpen(pr.url);
                           }}
