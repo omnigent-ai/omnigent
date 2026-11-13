@@ -510,7 +510,10 @@ class TestConstructor(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.spec.types import RetryPolicy
 
-        with patch.dict("os.environ"):
+        with (
+            patch.dict("os.environ"),
+            patch("omnigent.inner.claude_sdk_executor._find_system_claude", return_value=None),
+        ):
             os.environ.pop("OMNIGENT_CLAUDE_CODE_ENTRYPOINT", None)
             executor = ClaudeSDKExecutor()
         self.assertFalse(executor._os_env)
@@ -655,7 +658,9 @@ class TestConstructor(unittest.TestCase):
             patch(
                 "omnigent.inner.claude_sdk_executor.prepare_tight_cli_process",
                 return_value=PreparedClaudeCli(
-                    cli_path="/tmp/omnigent-claude-tight-wrapper", enable_native_tools=False
+                    cli_path="/tmp/omnigent-claude-tight-wrapper",
+                    enable_native_tools=False,
+                    cwd="/tmp/example-workspace",
                 ),
             ),
         ):
@@ -667,8 +672,8 @@ class TestConstructor(unittest.TestCase):
             executor._cli_path,
             "/tmp/omnigent-claude-tight-wrapper",
         )
-        self.assertIsNone(executor._cwd)
-        self.assertIsNone(executor._cli_sandbox_cwd)
+        self.assertEqual(executor._cwd, "/tmp/example-workspace")
+        self.assertEqual(executor._cli_sandbox_cwd, "/tmp/example-workspace")
 
     def test_model_override(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -6341,12 +6346,14 @@ class TestToolCallPolicyGate(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-def test_precompact_hook_emits_compaction_complete_with_session_messages() -> None:
+def test_precompact_hook_emits_compaction_complete_with_session_messages(monkeypatch) -> None:
     """When PreCompact fires and a ResultMessage carries a session_id,
     CompactionComplete is emitted with compacted_messages read from
     the CLI's session transcript."""
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
     from omnigent.inner.executor import CompactionComplete
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
 
     class _ResultMessage:
         def __init__(self, session_id, result):
@@ -6444,10 +6451,14 @@ def test_precompact_hook_emits_compaction_complete_with_session_messages() -> No
     _run(_t())
 
 
-def test_precompact_exception_persists_compaction_before_executor_error(tmp_path: Path) -> None:
+def test_precompact_exception_persists_compaction_before_executor_error(
+    tmp_path: Path, monkeypatch
+) -> None:
     """A stream failure after PreCompact still emits the durable boundary."""
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
     from omnigent.inner.executor import CompactionComplete, CompactionStarted
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
 
     class _SystemMessage:
         def __init__(self, subtype, data, hook_event_name=None, session_id=None):
@@ -6563,6 +6574,7 @@ def test_precompact_exception_sdk_wire_payload_contract(
     tmp_path: Path,
     transcript_location: str,
     expect_checkpoint: bool,
+    monkeypatch,
 ) -> None:
     """The SDK-decoded hook payload exposes a safe transcript boundary."""
     import claude_agent_sdk as real_sdk
@@ -6570,6 +6582,8 @@ def test_precompact_exception_sdk_wire_payload_contract(
 
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
     from omnigent.inner.executor import CompactionComplete
+
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
 
     class _FakeSessionMessage:
         def __init__(self, type, message):
