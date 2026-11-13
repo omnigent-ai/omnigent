@@ -2008,35 +2008,49 @@ describe("useCuratedOutHarnesses", () => {
     },
   );
 
-  it("looks a session agent's unknown harness up again the next time Settings opens", async () => {
-    const routes = {
-      [BUILTINS_URL]: HIDES_CODEX,
-      [HARNESSES_URL]: mockResponse({ data: [] }),
-      [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
-      [MINE_URL]: sessionResponse({ data: [{ id: "ag_one_off", name: "my-one-off" }] }),
-      "/v1/sessions/session_0/agent": mockResponse({ id: "ag_one_off", name: "x", harness: null }),
-    };
-    routeFetch(routes);
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const settingsWrapper = settingsProviders(client, true);
-    const first = renderHook(() => useCuratedOutHarnesses(), { wrapper: settingsWrapper });
-    await waitFor(() =>
-      expect(client.getQueryState(["session-agent-harness", "ag_one_off"])?.status).toBe("error"),
-    );
-    expect([...first.result.current]).toEqual([]);
-    first.unmount();
+  it.each([
+    [null, "claude-native", "error", [], ["codex-native"]],
+    ["claude-native", "codex-native", "success", ["codex-native"], []],
+  ] as const)(
+    "refreshes a session agent's harness from %s to %s when Settings reopens",
+    async (initialHarness, nextHarness, initialStatus, before, after) => {
+      const routes = {
+        [BUILTINS_URL]: HIDES_CODEX,
+        [HARNESSES_URL]: mockResponse({ data: [] }),
+        [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
+        [MINE_URL]: sessionResponse({ data: [{ id: "ag_one_off", name: "my-one-off" }] }),
+        "/v1/sessions/session_0/agent": mockResponse({
+          id: "ag_one_off",
+          name: "my-one-off",
+          harness: initialHarness,
+        }),
+      };
+      routeFetch(routes);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const queryKey = ["session-agent-harness", "ag_one_off"];
+      const { result, rerender } = renderHook(({ enabled }) => useCuratedOutHarnesses(enabled), {
+        initialProps: { enabled: true },
+        wrapper: settingsProviders(client, true),
+      });
+      await waitFor(() => expect(client.getQueryState(queryKey)?.status).toBe(initialStatus));
+      expect([...result.current]).toEqual(before);
+      rerender({ enabled: false });
 
-    routeFetch({
-      ...routes,
-      "/v1/sessions/session_0/agent": mockResponse({
-        id: "ag_one_off",
-        name: "x",
-        harness: "claude-native",
-      }),
-    });
-    const second = renderHook(() => useCuratedOutHarnesses(), { wrapper: settingsWrapper });
-    await waitFor(() => expect([...second.result.current]).toEqual(["codex-native"]));
-  });
+      routeFetch({
+        ...routes,
+        "/v1/sessions/session_0/agent": mockResponse({
+          id: "ag_one_off",
+          name: "my-one-off",
+          harness: nextHarness,
+        }),
+      });
+      rerender({ enabled: true });
+      await waitFor(() => {
+        expect(client.getQueryData(queryKey)).toBe(nextHarness);
+        expect([...result.current]).toEqual(after);
+      });
+    },
+  );
 
   it.each([
     ["nothing", []],

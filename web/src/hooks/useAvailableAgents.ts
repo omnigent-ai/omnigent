@@ -601,7 +601,7 @@ export function useAgentCatalog(
       queryKey: ["session-agent-harness", agent.id],
       queryFn: () => fetchSessionAgentHarness(agent.sessionId!),
       enabled,
-      staleTime: Infinity,
+      staleTime: 0,
     })),
     combine: (results) => ({
       harnesses: results.map((result) => result.data ?? null),
