@@ -18,6 +18,8 @@ from omnigent.db import cockroachdb, utils
     [
         ("CockroachDB v23.2.28 (x86_64)", Version("23.2.28")),
         ("CockroachDB CCL v24.3.20 (x86_64)", Version("24.3.20")),
+        ("CockroachDB CCL v25.1.9 (x86_64)", Version("25.1.9")),
+        ("CockroachDB CCL v25.2.0 (x86_64)", Version("25.2.0")),
         ("CockroachDB OSS v25.2.10 (x86_64)", Version("25.2.10")),
         ("CockroachDB Enterprise v25.4.5 (x86_64)", Version("25.4.5")),
     ],
@@ -47,6 +49,7 @@ def test_parse_crdb_server_version_warns_outside_tested_matrix(
 
     assert version == Version("26.1.0")
     assert "outside Omnigent's release-tested matrix" in caplog.text
+    assert "deprecated" not in caplog.text
 
 
 def test_crdb_engine_reports_missing_optional_dependencies(
