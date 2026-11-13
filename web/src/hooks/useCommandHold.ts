@@ -44,6 +44,9 @@ export function useCommandHoldTracking(
     const heldKeys = new Set<string>();
     const chordKeys = new Set<string>();
     const keyId = (e: globalThis.KeyboardEvent): string => e.code || e.key;
+    // A hold canceled by another key stays canceled until the command key is released,
+    // so a joining modifier pressed afterwards cannot revive it.
+    let holdCanceled = false;
 
     const clearHold = (): void => {
       clearTimeout(revealTimer);
@@ -53,6 +56,7 @@ export function useCommandHoldTracking(
     const reset = (): void => {
       heldKeys.clear();
       chordKeys.clear();
+      holdCanceled = false;
       clearHold();
     };
     // The command modifier down, with only joining modifiers beside it.
@@ -67,17 +71,19 @@ export function useCommandHoldTracking(
     };
     const onKeyDown = (e: globalThis.KeyboardEvent): void => {
       const joinsHold = joiningKeys.has(e.key);
+      // The physical modifier, not shortcut eligibility: ⌃⌘K still drops K's keyup.
+      const commandDown = isMac ? e.metaKey : e.ctrlKey;
       if (!joinsHold && !heldKeys.has(keyId(e))) {
-        // The physical modifier, not shortcut eligibility: ⌃⌘K still drops K's keyup.
-        const commandDown = isMac ? e.metaKey : e.ctrlKey;
         (commandDown ? chordKeys : heldKeys).add(keyId(e));
       }
       if (!joinsHold || !isCommandHold(e)) {
+        if (commandDown) holdCanceled = true;
         clearHold();
         return;
       }
       const keysDown = heldKeys.size + chordKeys.size;
-      if (keysDown === 0 && revealTimer === undefined && !useCommandHoldStore.getState().held) {
+      const idle = revealTimer === undefined && !useCommandHoldStore.getState().held;
+      if (keysDown === 0 && idle && !holdCanceled) {
         revealTimer = setTimeout(() => {
           revealTimer = undefined;
           setHeld(true);
@@ -91,6 +97,7 @@ export function useCommandHoldTracking(
         // macOS sends no keyup for keys released while ⌘ is down, so its release
         // forgets the chord's keys. Keys held from before ⌘ still block.
         if (isMac) chordKeys.clear();
+        holdCanceled = false;
         clearHold();
       }
       // Releasing a joining modifier keeps the hold. A keyup never starts one.

@@ -197,7 +197,7 @@ describe("Sidebar numbered-row shortcut hints", () => {
     releaseCommand();
   });
 
-  it("shows the New session chord while the command key is held", async () => {
+  it("shows the New session chord while the command key is held, and while Shift joins", async () => {
     renderSidebar();
     const chord = screen
       .getByTestId("new-chat-button")
@@ -206,22 +206,11 @@ describe("Sidebar numbered-row shortcut hints", () => {
 
     pressCommand();
     await waitFor(() => expect(chord).toHaveClass("opacity-100"));
-    releaseCommand();
-    expect(chord).not.toHaveClass("opacity-100");
-  });
-
-  it("keeps the hints and New session chord while Shift joins the hold", async () => {
-    renderSidebar();
-    const chord = screen
-      .getByTestId("new-chat-button")
-      .querySelector<HTMLElement>('[data-slot="shortcut-keys"]');
-    pressCommand();
-    await waitForHints(5);
-
     fireEvent.keyDown(window, { key: "Shift", ...COMMAND_MODIFIER, shiftKey: true });
     expect(hints()).toHaveLength(5);
     expect(chord).toHaveClass("opacity-100");
     releaseCommand();
+    expect(chord).not.toHaveClass("opacity-100");
     expect(hints()).toHaveLength(0);
   });
 

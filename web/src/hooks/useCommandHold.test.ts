@@ -425,6 +425,36 @@ describe("useCommandHoldTracking off macOS", () => {
   });
 });
 
+describe("useCommandHoldTracking after a canceled hold", () => {
+  it.each([
+    ["a chord key on macOS", true, true, "c", { metaKey: true }],
+    ["a chord key off macOS", false, true, "c", { ctrlKey: true }],
+    ["Alt in the desktop app", false, false, "Alt", { ctrlKey: true, altKey: true }],
+  ] as const)(
+    "keeps a hold canceled by %s hidden when Shift joins, until the command key is pressed again",
+    (_case, isMac, altJoinsHold, cancelKey, cancelModifiers) => {
+      const { result } = renderTracking(isMac, altJoinsHold);
+      const commandKey = isMac ? "Meta" : "Control";
+      const command = isMac ? MAC_COMMAND : OTHER_COMMAND;
+      key("keydown", commandKey, command);
+      elapseRevealDelay();
+      key("keydown", cancelKey, cancelModifiers);
+      key("keyup", cancelKey, command);
+      expect(result.current).toBe(false);
+
+      key("keydown", "Shift", { ...command, shiftKey: true });
+      elapseRevealDelay();
+      expect(result.current).toBe(false);
+
+      key("keyup", "Shift", command);
+      key("keyup", commandKey);
+      key("keydown", commandKey, command);
+      elapseRevealDelay();
+      expect(result.current).toBe(true);
+    },
+  );
+});
+
 describe("useCommandHoldTracking window focus", () => {
   it("hides on window blur", () => {
     const { result } = renderTracking(true);
