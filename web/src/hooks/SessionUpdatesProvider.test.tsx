@@ -27,16 +27,27 @@ import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 const setWatched = vi.fn();
 const start = vi.fn();
 const subscribe = vi.fn((_fn: () => void) => () => {});
+const statusListeners = new Set<() => void>();
+let socketConnected = false;
 vi.mock("@/lib/sessionUpdatesSocket", () => ({
   sessionUpdatesSocket: {
     start: (...args: unknown[]) => start(...args),
     stop: vi.fn(),
     setWatched: (...args: unknown[]) => setWatched(...args),
     subscribe: (fn: () => void) => subscribe(fn),
-    subscribeStatus: () => () => {},
-    isConnected: () => false,
+    subscribeStatus: (fn: () => void) => {
+      statusListeners.add(fn);
+      return () => statusListeners.delete(fn);
+    },
+    isConnected: () => socketConnected,
   },
 }));
+
+// Connect or drop the mocked socket and notify status subscribers, as the transport does.
+function setSocketConnected(connected: boolean): void {
+  socketConnected = connected;
+  for (const listener of [...statusListeners]) listener();
+}
 
 import { SidebarDataContext, SidebarDataProvider, useSidebarView } from "./useSidebarData";
 import { useCanEdit } from "./usePermissions";
@@ -115,6 +126,8 @@ beforeEach(() => {
   setWatched.mockClear();
   start.mockClear();
   subscribe.mockClear();
+  statusListeners.clear();
+  socketConnected = false;
 });
 
 afterEach(() => {
@@ -1358,6 +1371,115 @@ describe("SessionUpdatesProvider list invalidation", () => {
     } finally {
       vi.useRealTimers();
       clearRecentlyCreated();
+    }
+  });
+});
+
+describe("SessionUpdatesProvider tree list refetch", () => {
+  // A list's rows as the server returns them, with the fields the tree reads.
+  interface TreeRow {
+    id: string;
+    tool: string | null;
+    busy: boolean;
+    last_message_preview: string | null;
+    pending_elicitations_count: number;
+  }
+  const treeRow = (id: string, overrides: Partial<TreeRow> = {}): TreeRow => ({
+    id,
+    tool: "researcher",
+    busy: false,
+    last_message_preview: "old output",
+    pending_elicitations_count: 0,
+    ...overrides,
+  });
+
+  // Observe a tree list the way a mounted tree node does, fetching from `fetched`.
+  async function observeTreeList(client: QueryClient, fetched: () => TreeRow[]) {
+    const queryFn = vi.fn(async () => fetched());
+    const observer = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey("conv_a"),
+      queryFn,
+      staleTime: Infinity,
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    await waitFor(() => expect(observer.getCurrentResult().isSuccess).toBe(true));
+    return { queryFn, unsubscribe };
+  }
+
+  it("refetches a cached list once when it is observed again after a label change", async () => {
+    // The child's tool changed while the tree was closed, so no frame reached the list.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/"]);
+    let fetched = [treeRow("child_1", { tool: "researcher" })];
+    const first = await observeTreeList(client, () => fetched);
+    first.unsubscribe();
+
+    fetched = [treeRow("child_1", { tool: "explorer" })];
+    const reopened = await observeTreeList(client, () => fetched);
+    try {
+      await waitFor(() =>
+        expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+          expect.objectContaining({ tool: "explorer" }),
+        ]),
+      );
+      // One fetch on first open, one refetch on reopen; none on the reopen's own mount.
+      expect(first.queryFn).toHaveBeenCalledTimes(1);
+      expect(reopened.queryFn).toHaveBeenCalledTimes(1);
+    } finally {
+      reopened.unsubscribe();
+    }
+  });
+
+  it("refetches a cached list once when it is observed again after a missed turn", async () => {
+    // The child finished a whole turn while the tree was closed: its preview moved.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/"]);
+    let fetched = [treeRow("child_1", { busy: false, last_message_preview: "old output" })];
+    const first = await observeTreeList(client, () => fetched);
+    first.unsubscribe();
+
+    fetched = [treeRow("child_1", { busy: false, last_message_preview: "final answer" })];
+    const reopened = await observeTreeList(client, () => fetched);
+    try {
+      await waitFor(() =>
+        expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+          expect.objectContaining({ last_message_preview: "final answer" }),
+        ]),
+      );
+      // One fetch on first open, one refetch on reopen; none on the reopen's own mount.
+      expect(first.queryFn).toHaveBeenCalledTimes(1);
+      expect(reopened.queryFn).toHaveBeenCalledTimes(1);
+    } finally {
+      reopened.unsubscribe();
+    }
+  });
+
+  it("refetches an observed list after a reconnect so a same-count replacement shows", async () => {
+    // While disconnected, child_1 was deleted and child_2 created: the count is unchanged,
+    // so the reconnect refetch is the only thing that can show the new member.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/"]);
+    let fetched = [treeRow("child_1")];
+    const observed = await observeTreeList(client, () => fetched);
+    try {
+      setSocketConnected(true); // the first open has nothing to catch up on
+      expect(observed.queryFn).toHaveBeenCalledTimes(1);
+
+      setSocketConnected(false);
+      fetched = [treeRow("child_2")];
+      setSocketConnected(true);
+
+      await waitFor(() =>
+        expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+          expect.objectContaining({ id: "child_2" }),
+        ]),
+      );
+      expect(observed.queryFn).toHaveBeenCalledTimes(2);
+    } finally {
+      observed.unsubscribe();
     }
   });
 });

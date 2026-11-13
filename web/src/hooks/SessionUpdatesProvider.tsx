@@ -52,6 +52,7 @@ import {
   createChildSessionsRefetcher,
   createChildFrameState,
   pruneChildFrameState,
+  isObservedChildList,
   settleFetchedChildSessions,
   removeIdsFromChildSessions,
 } from "@/lib/childSessionFrames";
@@ -565,6 +566,20 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       // the visible tree nodes join (or leave) the watch-set.
       if (Array.isArray(key) && key[0] === "conversation" && key[2] === "child_sessions") {
         scheduleWatch();
+        // A cached list observed again (remount or re-watch) refetches once: frames
+        // that arrived while it was unwatched were never applied to it.
+        if (
+          event.type === "observerAdded" &&
+          event.query.getObserversCount() === 1 &&
+          event.query.state.data !== undefined &&
+          typeof key[1] === "string"
+        ) {
+          void queryClient.invalidateQueries({
+            queryKey: childSessionsQueryKey(key[1]),
+            exact: true,
+            refetchType: "active",
+          });
+        }
         // Settle a fetched list (not a local patch) against frames that
         // arrived while it was in flight; see settleFetchedChildSessions.
         if (event.type === "updated" && typeof key[1] === "string") {
@@ -576,10 +591,26 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       }
     });
 
+    // Frames missed while the socket was down can't be replayed, so each observed
+    // tree list refetches once per reconnect. The first open has nothing to catch up.
+    let socketOpened = false;
+    const unsubscribeStatus = sessionUpdatesSocket.subscribeStatus(() => {
+      if (!sessionUpdatesSocket.isConnected()) return;
+      if (!socketOpened) {
+        socketOpened = true;
+        return;
+      }
+      void queryClient.invalidateQueries({
+        predicate: isObservedChildList,
+        refetchType: "active",
+      });
+    });
+
     return () => {
       unsubscribeFrames();
       unsubscribeMutations();
       unsubscribeCache();
+      unsubscribeStatus();
       reconciler.dispose();
       childRefetcher.dispose();
       if (watchTimer !== null) clearTimeout(watchTimer);

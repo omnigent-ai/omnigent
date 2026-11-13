@@ -6,9 +6,11 @@
 // list is scheduled only for what a patch can't place: a child the list doesn't
 // hold yet, a changed child count, a rename or label change (tool, name and
 // routed model derive from them server-side), a finished turn (its preview),
-// or an older server whose rows lack the tree fields.
+// or an older server whose rows lack the tree fields. A list that becomes
+// observed again, and an observed list after a socket reconnect, refetch once,
+// since frames that arrived while it was unwatched were never applied to it.
 
-import type { QueryClient } from "@tanstack/react-query";
+import type { Query, QueryClient } from "@tanstack/react-query";
 import {
   type ChildSessionInfo,
   childSessionsQueryKey,
@@ -298,6 +300,20 @@ export function settleFetchedChildSessions(
   }
   const changed = next.length !== rows.length || next.some((row, index) => row !== rows[index]);
   if (changed) queryClient.setQueryData<ChildSessionInfo[]>(key, next);
+}
+
+/**
+ * Whether a query is a sub-agent tree list with a mounted observer.
+ *
+ * @param query - A query from the cache.
+ * @returns True for an observed ``["conversation", <id>, "child_sessions"]`` list.
+ */
+export function isObservedChildList(query: Query): boolean {
+  return (
+    query.queryKey[0] === "conversation" &&
+    query.queryKey[2] === "child_sessions" &&
+    query.getObserversCount() > 0
+  );
 }
 
 /**
