@@ -1017,11 +1017,15 @@ def _proxied_http_probe_no_auth(target_url: str) -> str:
     )
 
 
+@pytest.mark.parametrize("relaunch_when_stale", [False, True], ids=["direct", "reusable"])
+@pytest.mark.parametrize("source_update", ["changed", "removed"])
 def test_credential_proxy_swap_on_access_injects_basic_without_sandbox_secret(
     tmp_path: Path,
     active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
     sandbox_pythonpath_env: None,
     monkeypatch: pytest.MonkeyPatch,
+    relaunch_when_stale: bool,
+    source_update: str,
 ) -> None:
     """
     Swap-on-access (the default): the proxy injects Basic auth on a bare request.
@@ -1033,10 +1037,14 @@ def test_credential_proxy_swap_on_access_injects_basic_without_sandbox_secret(
     bound host on the way out. We assert both halves: the upstream
     received the real Basic credential AND the sandbox env never held the
     real secret or any ``oa_cred_*`` placeholder.
+
+    A file read warms the helper before the source changes or disappears.
+    Reusable clients resolve it again; direct clients keep startup-only values.
     """
     import base64
 
-    real_secret = "gho_real_git_token_5k1"
+    real_secret = "example-credential-first"
+    replacement_secret = "example-credential-second"
     monkeypatch.setenv("OA_TEST_GIT_SECRET", real_secret)
     upstream = _CapturingUpstream()
     spec = active_sandbox_spec_factory(
@@ -1054,10 +1062,23 @@ def test_credential_proxy_swap_on_access_injects_basic_without_sandbox_secret(
         ),
     )
     os_env = create_os_environment(
-        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=spec)
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=spec),
+        relaunch_when_stale=relaunch_when_stale,
     )
     probe = _proxied_http_probe_no_auth(f"http://127.0.0.1:{upstream.port}/probe")
+    (tmp_path / "note.txt").write_text("warm helper")
     try:
+        assert run_async(os_env.read("note.txt"))["content"] == "warm helper"
+        assert upstream.captured == []
+        if source_update == "changed":
+            monkeypatch.setenv("OA_TEST_GIT_SECRET", replacement_secret)
+        else:
+            monkeypatch.delenv("OA_TEST_GIT_SECRET")
+        if relaunch_when_stale and source_update == "removed":
+            with pytest.raises(ValueError, match="missing or empty"):
+                run_async(os_env.shell(_python_probe_argv(probe)))
+            assert upstream.captured == []
+            return
         result = run_async(os_env.shell(_python_probe_argv(probe)))
         # Dump every credential-shaped env var the sandbox can see.
         sandbox_env = run_async(
@@ -1071,7 +1092,8 @@ def test_credential_proxy_swap_on_access_injects_basic_without_sandbox_secret(
         f"Probe failed. stdout={result.get('stdout')!r} stderr={result.get('stderr')!r}"
     )
     assert "STATUS 200" in result["stdout"], f"Did not reach upstream: {result['stdout']!r}"
-    expected = "Basic " + base64.b64encode(f"x-access-token:{real_secret}".encode()).decode()
+    expected_secret = replacement_secret if relaunch_when_stale else real_secret
+    expected = "Basic " + base64.b64encode(f"x-access-token:{expected_secret}".encode()).decode()
     # The proxy synthesized the Authorization header from nothing the
     # client sent — if injection regressed, captured would be [None]
     # (the bare request) instead of the real Basic credential.
@@ -1084,6 +1106,7 @@ def test_credential_proxy_swap_on_access_injects_basic_without_sandbox_secret(
     assert real_secret not in sandbox_env["stdout"], (
         f"real secret leaked into the sandbox env: {sandbox_env['stdout']!r}"
     )
+    assert replacement_secret not in sandbox_env["stdout"]
     assert SYNTHETIC_CREDENTIAL_PREFIX not in sandbox_env["stdout"], (
         f"a synthetic placeholder was injected for a swap-on-access entry: "
         f"{sandbox_env['stdout']!r}"

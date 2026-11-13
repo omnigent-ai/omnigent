@@ -555,6 +555,9 @@ class _HelperProcessClient:
 
     def _launch_is_stale_locked(self) -> bool:
         """Whether a fresh launch would have different mounts or inherited values."""
+        # Proxy sources resolve at startup, including values filtered from the helper.
+        if self._relaunch_when_stale and self.sandbox.credential_proxy is not None:
+            return True
         if self._launch_env is not None and (
             build_helper_env(os.environ, self.sandbox) != self._launch_env
         ):
@@ -1168,7 +1171,8 @@ def create_os_environment(
 
     :param relaunch_when_stale: Relaunch the helper before a request once a
         fresh launch would have different mounts or inherited environment
-        values. A relaunch discards the helper's scratch dir.
+        values. Credential-proxy helpers relaunch for every request to resolve
+        their sources again. A relaunch discards the helper's scratch dir.
     """
     if spec is None:
         return None
