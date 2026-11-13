@@ -48,7 +48,8 @@ class _FakeClaudeFooter:
 
     After a panel key, captures can lag (``stale_captures`` frames drawn before
     the key) or tear (``torn``: ``"empty"``, ``"partial"`` without the agent
-    panel, or ``"spinner"`` with only a busy line), and keys in ``swallowed``
+    panel, ``"panel"`` with the whole input box but no agent panel for three
+    captures, or ``"spinner"`` with only a busy line), and keys in ``swallowed``
     are dropped once.
     """
 
@@ -127,6 +128,8 @@ class _FakeClaudeFooter:
                 self.queued_captures.append("")
             elif self.torn == "partial":
                 self.queued_captures.append("\n".join(self.pane().splitlines()[:3]))
+            elif self.torn == "panel":
+                self.queued_captures += ["\n".join(self.pane().splitlines()[:5])] * 3
             elif self.torn == "spinner":
                 self.queued_captures.append("✻ Exploring… (esc to interrupt)")
 
@@ -284,11 +287,12 @@ def test_a_slash_command_reaches_claude_while_the_footer_holds_focus(
 )
 @pytest.mark.parametrize(
     "torn",
-    ["", "empty", "partial", "spinner"],
+    ["", "empty", "partial", "panel", "spinner"],
     ids=[
         "whole-frames",
         "empty-capture-after-keys",
         "capture-without-panel-after-keys",
+        "whole-input-box-without-panel-after-keys",
         "capture-without-input-box-after-keys",
     ],
 )
@@ -317,6 +321,20 @@ def test_a_message_reaches_main_while_the_terminal_shows_a_subagent(
     assert tui.viewed == 0
     assert "Escape" not in tui.keys
     assert "x" not in tui.keys
+
+
+def test_an_empty_first_capture_does_not_skip_the_switch_to_main(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The readiness gate finds the subagent's view the torn first capture hid."""
+    tui = _FakeClaudeFooter(viewed=1, queued_captures=[""])
+    _drive(monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="what did the explorer find?")
+
+    assert tui.submitted == ["what did the explorer find?"]
+    assert tui.subagent_inbox == []
+    assert tui.viewed == 0
 
 
 def test_a_slash_command_reaches_main_while_the_terminal_shows_a_subagent(
@@ -356,12 +374,21 @@ def test_panel_keys_wait_for_the_screen_to_show_their_effect(
     assert panel_keys[1][1] - panel_keys[0][1] >= claude_native_bridge._AGENT_PANEL_STEP_RETRY_S
 
 
+@pytest.mark.parametrize(
+    "first_captures", [[], [""]], ids=["whole-first-capture", "empty-first-capture"]
+)
 def test_a_subagent_view_that_will_not_close_is_refused_before_typing(
-    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+    first_captures: list[str], bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """When main cannot be shown again, nothing is typed into the subagent's box."""
     monkeypatch.setattr(claude_native_bridge, "_OCCUPIED_INPUT_DISMISS_TIMEOUT_S", 0.3)
-    tui = _FakeClaudeFooter(focus="list", selected=1, viewed=1, view_switch_ignored=True)
+    tui = _FakeClaudeFooter(
+        focus="list",
+        selected=1,
+        viewed=1,
+        view_switch_ignored=True,
+        queued_captures=list(first_captures),
+    )
     _drive(monkeypatch, tui)
 
     with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied, match="a subagent's view"):

@@ -508,8 +508,9 @@ _SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
 # What :func:`_occupying_surface` reports while the terminal shows a subagent,
 # which a typed message would reach instead of the main conversation.
 _SUBAGENT_VIEW_SURFACE = "a subagent's view"
-# The agent panel's first row while another agent is shown; ``● main`` otherwise.
+# The agent panel's first row while another agent is shown, and while main is.
 _AGENT_PANEL_UNSHOWN_MAIN_ROW = re.compile(r"^(?:❯ |  )◯ main(?:\s|$)")
+_AGENT_PANEL_SHOWN_MAIN_ROW = re.compile(r"^(?:❯ |  )● main(?:\s|$)")
 # An empty input box's placeholder while a subagent is shown.
 _SUBAGENT_COMPOSER_PLACEHOLDER = re.compile(r"^Message @\S.*…$")
 # Re-press a panel key the screen has not acted on after this long. Each key is
@@ -7093,9 +7094,10 @@ def _restore_occupied_input(
     that subagent. It is walked back to main through the panel one key at a
     time (:func:`_step_toward_main_view`), each on a focus two captures agree
     on, so a stale frame cannot move the selection past main. Once the view
-    was seen, main counts as shown only after two whole frames in a row, so a
-    torn capture that drops the agent panel or input box is neither taken for
-    main nor dismissed with Escape.
+    was seen, main counts as shown only when two frames in a row mark it shown
+    in the agent panel, so a torn capture that drops the panel or input box is
+    neither taken for main nor dismissed with Escape. A panel that closes with
+    its last subagent leaves the view returned, and the caller holds the message.
 
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
@@ -7168,11 +7170,11 @@ def _restore_occupied_input(
             surface = _DETAILED_TRANSCRIPT_SURFACE
         box = _composer_box(pane)
         if subagent_view_seen and surface in (None, _OVERLAY_SURFACE):
-            # A torn frame can omit the agent panel or input box, so main needs two whole frames.
-            whole_frame = box is not None and box.framed
-            if not (whole_frame and main_frame_seen):
+            # A torn frame can omit the agent panel or input box, so it says nothing about main.
+            main_shown = _main_view_shown(pane)
+            if not (main_shown and main_frame_seen):
                 surface = _SUBAGENT_VIEW_SURFACE
-            main_frame_seen = whole_frame
+            main_frame_seen = main_shown
         else:
             main_frame_seen = False
         subagent_view_seen = subagent_view_seen or surface == _SUBAGENT_VIEW_SURFACE
@@ -7336,12 +7338,10 @@ def _subagent_view_focus(pane: str) -> _AgentPanelFocus | None:
     :returns: The selected panel row and the input box's draft while a
         subagent is shown, else ``None``.
     """
-    lines = pane.splitlines()
-    rules = _composer_frame_rule_indices(lines)
     box = _composer_box(pane)
-    if len(rules) < 2 or box is None or not box.framed:
+    panel = _rows_under_composer(pane)
+    if box is None or panel is None:
         return None
-    panel = lines[rules[-1] + 1 :]
     main = next(
         (idx for idx, line in enumerate(panel) if _AGENT_PANEL_UNSHOWN_MAIN_ROW.match(line)), None
     )
@@ -7355,6 +7355,22 @@ def _subagent_view_focus(pane: str) -> _AgentPanelFocus | None:
         _SUBAGENT_COMPOSER_PLACEHOLDER.match(box.rows[0].strip()[1:].strip())
     )
     return _AgentPanelFocus(pointer_row, () if empty else tuple(box.rows))
+
+
+def _main_view_shown(pane: str) -> bool:
+    """Return whether the agent panel under a framed input box marks main as shown."""
+    panel = _rows_under_composer(pane)
+    return panel is not None and any(_AGENT_PANEL_SHOWN_MAIN_ROW.match(row) for row in panel)
+
+
+def _rows_under_composer(pane: str) -> list[str] | None:
+    """Return the rows below a framed input box, where the agent panel is drawn."""
+    lines = pane.splitlines()
+    rules = _composer_frame_rule_indices(lines)
+    box = _composer_box(pane)
+    if len(rules) < 2 or box is None or not box.framed:
+        return None
+    return lines[rules[-1] + 1 :]
 
 
 def _step_toward_main_view(socket_path: str, tmux_target: str, focus: _AgentPanelFocus) -> None:
@@ -8075,6 +8091,8 @@ def _wait_for_claude_prompt_ready(
         process exited, carrying its wait-status so a clean quit is
         distinguishable from a crash, or tmux no longer reports the pane
         (no wait-status, so ``exit_status`` is ``None``).
+    :raises ClaudeInputBoxOccupied: If the terminal still shows a subagent
+        after the restore; nothing was typed.
     :raises ClaudeTerminalDialog: If a consent or selection dialog is holding
         the terminal (see :func:`_terminal_dialog_headline`) on two
         consecutive polls. Raised within a poll interval instead of waiting
@@ -8138,15 +8156,17 @@ def _wait_for_claude_prompt_ready(
             last_nonempty = pane
         else:
             empty_polls += 1
-        if _claude_prompt_rendered(pane):
+        occupying_surface = _occupying_surface(pane)
+        if _claude_prompt_rendered(pane) and (
+            bridge_dir is None or occupying_surface != _SUBAGENT_VIEW_SURFACE
+        ):
             return
         remaining = hard_deadline - time.monotonic()
-        occupying_surface = _occupying_surface(pane)
         if (
             bridge_dir is not None
             and remaining > 0
             and (
-                occupying_surface == _DETAILED_TRANSCRIPT_SURFACE
+                occupying_surface in (_DETAILED_TRANSCRIPT_SURFACE, _SUBAGENT_VIEW_SURFACE)
                 or (
                     occupying_surface == _OVERLAY_SURFACE
                     and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
@@ -8155,13 +8175,19 @@ def _wait_for_claude_prompt_ready(
             and _terminal_dialog_headline(pane) is None
             and not _escape_quits_claude(pane)
         ):
-            # A panel can appear after preflight or an empty startup capture.
+            # A panel or subagent's view can appear after preflight or an empty startup capture.
             surface = _restore_occupied_input(
                 socket_path,
                 tmux_target,
                 bridge_dir=bridge_dir,
                 timeout_s=min(_OCCUPIED_INPUT_DISMISS_TIMEOUT_S, remaining),
             )
+            if surface == _SUBAGENT_VIEW_SURFACE:
+                raise ClaudeInputBoxOccupied(
+                    f"Claude Code's input box is occupied by {surface}, so nothing was sent. "
+                    "Open the terminal, show main, then retry.",
+                    surface=surface,
+                )
             if surface is not None:
                 raise ClaudeTerminalDialog(
                     "A panel is covering Claude Code's input box, so nothing was sent. "
