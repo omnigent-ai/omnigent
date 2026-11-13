@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
@@ -152,29 +152,47 @@ const SANDBOX_SERVER: Partial<ServerInfo> = {
   request_managed_sandbox_host_id: true,
 };
 
+type DialogProps = Partial<ComponentProps<typeof SwitchHostDialog>>;
+
 /**
  * Render the dialog for a session on ``host_old``.
  *
  * @param info - Server capabilities; omitted leaves the context loading, which
  *   keeps the sandbox rows hidden.
  */
-function renderDialog(info?: Partial<ServerInfo>) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const dialog = (
-    <SwitchHostDialog open onOpenChange={() => {}} sessionId="conv_1" currentHostId="host_old" />
-  );
-  render(
-    <QueryClientProvider client={client}>
-      {info === undefined ? (
-        dialog
-      ) : (
-        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...info }}>
-          {dialog}
-        </CapabilitiesProvider>
-      )}
-    </QueryClientProvider>,
-  );
-  return client;
+function renderDialog(
+  info?: Partial<ServerInfo>,
+  overrides: DialogProps = {},
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
+  const content = (props: DialogProps) => {
+    const dialog = (
+      <SwitchHostDialog
+        open
+        onOpenChange={() => {}}
+        sessionId="conv_1"
+        currentHostId="host_old"
+        {...props}
+      />
+    );
+    return (
+      <QueryClientProvider client={client}>
+        {info === undefined ? (
+          dialog
+        ) : (
+          <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...info }}>
+            {dialog}
+          </CapabilitiesProvider>
+        )}
+      </QueryClientProvider>
+    );
+  };
+  const view = render(content(overrides));
+  return {
+    client,
+    ...view,
+    rerenderDialog: (props: DialogProps) => view.rerender(content({ ...overrides, ...props })),
+  };
 }
 
 /** Leave the session's own laptop as the only online host. */
@@ -328,7 +346,7 @@ describe("SwitchHostDialog", () => {
   });
 
   it("releases the runner and the model override before launching on the new host", async () => {
-    const client = renderDialog();
+    const { client } = renderDialog();
     const invalidate = vi.spyOn(client, "invalidateQueries");
 
     const button = await screen.findByTestId("switch-host-button");
@@ -390,7 +408,7 @@ describe("SwitchHostDialog", () => {
           rejectHosts = reject;
         }),
       );
-      const client = renderDialog();
+      const { client } = renderDialog();
       const invalidate = vi.spyOn(client, "invalidateQueries");
       const button = await screen.findByTestId("switch-host-button");
       await waitFor(() => expect(button).not.toBeDisabled());
@@ -428,7 +446,7 @@ describe("SwitchHostDialog", () => {
   );
 
   it("resets the terminals cache so the strip re-attaches to the new host", async () => {
-    const client = renderDialog();
+    const { client } = renderDialog();
     // Stale entry: the origin host's shell. The terminals query never goes
     // stale on its own (staleTime: Infinity) and its queryFn unions with the
     // cache, so only an explicit clear can drop a dead entry.
@@ -459,7 +477,7 @@ describe("SwitchHostDialog", () => {
     async (failure, originStatus) => {
       const failedRequest = failure === "release" ? updateSessionMock : launchRunnerMock;
       failedRequest.mockRejectedValueOnce(new Error("move request failed"));
-      const client = renderDialog();
+      const { client } = renderDialog();
       const invalidate = vi.spyOn(client, "invalidateQueries");
 
       // Moving to the host it is already on is a no-op, so the origin starts
@@ -600,19 +618,8 @@ describe("SwitchHostDialog", () => {
         boundHost = "host_new";
         throw new Error("launch response lost");
       });
-      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       const onOpenChange = vi.fn();
-      const dialog = (
-        <QueryClientProvider client={client}>
-          <SwitchHostDialog
-            open
-            onOpenChange={onOpenChange}
-            sessionId="conv_1"
-            currentHostId="host_old"
-          />
-        </QueryClientProvider>
-      );
-      const view = render(dialog);
+      const { client, unmount } = renderDialog(undefined, { onOpenChange });
       vi.spyOn(client, "invalidateQueries").mockImplementation(() => new Promise<void>(() => {}));
       let button = await screen.findByTestId("switch-host-button");
       await waitFor(() => expect(button).toBeEnabled());
@@ -625,8 +632,8 @@ describe("SwitchHostDialog", () => {
       if (reopen) {
         fireEvent.click(screen.getByRole("button", { name: "Close" }));
         expect(onOpenChange).toHaveBeenCalledWith(false);
-        view.unmount();
-        render(dialog);
+        unmount();
+        renderDialog(undefined, { onOpenChange }, client);
         button = await screen.findByTestId("switch-host-button");
       }
       await waitFor(() => expect(button).toBeEnabled());
@@ -659,19 +666,8 @@ describe("SwitchHostDialog", () => {
   it.each(["stop", "release"] as const)(
     "stops the refreshed binding and reports a retry %s failure",
     async (failure) => {
-      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-      const dialog = (hostId: string) => (
-        <QueryClientProvider client={client}>
-          <SwitchHostDialog
-            open
-            onOpenChange={() => {}}
-            sessionId="conv_1"
-            currentHostId={hostId}
-          />
-        </QueryClientProvider>
-      );
       launchRunnerMock.mockRejectedValueOnce(new Error("launch response lost"));
-      const view = render(dialog("host_old"));
+      const { rerenderDialog } = renderDialog();
       const button = await screen.findByTestId("switch-host-button");
       await waitFor(() => expect(button).toBeEnabled());
       fireEvent.click(button);
@@ -687,7 +683,7 @@ describe("SwitchHostDialog", () => {
       getSessionSlimMock.mockResolvedValue({ hostId: "host_new" } as Awaited<
         ReturnType<typeof getSessionSlim>
       >);
-      view.rerender(dialog("host_new"));
+      rerenderDialog({ currentHostId: "host_new" });
       const failedRequest = failure === "stop" ? stopSessionMock : updateSessionMock;
       failedRequest.mockRejectedValueOnce(new Error("retry failed"));
       await waitFor(() => expect(button).toBeEnabled());
@@ -857,7 +853,7 @@ describe("SwitchHostDialog", () => {
       launchManagedHostMock.mockResolvedValue({
         sandboxStatus: { stage: "provisioning", error: null, provider: "modal" },
       } as Awaited<ReturnType<typeof launchManagedHost>>);
-      const client = renderDialog(SANDBOX_SERVER);
+      const { client } = renderDialog(SANDBOX_SERVER);
       client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"), [
         { id: "terminal_shellA_s1", name: "shellA", session: "s1", running: true },
       ]);
@@ -927,7 +923,7 @@ describe("SwitchHostDialog", () => {
           sandboxStatus: { stage: "provisioning", error: null, provider: "modal" },
         } as Awaited<ReturnType<typeof launchManagedHost>>;
       });
-      const client = renderDialog(SANDBOX_SERVER);
+      const { client } = renderDialog(SANDBOX_SERVER);
       fireEvent.change(screen.getByTestId("mock-host-select"), {
         target: { value: "__sandbox__:modal" },
       });
@@ -957,7 +953,7 @@ describe("SwitchHostDialog", () => {
           sandboxStatus: { stage: "provisioning", error: null, provider: "modal" },
         } as Awaited<ReturnType<typeof launchManagedHost>>;
       });
-      const client = renderDialog(SANDBOX_SERVER);
+      const { client } = renderDialog(SANDBOX_SERVER);
       fireEvent.change(screen.getByTestId("mock-host-select"), {
         target: { value: "__sandbox__:modal" },
       });

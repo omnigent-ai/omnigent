@@ -4802,6 +4802,33 @@ class _HostFrameResponder:
             )
 
 
+async def _stop_owner_on_host_replica(
+    misplaced_client: httpx.AsyncClient,
+    routed_client: httpx.AsyncClient,
+    session: dict[str, str],
+    host: _HostFrameResponder,
+    *,
+    runner_requests: list[tuple[str, str]] | None = None,
+) -> None:
+    """Reject an owner's Stop on the wrong replica, then stop through its host."""
+    previous_requests = list(runner_requests) if runner_requests is not None else None
+    misplaced = await misplaced_client.post(
+        f"/v1/sessions/{session['id']}/events", json={"type": "stop_session"}
+    )
+    assert misplaced.status_code == 400, misplaced.text
+    assert misplaced.json()["error"]["code"] == "wrong_replica"
+    assert host.stopped_runner_ids == []
+    if runner_requests is not None:
+        assert runner_requests == previous_requests
+    bound = (await routed_client.get(f"/v1/sessions/{session['id']}")).json()
+    assert bound["runner_id"] == session["runner_id"]
+    stopped = await routed_client.post(
+        f"/v1/sessions/{session['id']}/events", json={"type": "stop_session"}
+    )
+    assert stopped.status_code in (200, 202), stopped.text
+    assert host.stopped_runner_ids == [session["runner_id"]]
+
+
 async def _inline_child_session(client: httpx.AsyncClient, parent_id: str) -> dict[str, str]:
     """Create a sub-agent child on the parent's host; it inherits the parent's runner."""
     parent = (await client.get(f"/v1/sessions/{parent_id}")).json()
@@ -5047,19 +5074,10 @@ async def test_stopping_child_does_not_stop_parents_shared_runner(
         assert store.get_conversation(parent["id"]).runner_id == parent["runner_id"]
 
         if host_placement == "remote":
-            # The owner still needs the host to terminate the dedicated process.
-            owner_stop = await client.post(
-                f"/v1/sessions/{parent['id']}/events", json={"type": "stop_session"}
+            # A reachable runner still needs host-directed termination for its owner.
+            await _stop_owner_on_host_replica(
+                client, host_client, parent, host, runner_requests=requests
             )
-            assert owner_stop.status_code == 400, owner_stop.text
-            assert owner_stop.json()["error"]["code"] == "wrong_replica"
-            assert requests == expected_requests
-            assert host.stopped_runner_ids == []
-            routed_stop = await host_client.post(
-                f"/v1/sessions/{parent['id']}/events", json={"type": "stop_session"}
-            )
-            assert routed_stop.status_code in (200, 202), routed_stop.text
-            assert host.stopped_runner_ids == [parent["runner_id"]]
 
 
 async def test_child_relaunch_does_not_stop_parents_shared_runner(
@@ -5475,19 +5493,7 @@ async def test_switch_host_stops_before_releasing_the_old_binding(
     ):
         set_runner_client(runner)
         try:
-            misplaced = await target_client.post(
-                f"/v1/sessions/{session['id']}/events", json={"type": "stop_session"}
-            )
-            assert misplaced.status_code == 400, misplaced.text
-            assert misplaced.json()["error"]["code"] == "wrong_replica"
-            assert first_host.stopped_runner_ids == []
-            bound = (await client.get(f"/v1/sessions/{session['id']}")).json()
-            assert bound["runner_id"] == session["runner_id"]
-            stopped = await client.post(
-                f"/v1/sessions/{session['id']}/events", json={"type": "stop_session"}
-            )
-            assert stopped.status_code in (200, 202), stopped.text
-            assert first_host.stopped_runner_ids == [session["runner_id"]]
+            await _stop_owner_on_host_replica(target_client, client, session, first_host)
             released = await client.patch(f"/v1/sessions/{session['id']}", json={"runner_id": ""})
             assert released.status_code == 200, released.text
             launched = await target_client.post(

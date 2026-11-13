@@ -46,44 +46,8 @@ import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import { captureLaunchStatus, useChatStore } from "@/store/chatStore";
 
 /**
- * Move an existing session onto a different host, from the composer's
- * host badge (see ``HostBadge``).
- *
- * Stop the old session before releasing its routing information. Generic
- * unbind also supports nondestructive runner transfers and cannot infer a move.
- *
- * 1. ``stop_session`` reaches the old host's replica while still bound.
- *    A known-offline origin is left alone so its outage cannot block a move.
- * 2. ``PATCH /v1/sessions/{id}`` with ``runner_id: ""`` releases the
- *    current runner binding. The launch endpoint binds atomically with
- *    ``UPDATE … WHERE runner_id IS NULL``, so a bound session is
- *    rejected until this clears it. The same call clears the model
- *    override, which is bound to the old host's catalog.
- * 3. ``POST /v1/hosts/{new}/runners`` validates the directory against
- *    the agent's sandbox boundary, binds the runner, and repoints the
- *    session's ``host_id``.
- *
- * A directory is always required: workspaces are per-machine, so the
- * old path means nothing on the new host even when it reads the same.
- *
- * Sandbox targets use the managed-host endpoint; the session page tracks
- * provisioning.
- *
- * The first available host is selected on open and its directory
- * defaulted, so the common "just move it over there" case is one click.
- * A sandbox costs a fresh provision, so it is the default only when no
- * other host is online.
- *
- * Step 2 landing without step 3 (a dropped connection between them)
- * leaves the session bound to nothing. The dialog stays open on that
- * failure and puts the origin host back in the picker, so recovering —
- * onward to the new host, or back to the old one — is the same click.
- *
- * @param open - Whether the dialog is visible.
- * @param onOpenChange - Radix-controlled visibility setter.
- * @param sessionId - The session to move, e.g. ``"conv_abc"``.
- * @param currentHostId - The host it is bound to now; excluded from the
- *   picker and used for the "different machine" warning.
+ * Refresh the binding, stop unless its host is freshly confirmed offline, then release and launch.
+ * Generic unbind remains nondestructive.
  */
 export function SwitchHostDialog(props: Parameters<typeof SupportedSwitchHostDialog>[0]) {
   const { switchHostDisabledReason } = useSessionActionRestrictions(props.sessionId, {
