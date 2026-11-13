@@ -105,7 +105,7 @@ def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
 @pytest.mark.parametrize("existing", [False, True])
 @pytest.mark.parametrize("caller", [False, True])
 async def test_claude_terminal_request_preserves_legacy_bridge_identity(
-    tmp_path, monkeypatch, existing, caller
+    tmp_path, monkeypatch, existing, caller, claude_settings_validator
 ) -> None:
     from omnigent.harnesses.claude_native import bridge
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec

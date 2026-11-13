@@ -1921,8 +1921,11 @@ async def test_failed_launch_rolls_back_only_new_relay(
 async def test_cli_caller_settings_finalize_under_terminal_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, terminal_registry_singleton
 ) -> None:
+    from omnigent.harnesses.claude_native import settings_validation
     from omnigent.harnesses.claude_native.main import _claude_terminal_request
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setattr(settings_validation, "validate_caller_settings", AsyncMock())
 
     disable_hooks = mode == "disable-hooks"
     agent_id = "settings-agent"

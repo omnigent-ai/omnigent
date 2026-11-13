@@ -5048,7 +5048,7 @@ async def _finalize_test_claude_args(
 
 @pytest.mark.asyncio
 async def test_augment_claude_args_merges_caller_settings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, claude_settings_validator
 ) -> None:
     """
     A caller ``--settings`` is merged into the invocation settings, not dropped.
@@ -5075,6 +5075,8 @@ async def test_augment_claude_args_merges_caller_settings(
                 "cleanupPeriodDays": 21,
                 "enableAllProjectMcpServers": False,
                 "customOptions": {"nested": {"first": True}, "retained": 1},
+                "attribution": False,
+                "remoteTools": {"allowUnattendedServing": False},
             }
         ),
         encoding="utf-8",
@@ -5130,6 +5132,10 @@ async def test_augment_claude_args_merges_caller_settings(
     assert settings["cleanupPeriodDays"] == 42
     assert settings["enableAllProjectMcpServers"] is True
     assert settings["customOptions"] == {"nested": {"later": True}, "retained": 1}
+    assert settings["attribution"] is False
+    assert settings["remoteTools"] == {"allowUnattendedServing": False}
+    claude_settings_validator.assert_awaited_once()
+    assert claude_settings_validator.await_args.args[1] == settings
     assert settings["skillOverrides"] == {"custom-skill": "off", "auto-mode-setup": "off"}
     assert settings["permissions"]["allow"][:2] == ["Read(first.txt)", "Read(second.txt)"]
     assert settings["permissions"]["deny"] == ["Bash(blocked)"]
@@ -5163,18 +5169,31 @@ def test_merge_caller_settings_validates_retention(tmp_path: Path, retention: ob
 
 
 @pytest.mark.asyncio
-async def test_caller_settings_validation_preserves_baseline_and_arguments(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "caller, error",
+    [
+        ({"cleanupPeriodDays": 0}, "cleanupPeriodDays must be a positive integer"),
+        ({"language": 0}, "Claude rejected the merged caller settings"),
+        ({"hooks": {"PreToolUse": [None]}}, "Claude rejected the merged caller settings"),
+        ({"remoteTools": 0}, "Claude rejected the merged caller settings"),
+    ],
+    ids=["retention", "language", "hook-null", "internal-field"],
+)
+async def test_caller_settings_validation_preserves_baseline_and_arguments(
+    tmp_path: Path, claude_settings_validator, caller: dict, error: str
+) -> None:
     from omnigent.inner.datamodel import OSEnvSpec
 
     args = augment_claude_args(
-        ('--settings={"cleanupPeriodDays":0}',),
+        ("--settings=" + json.dumps(caller),),
         bridge_dir=tmp_path,
         defer_caller_settings=True,
     )
     baseline_path = Path(args[max(i for i, arg in enumerate(args) if arg == "--settings") + 1])
     baseline_bytes = baseline_path.read_bytes()
     original_args = list(args)
-    with pytest.raises(ValueError, match="cleanupPeriodDays must be a positive integer"):
+    claude_settings_validator.side_effect = ValueError(error)
+    with pytest.raises(ValueError, match=error):
         await _finalize_test_claude_args(
             args,
             bridge_dir=tmp_path,
@@ -5193,7 +5212,9 @@ async def test_caller_settings_validation_preserves_baseline_and_arguments(tmp_p
     "mode",
     ["no-caller", "delimiter", "unreadable", "mismatch", "invalid-generation", "missing-boundary"],
 )
-async def test_caller_settings_finalize_parsing_and_generation(tmp_path: Path, mode: str) -> None:
+async def test_caller_settings_finalize_parsing_and_generation(
+    tmp_path: Path, mode: str, claude_settings_validator
+) -> None:
     from omnigent.inner.datamodel import OSEnvSpec
 
     caller_file = tmp_path / "caller.json"
@@ -5246,6 +5267,7 @@ async def test_caller_settings_finalize_parsing_and_generation(tmp_path: Path, m
 @pytest.mark.asyncio
 async def test_overlapping_caller_settings_finalizers_keep_immutable_baseline(
     tmp_path: Path,
+    claude_settings_validator,
 ) -> None:
     from omnigent.inner.datamodel import OSEnvSpec
 
@@ -5286,7 +5308,7 @@ async def test_overlapping_caller_settings_finalizers_keep_immutable_baseline(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("filesystem_mode", ["none", "default", "fork"])
 async def test_caller_settings_resolve_terminal_workspace(
-    tmp_path: Path, filesystem_mode: str
+    tmp_path: Path, filesystem_mode: str, claude_settings_validator
 ) -> None:
     from omnigent.inner.datamodel import OSEnvSpec
 
@@ -5506,6 +5528,7 @@ async def test_caller_settings_reuses_existing_terminal_filesystem_view(
     command: str,
     prefix: list[str],
     chdir: str | None,
+    claude_settings_validator,
 ) -> None:
     from unittest.mock import AsyncMock, Mock
 
@@ -5578,7 +5601,7 @@ async def test_caller_settings_reuses_existing_terminal_filesystem_view(
     sys.platform != "linux" or shutil.which("bwrap") is None, reason="requires Linux and bwrap"
 )
 async def test_caller_settings_follow_terminal_filesystem_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, claude_settings_validator
 ) -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 

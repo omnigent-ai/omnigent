@@ -3244,7 +3244,10 @@ def augment_claude_args(
         if defer_caller_settings
         else bridge_dir / _INVOCATION_SETTINGS_FILE
     )
-    _write_invocation_settings(settings_path, hook_settings, active_harnesses=active_harnesses)
+    _write_json_file(
+        settings_path,
+        _effective_invocation_settings(hook_settings, active_harnesses=active_harnesses),
+    )
     from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
     if claude_code_managed_mcp_present():
@@ -3598,19 +3601,17 @@ def _claude_settings_boundary(bridge_dir: Path, args: list[str], generation: str
     return start
 
 
-def _write_invocation_settings(
-    path: Path,
+def _effective_invocation_settings(
     settings: dict[str, Any],
     *,
     active_harnesses: Collection[str] | None,
-) -> None:
-    """Apply saved MCP denials before persisting baseline or merged settings."""
+) -> dict[str, Any]:
+    """Apply saved MCP denials before validating or persisting invocation settings."""
     from omnigent.mcp_disabled_servers import apply_claude_settings
 
-    settings = apply_claude_settings(
+    return apply_claude_settings(
         settings, executor="claude-native", active_harnesses=active_harnesses
     )
-    _write_json_file(path, settings)
 
 
 def _replace_framework_settings(args: list[str], baseline: Path, output: Path) -> None:
@@ -3736,8 +3737,12 @@ async def finalize_claude_caller_settings(
         if not isinstance(baseline, dict):
             raise ValueError("required bridge settings are unavailable under the terminal policy")
         settings = _merge_caller_settings(baseline, callers, bridge_dir)
+        settings = _effective_invocation_settings(settings, active_harnesses=active_harnesses)
+        from omnigent.harnesses.claude_native.settings_validation import validate_caller_settings
+
+        await validate_caller_settings(instance, settings, wrapper_prefix=prefix)
         output_path = bridge_dir / f"claude-settings-{generation}-{secrets.token_hex(16)}.json"
-        _write_invocation_settings(output_path, settings, active_harnesses=active_harnesses)
+        _write_json_file(output_path, settings)
         _replace_framework_settings(kept, settings_path, output_path)
     instance.args = [*prefix, *kept]
 
@@ -3755,7 +3760,8 @@ def _merge_caller_settings(
     before Omnigent's own values take precedence. Effective ``disableAllHooks``
     and ``allowManagedHooksOnly`` values of ``true`` are rejected. Other CLI
     hook controls, including environment modes and plugin-only customization,
-    are passed through; this validation is not exhaustive.
+    are passed through. These local guards enforce bridge merge requirements;
+    the finalizer validates the complete document with the selected CLI.
     Caller MCP-denial lists use the last caller value; saved denials append later.
     Other maps merge direct members only; a later nested map replaces the earlier one.
 

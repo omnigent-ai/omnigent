@@ -288,12 +288,13 @@ async def test_claude_settings_prepare_reads_shared_terminal_overlay(
     import json
     from unittest.mock import AsyncMock
 
-    from omnigent.harnesses.claude_native import bridge
+    from omnigent.harnesses.claude_native import bridge, settings_validation
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
 
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(settings_validation, "validate_caller_settings", AsyncMock())
     cow_spec.sandbox.read_paths.append(str(Path(sys.prefix).resolve()))
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
