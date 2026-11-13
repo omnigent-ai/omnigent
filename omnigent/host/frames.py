@@ -20,6 +20,7 @@ see.
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import math
 from collections.abc import Iterator
@@ -118,8 +119,10 @@ HOST_CAPABILITIES: list[str] = [
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
     CAP_CLONE_REPOSITORY,
-    CAP_WORKSPACE_API,
 ]
+# The workspace API needs the optional `omnigent[workspace-api]` extra.
+if importlib.util.find_spec("connectrpc") is not None:
+    HOST_CAPABILITIES.append(CAP_WORKSPACE_API)
 
 # Server capabilities, advertised on the tunnel's WebSocket upgrade response (the
 # server sends no frame before the host's hello). Older servers send no header.

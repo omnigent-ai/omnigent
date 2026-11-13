@@ -2823,7 +2823,15 @@ def register_resources_routes(
         hidden paths. A host on another replica gets the REST wrong-replica error,
         so the client's fetch re-addresses it; other refusals are Connect errors.
         """
-        from connectrpc.code import Code
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_API):
+            raise HTTPException(status_code=404, detail="The workspace API is disabled")
+        try:
+            from connectrpc.code import Code
+        except ImportError:
+            raise HTTPException(
+                status_code=501, detail="The workspace API needs `omnigent[workspace-api]`"
+            ) from None
         from connectrpc.errors import ConnectError
 
         from omnigent.api.workspace.v1alpha1.workspace_connect import (
@@ -2839,9 +2847,6 @@ def register_resources_routes(
             HostWorkspaceService,
         )
 
-        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
-        if not flags.enabled(Feature.WORKSPACE_API):
-            raise HTTPException(status_code=404, detail="The workspace API is disabled")
         conv = await _authorize_browse_read(session_id, request)
         owner = await asyncio.to_thread(routing_host_session, conv, conversation_store) or conv
         host_id = owner.host_id
