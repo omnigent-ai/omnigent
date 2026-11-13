@@ -290,9 +290,7 @@ class SqlFile(OmnigentBase):
     source_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
-        # Files are only ever listed per session (WHERE session_id = ?),
-        # so a session-scoped composite is the only index needed. There is
-        # no session-less "all files" listing.
+        # Session lists use creation order; shared-blob ownership uses equality.
         Index(
             "ix_files_session_id_created_at",
             "workspace_id",
@@ -300,6 +298,115 @@ class SqlFile(OmnigentBase):
             "created_at",
             "id",
         ),
+        Index("ix_files_blob_reference", "workspace_id", "blob_key", "id"),
+    )
+
+
+class SqlSessionSpawnEpoch(OmnigentBase):
+    """Current admission epoch fences retries after terminal receipts are retired."""
+
+    __tablename__ = "session_spawn_epochs"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id
+    )
+    parent_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    epoch: Mapped[int] = mapped_column(BigInteger)
+
+
+class SqlSessionSpawn(OmnigentBase):
+    """Pending child reservations and durable admission/cleanup receipts."""
+
+    __tablename__ = "session_spawns"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id
+    )
+    creator_runner_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    epoch: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    nonce: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    child_id: Mapped[str] = mapped_column(Uuid16())
+    parent_id: Mapped[str] = mapped_column(Uuid16())
+    owner_id: Mapped[str] = mapped_column(String(128))
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    title: Mapped[str] = mapped_column(String(768))
+    request_digest: Mapped[bytes] = mapped_column(_CKSUM32)
+    name_digest: Mapped[bytes | None] = mapped_column(_CKSUM32, nullable=True)
+    state: Mapped[int] = mapped_column(SmallInteger)
+    phase: Mapped[int] = mapped_column(SmallInteger)
+    create_payload: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    input_payload: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    input_digest: Mapped[bytes | None] = mapped_column(_CKSUM32, nullable=True)
+    file_mapping: Mapped[bytes | None] = mapped_column(BoundedBinary(7200), nullable=True)
+    cleanup_blob_keys: Mapped[bytes | None] = mapped_column(BoundedBinary(3600), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int] = mapped_column(Integer)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "child_id", name="uq_session_spawns_child"),
+        UniqueConstraint("workspace_id", "name_digest", name="uq_session_spawns_name"),
+        Index(
+            "ix_session_spawns_parent",
+            "workspace_id",
+            "parent_id",
+            "child_id",
+            "creator_runner_id",
+            "epoch",
+            "nonce",
+        ),
+        Index(
+            "ix_session_spawns_work",
+            "workspace_id",
+            "state",
+            "phase",
+            "child_id",
+            "creator_runner_id",
+            "epoch",
+            "nonce",
+        ),
+        Index(
+            "ix_session_spawns_global_work",
+            "state",
+            "phase",
+            "workspace_id",
+            "child_id",
+            "creator_runner_id",
+            "epoch",
+            "nonce",
+        ),
+        Index(
+            "ix_session_spawns_expiry",
+            "state",
+            "created_at",
+            "workspace_id",
+            "child_id",
+            "creator_runner_id",
+            "epoch",
+            "nonce",
+        ),
+        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_session_spawns_state"),
+        CheckConstraint("phase IN (1, 2, 3, 4, 5, 6)", name="ck_session_spawns_phase"),
+    )
+
+
+class SqlSessionSpawnPayload(OmnigentBase):
+    """Exclusive artifact ownership and retained cleanup for delayed uploaders."""
+
+    __tablename__ = "session_spawn_payloads"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    child_id: Mapped[str] = mapped_column(Uuid16())
+    payload_digest: Mapped[bytes] = mapped_column(_CKSUM32)
+    encoded_digest: Mapped[bytes] = mapped_column(_CKSUM32)
+    cleanup_after: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cleanup_attempts: Mapped[int] = mapped_column(SmallInteger)
+
+    __table_args__ = (
+        Index("ix_session_spawn_payloads_cleanup", "workspace_id", "cleanup_after", "id"),
+        Index("ix_session_spawn_payloads_global_cleanup", "cleanup_after", "workspace_id", "id"),
     )
 
 
@@ -840,6 +947,22 @@ class SqlProject(OmnigentBase):
             "id",
         ),
     )
+
+
+class SqlSessionSpawnMaterialization(ConversationBase):
+    """Immutable evidence that a reserved AP child was created, even after deletion."""
+
+    __tablename__ = "session_spawn_materializations"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id
+    )
+    child_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    creator_runner_id: Mapped[str] = mapped_column(String(64))
+    epoch: Mapped[int] = mapped_column(BigInteger)
+    nonce: Mapped[str] = mapped_column(Uuid16())
+    create_digest: Mapped[bytes] = mapped_column(_CKSUM32)
+    created_at: Mapped[int] = mapped_column(Integer)
 
 
 class SqlConversation(ConversationBase):
