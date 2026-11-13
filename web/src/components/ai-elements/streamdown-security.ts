@@ -273,6 +273,8 @@ export function markWorkspaceFileLinks() {
       const href = node.properties?.href;
       if (typeof href !== "string" || !href) return;
       if (NON_FILE_HREF.test(href) || href.includes("?")) return;
+      // Continuation notices link to another chat, not a workspace file.
+      if (/^\/c\/[A-Za-z0-9_-]+\/?$/.test(href)) return;
       const cited = splitWorkspaceFileCitation(href);
       if (href.includes("#") && !cited.hasPosition) return;
       node.properties = {

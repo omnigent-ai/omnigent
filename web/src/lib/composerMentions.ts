@@ -87,6 +87,19 @@ function spacedMention(before: string, sessionTitles: readonly string[]): RegExp
 }
 
 /**
+ * Whether a session's agent opens an "@"-mentioned workspace path: native
+ * wrappers via the agent registry, other harnesses when the server declares
+ * ``workspace_file_mentions`` for them (``useFileMentionHarnesses``).
+ */
+export function harnessSupportsFileMentions(
+  harness: string | null | undefined,
+  declared: ReadonlySet<string>,
+): boolean {
+  if (harness == null) return false;
+  return nativeCodingAgentForHarness(harness) !== undefined || declared.has(harness);
+}
+
+/**
  * Build the attachment marker for an "@"-tagged workspace ``path``, in the
  * wording the given native harness's executor uses for file delivery.
  *

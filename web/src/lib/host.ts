@@ -1,6 +1,7 @@
 import type { ComponentType, ReactNode, Ref } from "react";
 
 import { getBasePath, withBasePath } from "./basePath.ts";
+import { updatesRoutingKey } from "./sessionHost.ts";
 import { clientRoutingKey, SLICE_KEY_HEADER, SLICE_KEY_PARAM } from "./routingKey.ts";
 
 /**
@@ -339,10 +340,17 @@ export function getThemeRoots(): HTMLElement[] {
 export interface RoutingOptions {
   /** Send no slice key, to reach a host whose tunnels connected without one. */
   unkeyed?: boolean;
+  /** The request names no host: key it by the modal host, else this client's key. */
+  hostless?: boolean;
+}
+
+/** The fallback key for a request that names no host of its own. */
+function fallbackRoutingKey(options?: RoutingOptions): string {
+  return options?.hostless ? updatesRoutingKey() : clientRoutingKey();
 }
 
 /**
- * `init` with the client's slice key added when host routing is on and the
+ * `init` with the fallback slice key added when host routing is on and the
  * request carries no key yet, so every request names a replica.
  */
 export function withRoutingKey(
@@ -352,17 +360,17 @@ export function withRoutingKey(
   if (options?.unkeyed || !isHostRoutingEnabled()) return init;
   const headers = new Headers(init?.headers);
   if (headers.has(SLICE_KEY_HEADER)) return init;
-  headers.set(SLICE_KEY_HEADER, clientRoutingKey());
+  headers.set(SLICE_KEY_HEADER, fallbackRoutingKey(options));
   return { ...init, headers };
 }
 
-/** `path` with the client's slice key as a query parameter when it carries none. */
+/** `path` with the fallback slice key as a query parameter when it carries none. */
 export function withRoutingKeyParam(path: string, options?: RoutingOptions): string {
   if (options?.unkeyed || !isHostRoutingEnabled()) return path;
   const [base, query = ""] = path.split("?", 2);
   const params = new URLSearchParams(query);
   if (params.has(SLICE_KEY_PARAM)) return path;
-  params.set(SLICE_KEY_PARAM, clientRoutingKey());
+  params.set(SLICE_KEY_PARAM, fallbackRoutingKey(options));
   return `${base}?${params}`;
 }
 

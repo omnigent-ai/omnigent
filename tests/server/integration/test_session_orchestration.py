@@ -911,6 +911,51 @@ async def test_same_host_still_requires_host_ownership(auth_client, auth_app, pe
     assert permissions.list_for_user("alice") == before_grants
 
 
+async def test_same_host_creation_from_runner_keeps_source_surface(
+    auth_client, auth_app, peers, db_uri, monkeypatch
+) -> None:
+    """A web session's runner creates a same_host session, which is labeled web."""
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from omnigent.telemetry.request_headers import client_user_agent
+    from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _, _ = peers
+    host_id = "b" * 32
+    _register_online_host(auth_app, host_id, "alice")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(source["id"], host_id, workspace="/tmp")
+    store.set_labels(source["id"], {CLIENT_SURFACE_LABEL_KEY: "web"})
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    # The runner's own tool call carries the component User-Agent.
+    auth_client.headers["User-Agent"] = client_user_agent().replace(
+        "omnigent-cli/", "omnigent-runner/"
+    )
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": source["agent_id"], "placement": "same_host"}),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    created = store.get_conversation(result["conversation_id"])
+    assert created is not None, result
+    assert created.labels[CLIENT_SURFACE_LABEL_KEY] == "web"
+
+
 @pytest.mark.parametrize(
     "child_manager,move_before_recheck,policy_denied,source_viewers",
     [
@@ -1321,6 +1366,72 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
         )
         grants, _ = SqlAlchemyPermissionStore(db_uri).list_for_session(session_id)
         assert [g.user_id for g in grants] == ["alice"]
+    finally:
+        release.set()
+        await auth_app.state.startup_inputs.shutdown()
+
+
+class _ListLabelSelection:
+    """A deployment that records the whole selection in one JSON label."""
+
+    def validate(self, request, services, *, spec, user_id):
+        if "revoked" in services:
+            from omnigent.errors import ErrorCode, OmnigentError
+
+            raise OmnigentError("revoked", code=ErrorCode.FORBIDDEN)
+        return tuple(services)
+
+    def session_labels(self, services):
+        return {"deployment.mcp_services": json.dumps(list(services))}
+
+    def selected_services(self, labels):
+        return tuple(json.loads(labels.get("deployment.mcp_services", "[]")))
+
+
+@pytest.mark.parametrize(
+    ("source_services", "inherited"),
+    [(["github", "slack"], '["github", "slack"]'), (["github", "revoked"], None), ([], None)],
+    ids=["inherits", "unusable-service", "no-selection"],
+)
+async def test_managed_worker_starts_with_the_source_mcp_services(
+    auth_client, auth_app, peers, db_uri, monkeypatch, source_services, inherited
+):
+    import asyncio
+
+    from omnigent.server.managed_hosts import parse_sandbox_config
+    from omnigent.server.routes.sessions import routes_core
+
+    source, _, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    if source_services:
+        store.set_labels(source["id"], {"deployment.mcp_services": json.dumps(source_services)})
+    auth_app.state.session_mcp_selection = _ListLabelSelection()
+    auth_app.state.sandbox_config = parse_sandbox_config(
+        {"server_url": "https://managed-test.example.com", "providers": [{"provider": "modal"}]}
+    )
+    launched = asyncio.Event()
+    release = asyncio.Event()
+
+    async def launch(**kwargs):
+        launched.set()
+        await release.wait()
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    try:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": source["agent_id"], "placement": "managed", "message": "Go"}
+                ),
+                server_client=auth_client,
+                conversation_id=source["id"],
+            )
+        )
+        assert "error" not in result, result
+        await asyncio.wait_for(launched.wait(), timeout=2)
+        labels = store.get_conversation(result["conversation_id"]).labels
+        assert labels.get("deployment.mcp_services") == inherited
     finally:
         release.set()
         await auth_app.state.startup_inputs.shutdown()
@@ -2306,3 +2417,181 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
         store.update_conversation(session_id, archived=False)
     snapshot = (await auth_client.get(f"/v1/sessions/{source['id']}")).json()
     assert not snapshot["family"]["pinned"]
+
+
+@pytest.mark.parametrize("scenario", ["allowed", "foreign_host", "restricted", "shared_source"])
+@pytest.mark.parametrize("nested", [False, True])
+async def test_scripted_host_worktree_respects_ownership_and_policy(
+    auth_client, auth_app, peers, db_uri, monkeypatch, scenario, nested
+):
+    from omnigent.host.frames import (
+        HostCreateWorktreeFrame,
+        HostLaunchRunnerFrame,
+        HostStatFrame,
+        decode_host_frame,
+    )
+    from omnigent.server.sharing_settings import SiblingSessionDestinations
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _, _ = peers
+    auth_app.state.feature_flags = resolve_feature_flags(
+        {
+            FEATURES_ENV_VAR: "scripted_sessions,"
+            + ("sibling_sessions" if nested else "-sibling_sessions")
+        }
+    )
+    host = uuid4().hex
+    owner = "bob" if scenario == "foreign_host" else "alice"
+    _register_online_host(auth_app, host, owner)
+    auth_app.state.host_store.upsert_on_connect(host, "review-host", owner)
+    store = SqlAlchemyConversationStore(db_uri)
+    # A hostless caller can choose an owned host when destination policy allows it.
+    if scenario == "restricted":
+        auth_app.state.sibling_session_destinations = lambda: (
+            SiblingSessionDestinations.CURRENT_HOST
+        )
+    if scenario == "shared_source":
+        permissions = SqlAlchemyPermissionStore(db_uri)
+        permissions.ensure_user("bob")
+        permissions.grant("bob", source["id"], LEVEL_EDIT)
+    frames = []
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        frames.append(frame)
+        assert connection.host_id == host
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostCreateWorktreeFrame):
+            connection.pending_create_worktrees[frame.request_id].set_result(
+                {"status": "ok", "worktree_path": "/repos/review", "branch": frame.branch_name}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    before = {s.id for s in store.list_conversations().data}
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": source["agent_id"],
+                    "placement": "host",
+                    "host_id": host,
+                    "workspace": "/repos/example",
+                    "git": {"branch_name": "review", "base_branch": "main"},
+                }
+            ),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+    if scenario != "allowed":
+        assert "error" in result, result
+        assert {s.id for s in store.list_conversations().data} == before
+        assert not frames
+        return
+    assert "error" not in result, result
+    created = store.get_conversation(result["conversation_id"])
+    assert created.host_id == host
+    assert created.workspace == "/repos/review"
+    assert created.parent_conversation_id is None
+    worktree = next(f for f in frames if isinstance(f, HostCreateWorktreeFrame))
+    assert worktree.branch_name == "review" and worktree.base_branch == "main"
+    launch = next(f for f in frames if isinstance(f, HostLaunchRunnerFrame))
+    assert launch.workspace == "/repos/review"
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "allowed",
+        "disabled",
+        "shared_source",
+        "read_only_target",
+        "missing_source",
+        "legacy_disabled",
+    ],
+)
+async def test_scripted_pr_link_checks_source_and_target(
+    auth_client, auth_app, peers, db_uri, monkeypatch, scenario
+):
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, target, _ = peers
+    auth_app.state.feature_flags = resolve_feature_flags(
+        {
+            FEATURES_ENV_VAR: ""
+            if scenario in ("disabled", "legacy_disabled")
+            else "scripted_sessions"
+        }
+    )
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob")
+    if scenario == "shared_source":
+        permissions.grant("bob", source["id"], LEVEL_EDIT)
+    if scenario == "read_only_target":
+        target = await _create_session_as(auth_client, "", "bob")
+        permissions.grant("alice", target["id"], LEVEL_READ)
+    host = uuid4().hex
+    _register_online_host(auth_app, host, "alice")
+    SqlAlchemyConversationStore(db_uri).set_host_id(target["id"], host, workspace="/repo")
+
+    # Exercise the host fallback after the remote runner reports it is offline.
+    async def offline_runner(*args, **kwargs):
+        raise OmnigentError("Runner offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    monkeypatch.setattr(routes_resources, "_get_runner_client_for_resource_access", offline_runner)
+    captured = []
+
+    async def write(**kwargs):
+        captured.append(kwargs)
+        return {"object": "session.github.info", "prs": []}
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    path = f"/v1/sessions/{target['id']}/resources/github/prs"
+    if scenario != "legacy_disabled":
+        path += "/orchestrated"
+    headers = {"X-Forwarded-Email": "alice"}
+    if scenario != "missing_source":
+        headers[ORCHESTRATION_SOURCE_HEADER] = source["id"]
+    response = await auth_client.post(
+        path,
+        headers=headers,
+        json={"url": "https://github.com/example/repo/pull/1", "action": "attach"},
+    )
+    if scenario != "allowed":
+        assert response.status_code == 403, response.text
+        assert not captured
+        return
+    assert response.status_code == 200, response.text
+    assert len(captured) == 1
+    assert captured[0]["op"] == "github_prs_update"
+    assert captured[0]["params"]["session_id"] == target["id"]
+
+
+@pytest.mark.parametrize("enabled,source_header", [(False, True), (True, False)])
+async def test_explicit_host_endpoint_refuses_without_capability_or_source(
+    auth_client, auth_app, peers, db_uri, enabled, source_header
+):
+    source, _, _ = peers
+    auth_app.state.feature_flags = resolve_feature_flags(
+        {FEATURES_ENV_VAR: "scripted_sessions" if enabled else ""}
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    before = {session.id for session in store.list_conversations().data}
+    response = await auth_client.post(
+        "/v1/sessions/orchestrated/host",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]} if source_header else {},
+        json={"agent_id": source["agent_id"], "host_id": uuid4().hex, "workspace": "/repo"},
+    )
+    assert response.status_code == 403, response.text
+    assert {session.id for session in store.list_conversations().data} == before

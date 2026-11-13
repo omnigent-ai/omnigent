@@ -603,6 +603,9 @@ def create_runner_tunnel_router(
             ):
                 await ws.close(code=4004, reason="runner binding was replaced")
                 return
+            # Durable before the tunnel takes work, so another replica cannot settle
+            # this runner's running sessions as orphaned once it is accepted here.
+            await session_live_state.stamp_runner_liveness(runner_id)
             session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
             session.diagnostics.settings.update(
                 tunnel_side="server",

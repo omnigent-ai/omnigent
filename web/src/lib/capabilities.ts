@@ -278,14 +278,16 @@ export interface ServerInfo {
   scheduled_task_source_sessions?: boolean;
   /** Connected hosts and continued sandboxes accept ten-minute schedules. */
   scheduled_task_subhour?: boolean;
+  /** Runs drop a trigger prompt's header line before dispatch, so the form can save one. */
+  scheduled_task_trigger_headers?: boolean;
   /** Server default for new trigger templates, from 10 to 240 minutes. */
   automation_trigger_poll_minutes?: number;
   /** Sandbox automations accept a repository URL as their workspace. */
   scheduled_task_sandbox_workspaces?: boolean;
   /**
-   * True when a managed create accepts ``host_id`` naming its new sandbox
-   * host. Older servers reject it, so the create omits it there. Fails to
-   * ``false``.
+   * True when a managed create, fork or move accepts ``host_id`` naming its
+   * new sandbox host. Web JSON sends a minted id only when this is true.
+   * Fails to ``false``.
    */
   request_managed_sandbox_host_id?: boolean;
   /** True when sandbox forks accept an explicit `workspaces` list; absent on older servers. */
@@ -314,6 +316,8 @@ export interface ServerInfo {
    * list `clear` for native sessions only; absent there (off).
    */
   session_claude_sdk_clear?: boolean;
+  /** True when `POST /v1/sessions/{id}/rewind` exists; absent on older servers (off). */
+  session_rewind?: boolean;
   /**
    * True when the server stores session PRs (``/v1/sessions/{id}/pull-requests``
    * and ``Conversation.pull_request``); absent on older servers (off).
@@ -482,6 +486,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   session_create_permission_modes: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
+  scheduled_task_trigger_headers: false,
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
@@ -607,7 +612,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
       // Route through the host transport (`hostFetch`) so the embed hits the
       // proxied omnigent API; standalone `hostFetch` falls back to plain
       // `fetch("/v1/info")`, preserving the original behavior.
-      const res = await hostFetch("/v1/info");
+      const res = await hostFetch("/v1/info", undefined, { hostless: true });
       if (res.ok) {
         const data = (await res.json()) as Partial<ServerInfo>;
         const smartRoutingEnabled = data.smart_routing_enabled === true;
@@ -665,6 +670,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_create_permission_modes: data.session_create_permission_modes === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
+          scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,
           automation_trigger_poll_minutes:
             typeof data.automation_trigger_poll_minutes === "number" &&
             Number.isInteger(data.automation_trigger_poll_minutes) &&
@@ -683,6 +689,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.session_event_types.filter((t): t is string => typeof t === "string")
             : [],
           session_claude_sdk_clear: data.session_claude_sdk_clear === true,
+          session_rewind: data.session_rewind === true,
           session_pull_requests: data.session_pull_requests === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
