@@ -30,6 +30,7 @@ from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.llms.context_window import fetch_model_pricing_with_provider
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.policies.base import Policy
 from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
 from omnigent.policies.function import resolve_function_policy
@@ -442,9 +443,9 @@ def any_policies_apply(
     :param conversation: The conversation row when the caller holds one. For
         sub-agent conversations this lets the check see the CHILD spec's own
         guardrails (which :func:`build_policy_engine` enforces), so a bundle
-        whose only policies live on a sub-agent is not fast-path skipped.
-        Children with a policy store must build the engine to resolve
-        inherited session policies against their verified root.
+        whose only policies live on a sub-agent is not fast-path skipped. It
+        also names the root whose session policies a sub-agent inherits, so
+        pass a row read in the current request.
     :returns: ``False`` when the engine would have an empty policy list and
         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
     """
@@ -468,12 +469,12 @@ def any_policies_apply(
     # this is a cache hit on any call after the first for this session.
     if _load_session_policy_specs(conversation_id, policy_store):
         return True
-    # The engine verifies ancestry before inheriting root session policies.
-    # A child's local policy list cannot rule out an inherited policy.
+    # Sub-agents inherit the root session's policies. The row was read in this
+    # request and its root never changes, so it names the tree the engine loads.
     if (
-        policy_store is not None
-        and conversation is not None
-        and conversation.parent_conversation_id is not None
+        conversation is not None
+        and conversation.root_conversation_id != conversation_id
+        and _load_session_policy_specs(conversation.root_conversation_id, policy_store)
     ):
         return True
     return False
@@ -994,10 +995,10 @@ def _build_policy_llm_client(
 
 def _normalize_policy_model(model: str) -> str:
     """
-    Apply the ``databricks-`` → ``databricks/`` provider-prefix fixup.
+    Apply the ``databricks/`` provider-prefix fixup to bare Databricks ids.
 
-    Models prefixed with ``databricks-`` (e.g.
-    ``databricks-claude-sonnet-4-6``) need the ``databricks/``
+    Bare Databricks models (e.g. ``databricks-claude-sonnet-4-6`` or the
+    Unity Catalog ``system.ai.claude-sonnet-4-6``) need the ``databricks/``
     provider prefix so the LLM adapter routes through
     ``DatabricksAdapter`` (Chat Completions) rather than
     ``OpenAIAdapter`` (Responses API). Without this, the request
@@ -1006,11 +1007,11 @@ def _normalize_policy_model(model: str) -> str:
     fallback path routes the same way as the primary.
 
     :param model: A model id from the server ``llm:`` config,
-        possibly a bare ``databricks-`` name.
+        possibly a bare ``databricks-`` or ``system.ai.`` name.
     :returns: The model id with the ``databricks/`` prefix applied
         when needed; otherwise unchanged.
     """
-    if "/" not in model and model.startswith("databricks-"):
+    if "/" not in model and is_databricks_model_id(model):
         return f"databricks/{model}"
     return model
 
@@ -1841,26 +1842,33 @@ def _load_session_policy_specs(
     return specs
 
 
-def policy_specs_cache_age(conversation_id: str, policy_store: PolicyStore | None) -> float:
+def policy_specs_cache_age(
+    conversation_id: str,
+    policy_store: PolicyStore | None,
+    root_conversation_id: str | None = None,
+) -> float:
     """
     Return how old the store reads behind a session's cached policy lists are.
 
     A no-policy answer from :func:`any_policies_apply` is only as fresh as the
-    older of the default and session lists it read, so anything that lets
-    callers reuse that answer must subtract this age. A list no longer cached
-    counts as a full cache TTL old.
+    oldest of the default, session, and inherited root lists it read, so
+    anything that lets callers reuse that answer must subtract this age. A
+    list no longer cached counts as a full cache TTL old.
 
     :param conversation_id: The session, e.g. ``"conv_abc123"``.
     :param policy_store: The policy store; ``None`` means there are no stored
         policies to go stale.
+    :param root_conversation_id: The session's tree root, e.g.
+        ``"conv_root"``; a sub-agent's answer also depends on its list.
     :returns: Age in seconds, e.g. ``12.5``.
     """
     if policy_store is None:
         return 0.0
     now = time.monotonic()
+    session_ids = {conversation_id, root_conversation_id or conversation_id}
     entries = (
         _DEFAULT_POLICY_SPECS_CACHE.get(_DEFAULT_POLICY_SPECS_KEY),
-        _SESSION_POLICY_SPECS_CACHE.get(conversation_id),
+        *(_SESSION_POLICY_SPECS_CACHE.get(session_id) for session_id in session_ids),
     )
     return max(_POLICY_SPECS_CACHE_TTL_S if entry is None else now - entry[1] for entry in entries)
 

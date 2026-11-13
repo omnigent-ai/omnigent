@@ -395,6 +395,16 @@ export function useLoadedConversations() {
   return { data, serverRows, isLoading: data === undefined && all.isLoading };
 }
 
+/** Loaded rows when a SidebarDataProvider is mounted, else ``undefined``. */
+export function useOptionalLoadedConversations() {
+  return useContext(SidebarDataContext)?.loadedData;
+}
+
+/** The caller's own sessions when a SidebarDataProvider is mounted, else ``undefined``. */
+export function useOptionalMineSessions() {
+  return useContext(SidebarDataContext)?.mine;
+}
+
 /** Register the mounted sidebar's persisted selection; unmount releases its demand. */
 export function useSidebarView(view: SessionFilter) {
   const { registerView } = useSidebarData();

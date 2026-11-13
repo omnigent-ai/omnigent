@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
+from omnigent.entities.agent import Agent
 from omnigent.entities.conversation import Conversation
 from omnigent.errors import OmnigentError
 from omnigent.runner.app import _build_spawn_env_from_spec
@@ -307,3 +308,84 @@ def test_model_validation_applies_inherited_acp_harness_to_nested_worker(
         orch._validate_session_model_selection(
             _conv(sub_agent_name="worker"), "model-b", MagicMock()
         )
+
+
+def _agent_row(agent_id: str) -> Agent:
+    return Agent(id=agent_id, created_at=1700000000, name="acp-agent", bundle_location="b://acp")
+
+
+def _acp_cache() -> MagicMock:
+    cache = MagicMock()
+    cache.load.return_value.spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "acp:synthetic"}),
+    )
+    return cache
+
+
+def test_resolve_harness_is_acp_reuses_prefetched_agent() -> None:
+    """A caller that already holds the bound agent row must not read it again."""
+    store = MagicMock()
+    store.get.side_effect = AssertionError("the prefetched agent row must be reused")
+    cache = _acp_cache()
+    with patch("omnigent.runtime.get_agent_cache", return_value=cache):
+        assert orch._resolve_harness_impl_is_acp(
+            _conv(agent_id="agent_1"), store, agent=_agent_row("agent_1")
+        )
+    store.get.assert_not_called()
+    assert cache.load.call_args.args[:2] == ("agent_1", "b://acp")
+
+
+def test_resolve_harness_ignores_prefetched_agent_of_another_conversation() -> None:
+    """A row for a different agent id is not trusted; the store is read instead."""
+    store = MagicMock()
+    store.get.return_value = _agent_row("agent_1")
+    with patch("omnigent.runtime.get_agent_cache", return_value=_acp_cache()):
+        assert orch._resolve_harness_impl_is_acp(
+            _conv(agent_id="agent_1"), store, agent=_agent_row("agent_other")
+        )
+    store.get.assert_called_once_with("agent_1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefetched", [True, False])
+async def test_load_acp_model_options_reads_the_agent_only_without_a_prefetched_row(
+    prefetched: bool,
+) -> None:
+    """Options resolve either way; a prefetched row for conv's agent skips the store read."""
+    from omnigent.server.routes._sessions import helpers
+
+    store = MagicMock()
+    store.get.return_value = _agent_row("agent_1")
+    curated = ("gpt-5.4", "claude-fable-5")
+    with (
+        patch.object(helpers, "get_agent_cache", return_value=_acp_cache()),
+        patch("omnigent.models.model_catalog.acp_curated_models", return_value=curated),
+        patch("omnigent.models.model_catalog._acp_launch_model", return_value=curated[0]),
+        patch.object(orch, "_publish_model_options"),
+    ):
+        options = await orch._load_acp_model_options(
+            "conv_acp", _conv(), store, agent=_agent_row("agent_1") if prefetched else None
+        )
+    assert [option["id"] for option in options] == list(curated)
+    assert store.get.call_count == (0 if prefetched else 1)
+
+
+@pytest.mark.parametrize(("prefetched_id", "store_reads"), [("agent_1", 0), ("agent_other", 1)])
+def test_load_agent_spec_for_session_reuses_only_the_bound_agent(
+    prefetched_id: str, store_reads: int
+) -> None:
+    """The spec loader skips the agent-store read only when handed conv's own agent row."""
+    from omnigent.server.routes._sessions import helpers
+
+    store = MagicMock()
+    store.get.return_value = _agent_row("agent_1")
+    cache = _acp_cache()
+    with patch.object(helpers, "get_agent_cache", return_value=cache):
+        spec = helpers._load_agent_spec_for_session_impl(
+            _conv(agent_id="agent_1"), store, agent=_agent_row(prefetched_id)
+        )
+    assert spec is cache.load.return_value.spec
+    assert store.get.call_count == store_reads
+    assert cache.load.call_args.args[:2] == ("agent_1", "b://acp")

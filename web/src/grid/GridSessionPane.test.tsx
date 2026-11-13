@@ -1,8 +1,17 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import type * as FilesPanelModule from "@/shell/FilesPanel";
-import { type ComponentProps, useContext, useState } from "react";
-import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
+import { type ComponentProps, type ReactElement, useContext, useState } from "react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render as renderComponent,
+  screen,
+  within,
+  waitFor,
+} from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
@@ -15,6 +24,18 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { retrySession } from "@/lib/sessionsApi";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
+import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
+
+const queryClient = new QueryClient();
+const LINKED_PR = "https://github.com/example/app/pull/42";
+
+function render(ui: ReactElement) {
+  return renderComponent(ui, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    ),
+  });
+}
 
 const fixture = vi.hoisted(() => ({
   labels: {} as Record<string, string>,
@@ -49,11 +70,15 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 }));
 
 vi.mock("@/canvas/CanvasWorkspace", () => ({ CanvasWorkspace: () => null }));
+vi.mock("@/shell/PullRequestPanel", () => ({ selectPullRequestInPanel: vi.fn() }));
 vi.mock("@/shell/FilesPanel", async (original) => ({
   ...(await original<typeof FilesPanelModule>()),
   revealFolderInFilesPanel: vi.fn(),
 }));
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => ({}) }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => ({}),
+  useOptionalLoadedConversations: () => undefined,
+}));
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id: string) => ({
@@ -127,6 +152,9 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         <button type="button" onClick={() => context.openFolder?.("/workspace/experimental")}>
           Open folder
         </button>
+        <button type="button" onClick={() => context.openGithubTab(LINKED_PR)}>
+          Open PR
+        </button>
       </>
     );
   },
@@ -170,6 +198,7 @@ vi.mock("@/shell/WorkspacePanel", () => ({
 
 afterEach(() => {
   cleanup();
+  queryClient.clear();
   localStorage.clear();
   sessionStorage.clear();
   fixture.labels = {};
@@ -260,7 +289,7 @@ it("asks each cell's viewer before the shell's Close leaves the grid", () => {
   expect(leave).toHaveBeenCalledOnce();
 });
 
-it("browses a chat-linked folder in the Files tab of that pane's workspace", () => {
+it("opens chat-linked folders and PRs in that pane's workspace", () => {
   writeSessionWorkspaceState("first", { rightRailTab: "subagents" });
   render(
     <MemoryRouter>
@@ -275,7 +304,9 @@ it("browses a chat-linked folder in the Files tab of that pane's workspace", () 
   const first = within(screen.getByRole("region", { name: "first (active)" }));
   fireEvent.click(first.getByText("Block navigation"));
   fireEvent.click(first.getByText("Open folder"));
+  fireEvent.click(first.getByText("Open PR"));
   expect(revealFolderInFilesPanel).not.toHaveBeenCalledWith("first", expect.anything());
+  expect(selectPullRequestInPanel).not.toHaveBeenCalled();
   expect(screen.getByTestId("workspace-first")).toHaveAttribute("data-tab", "subagents");
   expect(screen.getByTestId("workspace-first")).toHaveAttribute("aria-hidden", "true");
 
@@ -286,6 +317,12 @@ it("browses a chat-linked folder in the Files tab of that pane's workspace", () 
   expect(workspace).toHaveAttribute("data-testid", "workspace-second");
   expect(workspace).toHaveAttribute("data-tab", "files");
   expect(workspace).toHaveTextContent("No file");
+
+  fireEvent.click(
+    within(screen.getByRole("region", { name: "second (active)" })).getByText("Open PR"),
+  );
+  expect(selectPullRequestInPanel).toHaveBeenCalledWith(queryClient, "second", LINKED_PR);
+  expect(workspace).toHaveAttribute("data-tab", "github");
 });
 
 it("keeps cell views, input, permissions and shortcut targets independent", async () => {
