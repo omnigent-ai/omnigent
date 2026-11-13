@@ -13,7 +13,7 @@ Every tool call an agent makes renders in the chat transcript as a muted row: an
 - `tool-raw`: the Fields | Raw switch (a Raw toggle on shell panels) shows the Input and Result panels, named like the Fields sections (arguments re-serialized, JSON output pretty-printed). Both options stay visible, and the switch keeps its place, so keyboard focus survives switching.
 - `tool-long-output`: a result too long to show in full keeps the truncated preview with Expand.
 - `tool-states`: running (spinner and waiting indicator), cancelled, failed turn, and no output recorded.
-- `tool-file-link`: a single-file row shows its path workspace-relative and opens it in the file viewer.
+- `tool-file-link`: a single-file row shows its path workspace-relative and opens it in the file viewer. This includes Codex `view_image`: clicking its image path opens the image preview.
 - `tool-run-fold`: runs fold into one summary line; the live run keeps its last three rows visible, and durable routing or dispatch cards never fold.
 
 ## How to get to it (user POV)
@@ -39,6 +39,7 @@ Preconditions: build this checkout's web UI and install its Playwright Chromium.
 - A live JSON result read on screen: `tests/e2e_ui/chat/test_cursor_native_list_models_row.py::test_cursor_native_worker_row_not_source_none`.
 - Manual evidence only: a spec-declared MCP server's tool row is on screen at the end of `tests/e2e_ui/chat/test_mcp_reconnect_after_restart.py::test_mcp_tool_call_recovers_after_mcp_server_restart`'s recording; the test asserts only the stored output.
 - Title, server-name, line-count and field rules, and per-tool views registered in `web/src/components/blocks/toolViews.ts`: `pnpm --filter web test src/lib/toolTitle.test.ts src/lib/mcpServerName.test.ts src/lib/toolValue.test.ts src/lib/toolResultSummary.test.ts src/lib/toolEditDiff.test.ts src/lib/toolIcon.test.ts src/components/blocks/ToolCard.test.ts src/components/blocks/ToolValueView.test.tsx src/components/blocks/toolViews.test.ts`.
+- Codex View Image path click opens a loaded image in the file viewer at desktop and phone width: `tests/browser_ui/chat/test_transcript_rendering.py::test_view_image_tool_opens_image`.
 - Visual review: the Components/Blocks/ToolCard stories in Storybook.
 - Human check with a live model: give a session an MCP server (a `tools:` entry with `type: mcp`) and ask for a plan, a file read, a lookup through that server, a shell command, an edit to an existing file, a new file, a rewrite of an existing file and a call that fails. Check each row's title and server tag before expanding, the counts after the edit's and new file's titles and none on the rewrite, and that the failure's row shows no error; expand a lookup, switch it to Raw and back, switch the edit from Diff to Raw and back, and expand the failure to see its error, then collapse it. Reload and confirm the rows rebuild the same way, then repeat at phone width and in dark mode.
 

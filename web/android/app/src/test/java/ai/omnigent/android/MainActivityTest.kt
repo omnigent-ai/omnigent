@@ -1,6 +1,7 @@
 package ai.omnigent.android
 
 import android.content.Context
+import android.content.Intent
 import android.content.RestrictionsManager
 import android.content.res.Configuration
 import android.net.Uri
@@ -331,6 +332,75 @@ class MainActivityTest {
         assertEquals("https://second.example.test", ServerStore(context).currentServerUrl())
         assertEquals("https://second.example.test", shadowOf(activity.webView()).lastLoadedUrl)
     }
+
+    // The hand-off a link makes: the store already names the link's server, and the intent
+    // carries the conversation.
+    @Test
+    fun `a link's conversation opens in the page already open on its server`() {
+        val activity = launch()
+        val webView = activity.webView()
+        webView.webViewClient.onPageFinished(webView, "https://example.com/")
+
+        activity.invoke("onNewIntent", arrayOf(Intent::class.java), conversationIntent("/c/abc"))
+
+        assertEquals("https://example.com", shadowOf(webView).lastLoadedUrl)
+        assertEquals(activationScript("/c/abc"), shadowOf(webView).lastEvaluatedJavascript)
+    }
+
+    @Test
+    fun `a link that starts the app opens its conversation once the page has loaded`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity =
+            Robolectric
+                .buildActivity(MainActivity::class.java, conversationIntent("/c/abc"))
+                .setup()
+                .get()
+        val webView = activity.webView()
+
+        // The page is asked for the server, not the conversation: the page's router opens it.
+        assertEquals("https://example.com", shadowOf(webView).lastLoadedUrl)
+        assertEquals("/c/abc", activity.declared<String?>("pendingNavigatePath"))
+
+        webView.webViewClient.onPageFinished(webView, "https://example.com/")
+
+        assertNull(activity.declared<String?>("pendingNavigatePath"))
+    }
+
+    // The old server's page must never be told to open a conversation that belongs to the new one.
+    @Test
+    fun `a link to another server opens its conversation once that server's page has loaded`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val activity = launch()
+        val webView = activity.webView()
+        webView.webViewClient.onPageFinished(webView, "https://example.com/")
+        val before = shadowOf(webView).lastEvaluatedJavascript
+
+        ServerStore(context).connect("https://second.example.test")
+        activity.invoke("onNewIntent", arrayOf(Intent::class.java), conversationIntent("/c/abc"))
+
+        assertEquals("https://second.example.test", shadowOf(webView).lastLoadedUrl)
+        assertEquals(before, shadowOf(webView).lastEvaluatedJavascript)
+        assertEquals("/c/abc", activity.declared<String?>("pendingNavigatePath"))
+
+        // A load of the old server that finishes late is not the page the link meant.
+        webView.webViewClient.onPageFinished(webView, "https://example.com/")
+        assertEquals("/c/abc", activity.declared<String?>("pendingNavigatePath"))
+
+        webView.webViewClient.onPageFinished(webView, "https://second.example.test/")
+
+        // Handed over; the test above shows what the page is sent.
+        assertNull(activity.declared<String?>("pendingNavigatePath"))
+    }
+
+    private fun conversationIntent(path: String) =
+        Intent(
+            ApplicationProvider.getApplicationContext<Context>(),
+            MainActivity::class.java,
+        ).putExtra(NativeNotificationManager.EXTRA_NAVIGATE_PATH, path)
+
+    private fun activationScript(path: String) =
+        "window.__omnigentNativeEmitNotificationActivated && " +
+            "window.__omnigentNativeEmitNotificationActivated(\"$path\");"
 
     @Test
     fun `server pill tracks the container width and truncates in the middle`() {

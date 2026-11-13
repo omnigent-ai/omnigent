@@ -6,11 +6,15 @@ import {
   closeDesktopWindow,
   confirmDesktopQuit,
   onDesktopCommand,
+  reportConversationShown,
+  openDesktopSessionWindow,
   setDesktopCommandState,
   startSystemDictation,
   supportsDesktopCommands,
+  supportsDesktopSessionWindows,
   supportsSystemDictation,
   getServerPicker,
+  getWidenWindowForRightSidebar,
   hasDbcertPreflightBridge,
   isAndroidShell,
   isElectronShell,
@@ -18,6 +22,8 @@ import {
   isNativeShell,
   nativeNotify,
   refreshDbcert,
+  reportRightSidebarVisibility,
+  resetRightSidebarWindowTracking,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
@@ -27,9 +33,11 @@ import {
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
   setThemeSource,
+  setWidenWindowForRightSidebar,
   supportsNativeServerPicker,
   supportsArcaConnect,
   supportsBrowser,
+  supportsWidenWindowForRightSidebar,
   switchServer,
   takeOnboardingRunner,
 } from "./nativeBridge";
@@ -836,6 +844,23 @@ describe("desktop command bridge", () => {
     await expect(confirmDesktopQuit(false)).resolves.toBe(false);
   });
 
+  it("reports the conversation on screen to a shell that listens for it", () => {
+    // An older shell has no such method: the report is simply dropped.
+    installDesktop({});
+    expect(() => reportConversationShown("conv_a")).not.toThrow();
+
+    const report = vi.fn();
+    installDesktop({ reportConversationShown: report });
+    reportConversationShown("conv_a");
+    reportConversationShown(null);
+    expect(report.mock.calls).toEqual([["conv_a"], [null]]);
+
+    report.mockImplementationOnce(() => {
+      throw new Error("bridge down");
+    });
+    expect(() => reportConversationShown("conv_a")).not.toThrow();
+  });
+
   it("confirms a quit with the Don't ask again choice", async () => {
     const confirmQuit = vi.fn().mockResolvedValue(true);
     installDesktop({ confirmQuit });
@@ -889,5 +914,120 @@ describe("system dictation bridge", () => {
     // A rejected IPC call reads as not started, so the mic can report it.
     start.mockRejectedValueOnce(new Error("ipc down"));
     await expect(startSystemDictation()).resolves.toBe(false);
+  });
+});
+
+describe("right sidebar window bridge", () => {
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+  });
+
+  function installRightSidebarWindow(overrides: Record<string, unknown> = {}) {
+    const bridge = {
+      getWidensWindow: vi.fn().mockResolvedValue(true),
+      setWidensWindow: vi.fn().mockResolvedValue(true),
+      opened: vi.fn(),
+      closed: vi.fn(),
+      ...overrides,
+    };
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      rightSidebarWindow: bridge,
+    };
+    return bridge;
+  }
+
+  it("is unsupported in a browser and on shells without the whole bridge", async () => {
+    expect(supportsWidenWindowForRightSidebar()).toBe(false);
+    await expect(getWidenWindowForRightSidebar()).resolves.toBeNull();
+    await expect(setWidenWindowForRightSidebar(true)).resolves.toBe(false);
+    expect(() => reportRightSidebarVisibility(true, 420)).not.toThrow();
+
+    (window as unknown as Record<string, unknown>).omnigentDesktop = { kind: "electron" };
+    expect(supportsWidenWindowForRightSidebar()).toBe(false);
+
+    const partial = installRightSidebarWindow({ closed: undefined });
+    expect(supportsWidenWindowForRightSidebar()).toBe(false);
+    reportRightSidebarVisibility(true, 420);
+    expect(partial.opened).not.toHaveBeenCalled();
+  });
+
+  it("reads and saves the setting, reading a failed call as unknown or unsaved", async () => {
+    const bridge = installRightSidebarWindow();
+    expect(supportsWidenWindowForRightSidebar()).toBe(true);
+    await expect(getWidenWindowForRightSidebar()).resolves.toBe(true);
+    await expect(setWidenWindowForRightSidebar(false)).resolves.toBe(true);
+    expect(bridge.setWidensWindow).toHaveBeenCalledWith(false);
+
+    bridge.getWidensWindow.mockRejectedValueOnce(new Error("ipc down"));
+    await expect(getWidenWindowForRightSidebar()).resolves.toBeNull();
+    bridge.setWidensWindow.mockResolvedValueOnce(false);
+    await expect(setWidenWindowForRightSidebar(true)).resolves.toBe(false);
+    bridge.setWidensWindow.mockRejectedValueOnce(new Error("ipc down"));
+    await expect(setWidenWindowForRightSidebar(true)).resolves.toBe(false);
+  });
+
+  it("reports the sidebar opening with its width, and closing", () => {
+    const bridge = installRightSidebarWindow();
+    reportRightSidebarVisibility(true, 420);
+    expect(bridge.opened).toHaveBeenCalledWith(420);
+    reportRightSidebarVisibility(false, 420);
+    expect(bridge.closed).toHaveBeenCalledTimes(1);
+  });
+
+  it("resets growth tracking when supported and tolerates older shells and failed IPC", () => {
+    expect(() => resetRightSidebarWindowTracking()).not.toThrow();
+    installRightSidebarWindow();
+    expect(supportsWidenWindowForRightSidebar()).toBe(true);
+    expect(() => resetRightSidebarWindowTracking()).not.toThrow();
+
+    const reset = vi.fn();
+    installRightSidebarWindow({ reset });
+    resetRightSidebarWindowTracking();
+    expect(reset).toHaveBeenCalledOnce();
+
+    reset.mockImplementation(() => {
+      throw new Error("ipc down");
+    });
+    expect(() => resetRightSidebarWindowTracking()).not.toThrow();
+  });
+});
+
+describe("desktop session windows", () => {
+  function setSessionWindowBridge(openSessionWindow?: (id: string) => Promise<boolean>): void {
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      ...(openSessionWindow ? { openSessionWindow } : {}),
+    };
+  }
+
+  it("asks a capable shell to open the session and reports its answer", async () => {
+    const openSessionWindow = vi.fn().mockResolvedValue(true);
+    setSessionWindowBridge(openSessionWindow);
+
+    expect(supportsDesktopSessionWindows()).toBe(true);
+    expect(await openDesktopSessionWindow("conv_1")).toBe(true);
+    expect(openSessionWindow).toHaveBeenCalledWith("conv_1");
+  });
+
+  it("reports no window for an older shell, a browser, or a failed request", async () => {
+    setSessionWindowBridge();
+    expect(supportsDesktopSessionWindows()).toBe(false);
+    expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+
+    setElectron(false);
+    expect(supportsDesktopSessionWindows()).toBe(false);
+    expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      setSessionWindowBridge(() => Promise.reject(new Error("ipc down")));
+      expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+      expect(warn).toHaveBeenCalled();
+      setSessionWindowBridge(() => Promise.resolve(false));
+      expect(await openDesktopSessionWindow("conv_1")).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

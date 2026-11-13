@@ -90,6 +90,42 @@ def _reject_escaping_cwd(cwd: str | None) -> None:
         )
 
 
+def _grant_escapes_workspace(grant: str) -> bool:
+    """Whether an ``os_env.sandbox`` path grant would resolve outside the workspace.
+
+    Like :func:`_cwd_escapes_workspace`, and also rejects a leading ``~``: the
+    runner expands grants with ``os.path.expanduser`` (see
+    ``omnigent.inner.sandbox._resolve_grant_root``), so ``~`` maps to the host
+    home directory.
+    """
+    return grant.startswith("~") or _cwd_escapes_workspace(grant)
+
+
+def _reject_escaping_sandbox_grants(os_env: OSEnvSpec | None) -> None:
+    """Reject absolute or escaping ``os_env.sandbox`` path grants in an uploaded spec.
+
+    ``read_paths``, ``write_paths``, and ``write_files`` become host bind mounts
+    under ``linux_bwrap`` and file-tool reach grants under ``sandbox.type=none``,
+    so they must stay inside the session workspace, as ``os_env.cwd`` does.
+    Direct in-process callers may bypass this via ``enforce_handler_allowlist=False``.
+    """
+    sandbox = os_env.sandbox if os_env is not None else None
+    if sandbox is None:
+        return
+    grants = [
+        *(("read_paths", root) for root in sandbox.read_paths or []),
+        *(("write_paths", grant.path) for grant in sandbox.write_path_specs),
+        *(("write_files", root) for root in sandbox.write_files or []),
+    ]
+    for field, grant in grants:
+        if _grant_escapes_workspace(grant):
+            raise OmnigentError(
+                f"agent os_env.sandbox.{field} entries must be relative paths "
+                f"within the workspace (no absolute paths, '~', or '..'); got {grant!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+
 def _reject_uploaded_escaping_cwd(spec: AgentSpec) -> None:
     """Validate working directories in the agent, its terminals, and all sub-agents."""
     _reject_escaping_cwd(spec.os_env.cwd if spec.os_env is not None else None)
@@ -98,6 +134,16 @@ def _reject_uploaded_escaping_cwd(spec: AgentSpec) -> None:
             _reject_escaping_cwd(terminal.os_env.cwd)
     for sub in spec.sub_agents:
         _reject_uploaded_escaping_cwd(sub)
+
+
+def _reject_uploaded_escaping_sandbox_grants(spec: AgentSpec) -> None:
+    """Validate sandbox path grants in the agent, its terminals, and all sub-agents."""
+    _reject_escaping_sandbox_grants(spec.os_env)
+    for terminal in (spec.terminals or {}).values():
+        if isinstance(terminal.os_env, OSEnvSpec):
+            _reject_escaping_sandbox_grants(terminal.os_env)
+    for sub in spec.sub_agents:
+        _reject_uploaded_escaping_sandbox_grants(sub)
 
 
 def validate_agent_bundle(
@@ -128,8 +174,10 @@ def validate_agent_bundle(
     :returns: The validated :class:`AgentSpec`.
     :raises OmnigentError: If the bundle is invalid, the spec is
         missing a name, or (when *enforce_handler_allowlist*) a policy
-        names an unregistered handler, ``os_env.cwd`` is an absolute or
-        escaping path, or a tool declares a server-side callable or Python/TS source file.
+        names an unregistered handler, ``os_env.cwd`` or an
+        ``os_env.sandbox`` grant (``read_paths`` / ``write_paths`` /
+        ``write_files``) is an absolute or escaping path, or a tool declares a
+        server-side callable or Python/TS source file.
     """
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -165,6 +213,9 @@ def validate_agent_bundle(
     if enforce_handler_allowlist:
         # Terminals and nested agents can override the session working directory.
         _reject_uploaded_escaping_cwd(spec)
+
+        # Sandbox grants are host bind mounts or reach grants, so they get the same containment.
+        _reject_uploaded_escaping_sandbox_grants(spec)
 
         # Server-side callables and source-file tools require operator-authored bundles.
         _reject_uploaded_callable_tools(spec)

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from omnigent.llms.client import Client as LLMClient
     from omnigent.runner.mcp_manager import RunnerMcpManager
-    from omnigent.runner.tool_dispatch import AsyncResultWake
+    from omnigent.runner.tool_dispatch import AsyncResultWake, UnknownSessionWorkspace
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
     from omnigent.terminals.registry import TerminalRegistry
 
@@ -91,6 +91,9 @@ def register_mcp_routes(
     _session_harness_name: Callable[[str], str | None],
     _session_inboxes: dict[str, asyncio.Queue[_JsonObject]],
     _session_runtime_cwd: Callable[[str], Coroutine[Any, Any, Path | None]],
+    _session_explicit_workspace: Callable[
+        [str], Coroutine[Any, Any, Path | UnknownSessionWorkspace | None]
+    ],
     _session_spec_cache: dict[str, _SpecEntry | None],
     filesystem_registry: FilesystemRegistry | None,
     mcp_execution_registry: McpExecutionRegistry,
@@ -354,6 +357,7 @@ def register_mcp_routes(
                         filesystem_registry=filesystem_registry,
                         effective_harness=_session_harness_name(session_id),
                         wake_on_async_result=wake_on_async_result,
+                        session_workspace=await _session_explicit_workspace(session_id),
                     )
                 except Exception as exc:
                     _logger.exception(

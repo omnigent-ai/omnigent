@@ -230,15 +230,71 @@ def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
         except OSError:
             return None
     try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        fd = _open_directory_beneath(root, parts[:-1])
     except OSError:
         return None
     try:
-        for name in parts[:-1]:
-            nfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
-            os.close(fd)
-            fd = nfd
         return os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _open_directory_beneath(root: Path, parts: Sequence[str], *, follow_root: bool = True) -> int:
+    """Open *root*/*parts* as a directory, opening each part ``O_NOFOLLOW``.
+
+    :param follow_root: Whether *root* itself may be a symlink.
+    :raises OSError: When a part is missing, a symlink or not a directory.
+    """
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | (0 if follow_root else os.O_NOFOLLOW))
+    try:
+        for name in parts:
+            next_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_regular_file_beneath(root: Path, rel: str, max_bytes: int) -> bytes | None:
+    """Read at most ``max_bytes + 1`` bytes of the regular file *root*/*rel*.
+
+    Like :func:`_lstat_beneath`, no component may be a symlink, even if one
+    is swapped in mid-read, and a FIFO cannot block the open. Unlike it,
+    *root* itself may not be a symlink and *rel* may not step outside it.
+
+    :param root: Absolute, resolved directory the path is relative to.
+    :param rel: ``/``-separated path relative to *root*.
+    :param max_bytes: Read cap; one more byte is read so callers see overflow.
+    :returns: The bytes read, or ``None`` when the path is unsafe, not a
+        regular file or unreadable, or the platform lacks ``dir_fd`` support.
+    """
+    parts = rel.split("/")
+    if not _BENEATH_SUPPORTED or any(part in ("", ".", "..") for part in parts):
+        return None
+    try:
+        parent = _open_directory_beneath(root, parts[:-1], follow_root=False)
+    except OSError:
+        return None
+    try:
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+    except OSError:
+        return None
+    finally:
+        os.close(parent)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        # A short read is not EOF; keep reading until EOF or the cap.
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0 and (chunk := os.read(fd, remaining)):
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
     except OSError:
         return None
     finally:
@@ -253,6 +309,8 @@ def search_indexed_paths(
     include: Sequence[str] = (),
     exclude: Sequence[str] = (),
     limit: int = 500,
+    kept_path: Callable[[str], bool] | None = None,
+    describe_link: Callable[[str, os.stat_result], FilesystemEntry] | None = None,
 ) -> list[FilesystemEntry]:
     """Match already-enumerated *paths* the way the directory walk would.
 
@@ -263,8 +321,9 @@ def search_indexed_paths(
     entries returned are stat'ed, and never through a symlink: parents are
     opened without following links and the leaf is ``lstat``-ed, so nothing
     outside *root* is ever described, even if a link is swapped mid-search.
-    A leaf that is itself a symlink is left out — the sandboxed walk, which
-    can follow links safely, describes those — and so is a path that no
+    A leaf that is itself a symlink is left out unless *describe_link* is
+    given — the sandboxed walk, which can follow links safely, describes
+    those — and so is a path that no
     longer exists (indexed but deleted from the working tree).
 
     :param root: Absolute directory the paths are relative to.
@@ -274,20 +333,15 @@ def search_indexed_paths(
     :param exclude: Pre-split exclude globs; an excluded directory takes its
         whole subtree with it, as the walk's pruning does.
     :param limit: Maximum number of entries to return.
+    :param kept_path: Returns False for a path, file or directory, to leave out.
+    :param describe_link: Describes a leaf that is a symlink, given its path and
+        own ``lstat``; without it, such leaves are left out.
     :returns: Matching entries sorted by path.
     """
     q = query.strip().lower()
     if not q:
         return []
-    inc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in include]
-    exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in exclude]
-
-    def kept(rel: str) -> bool:
-        parts = rel.split("/")
-        ancestors = ("/".join(parts[:i]) for i in range(1, len(parts) + 1))
-        if any(r.match(a) for a in ancestors for r in exc):
-            return False
-        return not inc or any(r.match(rel) for r in inc)
+    kept = indexed_path_filter(include, exclude, kept_path)
 
     # A directory whose path contains q is a prefix of every file under it,
     # so only files that match can contribute matching directories.
@@ -312,24 +366,76 @@ def search_indexed_paths(
     for rel in sorted(candidates):
         if not kept(rel):
             continue
-        st = _lstat_beneath(root, rel)
-        if st is None or stat.S_ISLNK(st.st_mode):
-            continue
-        # A submodule is one index entry but a directory on disk.
-        is_dir = candidates[rel] or stat.S_ISDIR(st.st_mode)
-        entries.append(
-            FilesystemEntry(
-                id=rel,
-                name=rel.rsplit("/", 1)[-1],
-                path=rel,
-                type="directory" if is_dir else "file",
-                bytes=None if is_dir else st.st_size,
-                modified_at=int(st.st_mtime),
-            )
+        entry = describe_indexed_path(
+            root, rel, listed_directory=candidates[rel], describe_link=describe_link
         )
+        if entry is None:
+            continue
+        entries.append(entry)
         if len(entries) >= limit:
             break
     return entries
+
+
+def indexed_path_filter(
+    include: Sequence[str],
+    exclude: Sequence[str],
+    kept_path: Callable[[str], bool] | None = None,
+) -> Callable[[str], bool]:
+    """Whether an indexed path passes the globs and *kept_path*, as the walk's would.
+
+    :param include: Pre-split include globs; when any, a path must match one.
+    :param exclude: Pre-split exclude globs; an excluded directory takes its
+        whole subtree with it, as the walk's pruning does.
+    :param kept_path: Returns False for a path to leave out.
+    """
+    inc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in include]
+    exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in exclude]
+
+    def kept(rel: str) -> bool:
+        parts = rel.split("/")
+        ancestors = ("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+        if any(r.match(a) for a in ancestors for r in exc):
+            return False
+        if kept_path is not None and not kept_path(rel):
+            return False
+        return not inc or any(r.match(rel) for r in inc)
+
+    return kept
+
+
+def describe_indexed_path(
+    root: Path,
+    rel: str,
+    *,
+    listed_directory: bool = False,
+    describe_link: Callable[[str, os.stat_result], FilesystemEntry] | None = None,
+) -> FilesystemEntry | None:
+    """Describe an indexed path from its own ``lstat``, never through a symlink.
+
+    :param root: Absolute directory *rel* is relative to.
+    :param listed_directory: The path is a directory of indexed files.
+    :param describe_link: Describes a file that is a symlink; without it, such
+        paths are left out.
+    :returns: The entry, or ``None`` when the path is gone or is a link left out.
+    """
+    st = _lstat_beneath(root, rel)
+    if st is None:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        if describe_link is not None and not listed_directory:
+            return describe_link(rel, st)
+        return None
+    # A submodule is one index entry but a directory on disk.
+    is_dir = listed_directory or stat.S_ISDIR(st.st_mode)
+    return FilesystemEntry(
+        id=rel,
+        name=rel.rsplit("/", 1)[-1],
+        path=rel,
+        type="directory" if is_dir else "file",
+        bytes=None if is_dir else st.st_size,
+        modified_at=int(st.st_mtime),
+    )
 
 
 def merge_entries(
@@ -820,7 +926,11 @@ class CallerProcessFilesystem:
                 f"before = {before!r}",
                 f"order = {_json.dumps(order)}",
                 f"limit = {limit}",
-                "names = sorted(os.listdir(d), reverse=order == 'desc')",
+                # A name that isn't UTF-8 can't travel in JSON; the host's reader skips it too.
+                "def utf8(n):",
+                "    try: return n.encode('utf-8') is not None",
+                "    except UnicodeEncodeError: return False",
+                "names = sorted((n for n in os.listdir(d) if utf8(n)), reverse=order == 'desc')",
                 "def cursor_index(cursor):",
                 "    if cursor is None: return None",
                 "    if prefix:",

@@ -35,6 +35,17 @@ function parseSend(entry: unknown): UnsentSend | null {
   return { ...draft, stableId, authorId };
 }
 
+/**
+ * A session's unsent-send records. Each session holds a list, one record per message. A record
+ * written before the list existed is a single object, read as a one-message list.
+ */
+function parseUnsentList(entry: unknown): UnsentSend[] | null {
+  const sends = (Array.isArray(entry) ? entry : [entry])
+    .map(parseSend)
+    .filter((send): send is UnsentSend => send !== null);
+  return sends.length > 0 ? sends : null;
+}
+
 function parseQueue(entry: unknown): UnsentSend[] | null {
   const sends = Array.isArray(entry) ? entry.map(parseSend).filter((send) => send !== null) : [];
   return sends.length > 0 ? sends : null;
@@ -67,23 +78,33 @@ function write(records: Record<string, unknown>, key: string): void {
   }
 }
 
-/** Record a message about to be POSTed; the latest send per session wins. */
+/** Record a message about to be POSTed. Each message keeps its own record, keyed by its id. */
 export function rememberUnsentSend(conversationId: string, send: UnsentSend): void {
-  write({ ...read(UNSENT_SENDS_KEY, parseSend), [conversationId]: send }, UNSENT_SENDS_KEY);
+  const records = read(UNSENT_SENDS_KEY, parseUnsentList);
+  const others = (records[conversationId] ?? []).filter((r) => r.stableId !== send.stableId);
+  write({ ...records, [conversationId]: [...others, send] }, UNSENT_SENDS_KEY);
 }
 
-/** Drop a session's record once this tab has seen that send settle. */
+/** Drop one message's record once this tab has seen that send settle. Other records stay. */
 export function forgetUnsentSend(conversationId: string, stableId: string): void {
   if (pageHiding) return;
-  const sends = read(UNSENT_SENDS_KEY, parseSend);
-  if (sends[conversationId]?.stableId !== stableId) return;
-  const others = Object.entries(sends).filter(([id]) => id !== conversationId);
-  write(Object.fromEntries(others), UNSENT_SENDS_KEY);
+  const records = read(UNSENT_SENDS_KEY, parseUnsentList);
+  const left = (records[conversationId] ?? []).filter((r) => r.stableId !== stableId);
+  if (left.length === (records[conversationId] ?? []).length) return;
+  const next = Object.fromEntries(Object.entries(records).filter(([id]) => id !== conversationId));
+  if (left.length > 0) next[conversationId] = left;
+  write(next, UNSENT_SENDS_KEY);
 }
 
-/** The send this tab last left unanswered in a session, if any. */
+/** Every unsent message a session's records hold, in the order they were sent. */
+export function peekUnsentSends(conversationId: string): UnsentSend[] {
+  return read(UNSENT_SENDS_KEY, parseUnsentList)[conversationId] ?? [];
+}
+
+/** The latest unsent message a session holds, if any. */
 export function peekUnsentSend(conversationId: string): UnsentSend | null {
-  return read(UNSENT_SENDS_KEY, parseSend)[conversationId] ?? null;
+  const sends = peekUnsentSends(conversationId);
+  return sends[sends.length - 1] ?? null;
 }
 
 /** Record the messages a session's queue holds, in order; an empty list clears it. */

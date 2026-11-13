@@ -121,9 +121,11 @@ def test_setting_routes_plain_clicks_in_app(page: Page, seeded_session: tuple[st
     first_tab = rail.get_by_role("tab", name="Product docs updated", exact=True)
     expect(first_tab).to_have_attribute("aria-selected", "false")
     expect(second_tab).to_have_attribute("aria-selected", "true")
-    expect(
-        rail.get_by_role("button", name="Close Product docs updated", exact=True)
-    ).to_be_visible()
+    # A crowded strip shows background tabs as icons without a close button, so
+    # check the renamed tab's close command through its context menu instead.
+    first_tab.click(button="right")
+    expect(page.get_by_role("menuitem", name="Close", exact=True)).to_be_visible()
+    page.keyboard.press("Escape")
 
     # Reopening the first URL selects its existing tab without reloading the page.
     link.click(modifiers=["ControlOrMeta"])

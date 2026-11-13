@@ -23,6 +23,7 @@ import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
+import { listDirectoryViaWorkspaceApi, searchFilesViaWorkspaceApi } from "@/lib/workspaceApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
@@ -98,7 +99,12 @@ const DEFAULT_ENVIRONMENT_ID = "default";
 
 interface WorkspaceQueryOptions {
   enabled?: boolean;
+  /** Leave out what Git ignores, where the host can tell (see `WorkspaceFile.ignored`). */
+  hideIgnored?: boolean;
 }
+
+/** The end of a listing's query key: listings that hide ignored files are cached apart. */
+const ignoredKey = (hideIgnored: boolean) => (hideIgnored ? [{ hideIgnored: true }] : []);
 
 // ── Changed files (flat, registry-backed) ────────────────────────────────────
 
@@ -114,6 +120,8 @@ export interface WorkspaceChangedFile {
   lines_added: number | null;
   /** Lines removed, or null when unknown. */
   lines_removed: number | null;
+  /** An untracked file's own lines; absent from runners that don't count them. */
+  untracked_lines?: number | null;
 }
 
 export interface WorkspaceChangedFilesResult {
@@ -246,6 +254,7 @@ interface ChangedFilesResponse {
     modified_at: number | null;
     lines_added: number | null;
     lines_removed: number | null;
+    untracked_lines?: number | null;
   }[];
   has_more: boolean;
 }
@@ -291,6 +300,7 @@ async function fetchWorkspaceChangedFiles(
     modified_at: e.modified_at,
     lines_added: e.lines_added ?? null,
     lines_removed: e.lines_removed ?? null,
+    untracked_lines: e.untracked_lines ?? null,
   }));
   return { available: true, data };
 }
@@ -341,11 +351,20 @@ export interface WorkspaceFile {
   type: "file" | "directory";
   bytes: number | null;
   modified_at: number | null;
+  /**
+   * For a listed directory whose only entry is a directory, and so on: the
+   * deepest directory of that chain, when the host reports it.
+   */
+  leaf_directory_path?: string;
+  /** Git ignores the entry; only hosts that can tell report it. */
+  ignored?: true;
 }
 
 export interface WorkspaceAllFilesResult {
   available: boolean;
   data: WorkspaceFile[];
+  /** The host left out what Git ignores; without it, `data` lists everything. */
+  ignoredHidden?: true;
 }
 
 interface FilesystemListResponse {
@@ -357,6 +376,8 @@ interface FilesystemListResponse {
     type: string;
     bytes: number | null;
     modified_at: number | null;
+    leaf_directory_path?: string;
+    ignored?: true;
   }[];
   has_more: boolean;
   last_id?: string | null;
@@ -385,22 +406,63 @@ function mapFilesystemEntries(
   prefix = "",
 ): WorkspaceFile[] {
   const echoed = target && !target.startsWith("/") ? `${target}/` : "";
-  return json.data.map((e) => {
-    const relative = echoed && e.path.startsWith(echoed) ? e.path.slice(echoed.length) : e.path;
-    return {
-      path: joinBrowseLocation(prefix, relative),
-      name: e.name,
-      type: e.type === "directory" ? "directory" : "file",
-      bytes: e.bytes,
-      modified_at: e.modified_at,
-    };
-  });
+  // An entry's path, and a directory chain's end, both come back in the listed location's shape.
+  const rebased = (path: string) =>
+    joinBrowseLocation(
+      prefix,
+      echoed && path.startsWith(echoed) ? path.slice(echoed.length) : path,
+    );
+  return json.data.map((e) => ({
+    path: rebased(e.path),
+    name: e.name,
+    type: e.type === "directory" ? "directory" : "file",
+    bytes: e.bytes,
+    modified_at: e.modified_at,
+    ...(e.leaf_directory_path ? { leaf_directory_path: rebased(e.leaf_directory_path) } : {}),
+    ...(e.ignored ? { ignored: true as const } : {}),
+  }));
+}
+
+/** A workspace directory listed through the workspace API, or null to list through REST. */
+async function listViaWorkspaceApi(
+  conversationId: string,
+  location: string,
+  maxEntries: number,
+  hideIgnored = false,
+): Promise<(FilesystemListResponse & { ignoredHidden?: true }) | null> {
+  // The workspace API only lists inside the workspace.
+  if (browseLocationBase(location)) return null;
+  const listed = await listDirectoryViaWorkspaceApi(
+    conversationId,
+    location,
+    maxEntries,
+    undefined,
+    {
+      hideIgnored,
+    },
+  );
+  return (
+    listed && {
+      object: "list",
+      data: listed.data,
+      has_more: listed.hasMore,
+      ...(listed.ignoredHidden && { ignoredHidden: true as const }),
+    }
+  );
 }
 
 async function fetchWorkspaceAllFiles(
   conversationId: string,
   location = "",
+  hideIgnored = false,
 ): Promise<WorkspaceAllFilesResult> {
+  const viaApi = await listViaWorkspaceApi(conversationId, location, 1000, hideIgnored);
+  if (viaApi) {
+    const data = mapFilesystemEntries(viaApi, location);
+    return viaApi.ignoredHidden
+      ? { available: true, data, ignoredHidden: true }
+      : { available: true, data };
+  }
   const segment = browseLocationSegment(location);
   const params = new URLSearchParams({ limit: "1000", order: "asc" });
   const base = browseLocationBase(location);
@@ -449,6 +511,7 @@ export function useWorkspaceAllFiles(
   location = "",
 ) {
   const queryEnabled = options.enabled ?? true;
+  const hideIgnored = options.hideIgnored ?? false;
   const serveable = useWorkspaceServeable(conversationId);
   const retry = useRunnerOfflineRetry(useRunnerRecovering(conversationId));
   const environmentQuery = useWorkspaceEnvironment(conversationId, {
@@ -457,8 +520,8 @@ export function useWorkspaceAllFiles(
   const sessionActive = useSessionActive(conversationId);
   useTrailingInvalidate(conversationId, sessionActive, "workspace-all-files");
   return useQuery({
-    queryKey: ["workspace-all-files", conversationId, location],
-    queryFn: () => fetchWorkspaceAllFiles(conversationId!, location),
+    queryKey: ["workspace-all-files", conversationId, location, ...ignoredKey(hideIgnored)],
+    queryFn: () => fetchWorkspaceAllFiles(conversationId!, location, hideIgnored),
     enabled:
       queryEnabled &&
       !!conversationId &&
@@ -469,10 +532,13 @@ export function useWorkspaceAllFiles(
     // Keep the tree warm on revisits: within staleTime a return to a
     // previously-loaded conversation/location paints its cached tree with no
     // loading flash. Freshness on turn-completion is still handled by
-    // useTrailingInvalidate above. No cross-key placeholderData — carrying the
-    // previous conversation's tree under a new conversation's key fed stale
-    // files into the folder tree's default-expansion cache; virtualization
-    // already keeps the per-switch render cheap, so the warm-carry isn't needed.
+    // useTrailingInvalidate above. Never carry another conversation's tree under
+    // this key: stale files fed the folder tree's default-expansion cache. Only
+    // showing or hiding ignored files keeps this session's tree up meanwhile.
+    placeholderData: (previous, previousQuery) =>
+      previousQuery?.queryKey[1] === conversationId && previousQuery?.queryKey[2] === location
+        ? previous
+        : undefined,
     staleTime: 30_000,
   });
 }
@@ -566,7 +632,17 @@ export interface WorkspaceFileSearchResult {
    * definitive "no match".
    */
   truncated: boolean;
+  /** True when the server returned its full result limit, so more matches may exist. */
+  hasMore: boolean;
+  /**
+   * True when the workspace couldn't be searched (no OS environment, or the runner
+   * is unavailable). `files` is then empty, which doesn't mean nothing matched.
+   */
+  unavailable: boolean;
 }
+
+// One cap for both routes, so the API and REST return the same matches.
+const FILE_SEARCH_LIMIT = 500;
 
 async function fetchWorkspaceFileSearch(
   conversationId: string,
@@ -576,7 +652,29 @@ async function fetchWorkspaceFileSearch(
   location: string,
   signal?: AbortSignal,
 ): Promise<WorkspaceFileSearchResult> {
-  const params = new URLSearchParams({ limit: "500" });
+  // The workspace API only searches inside the workspace.
+  if (!browseLocationBase(location)) {
+    const viaApi = await searchFilesViaWorkspaceApi(
+      conversationId,
+      query,
+      { path: location, include, exclude, limit: FILE_SEARCH_LIMIT },
+      signal,
+    );
+    if (viaApi) {
+      return {
+        // Already relative to `location`; stripping it again would break a nested same-named folder.
+        files: mapFilesystemEntries({
+          object: "list",
+          data: viaApi.data,
+          has_more: viaApi.hasMore,
+        }),
+        truncated: viaApi.truncated,
+        hasMore: viaApi.hasMore,
+        unavailable: false,
+      };
+    }
+  }
+  const params = new URLSearchParams({ limit: String(FILE_SEARCH_LIMIT) });
   if (query) params.set("q", query);
   if (include) params.set("include", include);
   if (exclude) params.set("exclude", exclude);
@@ -590,11 +688,17 @@ async function fetchWorkspaceFileSearch(
   // 404 means the runner has no OS environment for this session (cloud-only
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
   // results rather than surfacing an error.
-  if (res.status === 404) return { files: [], truncated: false };
-  if (await isRunnerUnavailable503(res)) return { files: [], truncated: false };
+  const unavailable = { files: [], truncated: false, hasMore: false, unavailable: true };
+  if (res.status === 404) return unavailable;
+  if (await isRunnerUnavailable503(res)) return unavailable;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as FilesystemListResponse;
-  return { files: mapFilesystemEntries(json, location), truncated: !!json.truncated };
+  return {
+    files: mapFilesystemEntries(json, location),
+    truncated: !!json.truncated,
+    hasMore: !!json.has_more,
+    unavailable: false,
+  };
 }
 
 /**
@@ -657,8 +761,12 @@ async function fetchWorkspaceDirectory(
   conversationId: string,
   dirPath: string,
   location = "",
+  hideIgnored = false,
 ): Promise<WorkspaceFile[]> {
   const target = joinBrowseLocation(location, dirPath);
+  const viaApi = await listViaWorkspaceApi(conversationId, target, 1000, hideIgnored);
+  // The tree addresses children relative to the location it is rooted at.
+  if (viaApi) return mapFilesystemEntries(viaApi, target, dirPath);
   const encodedPath = browseLocationSegment(target);
   const params = new URLSearchParams({ limit: "1000", order: "asc" });
   const base = browseLocationBase(target);
@@ -832,6 +940,8 @@ async function fetchDirEntriesTolerant(
   // ``base=host`` (see ``browseLocationSegment``). Entries of an absolute
   // listing echo back base-relative names, so the listed dir is re-attached
   // below and callers compare full paths uniformly.
+  const viaApi = await listViaWorkspaceApi(conversationId, dirPath, FILE_EXISTENCE_SCAN_LIMIT);
+  if (viaApi) return { files: mapFilesystemEntries(viaApi), truncated: viaApi.has_more };
   const base = `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem`;
   const params = new URLSearchParams({ order: "asc" });
   const hostBase = browseLocationBase(dirPath);
@@ -1064,11 +1174,31 @@ export function useWorkspaceDirectory(
 ) {
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
-    queryKey: ["workspace-dir", conversationId, dirPath, location],
-    queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath!, location),
+    ...workspaceDirectoryQuery(conversationId ?? "", dirPath ?? "", location),
     enabled: !!conversationId && !!dirPath && serveable !== false,
-    staleTime: 5_000,
   });
+}
+
+/** The query for one directory's listing, shared by the tree and prefetch so they share a cache. */
+export function workspaceDirectoryQuery(
+  conversationId: string,
+  dirPath: string,
+  location = "",
+  refreshToken = 0,
+  hideIgnored = false,
+) {
+  return {
+    queryKey: [
+      "workspace-dir",
+      conversationId,
+      dirPath,
+      location,
+      ...(refreshToken === 0 ? [] : [refreshToken]),
+      ...ignoredKey(hideIgnored),
+    ],
+    queryFn: () => fetchWorkspaceDirectory(conversationId, dirPath, location, hideIgnored),
+    staleTime: 5_000,
+  };
 }
 
 /** One expanded lazy directory's fetched children + load/error state. */
@@ -1094,9 +1224,11 @@ export function useWorkspaceDirectories(
   dirPaths: string[],
   location = "",
   refreshToken = 0,
+  hideIgnored = false,
 ): Map<string, DirectoryResult> {
   const serveable = useWorkspaceServeable(conversationId);
   const enabled = !!conversationId && serveable !== false;
+  const queryClient = useQueryClient();
   // `combine` lets TanStack memoize the assembled Map. Its recompute gate is a
   // reference check on the combine fn (`combine !== lastCombine`), so the
   // callback must be stable — an inline closure is a fresh fn every render and
@@ -1119,13 +1251,26 @@ export function useWorkspaceDirectories(
   );
   return useQueries({
     queries: dirPaths.map((dirPath) => ({
-      queryKey:
-        refreshToken === 0
-          ? ["workspace-dir", conversationId, dirPath, location]
-          : ["workspace-dir", conversationId, dirPath, location, refreshToken],
-      queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath, location),
+      ...workspaceDirectoryQuery(
+        conversationId ?? "",
+        dirPath,
+        location,
+        refreshToken,
+        hideIgnored,
+      ),
+      // useQueries starts a fresh observer per key, so the folder's other listing comes from
+      // the cache: showing or hiding ignored files keeps its rows up meanwhile.
+      placeholderData: () =>
+        queryClient.getQueryData<WorkspaceFile[]>(
+          workspaceDirectoryQuery(
+            conversationId ?? "",
+            dirPath,
+            location,
+            refreshToken,
+            !hideIgnored,
+          ).queryKey,
+        ),
       enabled,
-      staleTime: 5_000,
     })),
     combine,
   });

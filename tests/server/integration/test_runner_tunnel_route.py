@@ -47,6 +47,7 @@ from omnigent.server.disconnect_evidence import DisconnectEvidence
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
+from tests.server.helpers import wait_for_tunnel_registration
 
 pytestmark = pytest.mark.asyncio
 
@@ -230,18 +231,7 @@ async def _send_hello(
         {"type": "websocket.receive", "text": encode_frame(hello)},
     )
 
-    await asyncio.wait_for(_wait_until_registered(registry, runner_id), timeout=budget(1.0))
-
-
-async def _wait_until_registered(registry: TunnelRegistry, runner_id: str) -> None:
-    """Wait for runner registration.
-
-    :param registry: Registry shared with the tunnel router.
-    :param runner_id: Runner id expected to register.
-    :returns: None.
-    """
-    while registry.get(runner_id) is None:
-        await asyncio.sleep(0.01)
+    await wait_for_tunnel_registration(communicator, registry, runner_id)
 
 
 async def _route_requests_to_runner(

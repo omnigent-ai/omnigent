@@ -35,6 +35,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.server.integration._session_continuation import (
     _COMPACT_INPUT,
     _HOST_ID,
@@ -199,17 +200,17 @@ async def test_deleting_the_original_during_the_handoff_never_strands_the_contin
     def fork_around_the_delete(self: Any, *args: Any, **kwargs: Any) -> Any:
         forked = fork(self, *args, **kwargs) if deleted != "before_fork" else None
         loop.call_soon_threadsafe(paused.set)
-        assert resume.wait(timeout=10)
+        assert resume.wait(timeout=budget(10))
         return forked if forked is not None else fork(self, *args, **kwargs)
 
     monkeypatch.setattr(SqlAlchemyConversationStore, "fork_conversation", fork_around_the_delete)
     continuing = asyncio.create_task(continue_session(client, store, source_id, command))
-    await asyncio.wait_for(paused.wait(), timeout=10)
+    await asyncio.wait_for(paused.wait(), timeout=budget(10))
     if deleted != "not_then_failure":
         removed = await client.delete(f"/v1/sessions/{source_id}")
         assert removed.status_code == 200, removed.text
     resume.set()
-    continued = await asyncio.wait_for(continuing, timeout=10)
+    continued = await asyncio.wait_for(continuing, timeout=budget(10))
 
     if deleted == "not_then_failure":
         # The original still uses the sandbox, so only the continuation goes.
@@ -388,7 +389,7 @@ async def test_a_cancelled_request_still_finishes_the_move(
 
         def fork_after_cancel(self: Any, *args: Any, **kwargs: Any) -> Any:
             loop.call_soon_threadsafe(paused.set)
-            assert resume.wait(timeout=10)
+            assert resume.wait(timeout=budget(10))
             return fork(self, *args, **kwargs)
 
         monkeypatch.setattr(SqlAlchemyConversationStore, "fork_conversation", fork_after_cancel)
@@ -398,19 +399,19 @@ async def test_a_cancelled_request_still_finishes_the_move(
         async def bind_after_cancel(session_id: str, *args: Any, **kwargs: Any) -> Any:
             if session_id != source_id and not paused.is_set():
                 paused.set()
-                await asyncio.to_thread(resume.wait, 10)
+                await asyncio.to_thread(resume.wait, budget(10))
             return await resolve_runner(session_id, *args, **kwargs)
 
         monkeypatch.setattr(sessions_module, "_get_runner_client", bind_after_cancel)
     moving = asyncio.create_task(continue_session(client, store, source_id, command))
-    await asyncio.wait_for(paused.wait(), timeout=10)
+    await asyncio.wait_for(paused.wait(), timeout=budget(10))
 
     moving.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await moving
     retried = await continue_session(client, store, source_id, command)
     resume.set()
-    await poll_until_async(lambda: bool(live_runner.superseded), timeout_s=10)
+    await poll_until_async(lambda: bool(live_runner.superseded), timeout_s=budget(10))
 
     assert retried.status_code == 409, retried.text
     [(_, new_id, _)] = live_runner.superseded

@@ -1876,6 +1876,23 @@ describe("BlockStream — elicitation", () => {
     expect(blockFor({ is_blocking: true })).not.toHaveProperty("isBlocking");
   });
 
+  it("keeps the task a workflow question is about on its card", () => {
+    const card = (params: Record<string, unknown>) => {
+      const event = parseEvent("response.elicitation_request", {
+        elicitation_id: "elicit_journal_1",
+        params: { mode: "form", message: "Waiting for you on Deploy", ...params },
+      });
+      if (event === null) throw new Error("expected an elicitation request");
+      return reduce([event]).find((b): b is ElicitationBlock => b.type === "elicitation");
+    };
+
+    expect(card({ phase: "workflow_request_input", journal_step: "deploy" })).toMatchObject({
+      phase: "workflow_request_input",
+      journalStep: "deploy",
+    });
+    expect(card({ phase: "workflow_request_input" })).not.toHaveProperty("journalStep");
+  });
+
   it("flushes pending text before an elicitation prompt", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse({ responseId: "resp_plan" }) },
@@ -2043,5 +2060,40 @@ describe("BlockStream — naming a turn already in flight", () => {
 
     // Exactly one reasoning section was opened for the whole thought.
     expect(blocks.filter((b) => b.type === "reasoning_start")).toHaveLength(1);
+  });
+});
+
+describe("BlockStream — Claude sub-agent handback", () => {
+  it("streams the handed-back report as the answer and drops the delivery receipt", () => {
+    const handback = {
+      type: "tool_call",
+      name: "SubagentHandback",
+      arguments: { message: "**Audit** done." },
+      callId: "c1",
+      status: "completed",
+      agentName: "agent",
+      itemId: "fc_1",
+      responseId: "resp_1",
+    } satisfies StreamEvent;
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      handback,
+      // The runner can deliver the same call twice; it must render once.
+      handback,
+      {
+        type: "tool_result",
+        callId: "c1",
+        output: "delivered",
+        itemId: "fco_1",
+        responseId: "resp_1",
+      },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+    expect(
+      blockTypes(blocks).filter((t) => t !== "response_start" && t !== "response_end"),
+    ).toEqual(["text_done"]);
+    const answer = blocks.find((b): b is TextDone => b.type === "text_done");
+    expect(answer?.fullText).toBe("**Audit** done.");
+    expect(answer?.ctx.itemId).toBe("fc_1");
   });
 });

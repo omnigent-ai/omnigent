@@ -88,7 +88,7 @@ async def test_ask_skipped_when_unmeasured() -> None:
 
 
 async def test_ask_skipped_when_no_elicitation_but_completed() -> None:
-    r = await _ask(TurnResult(completed=True, tool_calls=[{"name": "list_files"}]))
+    r = await _ask(TurnResult(completed=True, tool_calls=[{"name": "sys_files_list"}]))
     assert r.verdict is Verdict.SKIPPED
 
 

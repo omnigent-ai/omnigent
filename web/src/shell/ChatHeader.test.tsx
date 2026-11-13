@@ -9,8 +9,6 @@ import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
-import * as sessionsApi from "@/lib/sessionsApi";
-import type { Session } from "@/lib/types";
 import { ChatHeader } from "./ChatHeader";
 import {
   TerminalFirstContextProvider,
@@ -60,6 +58,9 @@ const mobileMenu = {
   onOpenSubagents: () => {},
   githubPanelOpen: false,
   onOpenGithub: () => {},
+  tasksPanelOpen: false,
+  showTasks: false,
+  onOpenTasks: () => {},
   contentSearchPanelOpen: false,
   showContentSearch: false,
   onOpenContentSearch: () => {},
@@ -75,8 +76,6 @@ function renderHeader(props: {
   subAgentName?: string | null;
   conversationId?: string;
   workingDirectory?: string;
-  createdBySessionId?: string;
-  queryClient?: QueryClient;
   actionConversation?: Conversation | null;
   conversationTitle?: string | null;
   projectName?: string | null;
@@ -99,8 +98,7 @@ function renderHeader(props: {
   onFork?: () => void;
   settingsMode?: boolean;
 }) {
-  const qc =
-    props.queryClient ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <MemoryRouter initialEntries={["/"]}>
       <QueryClientProvider client={qc}>
@@ -116,7 +114,6 @@ function renderHeader(props: {
             // stay unmounted, isolating the left-slot affordances under test.
             conversationId={props.conversationId}
             workingDirectory={props.workingDirectory}
-            createdBySessionId={props.createdBySessionId}
             actionConversation={props.actionConversation}
             conversationTitle={props.conversationTitle ?? null}
             projectName={props.projectName ?? null}
@@ -153,57 +150,6 @@ afterEach(() => {
   isIOSShellMock.mockReturnValue(false);
   isAndroidShellMock.mockReturnValue(false);
   isMobileMock.mockReturnValue(false);
-});
-
-it.each([false, true])("links the creating session (mobile=%s)", async (mobile) => {
-  isMobileMock.mockReturnValue(mobile);
-  let resolveCreator!: (session: Session) => void;
-  const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockReturnValue(
-    new Promise<Session>((resolve) => {
-      resolveCreator = resolve;
-    }),
-  );
-  renderHeader({ sidebarOpen: true, conversationId: "worker", createdBySessionId: "manager" });
-  expect(screen.queryByText(/Created by/)).not.toBeInTheDocument();
-  await act(async () => {
-    resolveCreator({ id: "manager", title: "Release manager" } as Session);
-  });
-  expect(await screen.findByRole("link", { name: "Release manager" })).toHaveAttribute(
-    "href",
-    "/c/manager",
-  );
-  expect(lookup).toHaveBeenCalledWith("manager");
-  expect(screen.getByText(/Created by/)).toBeInTheDocument();
-  expect(screen.queryByRole("link", { name: "Back to parent session" })).not.toBeInTheDocument();
-});
-
-it("rechecks creator access without displaying cached metadata", async () => {
-  const queryClient = new QueryClient();
-  const cached = { id: "private", title: "Previously shared manager" } as Session;
-  queryClient.setQueryData(["session", "private"], cached);
-  queryClient.setQueryData(["session-creator", "private"], cached);
-  let rejectCreator!: (error: Error) => void;
-  const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockReturnValue(
-    new Promise<Session>((_, reject) => {
-      rejectCreator = reject;
-    }),
-  );
-  renderHeader({
-    sidebarOpen: true,
-    conversationId: "worker",
-    createdBySessionId: "private",
-    queryClient,
-  });
-  expect(screen.queryByText(/Created by/)).not.toBeInTheDocument();
-  expect(screen.queryByText(cached.title!)).not.toBeInTheDocument();
-  expect(screen.queryByRole("link")).not.toBeInTheDocument();
-  await act(async () => {
-    rejectCreator(new sessionsApi.ApiError("Unavailable", 403, null));
-  });
-  expect(await screen.findByText("Created by another session")).toBeInTheDocument();
-  expect(lookup).toHaveBeenCalledWith("private");
-  expect(screen.queryByText(cached.title!)).not.toBeInTheDocument();
-  expect(screen.queryByRole("link")).not.toBeInTheDocument();
 });
 
 describe("ChatHeader — deployed Share presentation", () => {
@@ -300,6 +246,19 @@ describe("ChatHeader — workspace pane alignment", () => {
       session.container.querySelector("header")!.classList.contains("session-header-glass"),
     ).toBe(!mobile);
   });
+
+  it("lets a page's content take clicks under the header, away from its controls", () => {
+    // A page scrolls under the header without a backdrop, e.g. its Back link.
+    const page = renderHeader({ sidebarOpen: true });
+    expect(page.container.querySelector("header")).toHaveClass(
+      "pointer-events-none",
+      "*:pointer-events-auto",
+    );
+    page.unmount();
+
+    const session = renderHeader({ sidebarOpen: true, conversationId: "conv-1" });
+    expect(session.container.querySelector("header")).not.toHaveClass("pointer-events-none");
+  });
 });
 
 describe("ChatHeader — workspace pane shortcut", () => {
@@ -358,12 +317,18 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
     );
   });
 
-  it("uses a back arrow and faded header surface for the mobile settings menu", () => {
+  it("uses the menu icon and faded header surface for the mobile settings menu", () => {
     const { container } = renderHeader({ sidebarOpen: false, settingsMode: true });
 
-    const button = screen.getByRole("button", { name: "Back to settings menu" });
-    expect(button.querySelector("svg")).toHaveClass("lucide-arrow-left");
+    const button = screen.getByRole("button", { name: "Open settings menu" });
+    expect(button.querySelector("svg")).toHaveClass("lucide-menu");
     expect(container.querySelector("header")).toHaveClass("settings-mobile-header");
+  });
+
+  it("drops the settings header fade while the sidebar is open", () => {
+    const { container } = renderHeader({ sidebarOpen: true, settingsMode: true });
+
+    expect(container.querySelector("header")).not.toHaveClass("settings-mobile-header");
   });
 
   it("cancels the pending peek as soon as the toggle is pressed", () => {
@@ -1118,6 +1083,29 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Files" }));
     expect(onOpenFiles).toHaveBeenCalled();
+  });
+
+  it("opens the Tasks drawer from the kebab, with no count of workers", () => {
+    const onOpenTasks = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: conversation,
+      hasRailContent: true,
+      showFilesPanel: true,
+      mobileMenu: { ...mobileMenu, showTasks: true, subagentsWorking: 2, onOpenTasks },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    const item = screen.getByTestId("mobile-tasks-action");
+    // Busy sub-agents count on the Agents item; the Tasks item is just its label.
+    expect(item.textContent?.trim()).toBe("Tasks");
+    fireEvent.click(item);
+    expect(onOpenTasks).toHaveBeenCalled();
   });
 
   it("opens the content-search drawer from the kebab when the feature is available", () => {

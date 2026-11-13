@@ -24,6 +24,7 @@ from omnigent.harnesses.codex_native.bridge import (
     codex_home_for_bridge_dir,
     codex_mcp_config_overrides,
     codex_terminal_interactive,
+    fail_pending_mcp_startup,
     mcp_startup_waiting_detail,
     pending_mcp_servers,
     prepare_bridge_dir,
@@ -104,6 +105,22 @@ def test_codex_mcp_config_overrides_isolate_the_bridge_relay(tmp_path: Path) -> 
     env_prefix = "mcp_servers.omnigent.env.OMNIGENT_DATA_DIR="
     raw_data_dir = next(o[len(env_prefix) :] for o in overrides if o.startswith(env_prefix))
     assert json.loads(raw_data_dir) == str(data_dir())
+
+
+def test_codex_gives_omnigent_tools_longer_than_the_runner_waits_for_a_person(
+    tmp_path: Path,
+) -> None:
+    """A tool waiting on a person, such as a workflow question, outlives Codex's 60 s default.
+
+    :param tmp_path: Stands in for the per-session bridge dir.
+    """
+    from omnigent.runner import pending_approvals
+
+    overrides = codex_mcp_config_overrides(tmp_path)
+
+    prefix = "mcp_servers.omnigent.tool_timeout_sec="
+    timeout = next(int(o[len(prefix) :]) for o in overrides if o.startswith(prefix))
+    assert timeout > pending_approvals._DEFAULT_WAIT_SECONDS
 
 
 def test_codex_mcp_config_overrides_pin_a_relative_data_dir_as_absolute(
@@ -1198,6 +1215,29 @@ def test_settle_pending_mcp_startup_drops_only_starting(bridge_dir: Path) -> Non
     assert read_mcp_startup(bridge_dir) == servers
     # Fully settled → nothing to drop, nothing rewritten.
     assert settle_pending_mcp_startup(bridge_dir) == (servers, False)
+
+
+def test_fail_pending_mcp_startup_marks_only_starting(bridge_dir: Path) -> None:
+    """
+    Failing the round records the reason on ``starting`` entries only.
+
+    Ready and cancelled servers keep their outcome; once nothing is
+    ``starting`` the band has nothing to spin on, so a second call is a no-op.
+    """
+    update_mcp_server_startup(bridge_dir, "safe", "starting")
+    update_mcp_server_startup(bridge_dir, "omnigent", "ready")
+    update_mcp_server_startup(bridge_dir, "storage-console", "cancelled")
+
+    servers, changed = fail_pending_mcp_startup(bridge_dir, "app-server stopped")
+
+    assert changed is True
+    assert servers == {
+        "safe": {"status": "failed", "error": "app-server stopped"},
+        "omnigent": {"status": "ready", "error": None},
+        "storage-console": {"status": "cancelled", "error": None},
+    }
+    assert read_mcp_startup(bridge_dir) == servers
+    assert fail_pending_mcp_startup(bridge_dir, "app-server stopped") == (servers, False)
 
 
 def test_read_mcp_startup_ignores_malformed_entries(bridge_dir: Path) -> None:

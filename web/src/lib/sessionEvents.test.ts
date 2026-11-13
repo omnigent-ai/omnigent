@@ -1123,6 +1123,18 @@ describe("session.usage (FLAT envelope)", () => {
     expect(ev.contextWindow).toBe(1000000);
   });
 
+  it("lifts a cost-only cost_hidden broadcast", () => {
+    const out = parse("session.usage", {
+      type: "session.usage",
+      conversation_id: "conv_abc",
+      cost_hidden: true,
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionUsageEvent;
+    expect(ev.costHidden).toBe(true);
+    expect(ev.totalCostUsd).toBeUndefined();
+  });
+
   it("rejects payloads with neither field", () => {
     const out = parse("session.usage", {
       type: "session.usage",
@@ -1825,6 +1837,30 @@ describe("session.presence (FLAT envelope)", () => {
         viewers: "nobody",
       }),
     ).toEqual([]);
+  });
+});
+
+describe("session.journal.appended (FLAT envelope)", () => {
+  it("carries the session and the new entry", () => {
+    const entry = { id: "e1", position: 1, kind: "note", content: { body: "hi" } };
+    const out = parse("session.journal.appended", {
+      type: "session.journal.appended",
+      conversation_id: "conv_abc",
+      entry,
+    });
+    expect(out).toEqual([{ type: "session_journal_appended", conversationId: "conv_abc", entry }]);
+  });
+
+  it("rejects an event without a usable entry", () => {
+    for (const entry of [undefined, [], { id: "e1" }, { position: 1 }]) {
+      expect(
+        parse("session.journal.appended", {
+          type: "session.journal.appended",
+          conversation_id: "conv_abc",
+          entry,
+        }),
+      ).toEqual([]);
+    }
   });
 });
 

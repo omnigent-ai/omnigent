@@ -15,6 +15,7 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -52,6 +53,7 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
+from omnigent.inner.sandbox import HarnessSandboxValidationError
 
 # ---------------------------------------------------------------------------
 # Construction / argv
@@ -2926,64 +2928,118 @@ def test_resolve_cwd_deleted_process_cwd_readlink_failure_still_raises() -> None
                 _resolve_cwd(None)
 
 
-def test_acp_executor_init_raises_on_deleted_explicit_cwd(tmp_path: Path) -> None:
-    """AcpExecutor.__init__ raises RuntimeError when an explicit cwd is missing."""
+_CWD_POLICY_CASES = [
+    pytest.param(None, False, id="no-policy"),
+    pytest.param(OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")), False, id="explicit-none"),
+    pytest.param(OSEnvSpec(), True, id="default-sandbox"),
+    pytest.param(
+        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")), True, id="requested-sandbox"
+    ),
+]
+
+
+@pytest.mark.parametrize(("os_env", "sandbox_requested"), _CWD_POLICY_CASES)
+def test_acp_executor_init_raises_on_deleted_explicit_cwd(
+    tmp_path: Path, os_env: OSEnvSpec | None, sandbox_requested: bool
+) -> None:
+    """Missing cwd diagnostics are preserved as a cause when sandboxing is requested."""
     missing = str(tmp_path / "workspace")
-    with pytest.raises(RuntimeError, match="workspace"):
-        AcpExecutor(AcpAgentConfig(command="agent"), cwd=missing)
+    expected_error = HarnessSandboxValidationError if sandbox_requested else RuntimeError
+    with pytest.raises(expected_error, match="workspace") as failure:
+        AcpExecutor(AcpAgentConfig(command="agent"), cwd=missing, os_env=os_env)
+    diagnostic = failure.value.__cause__ if sandbox_requested else failure.value
+    assert type(diagnostic) is RuntimeError
+    assert str(diagnostic) == f"ACP executor working directory does not exist: {missing!r}"
+    if not sandbox_requested:
+        assert failure.value.__cause__ is None
+    else:
+        assert missing not in failure.value.client_message
+        assert failure.value.client_message == (
+            "The working directory is unavailable. Choose an existing workspace and retry."
+        )
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("os_env", "sandbox_requested"), _CWD_POLICY_CASES)
 async def test_start_process_guard_raises_clear_error_on_deleted_cwd(
-    tmp_path: Path,
+    tmp_path: Path, os_env: OSEnvSpec | None, sandbox_requested: bool
 ) -> None:
-    """Deleting the cwd after __init__ yields an ExecutorError naming the path.
-
-    Without the guard at the top of _start_process(), the error would be the raw
-    ``asyncio.create_subprocess_exec`` OS error ("[Errno 2] No such file or directory:
-    '/path'"), which lacks ACP-specific context. With the guard, the message says
-    "ACP executor working directory does not exist".
-    """
+    """Unconfined sessions retain ordinary workspace errors."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=str(workspace))
+    ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=str(workspace), os_env=os_env)
     assert ex._cwd == str(workspace)
 
     # Simulate the workspace being deleted after the executor was constructed.
     workspace.rmdir()
 
     events = []
-    async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
-        events.append(ev)
-    await ex.close()
+    try:
+        with (
+            pytest.raises(HarnessSandboxValidationError)
+            if sandbox_requested
+            else contextlib.nullcontext()
+        ) as failure:
+            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                events.append(ev)
+    finally:
+        await ex.close()
 
-    assert events, "expected at least one ExecutorError event"
     error_events = [e for e in events if isinstance(e, ExecutorError)]
-    assert error_events, f"expected ExecutorError, got: {[type(e).__name__ for e in events]}"
-    msg = error_events[0].message
+    if failure is not None:
+        assert type(failure.value.__cause__) is RuntimeError
+        assert not error_events
+        assert str(workspace) not in failure.value.client_message
+        assert failure.value.client_message == (
+            "The working directory is unavailable. Choose an existing workspace and retry."
+        )
+        msg = str(failure.value.__cause__)
+    else:
+        assert error_events, f"expected ExecutorError, got: {[type(e).__name__ for e in events]}"
+        msg = error_events[0].message
     assert "working directory" in msg, f"expected 'working directory' in: {msg!r}"
     assert str(workspace) in msg, f"expected path in: {msg!r}"
 
 
 @pytest.mark.asyncio
-async def test_start_process_guard_deleted_process_cwd_relative_cwd() -> None:
-    """Relative cwd with deleted process cwd yields a clear 'Runner working directory' error."""
-    ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=".")
+@pytest.mark.parametrize(("os_env", "sandbox_requested"), _CWD_POLICY_CASES)
+async def test_start_process_guard_deleted_process_cwd_relative_cwd(
+    os_env: OSEnvSpec | None,
+    sandbox_requested: bool,
+) -> None:
+    """An inherited deleted cwd preserves its diagnostic outside client error events."""
+    ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=".", os_env=os_env)
 
     fnfe = FileNotFoundError(2, "No such file or directory")
-    with patch("omnigent.inner.acp_executor.os.getcwd", side_effect=fnfe):
-        with patch(
-            "omnigent.inner.acp_executor.os.readlink",
-            return_value="/workspace/project (deleted)",
-        ):
-            events = []
-            async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
-                events.append(ev)
-    await ex.close()
+    events = []
+    try:
+        with patch("omnigent.inner.acp_executor.os.getcwd", side_effect=fnfe):
+            with patch(
+                "omnigent.inner.acp_executor.os.readlink",
+                return_value="/workspace/project (deleted)",
+            ):
+                with (
+                    pytest.raises(HarnessSandboxValidationError)
+                    if sandbox_requested
+                    else contextlib.nullcontext()
+                ) as failure:
+                    async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        events.append(ev)
+    finally:
+        await ex.close()
 
     error_events = [e for e in events if isinstance(e, ExecutorError)]
-    assert error_events
-    msg = error_events[0].message
+    if failure is not None:
+        assert type(failure.value.__cause__) is RuntimeError
+        assert not error_events
+        assert "/workspace/project" not in failure.value.client_message
+        assert failure.value.client_message == (
+            "The working directory is unavailable. Choose an existing workspace and retry."
+        )
+        msg = str(failure.value.__cause__)
+    else:
+        assert error_events
+        msg = error_events[0].message
     assert "deleted" in msg, f"expected 'deleted' in: {msg!r}"
     assert "/workspace/project" in msg, f"expected path in: {msg!r}"
 

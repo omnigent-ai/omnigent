@@ -18,7 +18,7 @@ import {
   statusTone,
 } from "@/lib/toolValue";
 import { cn } from "@/lib/utils";
-import { FilePathAwareMessageResponse } from "./ChatMarkdown";
+import { ProseMarkdown } from "./ChatMarkdown";
 
 // Past this depth a value is shown as compact JSON instead of nested lists.
 const MAX_FIELD_DEPTH = 3;
@@ -189,22 +189,11 @@ function StringValue({ text, fieldKey }: { text: string; fieldKey?: string }) {
   return isToken ? <span className="font-mono">{text}</span> : text;
 }
 
-// Keeps a description's headings at the card's size; `!` beats the unlayered rules in index.css.
-const PROSE_MARKDOWN_CLASS =
-  "[&_:is(h1,h2,h3,h4,h5,h6)]:mt-3! [&_:is(h1,h2,h3,h4,h5,h6)]:mb-1! [&_[data-streamdown^=heading]]:text-sm!";
-
 /** Long text written for people, as markdown in the interface font. */
 function ProseValue({ text }: { text: string }) {
   return (
     <div className="max-h-60 overflow-auto" data-testid="tool-prose-value">
-      <FilePathAwareMessageResponse
-        mode="static"
-        breaks
-        literalHtml
-        className={PROSE_MARKDOWN_CLASS}
-      >
-        {text}
-      </FilePathAwareMessageResponse>
+      <ProseMarkdown>{text}</ProseMarkdown>
     </div>
   );
 }

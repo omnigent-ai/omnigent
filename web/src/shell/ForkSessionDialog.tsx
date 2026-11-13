@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { managedSandboxHostId } from "@/lib/managedSandboxHost";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -48,13 +49,21 @@ import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictio
 import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { fetchSessionRepositoryBranches, forkSession, launchRunner } from "@/lib/sessionsApi";
+import { conversationRowFromSession, insertCreatedRowIntoCaches } from "@/lib/sessionListCache";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useSession } from "@/hooks/useSession";
-import type { Session } from "@/lib/types";
+import type { NativeModelOption, Session } from "@/lib/types";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
+import {
+  newSandboxModelOptions,
+  noReachableModelsMessage,
+  useNewSandboxModelCatalog,
+} from "@/hooks/useNewSandboxModelCatalog";
+import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
+import { getCurrentUserId } from "@/lib/identity";
 import {
   nativeAgentHasCapability,
   nativeCodingAgentForAvailableAgent,
@@ -78,13 +87,12 @@ import {
   type NativeHarnessMode,
 } from "@/lib/nativeHarnessModes";
 import {
-  CLAUDE_NATIVE_EFFORTS,
-  PI_NATIVE_EFFORTS,
   DescribedSelect,
   EFFORT_SELECT_NONE,
   MODEL_SELECT_DEFAULT,
   RoutingModelSelect,
   defaultModelLabel,
+  nativeEffortOptions,
   nativeModelLabel,
 } from "@/components/HarnessConfigControls";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
@@ -94,7 +102,6 @@ import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/fo
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { randomUUID } from "@/lib/randomUUID";
 import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
@@ -141,9 +148,10 @@ const SAME_AS_SOURCE = "__same__";
 const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
 
 /** Form fields that can block submit, mapped to the control a blocked click focuses. */
-type ForkField = "host" | "directory" | "sandboxRepo" | "sandboxProfile";
+type ForkField = "host" | "agent" | "directory" | "sandboxRepo" | "sandboxProfile";
 const FORK_FIELD_IDS: Record<ForkField, string> = {
   host: "fork-session-host",
+  agent: "fork-session-agent",
   directory: "fork-session-directory",
   sandboxRepo: "fork-session-sandbox-repo-input",
   sandboxProfile: "fork-session-sandbox-profile",
@@ -170,7 +178,7 @@ function sandboxRepositoryHint(count: number): string {
  * Compact host label for the Select item — mirrors NewChatDialog's
  * HostOption (which is private to that module).
  */
-function HostLabel({ host }: { host: Host }) {
+export function HostLabel({ host }: { host: Host }) {
   const isOnline = host.status === "online";
   return (
     <span className="flex items-center gap-2">
@@ -273,11 +281,12 @@ export interface ForkRunConfigValue {
  * permission/approval/mode pickers seed from the source only on a same-AGENT
  * fork (`sameAgentAsSource`); otherwise each seeds the target's default. See
  * the parent for how those two flags are derived from the backend's
- * `copy_model_settings` / `copy_terminal_launch_args` gates.
+ * `copy_model_settings` / `copy_terminal_launch_args` gates. The Run workflow
+ * dialog passes no source, so every picker starts on its default there.
  *
- * Emission is opt-in per control: a field is sent ONLY when the user actually
- * changed that control (see `touched`). An untouched control omits its field,
- * so the fork request carries nothing for it and the server's own
+ * Emission is opt-in per control: a field is sent when the user changes that
+ * control; choosing a model also settles its effort. An untouched control omits
+ * its field, so the fork request carries nothing for it and the server's own
  * inherit / reset-by-family path decides — which is exactly the seeded meaning.
  * This is what keeps the section honest against the async model catalog: a
  * submit before the catalog resolves can't emit a spurious `model_override`.
@@ -294,15 +303,25 @@ export interface ForkRunConfigValue {
  *   backend carries only on a same-agent fork.
  * @param selectedHostId - Host whose model catalog feeds the model picker; null
  *   leaves it on Default until a host is chosen.
+ * @param modelCatalog - Models to offer instead of the host's, e.g. a new
+ *   sandbox's, and why none are listed; omitted to list the selected host's.
+ * @param modelCatalogKey - Where the model list comes from; when it changes,
+ *   the model and effort picks start over.
+ * @param remembered - Settings to start on in place of the source's, e.g. the
+ *   last ones used for a new session. With it, every shown control reports its
+ *   value, changed or not: a new session has no source to inherit from.
  * @param onChange - Reports the ready-to-send value on every change.
  */
-function ForkRunConfig({
+export function ForkRunConfig({
   targetHarness,
   targetAgent,
   sourceSession,
   sameFamilyAsSource,
   sameAgentAsSource,
   selectedHostId,
+  modelCatalog,
+  modelCatalogKey,
+  remembered,
   onChange,
 }: {
   targetHarness: string | null;
@@ -311,8 +330,12 @@ function ForkRunConfig({
   sameFamilyAsSource: boolean;
   sameAgentAsSource: boolean;
   selectedHostId: string | null;
+  modelCatalog?: { options: NativeModelOption[]; loading: boolean; emptyReason?: string | null };
+  modelCatalogKey?: string;
+  remembered?: ForkRunConfigValue;
   onChange: (value: ForkRunConfigValue) => void;
 }) {
+  const reportAll = remembered !== undefined;
   const hasPermission = nativeAgentHasCapability(targetAgent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(targetAgent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(targetAgent, "cursorMode");
@@ -323,26 +346,25 @@ function ForkRunConfig({
   const isCodex = targetHarness === "codex-native";
   const showModel = hasModelPicker || isCodex;
   const hasThinkingLevel = targetHarness === "omp-native";
-  const effortOptions = hasThinkingLevel ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
-  const showEffort = hasPermission || hasThinkingLevel;
 
   // Live model catalog for the target harness on the picked host. Only the
   // native harnesses that expose a picker resolve a catalog; others pass a
   // harmless unused harness key with the query disabled.
   const catalogHarness = showModel && targetHarness ? targetHarness : "claude-native";
-  const { data: hostModelOptions, isLoading: modelsLoading } = useHostModelOptions(
+  const hostCatalog = useHostModelOptions(
     selectedHostId,
     catalogHarness,
-    showModel && selectedHostId !== null,
+    showModel && selectedHostId !== null && modelCatalog === undefined,
   );
+  const catalogOptions = modelCatalog?.options ?? hostCatalog.data;
+  const modelsLoading = modelCatalog?.loading ?? hostCatalog.isLoading;
   const modelOptions = useMemo(
     () =>
-      (hostModelOptions ?? []).map((option) => ({
-        id: option.id,
+      (catalogOptions ?? []).map((option) => ({
+        ...option,
         displayName: option.displayName ?? option.id,
-        isDefault: option.isDefault,
       })),
-    [hostModelOptions],
+    [catalogOptions],
   );
   const modelSelectOptions = useMemo(
     () => modelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
@@ -356,17 +378,42 @@ function ForkRunConfig({
     // Seed the source's model only once the catalog confirms it: a model id
     // absent from the loaded options has no Select item to land on and would
     // blank the trigger. Until the catalog resolves, Default holds.
-    const picked = sameFamilyAsSource ? sourceSession?.modelOverride : null;
+    const picked = remembered
+      ? remembered.modelOverride
+      : sameFamilyAsSource
+        ? sourceSession?.modelOverride
+        : null;
     return picked && modelOptions.some((m) => m.id === picked) ? picked : MODEL_SELECT_DEFAULT;
-  }, [sameFamilyAsSource, sourceSession, modelOptions]);
+  }, [remembered, sameFamilyAsSource, sourceSession, modelOptions]);
+  const [model, setModel] = useState(seededModel);
+  const effortOptions = useMemo(
+    () =>
+      nativeEffortOptions(
+        targetHarness,
+        modelOptions,
+        model === MODEL_SELECT_DEFAULT ? null : model,
+      ) ?? [],
+    [targetHarness, modelOptions, model],
+  );
+  const showEffort = effortOptions.length > 0;
   const seededEffort = useMemo(() => {
     // Seed only an effort the picker can display; a source value outside the
-    // offered vocabulary (e.g. "minimal") falls back to Default rather than
-    // leaving the Select on an empty, unselectable value.
-    const effort = sameFamilyAsSource ? sourceSession?.reasoningEffort : null;
+    // selected model's vocabulary falls back to Default.
+    const effort = remembered
+      ? remembered.reasoningEffort
+      : sameFamilyAsSource
+        ? sourceSession?.reasoningEffort
+        : null;
     return effort && effortOptions.some((e) => e.value === effort) ? effort : EFFORT_SELECT_NONE;
-  }, [sameFamilyAsSource, sourceSession, effortOptions]);
+  }, [remembered, sameFamilyAsSource, sourceSession, effortOptions]);
   const seededPermission = useMemo(() => {
+    if (remembered) {
+      // Only a mode the picker still offers.
+      const mode = claudePermissionModeFromSession(remembered);
+      return mode && CLAUDE_NATIVE_PERMISSION_MODES.some((m) => m.value === mode)
+        ? mode
+        : CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE;
+    }
     // Permission mode rides terminal_launch_args, which the backend copies
     // ONLY on a same-AGENT fork (copy_terminal_launch_args = not switching).
     // Seed on the same rule (not harness equality) so the displayed mode can't
@@ -377,11 +424,15 @@ function ForkRunConfig({
       );
     }
     return CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE;
-  }, [sameAgentAsSource, sourceSession]);
+  }, [remembered, sameAgentAsSource, sourceSession]);
   const seededModeValue = useMemo(() => {
     // Same as permission: launch args carry over only on a same-agent fork, so
     // seed the mode from the source only then; otherwise the harness's default.
-    const source = sameAgentAsSource ? (sourceSession?.terminalLaunchArgs ?? []) : [];
+    const source = remembered
+      ? (remembered.terminalLaunchArgs ?? [])
+      : sameAgentAsSource
+        ? (sourceSession?.terminalLaunchArgs ?? [])
+        : [];
     const table: NativeHarnessMode[] = hasApproval
       ? CODEX_NATIVE_APPROVAL_MODES
       : hasCursor
@@ -398,11 +449,11 @@ function ForkRunConfig({
     // same-agent fork of a bypass-armed codex source seeds the bypass option.
     // (The source label is still dropped server-side; re-selecting here is the
     // explicit opt-in that re-arms it — never automatic.)
-    if (
-      isCodex &&
-      sameAgentAsSource &&
-      sourceSession?.labels?.["omnigent.codex_native.bypass_sandbox"] === "1"
-    ) {
+    const bypassed = remembered
+      ? remembered.codexBypassSandbox === true
+      : sameAgentAsSource &&
+        sourceSession?.labels?.["omnigent.codex_native.bypass_sandbox"] === "1";
+    if (isCodex && bypassed) {
       return CODEX_NATIVE_BYPASS_APPROVAL_VALUE;
     }
     // Match the source's launch args against the mode table (longest args first
@@ -411,15 +462,17 @@ function ForkRunConfig({
       .sort((a, b) => b.args.length - a.args.length)
       .find((m) => m.args.length > 0 && m.args.every((arg) => source.includes(arg)));
     return match?.value ?? dflt;
-  }, [isCodex, sameAgentAsSource, sourceSession, hasApproval, hasCursor, hasAgySkip]);
+  }, [remembered, isCodex, sameAgentAsSource, sourceSession, hasApproval, hasCursor, hasAgySkip]);
 
-  const [model, setModel] = useState(seededModel);
   const [effort, setEffort] = useState(seededEffort);
+  const selectedEffort = effortOptions.some((option) => option.value === effort)
+    ? effort
+    : EFFORT_SELECT_NONE;
   const [permission, setPermission] = useState(seededPermission);
   const [mode, setMode] = useState(seededModeValue);
 
-  // Which controls the user has actually changed. An UNTOUCHED control omits
-  // its field from the emitted config, so the fork request never carries it
+  // Which controls the user has chosen (a model pick also settles effort).
+  // An UNTOUCHED control omits its field, so the fork request never carries it
   // and the server's inherit / reset-by-family path decides — which is exactly
   // the seeded meaning (same-harness → inherit the source; switch → the
   // target's default). This is what makes the section safe against the async
@@ -436,8 +489,19 @@ function ForkRunConfig({
     mode: false,
   });
   const changeModel = (v: string) => {
-    setTouched((t) => ({ ...t, model: true }));
+    const nextEfforts = nativeEffortOptions(
+      targetHarness,
+      modelOptions,
+      v === MODEL_SELECT_DEFAULT ? null : v,
+    );
+    // Settle effort too, so a clone cannot inherit an effort the new model rejects.
+    setTouched((t) => ({ ...t, model: true, effort: true }));
     setModel(v);
+    setEffort(
+      nextEfforts?.some((option) => option.value === selectedEffort)
+        ? selectedEffort
+        : EFFORT_SELECT_NONE,
+    );
   };
   const changeEffort = (v: string) => {
     setTouched((t) => ({ ...t, effort: true }));
@@ -451,6 +515,15 @@ function ForkRunConfig({
     setTouched((t) => ({ ...t, mode: true }));
     setMode(v);
   };
+
+  // A model picked from another destination's list, and the effort that goes
+  // with it, starts over rather than naming a model this list may lack.
+  const catalogKeyRef = useRef(modelCatalogKey);
+  useEffect(() => {
+    if (catalogKeyRef.current === modelCatalogKey) return;
+    catalogKeyRef.current = modelCatalogKey;
+    setTouched((t) => ({ ...t, model: false, effort: false }));
+  }, [modelCatalogKey]);
 
   // Re-seed whenever the seeding basis changes (agent switch, source load), but
   // never clobber a control the user already touched — a catalog refetch that
@@ -474,20 +547,20 @@ function ForkRunConfig({
   // for a fork that sent no run-config at all.
   useEffect(() => {
     const value: ForkRunConfigValue = {};
-    if (showModel && touched.model) {
+    if (showModel && (touched.model || reportAll)) {
       value.modelOverride = model === MODEL_SELECT_DEFAULT ? "default" : model;
     }
-    if (showEffort && touched.effort) {
-      value.reasoningEffort = effort === EFFORT_SELECT_NONE ? "default" : effort;
+    if (touched.effort || (showEffort && reportAll)) {
+      value.reasoningEffort = selectedEffort === EFFORT_SELECT_NONE ? "default" : selectedEffort;
     }
     if (hasPermission) {
-      if (touched.permission) {
+      if (touched.permission || reportAll) {
         value.terminalLaunchArgs =
           permission === CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
             ? []
             : ["--permission-mode", permission];
       }
-    } else if (hasApproval && touched.mode) {
+    } else if (hasApproval && (touched.mode || reportAll)) {
       if (isCodex && mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
         // Bypass is a LABEL, not launch args: clear any preset flags and set
         // the dedicated opt-in the server turns into the bypass label.
@@ -497,9 +570,9 @@ function ForkRunConfig({
         value.terminalLaunchArgs =
           CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === mode)?.args ?? [];
       }
-    } else if (hasCursor && touched.mode) {
+    } else if (hasCursor && (touched.mode || reportAll)) {
       value.terminalLaunchArgs = CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === mode)?.args ?? [];
-    } else if (hasAgySkip && touched.mode) {
+    } else if (hasAgySkip && (touched.mode || reportAll)) {
       value.terminalLaunchArgs = AGY_NATIVE_SKIP_MODES.find((m) => m.value === mode)?.args ?? [];
     }
     onChange(value);
@@ -512,10 +585,11 @@ function ForkRunConfig({
     hasAgySkip,
     isCodex,
     model,
-    effort,
+    selectedEffort,
     permission,
     mode,
     touched,
+    reportAll,
     onChange,
   ]);
 
@@ -546,7 +620,10 @@ function ForkRunConfig({
             )}
             {!modelsLoading && modelOptions.length === 0 && (
               <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                {selectedHostId === null ? "Select a host to list models" : "Models unavailable"}
+                {modelCatalog?.emptyReason ??
+                  (selectedHostId === null && modelCatalog === undefined
+                    ? "Select a host to list models"
+                    : "Models unavailable")}
               </div>
             )}
           </RoutingModelSelect>
@@ -556,7 +633,7 @@ function ForkRunConfig({
       {showEffort && (
         <ForkConfigRow label={hasThinkingLevel ? "Thinking level" : "Effort"}>
           <Select
-            value={effort}
+            value={selectedEffort}
             onValueChange={changeEffort}
             componentId="fork_session.config.effort"
             valueHasNoPii
@@ -1288,6 +1365,64 @@ function SupportedForkSessionForm({
   // picked yet) and whether it clones several repos.
   const forkEffectiveProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  // A new sandbox has no host to list models, so offer its provider's catalog as
+  // New Chat does. Forks keep saved inference settings and skip bound profiles.
+  const sourceInferenceConfigured = sourceSession?.inferenceConfigured === true;
+  const destinationBindsInference =
+    info !== "loading" &&
+    forkEffectiveProvider !== null &&
+    info.sandbox_provider_capabilities?.[forkEffectiveProvider]?.inference_models === true;
+  const newSandbox = useNewSandboxModelCatalog(
+    forkEffectiveProvider,
+    targetHarness,
+    switching ? agentChoice : (sourceAgent?.id ?? null),
+    getCurrentUserId(),
+    sandboxSelected && !sourceInferenceConfigured && !destinationBindsInference,
+  );
+  // As in New Chat, a provider certain that no model serves the target says why
+  // and blocks the fork; a failed listing only explains the empty menu.
+  const sandboxUnsupportedReason = newSandbox.unsupported
+    ? (newSandbox.preview.data?.error ??
+      noReachableModelsMessage(
+        switching
+          ? switchableAgents.find((agent) => agent.id === agentChoice)?.display_name
+          : sourceAgentDisplay,
+      ))
+    : null;
+  const sandboxModelCatalog = useMemo(() => {
+    if (!sandboxSelected) return undefined;
+    if (sourceInferenceConfigured) {
+      return {
+        options: [],
+        loading: false,
+        emptyReason: "The fork keeps the original session's model settings.",
+      };
+    }
+    return {
+      options: newSandboxModelOptions(
+        targetHarness,
+        newSandbox.catalog,
+        newSandbox.pending || newSandbox.unsupported || newSandbox.boundCatalogError !== null,
+      ),
+      loading: newSandbox.pending,
+      emptyReason:
+        sandboxUnsupportedReason ?? newSandbox.boundCatalogError ?? newSandbox.defaultCatalogError,
+    };
+  }, [
+    sandboxSelected,
+    sourceInferenceConfigured,
+    targetHarness,
+    newSandbox.catalog,
+    newSandbox.pending,
+    newSandbox.unsupported,
+    newSandbox.boundCatalogError,
+    newSandbox.defaultCatalogError,
+    sandboxUnsupportedReason,
+  ]);
+  // Each destination lists its own models.
+  const modelCatalogSource = sandboxSelected
+    ? `sandbox:${forkEffectiveProvider ?? ""}`
+    : (selectedHostId ?? "");
   const {
     launchError: sandboxProfileError,
     selection: selectedSandboxProfile,
@@ -1345,6 +1480,9 @@ function SupportedForkSessionForm({
   // (the server provisions both), only a coherent repository.
   const submitBlocker = ((): { field: ForkField; message: string } | null => {
     if (sandboxSelected) {
+      if (sandboxUnsupportedReason !== null) {
+        return { field: "agent", message: sandboxUnsupportedReason };
+      }
       if (sandboxProfileError !== null) {
         return { field: "sandboxProfile", message: sandboxProfileError };
       }
@@ -1566,6 +1704,7 @@ function SupportedForkSessionForm({
       // Empty title → omit so the server derives "Fork of <source title>".
       // The run-config section (native targets only) reports its ready-to-send
       // value; an empty object (non-native target) sends no run overrides.
+      const sandboxHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
       const fork = await forkSession(sourceSessionId, {
         title: trimmed === "" ? undefined : trimmed,
         agentId: switching ? agentChoice : undefined,
@@ -1586,12 +1725,26 @@ function SupportedForkSessionForm({
               ...sandboxWorkspaceFields,
               // The new sandbox host's id; keys the fork and its requests
               // until the host binds (see NewChatDialog's managed create).
-              ...(info !== "loading" && info.request_managed_sandbox_host_id
-                ? { hostId: randomUUID().replace(/-/g, "") }
-                : {}),
+              ...(sandboxHostId ? { hostId: sandboxHostId } : {}),
             }
           : undefined,
       });
+      // As after New Chat, the fork's page resets a pick the live sandbox lacks.
+      if (sandboxSelected) {
+        const model =
+          runConfig.modelOverride && runConfig.modelOverride !== "default"
+            ? runConfig.modelOverride
+            : null;
+        const pickedRow = sandboxModelCatalog?.options.find((row) => row.id === model);
+        markSandboxLaunch(fork.id, {
+          model,
+          effort:
+            runConfig.reasoningEffort && runConfig.reasoningEffort !== "default"
+              ? runConfig.reasoningEffort
+              : null,
+          modelLabel: pickedRow ? nativeModelLabel(pickedRow) : null,
+        });
+      }
       // Coding fork: launch the runner in the BACKGROUND, then navigate
       // into the (already-created, unbound) clone immediately — awaiting the
       // launch would block the modal for a worktree create (up to minutes)
@@ -1635,6 +1788,8 @@ function SupportedForkSessionForm({
           console.warn(`Clone ${fork.id}: background runner launch failed`, e);
         });
       }
+      // Show the fork now and keep it listed while the list refetch lags.
+      insertCreatedRowIntoCaches(queryClient, conversationRowFromSession(fork));
       // Fire-and-forget: the sidebar refresh must not gate navigation.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       // The fork inherits the source's project, and each folder renders its
@@ -1948,6 +2103,7 @@ function SupportedForkSessionForm({
               ))}
             </SelectContent>
           </Select>
+          <ForkFieldError message={fieldError("agent")} />
         </div>
 
         {/* Run config (native targets only): model / effort / permission mode.
@@ -1966,6 +2122,8 @@ function SupportedForkSessionForm({
             sameFamilyAsSource={sameFamilyAsSource}
             sameAgentAsSource={sameAgentAsSource}
             selectedHostId={isCodingSource ? selectedHostId : (sourceHostId ?? null)}
+            modelCatalog={sandboxModelCatalog}
+            modelCatalogKey={modelCatalogSource}
             onChange={setRunConfig}
           />
         )}
