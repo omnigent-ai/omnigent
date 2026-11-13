@@ -432,8 +432,17 @@ def test_launch_fingerprint_tracks_new_and_replaced_masked_dotfiles(tmp_path: Pa
     replaced = backend.launch_fingerprint(argv, policy, tmp_path)
     assert replaced != launched
 
+    masked = tmp_path / ".env"
+    before = masked.stat()
+    masked.chmod(before.st_mode ^ 0o100)
+    after = masked.stat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert after.st_ctime_ns != before.st_ctime_ns
+    changed = backend.launch_fingerprint(argv, policy, tmp_path)
+    assert changed != replaced
+
     (tmp_path / ".npmrc").write_text("token")
-    assert backend.launch_fingerprint(argv, policy, tmp_path) != replaced
+    assert backend.launch_fingerprint(argv, policy, tmp_path) != changed
 
 
 def test_launch_fingerprint_tracks_explicit_mask_replacement(tmp_path: Path) -> None:
@@ -466,6 +475,12 @@ def test_launch_fingerprint_tracks_granted_roots_but_not_scratch(
     etc_file = tmp_path / "resolv.conf"
     etc_file.write_text("nameserver 192.0.2.1\n")
     monkeypatch.setattr(bwrap_module, "_DEFAULT_ETC_FILES", (str(etc_file),))
+    default_ro = tmp_path / "toolchain"
+    default_etc = tmp_path / "certificates"
+    default_ro.mkdir()
+    default_etc.mkdir()
+    monkeypatch.setattr(bwrap_module, "_DEFAULT_RO_DIRS", (str(default_ro),))
+    monkeypatch.setattr(bwrap_module, "_DEFAULT_ETC_DIRS", (str(default_etc),))
     backend = _make_backend()
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
@@ -484,7 +499,16 @@ def test_launch_fingerprint_tracks_granted_roots_but_not_scratch(
 
     (scratch / ".cache").mkdir()
     (scratch / "replaced").mkdir()
+    (default_ro / "installed-file").touch()
+    (default_etc / "certificate").touch()
     assert backend.launch_fingerprint(argv, policy, cwd) == launched
+
+    for directory in (default_ro, default_etc):
+        directory.rename(directory.with_suffix(".old"))
+        directory.mkdir()
+        replaced = backend.launch_fingerprint(argv, policy, cwd)
+        assert replaced != launched
+        launched = replaced
 
     replacement = tmp_path / "resolv.conf.new"
     replacement.write_text("nameserver 192.0.2.2\n")

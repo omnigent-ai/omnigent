@@ -65,6 +65,7 @@ import errno
 import logging
 import os
 import shutil
+import stat
 import sys
 from collections.abc import Sequence
 from dataclasses import replace
@@ -383,10 +384,10 @@ class BwrapSandboxBackend(SandboxBackend):
         cwd: Path,
         chdir: Path | None = None,
     ) -> object:
-        """Return the dotfile / symlink masks a launch would emit and the inodes it pins.
+        """Return mask and bind identities, including regular-file mask change times.
 
         A mount stays on the entry it covered, so a masked entry, granted
-        root or default ``/etc`` file replaced on the host must also force a
+        root or default bind source replaced on the host must also force a
         relaunch. Framework scratch roots are per-launch and excluded.
         """
         del chdir
@@ -404,7 +405,7 @@ class BwrapSandboxBackend(SandboxBackend):
             *(policy.read_roots or []),
             *(root for root in policy.write_roots if root not in skip),
             *policy.write_files,
-            *_DEFAULT_ETC_FILES,
+            *_default_readonly_bind_sources(),
         ]
         roots = [_path_identity(root, follow_symlinks=True) for root in granted]
         return masks, _mount_target_identities(masks), roots
@@ -468,11 +469,7 @@ class BwrapSandboxBackend(SandboxBackend):
         chdir_target = chdir.resolve(strict=False) if chdir is not None else cwd_resolved
         bwrap_args: list[str] = ["bwrap"]
 
-        for path in _DEFAULT_RO_DIRS:
-            bwrap_args += ["--ro-bind-try", path, path]
-        for path in _DEFAULT_ETC_FILES:
-            bwrap_args += ["--ro-bind-try", path, path]
-        for path in _DEFAULT_ETC_DIRS:
+        for path in _default_readonly_bind_sources():
             bwrap_args += ["--ro-bind-try", path, path]
 
         # Fresh procfs by default; bind outer /proc where nested sandboxes deny
@@ -1046,6 +1043,11 @@ _BIND_FLAGS = frozenset(
 )
 
 
+def _default_readonly_bind_sources() -> tuple[str, ...]:
+    """Share the persistent default mounts between launch and reuse validation."""
+    return (*_DEFAULT_RO_DIRS, *_DEFAULT_ETC_FILES, *_DEFAULT_ETC_DIRS)
+
+
 def _socket_mask_args(policy: SandboxPolicy) -> list[str]:
     """Return explicit socket masks shared by launch and fingerprint calculation."""
     return [
@@ -1055,8 +1057,8 @@ def _socket_mask_args(policy: SandboxPolicy) -> list[str]:
     ]
 
 
-def _mount_target_identities(argv: Sequence[str]) -> list[tuple[int, int] | None]:
-    """Return host ``(st_dev, st_ino)`` of mount points and the bind sources they get.
+def _mount_target_identities(argv: Sequence[str]) -> list[tuple[int, int, int | None] | None]:
+    """Return identities of mask destinations and their bind sources.
 
     Destinations are not followed (a mask covers the entry itself); bind
     sources are, since bwrap mounts what a symlinked source points at.
@@ -1067,16 +1069,22 @@ def _mount_target_identities(argv: Sequence[str]) -> list[tuple[int, int] | None
             targets.append((argv[i + 1], False))
         elif token in _BIND_FLAGS and i + 2 < len(argv):
             targets += [(argv[i + 1], True), (argv[i + 2], False)]
-    return [_path_identity(target, follow_symlinks=follow) for target, follow in targets]
+    return [
+        _path_identity(target, follow_symlinks=follow, track_file_changes=not follow)
+        for target, follow in targets
+    ]
 
 
-def _path_identity(path: str | Path, *, follow_symlinks: bool) -> tuple[int, int] | None:
-    """Return the host ``(st_dev, st_ino)`` of *path*, or ``None`` if it is missing."""
+def _path_identity(
+    path: str | Path, *, follow_symlinks: bool, track_file_changes: bool = False
+) -> tuple[int, int, int | None] | None:
+    """Track entry identity and optional regular-file mask changes, or missing paths."""
     try:
         info = os.stat(path, follow_symlinks=follow_symlinks)
     except OSError:
         return None
-    return info.st_dev, info.st_ino
+    changed = info.st_ctime_ns if track_file_changes and stat.S_ISREG(info.st_mode) else None
+    return info.st_dev, info.st_ino, changed
 
 
 def _tmpfs_mask_dirs(mask_args: Sequence[str]) -> list[Path]:
