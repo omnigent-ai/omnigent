@@ -716,23 +716,24 @@ def _record_cli_context_window(model: str | None, model_usage: object) -> None:
         _CLI_CONTEXT_WINDOWS[model] = window
 
 
-def _rejected_replay_retry_budget(failed_budget: int, failure_text: str) -> int | None:
+def _rejected_replay_retry_budget(replayed_tokens: int, failure_text: str) -> int | None:
     """
     Size the single retry of a history replay Claude Code rejected as too long.
 
-    :param failed_budget: The rejected replay's budget in estimated tokens.
+    :param replayed_tokens: Estimated tokens of the history the rejected prompt replayed.
     :param failure_text: The CLI's result text, e.g. ``"Prompt is too long ·
         the request is ~230841 tokens (limit 200000) ..."``.
-    :returns: A much smaller budget, or ``None`` when the prompt was not too long.
+    :returns: A budget below *replayed_tokens*, or ``None`` when the prompt was
+        not too long.
     """
     if not _PROMPT_TOO_LONG.search(failure_text):
         return None
-    budget = int(failed_budget * _REJECTED_REPLAY_RETRY_SHARE)
     match = _PROMPT_TOO_LONG_LIMIT.search(failure_text)
     if match:
-        limit = int(match.group(1) or match.group(2))
-        budget = min(budget, int(limit * _REPLAYED_HISTORY_WINDOW_SHARE))
-    return budget
+        limit_budget = int(int(match.group(1) or match.group(2)) * _REPLAYED_HISTORY_WINDOW_SHARE)
+        if limit_budget < replayed_tokens:
+            return limit_budget
+    return int(replayed_tokens * _REJECTED_REPLAY_RETRY_SHARE)
 
 
 def _render_prior_message(message: Message) -> list[_JsonObject]:
@@ -3521,7 +3522,7 @@ class ClaudeSDKExecutor(Executor):
             return
         await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
-        replay_budget: int | None = None
+        replayed_history_tokens = 0
         if resume_session:
             prompt = self._build_prompt(
                 messages,
@@ -3529,7 +3530,7 @@ class ClaudeSDKExecutor(Executor):
                 after_interrupt=self._clients[session_key].interruption_marker_pending,
             )
         else:
-            prompt, replay_budget = await self._fresh_session_prompt(
+            prompt, replayed_history_tokens = await self._fresh_session_prompt(
                 messages, cfg, replay_budget_cap
             )
         if not prompt:
@@ -3557,7 +3558,7 @@ class ClaudeSDKExecutor(Executor):
             if rebuild:
                 await self._close_live_client(session_key)
                 resume_session = False
-                prompt, replay_budget = await self._fresh_session_prompt(
+                prompt, replayed_history_tokens = await self._fresh_session_prompt(
                     messages, cfg, replay_budget_cap
                 )
 
@@ -4506,13 +4507,15 @@ class ClaudeSDKExecutor(Executor):
         if terminal_error:
             retry_budget = None
             if (
-                replay_budget is not None
+                replayed_history_tokens > 0
                 and replay_budget_cap is None
-                and not (got_stream_events or got_unstreamed_reply)
+                and not (got_stream_events or got_unstreamed_reply or compaction_occurred)
             ):
-                retry_budget = _rejected_replay_retry_budget(replay_budget, terminal_error)
+                retry_budget = _rejected_replay_retry_budget(
+                    replayed_history_tokens, terminal_error
+                )
             if retry_budget is not None:
-                # No model call succeeded, so the retry cannot repeat output or tool calls.
+                # No model reply or compaction started, so the retry cannot repeat work.
                 await self._close_live_client(session_key)
                 yield _RejectedReplay(retry_budget=retry_budget)
                 return
@@ -4580,7 +4583,7 @@ class ClaudeSDKExecutor(Executor):
 
     async def _fresh_session_prompt(
         self, messages: list[Message], cfg: ExecutorConfig, budget_cap: int | None
-    ) -> tuple[str | list[_JsonObject], int | None]:
+    ) -> tuple[str | list[_JsonObject], int]:
         """
         Build the first prompt for a newly launched client.
 
@@ -4591,27 +4594,26 @@ class ClaudeSDKExecutor(Executor):
         :param messages: Conversation history as inner :class:`Message` dicts.
         :param cfg: The turn's executor config, carrying any model override.
         :param budget_cap: A lower replay budget in estimated tokens, or ``None``.
-        :returns: The prompt from :meth:`_build_prompt` and its history
-            budget, which is ``None`` when there is no history to replay.
+        :returns: The prompt and the estimated tokens of the prior history it
+            replays, ``0`` when it replays none.
         """
-        budget = None
-        if _has_replayable_history(messages):
-            base_model = self._model_override if cfg.model else await self._spec_or_default_model()
-            # Off-loop: the window lookup may fetch the model catalog.
-            window = await run_sync_on_thread(
-                _resolve_replay_context_window,
-                self._context_window,
-                base_model,
-                cfg.model,
-            )
-            reported_window = _CLI_CONTEXT_WINDOWS.get(cfg.model or base_model or "")
-            if reported_window is not None:
-                window = min(window, reported_window)
-            budget = int(window * _REPLAYED_HISTORY_WINDOW_SHARE)
-            if budget_cap is not None:
-                budget = min(budget, budget_cap)
-        prompt = self._build_prompt(messages, resume_session=False, history_token_budget=budget)
-        return prompt, budget
+        if not _has_replayable_history(messages):
+            return self._extract_latest_user_content(messages), 0
+        base_model = self._model_override if cfg.model else await self._spec_or_default_model()
+        # Off-loop: the window lookup may fetch the model catalog.
+        window = await run_sync_on_thread(
+            _resolve_replay_context_window,
+            self._context_window,
+            base_model,
+            cfg.model,
+        )
+        reported_window = _CLI_CONTEXT_WINDOWS.get(cfg.model or base_model or "")
+        if reported_window is not None:
+            window = min(window, reported_window)
+        budget = int(window * _REPLAYED_HISTORY_WINDOW_SHARE)
+        if budget_cap is not None:
+            budget = min(budget, budget_cap)
+        return self._history_replay_prompt(messages, budget)
 
     @staticmethod
     def _build_prompt(
@@ -4658,7 +4660,20 @@ class ClaudeSDKExecutor(Executor):
 
         if not _has_replayable_history(messages):
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
+        prompt, _ = ClaudeSDKExecutor._history_replay_prompt(messages, history_token_budget)
+        return prompt
 
+    @staticmethod
+    def _history_replay_prompt(
+        messages: list[Message], history_token_budget: int | None
+    ) -> tuple[str | list[_JsonObject], int]:
+        """
+        Serialize prior history ahead of the latest user message.
+
+        :param messages: Conversation history with at least one prior turn.
+        :param history_token_budget: As for :meth:`_build_prompt`.
+        :returns: The prompt and the estimated tokens of the prior messages it kept.
+        """
         # Check if the latest user message is multimodal — if so,
         # serialize prior history as a text prefix but preserve the
         # latest message's content blocks for native multimodal
@@ -4668,14 +4683,14 @@ class ClaudeSDKExecutor(Executor):
         prior = messages[:latest_index] + messages[latest_index + 1 :]
 
         kept: list[list[_JsonObject]] = []
-        remaining_tokens = history_token_budget
+        kept_tokens = 0
         for msg in reversed(prior):
             rendered = _render_prior_message(msg)
-            if remaining_tokens is not None:
-                remaining_tokens -= _estimated_replay_tokens(rendered)
-                if remaining_tokens < 0:
-                    break
+            tokens = _estimated_replay_tokens(rendered)
+            if history_token_budget is not None and kept_tokens + tokens > history_token_budget:
+                break
             kept.append(rendered)
+            kept_tokens += tokens
 
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         omitted = len(prior) - len(kept)
@@ -4702,13 +4717,13 @@ class ClaudeSDKExecutor(Executor):
         prior_blocks = _coalesce_text_blocks(prior_blocks)
 
         if isinstance(latest_content, list):
-            return [*prior_blocks, *latest_content]
+            return [*prior_blocks, *latest_content], kept_tokens
         # Coalescing leaves an all-text history as the single opening block, so
         # more than one block means an attachment survived and the prompt has
         # to stay structured for its bytes to reach the model.
         if len(prior_blocks) > 1:
-            return [*prior_blocks, _text_block(f"\nuser: {latest_content}")]
-        return f"{prior_blocks[0]['text']}\n\nuser: {latest_content}"
+            return [*prior_blocks, _text_block(f"\nuser: {latest_content}")], kept_tokens
+        return f"{prior_blocks[0]['text']}\n\nuser: {latest_content}", kept_tokens
 
     @staticmethod
     def _extract_latest_user_content(
