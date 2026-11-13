@@ -217,6 +217,30 @@ def test_lost_login_session_probe_looks_up_the_user_in_a_child(
 
 
 @pytest.mark.parametrize(
+    ("executable", "probe_prefix"),
+    [
+        ("/nonexistent/python", ""),
+        (sys.executable, "import time\ntime.sleep(10)\n"),
+        (sys.executable, "import sys\nsys.exit(1)\n"),
+    ],
+    ids=["probe-cannot-start", "probe-times-out", "probe-exits-unexpectedly"],
+)
+def test_lost_login_session_probe_failure_is_not_a_diagnosis(
+    monkeypatch: pytest.MonkeyPatch, executable: str, probe_prefix: str
+) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "executable", executable)
+    monkeypatch.setattr(launch_failure, "_USER_LOOKUP_PROBE_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(
+        launch_failure,
+        "_USER_LOOKUP_PROBE",
+        probe_prefix + _UNKNOWN_USER + launch_failure._USER_LOOKUP_PROBE,
+    )
+
+    assert launch_failure.diagnose_lost_login_session() is None
+
+
+@pytest.mark.parametrize(
     ("exit_status", "output"),
     [
         # npm's ENOENT text from a launcher's failed install also says "no such file".
