@@ -170,6 +170,7 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     const cmd = asString(args.command);
     return shellTitle(cmd === null ? null : unwrapShellCommand(cmd));
   },
+  view_image: (args) => withPath("View image", args.path),
   apply_patch: (args) => {
     const changes = Array.isArray(args.changes) ? args.changes : null;
     if (changes === null || changes.length === 0) return null;

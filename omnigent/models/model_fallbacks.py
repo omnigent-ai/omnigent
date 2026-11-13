@@ -11,8 +11,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
-
 
 @dataclass(frozen=True)
 class StaticModelFallback:
@@ -61,27 +59,6 @@ PI_ANTHROPIC_BUDGET_THINKING = StaticModelFallback(
     provenance="Pi 1.0.4 Anthropic catalog reasoning entries without forceAdaptiveThinking",
     discovery_gap="gateway model listings do not advertise adaptive versus budget thinking",
 )
-
-
-#: Curated preference ORDER for codex's current arms — a ranking hint only
-#: (preferred first), consumed by the Databricks live-discovery ranker to
-#: sort servable ids. It never invents picker rows: ids absent from the live
-#: listing are simply not ranked by it.
-_CODEX_ARM_PREFERENCE = StaticModelFallback(
-    model_ids=("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.5"),
-    owner="Databricks model discovery (omnigent.models.databricks_model_discovery)",
-    provenance="Omnigent's release-curated Codex arm ordering",
-    discovery_gap="a workspace listing ranks models by neither recency nor capability",
-)
-
-_STATIC_MODEL_FALLBACKS: dict[tuple[str, str], StaticModelFallback] = {
-    (SUBSCRIPTION_KIND, "codex"): _CODEX_ARM_PREFERENCE,
-}
-
-
-def static_model_fallback(provider_kind: str, cli: str) -> StaticModelFallback | None:
-    """Return the owned fallback table for a provider kind and CLI, if registered."""
-    return _STATIC_MODEL_FALLBACKS.get((provider_kind, cli))
 
 
 # ── Smart Routing ───────────────────────────────────────────────────────────
