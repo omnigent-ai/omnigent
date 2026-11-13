@@ -123,9 +123,6 @@ dependencies = [
     # runtime guarantee allows a newer runtime (7.x) to load older gencode, so
     # a plain install stays on 6.x and an antigravity install upgrades to 7.x.
     "protobuf>=6,<8",
-    # Connect RPC server and client for the workspace API
-    # (omnigent/api/workspace/v1alpha1/workspace.proto). Pre-1.0: pin minor.
-    "connectrpc>=0.13,<0.14",
     # RFC 5545 recurrence rules for the scheduled-task scheduler
     # (omnigent/server/scheduled/rrule.py). Imported at module top and pulled
     # onto the core server boot path via app.py; previously only a transitive
@@ -210,6 +207,9 @@ islo = ["islo>=0.3.5,<0.4"]
 # lazy-import posture as above. Pre-1.0 SDK: pin minor. 0.1 addresses
 # exec by sandbox name within a workspace.
 openshell = ["openshell>=0.1.0,<1"]
+# Workspace API server and client (omnigent/api/workspace/v1alpha1/workspace.proto)
+# for the desktop fast track; optional while it ships off. Pre-1.0: pin minor.
+workspace-api = ["connectrpc>=0.13,<0.14"]
 # On-demand Kubernetes runner Pod launcher (server-managed
 # `sandbox.provider: kubernetes`). The launcher module ships in the base
 # package and imports the official client lazily, so only users of the
@@ -359,6 +359,7 @@ test = [
     # and execute the real packages against mocks.
     "hindsight-client>=0.4.0",
     "nimble-python>=1.2.0,<2",
+    "connectrpc>=0.13,<0.14",
     "pytest-asyncio>=0.21",
     "pytest-xdist>=3.6",
     # Line coverage during the unit-test matrix. Each CI shard writes its

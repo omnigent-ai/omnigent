@@ -3295,7 +3295,6 @@ dependencies = [
     { name = "certifi" },
     { name = "claude-agent-sdk" },
     { name = "click" },
-    { name = "connectrpc" },
     { name = "fastapi" },
     { name = "filelock" },
     { name = "ftfy" },
@@ -3447,11 +3446,15 @@ vault = [
 vertex = [
     { name = "google-auth" },
 ]
+workspace-api = [
+    { name = "connectrpc" },
+]
 
 [package.dev-dependencies]
 dev = [
     { name = "boto3" },
     { name = "build" },
+    { name = "connectrpc" },
     { name = "filelock" },
     { name = "grpcio-tools" },
     { name = "hindsight-client" },
@@ -3483,6 +3486,7 @@ lint = [
 test = [
     { name = "boto3" },
     { name = "build" },
+    { name = "connectrpc" },
     { name = "filelock" },
     { name = "hindsight-client" },
     { name = "moto", extra = ["s3"] },
@@ -3520,7 +3524,7 @@ requires-dist = [
     { name = "certifi", specifier = ">=2026.10.19" },
     { name = "claude-agent-sdk", specifier = ">=0.1.62" },
     { name = "click", specifier = ">=8.0,<10" },
-    { name = "connectrpc", specifier = ">=0.13,<0.14" },
+    { name = "connectrpc", marker = "extra == 'workspace-api'", specifier = ">=0.13,<0.14" },
     { name = "cursor-sdk", marker = "extra == 'cursor'", specifier = ">=0.1.7" },
     { name = "cwsandbox", marker = "extra == 'cwsandbox'", specifier = ">=0.24,<1" },
     { name = "databricks-ai-bridge", marker = "extra == 'databricks'", specifier = ">=0.19" },
@@ -3599,12 +3603,13 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "cockroachdb", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "lambda-microvm", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "postgres", "databricks", "loadtest"]
+provides-extras = ["claude-sdk", "openai-agents", "cockroachdb", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "openshell", "workspace-api", "kubernetes", "lambda-microvm", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "postgres", "databricks", "loadtest"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "boto3", specifier = ">=1.30,<2" },
     { name = "build", specifier = ">=1.2" },
+    { name = "connectrpc", specifier = ">=0.13,<0.14" },
     { name = "filelock", specifier = ">=3.0" },
     { name = "grpcio-tools", specifier = ">=1.68,<=1.81.1" },
     { name = "hindsight-client", specifier = ">=0.4.0" },
@@ -3636,6 +3641,7 @@ lint = [
 test = [
     { name = "boto3", specifier = ">=1.30,<2" },
     { name = "build", specifier = ">=1.2" },
+    { name = "connectrpc", specifier = ">=0.13,<0.14" },
     { name = "filelock", specifier = ">=3.0" },
     { name = "hindsight-client", specifier = ">=0.4.0" },
     { name = "moto", extras = ["s3"], specifier = ">=5,<6" },
