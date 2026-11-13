@@ -624,6 +624,7 @@ class SessionStatusPoller:
         """Whether the last ``busy`` read as waiting on a turn's background agent."""
         return self._holding_background_agents and not self._exhausted
 
+    @property
     def reports_idle(self) -> bool:
         """Whether the last read mapped Claude to :data:`IDLE`.
 

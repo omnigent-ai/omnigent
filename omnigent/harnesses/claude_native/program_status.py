@@ -113,6 +113,7 @@ class ClaudeProgramStatusPoller:
             return self._holding_background_agents
         return self._fallback.holding_background_agents
 
+    @property
     def reports_idle(self) -> bool:
         """Whether the current report maps Claude to idle, so pane polling may back off."""
         if self._retired:

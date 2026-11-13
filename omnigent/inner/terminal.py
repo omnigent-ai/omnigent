@@ -1715,7 +1715,7 @@ class TerminalInstance:
                     self._tmux_output_sync("run-shell", "-b", ":")
             time.sleep(min(_EXIT_STATUS_POLL_SECONDS, remaining))
 
-    def _tmux_base_cmd(self) -> list[str]:
+    def _tmux_base_cmd(self, path_env: str | None = None) -> list[str]:
         """
         Build the tmux argv prefix for this instance's private server.
 
@@ -1725,10 +1725,20 @@ class TerminalInstance:
         launch, so user config would make identical agent specs behave
         differently across machines.
 
+        :param path_env: ``PATH`` the tmux binary must resolve against. ``None``
+            means the runner's own ``PATH``, which the cached resolver tracks.
+            Launch passes the terminal's effective ``PATH`` because its
+            subprocess runs with that environment; empty means bare ``tmux``.
         :returns: Base argv for subprocess calls, e.g.
             ``["tmux", "-S", "/tmp/.../tmux.sock", "-f", "/dev/null"]``.
         """
-        return [_tmux_executable(), "-S", str(self.socket_path), "-f", _TMUX_CONFIG_PATH]
+        if path_env is None:
+            executable = _tmux_executable()
+        else:
+            # An empty launch PATH must stay bare so the spawn fails like it
+            # would without the cache, instead of finding the runner's tmux.
+            executable = _tmux_executable_for_path(path_env) if path_env else "tmux"
+        return [executable, "-S", str(self.socket_path), "-f", _TMUX_CONFIG_PATH]
 
     async def set_conversation_link(self, conversation_link: str | None) -> None:
         """
@@ -1870,7 +1880,7 @@ class TerminalInstance:
             else []
         )
         cmd = [
-            *self._tmux_base_cmd(),
+            *self._tmux_base_cmd(path_env=env.get("PATH", "")),
             *_tmux_command_sequence(
                 [
                     *option_commands,
