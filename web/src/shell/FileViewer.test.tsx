@@ -1850,12 +1850,22 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
   });
 
-  it("keeps HTML's preview-default and preview ↔ source toggle intact", () => {
-    renderViewer({ open: true, path: "page.html" });
-    expect(viewModeOf()).toBe("preview");
-    // In preview, the single toggle switches to source (existing behavior).
-    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+  it.each(["page.html", "results.csv", "export.tsv"])(
+    "keeps %s on the preview by default, with a preview ↔ source toggle",
+    (path) => {
+      renderViewer({ open: true, path });
+      expect(viewModeOf()).toBe("preview");
+      // In preview, the single toggle switches to source (existing behavior).
+      fireEvent.click(screen.getByRole("button", { name: "View source" }));
+      expect(viewModeOf()).toBe("source");
+    },
+  );
+
+  it("opens a ?comment= link to a CSV in source, then lets the toggle reach the table", () => {
+    renderViewer({ open: true, path: "results.csv", initialSearch: "comment=c1" });
     expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(viewModeOf()).toBe("preview");
   });
 
   it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {
