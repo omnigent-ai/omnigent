@@ -4,6 +4,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useState,
@@ -26,6 +27,7 @@ import {
   mergeScopeRows,
   type ScopeCacheData,
   sessionRowsPage,
+  sidebarWatchedIds,
 } from "@/lib/sidebarData";
 import {
   applyLocalElicitationResolutions,
@@ -153,6 +155,17 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
       return next;
     });
   }, []);
+  const [renderedRows, setRenderedRows] = useState<Map<string, readonly string[]>>(() => new Map());
+  const registerRenderedRows = useCallback((section: string, ids: readonly string[] | null) => {
+    setRenderedRows((previous) => {
+      const current = previous.get(section);
+      if (ids === null ? current === undefined : sameIds(current, ids)) return previous;
+      const next = new Map(previous);
+      if (ids === null) next.delete(section);
+      else next.set(section, ids);
+      return next;
+    });
+  }, []);
   const rawMineRows = useMemo(() => mine.data?.pages.flatMap((p) => p.data) ?? [], [mine.data]);
   const rawSharedRows = useMemo(
     () => (sharedActive ? (shared.data?.pages.flatMap((p) => p.data) ?? []) : []),
@@ -239,7 +252,10 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const automationInbox = useAutomationInbox(identityReady);
   const inboxCount =
     sumPendingApprovals(inboxRows) + comments.items.length + automationInbox.items.length;
-  const watchedIds = useMemo(() => loadedRows.map((row) => row.id), [loadedRows]);
+  const watchedIds = useMemo(
+    () => sidebarWatchedIds(loadedRows, renderedRows),
+    [loadedRows, renderedRows],
+  );
   const mineCursor = mine.data?.pages.at(-1)?.last_id;
   const sharedCursor = shared.data?.pages.at(-1)?.last_id;
   const mineBoundary = mine.data?.boundary;
@@ -336,12 +352,33 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     automationInbox,
     watchedIds,
     registerFolder,
+    registerRenderedRows,
     applyLocalResolutions,
     watermark: merged.watermark,
   };
 }
 
 export const SidebarDataContext = createContext<ReturnType<typeof useSidebarSources> | null>(null);
+
+function sameIds(current: readonly string[] | undefined, ids: readonly string[]): boolean {
+  return current?.length === ids.length && current.every((id, index) => id === ids[index]);
+}
+
+/**
+ * Report the rows a sidebar section currently renders, so the session-updates
+ * socket watches what is on screen. No-op outside a SidebarDataProvider.
+ *
+ * :param rows: The section's rendered rows, e.g. a folder's rows above "Show more".
+ */
+export function useRegisterRenderedSidebarRows(rows: readonly { id: string }[]): void {
+  const registerRenderedRows = useContext(SidebarDataContext)?.registerRenderedRows;
+  const section = useId();
+  const idsKey = rows.map((row) => row.id).join("\n");
+  useEffect(() => {
+    registerRenderedRows?.(section, idsKey === "" ? [] : idsKey.split("\n"));
+  }, [registerRenderedRows, section, idsKey]);
+  useEffect(() => () => registerRenderedRows?.(section, null), [registerRenderedRows, section]);
+}
 
 export function SidebarDataProvider({
   children,

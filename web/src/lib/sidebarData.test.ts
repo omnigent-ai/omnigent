@@ -6,6 +6,7 @@ import {
   refreshScopeWindow,
   appendScopePage,
   sessionRowsPage,
+  sidebarWatchedIds,
 } from "./sidebarData";
 
 const row = (id: string, updated_at: number): Conversation => ({
@@ -293,4 +294,39 @@ it("uses creation time for scope boundaries, appended pages, and capped refreshe
   );
   expect(refreshed.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
   expect(refreshed.pages[0].last_id).toBe("old");
+});
+
+describe("sidebarWatchedIds", () => {
+  const idle = row("idle", 1);
+  const running = { ...row("running", 1), status: "running" as const };
+  const awaiting = { ...row("awaiting", 1), pending_elicitations_count: 1 };
+  const shown = row("shown", 1);
+
+  it("watches every loaded row until a section reports what it renders", () => {
+    expect(sidebarWatchedIds([idle, running, shown], new Map())).toEqual([
+      "idle",
+      "running",
+      "shown",
+    ]);
+  });
+
+  it("drops hidden idle rows but keeps rows that can still notify", () => {
+    const rendered = new Map([
+      ["sessions", ["shown"]],
+      ["collapsed-folder", []],
+    ]);
+    expect(sidebarWatchedIds([idle, running, awaiting, shown], rendered)).toEqual([
+      "shown",
+      "running",
+      "awaiting",
+    ]);
+  });
+
+  it("lists a row rendered by two sections once", () => {
+    const rendered = new Map([
+      ["pinned", ["shown"]],
+      ["sessions", ["shown", "idle"]],
+    ]);
+    expect(sidebarWatchedIds([idle, shown], rendered)).toEqual(["shown", "idle"]);
+  });
 });

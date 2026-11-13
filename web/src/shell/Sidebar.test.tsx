@@ -2007,7 +2007,7 @@ describe("Sidebar idle latest-message error", () => {
     expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
   });
 
-  it("shows an idle message error on a collapsed project's marker", async () => {
+  it("reads a project's idle error once its row renders and keeps it on the collapsed marker", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_idle_error", "Claude Code", {
@@ -2017,11 +2017,17 @@ describe("Sidebar idle latest-message error", () => {
     ]);
     renderSidebar();
     const header = screen.getByRole("button", { name: /^Customer X/ });
-    await within(header).findByRole("img", { name: "Latest message is an error" });
+    // A collapsed folder starts no tail reads for rows it does not render.
+    await act(async () => {});
+    expect(sessionsApi.fetchSessionItemsPage).not.toHaveBeenCalled();
+    expect(within(header).queryByRole("img", { name: "Latest message is an error" })).toBeNull();
+
     fireEvent.click(header);
     const row = screen.getByRole("link", { name: "conv_idle_error" }).closest("li")!;
+    await within(row).findByRole("img", { name: "Latest message is an error" });
+    fireEvent.click(header);
     expect(
-      within(row).getByRole("img", { name: "Latest message is an error" }),
+      within(header).getByRole("img", { name: "Latest message is an error" }),
     ).toBeInTheDocument();
     expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
   });

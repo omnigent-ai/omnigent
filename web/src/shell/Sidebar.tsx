@@ -27,7 +27,12 @@ import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
 import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
-import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
+import {
+  useRegisterRenderedSidebarRows,
+  useSidebarData,
+  useSidebarView,
+  type SidebarListQuery,
+} from "@/hooks/useSidebarData";
 import { useArchivedSessions } from "@/hooks/useScopeCache";
 import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/InfiniteScrollSentinel";
 import {
@@ -1782,7 +1787,8 @@ function ProjectFolder({
     growFrom.current = { height: listRef.current?.offsetHeight ?? 0, count: visibleCount };
     return display.loadMore();
   };
-  const errors = useSessionErrorStates(conversations);
+  // Rendered rows read their own badges; the folder only reuses those results.
+  const errors = useSessionErrorStates(conversations, { startReads: false });
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
@@ -4501,6 +4507,7 @@ function ConversationSection({
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
   const rows = isCollapsed ? (heldConversations ?? []) : conversations;
+  useRegisterRenderedSidebarRows(rows);
   const families = sessionFamilyGroups(rows);
   const familyRepresentative = (row: Conversation) =>
     row.family ? families.get(row.family.id)?.[0] : undefined;

@@ -158,3 +158,30 @@ export function sessionRowsPage(rows: Conversation[], hasMore = false): Conversa
     has_more: hasMore,
   };
 }
+
+type WatchCandidate = Pick<Conversation, "id" | "status" | "pending_elicitations_count">;
+
+/**
+ * Ids the session-updates socket should watch. Rows hidden behind a collapsed
+ * section, a collapsed folder or "Show more" are left to the periodic list
+ * refresh, except running or input-awaiting rows, which can still notify.
+ * Until a section reports its rendered rows, every loaded row is watched.
+ *
+ * :param loadedRows: Every row loaded into the sidebar caches.
+ * :param renderedRows: Ids each mounted sidebar section renders, keyed by section.
+ * :returns: Unique ids to watch, rendered rows first.
+ */
+export function sidebarWatchedIds(
+  loadedRows: readonly WatchCandidate[],
+  renderedRows: ReadonlyMap<string, readonly string[]>,
+): string[] {
+  if (renderedRows.size === 0) return loadedRows.map((row) => row.id);
+  const ids = new Set<string>();
+  for (const sectionIds of renderedRows.values()) {
+    for (const id of sectionIds) ids.add(id);
+  }
+  for (const row of loadedRows) {
+    if (row.status === "running" || (row.pending_elicitations_count ?? 0) > 0) ids.add(row.id);
+  }
+  return [...ids];
+}

@@ -101,9 +101,16 @@ function liveError(conversation: ErrorConversation): LatestSessionError | null |
   );
 }
 
-/** Reuse live transcripts; unopened rows share a cached, bounded tail read. */
+/**
+ * Reuse live transcripts; unopened rows share a cached, bounded tail read.
+ *
+ * :param conversations: Rows to report error states for.
+ * :param options.startReads: ``false`` only reuses tail reads other callers
+ *     already cached, e.g. for a collapsed folder's marker over hidden rows.
+ */
 export function useSessionErrorStates(
   conversations: readonly ErrorConversation[],
+  { startReads = true }: { startReads?: boolean } = {},
 ): (LatestSessionError | null)[] {
   const queryClient = useQueryClient();
   const subscribe = useCallback(
@@ -156,6 +163,7 @@ export function useSessionErrorStates(
       queryFn: ({ signal }: { signal: AbortSignal }) =>
         fetchLatestError(c.id, c.host_online, signal),
       enabled:
+        startReads &&
         live[i] === "?" &&
         !isTempConvId(c.id) &&
         !c.provisional &&

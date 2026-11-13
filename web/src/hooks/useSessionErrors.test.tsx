@@ -268,6 +268,21 @@ describe("useSessionErrors", () => {
     expect(fetchPage).toHaveBeenCalledTimes(1);
   });
 
+  it("reuses a rendered row's read for a marker that starts no reads of its own", async () => {
+    fetchPage.mockResolvedValue(errorPage);
+    const { wrapper } = harness();
+    const marker = renderHook(() => useSessionErrorStates([session], { startReads: false }), {
+      wrapper,
+    });
+    await act(async () => {});
+    expect(fetchPage).not.toHaveBeenCalled();
+    expect(marker.result.current).toEqual([null]);
+
+    renderHook(() => useSessionErrorStates([session]), { wrapper });
+    await waitFor(() => expect(marker.result.current).toEqual(["error"]));
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+  });
+
   it("reads and subscribes to an already-loaded transcript without extra HTTP or streams", () => {
     const entry = conversationRegistry.acquire(session.id);
     entry.setState({

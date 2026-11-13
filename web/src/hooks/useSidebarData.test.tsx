@@ -13,7 +13,12 @@ import {
   useLocalElicitationResolutions,
 } from "@/lib/localElicitationResolutions";
 import type { Conversation } from "./useConversations";
-import { SidebarDataProvider, useLoadedConversations, useSidebarData } from "./useSidebarData";
+import {
+  SidebarDataProvider,
+  useLoadedConversations,
+  useRegisterRenderedSidebarRows,
+  useSidebarData,
+} from "./useSidebarData";
 import { useArchivedSessions } from "./useScopeCache";
 
 vi.mock("./useViewerId", () => ({ useViewerId: () => null }));
@@ -81,6 +86,38 @@ it("shares the two scope requests across consumers and includes old pins once", 
   expect(result.current.data.inboxCount).toBe(4);
   await act(async () => result.current.data.registerFolder("project", null));
   expect(result.current.data.inboxCount).toBe(3);
+});
+
+function RenderedSection({ ids }: { ids: string[] }) {
+  useRegisterRenderedSidebarRows(ids.map((id) => ({ id })));
+  return null;
+}
+
+it("watches rendered rows plus rows that can still notify once sections report", async () => {
+  let renderedIds: string[] | null = null;
+  const wrap = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>
+      <SidebarDataProvider>
+        {renderedIds && <RenderedSection ids={renderedIds} />}
+        {children}
+      </SidebarDataProvider>
+    </QueryClientProvider>
+  );
+  const { result, rerender } = renderHook(useSidebarData, { wrapper: wrap });
+  await waitFor(() => expect(result.current.watchedIds).toContain("mine"));
+  const hiddenIdle = { ...row("hidden-idle"), pending_elicitations_count: 0 };
+  await act(async () => result.current.registerFolder("project", [hiddenIdle]));
+  expect(result.current.watchedIds).toContain("hidden-idle");
+
+  renderedIds = ["mine"];
+  rerender();
+  await waitFor(() => expect(result.current.watchedIds).not.toContain("hidden-idle"));
+  // The fixture's other rows await input, so they stay watched while hidden.
+  expect(result.current.watchedIds.sort()).toEqual(["mine", "old-pin", "shared"]);
+
+  renderedIds = null;
+  rerender();
+  await waitFor(() => expect(result.current.watchedIds).toContain("hidden-idle"));
 });
 
 it("excludes cached shared rows when disabled and keeps inbox policy separate", async () => {
