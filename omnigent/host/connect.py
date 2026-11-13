@@ -1112,15 +1112,6 @@ def _write_runner_inference_config(session_id: str, inference_config: dict[str, 
     return path
 
 
-def _is_utf8_encodable(text: str) -> bool:
-    """Return whether ``text`` has no surrogate-escaped bytes, so it encodes as UTF-8."""
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
-
-
 def _paginate_list_dir(
     *,
     entries: list[HostListDirEntry],
@@ -3207,9 +3198,11 @@ class HostProcess:
         # Walk every entry, classifying by target type. Per-entry
         # OSError → skip (e.g. dangling symlink) so the listing
         # surfaces real entries instead of failing wholesale.
+        from omnigent.workspace_fs import is_utf8_encodable
+
         entries: list[HostListDirEntry] = []
         for de in scanned:
-            if not _is_utf8_encodable(de.path):
+            if not is_utf8_encodable(de.path):
                 # A name that isn't valid UTF-8 comes back surrogate-escaped; it
                 # can't be sent as JSON or reopened by path, so skip it too.
                 continue
