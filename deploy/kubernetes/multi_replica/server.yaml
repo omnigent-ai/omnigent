@@ -44,6 +44,9 @@ spec:
               value: "0"
             - name: OMNIGENT_LOCAL_SINGLE_USER
               value: "1"
+            # Persistent scheduling needs per-replica host ownership.
+            - name: OMNIGENT_FEATURES
+              value: "-automations_v2"
           ports:
             - name: http
               containerPort: 8000

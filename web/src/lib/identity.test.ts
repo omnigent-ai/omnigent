@@ -670,11 +670,11 @@ describe("authenticatedFetch", () => {
       expect(resolve).not.toHaveBeenCalled();
     });
 
-    it("keys project reads by the client key and discovery-publishing writes by the modal host", async () => {
+    it("keys project reads and discovery-publishing writes by the modal host", async () => {
       vi.doUnmock("./sessionHost");
       const { resolveModalHost, setSessionHost } = await import("./sessionHost");
       setSessionHost("session-a", "host_modal");
-      resolveModalHost();
+      resolveModalHost(["host_modal"]);
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
         hostFetch: fetchMock,
@@ -699,7 +699,7 @@ describe("authenticatedFetch", () => {
       const keys = fetchMock.mock.calls.map(([, init]) =>
         new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
       );
-      expect(keys).toEqual([CLIENT_KEY, "host_modal", "host_modal", "host_modal", "host_task"]);
+      expect(keys).toEqual(["host_modal", "host_modal", "host_modal", "host_modal", "host_task"]);
     });
 
     it("keys a session sub-path with an unknown host by the client key", async () => {

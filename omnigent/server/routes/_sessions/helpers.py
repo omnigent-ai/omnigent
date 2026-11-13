@@ -95,6 +95,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
@@ -2655,7 +2656,7 @@ def _persist_external_model_options(
     Stores into :data:`_pushed_model_options_cache` (which a browser reload
     does NOT clear — the extension only pushes on session start) and publishes
     ``session.model_options`` so open clients re-read the snapshot. An empty
-    list evicts the entry rather than caching nothing.
+    list is cached as an authoritative clear so host recovery cannot refill it.
 
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
@@ -2691,10 +2692,7 @@ def _persist_external_model_options(
                 "isDefault": bool(raw.get("isDefault", False)) if isinstance(raw, dict) else False,
             }
         )
-    if options:
-        _pushed_model_options_cache[session_id] = options
-    else:
-        _pushed_model_options_cache.pop(session_id, None)
+    _pushed_model_options_cache[session_id] = options
     _publish_model_options(session_id)
 
 
@@ -3479,7 +3477,10 @@ async def _forward_approval_to_runner(
     :param runner_router: Router used to resolve the bound runner, or
         ``None`` in in-process setups (forward skipped).
     """
-    runner_client = await _get_runner_client(session_id, runner_router)
+    if data.get("action") in ("decline", "cancel"):
+        runner_client = await _get_runner_client(session_id, runner_router, for_control=True)
+    else:
+        runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
         return
     try:
@@ -3494,6 +3495,10 @@ async def _forward_approval_to_runner(
             session_id,
             extra={"session_id": session_id},
         )
+
+
+# ``conversation_items.response_id`` is ``String(64)``; a longer id fails the insert.
+_EXTERNAL_RESPONSE_ID_MAX_LEN: Final[int] = 64
 
 
 def _parse_external_assistant_message(
@@ -3526,6 +3531,12 @@ def _parse_external_assistant_message(
     if not isinstance(response_id, str) or not response_id.strip():
         raise OmnigentError(
             "external_assistant_message data.response_id must be a non-empty string",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if len(response_id.strip()) > _EXTERNAL_RESPONSE_ID_MAX_LEN:
+        raise OmnigentError(
+            "external_assistant_message data.response_id must be at most "
+            f"{_EXTERNAL_RESPONSE_ID_MAX_LEN} characters",
             code=ErrorCode.INVALID_INPUT,
         )
     return agent_name.strip(), text, response_id.strip()
@@ -3621,6 +3632,12 @@ def _parse_external_conversation_item(
     if not isinstance(response_id, str) or not response_id.strip():
         raise OmnigentError(
             "external_conversation_item data.response_id must be a non-empty string",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if len(response_id.strip()) > _EXTERNAL_RESPONSE_ID_MAX_LEN:
+        raise OmnigentError(
+            "external_conversation_item data.response_id must be at most "
+            f"{_EXTERNAL_RESPONSE_ID_MAX_LEN} characters",
             code=ErrorCode.INVALID_INPUT,
         )
     message_id = body.data.get("message_id")
@@ -5944,6 +5961,7 @@ async def _get_runner_client_impl(
     runner_router: RunnerRouter | None,
     *,
     conversation: Conversation | None = None,
+    for_control: bool = False,
 ) -> httpx.AsyncClient | None:
     """
     Get an HTTP client for the runner bound to a session.
@@ -5956,22 +5974,30 @@ async def _get_runner_client_impl(
     :param runner_router: The ``RunnerRouter`` instance, or
         ``None`` for in-process setups.
     :param conversation: An already-loaded conversation to reuse for routing.
+    :param for_control: Route stop, interrupt, and teardown without admitting execution.
     :returns: An ``httpx.AsyncClient`` pointed at the runner,
         or ``None`` if no runner is available.
     """
     from omnigent.runtime import get_runner_client
+    from omnigent.server.runtime_compatibility import RuntimeSupportError
 
     if runner_router is not None:
         try:
+            resolve = (
+                runner_router.client_for_session_control
+                if for_control
+                else runner_router.client_for_session_resources
+            )
             if conversation is None:
-                routed = runner_router.client_for_session_resources(session_id)
+                routed = await asyncio.to_thread(resolve, session_id)
             else:
-                routed = runner_router.client_for_session_resources(
-                    session_id,
-                    conversation=conversation,
-                )
+                routed = await asyncio.to_thread(resolve, session_id, conversation=conversation)
             return routed.client
-        except (LookupError, httpx.HTTPError, OmnigentError):
+        except (LookupError, httpx.HTTPError, OmnigentError) as exc:
+            if isinstance(exc, RuntimeSupportError) or (
+                isinstance(exc, OmnigentError) and exc.code == ErrorCode.RUNNER_CAPABILITY_MISMATCH
+            ):
+                raise
             _logger.debug(
                 "No runner bound for session=%s",
                 session_id,
@@ -7220,6 +7246,7 @@ async def _get_runner_client_for_resource_access_impl(
     session_id: str,
     *,
     conversation: Conversation | None = None,
+    for_control: bool = False,
 ) -> httpx.AsyncClient | None:
     """Return the authoritative runner client for session resources.
 
@@ -7233,10 +7260,16 @@ async def _get_runner_client_for_resource_access_impl(
 
     runner_router = get_runner_router()
     if runner_router is not None:
+        resolve = (
+            runner_router.client_for_session_control
+            if for_control
+            else runner_router.client_for_session_resources
+        )
         if conversation is None:
-            routed_runner = runner_router.client_for_session_resources(session_id)
+            routed_runner = await asyncio.to_thread(resolve, session_id)
         else:
-            routed_runner = runner_router.client_for_session_resources(
+            routed_runner = await asyncio.to_thread(
+                resolve,
                 session_id,
                 conversation=conversation,
             )
@@ -7844,8 +7877,27 @@ async def _forward_session_change_to_runner_impl(
         operation is the authoritative fallback).
     """
     from omnigent.runtime import get_runner_client
+    from omnigent.server.runtime_compatibility import RuntimeSupportError
 
-    runner_client = await _get_runner_client(session_id, runner_router)
+    event_type = event.get("type")
+    try:
+        if event_type in ("interrupt", "cost_approval_popup", "policy_blocked_notice"):
+            runner_client = await _get_runner_client(session_id, runner_router, for_control=True)
+        else:
+            runner_client = await _get_runner_client(session_id, runner_router)
+    except OmnigentError as exc:
+        if event_type not in ("effort_change", "model_change") or not (
+            isinstance(exc, RuntimeSupportError)
+            or exc.code == ErrorCode.RUNNER_CAPABILITY_MISMATCH
+        ):
+            raise
+        _logger.warning(
+            "Session-change forward skipped for session=%s type=%s: %s",
+            session_id,
+            event_type,
+            exc,
+        )
+        return None
     if runner_client is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
@@ -7930,7 +7982,7 @@ async def _stop_session_via_runner_impl(
     """
     from omnigent.runtime import get_runner_client
 
-    runner_client = await _get_runner_client(session_id, runner_router)
+    runner_client = await _get_runner_client(session_id, runner_router, for_control=True)
     if runner_client is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
@@ -9501,6 +9553,7 @@ def _filesystem_attachment_in_history(
     file_store: FileStore | None,
     *,
     up_to_response_id: str | None = None,
+    before_item_id: str | None = None,
     content: Sequence[dict[str, Any]] = (),
 ) -> str | None:
     """Find a retained attachment requiring filesystem tools, using its stored name.
@@ -9509,6 +9562,8 @@ def _filesystem_attachment_in_history(
     :param conversation_store: Store containing the ordered source history.
     :param file_store: Store containing authoritative attachment filenames.
     :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
+    :param before_item_id: Exclusive cutoff: only the items before this one
+        are retained, e.g. ``"msg_abc"``.
     :param content: Additional incoming message blocks to check before stored history.
     :returns: A referenced filesystem attachment's name, or ``None``.
     """
@@ -9536,7 +9591,7 @@ def _filesystem_attachment_in_history(
 
     # Descending order finds the last item of the cutoff response first,
     # matching the fork store's inclusive position cutoff.
-    retained = up_to_response_id is None
+    retained = up_to_response_id is None and before_item_id is None
     items_after: str | None = None
     while True:
         page = conversation_store.list_items(
@@ -9545,6 +9600,9 @@ def _filesystem_attachment_in_history(
         for item in page.data:
             if item.response_id == up_to_response_id:
                 retained = True
+            if before_item_id is not None and item.id == before_item_id:
+                retained = True
+                continue
             if not retained or not isinstance(item.data, MessageData):
                 continue
             for block in item.data.content:
@@ -9610,6 +9668,8 @@ def _load_agent_spec_for_session_impl(
     conv: Conversation,
     agent_store: AgentStore,
     agent: Agent | None = None,
+    *,
+    agent_cache: AgentCache | None = None,
 ) -> AgentSpec | None:
     # Split from _build_policy_engine_from_spec so callers can skip engine
     # construction when no policy could fire; both halves run in to_thread.
@@ -9620,7 +9680,8 @@ def _load_agent_spec_for_session_impl(
         agent = agent_store.get(conv.agent_id)
     if agent is None:
         return None
-    agent_cache = cast(AgentCache, get_agent_cache())
+    if agent_cache is None:
+        agent_cache = cast(AgentCache, get_agent_cache())
     spec = agent_cache.load(
         agent.id,
         agent.bundle_location,
@@ -10918,7 +10979,12 @@ def _derive_terminal_launch_args_from_spec(
       is the real boundary, matching claude-native's ``bypassPermissions``
       and the codex-sdk executor's ``approvalPolicy="never"``). An explicit
       ``executor.config.yolo: false`` opts back out for a read-only / must
-      -keep-prompting sub-agent. See issue #171.
+      -keep-prompting sub-agent. See issue #171. An
+      ``executor.config.permission_mode`` naming a codex-native mode in
+      :data:`~omnigent.native.permission_modes.PERMISSION_LAUNCH_ARGS`
+      (e.g. ``approve-for-me``) maps to that mode's args instead and takes
+      precedence over ``yolo`` and the headless default; ``default`` leaves
+      args unset. ``bypass`` is not mapped here; use ``yolo: true``.
     - cursor-native -> ``["--yolo"]`` by DEFAULT. Headless cursor workers
       otherwise stall on cursor-agent's in-terminal approval prompts (also
       mirrored as web elicitation cards). ``--yolo`` is cursor-agent's
@@ -10943,7 +11009,8 @@ def _derive_terminal_launch_args_from_spec(
     verbatim pass-through and the runner's exact ``bypassPermissions``
     comparison (``should_skip_permissions`` in
     :mod:`omnigent.harnesses.antigravity_native.launch`). A present-but-unrecognized
-    value logs at debug and leaves args unset.
+    value logs at debug and leaves args unset, except codex-native, which
+    falls back to its ``yolo`` / headless default.
 
     Only those native harnesses are translated; for any other harness
     (e.g. ``claude-sdk`` / ``cursor``, whose bypass is set via the SDK
@@ -10988,6 +11055,17 @@ def _derive_terminal_launch_args_from_spec(
         # approval/sandbox). Without the flag the thread is created at
         # codex's on-request + own-sandbox default and a headless worker
         # stalls. An explicit ``yolo: false`` is the opt-out. See #171.
+        # An explicit permission_mode, the harness default included, wins.
+        mode = spec.executor.config.get("permission_mode")
+        codex_modes = PERMISSION_LAUNCH_ARGS[_CODEX_NATIVE_HARNESS]
+        if isinstance(mode, str) and mode in codex_modes and mode != "bypass":
+            return _validate_terminal_launch_args(list(codex_modes[mode]) or None)
+        if mode is not None:
+            _logger.debug(
+                "codex-native spec has unsupported permission_mode=%r; "
+                "falling back to the yolo / headless default.",
+                mode,
+            )
         if _spec_config_flag_explicitly_disabled(spec, "yolo"):
             return None
         if not headless_defaults and not _spec_config_flag_explicitly_enabled(spec, "yolo"):
@@ -11774,9 +11852,10 @@ def _child_session_summary_from_conversation(
         child-message lookup, or ``None`` when no visible message exists.
     :param cached_status: Session status to derive ``busy`` /
         ``current_task_status`` from, e.g. ``"running"``. ``None`` reads the
-        live ``_session_status_cache``; a status-edge publisher passes the
-        edge's own value so a burst of transitions fans out one summary per
-        edge instead of the latest status repeated.
+        live ``_session_status_cache``, then the row's ``live_status``; a
+        status-edge publisher passes the edge's own value so a burst of
+        transitions fans out one summary per edge instead of the latest status
+        repeated.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -11823,9 +11902,12 @@ def _child_session_summary_from_conversation(
         tool = display_title or None
         session_name = None
 
-    # Derive busy from the relay-fed cache; tasks table is gone.
+    # Derive busy from the relay-fed cache, falling back to the persisted row
+    # status on a replica without the runner's tunnel.
     if cached_status is None:
         cached_status = _session_status_cache.get(conv.id)
+    if cached_status is None:
+        cached_status = conv.live_status
     if cached_status in ("running", "waiting"):
         busy = True
     else:
@@ -12703,15 +12785,18 @@ def prefetch_session_routing_catalogs(
     task.add_done_callback(_catalog_prefetch_tasks.discard)
 
 
-async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]] | None:
+async def _host_model_options_via_registry(
+    host_id: str, harness: str = "claude-native"
+) -> list[dict[str, Any]] | None:
     """
-    Resolve a host's pre-launch claude catalog over its live tunnel.
+    Resolve a host's pre-launch catalog for *harness* over its live tunnel.
 
     Session-side reuse of the new-session picker's source
     (``get_host_model_options`` in ``routes/hosts.py``): the host resolves
     the catalog locally, so no runner is needed.
 
     :param host_id: Host identifier, e.g. ``"host_a1b2c3"``.
+    :param harness: Harness whose catalog to resolve, e.g. ``"pi-native"``.
     :returns: Raw model rows, or ``None`` when the host is not connected,
         rejects the request, or times out.
     """
@@ -12728,7 +12813,7 @@ async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]]
         result = await _proxy_model_options(
             host_registry=registry,
             host_conn=conn,
-            harness="claude-native",
+            harness=harness,
         )
     except HTTPException:
         return None
@@ -12738,25 +12823,27 @@ async def _host_model_options_via_registry(host_id: str) -> list[dict[str, Any]]
     return models if isinstance(models, list) else None
 
 
-async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
+async def _load_model_options_from_host(
+    session_id: str, host_id: str, harness: str = "claude-native"
+) -> None:
     """
-    Background catalog fill for an asleep claude-native session.
+    Fill a sleeping native session's cold catalog from its host.
 
-    With no runner bound and a cold cache (e.g. the server restarted while
-    the session slept), the session's host can still resolve the claude
-    catalog — the same pre-launch source the new-session picker uses. Fills
-    the cache stale-marked so the next live runner replaces it with its
-    launch-exact snapshot, and publishes ``session.model_options`` so open
-    tabs re-read.
+    Reuse the new-session picker's source and notify open clients. Claude's
+    preview is stale-marked until the live runner refreshes it; Pi's
+    extension replaces its preview when the session resumes.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param host_id: The session's bound host, e.g. ``"host_a1b2c3"``.
+    :param harness: Harness whose catalog to resolve. ``"pi-native"`` fills the
+        extension-pushed cache (the only store its picker reads) and is never
+        stale-marked: the extension's own push replaces it.
     """
     # Read through the facade so tests patching
     # ``sessions._host_model_options_via_registry`` reach this impl.
     import omnigent.server.routes.sessions as _facade
 
-    raw = await _facade._host_model_options_via_registry(host_id)
+    raw = await _facade._host_model_options_via_registry(host_id, harness)
     if not raw:
         return
     try:
@@ -12764,6 +12851,11 @@ async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
     except ValueError:
         return
     if not options:
+        return
+    if harness == "pi-native":
+        # Respect a catalog or explicit clear the extension pushed while we awaited.
+        _pushed_model_options_cache.setdefault(session_id, options)
+        _publish_model_options(session_id)
         return
     _model_options_cache[session_id] = options
     _model_options_stale.add(session_id)

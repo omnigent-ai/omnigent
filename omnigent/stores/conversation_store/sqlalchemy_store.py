@@ -120,6 +120,7 @@ from omnigent.stores.conversation_store import (
     ProfileHostBinding,
     SessionActivity,
     SessionConnectivity,
+    SpawnTreeUsage,
     family_pinned_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -4021,6 +4022,53 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more=page.has_more,
         )
 
+    def list_spawn_tree_usage(
+        self, root_conversation_id: str, *, limit: int
+    ) -> PagedList[SpawnTreeUsage]:
+        """Walk the root index for ids and parents, then read usage by those ids."""
+        with self._conv_session("list_spawn_tree_usage") as session:
+            members = session.execute(
+                select(SqlConversation.id, SqlConversation.parent_conversation_id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.root_conversation_id == root_conversation_id,
+                )
+                .order_by(SqlConversation.id)
+                .limit(limit + 1)
+            ).all()
+        has_more = len(members) > limit
+        members = members[:limit]
+        usage_by_id: dict[str, str | None] = {}
+        if members:
+            with self._session("list_spawn_tree_usage") as session:
+                usage_by_id = {
+                    str(row.id): row.session_usage
+                    for row in session.execute(
+                        select(
+                            SqlConversationMetadata.id, SqlConversationMetadata.session_usage
+                        ).where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            SqlConversationMetadata.id.in_([row.id for row in members]),
+                        )
+                    ).all()
+                }
+        rows = [
+            SpawnTreeUsage(
+                id=str(row.id),
+                parent_conversation_id=(
+                    str(row.parent_conversation_id) if row.parent_conversation_id else None
+                ),
+                session_usage=json.loads(usage) if (usage := usage_by_id.get(str(row.id))) else {},
+            )
+            for row in members
+        ]
+        return PagedList(
+            data=rows,
+            first_id=rows[0].id if rows else None,
+            last_id=rows[-1].id if rows else None,
+            has_more=has_more,
+        )
+
     @staticmethod
     def _resolve_sort_column(sort_by: str) -> QueryableAttribute[Any]:
         """
@@ -6521,6 +6569,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # copied items instead.
             if source_ext_session and not truncated and resume_source_native_session:
                 fork_labels[FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY] = source_ext_session
+            elif truncated or not resume_source_native_session:
+                # A directive the source inherited from its own fork source
+                # would resume that ancestor's full transcript instead.
+                fork_labels.pop(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY, None)
             # When the fork binds a native target, mark it so the runner
             # rebuilds the native transcript (clone the source's native
             # transcript when same-family, else build from the copied
