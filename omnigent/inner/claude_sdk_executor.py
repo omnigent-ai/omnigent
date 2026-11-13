@@ -99,9 +99,11 @@ from .executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    is_interruption_marker,
     without_tool_history,
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
@@ -447,6 +449,8 @@ _CONNECT_TIMEOUT_SECONDS = 60.0
 _QUERY_START_TIMEOUT_SECONDS = 30.0
 _MCP_STATUS_TIMEOUT_SECONDS = 10.0
 _MCP_RECONNECT_TIMEOUT_SECONDS = 30.0
+# Leaves room under the harness adapter's 2s interrupt settle budget for the turn to end.
+_INTERRUPT_TIMEOUT_SECONDS = 1.5
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
@@ -1080,6 +1084,10 @@ class _ClaudeClientState:
     mcp_relay: _ManagedMcpRelay | None = None
     # This client's own sandbox launcher, which exposes the managed config and its relay.
     cli_launcher: str | None = None
+    # Set once the current query has been interrupted; cleared when the next query starts.
+    interrupted: bool = False
+    # Whether the next query must carry the runner's interruption marker.
+    interruption_marker_pending: bool = False
 
 
 def _recording_consents(
@@ -2729,23 +2737,24 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.get(session_key)
         if state is None:
             return False
-        # Interrupt is best-effort and fast; a failure just falls through to
-        # the close below.
+        state.interruption_marker_pending = True
+        if state.interrupted:
+            return True
+        state.interrupted = True
         try:
-            await asyncio.wait_for(state.client.interrupt(), timeout=0.5)
+            await asyncio.wait_for(state.client.interrupt(), timeout=_INTERRUPT_TIMEOUT_SECONDS)
+            return True
+        except asyncio.CancelledError:
+            state.interrupted = False
+            raise
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.warning(
                 "Claude SDK interrupt failed for session %s: %s",
                 session_key,
                 exc,
             )
-        # Always drop the live session after an interrupt. Its transcript
-        # still holds the abandoned prompt, and resumed turns send only the
-        # latest user message (see _build_prompt), so the runner's
-        # "[System: interrupted]" marker would never reach the model. Closing
-        # forces the next turn to rebuild full history (marker included) in a
-        # fresh session — the abandoned request is then visible-but-superseded
-        # rather than silently continued.
+        # The turn may still be running, so drop the session; the next turn
+        # replays history, including the interruption marker, in a fresh one.
         try:
             await self.close_session(session_key)
             return True
@@ -2920,6 +2929,9 @@ class ClaudeSDKExecutor(Executor):
         )
 
     def supports_tool_boundary_interrupt(self) -> bool:
+        return True
+
+    def resumes_after_interrupt(self) -> bool:
         return True
 
     def max_context_tokens(self) -> int | None:
@@ -3398,7 +3410,11 @@ class ClaudeSDKExecutor(Executor):
         await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
         prompt = (
-            self._build_prompt(messages, resume_session=True)
+            self._build_prompt(
+                messages,
+                resume_session=True,
+                after_interrupt=self._clients[session_key].interruption_marker_pending,
+            )
             if resume_session
             else await self._fresh_session_prompt(messages, cfg)
         )
@@ -3894,12 +3910,17 @@ class ClaudeSDKExecutor(Executor):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
+                if is_interruption_marker(message):
+                    break
         self._pending_framework_context[session_key] = "\n\n".join(
             notice
             for message in notice_messages
             if message.get("role") == "user"
             for notice in framework_notices(message.get("content"))
         )
+        client_state = self._clients.get(session_key)
+        if client_state is not None:
+            client_state.interrupted = False
         try:
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
@@ -3917,6 +3938,8 @@ class ClaudeSDKExecutor(Executor):
                 raise TimeoutError(
                     f"Claude SDK query start timed out after {int(_QUERY_START_TIMEOUT_SECONDS)}s"
                 ) from exc
+            if client_state is not None:
+                client_state.interruption_marker_pending = False
             message_stream = client.receive_response()
             try:
                 while True:
@@ -4338,6 +4361,14 @@ class ClaudeSDKExecutor(Executor):
         if turn_usage is None:
             turn_usage = _usage_from_observed_call(last_call_usage, observed_model or model)
 
+        if client_state is not None and client_state.interrupted:
+            # The CLI's result for an interrupted query is not a turn outcome. Its compaction
+            # never reaches the server, so drop the compacted client and replay history next turn.
+            if compaction_occurred:
+                self._evict_client_on_cancel(session_key)
+            yield TurnCancelled()
+            return
+
         if terminal_error:
             if compaction_occurred and claude_session_id:
                 compaction_event = _build_compaction_complete_event()
@@ -4433,6 +4464,7 @@ class ClaudeSDKExecutor(Executor):
         *,
         resume_session: bool,
         history_token_budget: int | None = None,
+        after_interrupt: bool = False,
     ) -> str | list[_JsonObject]:
         """
         Build the prompt for the SDK.
@@ -4457,13 +4489,17 @@ class ClaudeSDKExecutor(Executor):
             history may use, e.g. ``100000``. The newest prior messages
             that fit are kept behind a marker counting the omitted ones;
             ``None`` replays every prior message.
+        :param after_interrupt: ``True`` when the resumed session's
+            interruption marker has not been delivered yet.
         :returns: A plain string prompt, or a list of Anthropic
             API content block dicts when multimodal blocks are
             present in the latest user message.
         """
         if resume_session:
             # The live session already holds its tool items; only a fresh one replays them.
-            return ClaudeSDKExecutor._extract_trailing_user_content(without_tool_history(messages))
+            return ClaudeSDKExecutor._extract_trailing_user_content(
+                without_tool_history(messages), after_interrupt=after_interrupt
+            )
 
         if not _has_replayable_history(messages):
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
@@ -4551,6 +4587,8 @@ class ClaudeSDKExecutor(Executor):
     @staticmethod
     def _extract_trailing_user_content(
         messages: list[Message],
+        *,
+        after_interrupt: bool = False,
     ) -> str | list[_JsonObject]:
         """
         Extract the trailing run of consecutive user messages for the SDK.
@@ -4572,6 +4610,8 @@ class ClaudeSDKExecutor(Executor):
         survive.
 
         :param messages: Conversation history.
+        :param after_interrupt: ``True`` when an interruption marker in
+            the run has not been delivered yet, so it is sent too.
         :returns: A string prompt, or a list of Anthropic content
             block dicts when the trailing run is multimodal.
         """
@@ -4590,6 +4630,11 @@ class ClaudeSDKExecutor(Executor):
                     # Compaction may emit no assistant text; keep it out of later prompts.
                     if not trailing:
                         return "/compact"
+                    break
+                # The live session already received the user input before an interruption.
+                if is_interruption_marker(msg):
+                    if after_interrupt:
+                        trailing.append(msg)
                     break
                 trailing.append(msg)
             else:
