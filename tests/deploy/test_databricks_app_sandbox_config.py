@@ -144,7 +144,7 @@ def test_databricks_account_connection_needs_a_cipher(
     assert create_app.call_args.kwargs["databricks_store"] is None
 
 
-@pytest.mark.parametrize("routing_provider", ["external", "none"])
+@pytest.mark.parametrize("routing_provider", ["external", "none", "default"])
 def test_runtime_and_module_configuration_reaches_databricks_boot(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
@@ -163,7 +163,11 @@ def test_runtime_and_module_configuration_reaches_databricks_boot(
     monkeypatch.setattr(
         "omnigent.runtime.policies.builder._build_policy_llm_client", lambda *_args: MagicMock()
     )
-    config = {
+    resolve_workspace = MagicMock(return_value=MagicMock(host="https://workspace.example.test"))
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", resolve_workspace
+    )
+    config: dict[str, object] = {
         "llm": {"model": "test-judge"},
         "routing": {
             "provider": routing_provider,
@@ -182,6 +186,9 @@ def test_runtime_and_module_configuration_reaches_databricks_boot(
         "execution_timeout": 900,
         "native_hook_allow_cache_seconds": 45,
     }
+    if routing_provider == "default":
+        config.pop("routing")
+        config["providers"] = {"workspace": {"kind": "databricks", "profile": "deployment"}}
     create_app = _boot_with_config(monkeypatch, tmp_path, config)
 
     assert exit_codes == []
@@ -199,10 +206,16 @@ def test_runtime_and_module_configuration_reaches_databricks_boot(
     assert caps.execution_timeout == 900
     assert caps.native_hook_allow_cache_seconds() == 45
     assert caps.llm.model == "test-judge"
-    if routing_provider == "external":
+    if routing_provider != "none":
         assert isinstance(caps.routing_backends.external, ExternalRoutingClient)
         assert isinstance(caps.routing_backends.local, LLMRoutingClient)
         assert caps.routing_client is caps.routing_backends.external
+        if routing_provider == "default":
+            resolve_workspace.assert_called_once_with("deployment")
+            assert caps.routing_backends.external._url == (
+                "https://workspace.example.test/ai-gateway/routing/v1/routes:select"
+            )
+            assert caps.routing_backends.external._databricks_profile == "deployment"
     else:
         assert caps.routing_backends.external is None
         assert caps.routing_backends.local is None
