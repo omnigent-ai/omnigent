@@ -25,8 +25,14 @@ from omnigent.db import cockroachdb, utils
 def test_parse_crdb_server_version_accepts_distribution_labels(
     raw: str,
     expected: Version,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     assert cockroachdb._parse_crdb_server_version(raw) == expected
+    if expected < Version("25.2"):
+        assert "support is deprecated and will be removed in Omnigent v0.24.0" in caplog.text
+        assert "Upgrade to CockroachDB v25.2.10 or newer" in caplog.text
+    else:
+        assert "deprecated" not in caplog.text
 
 
 def test_parse_crdb_server_version_rejects_versions_below_minimum() -> None:
