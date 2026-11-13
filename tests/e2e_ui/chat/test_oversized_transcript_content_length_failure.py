@@ -63,6 +63,57 @@ def _seed_oversized_transcript(session_id: str) -> None:
         seed_committed_items(session_id, items[start : start + 200])
 
 
+def _record_stream_ready_heartbeats(page: Page) -> None:
+    """Count each session stream's ``session.heartbeat`` frames in ``window``.
+
+    The server sends a ready heartbeat once the live subscriber is registered;
+    status events published before then never reach the page.
+    """
+    page.add_init_script(
+        """
+        (() => {
+          const originalFetch = window.fetch.bind(window);
+          window.__streamHeartbeats = {};
+          window.fetch = async (input, init) => {
+            const url = typeof input === "string" ? input : input.url;
+            const match = new URL(url, window.location.origin).pathname.match(
+              /^\\/v1\\/sessions\\/([^/]+)\\/stream$/,
+            );
+            const response = await originalFetch(input, init);
+            if (!match || !response.body) return response;
+            const sessionId = match[1];
+            const decoder = new TextDecoder();
+            let tail = "";
+            const counter = new TransformStream({
+              transform(chunk, controller) {
+                const text = tail + decoder.decode(chunk, { stream: true });
+                const frames = text.split("event: session.heartbeat").length - 1;
+                window.__streamHeartbeats[sessionId] =
+                  (window.__streamHeartbeats[sessionId] ?? 0) + frames;
+                tail = frames > 0 ? "" : text.slice(-64);
+                controller.enqueue(chunk);
+              },
+            });
+            return new Response(response.body.pipeThrough(counter), {
+              status: response.status,
+              statusText: response.statusText,
+              headers: response.headers,
+            });
+          };
+        })()
+        """
+    )
+
+
+def _wait_for_live_stream(page: Page, session_id: str) -> None:
+    """Wait until the page's stream for ``session_id`` is subscribed server-side."""
+    page.wait_for_function(
+        "sessionId => (window.__streamHeartbeats[sessionId] ?? 0) > 0",
+        arg=session_id,
+        timeout=90_000,
+    )
+
+
 def _publish_native_status(
     base_url: str,
     session_id: str,
@@ -124,6 +175,7 @@ def test_oversized_session_turn_and_fork_fail_with_content_length_error(
     """
     base_url, session_id = seeded_session
     _seed_oversized_transcript(session_id)
+    _record_stream_ready_heartbeats(page)
 
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=90_000)
@@ -153,6 +205,7 @@ def test_oversized_session_turn_and_fork_fail_with_content_length_error(
 
     # The fork's first turn carries the inherited oversized transcript and is
     # rejected by the same content-length cap.
+    _wait_for_live_stream(page, fork_id)
     _fail_turn_with_content_length_error(base_url, fork_id, "fork_turn_1")
     _expect_content_length_failure(page, expected_pills=1)
 
@@ -160,6 +213,7 @@ def test_oversized_session_turn_and_fork_fail_with_content_length_error(
     # must keep the context-overflow classification.
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=90_000)
+    _wait_for_live_stream(page, session_id)
     _fail_turn_with_content_length_error(base_url, session_id, "turn_1")
     _expect_content_length_failure(page, expected_pills=1)
     _fail_turn_with_content_length_error(base_url, session_id, "turn_2")

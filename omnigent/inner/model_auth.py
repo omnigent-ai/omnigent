@@ -253,7 +253,7 @@ async def mint_ucode_token(*, host: str, profile: str) -> str:
                 cleanup_task.result()
             close_subprocess_transport(proc)
         raise
-    except (OSError, ValueError, asyncio.TimeoutError):
+    except (TimeoutError, OSError, ValueError):
         if proc is not None:
             with contextlib.suppress(Exception):
                 await terminate_subprocess(

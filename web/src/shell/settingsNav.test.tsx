@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   customAgentsEnabled: false as boolean | undefined,
   agentInstall: false,
   enabledConnections: [] as string[],
+  nestedAgents: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -37,6 +38,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     },
     agent_install: mocks.agentInstall,
     enabled_connections: mocks.enabledConnections,
+    sibling_sessions: mocks.nestedAgents,
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -53,12 +55,12 @@ import {
   useTrackSettingsReturn,
 } from "./settingsNav";
 
-function renderBody(opts: { onNavClick?: () => void } = {}) {
+function renderBody(opts: { onNavClick?: () => void; harnessesOffered?: boolean } = {}) {
   const onNavClick = opts.onNavClick ?? vi.fn();
   render(
     <TooltipProvider>
       <MemoryRouter initialEntries={["/settings/appearance"]}>
-        <SettingsSidebarBody onNavClick={onNavClick} />
+        <SettingsSidebarBody onNavClick={onNavClick} harnessesOffered={opts.harnessesOffered} />
       </MemoryRouter>
     </TooltipProvider>,
   );
@@ -73,6 +75,7 @@ beforeEach(() => {
   mocks.customAgentsEnabled = false;
   mocks.agentInstall = false;
   mocks.enabledConnections = [];
+  mocks.nestedAgents = false;
 });
 afterEach(cleanup);
 
@@ -175,6 +178,41 @@ describe("settingsNavGroups", () => {
 });
 
 describe("SettingsSidebarBody", () => {
+  it.each([
+    { customAgents: false, harnessesOffered: true },
+    { customAgents: false, harnessesOffered: false },
+    { customAgents: true, harnessesOffered: true },
+    { customAgents: true, harnessesOffered: false },
+  ])(
+    "lists Harnesses only while the deployment offers one: %o",
+    ({ customAgents, harnessesOffered }) => {
+      mocks.customAgentsEnabled = customAgents;
+      mocks.agentInstall = customAgents;
+      renderBody({ harnessesOffered });
+      expect(!!screen.queryByTestId("settings-nav-harnesses")).toBe(harnessesOffered);
+      expect(!!screen.queryByTestId("settings-nav-custom-agents")).toBe(customAgents);
+    },
+  );
+
+  it.each([
+    [true, true, false, true],
+    [true, false, false, false],
+    [false, true, false, false],
+    [false, true, true, true],
+    [false, false, true, false],
+  ])(
+    "gates Admin General by admin=%s, nested agents=%s, single user=%s",
+    (isAdmin, enabled, singleUser, visible) => {
+      mocks.isAdmin = isAdmin;
+      mocks.nestedAgents = enabled;
+      mocks.singleUser = singleUser;
+      renderBody();
+      const entry = screen.queryByTestId("settings-nav-admin");
+      expect(entry !== null).toBe(visible);
+      if (entry) expect(entry).toHaveAttribute("href", "/settings/admin");
+    },
+  );
+
   it.each([
     { connections: [], mcp: false, integrations: false },
     { connections: ["mcp"], mcp: true, integrations: false },
@@ -358,6 +396,14 @@ describe("SettingsSidebarBody", () => {
 });
 
 describe("useSettingsRoute", () => {
+  it.each([false, true])("gates the admin general route on nesting=%s", (enabled) => {
+    mocks.nestedAgents = enabled;
+    expect(routeHook("/settings/admin")).toEqual({
+      inSettings: true,
+      section: enabled ? "admin" : "general",
+    });
+  });
+
   it("treats /settings/members and /settings/policies as in-settings sections on an accounts deploy", () => {
     // The core of the fix: Members / Policies now live UNDER /settings, so the
     // sidebar's `inSettings` gate stays true and the settings nav stays put —

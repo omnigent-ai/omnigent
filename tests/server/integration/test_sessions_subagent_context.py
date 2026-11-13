@@ -651,6 +651,7 @@ async def two_replica_stack(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
+    request: pytest.FixtureRequest,
 ) -> AsyncIterator[_TwoReplicaStack]:
     """Model a host-sharded deployment with two replicas.
 
@@ -668,7 +669,20 @@ async def two_replica_stack(
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
 
     def _replica(name: str) -> FastAPI:
+        from omnigent.server.auth import UnifiedAuthProvider
+        from omnigent.server.managed_hosts import parse_sandbox_config
+        from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+        mode = getattr(request, "param", None)
+        authenticated = mode in ("authenticated", "managed")
         return create_app(
+            sandbox_config=parse_sandbox_config(
+                {"provider": "modal", "server_url": "http://sharded"}
+            )
+            if mode == "managed"
+            else None,
+            auth_provider=UnifiedAuthProvider(source="header") if authenticated else None,
+            permission_store=SqlAlchemyPermissionStore(db_uri) if authenticated else None,
             agent_store=SqlAlchemyAgentStore(db_uri),
             file_store=SqlAlchemyFileStore(db_uri),
             conversation_store=SqlAlchemyConversationStore(db_uri),
@@ -703,6 +717,10 @@ async def two_replica_stack(
                 conv_store=SqlAlchemyConversationStore(db_uri),
             )
     finally:
+        for app in (tunnel_replica, keyless_replica):
+            startup = getattr(app.state, "startup_inputs", None)
+            if startup is not None:
+                await startup.shutdown()
         with contextlib.suppress(Exception):
             await tunnel_replica.state.runner_router.aclose()
         with contextlib.suppress(Exception):

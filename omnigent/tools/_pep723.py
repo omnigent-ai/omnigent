@@ -23,9 +23,8 @@ over the raw lines handles reliably.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-
 import tomllib
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)

@@ -137,6 +137,7 @@ def test_claude_sdk_credential_proxy_survives_transport_and_renews(
                 },
             }
         },
+        operator_authored=True,
     )
     session_id = create_runner_bound_session(
         http_client, agent_name=agent_name, runner_id=live_runner_id

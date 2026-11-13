@@ -16,6 +16,7 @@ from typing import cast
 import pytest
 
 from omnigent.debug_logging import record_to_row
+from omnigent.harnesses import diagnostics as shared_diagnostics
 from omnigent.harnesses.codex_native import app_server, stderr_diagnostics
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
@@ -195,7 +196,7 @@ async def test_worker_start_failure_keeps_draining_without_debug_fallback(
             super().start()
 
     monkeypatch.setattr(
-        stderr_diagnostics,
+        shared_diagnostics,
         "threading",
         SimpleNamespace(Thread=UnavailableThread, Lock=threading.Lock, Event=threading.Event),
     )

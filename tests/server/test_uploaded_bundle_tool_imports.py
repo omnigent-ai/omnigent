@@ -213,7 +213,6 @@ async def test_upload_routes_guard_imports(
     files = {"bundle": ("agent.tar.gz", bundle, "application/gzip")}
     if operation == "create":
         response = await upload_client.post("/v1/sessions", data={"metadata": "{}"}, files=files)
-        success_status = 201
     else:
         clean = _agent_with_tool({}, 0)
         clean["tools"] = {}
@@ -225,17 +224,7 @@ async def test_upload_routes_guard_imports(
         assert created.status_code == 201, created.text
         session_id = created.json()["session_id"]
         response = await upload_client.put(f"/v1/sessions/{session_id}/agent", files=files)
-        success_status = 200
 
-    if trusted_local:
-        assert marker.exists(), "trusted uploads must retain dynamic tool loading"
-        if tool_type == "cancellable_function":
-            # The loader supports these, but spec translation has retired them.
-            assert response.status_code == 400, response.text
-            assert "was retired" in response.text
-        else:
-            assert response.status_code == success_status, response.text
-    else:
-        assert not marker.exists(), "untrusted validation imported the tool's module"
-        assert response.status_code == 400, response.text
-        assert _REJECTION in response.text
+    assert not marker.exists(), "HTTP validation imported the tool's module"
+    assert response.status_code == 400, response.text
+    assert _REJECTION in response.text

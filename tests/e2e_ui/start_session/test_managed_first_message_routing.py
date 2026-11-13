@@ -86,6 +86,9 @@ def managed_replicas(
         "OPENAI_API_KEY": "mock-key",
         "ANTHROPIC_API_KEY": "",
     }
+    # These replicas exercise legacy dispatch without persistent host ownership.
+    features = env.get("OMNIGENT_FEATURES", "")
+    env["OMNIGENT_FEATURES"] = ",".join(filter(None, (features, "-automations_v2")))
     set_fallback_mock_llm(mock_llm_server_url, "_policy_llm_", '{"action": "allow", "reason": ""}')
     processes: list[subprocess.Popen[bytes]] = []
     try:
@@ -206,7 +209,11 @@ def _persisted_messages(snapshot: dict[str, Any], role: str, text: str) -> list[
         item
         for item in snapshot["items"]
         if item.get("data", {}).get("role") == role
-        and text in json.dumps(item["data"].get("content", []))
+        and any(
+            text in block.get("text", "")
+            for block in item["data"].get("content", [])
+            if block.get("type") in {"input_text", "output_text", "text"}
+        )
     ]
 
 
@@ -457,6 +464,7 @@ async def _drive_sharded(rig: ManagedReplicas, model_url: str, *, keyed: bool) -
             session_prefix = f"/v1/sessions/{json.loads(create['body'])['id']}"
             replica, replica_url = ("b", rig.b) if keyed else ("a", rig.a)
             host_id = json.loads(create["request"]).get("host_id")
+            # The stripped legacy create reaches the ingress with neither id nor key.
             assert create["replica"] == replica and create["key"] == host_id
             assert create["status"] == 201
             labels = json.loads(create["body"])["labels"]
