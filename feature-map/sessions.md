@@ -642,9 +642,9 @@ tab for **Pin tab**, **Unpin tab**, **Move left**, **Move right** and **Close
 tab**. Pinned tabs follow the fixed pages, ahead of other open tabs, and show a
 pin button in place of Close; tabs move only within the pinned or unpinned group. Drag a tab
 with the mouse to reorder it. The mobile Side chats drawer offers the same
-menu. Open four or more side chats to see number-only labels
-and seven or more to see Close only on the selected tab; the full name stays in
-each tab's tooltip. Sub-agent tabs offer only Close tab and are not reordered.
+menu. Open four or more side-chat and sub-agent tabs combined to see
+number-only labels and seven or more to see Close only on the selected tab; the
+full name stays in each tab's tooltip. Sub-agent tabs offer only Close tab and are not reordered.
 In the Electron desktop app, Cmd/Ctrl+W also closes the selected side-chat tab
 in a visible workspace rail. With no closable visible tab it returns to the
 new-session page; Cmd/Ctrl+Shift+W closes the window. Grid workspaces are

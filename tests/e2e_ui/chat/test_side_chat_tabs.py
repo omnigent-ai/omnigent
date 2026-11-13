@@ -25,16 +25,21 @@ pytestmark = pytest.mark.browser_context_args(record_video_size={"width": 1280, 
 
 @pytest.fixture
 def side_chat_forks(seeded_session: tuple[str, str]) -> Iterator[list[str]]:
-    """Delete forks a test recorded, after its page and recording have closed."""
+    """Delete forks a test recorded, after its page and recording have closed.
+
+    Unlike the entry-point suite's fixture, this one does not request ``page``,
+    so a recorded page is created only after setup.
+    """
     base_url, _session_id = seeded_session
     child_ids: list[str] = []
     yield child_ids
     for child_id in child_ids:
-        httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)
+        httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0).raise_for_status()
 
 
 def _track_forks(page: Page, session_id: str, child_ids: list[str]) -> None:
     def track_fork(route: Route) -> None:
+        assert route.request.post_data_json["side_chat"] is True
         response = route.fetch()
         if response.ok:
             child_ids.append(response.json()["id"])

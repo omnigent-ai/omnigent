@@ -27,13 +27,7 @@ export type SideChatTabDensity = "regular" | "compact" | "dense";
 const COMPACT_FROM_TABS = 4;
 const DENSE_FROM_TABS = 7;
 
-/**
- * Pick the side-chat tab density for the number of open side-chat strip tabs.
- *
- * @param tabCount - Open side-chat and sub-agent tabs in the strip.
- * @returns `regular` for a few tabs, `compact` (number-only labels) from four,
- *   and `dense` (close button only on the selected tab) from seven.
- */
+/** Choose density from the combined side-chat and sub-agent tab count. */
 export function sideChatTabDensity(tabCount: number): SideChatTabDensity {
   if (tabCount >= DENSE_FROM_TABS) return "dense";
   if (tabCount >= COMPACT_FROM_TABS) return "compact";

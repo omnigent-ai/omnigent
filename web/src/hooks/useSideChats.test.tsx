@@ -313,8 +313,9 @@ describe("side-chat tabs when storage writes fail", () => {
     expect(readSessionWorkspaceState("session-a")).toEqual({});
   });
 
+  // The unsaved tab keeps its number unless the other window has since given it out.
   it.each([
-    ["closes a tab", (hook: SideChatsHook) => hook.close("conv_z"), ["conv_x"], { conv_x: 1 }],
+    ["closes a tab", (hook: SideChatsHook) => hook.close("conv_z"), ["conv_x"], { conv_x: 2 }],
     [
       "opens a tab",
       (hook: SideChatsHook) => hook.open("conv_y"),
@@ -333,6 +334,7 @@ describe("side-chat tabs when storage writes fail", () => {
       });
       act(() => first.result.current.open("conv_x"));
       setItem.mockRestore();
+      expect(first.result.current.numbers).toEqual({ conv_z: 1, conv_x: 2 });
 
       const second = renderHook(() => useSideChats("session-a"));
       act(() => otherWindowChange(second.result.current));
@@ -345,6 +347,7 @@ describe("side-chat tabs when storage writes fail", () => {
         selectedSideChatId: subagentTab,
         sideChatNumbers,
       });
+      expect(first.result.current.numbers).toEqual(sideChatNumbers);
     },
   );
 
@@ -435,6 +438,11 @@ describe("side-chat names, pins and order", () => {
     // A pinned and an unpinned tab don't trade places.
     act(() => result.current.move("conv_c", "conv_a"));
     expect(result.current.tabs).toEqual(["conv_a", "conv_b", "conv_c", "conv_d"]);
+    // Pinned tabs reorder among themselves.
+    act(() => result.current.setPinned("conv_b", true));
+    act(() => result.current.move("conv_b", "conv_a"));
+    expect(result.current.tabs).toEqual(["conv_b", "conv_a", "conv_c", "conv_d"]);
+    expect(result.current.pinned).toEqual(["conv_b", "conv_a"]);
   });
 
   it("restores pins, order and names after a reload", () => {

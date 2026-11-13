@@ -31,19 +31,25 @@ const MAX_UNSAVED_CHANGES = 50;
  * Keep pinned side chats first and give every open side chat a label number.
  * A new tab takes the next number after the highest open one, so closing a tab
  * never renumbers the rest; tabs saved before numbering keep their old labels.
+ * A tab missing from `state.numbers` keeps its `displayed` number when no other
+ * open tab holds it.
  */
-function normalizeSideChatTabs(state: SideChatTabsState): SideChatTabsState {
+function normalizeSideChatTabs(
+  state: SideChatTabsState,
+  displayed: Record<string, number> = {},
+): SideChatTabsState {
   const pinned = state.pinned.filter((id) => state.tabs.includes(id));
   const tabs = [...pinned, ...state.tabs.filter((id) => !pinned.includes(id))];
   const numbers: Record<string, number> = {};
-  let highest = 0;
-  for (const id of tabs) {
-    const number = state.numbers[id];
-    if (number !== undefined) {
-      numbers[id] = number;
-      highest = Math.max(highest, number);
-    }
-  }
+  const used = new Set<number>();
+  const assign = (id: string, number: number | undefined) => {
+    if (numbers[id] !== undefined || number === undefined || used.has(number)) return;
+    numbers[id] = number;
+    used.add(number);
+  };
+  for (const id of tabs) assign(id, state.numbers[id]);
+  for (const id of tabs) assign(id, displayed[id]);
+  let highest = Math.max(0, ...used);
   for (const id of tabs) {
     if (numbers[id] === undefined) numbers[id] = ++highest;
   }
@@ -79,6 +85,8 @@ function sameSideChatGroup(state: SideChatTabsState, id: string, target: string)
 /** Per-session side-chat and sub-agent tabs, with browser-local selection and closure. */
 export function useSideChats(conversationId: string) {
   const [state, setState] = useState(() => readSideChatTabsState(conversationId));
+  const displayedNumbers = useRef(state.numbers);
+  displayedNumbers.current = state.numbers;
   // Changes a failed storage write couldn't save. Each update replays them on
   // fresh storage, so they survive without undoing other windows' changes.
   const unsaved = useRef<{ conversationId: string; changes: TabsChange[] } | null>(null);
@@ -97,8 +105,10 @@ export function useSideChats(conversationId: string) {
       const pending =
         unsaved.current?.conversationId === conversationId ? unsaved.current.changes : [];
       const changes = [...pending, mutate];
+      // Replayed tabs keep the numbers this window shows unless another window took them.
+      const displayed = pending.length > 0 ? displayedNumbers.current : {};
       const next = changes.reduce(
-        (current, change) => normalizeSideChatTabs(change(current)),
+        (current, change) => normalizeSideChatTabs(change(current), displayed),
         readSideChatTabsState(conversationId),
       );
       const saved = saveSessionWorkspaceState(conversationId, {

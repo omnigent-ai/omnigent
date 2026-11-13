@@ -1737,7 +1737,7 @@ describe("WorkspacePanel mobile side chats", () => {
     expect(onMobileSideChatsOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("gives a pinned drawer tab an unpin button instead of close, as on the strip", () => {
+  it("gives a pinned drawer tab an unpin button instead of close, and reorders from its menu", async () => {
     isMobileMock.mockReturnValue(true);
     writeSessionWorkspaceState("conv_ws", {
       openSideChats: ["conv_side_a", "conv_side_b"],
@@ -1750,6 +1750,13 @@ describe("WorkspacePanel mobile side chats", () => {
     fireEvent.click(within(drawer).getByRole("button", { name: "Unpin Side chat 1" }));
     expect(readSessionWorkspaceState("conv_ws").pinnedSideChats).toBeUndefined();
     expect(within(drawer).getByRole("button", { name: "Close Side chat 1" })).toBeVisible();
+
+    fireEvent.contextMenu(within(drawer).getByRole("tab", { name: "Side chat 1" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Move right" }));
+    expect(readSessionWorkspaceState("conv_ws").openSideChats).toEqual([
+      "conv_side_b",
+      "conv_side_a",
+    ]);
   });
 
   it("renders the drawer inside the app subtree, beside the hidden rail", () => {
@@ -1900,6 +1907,23 @@ describe("WorkspacePanel sub-agent tabs", () => {
 
     expect(within(rail).getAllByRole("tab", { name: "Research agent" })).toHaveLength(1);
     expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+  });
+
+  it("counts sub-agent tabs toward density and offers them only Close tab", async () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side_a", "conv_side_b", "conv_side_c"],
+      openSubagentTabs: [SUBAGENT_TAB],
+      selectedSideChatId: "conv_side_c",
+    });
+    renderWorkspace({ rightRailTab: "sidechat", queryClient: clientWithSubagent() });
+    const rail = screen.getByRole("complementary", { name: "Workspace" });
+
+    // Three side chats plus one sub-agent tab reach the compact threshold.
+    expect(within(rail).getByRole("tab", { name: "Side chat 3" })).toHaveTextContent(/^3$/);
+    fireEvent.contextMenu(within(rail).getByRole("tab", { name: "Research agent" }));
+    expect(await screen.findByRole("menuitem", { name: "Close tab" })).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Pin tab" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Move left" })).toBeNull();
   });
 
   it("shows the sub-agent's whole session with a full-screen link", () => {
