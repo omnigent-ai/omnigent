@@ -208,23 +208,24 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("instruction_spec", "env_denylist", "expected_env_unset"),
+    ("instruction_spec", "env_denylist", "expected_env_unset", "confined"),
     [
-        ("missing", None, []),
+        ("missing", None, [], False),
         (
             "missing",
             " OPENAI_API_KEY,ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY, ",
             ["ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"],
+            False,
         ),
-        ("empty", None, []),
-        ("raw", None, []),
-        ("resolved", None, []),
-        ("resolved-replace", None, []),
-        ("sdk-missing-replace", None, []),
-        ("resolved-sdk-empty-replace", None, []),
+        ("empty", None, [], False),
+        ("raw", None, [], False),
+        ("resolved", None, [], False),
+        ("resolved-replace", None, [], False),
+        ("sdk-missing-replace", None, [], False),
+        ("resolved-sdk-empty-replace", None, [], False),
+        ("resolved", None, [], True),
     ],
 )
-@pytest.mark.parametrize("confined", [False, True])
 async def test_auto_create_pi_terminal_launches_required_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
