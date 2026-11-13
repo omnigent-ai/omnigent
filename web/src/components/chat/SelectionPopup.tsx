@@ -1,8 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { CornerUpLeftIcon, MessagesSquareIcon } from "lucide-react";
+import { ALT_KEY, CompactShortcutKeys, ENTER_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { getEmbedRoot } from "@/lib/host";
+import { isFocusInDialogOrMenu, isKeyOwningOverlayOpen, isTextEntry } from "@/lib/hotkeys";
+import { chordMatches } from "@/lib/shortcuts/chord";
+
+function ownsSelectionHotkey(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    (isTextEntry(target) ||
+      target.closest("button, a[href], select, [role='button'], .xterm, .monaco-editor") !== null)
+  );
+}
 
 export function SelectionPopup({
   containerRef,
@@ -16,46 +27,49 @@ export function SelectionPopup({
   onAskInSideChat?: (text: string) => void;
 }) {
   const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
-  const selectedTextRef = useRef<string>("");
+  const selectedTextRef = useRef("");
+
+  const getScopedSelection = useCallback(() => {
+    const selection = window.getSelection();
+    const container = containerRef.current;
+    if (
+      !selection ||
+      selection.isCollapsed ||
+      selection.rangeCount === 0 ||
+      !selection.toString().trim() ||
+      !container ||
+      !container.contains(selection.anchorNode) ||
+      !container.contains(selection.focusNode)
+    ) {
+      return null;
+    }
+    return selection;
+  }, [containerRef]);
+
+  const applySelection = useCallback((action: (text: string) => void, text: string) => {
+    window.getSelection()?.removeAllRanges();
+    setPopupPos(null);
+    selectedTextRef.current = "";
+    action(text);
+  }, []);
 
   const updatePopup = useCallback(() => {
-    const sel = window.getSelection();
-    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+    const selection = getScopedSelection();
+    if (!selection) {
       setPopupPos(null);
       selectedTextRef.current = "";
       return;
     }
 
-    const text = sel.toString().trim();
-    if (!text) {
-      setPopupPos(null);
-      selectedTextRef.current = "";
-      return;
-    }
-
-    // Scope to the conversation container — ignore selections in the composer.
-    const container = containerRef.current;
-    if (!container) {
-      setPopupPos(null);
-      selectedTextRef.current = "";
-      return;
-    }
-    const anchor = sel.anchorNode;
-    if (!anchor || !container.contains(anchor)) {
-      setPopupPos(null);
-      selectedTextRef.current = "";
-      return;
-    }
-
-    const range = sel.getRangeAt(0);
+    const range = selection.getRangeAt(0);
     const rect = range.getBoundingClientRect();
     // Position the button just above the selection, horizontally centered.
     setPopupPos({
       x: rect.left + rect.width / 2,
       y: rect.top,
     });
-    selectedTextRef.current = text;
-  }, [containerRef]);
+    selectedTextRef.current = selection.toString().trim();
+  }, [getScopedSelection]);
 
   useEffect(() => {
     document.addEventListener("mouseup", updatePopup);
@@ -65,6 +79,33 @@ export function SelectionPopup({
       document.removeEventListener("selectionchange", updatePopup);
     };
   }, [updatePopup]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat || event.isComposing) return;
+      const action = chordMatches({ key: "Enter", alt: true }, event)
+        ? onReply
+        : chordMatches({ key: "Enter", alt: true, shift: true }, event)
+          ? onAskInSideChat
+          : undefined;
+      if (
+        !action ||
+        ownsSelectionHotkey(event.target) ||
+        ownsSelectionHotkey(document.activeElement) ||
+        isFocusInDialogOrMenu() ||
+        isKeyOwningOverlayOpen()
+      ) {
+        return;
+      }
+      const selection = getScopedSelection();
+      if (!selection) return;
+      event.preventDefault();
+      event.stopPropagation();
+      applySelection(action, selection.toString().trim());
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [applySelection, getScopedSelection, onReply, onAskInSideChat]);
 
   if (!popupPos) return null;
 
@@ -83,6 +124,7 @@ export function SelectionPopup({
     >
       <Button
         type="button"
+        aria-keyshortcuts="Alt+Enter"
         variant="secondary"
         size="sm"
         // Override shared-variant translucent hover — this button floats over text.
@@ -92,21 +134,17 @@ export function SelectionPopup({
           e.preventDefault();
         }}
         onClick={() => {
-          const text = selectedTextRef.current;
-          if (text) {
-            onReply(text);
-            window.getSelection()?.removeAllRanges();
-            setPopupPos(null);
-            selectedTextRef.current = "";
-          }
+          if (selectedTextRef.current) applySelection(onReply, selectedTextRef.current);
         }}
       >
         <CornerUpLeftIcon className="size-3.5" />
-        Reply ↵
+        Reply
+        <CompactShortcutKeys keys={[ALT_KEY, ENTER_KEY]} />
       </Button>
       {onAskInSideChat ? (
         <Button
           type="button"
+          aria-keyshortcuts="Alt+Shift+Enter"
           variant="secondary"
           size="sm"
           className="gap-1 shadow-md hover:bg-secondary hover:brightness-95 dark:hover:brightness-110"
@@ -114,17 +152,12 @@ export function SelectionPopup({
             e.preventDefault();
           }}
           onClick={() => {
-            const text = selectedTextRef.current;
-            if (text) {
-              onAskInSideChat(text);
-              window.getSelection()?.removeAllRanges();
-              setPopupPos(null);
-              selectedTextRef.current = "";
-            }
+            if (selectedTextRef.current) applySelection(onAskInSideChat, selectedTextRef.current);
           }}
         >
           <MessagesSquareIcon className="size-3.5" />
           Ask in side chat
+          <CompactShortcutKeys keys={[ALT_KEY, SHIFT_KEY, ENTER_KEY]} />
         </Button>
       ) : null}
     </div>,
