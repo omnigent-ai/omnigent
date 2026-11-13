@@ -118,13 +118,13 @@ jobs:
       # pinned CLI only in the lanes that run them.
       - name: Install Codex CLI
         if: matrix.group == 'misc' || matrix.group == 'harnesses' || matrix.group == 'inner-rest'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: codex
 
       - name: Install Pi CLI
         if: matrix.group == 'inner-rest'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: pi
 
@@ -440,7 +440,7 @@ jobs:
           cache: ""
 
       - name: Install codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: codex
 

@@ -1,4 +1,4 @@
-"""Session permission entity."""
+"""Session and scheduled task permission entities."""
 
 from __future__ import annotations
 
@@ -19,6 +19,23 @@ class SessionPermission:
 
     user_id: str
     conversation_id: str
+    level: int
+
+
+@dataclasses.dataclass
+class ScheduledTaskPermission:
+    """A single permission grant on a scheduled task (an automation).
+
+    The task's owner holds no grant; ownership is ``ScheduledTask.user_id``.
+
+    :param user_id: The grantee, a user or group, e.g. ``"alice@example.com"``.
+    :param scheduled_task_id: The scheduled task this grant applies to.
+    :param level: Numeric permission level: ``1`` = read, ``2`` = edit,
+        ``3`` = manage. Comparison is ``>=``.
+    """
+
+    user_id: str
+    scheduled_task_id: str
     level: int
 
 

@@ -300,6 +300,7 @@ def register_resources_routes(
                 session_id=conv.id,
                 conv=conv,
                 app_state=request.app.state,
+                request=request,
                 conversation_store=conversation_store,
                 runner_router=runner_router,
             )
@@ -494,6 +495,7 @@ def register_resources_routes(
                 session_id=session_id,
                 conv=conversation,
                 app_state=request.app.state,
+                request=request,
                 conversation_store=conversation_store,
                 runner_router=runner_router or get_server_runner_router(),
                 raise_host_refusal=True,
@@ -1643,6 +1645,7 @@ def register_resources_routes(
             session_id=session_id,
             conv=conv,
             app_state=request.app.state,
+            request=request,
             conversation_store=conversation_store,
             runner_router=runner_router or get_server_runner_router(),
         )
@@ -2544,6 +2547,7 @@ def register_resources_routes(
                     session_id=session_id,
                     conv=conv,
                     app_state=request.app.state,
+                    request=request,
                     conversation_store=conversation_store,
                     runner_router=runner_router or get_server_runner_router(),
                     raise_host_refusal=True,

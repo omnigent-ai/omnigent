@@ -45,6 +45,7 @@ from omnigent.runtime import tool_result_replay as trc
 from omnigent.runtime import workflow
 from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec import load_omnigent_yaml
+from omnigent.telemetry.request_headers import client_user_agent
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -5707,6 +5708,7 @@ def test_websocket_connect_sets_short_close_timeout(monkeypatch: pytest.MonkeyPa
             "Authorization": "Bearer tok",
             "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
         },
+        "user_agent_header": client_user_agent(),
         "close_timeout": claude_native._CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
     }
 

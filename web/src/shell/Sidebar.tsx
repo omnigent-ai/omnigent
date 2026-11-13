@@ -1782,7 +1782,8 @@ function ProjectFolder({
     growFrom.current = { height: listRef.current?.offsetHeight ?? 0, count: visibleCount };
     return display.loadMore();
   };
-  const errors = useSessionErrorStates(conversations);
+  // Rendered rows read their own badges; the folder only reuses those results.
+  const errors = useSessionErrorStates(conversations, { startReads: false });
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
@@ -1795,7 +1796,8 @@ function ProjectFolder({
     errors.filter(isHidden),
     startingConversationId,
   );
-  // "Show more" carries the badge of the rows it hides, as a collapsed header does.
+  // "Show more" carries the badge of the rows it hides, as a collapsed header does,
+  // from cached reads only: hidden rows show an idle error once they have rendered.
   const hiddenMarker =
     expanded && visibleCount < conversations.length
       ? projectMarkerState(

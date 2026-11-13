@@ -746,6 +746,7 @@ async def _recover_retry_session(
         runner_client, conv = await ensure_runner_connected(
             session_id=session_id,
             conv=conv,
+            request=request,
             app_state=request.app.state,
             conversation_store=conversation_store,
             runner_router=runner_router,
@@ -1887,6 +1888,7 @@ def register_events_routes(
                 conv=wake_conv,
                 app_state=_app_state,
                 conversation_store=conversation_store,
+                request=request,
             ):
                 _refreshed = await asyncio.to_thread(
                     conversation_store.get_conversation, session_id
@@ -1934,6 +1936,7 @@ def register_events_routes(
                     conv=wake_conv,
                     app_state=_app_state,
                     conversation_store=conversation_store,
+                    request=request,
                 ):
                     _refreshed = await asyncio.to_thread(
                         conversation_store.get_conversation, session_id
@@ -3128,6 +3131,7 @@ def register_events_routes(
             conv=conv,
             app_state=request.app.state,
             conversation_store=conversation_store,
+            request=request,
         ):
             # A resumable managed wake may have re-launched the runner and
             # updated liveness while this handler was holding an old row.
@@ -3330,6 +3334,7 @@ def register_events_routes(
                         conv=conv,
                         app_state=request.app.state,
                         conversation_store=conversation_store,
+                        request=request,
                     ):
                         conv_after_relaunch = await asyncio.to_thread(
                             conversation_store.get_conversation, session_id
