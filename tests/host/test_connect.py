@@ -3222,6 +3222,17 @@ async def test_workspace_direct_access_follows_omnigent_features(
     assert _workspace_direct_access_enabled() is enabled
 
 
+async def test_workspace_socket_without_its_extra_leaves_the_host_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enabling direct access without `omnigent[workspace-api]` turns it off, not the host."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", "workspace_direct_access")
+    # None in sys.modules makes the import fail as if connectrpc weren't installed.
+    monkeypatch.setitem(sys.modules, "omnigent.host.workspace_service", None)
+
+    assert await _make_host_process()._start_workspace_socket() is None
+
+
 async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

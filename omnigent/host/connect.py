@@ -3841,6 +3841,19 @@ class HostProcess:
             ],
         )
 
+    async def _start_workspace_socket(self) -> WorkspaceSocket | None:
+        """Open the direct workspace socket when enabled and installed, else ``None``."""
+        if not _workspace_direct_access_enabled():
+            return None
+        try:
+            from omnigent.host.workspace_service import start_workspace_socket
+        except ImportError:
+            _logger.warning(
+                "workspace_direct_access needs `omnigent[workspace-api]`; direct access is off"
+            )
+            return None
+        return await start_workspace_socket(self._workspace_reader, host_id=self._identity.host_id)
+
     def _workspace_reader(self, workspace: str) -> WorkspaceReader:
         """Return the cached reader for an existing workspace directory.
 
@@ -5094,12 +5107,7 @@ class HostProcess:
         self._suspend_task = asyncio.create_task(
             watch_for_resume(self._on_resume_from_suspend), name="host-suspend-watch"
         )
-        if _workspace_direct_access_enabled():
-            from omnigent.host.workspace_service import start_workspace_socket
-
-            self._workspace_socket = await start_workspace_socket(
-                self._workspace_reader, host_id=self._identity.host_id
-            )
+        self._workspace_socket = await self._start_workspace_socket()
         # Warm the runner zygote now: start() blocks on its one-time import
         # of the runner graph (~1-2s), which otherwise lands inside the first
         # session launch of the daemon's life. Best-effort — a failure
