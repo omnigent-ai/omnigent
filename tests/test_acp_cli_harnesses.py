@@ -110,8 +110,10 @@ def test_spawn_env_forwards_cwd_sandbox_and_quotes_command(
     assert "HARNESS_ACP_MODEL" not in env
 
 
+@pytest.mark.parametrize("row_passthrough", [(), ("TEST_ROW_AUTH",)])
 def test_jcode_connect_injects_gateway_env_and_passthrough(
     monkeypatch: pytest.MonkeyPatch,
+    row_passthrough: tuple[str, ...],
 ) -> None:
     """On a managed-connect host (and no explicit spec key), the jcode row's spawn env
     carries the broker bearer + JCODE_HOME + runtime dir and names ALL THREE in
@@ -131,14 +133,15 @@ def test_jcode_connect_injects_gateway_env_and_passthrough(
     monkeypatch.setitem(
         ACP_CLI_HARNESSES,
         "jcode",
-        dataclasses.replace(ACP_CLI_HARNESSES["jcode"], env_passthrough=("TEST_ROW_AUTH",)),
+        dataclasses.replace(ACP_CLI_HARNESSES["jcode"], env_passthrough=row_passthrough),
     )
     env = _build_acp_cli_spawn_env(_spec("jcode"), harness="jcode", session_id="sess-1")
     assert env["JCODE_DBX_TOKEN"] == "fresh-bearer"
     assert env["JCODE_HOME"] == "/tmp/jc-home"
     assert env["JCODE_RUNTIME_DIR"] == "/tmp/jc-home/run"
     names = set(env["HARNESS_ACP_ENV_PASSTHROUGH"].split(","))
-    assert {"TEST_ROW_AUTH", "JCODE_DBX_TOKEN", "JCODE_HOME", "JCODE_RUNTIME_DIR"} <= names
+    assert {"JCODE_DBX_TOKEN", "JCODE_HOME", "JCODE_RUNTIME_DIR", *row_passthrough} <= names
+    assert ("TEST_ROW_AUTH" in names) == bool(row_passthrough)
 
 
 def test_jcode_no_connect_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
