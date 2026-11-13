@@ -234,14 +234,14 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.27.0",
-        frontend_visible=False,
+        frontend_visible=True,
     ),
     FeatureDefinition(
         feature=Feature.WORKSPACE_API_SERVER_ACCESS,
         description="Serve the workspace API through the server, answered by the session's host",
         owner="server",
         review_by_release="0.27.0",
-        frontend_visible=False,
+        frontend_visible=True,
     ),
 )
 

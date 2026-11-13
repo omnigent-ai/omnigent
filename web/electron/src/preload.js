@@ -259,6 +259,18 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
          */
         connectSshHost: (destination) => ipcRenderer.invoke("omnigent:ssh-connect", destination),
       }),
+  // Main checks a socket's owner before using it, which Windows can't report.
+  ...(process.platform === "win32"
+    ? {}
+    : {
+        /**
+         * Send one workspace API call to a session host's local socket, named
+         * by the server with a token. Resolves `{ status, headers, body }`.
+         * @param {{socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
+         */
+        workspaceSocketRequest: (request) =>
+          ipcRenderer.invoke("omnigent:workspace-socket-request", request),
+      }),
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
   /**

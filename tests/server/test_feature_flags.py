@@ -51,6 +51,8 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
+        "workspace_direct_access": False,
+        "workspace_api_server_access": False,
     }
 
 
