@@ -1,28 +1,7 @@
-"""Guards against sub-agent dispatch ``ReadTimeout`` and ``sys_session_close`` tombstone
-both leak the spawned child OS-process cluster: the runner's session-DELETE
-reaper is never reached on either path, so orphaned harness / tmux /
-``claude_native_bridge`` clusters accumulate and eventually saturate the host.
+"""Failed named sends preserve uncertain work under confined credentials.
 
-Both tests drive the REAL runner dispatch entry point
-(:func:`omnigent.runner.tool_dispatch.execute_tool`) against an
-``httpx.MockTransport`` standing in for the Omnigent server, exactly as the
-sibling ``tests/runner/test_runner_dispatch.py`` cases do. The mock injects
-the report's fault (a create-time ``ReadTimeout`` after the server commits
-child creation) and records every ``DELETE`` (the reaper) so the tests can
-assert on what the dispatch code actually did.
-
-Acceptance criteria:
-
-1. After a create-timeout where the child turn never started, the dispatch
-   MUST reach the runner session-DELETE reaper for the created child --
-   otherwise its harness / ``omnigent-terminal-*`` tmux / ``claude_native_bridge``
-   cluster is orphaned.
-2. ``sys_session_close`` MUST reap the target's cluster (call the runner
-   reaper -- a ``DELETE``, or an archive-equivalent ``PATCH archived=true``
-   that schedules ``_spawn_archive_stop``), not merely PATCH ``closed=true``.
-
-These tests fail when the reaper is never called (leaking build) and pass once the
-timeout / tombstone paths properly wire to the session-DELETE lifecycle.
+Local transports cover legacy cleanup, scoped timeout retention and explicit
+session close. No runner process or external server is started.
 """
 
 from __future__ import annotations
@@ -42,25 +21,15 @@ CHILD_ID = "conv_child_leaked"
 
 
 @pytest.mark.asyncio
-async def test_create_timeout_reaps_orphaned_child() -> None:
-    """Facet 1 -- the create-timeout path must not leak the child cluster.
-
-    The child-session create (``POST /v1/sessions``) commits server-side, then
-    the caller's read deadline elapses -> ``httpx.ReadTimeout`` with no child
-    id bound to the caller. The report's acceptance criterion (1): the dispatch
-    must still reap the created child via the runner session-DELETE lifecycle,
-    so no residual harness / tmux / bridge process remains.
-
-    On the leaking build the create ``POST`` has a bare ``timeout=30.0`` with
-    no ``ReadTimeout`` recovery and ``child_session_id`` is only bound after a
-    successful response, so ``_teardown_failed_child`` (the DELETE reaper) can
-    never fire -- the ReadTimeout propagates and ZERO DELETEs are issued.
-    """
+@pytest.mark.parametrize("confined", [False, True])
+async def test_create_timeout_cleanup_respects_confined_credentials(confined: bool) -> None:
+    """Legacy cleanup remains; confined timeouts never reconcile by mutable title."""
     deletes: list[str] = []
     created_ids: list[str] = []
     # Becomes True once the POST raises ReadTimeout, so the reconcile lookup
     # (child_sessions GET after the timeout) can return the committed session.
     post_committed: list[bool] = [False]
+    timeout_reconciliations: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -81,6 +50,7 @@ async def test_create_timeout_reaps_orphaned_child() -> None:
         if method == "GET" and path == f"/v1/sessions/{PARENT_ID}/child_sessions":
             if not post_committed[0]:
                 return httpx.Response(200, json={"data": []})
+            timeout_reconciliations.append(path)
             return httpx.Response(
                 200,
                 json={
@@ -108,8 +78,10 @@ async def test_create_timeout_reaps_orphaned_child() -> None:
 
     inbox: asyncio.Queue = asyncio.Queue()
     subagent_work._session_inboxes_ref[PARENT_ID] = inbox
+    auth = httpx.Auth()
+    auth.runner_confined = confined
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), base_url="http://server"
+        transport=httpx.MockTransport(handler), base_url="http://server", auth=auth
     ) as server_client:
         try:
             output = await execute_tool(
@@ -133,6 +105,11 @@ async def test_create_timeout_reaps_orphaned_child() -> None:
     assert isinstance(output, str) and output.startswith("Error"), (
         f"a create-timeout must return a handled error, not propagate ReadTimeout (got {output!r})"
     )
+    if confined:
+        assert not deletes
+        assert not timeout_reconciliations
+        assert "unknown" in output and "automatic cleanup is unavailable" in output
+        return
     # Acceptance criterion (1): the created child's cluster must be reaped.
     assert deletes, (
         "create-timeout leaked the child: the dispatch never called the runner "
@@ -216,3 +193,34 @@ async def test_tombstone_close_reaps_cluster() -> None:
         f"({patches}) -- it set no archived=true and issued no runner DELETE, "
         "so the child's harness / tmux / bridge cluster is never reaped"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("created_child", [False, True])
+async def test_confined_failed_send_retains_work_without_cleanup(created_child: bool) -> None:
+    from omnigent.runner.tool_dispatch import _teardown_failed_child
+
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(500)
+
+    auth = httpx.Auth()
+    auth.runner_confined = True
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=PARENT_ID,
+        child_session_id=CHILD_ID,
+        agent="researcher",
+        title="task-1",
+    )
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handle), base_url="http://server", auth=auth
+        ) as client:
+            warning = await _teardown_failed_child(client, CHILD_ID, created_child=created_child)
+        assert warning is not None and CHILD_ID in warning and "retained" in warning
+        assert subagent_work.get_subagent_work(CHILD_ID) is entry
+        assert requests == []
+    finally:
+        subagent_work.unregister_subagent_work(CHILD_ID)

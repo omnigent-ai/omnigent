@@ -2041,6 +2041,12 @@ async def _teardown_failed_child(
     """
     from omnigent.runner import subagent_work as _subagent_work
 
+    if runner_uses_confined_bearer(server_client):
+        return (
+            f"Warning: retained child session {child_session_id!r} and its work handle. "
+            "This server cannot confirm that the child accepted no input; "
+            "inspect its status before retrying the send."
+        )
     entry = _subagent_work.get_subagent_work(child_session_id)
     _subagent_work.unregister_child_session(child_session_id)
     _subagent_work.unregister_subagent_work(child_session_id)
@@ -3013,6 +3019,13 @@ async def _execute_subagent_tool(
         except httpx.ReadTimeout as _exc:
             _create_timeout_exc = _exc
         if _create_timeout_exc is not None:
+            if runner_uses_confined_bearer(server_client):
+                return (
+                    "Error: timed out waiting for child session creation; "
+                    f"the outcome of dispatch {work_id!r} is unknown. "
+                    "The server may have created the child. Inspect the parent's "
+                    "child sessions before retrying; automatic cleanup is unavailable."
+                )
             # The read deadline elapsed after the server may have committed the
             # child session — child_session_id is unknown to us, but the
             # (parent, agent, title) triple is. Reconcile: look up the created
