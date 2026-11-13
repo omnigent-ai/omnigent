@@ -195,6 +195,21 @@ async def test_subagent_idle_publishes_status_without_completion(
 ) -> None:
     route = status_route
     sid = route.child_id if is_child else route.parent_id
+    # The run's agent has replied, so going idle ends its run.
+    reply = route.store.append(
+        sid,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_active",
+                data=MessageData(
+                    role="assistant",
+                    agent="claude-native",
+                    content=[{"type": "output_text", "text": "Done."}],
+                ),
+            )
+        ],
+    )
     response = await route.client.post(
         f"/v1/sessions/{sid}/events",
         json={"type": "subagent.status", "data": {"idle": True, **optional}},
@@ -209,7 +224,8 @@ async def test_subagent_idle_publishes_status_without_completion(
     assert common._session_background_tasks_cache.get(sid) == tasks
     conv = route.store.get_conversation(sid)
     assert conv is not None and conv.live_status == "idle"
-    assert route.store.list_items(sid).data == []
+    # The idle status writes no completion item of its own.
+    assert [item.id for item in route.store.list_items(sid).data] == [reply[0].id]
     runs, _ = route.scheduled.list_runs(route.task_id)
     run = next(run for run in runs if run.conversation_id == sid)
     assert run.status == "succeeded"
