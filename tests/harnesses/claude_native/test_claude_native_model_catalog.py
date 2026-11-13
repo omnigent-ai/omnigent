@@ -22,9 +22,16 @@ from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 
 
-@pytest.mark.parametrize("helper", [None, "", "printf test-token"])
+@pytest.mark.parametrize(
+    ("helper", "subscription_auth"),
+    [(None, False), ("", False), ("printf test-token", False), (None, True)],
+)
+@pytest.mark.parametrize("stream_input", [True, False])
 def test_model_probe_uses_configured_auth_helper(
-    monkeypatch: pytest.MonkeyPatch, helper: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    helper: str | None,
+    subscription_auth: bool,
+    stream_input: bool,
 ) -> None:
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
         monkeypatch.setenv(name, "ambient-credential")
@@ -33,39 +40,20 @@ def test_model_probe_uses_configured_auth_helper(
     )
     config = (
         claude_native.ClaudeNativeUcodeConfig(
-            env={"CLAUDE_CODE_USE_GATEWAY": "1"}, api_key_helper=helper
+            env={}, api_key_helper=helper, subscription_auth=subscription_auth
         )
-        if helper is not None
+        if helper is not None or subscription_auth
         else None
     )
 
-    _, args, env = claude_native._claude_model_probe_invocation(config)
+    _, args, env = claude_native._claude_model_probe_invocation(config, stream_input=stream_input)
 
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
-        if helper:
+        if helper or subscription_auth:
             assert name not in env
         else:
             assert env[name] == "ambient-credential"
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "ambient-credential"
-    if helper:
-        assert json.loads(args[args.index("--settings") + 1])["apiKeyHelper"] == helper
-
-
-@pytest.mark.parametrize("helper", [None, "printf test-token"])
-@pytest.mark.parametrize("stream_input", [True, False])
-def test_model_probe_disables_user_hooks_in_one_settings_argument(
-    monkeypatch: pytest.MonkeyPatch, helper: str | None, stream_input: bool
-) -> None:
-    """User SessionStart hooks would run for the headless probe and stall it past its timeout."""
-    monkeypatch.setattr(
-        "omnigent.claude_launcher.resolve_claude_launch", lambda command, args: (command, args)
-    )
-    config = claude_native.ClaudeNativeUcodeConfig(
-        env={"CLAUDE_CODE_USE_GATEWAY": "1"}, api_key_helper=helper
-    )
-
-    _, args = claude_native._claude_model_probe_launch(config, stream_input=stream_input)
-
     assert args.count("--settings") == 1
     settings = json.loads(args[args.index("--settings") + 1])
     expected: dict[str, object] = {"disableAllHooks": True}

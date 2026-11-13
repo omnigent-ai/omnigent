@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import tarfile
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -11,6 +12,7 @@ import pytest
 import yaml
 from fastapi import FastAPI
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.bundles import bundle_location
 from omnigent.server.routes import session_mcp_servers as mcp_routes
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -407,3 +409,225 @@ async def test_mcp_mutation_rejects_legacy_source_tool_bundle(
     assert replaced.status_code == 200, replaced.text
     response = await client.request(method, path, json=payload if method != "DELETE" else None)
     assert response.status_code == (204 if method == "DELETE" else 200), response.text
+
+
+async def test_live_mcp_status_maps_each_runner_answer(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The panel's status read never fails; each runner answer becomes a ``reason``."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    answers: list[Any] = []
+    requests: list[tuple[str, str, Any]] = []
+
+    async def runner_request(
+        _router: object, _session_id: str, method: str, path: str, **kwargs: Any
+    ):
+        requests.append((method, path, kwargs.get("json")))
+        answer = answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(mcp_routes, "_live_mcp_runner_request", runner_request)
+    session = await create_test_session(client, name="live-mcp-agent")
+    url = f"/v1/sessions/{session['id']}/live-mcp-servers"
+    live = {
+        "running": True,
+        "servers": [
+            {"name": "plugin:tools:search", "status": "needs-auth"},
+            {"name": "docs", "status": "failed", "error": "connection refused", "scope": "user"},
+            {"status": "connected"},
+        ],
+    }
+    answers[:] = [
+        httpx.Response(200, json=live),
+        None,
+        httpx.Response(200, json={"running": False, "servers": []}),
+        httpx.Response(404, json={"error": "unsupported"}),
+        httpx.Response(504, json={"error": "harness_timeout"}),
+        httpx.Response(502, json={"error": "harness_unreachable", "detail": "harness exited"}),
+        httpx.ReadTimeout("slow"),
+        httpx.ConnectError("refused"),
+        ConnectionError("host tunnel closed"),
+        OmnigentError("The session's host is offline.", code=ErrorCode.RUNNER_UNAVAILABLE),
+    ]
+    results = []
+    for _ in range(len(answers)):
+        response = await client.get(url)
+        assert response.status_code == 200, response.text
+        results.append(response.json())
+
+    assert results[0] == {
+        "live": True,
+        "reason": None,
+        "detail": None,
+        "servers": [
+            {"name": "plugin:tools:search", "status": "needs-auth", "error": None, "scope": None},
+            {"name": "docs", "status": "failed", "error": "connection refused", "scope": "user"},
+        ],
+        "reconnect_error": None,
+    }
+    assert [(result["live"], result["reason"], result["detail"]) for result in results[1:]] == [
+        (False, "not_running", None),
+        (False, "not_running", None),
+        (False, "unsupported", None),
+        (False, "unavailable", mcp_routes._HARNESS_BUSY_MESSAGE),
+        (False, "unavailable", "harness exited"),
+        (False, "unavailable", mcp_routes._HARNESS_BUSY_MESSAGE),
+        (False, "unavailable", "Could not reach the session's host."),
+        (False, "unavailable", "Could not reach the session's host."),
+        (False, "unavailable", "The session's host is offline."),
+    ]
+    assert {request[:2] for request in requests} == {("GET", "live-mcp-servers")}
+
+    # A runner on another replica keeps its routing error so the client re-addresses.
+    answers.append(OmnigentError("Session is on another replica.", code=ErrorCode.WRONG_REPLICA))
+    misrouted = await client.get(url)
+    assert misrouted.status_code == 400, misrouted.text
+    assert misrouted.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+
+
+async def test_live_mcp_reconnect_maps_each_runner_answer(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused reconnect answers 200 with its reason; a missing harness or server does not."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    answers: list[Any] = []
+    requests: list[tuple[str, str, Any]] = []
+
+    async def runner_request(
+        _router: object, _session_id: str, method: str, path: str, **kwargs: Any
+    ):
+        requests.append((method, path, kwargs.get("json")))
+        answer = answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(mcp_routes, "_live_mcp_runner_request", runner_request)
+    session = await create_test_session(client, name="live-mcp-reconnect-agent")
+    url = f"/v1/sessions/{session['id']}/live-mcp-servers/reconnect"
+
+    answers.append(
+        httpx.Response(
+            200,
+            json={
+                "running": True,
+                "servers": [{"name": "docs", "status": "failed", "error": "token expired"}],
+                "reconnect_error": "token expired",
+            },
+        )
+    )
+    refused = await client.post(url, json={"name": "docs"})
+    assert refused.status_code == 200, refused.text
+    assert refused.json()["reconnect_error"] == "token expired"
+    assert refused.json()["servers"][0]["status"] == "failed"
+    assert requests == [("POST", "live-mcp-servers/reconnect", {"name": "docs"})]
+
+    # The harness is running but could not report after the reconnect.
+    answers.append(
+        httpx.Response(
+            200,
+            json={
+                "running": True,
+                "servers": [],
+                "status_unavailable": True,
+                "reconnect_error": "token expired",
+            },
+        )
+    )
+    unreported = (await client.post(url, json={"name": "docs"})).json()
+    assert (unreported["live"], unreported["reason"], unreported["reconnect_error"]) == (
+        False,
+        "unavailable",
+        "token expired",
+    )
+
+    cases: list[tuple[Any, int, str]] = [
+        (None, 409, "isn't running"),
+        (httpx.Response(409, json={"error": "harness_not_running"}), 409, "isn't running"),
+        (
+            httpx.Response(404, json={"error": "mcp_server_unknown"}),
+            404,
+            "no MCP server named 'docs'",
+        ),
+        (httpx.Response(404, json={"error": "unsupported"}), 404, "can't reconnect"),
+        (httpx.Response(504, json={"error": "harness_timeout"}), 503, "did not answer in time"),
+        (
+            httpx.Response(502, json={"error": "harness_unreachable", "detail": "gone"}),
+            503,
+            "gone",
+        ),
+        (httpx.ReadTimeout("slow"), 503, "did not answer in time"),
+        (httpx.ConnectError("refused"), 503, "Could not reach"),
+        (ConnectionError("host tunnel closed"), 503, "Could not reach"),
+        (OmnigentError("on another replica", code=ErrorCode.WRONG_REPLICA), 400, "replica"),
+    ]
+    for answer, status_code, message in cases:
+        answers.append(answer)
+        response = await client.post(url, json={"name": "docs"})
+        assert response.status_code == status_code, (answer, response.text)
+        assert message in response.text, (answer, response.text)
+
+    for body in ({}, {"name": ""}, {"name": "  "}, {"name": "docs", "extra": 1}):
+        invalid = await client.post(url, json=body)
+        assert invalid.status_code in (400, 422), invalid.text
+    assert answers == []
+
+
+class _LiveMcpRouter:
+    """Routes one conversation to a fake runner, or raises the offline error."""
+
+    def __init__(self, routed: Any) -> None:
+        self.routed = routed
+
+    def client_for_existing_conversation(self, conversation_id: str) -> Any:
+        if isinstance(self.routed, Exception):
+            raise self.routed
+        return self.routed
+
+
+async def test_live_mcp_runner_request_forwards_to_the_sessions_runner() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"live": True, "servers": []})
+
+    async with httpx.AsyncClient(
+        base_url="http://runner.example.com", transport=httpx.MockTransport(handler)
+    ) as client:
+        router: Any = _LiveMcpRouter(SimpleNamespace(client=client))
+        response = await mcp_routes._live_mcp_runner_request(
+            router,
+            "conv/a b",
+            "POST",
+            "live-mcp-servers/reconnect",
+            json={"name": "docs"},
+            timeout=5,
+        )
+    assert response is not None and response.status_code == 200
+    assert seen[0].method == "POST"
+    assert seen[0].url.raw_path == b"/v1/sessions/conv%2Fa%20b/live-mcp-servers/reconnect"
+    assert seen[0].read() == b'{"name":"docs"}'
+
+    # No router, or no runner holding the session, means nothing is running.
+    no_runner: Any = _LiveMcpRouter(None)
+    for absent in (None, no_runner):
+        assert (
+            await mcp_routes._live_mcp_runner_request(
+                absent, "conv_a", "GET", "live-mcp-servers", timeout=5
+            )
+            is None
+        )
+    offline: Any = _LiveMcpRouter(
+        OmnigentError("runner offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+    )
+    with pytest.raises(OmnigentError, match="runner offline"):
+        await mcp_routes._live_mcp_runner_request(
+            offline, "conv_a", "GET", "live-mcp-servers", timeout=5
+        )

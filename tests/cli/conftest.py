@@ -29,3 +29,5 @@ def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OMNIGENT_RUNNER_SLICE_KEY", raising=False)
     monkeypatch.delenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", raising=False)
     monkeypatch.setattr("omnigent.session_host._session_hosts", {})
+    # The last fallback, this machine's stored random key, reads as "client_key".
+    monkeypatch.setattr("omnigent.routing_key.client_routing_key", lambda: "client_key")

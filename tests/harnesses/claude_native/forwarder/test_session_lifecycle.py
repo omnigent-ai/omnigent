@@ -25,18 +25,24 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "project_available", [True, False], ids=["project-available", "project-not-found"]
+)
 async def test_clear_hook_rotates_active_session_without_reprocessing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    project_available: bool,
 ) -> None:
     """
     Claude ``/clear`` creates a fresh Omnigent session and consumes the hook.
 
     This exercises the rotation transaction directly: create the new
-    session, bind the same runner, transfer the terminal, rewrite the
-    active bridge session, clear the old runner binding, and keep the
-    hook cursor past the clear record so the next poll does not fork
-    again from the same hook line.
+    session with the old title and project, bind the same runner,
+    transfer the terminal, rewrite the active bridge session, clear the
+    old runner binding, and keep the hook cursor past the clear record
+    so the next poll does not fork again from the same hook line. A
+    project the server reports as not found (deleted, or owned by another
+    user) gets one unfiled retry and the same transaction.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
@@ -74,17 +80,14 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
                         "omnigent.ui": "terminal",
                         BRIDGE_ID_LABEL_KEY: "bridge_shared",
                     },
+                    "title": "Fix login flow",
+                    "project_id": "proj_alpha",
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions":
-            assert body == {
-                "agent_id": "ag_claude",
-                "labels": {
-                    "omnigent.ui": "terminal",
-                    BRIDGE_ID_LABEL_KEY: "bridge_shared",
-                },
-            }
-            return httpx.Response(201, json={"id": "conv_new"})
+            if project_available or "project_id" not in body:
+                return httpx.Response(201, json={"id": "conv_new"})
+            return httpx.Response(404, json={"error": {"message": "Project not found"}})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_new":
             assert body == {"runner_id": "runner_one"}
             return httpx.Response(200, json={"id": "conv_new"})
@@ -133,19 +136,18 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
     assert read_active_session_id(bridge_dir) == "conv_new"
     assert not (bridge_dir / "transcript_forwarder.json").exists()
     assert (bridge_dir / "hook_forwarder.json").exists()
+    unfiled_body = {
+        "agent_id": "ag_claude",
+        "labels": {"omnigent.ui": "terminal", BRIDGE_ID_LABEL_KEY: "bridge_shared"},
+        "title": "Fix login flow",
+    }
+    filed_body = {**unfiled_body, "project_id": "proj_alpha", "workspace": None, "git": None}
+    creates = [("POST", "/v1/sessions", filed_body)]
+    if not project_available:
+        creates.append(("POST", "/v1/sessions", unfiled_body))
     assert calls == [
         ("GET", "/v1/sessions/conv_old", None),
-        (
-            "POST",
-            "/v1/sessions",
-            {
-                "agent_id": "ag_claude",
-                "labels": {
-                    "omnigent.ui": "terminal",
-                    BRIDGE_ID_LABEL_KEY: "bridge_shared",
-                },
-            },
-        ),
+        *creates,
         ("PATCH", "/v1/sessions/conv_new", {"runner_id": "runner_one"}),
         (
             "POST",
@@ -158,6 +160,125 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             {"runner_id": "", "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}},
         ),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("measured_resume_prefix", [False, True])
+@pytest.mark.parametrize("transcript_delayed", [False, True])
+@pytest.mark.parametrize("transfer_rejected", [False, True])
+async def test_clear_after_resume_preserves_input_recorded_before_cursor_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    measured_resume_prefix: bool,
+    transcript_delayed: bool,
+    transfer_rejected: bool,
+) -> None:
+    """A fresh cleared transcript must not inherit its parent's skip-prefix policy."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)
+    old_transcript = tmp_path / "old.jsonl"
+    old_transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "old-input",
+                "message": {"role": "user", "content": "old history"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    old_content = old_transcript.read_text(encoding="utf-8")
+    parent_prefix = old_transcript.stat().st_size
+    forwarder._write_forward_state(
+        bridge_dir,
+        forwarder.TranscriptForwardState(
+            transcript_path=old_transcript,
+            line_cursor=0,
+            byte_offset=parent_prefix,
+            cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(old_transcript, parent_prefix),
+        ),
+    )
+    transcript = tmp_path / "new.jsonl"
+    native_record = (
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "after-clear",
+                "message": {"role": "user", "content": "new input"},
+            }
+        )
+        + "\n"
+    )
+    if not transcript_delayed:
+        transcript.write_text(native_record, encoding="utf-8")
+    target_session = "conv_old" if transfer_rejected else "conv_new"
+    record_hook_event(
+        bridge_dir,
+        {"hook_event_name": "SessionStart", "source": "clear", "transcript_path": str(transcript)},
+    )
+    mirrored: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_old",
+                    "agent_id": "agent",
+                    "runner_id": "runner",
+                    "labels": {BRIDGE_ID_LABEL_KEY: "bridge_shared"},
+                },
+            )
+        body = json.loads(request.content) if request.content else {}
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(201, json={"id": "conv_new"})
+        if request.url.path.endswith("/transfer") and transfer_rejected:
+            return httpx.Response(400, json={"detail": "terminal transfer rejected"})
+        if (
+            request.method == "POST"
+            and request.url.path == f"/v1/sessions/{target_session}/events"
+        ):
+            assert body["type"] == "external_conversation_item"
+            mirrored.append(body)
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://ap"
+    ) as client:
+        hooks = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_old"
+        )
+        rotated_to = await forwarder._maybe_rotate_session_on_clear(
+            client=client, session_id="conv_old", bridge_dir=bridge_dir, state=hooks
+        )
+        assert rotated_to == (None if transfer_rejected else "conv_new")
+        assert read_active_session_id(bridge_dir) == target_session
+        if transcript_delayed:
+            transcript.write_text(native_record, encoding="utf-8")
+        state = await forwarder._ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=None,
+            transcript_path=transcript,
+            start_at_end=True,
+            start_at_offset=parent_prefix if measured_resume_prefix else None,
+            session_id=target_session,
+        )
+        assert state.byte_offset == 0
+        for _ in range(2):
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id=target_session,
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=forwarder._ForwardDedupeState(),
+            )
+    assert [event["data"]["source_id"] for event in mirrored] == ["after-clear:0:message"]
+    assert transcript.read_text(encoding="utf-8") == native_record
+
+    assert old_transcript.read_text(encoding="utf-8") == old_content
 
 
 @pytest.mark.asyncio

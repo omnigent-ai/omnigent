@@ -4,6 +4,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type * as WorkspaceChangedFiles from "./useWorkspaceChangedFiles";
 import {
   usePullRequestChangedFiles,
+  usePullRequestDiff,
   usePullRequestInfo,
   useUpdateSessionPr,
 } from "./usePullRequests";
@@ -114,6 +115,42 @@ it("preserves changed-file incompleteness from the host response", async () => {
 
   await waitFor(() => expect(result.current.isSuccess).toBe(true));
   expect(result.current.data).toEqual({ ...payload, available: true });
+});
+
+it("pins the changed-file list to the same revision as the diff", async () => {
+  const url = "https://github.com/example/one/pull/42";
+  const revision = `${"b".repeat(40)}:${"a".repeat(40)}`;
+  const fetchMock = vi.fn(
+    async () => new Response(JSON.stringify({ object: "list", data: [] }), { status: 200 }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const { result } = renderHook(
+    () => ({
+      changes: usePullRequestChangedFiles("conv", true, url, revision),
+      diff: usePullRequestDiff("conv", true, url, revision),
+    }),
+    {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    },
+  );
+
+  await waitFor(() =>
+    expect(result.current.changes.isSuccess && result.current.diff.isSuccess).toBe(true),
+  );
+  const queries = fetchMock.mock.calls.map((call: unknown[]) => {
+    const request = new URL(String(call[0]), "http://localhost");
+    return [request.pathname.split("/").pop(), Object.fromEntries(request.searchParams)];
+  });
+  const pinned = { pr_url: url, base_sha: "b".repeat(40), head_sha: "a".repeat(40) };
+  expect(queries).toEqual(
+    expect.arrayContaining([
+      ["changes", pinned],
+      ["diff", pinned],
+    ]),
+  );
 });
 
 it("replaces the default selection and the removed PR's cached metadata", async () => {

@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -53,7 +53,11 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
 )
-from omnigent.cli_diagnostics import printable
+from omnigent.cli_diagnostics import (
+    SUPPRESS_RECOVERY_HINT_ATTR,
+    printable,
+    suppresses_recovery_hint,
+)
 from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import (
     announce_conversation_url,
@@ -140,6 +144,10 @@ _PER_TURN_TIMEOUT_S = 120.0
 # Overall budget for following one headless ``-p`` session to idle
 # (first-turn recovery and the extra-turns loop share it).
 _LOOP_TIMEOUT_S = 1800.0  # 30 min total
+# Snapshot statuses that keep a headless ``-p`` run going. The server reports any
+# ``waiting`` (an async orchestrator's, or a claude-native turn's background-agent
+# hold) as ``running``; ``waiting`` is here in case a snapshot ever carries it raw.
+_HEADLESS_UNFINISHED_STATUSES = frozenset({"running", "launching", "waiting"})
 
 # Optional bearer token for remote omnigent servers that sit
 # behind an auth proxy (for example Databricks Apps). When set, the
@@ -928,6 +936,33 @@ class _DatabricksTokenAuth(httpx.Auth):
         :param request: The outgoing httpx request.
         :yields: The request with auth header set.
         """
+        self._apply_headers(request)
+        yield request
+
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> Generator[httpx.Request, httpx.Response, None]:
+        """Authenticate *request*, re-sending it unkeyed once after a ``wrong_replica`` miss."""
+        self._apply_headers(request)
+        response = yield request
+        if _keyed_wrong_replica_candidate(request, response):
+            response.read()
+            if _is_wrong_replica(response):
+                yield _unkeyed(request)
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        """Async twin of :meth:`sync_auth_flow`."""
+        self._apply_headers(request)
+        response = yield request
+        if _keyed_wrong_replica_candidate(request, response):
+            await response.aread()
+            if _is_wrong_replica(response):
+                yield _unkeyed(request)
+
+    def _apply_headers(self, request: httpx.Request) -> None:
+        """Set the routing and ``Authorization`` headers on *request*."""
         if self._server_url:
             from omnigent.cli_auth import databricks_request_headers
 
@@ -959,7 +994,35 @@ class _DatabricksTokenAuth(httpx.Auth):
                 token = self._sdk_token()
                 if token:
                     request.headers["Authorization"] = f"Bearer {token}"
-        yield request
+
+
+def _keyed_wrong_replica_candidate(request: httpx.Request, response: httpx.Response) -> bool:
+    # Only a 400 can be wrong_replica; reading other bodies would buffer streams.
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, UNKEYED_REQUEST_EXTENSION
+
+    return (
+        response.status_code == 400
+        and OMNIGENT_SLICE_KEY_HEADER in request.headers
+        and not request.extensions.get(UNKEYED_REQUEST_EXTENSION)
+    )
+
+
+def _is_wrong_replica(response: httpx.Response) -> bool:
+    from omnigent.runner.session_requests import is_wrong_replica
+
+    return is_wrong_replica(response)
+
+
+def _unkeyed(request: httpx.Request) -> httpx.Request:
+    """*request* re-addressed without a slice key, reaching the default replica.
+
+    A host whose tunnels connected without a key is only reachable there.
+    """
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, UNKEYED_REQUEST_EXTENSION
+
+    request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
+    request.extensions[UNKEYED_REQUEST_EXTENSION] = True
+    return request
 
 
 def _server_headers(
@@ -2734,9 +2797,28 @@ async def _run_bound_turn(
     tool_callables: dict[str, ToolCallable] | None,
 ) -> str | None:
     """Send one prompt on a bound session and return the final assistant text."""
-    from omnigent_client import SessionsChat
+    from omnigent_client import SessionsChat, StreamHooks
+    from omnigent_client._tool_handler import ResponseEndCtx
 
     session_files = client.files.for_session(bound.id)
+    # ``SessionsChat.query`` ends quietly on ``response.failed`` and returns
+    # whatever text streamed before it, so a turn that failed after emitting an
+    # error as text (the Claude CLI's "apiKeyHelper script is failing") would
+    # print as a reply and exit 0. Record the turn's own failure to raise it.
+    turn_failures: list[ClientOmnigentError] = []
+
+    def _note_failed_turn(ctx: ResponseEndCtx) -> None:
+        if ctx.status != "failed":
+            return
+        error = ctx.response.error
+        failure = ClientOmnigentError(
+            error.message if error is not None and error.message else "turn failed",
+            code=error.code if error is not None else None,
+        )
+        # The runner ran the turn, so `omnigent stop` cannot fix this failure.
+        setattr(failure, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        turn_failures.append(failure)
+
     chat = SessionsChat(
         namespace=client.sessions,
         files_uploader=session_files.upload,
@@ -2744,6 +2826,7 @@ async def _run_bound_turn(
         session=bound,
         tool_callables=tool_callables,
         agent_tools_getter=client._fetch_agent_tools,
+        hooks=StreamHooks(on_response_end=_note_failed_turn),
     )
     # A transport-level runner disconnect publishes ``session.status:
     # failed`` for every session pinned to that runner (server
@@ -2802,7 +2885,7 @@ async def _run_bound_turn(
             async with asyncio.timeout(_LOOP_TIMEOUT_S):
                 while True:
                     await chat.refresh()
-                    if chat.status not in ("running", "launching"):
+                    if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
                         break
                     await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
         reconciled = await _persisted_turn_text(client, bound.id)
@@ -2814,6 +2897,10 @@ async def _run_bound_turn(
             "(subscribe-after-post race: the terminal event was lost and "
             "the runner appears not to have completed either)."
         ) from None
+    if turn_failures:
+        # Not reconciled: the transcript can hold the failed turn's error text
+        # as a completed assistant item, which would read as a reply.
+        raise turn_failures[0]
     all_text_parts: list[str] = []
     if result.text:
         all_text_parts.append(result.text)
@@ -2871,7 +2958,7 @@ async def _run_bound_turn(
         # relay cache holds "waiting" (sub-agents still running); "idle" means
         # truly done (single-turn agent, or synthesis completed in the probe).
         await chat.refresh()
-        if chat.status not in ("running", "launching"):
+        if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
             return
         # Async orchestrator confirmed. Loop, refreshing after each turn.
         for _ in range(_MAX_EXTRA_TURNS):
@@ -2879,7 +2966,7 @@ async def _run_bound_turn(
             if extra.text:
                 all_text_parts.append(extra.text)
             await chat.refresh()
-            if chat.status not in ("running", "launching"):
+            if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
                 return  # Idle: synthesis done or all sub-agents complete.
         logger.warning(
             "headless -p hit the %d-turn guard for session %s; "
@@ -2902,7 +2989,7 @@ async def _run_bound_turn(
         return "\n\n".join(p for p in all_text_parts if p)
     # An auto-woken turn can finish between live-stream subscriptions.
     # Recheck its durable output once the session has stopped running.
-    if chat.status not in ("running", "launching"):
+    if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             logger.info("Recovered headless output from completed session %s", bound.id)
@@ -4573,7 +4660,10 @@ def _run_one_shot(
         # raises as an OmnigentError. Surface its message as a clean
         # CLI error instead of an opaque traceback so ``-p`` users see
         # why the turn produced no output.
-        raise click.ClickException(str(exc)) from exc
+        error = click.ClickException(str(exc))
+        if suppresses_recovery_hint(exc):
+            setattr(error, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        raise error from exc
 
 
 # ---------------------------------------------------------------------------

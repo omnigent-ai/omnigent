@@ -11,11 +11,19 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ClockIcon, InfoIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-react";
+import {
+  ClockIcon,
+  InfoIcon,
+  Loader2Icon,
+  PlusIcon,
+  SearchIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { showToast } from "@/components/ui/toast";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { AutomationsIntro } from "@/components/scheduled/AutomationsIntro";
@@ -33,7 +41,7 @@ import {
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
-import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
 
@@ -107,6 +115,22 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     setManualOpen(true);
   }
 
+  // After an automation is created, show the list with filters cleared so the
+  // new row is visible (creating from a template starts on the gallery view).
+  function handleCreated() {
+    setFilter("all");
+    setSearch("");
+    if (view !== "yours") {
+      requestedView.current = "yours";
+      setSearchParams((current) => {
+        const next = new URLSearchParams(current);
+        next.delete("view");
+        return next;
+      });
+    }
+    showToast("Automation created");
+  }
+
   function handleManualOpenChange(next: boolean) {
     setManualOpen(next);
     if (!next) {
@@ -171,7 +195,20 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   function handleRunNow(task: ScheduledTask) {
-    runNowMutation.mutate(task.id);
+    runNowMutation.mutate(task.id, {
+      onSuccess: () => {
+        showToast(
+          "Run triggered, it will start shortly. Open automation details to check run history.",
+        );
+      },
+      onError: (err) => {
+        if (err instanceof ScheduledTaskApiError && err.status === 409) {
+          showToast("This run is already in progress");
+        } else {
+          showToast("Couldn't start the run");
+        }
+      },
+    });
   }
 
   function handleEdit(task: ScheduledTask) {
@@ -192,11 +229,16 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       initialTemplateId={selectedTemplate?.id}
       sessionLink={sessionLink}
       editingTask={editingTask}
+      onCreated={handleCreated}
     />
   );
 
   return (
-    <PageScroll className="[scrollbar-gutter:stable]" contentClassName="px-4 md:px-6">
+    <PageScroll
+      maxWidthClassName="max-w-4xl"
+      className="[scrollbar-gutter:stable]"
+      contentClassName="px-4 md:px-8"
+    >
       {tasks !== undefined && (view === "yours" || introOpens > 0) && (
         <AutomationsIntro
           openCount={introOpens}
@@ -206,7 +248,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       <div className="mb-6 flex items-start justify-between gap-4">
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-1">
-            <h1 className="text-2xl font-semibold">Automations</h1>
+            <h1 className="settings-page-title text-2xl font-medium">Automations</h1>
             <Button
               ref={introButtonRef}
               variant="ghost"
@@ -220,9 +262,6 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
               <InfoIcon className="size-4" />
             </Button>
           </div>
-          <p className="text-ui text-muted-foreground">
-            Run agent sessions on a recurring schedule.
-          </p>
         </div>
         <Button
           ref={newTaskButtonRef}
@@ -231,7 +270,8 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
           componentId="tasks.new"
           onClick={openManual}
         >
-          New automation
+          <PlusIcon />
+          New
         </Button>
       </div>
 
@@ -342,12 +382,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
               Loading automations…
             </div>
           ) : filtered.length === 0 ? (
-            <EmptyState
-              hasAny={hasAnyTasks}
-              showSuggestions={filter === "all"}
-              onPickTemplate={openFromTemplate}
-              triggersSupported={triggersSupported}
-            />
+            <EmptyState hasAny={hasAnyTasks} />
           ) : (
             <div className="flex flex-col gap-2" data-testid="tasks-list">
               {filtered.map((task) => (
@@ -364,6 +399,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
               ))}
             </div>
           )}
+          {!isError && !isLoading && filter === "all" && !search.trim() && triggersSupported && (
+            <TemplateGallery onPick={openFromTemplate} preview />
+          )}
         </TabsContent>
         <TabsContent value="templates" className="mt-4">
           {triggersSupported ? (
@@ -379,34 +417,19 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   );
 }
 
-function EmptyState({
-  hasAny,
-  showSuggestions,
-  onPickTemplate,
-  triggersSupported,
-}: {
-  hasAny: boolean;
-  showSuggestions: boolean;
-  onPickTemplate: (id: string) => void;
-  triggersSupported: boolean;
-}) {
+function EmptyState({ hasAny }: { hasAny: boolean }) {
   return (
     <div className="py-8" data-testid="tasks-empty-state">
       {hasAny ? (
         <div className="py-10 text-center text-ui text-muted-foreground">No automations found</div>
       ) : (
-        <>
-          <div className="flex flex-col items-center gap-2 py-8 text-center">
-            <ClockIcon className="size-8 text-muted-foreground/50" />
-            <p className="text-ui font-medium">No automations yet</p>
-            <p className="max-w-sm text-sm text-muted-foreground">
-              Create an automation to run an agent session automatically on a recurring schedule.
-            </p>
-          </div>
-          {showSuggestions && triggersSupported && (
-            <TemplateGallery onPick={onPickTemplate} preview />
-          )}
-        </>
+        <div className="flex flex-col items-center gap-2 py-8 text-center">
+          <ClockIcon className="size-8 text-muted-foreground/50" />
+          <p className="text-ui font-medium">No automations yet</p>
+          <p className="max-w-sm text-sm text-muted-foreground">
+            Create an automation to run an agent session automatically on a recurring schedule.
+          </p>
+        </div>
       )}
     </div>
   );
@@ -425,8 +448,8 @@ function TemplateGallery({
       data-testid="tasks-suggestions"
       aria-label={preview ? "Suggested Automations" : "Automation templates"}
     >
-      {preview && <h2 className="mb-3 text-base font-semibold">Suggested Automations</h2>}
-      <div className="grid gap-x-6 gap-y-2 md:grid-cols-2">
+      {preview && <h2 className="mb-3 text-base font-semibold">Suggested</h2>}
+      <div className="grid gap-3 md:grid-cols-2">
         {AUTOMATION_TEMPLATES.map((template) => {
           const Icon = template.icon;
           const detailsId = `automation-template-${template.id}`;
@@ -435,27 +458,23 @@ function TemplateGallery({
               key={template.id}
               type="button"
               aria-label={template.title}
-              aria-describedby={`${detailsId}-description ${detailsId}-schedule ${detailsId}-requirements`}
+              aria-describedby={`${detailsId}-description ${detailsId}-requirements`}
               onClick={() => onPick(template.id)}
               data-testid={template.testId}
-              className="flex cursor-pointer items-start gap-4 rounded-xl p-4 text-left text-ui transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="flex cursor-pointer items-start gap-4 rounded-[20px] border border-border bg-card p-4 text-left text-ui transition-colors hover:border-foreground/20 hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
             >
               <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-muted">
                 <Icon className={cn("size-5", template.iconClassName)} />
               </span>
               <span className="flex min-w-0 flex-col gap-2">
-                <span className="font-medium">{template.title}</span>
-                <span id={`${detailsId}-description`} className="text-muted-foreground">
+                <span className="text-ui font-medium">{template.title}</span>
+                <span id={`${detailsId}-description`} className="text-sm text-muted-foreground">
                   {template.description}
                 </span>
                 <span
-                  id={`${detailsId}-schedule`}
-                  className="flex items-center gap-2 text-muted-foreground"
+                  id={`${detailsId}-requirements`}
+                  className="text-caption text-muted-foreground"
                 >
-                  <ClockIcon className="size-4 shrink-0" />
-                  Checks every hour
-                </span>
-                <span id={`${detailsId}-requirements`} className="text-xs text-muted-foreground">
                   {template.needs}
                 </span>
               </span>

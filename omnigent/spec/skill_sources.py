@@ -36,6 +36,7 @@ from omnigent.spec.parser import (
     discover_host_skills,
     skill_matches_names,
 )
+from omnigent.spec.repo_scope import repo_scope_dirs
 from omnigent.spec.types import AgentSpec, SkillSpec
 
 _log = logging.getLogger(__name__)
@@ -444,6 +445,26 @@ def _plugin_install_paths(
     # skipped so a tampered/odd manifest can't turn an arbitrary directory into
     # a discovery root.
     plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
+    # Profile managers (e.g. ccs) symlink ``plugins/cache`` to a cache shared
+    # across config dirs; its target is as trusted as the root that links it.
+    plugin_roots = [plugins_root]
+    cache_link = plugins_root / "cache"
+    try:
+        if cache_link.is_symlink():
+            # Strict: a non-strict resolve can lexically collapse ``..`` past a
+            # loop and name a real directory the link can't actually reach.
+            cache_target = cache_link.resolve(strict=True)
+            if cache_target.is_dir():
+                plugin_roots.append(cache_target)
+            else:
+                _log.warning(
+                    "Ignoring plugins cache %s: target %s is not a directory",
+                    cache_link,
+                    cache_target,
+                )
+    except (OSError, RuntimeError) as exc:
+        # A loop or dangling link raises here; the root alone keeps other plugins usable.
+        _log.warning("Ignoring unresolvable plugins cache %s: %s", cache_link, exc)
     out: dict[str, Path] = {}
     for key, entries in plugins.items():
         if (enabled is not None and key not in enabled) or not isinstance(entries, list):
@@ -458,15 +479,44 @@ def _plugin_install_paths(
             # A relative installPath is resolved against the plugins root
             # (its only sensible base), never the runner's cwd.
             path_obj = Path(path)
-            resolved = (path_obj if path_obj.is_absolute() else plugins_root / path_obj).resolve()
-            if not resolved.is_relative_to(plugins_root):
+            try:
+                resolved = (
+                    path_obj if path_obj.is_absolute() else plugins_root / path_obj
+                ).resolve()
+            except (OSError, RuntimeError) as exc:
                 _log.warning(
-                    "Skipping plugin %r: installPath %r is outside %s",
+                    "Skipping entry for plugin %r: installPath %r is unresolvable: %s",
                     key,
                     path,
-                    plugins_root,
+                    exc,
                 )
-                break
+                continue
+            if not any(resolved.is_relative_to(root) for root in plugin_roots):
+                _log.warning(
+                    "Skipping entry for plugin %r: installPath %r is outside the trusted roots %s",
+                    key,
+                    path,
+                    ", ".join(str(root) for root in plugin_roots),
+                )
+                continue
+            # Python 3.13+ returns a dead path for a symlink loop instead of
+            # raising; only an existing directory can be the plugin's install.
+            # On 3.12, ``is_dir`` raises for an unsearchable parent directory.
+            try:
+                is_dir = resolved.is_dir()
+            except OSError as exc:
+                _log.warning(
+                    "Skipping entry for plugin %r: installPath %r is unreadable: %s",
+                    key,
+                    path,
+                    exc,
+                )
+                continue
+            if not is_dir:
+                _log.warning(
+                    "Skipping entry for plugin %r: installPath %r is not a directory", key, path
+                )
+                continue
             out[key] = resolved
             break
     return out
@@ -669,15 +719,8 @@ def _claude_command_roots(ctx: SkillSourceContext) -> list[Path]:
     roots = [_claude_user_dir(ctx) / "commands"]
     if not ctx.roots:
         return roots
-    home = ctx.home.resolve()
-    workspace = ctx.roots[0].resolve()
-    for directory in (workspace, *workspace.parents):
-        if directory == home:
-            break
-        roots.append(directory / ".claude" / "commands")
-        if (directory / ".git").exists():
-            break
-    return roots
+    project = repo_scope_dirs(ctx.roots[0], home=ctx.home, outside_repo="ancestors")
+    return roots + [directory / ".claude" / "commands" for directory in project]
 
 
 def _discover_claude_commands(
@@ -860,10 +903,18 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     Reuses the Codex executor's own helpers — ``codex_skill_sources`` (the
     shared source-list builder) and ``select_codex_skill_dirs`` (the shared
     selector) — so the menu draws from the same roots and selection the
-    executor symlinks into ``$CODEX_HOME/skills/``. The menu is the subset of
-    that selection whose ``SKILL.md`` parses: the executor links by existence,
-    so a present-but-unparseable skill is linked but not shown (correct — Codex
-    won't register a malformed skill as a command either).
+    executor symlinks into ``$CODEX_HOME/skills/``, plus the native repo-scope
+    ``.agents/skills`` dirs Codex reads from its workspace cwd (first root).
+    The menu is the subset of that selection whose ``SKILL.md`` parses: the
+    executor links by existence, so a present-but-unparseable skill is linked
+    but not shown (correct — Codex won't register a malformed skill as a
+    command either).
+
+    Native skills come first and ignore ``skills_filter``: Codex loads repo
+    skills whatever the filter and ranks them above the linked user skills.
+    Codex lists every same-named copy, and a plain ``$name`` that matches more
+    than one injects none of them. Codex has no precedence within the repo
+    scope, so the nearest directory wins here.
 
     A native ``codex-native`` session honors ``$CODEX_HOME``: its launch seeds
     the per-bridge home from the ``$CODEX_HOME``-resolved host home, so the menu
@@ -888,16 +939,21 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     from omnigent.spec.codex_plugin_skills import discover_codex_plugin_skills
 
     host_override = ctx.codex_home if ctx.is_native else None
-    sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=host_override)
+    cwd = ctx.roots[0] if ctx.roots else None
+    sources = codex_skill_sources(
+        ctx.bundle_dir, ctx.home, codex_home=host_override, workspace=cwd
+    )
+    selected = select_codex_skill_dirs("all", sources.native)
+    for name, skill_dir in select_codex_skill_dirs(ctx.skills_filter, sources.linked).items():
+        selected.setdefault(name, skill_dir)
     out: list[SkillSpec] = []
-    for name, skill_dir in select_codex_skill_dirs(ctx.skills_filter, sources).items():
+    for name, skill_dir in selected.items():
         try:
             spec = _parse_skill(skill_dir / "SKILL.md")
         except (OmnigentError, OSError):  # best-effort discovery
             continue
         out.append(replace(spec, name=name))
     codex_home = host_override if host_override is not None else ctx.home / ".codex"
-    cwd = ctx.roots[0] if ctx.roots else None
     out.extend(
         discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd, warnings=ctx.warnings)
     )

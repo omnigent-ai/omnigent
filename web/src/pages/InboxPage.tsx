@@ -42,6 +42,10 @@
  * what clears an approval.
  */
 
+import type { AutomationFailure } from "@/lib/scheduledTasksApi";
+import { describeRunFailure } from "@/lib/scheduleText";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import type { Query } from "@tanstack/react-query";
 import type { Session } from "@/lib/types";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
@@ -105,6 +109,12 @@ import { latestOutput } from "@/lib/lastAssistantText";
 import { isEditorLevel } from "@/lib/permissionsApi";
 import { randomUUID } from "@/lib/randomUUID";
 import { describeSendFailure } from "@/lib/sendFailure";
+import {
+  acknowledgeLocalElicitationResolution,
+  affectedSessionIds,
+  beginLocalElicitationResolution,
+  cancelLocalElicitationResolution,
+} from "@/lib/localElicitationResolutions";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -179,7 +189,8 @@ const PREVIEW_MAX_CHARS = 280;
 type InboxEntry =
   | { kind: "approval"; key: string; at: number; item: InboxItem }
   | { kind: "comment"; key: string; at: number; item: CommentInboxItem }
-  | { kind: "unread"; key: string; at: number; item: UnreadInboxItem };
+  | { kind: "unread"; key: string; at: number; item: UnreadInboxItem }
+  | { kind: "automation"; key: string; at: number; item: AutomationFailure };
 
 const TILE_TONES = {
   yellow: "bg-status-yellow/12 text-status-yellow",
@@ -189,18 +200,25 @@ const TILE_TONES = {
 
 // Compact action buttons inside an expanded card.
 const OUTLINE_ACTION =
-  "rounded-md border-button-border bg-transparent text-ui text-muted-foreground hover:text-foreground";
+  "mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal rounded-md border-button-border bg-transparent text-ui text-muted-foreground hover:text-foreground";
 const PRIMARY_ACTION =
-  "rounded-md bg-foreground text-ui text-card hover:bg-foreground/80 [&_svg]:text-card";
+  "mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal rounded-md bg-foreground text-ui text-card hover:bg-foreground/80 [&_svg]:text-card";
 
 export function InboxPage() {
   const queryClient = useQueryClient();
   const { trackClick } = useOmnigentAnalytics();
+  useEffect(() => {
+    void queryClient.invalidateQueries({ queryKey: ["automation-inbox"] });
+  }, [queryClient]);
   const {
     inbox: conversationsQuery,
-    inboxRows: allRows,
+    // Server counts, not the answer overlay: a card answered here stays listed,
+    // with its delivery state, until the server drops the prompt.
+    serverInboxRows: allRows,
     comments: commentInbox,
+    automationInbox,
   } = useSidebarData();
+  const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
   const [filter, setFilter] = useState<InboxFilter>(readInboxFilter);
   const [responded, setResponded] = useState<RespondedMap>({});
   const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
@@ -307,19 +325,35 @@ export function InboxPage() {
   const visibleApprovals = showApprovals ? items : [];
   const visibleComments = showUnread ? commentInbox.items : [];
   const visibleUnread = showUnread ? unreadItems : [];
-  const visibleCount = visibleApprovals.length + visibleComments.length + visibleUnread.length;
-  const totalCount = items.length + commentInbox.items.length + unreadItems.length;
+  const visibleAutomations = showUnread ? automationInbox.items : [];
+  const visibleCount =
+    visibleApprovals.length +
+    visibleComments.length +
+    visibleUnread.length +
+    visibleAutomations.length;
+  const totalCount =
+    items.length + commentInbox.items.length + unreadItems.length + automationInbox.items.length;
   const summary = [
     items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
     commentInbox.items.length > 0 &&
       (commentInbox.items.length === 1 ? "1 comment" : `${commentInbox.items.length} comments`),
     unreadItems.length > 0 && `${unreadItems.length} unread`,
+    automationInbox.items.length > 0 &&
+      (automationInbox.items.length === 1
+        ? "1 failed automation"
+        : `${automationInbox.items.length} failed automations`),
   ]
     .filter(Boolean)
     .join(" · ");
   const emptyState = EMPTY_STATES[filter];
 
   const groups = groupInboxEntries<InboxEntry>([
+    ...visibleAutomations.map((item) => ({
+      kind: "automation" as const,
+      key: `automation:${item.runId}`,
+      at: item.finishedAt ?? item.scheduledAt,
+      item,
+    })),
     ...visibleApprovals.map((item) => ({
       kind: "approval" as const,
       key: `approval:${item.elicitation.elicitationId}`,
@@ -379,7 +413,8 @@ export function InboxPage() {
     conversationsQuery.isLoading ||
     isFetchingNextPage ||
     snapshotQueries.some((q) => q.isLoading) ||
-    commentInbox.isLoading;
+    commentInbox.isLoading ||
+    (showUnread && automationInbox.isLoading);
   const failedSnapshots = snapshotQueries.filter((q) => q.isError);
   const failedSessionCount =
     failedSnapshots.length + commentInbox.failedCount + Number(Boolean(conversationsQuery.isError));
@@ -400,6 +435,15 @@ export function InboxPage() {
       };
       pendingSubmissions.current.set(elicitationId, verdict);
       setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
+      const holdToken = beginLocalElicitationResolution(
+        elicitationId,
+        affectedSessionIds(
+          [item.row.id, item.resolveSessionId],
+          (knownSessionId) =>
+            queryClient.getQueryData<Session>(["session", knownSessionId])?.parentSessionId,
+        ),
+        { nativeDelivery: Boolean(item.elicitation.nativeDelivery) },
+      );
       void approve(item.resolveSessionId, elicitationId, {
         action,
         ...(content === undefined ? {} : { content }),
@@ -408,6 +452,7 @@ export function InboxPage() {
         () => {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
           pendingSubmissions.current.delete(elicitationId);
+          acknowledgeLocalElicitationResolution(elicitationId, holdToken);
           clearAskUserQuestionDraft(elicitationId);
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
           if (item.elicitation.nativeDelivery) {
@@ -420,6 +465,7 @@ export function InboxPage() {
         () => {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
           pendingSubmissions.current.delete(elicitationId);
+          cancelLocalElicitationResolution(elicitationId, holdToken);
           // Roll back to pending so the buttons reappear and the user
           // can retry — same recovery the chat store uses.
           setResponded((prev) => {
@@ -438,6 +484,47 @@ export function InboxPage() {
       trackClick(`inbox.${entry.kind}.toggle_expanded`, "button");
       setExpandedOverrides((prev) => ({ ...prev, [entry.key]: !expanded }));
     };
+    if (entry.kind === "automation") {
+      const { item } = entry;
+      const failure = describeRunFailure(item.errorCode, "failed");
+      const reason = failure.stage ? `${failure.stage} · ${failure.reason}` : failure.reason;
+      return (
+        <InboxCard
+          key={entry.key}
+          testId="inbox-automation-item"
+          tile={<KindTile icon={AlertTriangleIcon} tone="red" />}
+          kindLabel="Automation failed"
+          title={item.taskName}
+          preview={reason}
+          at={entry.at}
+          unread
+          expanded={expanded}
+          onToggle={onToggle}
+        >
+          <p className="text-ui font-medium">{item.taskName}</p>
+          <p className="mt-2 text-ui text-muted-foreground">{reason}</p>
+          <InboxActions>
+            <Button asChild size="xs" className={PRIMARY_ACTION}>
+              <Link
+                to={taskDetailsEnabled ? `/tasks/${item.taskId}` : "/tasks"}
+                componentId="inbox.automation.open"
+              >
+                Open automation <ArrowRightIcon className="size-3.5" />
+              </Link>
+            </Button>
+            <Button
+              variant="outline"
+              size="xs"
+              className={OUTLINE_ACTION}
+              onClick={() => automationInbox.markRead(item.runId)}
+              componentId="inbox.automation.mark_read"
+            >
+              <CheckIcon className="size-3.5" /> Mark as read
+            </Button>
+          </InboxActions>
+        </InboxCard>
+      );
+    }
     const title = conversationDisplayLabel(entry.item.row);
 
     if (entry.kind === "approval") {
@@ -489,6 +576,7 @@ export function InboxPage() {
             response={verdict ?? null}
             askUserQuestion={item.elicitation.askUserQuestion}
             exitPlanMode={item.elicitation.exitPlanMode}
+            fileEdit={item.elicitation.fileEdit}
             codexCommand={item.elicitation.codexCommand}
             allowAllEdits={item.elicitation.allowAllEdits}
             allowAutoMode={item.elicitation.allowAutoMode}
@@ -565,10 +653,14 @@ export function InboxPage() {
               {/* Deep-link into the file browser with this comment selected —
                   opening it there marks it seen, which clears this item. */}
               <Link
-                to={`/c/${entry.item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`}
+                to={
+                  comment.anchor_metadata
+                    ? `/c/${entry.item.row.id}`
+                    : `/c/${entry.item.row.id}?file=${encodeURIComponent(comment.path)}&comment=${encodeURIComponent(comment.id)}`
+                }
                 componentId="inbox.comment.open_file"
               >
-                Open file
+                {comment.anchor_metadata ? "Open session" : "Open file"}
                 <ArrowRightIcon className="size-3.5" />
               </Link>
             </Button>
@@ -805,9 +897,17 @@ export function InboxPage() {
         componentId="inbox.filter"
         className="mb-4"
       >
-        <TabsList variant="pill" aria-label="Inbox filter" className="gap-1">
+        <TabsList
+          variant="pill"
+          aria-label="Inbox filter"
+          className="gap-1 mobile-app:max-w-full mobile-app:flex-wrap mobile-app:justify-start"
+        >
           {INBOX_TABS.map(({ value, label }) => (
-            <TabsTrigger key={value} value={value} className="h-7 flex-none px-3">
+            <TabsTrigger
+              key={value}
+              value={value}
+              className="h-7 mobile-touch-target mobile-app:h-auto flex-none mobile-app:whitespace-normal px-3"
+            >
               {label}
             </TabsTrigger>
           ))}
@@ -839,6 +939,20 @@ export function InboxPage() {
         </div>
       )}
 
+      {showUnread && automationInbox.isError && (
+        <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
+          Couldn’t load automation failures.
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void automationInbox.refetch()}
+            componentId="inbox.retry_automations"
+          >
+            Retry automations
+          </Button>
+        </div>
+      )}
+
       {assembling && visibleCount === 0 && (
         <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
@@ -846,15 +960,20 @@ export function InboxPage() {
         </div>
       )}
 
-      {!assembling && failedSessionCount === 0 && visibleCount === 0 && (
-        <div className="flex flex-col items-center gap-2 py-16 text-center">
-          <InboxIcon className="size-8 text-muted-foreground/50" />
-          <p className="text-ui font-medium">
-            {hasNextPage ? "Nothing waiting in these sessions" : emptyState.title}
-          </p>
-          <p className="text-sm text-muted-foreground">{emptyState.body}</p>
-        </div>
-      )}
+      {!assembling &&
+        failedSessionCount === 0 &&
+        !(showUnread && automationInbox.isError) &&
+        visibleCount === 0 && (
+          <div className="flex flex-col items-center gap-2 py-16 text-center">
+            <InboxIcon className="size-8 text-muted-foreground/50" />
+            <p className="text-ui font-medium">
+              {hasNextPage || (showUnread && automationInbox.hasNextPage)
+                ? "Nothing waiting in the loaded items"
+                : emptyState.title}
+            </p>
+            <p className="text-sm text-muted-foreground">{emptyState.body}</p>
+          </div>
+        )}
 
       <div className="flex flex-col gap-4">
         {groups.map((group) => (
@@ -879,6 +998,17 @@ export function InboxPage() {
           className="mt-4"
         >
           {isFetchingNextPage ? "Loading…" : "Load more sessions"}
+        </Button>
+      )}
+      {showUnread && automationInbox.hasNextPage && (
+        <Button
+          variant="outline"
+          disabled={automationInbox.isFetching}
+          onClick={() => void automationInbox.fetchNextPage()}
+          componentId="inbox.load_more_automations"
+          className="mt-4"
+        >
+          {automationInbox.isFetchingNextPage ? "Loading…" : "Check more automations"}
         </Button>
       )}
     </PageScroll>
@@ -993,7 +1123,11 @@ function SessionLine({ title, detail }: { title: string; detail?: string }) {
 }
 
 function InboxActions({ children }: { children: ReactNode }) {
-  return <div className="flex items-center justify-end gap-1 pt-0.5">{children}</div>;
+  return (
+    <div className="flex items-center justify-end gap-1 pt-0.5 mobile-app:flex-col mobile-app:items-stretch">
+      {children}
+    </div>
+  );
 }
 
 /**
