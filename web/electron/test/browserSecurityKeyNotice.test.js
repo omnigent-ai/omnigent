@@ -125,6 +125,37 @@ describe("security-key notice for embedded browser pages", () => {
     });
   }
 
+  it("keeps one hidden-pane poll when a failed handoff overlaps a pending report", async () => {
+    mock.method(console, "warn", () => {});
+    let rejectLaunch;
+    let visible = true;
+    let checks = 0;
+    const h = harness({
+      canPrompt: () => {
+        checks += 1;
+        return visible;
+      },
+      launch: () =>
+        new Promise((_resolve, reject) => {
+          rejectLaunch = reject;
+        }),
+    });
+    h.report(true);
+    await h.wait();
+    h.prompts[0].choose("open-in-browser");
+    await flush();
+    visible = false;
+    h.report(true);
+    rejectLaunch(new Error("launch failed"));
+    await flush();
+    checks = 0;
+    await h.wait();
+    assert.equal(checks, 1, "the handoff failure replaces the already armed poll");
+    h.report(false);
+    await h.wait();
+    assert.equal(checks, 1, "request completion cancels the remaining poll");
+  });
+
   it("does not reopen after a browser launch fails when the view has closed", async () => {
     const warning = mock.method(console, "warn", () => {});
     let rejectLaunch;
@@ -176,13 +207,25 @@ describe("security-key notice for embedded browser pages", () => {
     });
   }
 
-  it("hides the notice when the view closes", async () => {
-    const h = harness();
-    h.report(true);
-    await h.wait();
-    h.contents.emit("destroyed");
-    assert.equal(h.prompts[0].options.signal.aborted, true);
-  });
+  for (const beforeShow of [false, true]) {
+    it(`handles view destruction ${beforeShow ? "before" : "after"} showing the notice`, async () => {
+      const h = harness();
+      h.report(true);
+      if (!beforeShow) await h.wait();
+      mock.method(h.contents, "isDestroyed", () => true);
+      const getURL = mock.method(h.contents, "getURL", () => {
+        throw new Error("view destroyed");
+      });
+      if (beforeShow) {
+        await h.wait();
+        assert.equal(h.prompts.length, 0);
+      } else {
+        h.contents.emit("destroyed");
+        assert.equal(h.prompts[0].options.signal.aborted, true);
+      }
+      assert.equal(getURL.mock.callCount(), 0);
+    });
+  }
 
   it("keeps the notice while a navigation that may not commit is in flight", async () => {
     const h = harness();

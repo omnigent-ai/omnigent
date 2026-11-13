@@ -37,6 +37,7 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
   }
 
   function show() {
+    clearTimeout(timer);
     timer = null;
     if (!pending || shown || contents.isDestroyed()) return;
     const origin = pageOrigin(contents.getURL());
