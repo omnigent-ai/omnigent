@@ -3809,7 +3809,12 @@ def _merge_caller_settings(
             raise ValueError(f"Caller {flag}=true disables required Omnigent bridge hooks")
     if "cleanupPeriodDays" in merged:
         retention = merged["cleanupPeriodDays"]
-        if type(retention) is not int or retention <= 0:
+        if (
+            isinstance(retention, bool)
+            or not isinstance(retention, (int, float))
+            or retention <= 0
+            or (isinstance(retention, float) and not retention.is_integer())
+        ):
             raise ValueError("Caller cleanupPeriodDays must be a positive integer")
     if isinstance(caller_status, dict):
         command = caller_status.get("command")

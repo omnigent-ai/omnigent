@@ -5041,7 +5041,7 @@ async def _finalize_test_claude_args(args, *, bridge_dir, os_env_spec, active_ha
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("retention", [42, 0, -1, "x", False, None, 1.5])
+@pytest.mark.parametrize("retention", [42, 42.0, 0, -1, "x", False, None, 1.5])
 async def test_augment_claude_args_merges_caller_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retention: object
 ) -> None:
