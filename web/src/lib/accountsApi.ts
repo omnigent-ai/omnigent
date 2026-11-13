@@ -21,7 +21,7 @@ import { withRoutingKey } from "./host";
 
 // Standalone accounts endpoints skip the embed transport, so they add the routing key here.
 function accountsFetch(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(withBasePath(path), withRoutingKey(init));
+  return fetch(withBasePath(path), withRoutingKey(init, { hostless: true }));
 }
 
 /** Body of POST /auth/login. */

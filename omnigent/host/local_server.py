@@ -38,6 +38,7 @@ from omnigent.process_logging import (
     child_logging_popen_kwargs,
     open_process_log_file,
 )
+from omnigent.telemetry.request_headers import client_identity_headers
 
 _logger = logging.getLogger(__name__)
 
@@ -319,7 +320,9 @@ def local_server_url_if_healthy() -> str | None:
         return None
     base_url = f"http://127.0.0.1:{port}"
     try:
-        resp = httpx.get(f"{base_url}/health", timeout=2.0, trust_env=False)
+        resp = httpx.get(
+            f"{base_url}/health", headers=client_identity_headers(), timeout=2.0, trust_env=False
+        )
     except httpx.HTTPError:
         return None
     if resp.status_code == 200:
@@ -955,7 +958,9 @@ def _local_server_health_ok(base_url: str) -> bool:
     import httpx
 
     try:
-        resp = httpx.get(f"{base_url}/health", timeout=2.0, trust_env=False)
+        resp = httpx.get(
+            f"{base_url}/health", headers=client_identity_headers(), timeout=2.0, trust_env=False
+        )
     except httpx.HTTPError:
         return False
     if resp.status_code != 200:
@@ -1109,7 +1114,12 @@ def _wait_for_local_omnigent_server(
                 max(timeout, boot_ceiling),
             )
         try:
-            resp = httpx.get(f"{base_url}/health", timeout=2.0, trust_env=False)
+            resp = httpx.get(
+                f"{base_url}/health",
+                headers=client_identity_headers(),
+                timeout=2.0,
+                trust_env=False,
+            )
             if resp.status_code == 200:
                 return
         except httpx.TransportError:

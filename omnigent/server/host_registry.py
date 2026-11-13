@@ -204,6 +204,11 @@ def _fail_pending_worktrees(conn: HostConnection) -> None:
         _fail_pending_inventory(pending, conn.host_id)
 
 
+def _fail_pending_clones(conn: HostConnection) -> None:
+    """Fail clone requests as soon as their host disappears."""
+    _fail_pending_inventory(conn.pending_clones, conn.host_id)
+
+
 def _fail_pending_harness_rpcs(conn: HostConnection) -> None:
     """Wake account/login route waiters when their tunnel disappears."""
     for pending in (
@@ -445,6 +450,9 @@ class HostConnection:
         host sends ``host.create_dir_result``. Values carry the
         result fields (``status``, ``path``, ``error``). Same
         ``Any`` typing rationale as ``pending_stats``.
+    :param pending_clones: Per-``request_id`` futures for in-flight
+        ``host.clone_repository`` requests. Values carry ``status``,
+        ``path``, ``error``, and ``error_code``.
     :param pending_installs: Per-``request_id`` futures for in-flight
         ``host.install_harness`` requests. Resolved when the host sends
         ``host.install_harness_result``. Values carry the result fields
@@ -531,6 +539,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_create_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_clones: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
     pending_installs: dict[str, asyncio.Future[dict[str, Any]]] = field(
@@ -719,6 +730,7 @@ class HostRegistry:
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
                 _fail_pending_worktrees(old)
+                _fail_pending_clones(old)
                 _fail_pending_harness_rpcs(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
@@ -770,6 +782,7 @@ class HostRegistry:
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
         _fail_pending_worktrees(removed)
+        _fail_pending_clones(removed)
         _fail_pending_harness_rpcs(removed)
         return True
 
