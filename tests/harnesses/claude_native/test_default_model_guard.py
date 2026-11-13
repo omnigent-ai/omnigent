@@ -127,6 +127,7 @@ def test_keeps_a_users_own_change_and_restores_to_it(paths: tuple[Path, Path]) -
     default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
 
     _write(settings, {"model": "haiku"})  # the user picks a new default meanwhile
+    assert default_model_guard.begin_model_switch(settings, "haiku", state_dir=state) is None
     assert default_model_guard.settle_default_model(settings, state_dir=state)
     assert _read(settings) == {"model": "haiku"}
 
@@ -294,10 +295,12 @@ def test_an_expired_switch_leaves_a_later_save_alone(
     assert _read(settings) == {"model": "sonnet"}
 
 
+@pytest.mark.parametrize("failure", [OSError, ValueError])
 def test_the_watcher_restores_the_default_on_its_own(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _isolate_claude_default_model_guard: Callable[[Path, Path], None],
+    failure: type[Exception],
 ) -> None:
     settings, state = tmp_path / "settings.json", tmp_path / "state"
     _write(settings, {"model": "opus"})
@@ -307,7 +310,7 @@ def test_the_watcher_restores_the_default_on_its_own(
     def settle_failing_once(path: Path, *, state_dir: Path) -> bool:
         calls.append(path)
         if len(calls) == 1:
-            raise OSError("state dir briefly unavailable")
+            raise failure("record briefly unreadable")
         return real_settle(path, state_dir=state_dir)
 
     monkeypatch.setattr(default_model_guard, "settle_default_model", settle_failing_once)

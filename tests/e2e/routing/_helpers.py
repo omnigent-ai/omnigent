@@ -464,19 +464,19 @@ def rollout_turn_contexts(session_id: str) -> list[dict[str, Any]]:
 # ── Isolation guards ────────────────────────────────────────────────────────
 
 
-def claude_settings_apart_from_the_model(*, include_model: bool = False) -> str | None:
-    """Return the developer's ``~/.claude/settings.json`` minus its ``model`` key.
+def claude_settings_apart_from_the_model(path: Path, *, include_model: bool = False) -> str | None:
+    """Snapshot the launched Claude settings file, optionally including its model.
 
     Hook registration lives in the per-session bridge dir. The model guard
     restores Claude Code's temporary ``model`` writes asynchronously; callers
     checking that restoration include the model and wait for the snapshot.
 
+    :param path: Settings path resolved from the launch environment and workspace.
     :param include_model: Include the saved default in the snapshot.
 
     :returns: A canonical rendering of the remaining settings, or ``None``
         when the file does not exist.
     """
-    path = Path.home() / ".claude" / "settings.json"
     if not path.exists():
         return None
     try:

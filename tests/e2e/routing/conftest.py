@@ -260,8 +260,15 @@ def routing_client(routing_server: str) -> Iterator[httpx.Client]:
 
 
 @pytest.fixture(scope="session")
+def routing_host_env() -> dict[str, str]:
+    """The environment passed to the host and inherited by its native launches."""
+    return dict(os.environ)
+
+
+@pytest.fixture(scope="session")
 def routing_host(
     routing_server: str,
+    routing_host_env: dict[str, str],
     routing_client: httpx.Client,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[str]:
@@ -273,6 +280,7 @@ def routing_host(
     block. ``~/.omnigent/config.yaml`` is never read or written.
 
     :param routing_server: Server URL the daemon registers with.
+    :param routing_host_env: Shared launch environment for settings-path assertions.
     :param routing_client: Used to poll ``GET /v1/hosts``.
     :param tmp_path_factory: Pytest temp path factory.
     :yields: The registered host's ``host_id``.
@@ -286,13 +294,15 @@ def routing_host(
     )
     log_path = root / "host.log"
 
-    env = {
-        **os.environ,
-        "OMNIGENT_CONFIG_HOME": str(config_home),
-        "OMNIGENT_DATA_DIR": str(root / "data"),
-        "PYTHONPATH": str(_REPO_ROOT),
-        "OMNIGENT_LOG_TO_STDERR": "1",
-    }
+    env = routing_host_env
+    env.update(
+        {
+            "OMNIGENT_CONFIG_HOME": str(config_home),
+            "OMNIGENT_DATA_DIR": str(root / "data"),
+            "PYTHONPATH": str(_REPO_ROOT),
+            "OMNIGENT_LOG_TO_STDERR": "1",
+        }
+    )
     # Claude Code refuses to start a nested session; the agent process running
     # this suite may export the marker.
     env.pop("CLAUDECODE", None)

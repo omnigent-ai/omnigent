@@ -28,6 +28,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.harnesses.claude_native.bridge import claude_user_settings_path
 from omnigent.server.smart_routing import models_in_family
 from tests.e2e.routing._helpers import (
     arm_in,
@@ -67,14 +68,16 @@ _SPAWN_TIMEOUT_S = 300.0
 def test_claude_session_create_routes_the_model_and_then_the_spawn(
     routing_client: httpx.Client,
     routing_host: str,
+    routing_host_env: dict[str, str],
     routing_arms: object,
     mock_router: MockRouter,
     tmp_path: Path,
 ) -> None:
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
-    settings_before = claude_settings_apart_from_the_model(include_model=True)
     workspace = trusted_workspace(tmp_path, "claude_ui_ws")
+    settings_path = claude_user_settings_path(workspace, routing_host_env)
+    settings_before = claude_settings_apart_from_the_model(settings_path, include_model=True)
 
     # ── 1. The routed create ────────────────────────────────────────────────
     # Unique but still rule-0 (short, no error/code markers), so the mock's
@@ -171,7 +174,8 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
     wait_for(
         lambda: (
             True
-            if claude_settings_apart_from_the_model(include_model=True) == settings_before
+            if claude_settings_apart_from_the_model(settings_path, include_model=True)
+            == settings_before
             else None
         ),
         timeout=10,

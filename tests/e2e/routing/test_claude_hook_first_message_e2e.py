@@ -19,8 +19,8 @@ What is scored:
 * **The switch actually lands.** The apply layer types ``/model <id>``, so the
   pane must report the switch before the replay runs. Claude Code answers that
   form by also rewriting the ``model`` key in the developer's own
-  ``~/.claude/settings.json`` — an accepted trade-off — so everything *else* in
-  that file must be unchanged.
+  settings file. The guard restores its model key asynchronously; this check
+  verifies that unrelated settings remain unchanged.
 * **One decision, one turn.** A leaked replay shows up as two user messages for
   one thing typed.
 * **The second prompt fast-skips.** Turn 2 must issue **zero** routing calls —
@@ -36,6 +36,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.harnesses.claude_native.bridge import claude_user_settings_path
 from omnigent.runner.turn_routing import MARKER_FILE
 from tests.e2e.routing._helpers import (
     capture_pane,
@@ -104,6 +105,7 @@ def _wait_for_pane_ready(socket_path: str, target: str) -> None:
 def test_claude_routes_the_first_typed_message_exactly_once(
     routing_client: httpx.Client,
     routing_host: str,
+    routing_host_env: dict[str, str],
     routing_arms: object,
     mock_router: MockRouter,
     type_into_tui: Callable[[str, str, str], None],
@@ -111,8 +113,9 @@ def test_claude_routes_the_first_typed_message_exactly_once(
 ) -> None:
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
-    settings_before = claude_settings_apart_from_the_model()
     workspace = trusted_workspace(tmp_path, "claude_hook_ws")
+    settings_path = claude_user_settings_path(workspace, routing_host_env)
+    settings_before = claude_settings_apart_from_the_model(settings_path)
 
     # A BARE routed create: Smart Routing on, no prompt, so nothing is routed
     # yet and the pick is left to the in-harness hook.
@@ -190,7 +193,7 @@ def test_claude_routes_the_first_typed_message_exactly_once(
         "turn 2's prompt reached the router; the fast skip must be free"
     )
 
-    assert claude_settings_apart_from_the_model() == settings_before, (
+    assert claude_settings_apart_from_the_model(settings_path) == settings_before, (
         "~/.claude/settings.json changed beyond its `model` key — `/model <id>` "
         "may move Claude Code's own default, nothing else"
     )

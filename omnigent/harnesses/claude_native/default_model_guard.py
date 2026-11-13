@@ -21,6 +21,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import stat
 import tempfile
@@ -86,7 +87,7 @@ class PendingModelSwitch:
                 if match is not None:
                     pending.remove(match)
                 _save_record(record_path, record, pending)
-        except (OSError, FileLockTimeout):
+        except (OSError, ValueError, FileLockTimeout):
             _logger.warning(
                 "claude-native: could not cancel a pending /model record", exc_info=True
             )
@@ -98,8 +99,8 @@ def begin_model_switch(
     """
     Record a ``/model`` switch about to be typed, and watch for its save.
 
-    The first pending switch snapshots the user's default; later ones reuse
-    it, so a save another session has not undone yet is never taken for it.
+    Each registration checks for a new user default against the switches
+    already pending, so their unsettled saves are not taken for user changes.
 
     :param settings_path: The user ``settings.json`` the pane's Claude saves to.
     :param model_arg: The ``/model`` argument, e.g. ``"claude-sonnet-5-5"``.
@@ -113,23 +114,29 @@ def begin_model_switch(
         with _locked_record(state_dir, settings_path) as record_path:
             record: dict[str, Any] | None = _load_record(record_path)
             pending = _live_pending(record) if record is not None else []
+            current = _read_settings_model(settings_path)
+            if current is _UNREADABLE:
+                raise ModelSwitchProtectionError(
+                    "Cannot read Claude settings to protect the default model; retry the switch."
+                )
             if record is None or not pending:
-                current = _read_settings_model(settings_path)
-                if current is _UNREADABLE:
-                    raise ModelSwitchProtectionError(
-                        "Cannot read Claude settings to protect the default model; "
-                        "retry the switch."
-                    )
                 record = {"settings_path": str(settings_path), "default": _encode(current)}
-            if _normalized_value(_decode(record["default"])) == model:
-                return None
-            pending.append({"model": model, "expires_at": time.time() + PENDING_SWITCH_TTL_S})
+            elif current != _decode(record["default"]) and not any(
+                entry["model"] == _normalized_value(current) for entry in pending
+            ):
+                record["default"] = _encode(current)
+            needs_protection = _normalized_value(_decode(record["default"])) != model
+            if needs_protection:
+                pending.append({"model": model, "expires_at": time.time() + PENDING_SWITCH_TTL_S})
             _save_record(record_path, record, pending)
-    except (OSError, FileLockTimeout) as exc:
+    except (OSError, ValueError, FileLockTimeout) as exc:
         raise ModelSwitchProtectionError(
             "Cannot record Claude's default model; the model switch was not submitted. Retry it."
         ) from exc
-    _ensure_watcher(settings_path, state_dir)
+    if pending:
+        _ensure_watcher(settings_path, state_dir)
+    if not needs_protection:
+        return None
     return PendingModelSwitch(settings_path=settings_path, state_dir=state_dir, model=model)
 
 
@@ -214,7 +221,7 @@ def _watch(settings_path: Path, state_dir: Path) -> None:
                         _watchers.pop((settings_path, state_dir), None)
                         return
             failures = 0
-        except (OSError, FileLockTimeout):
+        except (OSError, ValueError, FileLockTimeout):
             failures += 1
             if failures == 1 or failures > _WATCH_MAX_FAILURES:
                 _logger.warning(
@@ -245,10 +252,27 @@ def _locked_record(state_dir: Path, settings_path: Path) -> Iterator[Path]:
 def _load_record(record_path: Path) -> dict[str, Any] | None:
     try:
         record = json.loads(record_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return None
-    if not isinstance(record, dict) or not isinstance(record.get("default"), dict):
-        return None
+    if not isinstance(record, dict):
+        raise ValueError("Invalid Claude default-model record")
+    default = record.get("default")
+    pending = record.get("pending")
+    if (
+        not isinstance(default, dict)
+        or not isinstance(default.get("present"), bool)
+        or (default["present"] and "value" not in default)
+        or not isinstance(pending, list)
+        or any(
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("model"), str)
+            or not entry["model"]
+            or type(entry.get("expires_at")) not in (int, float)
+            or (isinstance(entry["expires_at"], float) and not math.isfinite(entry["expires_at"]))
+            for entry in pending
+        )
+    ):
+        raise ValueError("Invalid Claude default-model record")
     return record
 
 

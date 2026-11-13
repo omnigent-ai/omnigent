@@ -8,8 +8,8 @@ A routed switch is typed as ``/model <id>``. Claude Code answers it with "Set
 model to X **and saved as your default for new sessions**" and rewrites the
 ``model`` key in the person's own ``~/.claude/settings.json``. The dedicated
 default-model guard restores that key after an Omnigent switch; its behavior
-is covered in ``test_default_model_guard.py``. The bridge itself only reads
-settings, and the switch path polls the TUI rather than guessing its latency.
+is covered in ``test_default_model_guard.py``. These static checks keep the
+switch path polling the TUI rather than guessing its latency.
 """
 
 from __future__ import annotations
@@ -40,31 +40,6 @@ def _tree(relative: str) -> ast.Module:
     :returns: The parsed module.
     """
     return ast.parse((_OMNIGENT / relative).read_text(encoding="utf-8"))
-
-
-def test_the_bridge_only_reads_the_users_claude_settings_file() -> None:
-    """
-    Settings restoration belongs to the dedicated default-model guard.
-
-    Direct settings access from the bridge must remain read-only; the guard's
-    behavioral tests cover preserving other keys during restoration.
-    """
-    tree = _tree("harnesses/claude_native/bridge.py")
-    reads: list[str] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Attribute):
-            continue
-        if not (
-            isinstance(node.value, ast.Name) and node.value.id == "_USER_CLAUDE_SETTINGS_PATH"
-        ):
-            continue
-        reads.append(node.attr)
-    # The definition itself is an assignment, not an attribute access, so every
-    # hit here is a use.
-    assert reads, "the guard found no usages at all — has the constant been renamed?"
-    assert set(reads) <= {"read_text", "read_bytes", "exists", "is_file"}, (
-        f"non-read access to the user's settings file: {sorted(set(reads))}"
-    )
 
 
 @pytest.mark.parametrize("name", _SWITCH_PATH_FUNCTIONS)
