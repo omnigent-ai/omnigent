@@ -6893,6 +6893,11 @@
             "title": "Scheduled Task Subhour",
             "type": "boolean"
           },
+          "scheduled_task_trigger_headers": {
+            "default": true,
+            "title": "Scheduled Task Trigger Headers",
+            "type": "boolean"
+          },
           "scheduled_task_worktrees": {
             "default": true,
             "title": "Scheduled Task Worktrees",

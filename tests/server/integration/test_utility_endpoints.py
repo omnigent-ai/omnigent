@@ -98,7 +98,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "sidebar_grouping_ui": True,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
-        "automations_v2": False,
+        "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
         "session_orchestration": True,
@@ -122,6 +122,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
     assert data["scheduled_task_subhour"] is True
+    # Lets the trigger form save its header; older servers would send it to the model.
+    assert data["scheduled_task_trigger_headers"] is True
     assert data["automation_trigger_poll_minutes"] == 10
     assert data["scheduled_task_harness_settings"] is True
     # Lets sys_session_create refuse permission_mode on servers that would ignore it.

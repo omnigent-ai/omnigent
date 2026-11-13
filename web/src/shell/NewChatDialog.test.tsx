@@ -11161,7 +11161,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       skills: [],
     };
     vi.mocked(installAgentBundle).mockResolvedValue({ id: "ag_orion", name: "orion" });
-    vi.mocked(fetchUserAgents).mockResolvedValue([orion]);
+    vi.mocked(fetchUserAgents).mockResolvedValue({ agents: [orion], truncated: false });
     mockAgents([...DEFAULT_LANDING_AGENTS, orion]);
     renderLanding({ agent_install: true });
 
@@ -11181,7 +11181,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
 
   it("says so when an imported agent is missing from the picker list", async () => {
     vi.mocked(installAgentBundle).mockResolvedValue({ id: "ag_orion", name: "orion" });
-    vi.mocked(fetchUserAgents).mockResolvedValue([]);
+    vi.mocked(fetchUserAgents).mockResolvedValue({ agents: [], truncated: false });
     // The refreshed picker list exists but lacks the import.
     const lists = vi
       .spyOn(QueryClient.prototype, "getQueriesData")

@@ -689,7 +689,7 @@ def register_core_routes(
         """
         try:
             runner_client = await _get_runner_client(
-                session_id, runner_router, conversation=routing
+                session_id, runner_router, conversation=routing, for_control=True
             )
             if runner_client is not None:
                 await runner_client.delete(f"/v1/sessions/{session_id}", timeout=30.0)
@@ -2013,17 +2013,35 @@ def register_core_routes(
             )
             parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
 
-        from omnigent.server.mcp_compatibility import (
+        from omnigent.server.runtime_compatibility import (
             registry_services,
-            require_registry_mcp_runtime,
+            require_runtime_support,
+            uses_tcp_egress,
         )
 
-        require_registry_mcp_runtime(
-            registry_services(spec),
-            host_id=parsed_metadata.host_id,
+        services = registry_services(spec)
+        tcp_egress_required = uses_tcp_egress(spec)
+        runtime_host_id = parsed_metadata.host_id
+        if (
+            runtime_host_id is None
+            and inherited_runner_id
+            and parent_conv is not None
+            and (tcp_egress_required or services)
+        ):
+            from omnigent.runner.routing import routing_host_id
+
+            runtime_host_id = await asyncio.to_thread(
+                routing_host_id, parent_conv, conversation_store
+            )
+        await asyncio.to_thread(
+            require_runtime_support,
+            services,
+            tcp_egress_required=tcp_egress_required,
+            host_id=runtime_host_id,
             runner_id=inherited_runner_id,
             host_registry=getattr(request.app.state, "host_registry", None),
             tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            runner_router=runner_router,
         )
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
@@ -4036,7 +4054,7 @@ def register_core_routes(
                 )
                 if runner_router is not None:
                     await asyncio.to_thread(
-                        runner_router.require_mcp_registry_support,
+                        runner_router.require_runtime_support,
                         dataclasses.replace(conv, runner_id=runner_id),
                     )
                 try:
