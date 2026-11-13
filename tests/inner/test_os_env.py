@@ -889,9 +889,12 @@ def test_close_stops_the_helper_and_releases_its_spawner_thread(
             )
             assert status.get("stdout", "").strip() == "False", status
         except BaseException:
-            if pid_file.exists():
-                asyncio.run(os_env.shell(f"kill -9 {int(pid_file.read_text())}"))
-            os_env.close()
+            try:
+                with suppress(Exception):
+                    if pid_file.exists():
+                        asyncio.run(os_env.shell(f"kill -9 {int(pid_file.read_text())}"))
+            finally:
+                os_env.close()
             raise
     assert asyncio.run(os_env.shell("true")).get("exit_code") == 0
     helper = os_env._helper._proc
