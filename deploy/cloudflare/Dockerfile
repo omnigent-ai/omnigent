@@ -12,6 +12,9 @@
 # from this branch.)
 FROM ghcr.io/omnigent-ai/omnigent-server:latest
 
+# D1 cannot provide the transactions required by persistent scheduling.
+ENV OMNIGENT_FEATURES=-automations_v2
+
 ARG SITE=/opt/venv/lib/python3.12/site-packages
 USER root
 

@@ -38,6 +38,7 @@ unaffected.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import functools
 import logging
@@ -459,6 +460,27 @@ def touch_runner_liveness(runner_ids: list[str]) -> None:
     for runner_id in runner_ids:
         _last_liveness_stamp[runner_id] = now
     submit("runner_liveness", _store.touch_runner_liveness, list(runner_ids), now)
+
+
+async def stamp_runner_liveness(runner_id: str) -> None:
+    """
+    Stamp ``runner_last_seen`` now and wait for the write to land.
+
+    Called before a reconnecting runner's tunnel is registered. The background
+    stamp can queue behind other writes, and in that gap another replica may
+    settle the runner's running sessions as orphaned. A failed write is logged
+    and the connection proceeds, as with the background stamp.
+
+    :param runner_id: The reconnecting runner's id, e.g. ``"runner_abc123"``.
+    """
+    if _store is None:
+        return
+    now = int(time.time())
+    _last_liveness_stamp[runner_id] = now
+    try:
+        await asyncio.to_thread(_store.touch_runner_liveness, [runner_id], now)
+    except Exception:  # best-effort, like the background stamp
+        _logger.warning("liveness stamp failed for %s", runner_id, exc_info=True)
 
 
 def last_liveness_stamp(runner_id: str) -> int | None:

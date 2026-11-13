@@ -116,6 +116,15 @@ class SysScheduledTaskCreateTool(Tool):
                                 "task setting."
                             ),
                         },
+                        "mcp_services": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Optional MCP services every run starts with, as the "
+                                "deployment's service names. The owner must already be "
+                                "connected to each one. Omit for none."
+                            ),
+                        },
                         "max_cost_usd": {
                             "type": "number",
                             "description": (
@@ -297,6 +306,14 @@ class SysScheduledTaskUpdateTool(Tool):
                                 "null (not the string 'null') for the agent default, and "
                                 "always for a harness without modes. Required for approval "
                                 "review; resend the current value when it is unchanged."
+                            ),
+                        },
+                        "mcp_services": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Replaces the MCP services every run starts with. "
+                                "An empty list clears them."
                             ),
                         },
                         "max_cost_usd": {
