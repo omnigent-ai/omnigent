@@ -502,12 +502,19 @@ async def test_delete_session_calls_full_runner_teardown(
         base_url="http://runner",
     )
 
-    async def _get_runner(session_id: str) -> httpx.AsyncClient:
+    async def _get_runner(
+        session_id: str,
+        runner_router: object,
+        *,
+        conversation: object,
+        for_control: bool = False,
+    ) -> httpx.AsyncClient:
+        assert for_control
         return fake_runner
 
     monkeypatch.setattr(
         sessions_module,
-        "_get_runner_client_for_resource_access",
+        "_get_runner_client",
         _get_runner,
     )
     try:
@@ -583,10 +590,17 @@ async def test_delete_session_reaps_child_that_ignores_sigterm(
         transport=httpx.MockTransport(dispatch), base_url="http://runner", timeout=30.0
     ) as runner_client:
 
-        async def get_runner(session_id: str) -> httpx.AsyncClient:
+        async def get_runner(
+            session_id: str,
+            runner_router: object,
+            *,
+            conversation: object,
+            for_control: bool = False,
+        ) -> httpx.AsyncClient:
+            assert for_control
             return runner_client
 
-        monkeypatch.setattr(sessions_module, "_get_runner_client_for_resource_access", get_runner)
+        monkeypatch.setattr(sessions_module, "_get_runner_client", get_runner)
         create_request = asyncio.create_task(
             runner_client.post(
                 "/v1/sessions", json={"session_id": session_id, "agent_id": "ag_cleanup"}

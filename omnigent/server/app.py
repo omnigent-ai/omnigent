@@ -2529,14 +2529,13 @@ def create_app(
                 transfer_from_host_id,
                 require_account_owner=runner_account_store is not None,
             )
-        from omnigent.host.frames import CAP_MCP_REGISTRY
-        from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+        from omnigent.server.runtime_compatibility import require_session_runtime_support
 
         connection = host_registry.get(host_id)
-        if connection is not None and CAP_MCP_REGISTRY not in connection.hello.capabilities:
+        if connection is not None:
             conv = conversation_store.get_conversation(session_id)
             if conv is not None:
-                require_session_registry_mcp_support(
+                require_session_runtime_support(
                     conv,
                     connection.hello.capabilities,
                     component="host",
@@ -4978,8 +4977,10 @@ def create_app(
                             "_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id
                         )
                         try:
-                            routed = runner_router.client_for_session_resources(
-                                conv.id, conversation=conv
+                            routed = await asyncio.to_thread(
+                                runner_router.client_for_session_resources,
+                                conv.id,
+                                conversation=conv,
                             )
                         except OmnigentError as exc:
                             if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.WRONG_REPLICA):

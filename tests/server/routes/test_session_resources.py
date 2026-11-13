@@ -474,6 +474,11 @@ class _FakeRunnerRouter:
         self.resource_calls: list[str] = []
         self.resource_conversations: list[Conversation | None] = []
 
+    def client_for_session_control(
+        self, conversation_id: str, *, conversation: Conversation | None = None
+    ) -> _RoutedRunner:
+        return self.client_for_session_resources(conversation_id, conversation=conversation)
+
     def client_for_session_resources(
         self,
         session_id: str,
@@ -7675,7 +7680,7 @@ class _ReconnectWaitRouter:
         self._reconnects = reconnects
         self.waits: list[tuple[str, float]] = []
 
-    def require_mcp_registry_support(self, conversation: Conversation) -> None:
+    def require_runtime_support(self, conversation: Conversation) -> None:
         """These reconnect fixtures have no registry MCPs."""
 
     async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:
