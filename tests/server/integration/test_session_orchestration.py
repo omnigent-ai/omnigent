@@ -1555,7 +1555,7 @@ async def test_peer_message_readdresses_across_replicas(
 
     from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
     from omnigent.runner._entry import _RunnerDatabricksAuth
-    from omnigent.server.routes import sessions
+    from omnigent.server.routes import _host_launch, sessions
     from omnigent.server.routes._sessions.helpers import _get_runner_client_impl
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
@@ -1567,6 +1567,7 @@ async def test_peer_message_readdresses_across_replicas(
     host_id = uuid4().hex
     _register_online_host(stack.tunnel_replica, host_id, "alice")
     stack.conv_store.set_host_id(target["id"], host_id, workspace="/worker")
+    monkeypatch.setattr(_host_launch, "_host_sharded", True)
     captured = _stub_late_runner_bind(monkeypatch)
     capture_client = sessions._get_runner_client
 
@@ -1630,15 +1631,17 @@ async def test_peer_message_readdresses_across_replicas(
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
 @pytest.mark.parametrize("primed", [True, False], ids=["create_response_cached", "other_host"])
+@pytest.mark.parametrize("keyed", [True, False], ids=["keyed_create", "unkeyed_create"])
 async def test_sub_agent_requests_are_keyed_by_its_host_across_replicas(
-    two_replica_stack, db_uri, monkeypatch, primed
+    two_replica_stack, db_uri, monkeypatch, primed, keyed
 ):
     import httpx
 
     from omnigent import session_host
     from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
     from omnigent.runner._entry import _RunnerDatabricksAuth
-    from omnigent.server.routes import sessions
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+    from omnigent.server.routes import _host_launch, sessions
     from omnigent.server.routes._sessions import orchestration
     from omnigent.server.routes._sessions.helpers import _get_runner_client_impl
     from omnigent.stores.host_store import HostStore
@@ -1653,6 +1656,10 @@ async def test_sub_agent_requests_are_keyed_by_its_host_across_replicas(
     _register_online_host(stack.tunnel_replica, host_id, "alice")
     HostStore(db_uri).bind_sandbox(host_id, provider="modal", sandbox_id="sandbox-b")
     stack.conv_store.set_host_id(sub_agent["id"], host_id, workspace="/worker")
+    if keyed:
+        # A create that requested this host id keys it: the refusal then names the host.
+        stack.conv_store.set_labels(sub_agent["id"], {REQUESTED_HOST_ID_LABEL_KEY: host_id})
+    monkeypatch.setattr(_host_launch, "_host_sharded", True)
     if primed:
         # The managed create response names the sub-agent's host; the runner caches it.
         session_host.set_session_host(sub_agent["id"], host_id)
@@ -1716,14 +1723,15 @@ async def test_sub_agent_requests_are_keyed_by_its_host_across_replicas(
         # The cached host keys round 1 from its first request: no refusal, no lookup.
         assert wrong == [] and not any(entry[5] for entry in seen), seen
     else:
-        # The first request goes out with the runner's key and is refused once; one lookup
-        # learns the host, and everything after it is keyed correctly.
+        # The runner's key is refused first, fast and without a wake, then the host serves.
         assert len(wrong) == 1 and wrong[0][0] == 1, seen
-        assert sum(entry[5] for entry in seen) == 1, seen
+        assert seen[0][4] and seen[0][2] == "parent-host", seen
+        # A refusal that names the host is retried on it directly; an unnamed one costs a lookup.
+        assert sum(entry[5] for entry in seen) == (0 if keyed else 1), seen
     settled = [entry for entry in seen if not entry[4] and not entry[5]]
     assert settled and all(key == host_id for _, _, key, *_ in settled), seen
-    # Only a host the runner has not seen costs a wake: its first request carries the runner's key.
-    assert forced_wakes == ([] if primed else [host_id]), forced_wakes
+    # The keyless replica refuses the runner's key before any wake is kicked, primed or not.
+    assert forced_wakes == [], forced_wakes
     delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
     assert len(delivered) == 3
 
