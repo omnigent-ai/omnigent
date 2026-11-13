@@ -618,7 +618,8 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
   });
 
   it("keeps a live loading event over an older existence snapshot", async () => {
-    let resolveProbe: ((r: { exists: boolean; url: string; isLoading: boolean }) => void) | undefined;
+    let resolveProbe:
+      ((r: { exists: boolean; url: string; isLoading: boolean }) => void) | undefined;
     let fireLoading: ((p: { conversationId: string; isLoading: boolean }) => void) | undefined;
     installBridge({
       browserHasView: vi.fn(
