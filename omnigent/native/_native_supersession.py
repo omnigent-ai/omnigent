@@ -202,7 +202,7 @@ async def post_clear_supersession(
 
     if not detach_runner:
         return
-    # Detach after the notifications because this revokes the runner credential.
+    # Detach last: a confined runner cannot reach the old session once unbound.
     try:
         detach_resp = await client.patch(
             f"/v1/sessions/{urllib.parse.quote(old_session_id, safe='')}",

@@ -47,6 +47,7 @@ from starlette.requests import HTTPConnection
 from starlette.routing import compile_path
 
 from omnigent.errors import ERROR_CODE_HEADER, ErrorCode, OmnigentError
+from omnigent.runner.identity import RUNNER_TOKEN_SCOPE
 from omnigent.stores.conversation_store import RUNNER_CREATOR_LABEL_KEY
 
 logger = logging.getLogger(__name__)
@@ -131,8 +132,6 @@ def delegated_path_allowed(path: str) -> bool:
     return False
 
 
-# Sandbox-readable bearer confined to its runner's sessions.
-RUNNER_TOKEN_SCOPE = "runner"
 # Remove legacy owner-wide issuance in 0.21.0, after the 0.20.x upgrade window.
 LEGACY_RUNNER_TOKENS_ENV = "OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS"
 

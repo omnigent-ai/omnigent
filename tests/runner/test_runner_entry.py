@@ -1091,10 +1091,12 @@ def test_declined_latch_stays_bare_when_bare_request_succeeds(
     assert factory.declined is True
 
     auth = _RunnerDatabricksAuth(factory)
+    auth._last_bearer = "previous-bearer"
     request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
     gen = auth.auth_flow(request)
     bare = next(gen)
     assert "Authorization" not in bare.headers
+    assert auth._last_bearer is None
 
     with pytest.raises(StopIteration):
         gen.send(httpx.Response(200))
@@ -4241,7 +4243,10 @@ async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path
 async def test_managed_mint_protocol_failure_never_falls_back(
     monkeypatch, cached, caller, provider_message
 ):
+    mint_attempts = []
+
     def refuse(mint_url, *args, **kwargs):
+        mint_attempts.append(mint_url)
         request = httpx.Request("POST", mint_url)
         raise httpx.HTTPStatusError(
             "upgrade required",
@@ -4273,6 +4278,9 @@ async def test_managed_mint_protocol_failure_never_falls_back(
             factory()
     assert not factory.declined
     assert not factory.proxy_auth_failed
+    with pytest.raises(httpx.HTTPStatusError, match=provider_message or "upgrade the runner"):
+        factory()
+    assert len(mint_attempts) == 1
 
 
 @pytest.mark.parametrize("protocols", [[], ["future-v2"], "legacy", None, [1, "legacy"]])
@@ -4313,4 +4321,4 @@ def test_runner_scoped_mint_refusal_does_not_renegotiate_legacy(monkeypatch):
     for _ in range(2):
         with pytest.raises(httpx.HTTPStatusError):
             factory()
-    assert [request.method for request in requests] == ["GET", "POST", "POST"]
+    assert [request.method for request in requests] == ["GET", "POST"]

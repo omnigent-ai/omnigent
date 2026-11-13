@@ -403,6 +403,7 @@ class _RunnerDatabricksAuth(ThreadedAuth):
             )
         if self._factory is not None:
             token, declined = _call_factory_with_declined(self._factory)
+            self._last_bearer = token
             if not token:
                 if declined:
                     # The mint declined (400/404 no-auth, intermediary 5xx, or a
@@ -422,7 +423,6 @@ class _RunnerDatabricksAuth(ThreadedAuth):
                         yield request
                     return
                 raise httpx.RequestError("Databricks token refresh returned no token")
-            self._last_bearer = token
             request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
         if self._factory is None:
@@ -1016,6 +1016,7 @@ class _ManagedMintTokenFactory:
         self._proxy_bearer = proxy_bearer
         self._cached_token: str | None = None
         self._cached_expires_at = 0.0
+        self._protocol_failure: tuple[str, httpx.Response] | None = None
         # Serializes mint/latch state across concurrent callbacks so a
         # decline reset and a re-mint cannot interleave into duplicate
         # mints or a declined-latch alongside a freshly cached token.
@@ -1053,6 +1054,9 @@ class _ManagedMintTokenFactory:
         """
         if self.declined:
             return None
+        if self._protocol_failure is not None:
+            message, response = self._protocol_failure
+            raise httpx.HTTPStatusError(message, request=response.request, response=response)
         now = time.time()
         if (
             self._cached_token is not None
@@ -1082,6 +1086,7 @@ class _ManagedMintTokenFactory:
                         message = error["message"]
                 except (ValueError, AttributeError):
                     pass
+                self._protocol_failure = (message, response)
                 raise httpx.HTTPStatusError(
                     message, request=exc.request, response=response
                 ) from exc

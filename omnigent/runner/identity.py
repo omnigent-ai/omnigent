@@ -15,6 +15,8 @@ from collections.abc import Mapping
 from pathlib import Path
 
 RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
+# Sandbox-readable bearer confined to its runner's sessions.
+RUNNER_TOKEN_SCOPE = "runner"
 ORCHESTRATION_SOURCE_HEADER = "X-Omnigent-Orchestration-Source"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 # Host-launched runners delegate machine-global stale-process cleanup to the
@@ -287,4 +289,4 @@ def runner_bearer_is_confined(token: str | None) -> bool:
         claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
     except (IndexError, ValueError, UnicodeDecodeError):
         return False
-    return isinstance(claims, dict) and claims.get("scope") == "runner"
+    return isinstance(claims, dict) and claims.get("scope") == RUNNER_TOKEN_SCOPE

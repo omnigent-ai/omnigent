@@ -785,7 +785,9 @@ Update this top-level README with a row in the table above.
   `scoped-v1`, selecting a headerless legacy request only when `legacy` is
   advertised and scoped issuance is unavailable. Strict mode excludes legacy.
   The selected protocol persists through refresh: a scoped request or refusal
-  never triggers a legacy retry. Malformed or unsupported advertisements stop
+  never triggers a legacy retry. A protocol refusal is retained until the runner
+  restarts, so later callbacks do not repeatedly request the refused credential.
+  Malformed or unsupported advertisements stop
   minting. A 404/405 from an older server preserves the existing scoped request.
 - Supporting servers never issue legacy credentials in response to `scoped-v1`.
   Unknown protocols, unwired accounts/OIDC validators and legacy minting custom

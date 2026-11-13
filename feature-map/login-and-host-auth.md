@@ -62,7 +62,7 @@ be able to write resources without a separate Omnigent account.
   Hosts and interactive user clients keep their own authority. States: own
   callback succeeds, another runner's session is denied, permission denials do
   not renew credentials, shared-agent writes and session deletion are denied,
-  and strict mode gives incompatible runners upgrade guidance. Header/proxy
+  and strict mode rejects incompatible runners until they are upgraded. Header/proxy
   providers decline minting without interrupting binding-token callbacks.
   Credential discovery prefers advertised scoped support; legacy custom
   providers work only when legacy issuance is advertised. A scoped selection
