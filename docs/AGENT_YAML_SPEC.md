@@ -677,13 +677,19 @@ private scratch and vendor runtime-state write grants also remain.
 
 ### Secretless credential proxy
 
-`sandbox.credential_proxy` lets sandboxed tools authenticate to external hosts
-without the real secret ever entering the sandbox: the mandatory L7 egress proxy
-attaches the credential on the way out. It requires `egress_rules` and a
+The credential-proxy machinery lets sandboxed framework tools authenticate to
+external hosts without the real secret ever entering the sandbox: the mandatory
+L7 egress proxy attaches the credential on the way out. It requires `egress_rules` and a
 network-isolating backend (`linux_bwrap` or `darwin_seatbelt`). See
 `designs/SANDBOX_CREDENTIAL_PROXY.md` for the full type table.
 
-The `databricks_cli` type proxies the Databricks CLI. List the profiles to
+Inner workers accept `sandbox.credential_proxy` only with Codex's supported
+brokered gateway configuration. Nonbrokered Codex and non-Codex inner workers
+reject these policies. The general proxy types described below do not imply
+support for launching an inner worker with them.
+
+The `databricks_cli` type is for framework tools, not inner workers. It proxies
+the Databricks CLI. List the profiles to
 proxy; only those are materialized into the sandbox (with placeholder tokens)
 and swapped by the proxy. As with every other credential-proxy type, you must
 list each workspace host in `egress_rules` yourself — the proxy does not widen
@@ -716,8 +722,9 @@ The runner replaces the provider's auth command with a fixed command that
 prints only the placeholder. The trusted parent reads the protected source and
 renews its token; Codex receives a private home without host auth or provider
 configuration. A locked profile requires an explicit `broker_gateway: true`;
-missing or mismatched bindings prevent launch. Other gateway profiles retain
-their existing authentication.
+missing or mismatched bindings prevent launch. Nonbrokered gateway profiles
+retain their existing authentication only when `credential_proxy` is absent;
+configuring it on a nonbrokered Codex worker prevents launch.
 
 ```yaml
 executor:
