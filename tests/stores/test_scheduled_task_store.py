@@ -955,6 +955,32 @@ def test_update_from_a_stale_snapshot_conflicts_on_agent_or_mcp_changes(
     assert (saved.agent_id, saved.mcp_services) == (applied.agent_id, applied.mcp_services)
 
 
+def test_update_guard_sees_the_locked_task_and_a_refusal_saves_nothing(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _session_task(store, "st_guard", workspace="/repo")
+    seen: list[Any] = []
+
+    def refuse(locked: Any) -> None:
+        seen.append(locked)
+        raise OmnigentError("refused", code=ErrorCode.FORBIDDEN)
+
+    with pytest.raises(OmnigentError, match="refused"):
+        store.update(task.id, name="renamed", workspace="/elsewhere", guard=refuse)
+
+    assert [(locked.id, locked.workspace) for locked in seen] == [(task.id, "/repo")]
+    saved = store.get(task.id)
+    assert saved is not None
+    assert (saved.name, saved.workspace, saved.updated_at) == (
+        task.name,
+        task.workspace,
+        task.updated_at,
+    )
+    # A guard that returns lets the update through.
+    applied = store.update(task.id, workspace="/elsewhere", guard=seen.append)
+    assert applied is not None and applied.workspace == "/elsewhere"
+
+
 def test_update_last_run_conversation_id_can_be_cleared_to_null(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:

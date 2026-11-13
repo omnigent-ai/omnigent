@@ -58,6 +58,12 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
 from omnigent.server.routes.runner_tunnel import _expected_runner_id_from_headers
+from omnigent.server.routes.scheduled_task_permissions import (
+    agent_shared_target_guard,
+    owns_scheduled_task,
+    register_scheduled_task_permissions_routes,
+    require_agent_keeps_shared_target,
+)
 from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
@@ -592,16 +598,6 @@ def create_scheduled_tasks_router(
             agent_for_user, agent_store, artifact_store, agent, owner_id
         )
 
-    def _owns_task(task: ScheduledTask, owner: str | None) -> bool:
-        return (
-            task.state != "deleted"
-            and task.user_id == owner
-            and (
-                current_account_user() is None
-                or task.account_generation == account_generation(owner or RESERVED_USER_LOCAL)
-            )
-        )
-
     def _require_owned(scheduled_task_id: str, owner: str | None) -> ScheduledTask:
         """Load a task the caller owns, or raise 404.
 
@@ -609,7 +605,7 @@ def create_scheduled_tasks_router(
         enumerable across users.
         """
         task = store.get(scheduled_task_id)
-        if task is None or not _owns_task(task, owner):
+        if task is None or not owns_scheduled_task(task, owner):
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
 
@@ -1060,7 +1056,7 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
+        tasks = [t for t in store.list(owner_user_id=owner_id) if owns_scheduled_task(t, owner_id)]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
         # Force-fail stale orphans FIRST so the completion badge below reports a
@@ -1472,9 +1468,17 @@ def create_scheduled_tasks_router(
             await _require_mode_fits_session(request, continuing)
         project_owner = _project_owner(owner)
         try:
+            # On the derived fields, so a session the update clears counts as a change.
+            await require_agent_keeps_shared_target(request, fields, existing, permission_store)
             if fields.get("project_id") is not None:
                 fields["project_id"] = await _owned_project_id(project_owner, fields["project_id"])
-            updated = store.update(scheduled_task_id, expected_schedule=existing, **fields)
+            updated = store.update(
+                scheduled_task_id,
+                expected_schedule=existing,
+                # Rechecked under the task's lock, so a grant made meanwhile counts.
+                guard=agent_shared_target_guard(request, fields, permission_store),
+                **fields,
+            )
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         except Exception as exc:
@@ -1546,4 +1550,14 @@ def create_scheduled_tasks_router(
             scheduler.remove(scheduled_task_id)
         return {"deleted": True, "id": scheduled_task_id}
 
+    def _load_owned_by_caller(request: Request, scheduled_task_id: str) -> ScheduledTask:
+        owner = _owner(request)
+        return _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+
+    register_scheduled_task_permissions_routes(
+        router,
+        load_owned_task=_load_owned_by_caller,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+    )
     return router
