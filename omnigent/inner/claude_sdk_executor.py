@@ -123,6 +123,8 @@ from .executor import (
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
     SandboxPolicy,
     cleanup_private_tmpdir,
     create_exec_launcher,
@@ -2124,185 +2126,190 @@ def prepare_claude_cli_path(
     if _sandbox_disabled_by_env():
         raise OSError("OMNIGENT_CLAUDE_SDK_NO_SANDBOX conflicts with the requested sandbox")
 
-    if model_access is not None and worker_env is None:
-        raise ValueError("Brokered Claude model access requires an owned worker environment")
-
-    cwd = resolved_cwd
-    sandbox = resolve_sandbox(spec, cwd)
-    if not sandbox.active:
-        raise OSError("The configured Claude sandbox resolved to an inactive policy")
-
-    sandbox = with_additional_read_roots(sandbox, [pathlib.Path(__file__).resolve().parents[1]])
-    if worker_env is not None:
-        parent_env = {**os.environ, **worker_env}
-        if "ANTHROPIC_API_KEY" not in worker_env:
-            parent_env.pop("ANTHROPIC_API_KEY", None)
-        credential_env_names = json.loads(
-            parent_env.get("HARNESS_CLAUDE_SDK_CREDENTIAL_ENV_NAMES", "[]")
-        )
-        if not isinstance(credential_env_names, list) or not all(
-            isinstance(name, str) for name in credential_env_names
-        ):
-            raise ValueError("invalid Claude credential environment metadata")
-        if model_access is None:
-            model_access = resolve_claude_model_access(
-                parent_env,
-                cwd=cwd,
-                databricks_profile=databricks_profile,
-                source_paths=user_settings_source_paths,
-                source_env_names=frozenset(credential_env_names),
-                user_settings_has_api_key_helper=user_settings_has_api_key_helper,
-            )
-        elif user_settings_source_paths:
-            model_access = replace(
-                model_access,
-                source_paths=(*model_access.source_paths, *user_settings_source_paths),
-            )
-        if response_header_timeout_seconds is not None:
-            model_access = replace(
-                model_access, response_header_timeout_seconds=response_header_timeout_seconds
-            )
-        model_access = model_access.with_bundle_sources(bundle_dir)
-        sandbox = model_access.protect_sources(sandbox, cwd)
-    else:
-        sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
-        sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
-        sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-    probe_argv = [sys.executable, "-c", "pass"]
-    wrapped_argv = get_backend(sandbox.backend_type).wrap_launcher_argv(
-        probe_argv, sandbox, cwd, target=real_cli_path
-    )
-    if wrapped_argv == probe_argv:
-        raise OSError(f"Sandbox backend {sandbox.backend_type!r} cannot contain the Claude CLI")
-    egress_rules = list(sandbox_spec.egress_rules or [])
-    if egress_rules and worker_env is None:
-        raise ValueError("Egress-filtered Claude requires an owned worker environment")
-    egress_handle: EgressProxyHandle | None = None
-    runtime_tmpdir: pathlib.Path | None = None
-    staged_env = dict(worker_env) if worker_env is not None else {}
-    allowed_env = clean_agent_env(
-        allow_prefixes=("ANTHROPIC_", "CLAUDE_"),
-        extra_allowed=declared_passthrough(spec),
-    )
-    source_env_names: set[str] = set()
-    plugin_dir: pathlib.Path | None = None
     try:
-        if worker_env is not None:
-            runtime_tmpdir = create_private_tmpdir()
-            sandbox = with_additional_write_roots(sandbox, [runtime_tmpdir])
-            staged_env["CLAUDE_CODE_TMPDIR"] = str(runtime_tmpdir)
-            if bundle_dir is not None:
-                plugin_dir = stage_contained_bundle_skills(
-                    bundle_dir, runtime_tmpdir / "plugin", agent_name
-                )
-            if model_access is not None:
-                home = runtime_tmpdir / "home"
-                (home / ".claude").mkdir(parents=True)
-                credential_value = model_access.worker_environment(staged_env, home)
-                model_access.worker_environment(
-                    allowed_env, home, credential_value=credential_value
-                )
-        if egress_rules or model_access is not None:
-            assert runtime_tmpdir is not None
-            from .credential_proxy import prepare_credential_proxy_runtime
-            from .os_env import (
-                _build_credential_proxy_parent_env,
-                _write_credential_proxy_files,
-            )
+        if model_access is not None and worker_env is None:
+            raise ValueError("Brokered Claude model access requires an owned worker environment")
 
-            credential_runtime = prepare_credential_proxy_runtime(
-                sandbox.credential_proxy,
-                parent_env=_build_credential_proxy_parent_env(
-                    helper_env={**allowed_env, **staged_env},
-                    parent_env=os.environ,
-                    spec=sandbox.credential_proxy,
+        cwd = resolved_cwd
+        sandbox = resolve_sandbox(spec, cwd)
+        if not sandbox.active:
+            raise OSError("The configured Claude sandbox resolved to an inactive policy")
+
+        sandbox = with_additional_read_roots(sandbox, [pathlib.Path(__file__).resolve().parents[1]])
+        if worker_env is not None:
+            parent_env = {**os.environ, **worker_env}
+            if "ANTHROPIC_API_KEY" not in worker_env:
+                parent_env.pop("ANTHROPIC_API_KEY", None)
+            credential_env_names = json.loads(
+                parent_env.get("HARNESS_CLAUDE_SDK_CREDENTIAL_ENV_NAMES", "[]")
+            )
+            if not isinstance(credential_env_names, list) or not all(
+                isinstance(name, str) for name in credential_env_names
+            ):
+                raise ValueError("invalid Claude credential environment metadata")
+            if model_access is None:
+                model_access = resolve_claude_model_access(
+                    parent_env,
+                    cwd=cwd,
+                    databricks_profile=databricks_profile,
+                    source_paths=user_settings_source_paths,
+                    source_env_names=frozenset(credential_env_names),
+                    user_settings_has_api_key_helper=user_settings_has_api_key_helper,
                 )
-                if sandbox.credential_proxy is not None
-                else {},
-                sandbox=sandbox,
-                cwd=cwd,
-            )
-            staged_env.update(credential_runtime.helper_env_updates)
-            if sandbox.credential_proxy is not None:
-                source_env_names = {
-                    entry.source.env
-                    for entry in sandbox.credential_proxy.entries
-                    if entry.source.kind == "env" and entry.source.env
-                } - credential_runtime.helper_env_updates.keys()
-                for name in source_env_names:
-                    staged_env.pop(name, None)
-            _write_credential_proxy_files(
-                staged_env, credential_runtime.sandbox_files, runtime_tmpdir
-            )
-            for key in ("ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
-                staged_env.pop(key, None)
-            egress_handle = start_egress_proxy(
-                rules=egress_rules,
-                tmpdir=runtime_tmpdir,
-                allow_private_destinations=sandbox_spec.egress_allow_private_destinations,
-                require_auth=True,
-                credential_rewrites=credential_runtime.rewrites,
-                request_body_transform=request_body_transform,
-                model_access=model_access,
-            )
-            apply_egress_env(
-                staged_env,
-                relay_port=egress_handle.relay_port,
-                ca_bundle_path=egress_handle.ca_bundle_path,
-                auth_token=None,
-            )
-            sandbox = replace(
-                sandbox,
-                allow_network=False,
-                egress_relay_port=egress_handle.relay_port,
-                egress_socket_path=str(egress_handle.socket_path),
-            )
-        if worker_env is not None:
-            # The SDK adds its identity and cwd after merging options.env.
-            names = [
-                *allowed_env,
-                *staged_env,
-                "CLAUDE_CODE_ENTRYPOINT",
-                "CLAUDE_AGENT_SDK_VERSION",
-                "PWD",
-                *ALIAS_MODEL_ENV_VARS.values(),
-            ]
-            if egress_rules or model_access is not None:
-                names = [
-                    name
-                    for name in names
-                    if name not in {"ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"}
-                ]
-            names = [name for name in names if name not in source_env_names]
-            sandbox = with_spawn_env_allowlist(sandbox, names)
-        launcher = pathlib.Path(
-            create_exec_launcher(real_cli_path, sandbox, cwd=str(cwd), env_overrides=staged_env)
-            if worker_env is not None
-            else create_exec_launcher(real_cli_path, sandbox, cwd=str(cwd))
+            elif user_settings_source_paths:
+                model_access = replace(
+                    model_access,
+                    source_paths=(*model_access.source_paths, *user_settings_source_paths),
+                )
+            if response_header_timeout_seconds is not None:
+                model_access = replace(
+                    model_access, response_header_timeout_seconds=response_header_timeout_seconds
+                )
+            model_access = model_access.with_bundle_sources(bundle_dir)
+            sandbox = model_access.protect_sources(sandbox, cwd)
+        else:
+            sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
+            sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
+            sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
+        probe_argv = [sys.executable, "-c", "pass"]
+        wrapped_argv = get_backend(sandbox.backend_type).wrap_launcher_argv(
+            probe_argv, sandbox, cwd, target=real_cli_path
         )
-        if worker_env is not None:
-            worker_env.clear()
-            worker_env.update(staged_env)
-        return PreparedClaudeCli(
-            cli_path=str(launcher),
-            cwd=str(cwd),
-            enable_native_tools=True,
-            sandbox=sandbox,
-            sandboxed=True,
-            _owned_launcher=launcher,
-            _egress_handle=egress_handle,
-            _runtime_tmpdir=runtime_tmpdir,
-            model_access=model_access,
-            plugin_dir=plugin_dir,
+        if wrapped_argv == probe_argv:
+            raise OSError(f"Sandbox backend {sandbox.backend_type!r} cannot contain the Claude CLI")
+        egress_rules = list(sandbox_spec.egress_rules or [])
+        if egress_rules and worker_env is None:
+            raise ValueError("Egress-filtered Claude requires an owned worker environment")
+        egress_handle: EgressProxyHandle | None = None
+        runtime_tmpdir: pathlib.Path | None = None
+        staged_env = dict(worker_env) if worker_env is not None else {}
+        allowed_env = clean_agent_env(
+            allow_prefixes=("ANTHROPIC_", "CLAUDE_"),
+            extra_allowed=declared_passthrough(spec),
         )
-    except BaseException:
+        source_env_names: set[str] = set()
+        plugin_dir: pathlib.Path | None = None
         try:
-            if egress_handle is not None:
-                with suppress(Exception):
-                    egress_handle.stop()
-        finally:
-            cleanup_private_tmpdir(runtime_tmpdir)
+            if worker_env is not None:
+                runtime_tmpdir = create_private_tmpdir()
+                sandbox = with_additional_write_roots(sandbox, [runtime_tmpdir])
+                staged_env["CLAUDE_CODE_TMPDIR"] = str(runtime_tmpdir)
+                if bundle_dir is not None:
+                    plugin_dir = stage_contained_bundle_skills(
+                        bundle_dir, runtime_tmpdir / "plugin", agent_name
+                    )
+                if model_access is not None:
+                    home = runtime_tmpdir / "home"
+                    (home / ".claude").mkdir(parents=True)
+                    credential_value = model_access.worker_environment(staged_env, home)
+                    model_access.worker_environment(
+                        allowed_env, home, credential_value=credential_value
+                    )
+            if egress_rules or model_access is not None:
+                assert runtime_tmpdir is not None
+                from .credential_proxy import prepare_credential_proxy_runtime
+                from .os_env import (
+                    _build_credential_proxy_parent_env,
+                    _write_credential_proxy_files,
+                )
+
+                credential_runtime = prepare_credential_proxy_runtime(
+                    sandbox.credential_proxy,
+                    parent_env=_build_credential_proxy_parent_env(
+                        helper_env={**allowed_env, **staged_env},
+                        parent_env=os.environ,
+                        spec=sandbox.credential_proxy,
+                    )
+                    if sandbox.credential_proxy is not None
+                    else {},
+                    sandbox=sandbox,
+                    cwd=cwd,
+                )
+                staged_env.update(credential_runtime.helper_env_updates)
+                if sandbox.credential_proxy is not None:
+                    source_env_names = {
+                        entry.source.env
+                        for entry in sandbox.credential_proxy.entries
+                        if entry.source.kind == "env" and entry.source.env
+                    } - credential_runtime.helper_env_updates.keys()
+                    for name in source_env_names:
+                        staged_env.pop(name, None)
+                _write_credential_proxy_files(
+                    staged_env, credential_runtime.sandbox_files, runtime_tmpdir
+                )
+                for key in ("ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+                    staged_env.pop(key, None)
+                egress_handle = start_egress_proxy(
+                    rules=egress_rules,
+                    tmpdir=runtime_tmpdir,
+                    allow_private_destinations=sandbox_spec.egress_allow_private_destinations,
+                    require_auth=True,
+                    credential_rewrites=credential_runtime.rewrites,
+                    request_body_transform=request_body_transform,
+                    model_access=model_access,
+                )
+                apply_egress_env(
+                    staged_env,
+                    relay_port=egress_handle.relay_port,
+                    ca_bundle_path=egress_handle.ca_bundle_path,
+                    auth_token=None,
+                )
+                sandbox = replace(
+                    sandbox,
+                    allow_network=False,
+                    egress_relay_port=egress_handle.relay_port,
+                    egress_socket_path=str(egress_handle.socket_path),
+                )
+            if worker_env is not None:
+                # The SDK adds its identity and cwd after merging options.env.
+                names = [
+                    *allowed_env,
+                    *staged_env,
+                    "CLAUDE_CODE_ENTRYPOINT",
+                    "CLAUDE_AGENT_SDK_VERSION",
+                    "PWD",
+                    *ALIAS_MODEL_ENV_VARS.values(),
+                ]
+                if egress_rules or model_access is not None:
+                    names = [
+                        name
+                        for name in names
+                        if name not in {"ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"}
+                    ]
+                names = [name for name in names if name not in source_env_names]
+                sandbox = with_spawn_env_allowlist(sandbox, names)
+            launcher = pathlib.Path(
+                create_exec_launcher(real_cli_path, sandbox, cwd=str(cwd), env_overrides=staged_env)
+                if worker_env is not None
+                else create_exec_launcher(real_cli_path, sandbox, cwd=str(cwd))
+            )
+            if worker_env is not None:
+                worker_env.clear()
+                worker_env.update(staged_env)
+            return PreparedClaudeCli(
+                cli_path=str(launcher),
+                cwd=str(cwd),
+                enable_native_tools=True,
+                sandbox=sandbox,
+                sandboxed=True,
+                _owned_launcher=launcher,
+                _egress_handle=egress_handle,
+                _runtime_tmpdir=runtime_tmpdir,
+                model_access=model_access,
+                plugin_dir=plugin_dir,
+            )
+        except BaseException:
+            try:
+                if egress_handle is not None:
+                    with suppress(Exception):
+                        egress_handle.stop()
+            finally:
+                cleanup_private_tmpdir(runtime_tmpdir)
+            raise
+    except HarnessSandboxValidationError:
         raise
+    except Exception as exc:
+        raise HarnessSandboxPreparationError(str(exc)) from exc
 
 
 def prepare_tight_cli_process(

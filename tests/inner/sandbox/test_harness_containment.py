@@ -147,6 +147,8 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
     monkeypatch.setattr(codex_worker, "get_backend", backend)
     spec = OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
     expected_error = NotImplementedError if fault in ("unsupported", "backend") else OSError
+    if harness == "claude-sdk":
+        expected_error = sandbox.HarnessSandboxPreparationError
     with pytest.raises(expected_error):
         with _prepared_launch(harness, executable, workspace, spec):
             pytest.fail(f"{harness} accepted an unavailable requested sandbox")
