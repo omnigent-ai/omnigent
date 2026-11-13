@@ -58,10 +58,13 @@ import pytest
 from playwright.sync_api import APIResponse, Error, Locator, Page, Route, expect
 
 from tests._helpers.compat import (
+    COMPAT_SERVER_VERSION_ENV,
     apply_runner_env,
     apply_server_env,
     compat_runner_cwd,
     compat_server_cwd,
+    compat_server_python,
+    meets_min_server_version,
     runner_executable,
     server_executable,
 )
@@ -1118,6 +1121,14 @@ def live_server(
     # drop PYTHONPATH so the pinned old build in the compat venv resolves
     # instead of being shadowed by the worktree.
     apply_server_env(env, _REPO_ROOT)
+    # The shared server keeps per-task timers; dedicated v2 suites start their own.
+    # Pre-0.22 compatibility servers already default to the timers.
+    features = env.get("OMNIGENT_FEATURES", "")
+    compat_version = env.get(COMPAT_SERVER_VERSION_ENV) or "0"
+    if "automations_v2" not in features and (
+        compat_server_python() is None or meets_min_server_version(compat_version, "0.22.0")
+    ):
+        env["OMNIGENT_FEATURES"] = ",".join(filter(None, (features, "-automations_v2")))
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     server_argv = [
         server_executable(),

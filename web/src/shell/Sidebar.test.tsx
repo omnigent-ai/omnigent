@@ -2013,7 +2013,33 @@ describe("Sidebar idle latest-message error", () => {
     expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
   });
 
-  it("shows an idle message error on a collapsed project's marker", async () => {
+  it("reads idle errors only for folder rows above Show more until more are shown", async () => {
+    projectsMock.push("Customer X");
+    const filed = Array.from({ length: PROJECT_FOLDER_PAGE_SIZE + 1 }, (_, i) =>
+      conv(`conv_filed_${i}`, "Claude Code", {
+        status: "idle",
+        updated_at: 100 - i,
+        labels: { omni_project: "Customer X" },
+      }),
+    );
+    mockConversations(filed);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    const hiddenId = filed.at(-1)!.id;
+    await waitFor(() =>
+      expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(PROJECT_FOLDER_PAGE_SIZE),
+    );
+    expect(vi.mocked(sessionsApi.fetchSessionItemsPage).mock.calls.map(([id]) => id)).not.toContain(
+      hiddenId,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Show more/ }));
+    const row = (await screen.findByRole("link", { name: hiddenId })).closest("li")!;
+    await within(row).findByRole("img", { name: "Latest message is an error" });
+    expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(PROJECT_FOLDER_PAGE_SIZE + 1);
+  });
+
+  it("reads a project's idle error once its row renders and keeps it on the collapsed marker", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_idle_error", "Claude Code", {
@@ -2023,11 +2049,17 @@ describe("Sidebar idle latest-message error", () => {
     ]);
     renderSidebar();
     const header = screen.getByRole("button", { name: /^Customer X/ });
-    await within(header).findByRole("img", { name: "Latest message is an error" });
+    // A collapsed folder starts no tail reads for rows it does not render.
+    await act(async () => {});
+    expect(sessionsApi.fetchSessionItemsPage).not.toHaveBeenCalled();
+    expect(within(header).queryByRole("img", { name: "Latest message is an error" })).toBeNull();
+
     fireEvent.click(header);
     const row = screen.getByRole("link", { name: "conv_idle_error" }).closest("li")!;
+    await within(row).findByRole("img", { name: "Latest message is an error" });
+    fireEvent.click(header);
     expect(
-      within(row).getByRole("img", { name: "Latest message is an error" }),
+      within(header).getByRole("img", { name: "Latest message is an error" }),
     ).toBeInTheDocument();
     expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
   });

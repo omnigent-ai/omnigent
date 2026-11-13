@@ -2,9 +2,14 @@ import { useEffect } from "react";
 
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { type Chord, chordMatches } from "@/lib/shortcuts/chord";
 import { isNativeShell } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
+
+const BROWSER_NEW_SESSION_CHORD: Chord = { mod: true, shift: true, key: "o" };
+// The key that types N, on any layout.
+const NATIVE_NEW_SESSION_CHORD: Chord = { mod: true, key: "n" };
 
 /** Browser Cmd/Ctrl+Shift+O; native shells Cmd/Ctrl+N. */
 export function isNewSessionHotkey(
@@ -12,10 +17,7 @@ export function isNewSessionHotkey(
   isMac = isMacPlatform(),
   native = isNativeShell(),
 ): boolean {
-  if (!hasCommandModifier(e, isMac) || e.getModifierState("AltGraph")) return false;
-  if (!native) return !e.altKey && e.shiftKey && e.key.toLowerCase() === "o";
-  // The key that types N, on any layout.
-  return !e.shiftKey && !e.altKey && e.key.toLowerCase() === "n";
+  return chordMatches(native ? NATIVE_NEW_SESSION_CHORD : BROWSER_NEW_SESSION_CHORD, e, isMac);
 }
 
 /** Start a new session via `onNewSession`, or open the plain composer. */
