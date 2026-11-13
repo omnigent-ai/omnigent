@@ -2845,8 +2845,9 @@ def register_resources_routes(
         )
 
         conv = await _authorize_browse_read(session_id, request)
-        owner, host = await _session_host(conv, request)
-        reach = await _environment_reach_for_session(owner) if host is not None else None
+        _host_id, host, workspace = await _session_host(conv, request)
+        # The session's own spec decides confinement, even on an inherited host.
+        reach = await _environment_reach_for_session(conv, workspace) if host is not None else None
         target: HostTarget | ConnectError
         if host is None or host_registry is None:
             target = ConnectError(Code.UNAVAILABLE, "The session's host is not connected")
