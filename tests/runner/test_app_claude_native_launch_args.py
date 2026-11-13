@@ -1462,9 +1462,9 @@ def test_claude_terminal_env_boundary_preserves_original_suffix(args, expected):
 async def test_auto_create_claude_settings_preserve_configured_argument_boundary(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, command: str, prefix: list[str]
 ) -> None:
-    from unittest.mock import Mock
+    from unittest.mock import AsyncMock, Mock
 
-    from omnigent.harnesses.claude_native import bridge
+    from omnigent.harnesses.claude_native import bridge, settings_validation
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.terminal import create_terminal_instance
     from omnigent.runner.native import orchestration
@@ -1481,6 +1481,7 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
         lambda **_kwargs: ('--settings={"env":{"ORDER":"caller"}}',),
     )
     monkeypatch.setattr(bridge, "ensure_claude_workspace_trusted", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(settings_validation, "validate_caller_settings", AsyncMock())
 
     async def prepare_before_launch(**kwargs):
         assert kwargs["spec"].command == command

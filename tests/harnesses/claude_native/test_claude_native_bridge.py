@@ -18699,6 +18699,7 @@ def test_read_tmux_target_rejects_invalid_payloads(tmp_path: Path) -> None:
 @pytest.mark.parametrize("deferred", [False, True])
 @pytest.mark.parametrize("saved", [False, True])
 @pytest.mark.parametrize("active", [None, [], ["claude"]])
+@pytest.mark.usefixtures("claude_settings_validator")
 async def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved, deferred):
     from omnigent.inner.datamodel import OSEnvSpec
     from tests._helpers.mcp_disabled_servers import launch_activation
