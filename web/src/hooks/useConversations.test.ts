@@ -4213,6 +4213,65 @@ describe("useDeleteProject", () => {
     });
   });
 
+  it("leaves a project with working members untouched until the caller confirms", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        data: [
+          { id: "conv_busy", object: "conversation", status: "running" },
+          { id: "conv_waiting", object: "conversation", pending_elicitations_count: 1 },
+          { id: "conv_bg", object: "conversation", background_work_running: true },
+          { id: "conv_idle", object: "conversation", status: "idle" },
+        ],
+        has_more: false,
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+
+    result.current.mutate({ id: "p_1", name: "Sprint 42" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual({
+      status: "needs_running_confirmation",
+      runningCount: 3,
+    });
+    // Only the member listing ran: no archive PATCH and no project DELETE.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(invalidateSpy).not.toHaveBeenCalled();
+  });
+
+  it("archives working members and deletes the project once stopRunning is confirmed", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [{ id: "conv_busy", object: "conversation", status: "running" }],
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(archivedConv("conv_busy"))
+      .mockResolvedValueOnce(mockResponse({ id: "p_1", object: "project.deleted", deleted: true }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+
+    result.current.mutate({ id: "p_1", name: "Sprint 42", stopRunning: true });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual({
+      status: "deleted",
+      succeeded: ["conv_busy"],
+      failed: [],
+    });
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/sessions/conv_busy");
+    expect((fetchMock.mock.calls[1][1] as RequestInit).method).toBe("PATCH");
+    expect(fetchMock.mock.calls[2][0]).toBe("/v1/projects/p_1");
+    expect((fetchMock.mock.calls[2][1] as RequestInit).method).toBe("DELETE");
+  });
+
   it("throws with succeeded/failed split when some archives fail", async () => {
     fetchMock
       .mockResolvedValueOnce(

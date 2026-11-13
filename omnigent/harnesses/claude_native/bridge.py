@@ -308,7 +308,7 @@ _MCP_PROTOCOL_VERSION = "2024-11-05"
 # on its MCP stdout. Standard MCP notification — unrelated to the
 # experimental Claude Channels feature that this module no longer
 # uses.
-_TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
+TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
 _TOOLS_CHANGED_POST_TIMEOUT_S = 10.0
 # The control POST carries an empty JSON object; anything larger is not ours.
 _TOOLS_CHANGED_BODY_MAX_BYTES = 4096
@@ -498,6 +498,8 @@ _OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
 _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
 # What :func:`_occupying_surface` reports when no input box is drawn.
 _OVERLAY_SURFACE = "an overlay"
+_DETAILED_TRANSCRIPT_SURFACE = "the detailed transcript view"
+_DETAILED_TRANSCRIPT_FOOTER = "showingdetailedtranscript·ctrl+ototoggle·?forshortcuts"
 # What :func:`_occupying_surface` reports when the box is in ``!`` shell mode.
 _SHELL_MODE_SURFACE = "shell mode"
 # What :func:`_occupying_surface` reports when a draft taller than the pane
@@ -1141,6 +1143,8 @@ class ClaudeHookRecord:
         payload's ``error_details`` field, e.g.
         ``"prompt is too long: 120000 tokens (limit 100000)"``. ``None`` when absent.
     :param failure_context: Structured evidence supplied by this hook record.
+    :param completion_output: Authoritative ``Stop`` reply, including an empty
+        reply. ``None`` when absent or malformed; never truncated here.
     """
 
     event_cursor: int
@@ -1165,6 +1169,7 @@ class ClaudeHookRecord:
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
+    completion_output: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2918,6 +2923,9 @@ def build_hook_settings(
         # a catch-all policy evaluation entry so TOOL_RESULT policies
         # fire for all tools, not just the forwarder-specific ones.
         hooks["PostToolUse"].append({"hooks": [evaluate_policy_hook]})
+        # A failed tool call (e.g. Bash exiting non-zero) fires
+        # PostToolUseFailure instead of PostToolUse.
+        hooks["PostToolUseFailure"] = [{"hooks": [evaluate_policy_hook]}]
         # UserPromptSubmit already carries the transcript forwarder's
         # status hook (running). Append the policy hook so REQUEST-phase
         # policies gate native prompts — for native sessions this is the
@@ -4667,6 +4675,11 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
+    completion_output: str | None = None
+    if event_name == "Stop" and isinstance(payload, dict):
+        raw_output = payload.get("last_assistant_message")
+        if isinstance(raw_output, str):
+            completion_output = raw_output
     if event_name == "StopFailure" and isinstance(payload, dict):
         failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
         # ``error_details`` is the purpose-built API error field; ``last_assistant_message``
@@ -4727,6 +4740,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         failure_category=failure_category,
         failure_message=failure_message,
         failure_context=failure_context,
+        completion_output=completion_output,
     )
 
 
@@ -6274,10 +6288,14 @@ def display_cost_approval_popup(
     )
 
 
+class ClaudeBridgeNotReady(RuntimeError):
+    """The MCP control endpoint has not published its connection details yet."""
+
+
 def post_tools_changed(
     bridge_dir: Path,
     *,
-    timeout_s: float = _TOOLS_CHANGED_READY_TIMEOUT_S,
+    timeout_s: float = TOOLS_CHANGED_READY_TIMEOUT_S,
     cancelled: threading.Event | None = None,
 ) -> None:
     """
@@ -6290,7 +6308,7 @@ def post_tools_changed(
 
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait for the bridge control endpoint
-        to publish itself, e.g. ``30.0``.
+        to publish itself, e.g. ``30.0``; ``0`` probes once without waiting.
     :param cancelled: Stops waiting when the notifying task is cancelled.
     :returns: None.
     :raises RuntimeError: If the bridge server is not ready, cannot
@@ -6735,7 +6753,9 @@ def claude_pane_input_box_shown(pane: str) -> bool:
     :param pane: Captured pane text, e.g. the watcher's last capture.
     :returns: ``False`` when a dialog or picker replaces the input box.
     """
-    return _composer_box(pane) is not None or _history_search_overlay_shown(pane)
+    return not _detailed_transcript_view_shown(pane) and (
+        _composer_box(pane) is not None or _history_search_overlay_shown(pane)
+    )
 
 
 def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
@@ -6757,8 +6777,8 @@ def _user_prompt_visible(pane: str) -> bool:
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
-    # Narrow panes wrap the decision footer across captured lines.
-    footer = " ".join(region.split())
+    # Narrow panes can wrap inside the decision footer's words.
+    footer = "".join(region.split())
     # A short pane can clip the plan decision's footer entirely.
     plan_region = "\n".join(lines[rules[-1] + 1 :]) if rules else ""
     plan_exit = re.search(
@@ -6774,8 +6794,8 @@ def _user_prompt_visible(pane: str) -> bool:
         or "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
-            any(hint in footer for hint in ("Enter to select", "Enter to submit"))
-            and "Esc to cancel" in footer
+            any(hint in footer for hint in ("Entertoselect", "Entertosubmit"))
+            and "Esctocancel" in footer
         )
     )
 
@@ -7040,6 +7060,9 @@ def _restore_occupied_input(
     the pane, which scrolls the box's glyph row out of view
     (:func:`_scrolled_draft_rows`).
 
+    The detailed transcript view uses Ctrl+O instead of Escape. Toggle it
+    once after two matching captures; repeating it could reopen the view.
+
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
     startup dialogs whose Escape quits Claude Code instead of closing them
@@ -7049,7 +7072,7 @@ def _restore_occupied_input(
     it once with Ctrl+L before any edit keys can erase its identifying prefix,
     then check the actual composer and pending prompts again.
 
-    Escape is only sent while the surface is verifiably on screen —
+    Dismissal keys are only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
     in-flight turn. A screen with no input box counts only when it
     advertises Escape as its dismissal; before Claude Code draws its input
@@ -7083,6 +7106,8 @@ def _restore_occupied_input(
     confirmed = False
     unclearable_seen = False
     notice_redrawn = False
+    transcript_view_seen = False
+    transcript_toggled = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(
@@ -7098,6 +7123,9 @@ def _restore_occupied_input(
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
             return None
         surface = _occupying_surface(pane)
+        if transcript_toggled and not pane.strip():
+            # A torn capture cannot confirm that the toggled view closed.
+            surface = _DETAILED_TRANSCRIPT_SURFACE
         delivery_diagnostics.record_restore_observation(pane=pane, surface=surface)
         box = _composer_box(pane)
         if (
@@ -7132,6 +7160,13 @@ def _restore_occupied_input(
             # can misreport during a repaint. A real surface is still there a
             # poll later; a repaint artifact is not.
             confirmed = True
+        elif surface == _DETAILED_TRANSCRIPT_SURFACE:
+            if transcript_view_seen and not transcript_toggled:
+                _logger.info("claude-native: leaving the detailed transcript view")
+                delivery_diagnostics.record_restore_action("transcript_toggle")
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-o")
+                # Repeating a toggle against a stale capture would reopen the view.
+                transcript_toggled = True
         elif unclearable:
             # Give it up only on two consecutive hint-less sightings, so a
             # torn frame mid-redraw of a dismissible surface does not hand a
@@ -7157,6 +7192,7 @@ def _restore_occupied_input(
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
             last_escape = now
         unclearable_seen = unclearable
+        transcript_view_seen = surface == _DETAILED_TRANSCRIPT_SURFACE
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
@@ -7200,6 +7236,8 @@ def _occupying_surface(pane: str) -> str | None:
     """
     if not pane.strip():
         return None
+    if _detailed_transcript_view_shown(pane):
+        return _DETAILED_TRANSCRIPT_SURFACE
     if _history_search_footer_shown(pane):
         return "the prompt-history search"
     row = _composer_row(pane)
@@ -7518,7 +7556,17 @@ def _claude_prompt_rendered(pane: str) -> bool:
     row = _composer_row(pane)
     if row is None or not row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return False
-    return not _history_search_footer_shown(pane)
+    return not _history_search_footer_shown(pane) and not _detailed_transcript_view_shown(pane)
+
+
+def _detailed_transcript_view_shown(pane: str) -> bool:
+    """Match the view's complete footer below its last rule, including wrapped text."""
+    lines = pane.splitlines()
+    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
+    if last_rule is None:
+        return False
+    footer = "".join("".join(lines[last_rule + 1 :]).split()).lower()
+    return footer in {_DETAILED_TRANSCRIPT_FOOTER, _DETAILED_TRANSCRIPT_FOOTER + "verbose"}
 
 
 def _history_search_footer_shown(pane: str) -> bool:
@@ -7960,11 +8008,17 @@ def _wait_for_claude_prompt_ready(
         if _claude_prompt_rendered(pane):
             return
         remaining = hard_deadline - time.monotonic()
+        occupying_surface = _occupying_surface(pane)
         if (
             bridge_dir is not None
             and remaining > 0
-            and _occupying_surface(pane) == _OVERLAY_SURFACE
-            and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
+            and (
+                occupying_surface == _DETAILED_TRANSCRIPT_SURFACE
+                or (
+                    occupying_surface == _OVERLAY_SURFACE
+                    and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
+                )
+            )
             and _terminal_dialog_headline(pane) is None
             and not _escape_quits_claude(pane)
         ):
@@ -8262,6 +8316,22 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
+def read_tmux_target(bridge_dir: Path) -> dict[str, str] | None:
+    """
+    Read the ``tmux.json`` advertisement once.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: ``{"socket_path": ..., "tmux_target": ...}``, or ``None`` when
+        the file is absent or lacks valid fields.
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
+    tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
+    if isinstance(socket_path, str) and isinstance(tmux_target, str):
+        return {"socket_path": socket_path, "tmux_target": tmux_target}
+    return None
+
+
 def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]:
     """
     Wait for the runner to write ``tmux.json``.
@@ -8273,14 +8343,11 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
         ``socket_path`` and ``tmux_target`` fields.
     """
     deadline = time.monotonic() + timeout_s
-    path = bridge_dir / _TMUX_FILE
     while time.monotonic() < deadline:
         _check_injection_cancelled()
-        payload = _read_json_file(path)
-        socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
-        tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
-        if isinstance(socket_path, str) and isinstance(tmux_target, str):
-            return {"socket_path": socket_path, "tmux_target": tmux_target}
+        info = read_tmux_target(bridge_dir)
+        if info is not None:
+            return info
         time.sleep(0.05)
     raise TmuxSessionNotAdvertised(
         "Claude terminal tmux target is not advertised yet. Wait for the "
@@ -11861,7 +11928,7 @@ def _wait_for_server_info(
     """
     deadline = time.monotonic() + timeout_s
     path = bridge_dir / _SERVER_FILE
-    while time.monotonic() < deadline:
+    while True:
         if cancelled is not None and cancelled.is_set():
             raise RuntimeError("Claude native bridge notification was cancelled")
         payload = _read_json_file(path)
@@ -11871,11 +11938,13 @@ def _wait_for_server_info(
             and (payload.get("socket") or payload.get("url"))
         ):
             return payload
+        if time.monotonic() >= deadline:
+            break
         if cancelled is None:
             time.sleep(0.05)
         else:
             cancelled.wait(0.05)
-    raise RuntimeError(
+    raise ClaudeBridgeNotReady(
         "Claude native bridge is not ready yet. Wait for Claude Code "
         "startup to finish before notifying tool list changes."
     )

@@ -31,6 +31,7 @@ from starlette.datastructures import Headers
 
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
+    FunctionCallData,
     MessageData,
     NewConversationItem,
 )
@@ -4910,6 +4911,62 @@ async def test_list_session_items_pagination(
     assert len(page["data"]) <= 1
 
 
+async def test_list_session_items_filters_by_item_type(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``type`` keeps only items of that type, across pages; an unknown type is a 422."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    SqlAlchemyConversationStore(db_uri).append(
+        session["id"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            ),
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_1",
+                data=FunctionCallData(
+                    agent="test-agent", name="search", arguments="{}", call_id="call_1"
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_2",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "again"}]),
+            ),
+        ],
+    )
+    items_url = f"/v1/sessions/{session['id']}/items"
+
+    by_type = {
+        item_type: [
+            item["type"]
+            for item in (await client.get(items_url, params={"type": item_type})).json()["data"]
+        ]
+        for item_type in ("message", "function_call")
+    }
+    # The cursor of a filtered page continues with the next item of that type.
+    first = (await client.get(items_url, params={"type": "message", "limit": 1})).json()
+    second = (
+        await client.get(
+            items_url, params={"type": "message", "limit": 1, "after": first["last_id"]}
+        )
+    ).json()
+    bogus = await client.get(items_url, params={"type": "bogus"})
+
+    assert by_type == {"message": ["message", "message"], "function_call": ["function_call"]}
+    pages = [
+        ([item["content"][0]["text"] for item in page["data"]], page["has_more"])
+        for page in (first, second)
+    ]
+    assert pages == [(["hi"], True), (["again"], False)]
+    assert bogus.status_code == 422, bogus.text
+
+
 async def test_list_session_items_404_for_nonexistent(
     client: httpx.AsyncClient,
 ) -> None:
@@ -5880,12 +5937,14 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     assert relay_bindings == [(sid, "runner_recovered")]
 
 
+@pytest.mark.parametrize("wire_output", [None, "HOOK_FINAL", ""])
 async def test_post_external_session_status_idle_forwards_persisted_assistant_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    wire_output: str | None,
 ) -> None:
     """
-    Native idle status forwarding includes AP-persisted assistant text.
+    A confirmed native idle keeps the hook reply; otherwise persisted text fills it.
 
     The native forwarder posts transcript items to Omnigent server, then posts
     ``external_session_status: idle``. The runner's sub-agent registry
@@ -5950,9 +6009,14 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         assert item_resp.status_code == 202, item_resp.text
 
         forwarded.clear()
+        status_data: dict[str, Any] = {"status": "idle"}
+        if wire_output is not None:
+            # The Claude ``Stop`` edge carries its reply with ``turn_completed``.
+            status_data["output"] = wire_output
+            status_data["turn_completed"] = True
         status_resp = await client.post(
             f"/v1/sessions/{child['id']}/events",
-            json={"type": "external_session_status", "data": {"status": "idle"}},
+            json={"type": "external_session_status", "data": status_data},
         )
 
     assert status_resp.status_code == 202, status_resp.text
@@ -5961,7 +6025,11 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
             "path": f"/v1/sessions/{child['id']}/events",
             "body": {
                 "type": "external_session_status",
-                "data": {"status": "idle", "output": "AP_NATIVE_DONE"},
+                "data": (
+                    {"status": "idle", "output": "AP_NATIVE_DONE"}
+                    if wire_output is None
+                    else {"status": "idle", "output": wire_output, "turn_completed": True}
+                ),
                 "model_override": None,
                 "tools": None,
                 "created_by": None,
