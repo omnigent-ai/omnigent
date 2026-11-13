@@ -4035,11 +4035,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();
     expect(screen.queryByTestId("task-schedule-trigger")).not.toBeInTheDocument();
 
-    fireEvent.keyDown(sessionMode, { key: "Enter" });
-    expect(
-      screen.getByRole("menuitemradio", { name: /^One task session for all matches/ }),
-    ).toHaveTextContent("Started on the first match, so it keeps its context across matches.");
-    fireEvent.click(screen.getByRole("menuitemradio", { name: /^One task session/ }));
+    chooseTriggerSessionMode("One task session");
     expect(sessionMode).toHaveTextContent("One task session for all matches");
     expect(screen.getByLabelText("Instructions for the task session")).toHaveValue("Triage it.");
     expect(screen.queryByTestId("task-trigger-cadence")).not.toBeInTheDocument();

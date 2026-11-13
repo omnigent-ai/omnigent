@@ -1913,7 +1913,7 @@ export function CreateScheduledTaskDialog({
                                     data-testid="task-trigger-session-mode"
                                   />
                                 </DropdownMenuTrigger>
-                                <DropdownMenuContent align="end" className="w-80">
+                                <DropdownMenuContent align="end" className="min-w-64">
                                   <DropdownMenuRadioGroup
                                     value={triggerTaskSessionMode}
                                     onValueChange={(value) =>
@@ -1924,13 +1924,7 @@ export function CreateScheduledTaskDialog({
                                       New session for each match
                                     </DropdownMenuRadioItem>
                                     <DropdownMenuRadioItem value="continue">
-                                      <span className="flex flex-col gap-0.5">
-                                        <span>One task session for all matches</span>
-                                        <span className="text-sm text-muted-foreground">
-                                          Started on the first match, so it keeps its context across
-                                          matches. Archiving it starts a new one on the next match.
-                                        </span>
-                                      </span>
+                                      One task session for all matches
                                     </DropdownMenuRadioItem>
                                   </DropdownMenuRadioGroup>
                                 </DropdownMenuContent>
