@@ -529,6 +529,7 @@ _SESSION_HEADER = {"X-Omnigent-Session-Id": "conv_bound"}
         ("POST", "/v1/sessions/conv_bound/spawns/" + "1" * 32 + "/abort", None),
         ("PATCH", "/v1/sessions/conv_bound", None),
         ("POST", "/v1/sessions/conv_bound/hooks/permission-request", None),
+        ("POST", "/v1/sessions/conv_bound/hooks/pi-extension-ui", None),
         ("POST", "/v1/sessions/conv_bound/policies/evaluate", None),
         (
             "GET",
@@ -566,6 +567,7 @@ def test_runner_token_accepted_on_runner_routes(
         ("GET", "/v1/me", None),
         ("POST", "/v1/info", None),
         ("POST", "/v1/sessions/conv_other/ui/open-file", None),
+        ("POST", "/v1/sessions/conv_other/hooks/pi-extension-ui", None),
         ("POST", "/v1/sessions/conv_other/resources/github/prs/orchestrated", None),
         ("GET", "/auth/users", None),
         ("POST", "/auth/invite", None),

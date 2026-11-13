@@ -168,6 +168,7 @@ _RUNNER_SESSION_CAPABILITIES = tuple(
         ("POST", "/hooks/antigravity-elicitation-request"),
         ("POST", "/hooks/cursor-permission-request"),
         ("POST", "/hooks/native-permission-request"),
+        ("POST", "/hooks/pi-extension-ui"),
         ("POST", "/hooks/route-subagent"),
         ("POST", "/hooks/route-turn"),
         ("GET POST", "/policies"),
