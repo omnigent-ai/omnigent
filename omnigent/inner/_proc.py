@@ -399,7 +399,9 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
         current = {}
         leader_live = False
     observed = _remember_identities(process, current)
-    group_is_owned = owned_pgid is None or _identity_in_group(observed, owned_pgid)
+    group_is_owned = (
+        leader_live if owned_pgid is None else _identity_in_group(observed, owned_pgid)
+    )
     identities = _signal_tree_census(
         process,
         pid,
@@ -444,7 +446,9 @@ def kill_tree(process: _ProcessLike | None) -> None:
         current = {}
         leader_live = False
     observed = _remember_identities(process, current)
-    group_is_owned = owned_pgid is None or _identity_in_group(observed, owned_pgid)
+    group_is_owned = (
+        leader_live if owned_pgid is None else _identity_in_group(observed, owned_pgid)
+    )
     identities = _signal_tree_census(
         process,
         pid,

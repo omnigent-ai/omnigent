@@ -383,22 +383,33 @@ def test_identity_census_skips_reused_pid(monkeypatch: pytest.MonkeyPatch) -> No
     reused.kill.assert_not_called()
 
 
-def test_kill_tree_does_not_adopt_reused_reaped_leader_pid(
+@pytest.mark.parametrize("operation", ["terminate_tree", "kill_tree"])
+@pytest.mark.parametrize("returncode", [None, 0])
+@pytest.mark.parametrize("remember_group", [False, True])
+def test_tree_cleanup_does_not_adopt_reused_leader_pid(
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    returncode: int | None,
+    remember_group: bool,
 ) -> None:
     class _ReapedProcess:
         pid = 43210
-        returncode = 0
+        returncode: int | None = None
 
         def kill(self) -> None:
             raise AssertionError("must not kill a reused PID")
 
+        def terminate(self) -> None:
+            raise AssertionError("must not terminate a reused PID")
+
     process = _ReapedProcess()
+    process.returncode = returncode
     reused = Mock(pid=process.pid)
     reused.create_time.return_value = 200.0
     reused.children.return_value = []
     sent: list[tuple[int, int]] = []
-    _proc._owned_process_groups[process] = process.pid
+    if remember_group:
+        _proc._owned_process_groups[process] = process.pid
     _proc._owned_process_identities[process] = {process.pid: 100.0}
     monkeypatch.setattr(_proc.psutil, "Process", lambda pid: reused)
     monkeypatch.setattr(
@@ -412,10 +423,11 @@ def test_kill_tree_does_not_adopt_reused_reaped_leader_pid(
         lambda pgid, sig: sent.append((pgid, sig)),
     )
 
-    _proc.kill_tree(process)
+    getattr(_proc, operation)(process)
 
     assert sent == []
     reused.kill.assert_not_called()
+    reused.terminate.assert_not_called()
 
 
 def test_terminate_tree_stops_the_process() -> None:
