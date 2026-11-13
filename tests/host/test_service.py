@@ -256,12 +256,14 @@ def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
         ),
     ],
 )
+@pytest.mark.parametrize("existing_definition", [False, True], ids=["fresh", "existing"])
 def test_service_refuses_unusable_wrapper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     configured: str,
     wrapper_mode: int | None,
     error: str,
+    existing_definition: bool,
 ) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.setattr(service.platform, "system", lambda: "Linux")
@@ -270,6 +272,11 @@ def test_service_refuses_unusable_wrapper(
         (tmp_path / "wrapper").write_text("#!/bin/sh\n")
         (tmp_path / "wrapper").chmod(wrapper_mode)
     environment = {"PATH": str(tmp_path), "OMNIGENT_WRAPPER_COMMAND": configured}
+    definition = tmp_path / "xdg/systemd/user/omnigent-host.service"
+    previous = b"[Service]\nExecStart=/missing/cache/python -m omnigent.host.service_entry\n"
+    if existing_definition:
+        definition.parent.mkdir(parents=True)
+        definition.write_bytes(previous)
 
     with pytest.raises(service.HostServiceError, match=error):
         service.validate_user_host_service(None, environment=environment)
@@ -277,7 +284,10 @@ def test_service_refuses_unusable_wrapper(
         service.enable_user_host_service(None, environment=environment)
 
     assert calls == []
-    assert not (tmp_path / "xdg/systemd/user/omnigent-host.service").exists()
+    if existing_definition:
+        assert definition.read_bytes() == previous
+    else:
+        assert not definition.exists()
 
 
 @pytest.mark.parametrize("by_path", [False, True], ids=["path-lookup", "absolute-path"])
