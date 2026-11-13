@@ -6633,6 +6633,19 @@ def create_runner_app(
         manager = cast(HarnessProcessManager, process_manager)
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
         spawn_env = dispatch.spawn_env if dispatch else None
+        legacy_model_env: dict[str, str] = {}
+        if dispatch is None and body.get("spawn_env") is not None:
+            try:
+                compatible_env = _compatible_stream_spawn_env(
+                    harness_name or "", body["spawn_env"]
+                )
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=400, content={"error": "invalid_input", "detail": str(exc)}
+                )
+            if compatible_env and body.get("model_override") is None:
+                legacy_model_env = compatible_env
+                body = {**body, "model_override": next(iter(compatible_env.values()))}
         selected_spec_entry = dispatch.spec_entry if dispatch else None
         _note_session_harness_override(conv_id, cast(str | None, body.get("harness_override")))
         # Shared agent-change invalidation for both dispatch paths.
@@ -6765,6 +6778,9 @@ def create_runner_app(
                 server_client=server_client,
                 optional_labels=startup_labels,
             )
+
+        if legacy_model_env and spec_resolver is None:
+            spawn_env = {**(spawn_env or {}), **legacy_model_env}
 
         agent_version = (
             dispatch.agent_version if dispatch else cast(int | None, body.get("agent_version"))
@@ -9706,6 +9722,19 @@ _HARNESS_MODEL_ENV_KEY: dict[str, str] = {
     "copilot": "HARNESS_COPILOT_MODEL",
 }
 _HARNESS_MODEL_ENV_KEY = model_env_keys()
+
+
+def _compatible_stream_spawn_env(harness: str, value: object) -> dict[str, str]:
+    """Keep legacy model overrides without accepting launcher or policy settings."""
+    if not isinstance(value, dict):
+        raise ValueError("spawn_env must be an object")
+    model_key = _HARNESS_MODEL_ENV_KEY.get(canonicalize_harness(harness) or harness)
+    if model_key is None or model_key not in value:
+        return {}
+    model = value[model_key]
+    if not isinstance(model, str) or "\0" in model:
+        raise ValueError("spawn_env model override must be a string without NUL characters")
+    return {model_key: model}
 
 
 class _SpawnEnvBuilder(Protocol):

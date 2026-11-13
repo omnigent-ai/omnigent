@@ -2929,22 +2929,27 @@ def test_resolve_cwd_deleted_process_cwd_readlink_failure_still_raises() -> None
 
 
 @pytest.mark.parametrize(
-    "os_env",
-    [None, OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap"))],
-    ids=["no-policy", "requested-sandbox"],
+    ("os_env", "sandbox_requested"),
+    [
+        (None, False),
+        (OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")), False),
+        (OSEnvSpec(), True),
+        (OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")), True),
+    ],
+    ids=["no-policy", "explicit-none", "default-sandbox", "requested-sandbox"],
 )
 def test_acp_executor_init_raises_on_deleted_explicit_cwd(
-    tmp_path: Path, os_env: OSEnvSpec | None
+    tmp_path: Path, os_env: OSEnvSpec | None, sandbox_requested: bool
 ) -> None:
     """Missing cwd diagnostics are preserved as a cause when sandboxing is requested."""
     missing = str(tmp_path / "workspace")
-    expected_error = RuntimeError if os_env is None else HarnessSandboxPreparationError
+    expected_error = HarnessSandboxPreparationError if sandbox_requested else RuntimeError
     with pytest.raises(expected_error, match="workspace") as failure:
         AcpExecutor(AcpAgentConfig(command="agent"), cwd=missing, os_env=os_env)
-    diagnostic = failure.value if os_env is None else failure.value.__cause__
+    diagnostic = failure.value.__cause__ if sandbox_requested else failure.value
     assert type(diagnostic) is RuntimeError
     assert str(diagnostic) == f"ACP executor working directory does not exist: {missing!r}"
-    if os_env is None:
+    if not sandbox_requested:
         assert failure.value.__cause__ is None
     else:
         assert missing not in failure.value.client_message
@@ -2952,14 +2957,19 @@ def test_acp_executor_init_raises_on_deleted_explicit_cwd(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "os_env",
-    [None, OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap"))],
-    ids=["no-policy", "requested-sandbox"],
+    ("os_env", "sandbox_requested"),
+    [
+        (None, False),
+        (OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")), False),
+        (OSEnvSpec(), True),
+        (OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")), True),
+    ],
+    ids=["no-policy", "explicit-none", "default-sandbox", "requested-sandbox"],
 )
 async def test_start_process_guard_raises_clear_error_on_deleted_cwd(
-    tmp_path: Path, os_env: OSEnvSpec | None
+    tmp_path: Path, os_env: OSEnvSpec | None, sandbox_requested: bool
 ) -> None:
-    """Deleted cwd errors remain raw events only when no OS policy is requested."""
+    """Unconfined sessions retain ordinary workspace errors."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=str(workspace), os_env=os_env)
@@ -2972,7 +2982,7 @@ async def test_start_process_guard_raises_clear_error_on_deleted_cwd(
     try:
         with (
             pytest.raises(HarnessSandboxPreparationError)
-            if os_env is not None
+            if sandbox_requested
             else contextlib.nullcontext()
         ) as failure:
             async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):
@@ -2995,12 +3005,18 @@ async def test_start_process_guard_raises_clear_error_on_deleted_cwd(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "os_env",
-    [None, OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap"))],
-    ids=["no-policy", "requested-sandbox"],
+    ("os_env", "sandbox_requested"),
+    [
+        (None, False),
+        (OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none")), False),
+        (OSEnvSpec(), True),
+        (OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")), True),
+    ],
+    ids=["no-policy", "explicit-none", "default-sandbox", "requested-sandbox"],
 )
 async def test_start_process_guard_deleted_process_cwd_relative_cwd(
     os_env: OSEnvSpec | None,
+    sandbox_requested: bool,
 ) -> None:
     """An inherited deleted cwd preserves its diagnostic outside client error events."""
     ex = AcpExecutor(AcpAgentConfig(command="agent --acp"), cwd=".", os_env=os_env)
@@ -3015,7 +3031,7 @@ async def test_start_process_guard_deleted_process_cwd_relative_cwd(
             ):
                 with (
                     pytest.raises(HarnessSandboxPreparationError)
-                    if os_env is not None
+                    if sandbox_requested
                     else contextlib.nullcontext()
                 ) as failure:
                     async for ev in ex.run_turn([{"role": "user", "content": "hi"}], [], ""):

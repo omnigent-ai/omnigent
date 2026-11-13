@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
+from omnigent.inference_config import inference_config_scope
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.policies import FunctionPolicy
 from omnigent.runner import app as runner_app_module
@@ -137,16 +138,33 @@ async def test_start_probe_keeps_real_tool_enforcement() -> None:
     assert (await gate.evaluate_tool_call("shell", {"command": "ls"})).action == "deny"
 
 
+@pytest.mark.parametrize("resolve_spec", [True, False], ids=["resolved", "explicit-harness"])
+@pytest.mark.parametrize("model_override", [None, "explicit-model"])
 async def test_direct_stream_selection_builds_policy_environment(
     monkeypatch: pytest.MonkeyPatch,
+    resolve_spec: bool,
+    model_override: str | None,
 ) -> None:
     spec = _spec(_force_bwrap())
-    build_environment = Mock(return_value={"SELECTED_ENV": "trusted"})
+    trusted_environment = {"HARNESS_OPENAI_AGENTS_OS_ENV": '{"sandbox":{"type":"linux_bwrap"}}'}
+
+    def build_spawn_environment(
+        spec: AgentSpec, harness: str, *, model_override: str | None, **kwargs: object
+    ) -> dict[str, str]:
+        env = dict(trusted_environment)
+        env["HARNESS_OPENAI_AGENTS_MODEL"] = model_override or "spec-model"
+        return env
+
+    build_environment = Mock(side_effect=build_spawn_environment)
     monkeypatch.setattr(runner_app_module, "_build_spawn_env_from_spec", build_environment)
-    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    native_env = {"NATIVE_ENV": "trusted", "HARNESS_OPENAI_AGENTS_MODEL": "native-model"}
+    native_environment = AsyncMock(return_value=native_env)
+    monkeypatch.setattr(runner_app_module, "_resolve_native_spawn_env", native_environment)
+    worker = _ScriptedHarnessClient([])
+    manager = _FakeProcessManager(worker)
     app = create_runner_app(
         process_manager=manager,
-        spec_resolver=AsyncMock(return_value=spec),
+        spec_resolver=AsyncMock(return_value=spec) if resolve_spec else None,
         server_client=NullServerClient(),
     )
     async with _runner_client(app) as client:
@@ -159,18 +177,177 @@ async def test_direct_stream_selection_builds_policy_environment(
                 "content": [],
                 "harness": "openai-agents",
                 "harness_override": "pi",
-                "spawn_env": {"SELECTED_ENV": "untrusted"},
+                **({"model_override": model_override} if model_override is not None else {}),
+                "spawn_env": {
+                    "HARNESS_OPENAI_AGENTS_MODEL": "compatible-model",
+                    "HARNESS_OPENAI_AGENTS_OS_ENV": '{"sandbox":{"type":"none"}}',
+                    "HARNESS_CODEX_MODEL": "bad\u0000model",
+                    "PYTHONPATH": {"untrusted": "modules"},
+                    "OMNIGENT_LAUNCHER_SPAWN_WRAPPED": None,
+                },
             },
         )
     assert response.status_code == 200, response.text
-    selected_spec, selected_harness = build_environment.call_args.args
-    assert selected_harness == "openai-agents"
-    assert selected_spec.os_env.sandbox.type == "linux_bwrap"
-    assert selected_spec.os_env.sandbox.allow_network is False
+    if resolve_spec:
+        selected_spec, selected_harness = build_environment.call_args.args
+        assert selected_harness == "openai-agents"
+        assert selected_spec.os_env.sandbox.type == "linux_bwrap"
+        assert selected_spec.os_env.sandbox.allow_network is False
+        assert build_environment.call_args.kwargs["model_override"] == (
+            model_override or "compatible-model"
+        )
+    else:
+        build_environment.assert_not_called()
+        native_environment.assert_awaited_once()
     assert spec.os_env.sandbox.type == "none"
+    expected_environment = dict(trusted_environment if resolve_spec else native_env)
+    if model_override is None or resolve_spec:
+        expected_environment["HARNESS_OPENAI_AGENTS_MODEL"] = model_override or "compatible-model"
     assert manager.get_client_calls == [
-        (_SESSION_ID, "openai-agents", {"SELECTED_ENV": "trusted"})
+        (_SESSION_ID, "openai-agents", expected_environment or None)
     ]
+    assert worker.posted_bodies[0]["model_override"] == (model_override or "compatible-model")
+
+
+@pytest.mark.parametrize(
+    "spawn_env", [[], "invalid", {"HARNESS_PI_MODEL": 1}, {"HARNESS_PI_MODEL": "bad\u0000model"}]
+)
+async def test_direct_stream_rejects_invalid_compatible_environment(spawn_env: object) -> None:
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(process_manager=manager, server_client=NullServerClient())
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{_SESSION_ID}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "content": [],
+                "harness": "pi",
+                "spawn_env": spawn_env,
+            },
+        )
+    assert response.status_code == 400, response.text
+    assert not manager.get_client_calls
+    assert "bad" not in response.text
+
+
+@pytest.mark.parametrize("harness", ["pi", "runner-test-default"])
+async def test_direct_stream_ignores_environment_without_selected_model(harness: str) -> None:
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(process_manager=manager, server_client=NullServerClient())
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{_SESSION_ID}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "content": [],
+                "harness": harness,
+                "spawn_env": {
+                    "HARNESS_CODEX_MODEL": None,
+                    "HARNESS_PI_OS_ENV": {"sandbox": {"type": "none"}},
+                },
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert manager.get_client_calls == [(_SESSION_ID, harness, None)]
+
+
+async def test_direct_stream_legacy_model_switch_reaches_reused_worker() -> None:
+    worker = _ScriptedHarnessClient([])
+    manager = _FakeProcessManager(worker)
+    app = create_runner_app(process_manager=manager, server_client=NullServerClient())
+    async with _runner_client(app) as client:
+        for legacy_model, model_override in [
+            ("model-a", None),
+            ("model-b", None),
+            ("model-c", "explicit-model"),
+        ]:
+            response = await client.post(
+                f"/v1/sessions/{_SESSION_ID}/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "content": [],
+                    "harness": "qwen",
+                    "spawn_env": {"HARNESS_QWEN_MODEL": legacy_model},
+                    **({"model_override": model_override} if model_override is not None else {}),
+                },
+            )
+            assert response.status_code == 200, response.text
+    assert [body["model_override"] for body in worker.posted_bodies] == [
+        "model-a",
+        "model-b",
+        "explicit-model",
+    ]
+
+
+@pytest.mark.parametrize("legacy_model", ["model-a", "model-b"])
+async def test_direct_stream_legacy_model_obeys_inference_allowlist(
+    monkeypatch: pytest.MonkeyPatch, legacy_model: str
+) -> None:
+    monkeypatch.setenv("INFERENCE_TEST_KEY", "test-key")
+    config: dict[str, object] = {
+        "providers": {
+            "gateway": {
+                "kind": "gateway",
+                "openai": {
+                    "base_url": "https://gateway.example.test/v1",
+                    "api_key_ref": "env:INFERENCE_TEST_KEY",
+                    "models": {"default": "model-a"},
+                },
+            }
+        },
+        "inference": {
+            "harnesses": {
+                "qwen": {
+                    "provider": "gateway",
+                    "default_model": "model-a",
+                    "model_allowlist": ["model-a"],
+                }
+            }
+        },
+    }
+    declared = _spec(_force_bwrap())
+    spec = replace(
+        declared,
+        executor=replace(
+            declared.executor, config={"harness": "qwen"}, model="model-a", auth=None
+        ),
+    )
+    worker = _ScriptedHarnessClient([])
+    manager = _FakeProcessManager(worker)
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=AsyncMock(return_value=spec),
+        server_client=NullServerClient(),
+    )
+    with inference_config_scope(config):
+        async with _runner_client(app) as client:
+            response = await client.post(
+                f"/v1/sessions/{_SESSION_ID}/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "agent",
+                    "content": [],
+                    "harness": "qwen",
+                    "spawn_env": {"HARNESS_QWEN_MODEL": legacy_model},
+                },
+            )
+    if legacy_model == "model-b":
+        assert response.status_code == 400, response.text
+        assert not manager.get_client_calls
+        assert not worker.posted_bodies
+    else:
+        assert response.status_code == 200, response.text
+        env = manager.get_client_calls[0][2]
+        assert env is not None
+        assert env["HARNESS_QWEN_MODEL"] == legacy_model
+        sandbox = json.loads(env["HARNESS_QWEN_OS_ENV"])["sandbox"]
+        assert sandbox["type"] == "linux_bwrap"
+        assert sandbox["allow_network"] is False
+        assert worker.posted_bodies[0]["model_override"] == legacy_model
 
 
 @pytest.mark.parametrize(
