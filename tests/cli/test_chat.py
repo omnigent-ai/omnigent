@@ -3511,6 +3511,7 @@ def test_remote_headers_adds_org_id_header(monkeypatch: pytest.MonkeyPatch) -> N
     assert headers == {
         "Authorization": "Bearer rec-tok",
         "X-Databricks-Org-Id": "2850744067564480",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
     }
 
 
@@ -3531,7 +3532,10 @@ def test_remote_headers_omits_org_when_no_record(monkeypatch: pytest.MonkeyPatch
         server_url="https://single.databricks.com/api/2.0/omnigent", host_id=None
     )
 
-    assert headers == {"Authorization": "Bearer rec-tok"}
+    assert headers == {
+        "Authorization": "Bearer rec-tok",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
+    }
     assert "X-Databricks-Org-Id" not in headers
 
 
@@ -3543,8 +3547,8 @@ def test_remote_headers_keys_by_host_id_on_workspace_mount(
     The native attach WebSocket handshake (claude / codex / antigravity) and
     its reconnects build their headers here, so the host_id must surface as the
     routing header to reach the replica holding the runner's tunnel. It is
-    emitted only on a host-sharded mount; no host_id, or an unsharded server,
-    sends none.
+    emitted only on a host-sharded mount; no host_id sends the machine's own
+    key, and an unsharded server sends none.
     """
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
     monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
@@ -3556,8 +3560,11 @@ def test_remote_headers_keys_by_host_id_on_workspace_mount(
         _remote_headers(server_url=mount, host_id="host_abc")["X-Databricks-Omnigent-Slice-Key"]
         == "host_abc"
     )
-    # No host_id → no slice-key header on the same mount.
-    assert "X-Databricks-Omnigent-Slice-Key" not in _remote_headers(server_url=mount, host_id=None)
+    # No host_id → the machine's own key on the same mount.
+    assert (
+        _remote_headers(server_url=mount, host_id=None)["X-Databricks-Omnigent-Slice-Key"]
+        == "client_key"
+    )
     # Unsharded server → no slice-key header even with a host_id.
     assert "X-Databricks-Omnigent-Slice-Key" not in _remote_headers(
         server_url="http://127.0.0.1:6767", host_id="host_abc"

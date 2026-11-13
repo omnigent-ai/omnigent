@@ -62,7 +62,8 @@ Additional requirements:
   is no new comment tier. Source restrictions include side-chat ancestry.
 - With nested agents enabled, immediate MCP creation produces a child or sibling.
   Omitted `placement` keeps its existing `child` default; `same_host` and `managed`
-  create siblings when enabled and standalone roots when disabled. Tools
+  create siblings when enabled and standalone roots when disabled. A create that
+  names a project other than the source's project makes a standalone root there. Tools
   expose family metadata and retain creator attribution. Scheduled roots and
   ordinary user-created sessions remain independent.
 - Automatic session cleanup must retain compute while any session is bound,
@@ -126,12 +127,13 @@ for both JSON and uploaded-agent creates. Uploaded agents bind and launch on the
 chosen host in the create request. Later host launches and runner reassignments recheck the same policy;
 failed launches restore the prior host so a restricted session can retry. MCP rejects disallowed fresh-sandbox placement before reserving a host.
 
-The default-off `sibling_sessions` release feature controls both the `/v1/info`
-capability and server creation authorization. Enable it with
-`OMNIGENT_FEATURES=sibling_sessions`; embedded deployments may supply a
+The default-on `sibling_sessions` release feature controls both the `/v1/info`
+capability and server creation authorization. Disable it with
+`OMNIGENT_FEATURES=-sibling_sessions`; embedded deployments may supply a
 per-request `FeatureFlags.enabled()` override backed by their rollout service.
 The UI hides creation and same-sandbox fork selection when disabled or absent.
-The server groups MCP independent creation when enabled and preserves standalone
+The server groups MCP independent creation when enabled, unless the create names a
+project other than the source's project, and preserves standalone
 root creation when disabled. Both use the authenticated orchestration endpoint;
 the runner also supports older servers without the sibling capability. Explicit
 sibling requests still fail when disabled. Uncertain creates are never auto-retried.

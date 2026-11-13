@@ -9,6 +9,7 @@ import os
 import stat
 import sys
 import tempfile
+import tomllib
 import unittest
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -29,18 +30,25 @@ from omnigent.inner.codex_executor import (
     _CodexAppServerSession,
     _CodexSessionState,
     _databricks_codex_config_overrides,
+    _default_app_session_factory,
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
     _parse_codex_gateway_error,
+    _populate_codex_home_config,
     _prompt_for_turn,
     _provider_codex_config_overrides,
     _require_brokered_codex_version,
     _to_codex_input_items,
+    materialize_codex_provider_config,
+    populate_codex_skills_from_bundle,
+    verify_brokered_codex_native_tools_disabled,
+    write_required_brokered_model_catalog,
 )
 from omnigent.inner.codex_goal_command import (
     GOAL_OBJECTIVE_MAX_CHARS,
     goal_objective_length_error,
 )
+from omnigent.inner.codex_worker import BROKERED_CODEX_AUTH_COMMAND, BROKERED_CODEX_ENV
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     INTERRUPTION_MARKER_TEXT,
@@ -74,6 +82,265 @@ def _run(coro):
     finally:
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
+
+
+def test_brokered_home_contains_only_generated_gateway_config(tmp_path: Path) -> None:
+    source = tmp_path / "host-home"
+    source.mkdir()
+    (source / "auth.json").write_text("host-auth-secret")
+    (source / "hooks.json").write_text("host-hook-secret")
+    (source / "config.toml").write_text('model_provider="host-provider"\n')
+    target = tmp_path / "session-home"
+    target.mkdir()
+    _populate_codex_home_config(target, source, minimal_config=True, include_credentials=False)
+    overrides = _databricks_codex_config_overrides(
+        model="gpt-daybreak-blue-latest",
+        base_url="https://model.example.com/cyber/v1",
+        auth_command=BROKERED_CODEX_AUTH_COMMAND,
+        auth_refresh_interval_ms=None,
+    )
+    materialize_codex_provider_config(target, overrides)
+    assert sorted(path.name for path in target.iterdir()) == ["config.toml"]
+    config = (target / "config.toml").read_text()
+    assert (
+        tomllib.loads(config)["model_providers"]["omnigent_databricks"]["auth"]["args"][-1]
+        == BROKERED_CODEX_AUTH_COMMAND
+    )
+    assert "host-auth-secret" not in config
+    assert "host-hook-secret" not in config
+    assert "host-provider" not in config
+
+
+def test_brokered_home_loads_only_bundle_skills(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    host_home = tmp_path / "host-home"
+    host_skill = host_home / ".codex" / "skills" / "host-skill"
+    host_skill.mkdir(parents=True)
+    (host_skill / "SKILL.md").write_text("host state")
+    shared_skill = host_home / ".agents" / "skills" / "shared-skill"
+    shared_skill.mkdir(parents=True)
+    (shared_skill / "SKILL.md").write_text("shared state")
+    bundle = tmp_path / "bundle"
+    bundle_skill = bundle / "skills" / "intended-skill"
+    bundle_skill.mkdir(parents=True)
+    (bundle_skill / "SKILL.md").write_text("bundle skill")
+    target = tmp_path / "session-home"
+    monkeypatch.setenv("HOME", str(host_home))
+
+    populate_codex_skills_from_bundle(
+        target, bundle, "all", copy_skills=True, include_host_skills=False
+    )
+
+    assert [path.name for path in (target / "skills").iterdir()] == ["intended-skill"]
+
+
+def test_brokered_gateway_removes_inherited_auth_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABRICKS_BEARER", "real-databricks-token")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "real-client-secret")
+    monkeypatch.setenv("OPENAI_ORG_ID", "ambient-org")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/host/config")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/host/ssh-agent.sock")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/host/gh")
+    monkeypatch.setenv("BROWSER", "/host/browser")
+    monkeypatch.setenv("CODEX_HOME", "/host/codex")
+    monkeypatch.setenv("DECLARED_TOOL_SECRET", "tool-only-secret")
+    monkeypatch.setenv("PARENT_MODEL_TOKEN", "parent-model-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SESSION_ENV_NAMES", "PARENT_MODEL_TOKEN")
+    os_env = OSEnvSpec(
+        sandbox=OSEnvSandboxSpec(
+            type="darwin_seatbelt",
+            egress_rules=["POST model.example.com/cyber/v1/responses"],
+            env_passthrough=["DECLARED_TOOL_SECRET", "PARENT_MODEL_TOKEN"],
+        )
+    )
+    with pytest.raises(ValueError, match="requires disabled web search and native tools"):
+        CodexExecutor(
+            codex_path="/bin/echo",
+            os_env=os_env,
+            model="gpt-daybreak-blue-latest",
+            gateway=True,
+            brokered_gateway=True,
+            gateway_host="https://model.example.com",
+            base_url_override="https://model.example.com/cyber/v1",
+            gateway_auth_command=BROKERED_CODEX_AUTH_COMMAND,
+        )
+    executor = CodexExecutor(
+        codex_path="/bin/echo",
+        os_env=os_env,
+        model="gpt-daybreak-blue-latest",
+        gateway=True,
+        brokered_gateway=True,
+        gateway_host="https://model.example.com",
+        base_url_override="https://model.example.com/cyber/v1",
+        gateway_auth_command=BROKERED_CODEX_AUTH_COMMAND,
+        enable_web_search=False,
+        disable_native_tools=True,
+    )
+    assert executor._env[BROKERED_CODEX_ENV] == "1"
+    assert not any(key.startswith("DATABRICKS_") for key in executor._env)
+    assert "OPENAI_API_KEY" not in executor._env
+    assert "OPENAI_ORG_ID" not in executor._env
+    for key in (
+        "XDG_CONFIG_HOME",
+        "SSH_AUTH_SOCK",
+        "GH_CONFIG_DIR",
+        "BROWSER",
+        "CODEX_HOME",
+        "DECLARED_TOOL_SECRET",
+        "PARENT_MODEL_TOKEN",
+    ):
+        assert key not in executor._env
+    assert "real-databricks-token" not in repr(executor._codex_config_overrides)
+    assert "real-client-secret" not in repr(executor._codex_config_overrides)
+
+
+def test_brokered_gateway_pins_generated_thread_provider() -> None:
+    from omnigent.spec.types import RetryPolicy
+
+    session = _default_app_session_factory(
+        codex_path="/bin/echo",
+        cwd=None,
+        env={BROKERED_CODEX_ENV: "1"},
+        tool_executor=None,
+        codex_config_overrides=[],
+        retry_policy=RetryPolicy(),
+        disable_native_tools=True,
+        bundle_dir=None,
+        skills_filter="none",
+        os_env=None,
+    )
+    assert session._thread_model_provider == "omnigent_databricks"
+
+
+def test_brokered_native_tool_preflight_requires_disabled_shell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    names = (
+        "shell_tool",
+        "apps",
+        "browser_use",
+        "browser_use_external",
+        "browser_use_full_cdp_access",
+        "in_app_browser",
+        "view_image",
+        "image_generation",
+        "multi_agent",
+        "code_mode",
+    )
+
+    def _result(enabled: str | None = None, missing: str | None = None) -> SimpleNamespace:
+        stdout = "".join(
+            f"{name} stable {'true' if name == enabled else 'false'}\n"
+            for name in names
+            if name != missing
+        )
+        return SimpleNamespace(returncode=0, stdout=stdout.encode())
+
+    run = unittest.mock.Mock(return_value=_result())
+    monkeypatch.setattr("omnigent.inner.codex_executor.subprocess.run", run)
+    verify_brokered_codex_native_tools_disabled("/bin/codex", tmp_path)
+    assert run.call_args.args[0][-2:] == ["features", "list"]
+    assert "features.shell_tool=false" in run.call_args.args[0]
+    run.return_value = _result("apps")
+    with pytest.raises(RuntimeError, match="disables native tools"):
+        verify_brokered_codex_native_tools_disabled("/bin/codex", tmp_path)
+    run.return_value = _result(missing="shell_tool")
+    with pytest.raises(RuntimeError, match="disables native tools"):
+        verify_brokered_codex_native_tools_disabled("/bin/codex", tmp_path)
+    run.return_value = SimpleNamespace(returncode=1, stdout=b"shell_tool stable false\n")
+    with pytest.raises(RuntimeError, match="disables native tools"):
+        verify_brokered_codex_native_tools_disabled("/bin/codex", tmp_path)
+    run.side_effect = OSError("private diagnostic")
+    with pytest.raises(RuntimeError, match="disables native tools"):
+        verify_brokered_codex_native_tools_disabled("/bin/codex", tmp_path)
+
+
+def test_brokered_catalog_removes_native_shell_and_patch_tools(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bundled = {
+        "models": [
+            {
+                "slug": "test-model",
+                "shell_type": "unified_exec",
+                "apply_patch_tool_type": "freeform",
+                "experimental_supported_tools": ["test_sync_tool"],
+            }
+        ]
+    }
+    completed = SimpleNamespace(returncode=0, stdout=json.dumps(bundled).encode())
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.subprocess.run", unittest.mock.Mock(return_value=completed)
+    )
+    catalog_path = write_required_brokered_model_catalog(
+        tmp_path, codex_path="/bin/codex", strip_native_tools=True
+    )
+    model = json.loads(catalog_path.read_text())["models"][0]
+    assert model["shell_type"] == "disabled"
+    assert model["apply_patch_tool_type"] is None
+    assert model["experimental_supported_tools"] == []
+
+    signer_home = tmp_path / "signer"
+    signer_catalog = write_required_brokered_model_catalog(signer_home, codex_path="/bin/codex")
+    signer_model = json.loads(signer_catalog.read_text())["models"][0]
+    assert signer_model["shell_type"] == "unified_exec"
+    assert signer_model["apply_patch_tool_type"] == "freeform"
+    assert signer_model["experimental_supported_tools"] == ["test_sync_tool"]
+
+
+@pytest.mark.parametrize("with_dynamic_tool", [False, True])
+def test_disabled_native_tools_apply_with_or_without_dynamic_tools(
+    with_dynamic_tool: bool,
+) -> None:
+    async def run() -> None:
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo",
+            cwd="/tmp/workspace",
+            env={},
+            tool_executor=None,
+            disable_native_tools=True,
+        )
+        session.start = AsyncMock()
+        session._proc = _FakeProcess()
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+
+        async def complete() -> None:
+            await asyncio.sleep(0.01)
+            session._events.put_nowait(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1"}},
+                }
+            )
+
+        task = asyncio.create_task(complete())
+        _ = [
+            event
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[{"name": "sys_os_shell", "description": "Shell"}]
+                if with_dynamic_tool
+                else [],
+                system_prompt="",
+                model="test-model",
+                cwd=".",
+                sandbox="workspace-write",
+            )
+        ]
+        await task
+        params = session._request.await_args_list[0].args[1]
+        assert params["config"]["features.shell_tool"] is False
+        assert params["config"]["features.unified_exec"] is False
+
+    _run(run())
 
 
 @dataclass
@@ -1342,64 +1609,6 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
-    def test_app_server_run_turn_can_disable_native_tools_when_requested(self):
-        async def _t():
-            session = _CodexAppServerSession(
-                codex_path="/bin/echo",
-                cwd="/tmp/workspace",
-                env={},
-                tool_executor=None,
-                disable_native_tools=True,
-            )
-            session.start = AsyncMock()
-            session._proc = _FakeProcess()
-            session._request = AsyncMock(
-                side_effect=[
-                    {"result": {"thread": {"id": "thread-1"}}},
-                    {"result": {"turn": {"id": "turn-1"}}},
-                ]
-            )
-
-            async def _inject_turn_completed() -> None:
-                await asyncio.sleep(0.01)
-                session._events.put_nowait(
-                    {
-                        "method": "turn/completed",
-                        "params": {
-                            "turn": {"id": "turn-1"},
-                        },
-                    }
-                )
-
-            inject_task = asyncio.create_task(_inject_turn_completed())
-            _ = [
-                event
-                async for event in session.run_turn(
-                    messages=[{"role": "user", "content": "hi"}],
-                    tools=[
-                        {
-                            "name": "sys_os_shell",
-                            "description": "Shell",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {"command": {"type": "string"}},
-                            },
-                        }
-                    ],
-                    system_prompt="Be helpful.",
-                    model="gpt-5.4-mini",
-                    cwd=".",
-                    sandbox="workspace-write",
-                )
-            ]
-            await inject_task
-
-            thread_start_call = session._request.await_args_list[0]
-            params = thread_start_call.args[1]
-            self.assertEqual(params["config"]["features.shell_tool"], False)
-
-        _run(_t())
-
     def test_close_uses_process_tree_termination(self):
         async def _t():
             session = _CodexAppServerSession(
@@ -1861,6 +2070,216 @@ class TestCodexExecutor(unittest.TestCase):
             )
 
         _run(_t())
+
+    def test_app_server_progress_warning_distinguishes_notifications_and_work(self):
+        async def _scenario(progress: str) -> None:
+            import omnigent.inner.codex_executor as codex_executor_module
+
+            clock = SimpleNamespace(now=0.0)
+            final_response = "done!" if progress == "agent_delta" else "done"
+            notification = {
+                "method": "account/rateLimits/updated",
+                "params": {"private": "credential-must-not-be-logged"},
+            }
+            events = [(float(tick), notification) for tick in range(1, 11)]
+            if progress in ("reasoning", "agent_delta"):
+                method = (
+                    "item/reasoning/textDelta"
+                    if progress == "reasoning"
+                    else "item/agentMessage/delta"
+                )
+                for index in (0, 2, 4, 6, 8):
+                    events[index] = (
+                        events[index][0],
+                        {
+                            "method": method,
+                            "params": {
+                                "turnId": "turn-1",
+                                "itemId": "final-1",
+                                "delta": final_response[index // 2]
+                                if progress == "agent_delta"
+                                else "private reasoning",
+                            },
+                        },
+                    )
+            elif progress in ("command", "command_output"):
+                command = {
+                    "id": "command-1",
+                    "type": "commandExecution",
+                    "command": "private-command-must-not-be-logged",
+                    "cwd": "/private-workspace",
+                    "status": "inProgress",
+                }
+                events[0] = (
+                    1.0,
+                    {"method": "item/started", "params": {"turnId": "turn-1", "item": command}},
+                )
+                if progress == "command_output":
+                    for index in (2, 4, 6, 8):
+                        events[index] = (
+                            events[index][0],
+                            {
+                                "method": "item/commandExecution/outputDelta",
+                                "params": {"turnId": "turn-1", "delta": "private output"},
+                            },
+                        )
+                else:
+                    events[4] = (
+                        5.0,
+                        {
+                            "method": "item/completed",
+                            "params": {
+                                "turnId": "turn-1",
+                                "item": {**command, "status": "completed", "exitCode": 0},
+                            },
+                        },
+                    )
+            elif progress == "tool_result":
+                events[0] = (
+                    1.0,
+                    {
+                        "id": 1,
+                        "method": "item/tool/call",
+                        "params": {"turnId": "turn-1", "callId": "tool-1", "tool": "read_file"},
+                    },
+                )
+            elif progress == "stale_command_output":
+                # Delivered after startup draining, before any current-turn item.
+                events[0] = (
+                    1.0,
+                    {
+                        "method": "item/commandExecution/outputDelta",
+                        "params": {"turnId": "previous-turn", "delta": "private output"},
+                    },
+                )
+            elif progress != "notifications":
+                ignored = {
+                    "user_started": {
+                        "method": "item/started",
+                        "params": {"turnId": "turn-1", "item": {"type": "userMessage"}},
+                    },
+                    "user_completed": {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {"type": "userMessage", "text": "private steering"},
+                        },
+                    },
+                    "steering_ack": {"id": 42, "result": {"turnId": "turn-1"}},
+                    "unrelated_turn": {
+                        "method": "item/reasoning/textDelta",
+                        "params": {"turnId": "other-turn", "delta": "unrelated reasoning"},
+                    },
+                }
+                events = [(float(tick), ignored[progress]) for tick in range(1, 11)]
+                # Establish the current turn before testing unrelated-turn traffic.
+                events.insert(0, (0.0, ignored["user_started"]))
+            events.append(
+                (
+                    11.0,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "final-1",
+                                "type": "agentMessage",
+                                "text": final_response,
+                                "phase": "final_answer",
+                            },
+                        },
+                    },
+                )
+            )
+
+            class TimedEvents(asyncio.Queue):
+                async def get(queue_self):
+                    await asyncio.sleep(0)
+                    self.assertEqual(session.active_turn_id, "turn-1")
+                    clock.now, message = events.pop(0)
+                    return message
+
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._events = TimedEvents()
+            session._recent_stderr.append("private-stderr-must-not-be-logged")
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+            session._execute_dynamic_tool = AsyncMock(return_value={"error": "private-tool-error"})
+            session._send_response = AsyncMock()
+            warnings = []
+
+            def record_warning(message, *args):
+                warnings.append((clock.now, message % args))
+
+            with (
+                patch.object(
+                    codex_executor_module, "time", SimpleNamespace(monotonic=lambda: clock.now)
+                ),
+                patch.object(codex_executor_module, "_TURN_EVENT_WARN_SECONDS", 3.0),
+                patch.object(codex_executor_module.logger, "warning", side_effect=record_warning),
+            ):
+                output = [
+                    event
+                    async for event in session.run_turn(
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=[],
+                        system_prompt="",
+                        model="test-model",
+                        cwd=".",
+                        sandbox="workspace-write",
+                    )
+                ]
+            self.assertEqual(
+                [event.response for event in output if isinstance(event, TurnComplete)],
+                [final_response],
+            )
+            self.assertIsNone(session.active_turn_id)
+            if progress in ("reasoning", "agent_delta", "command_output"):
+                self.assertEqual(warnings, [])
+            else:
+                expected_times = {
+                    "command": [4.0, 8.0],
+                    "tool_result": [4.0, 7.0, 10.0],
+                }.get(progress, [3.0, 6.0, 9.0])
+                self.assertEqual([timestamp for timestamp, _ in warnings], expected_times)
+                diagnostics = str(warnings)
+                for private in (
+                    "credential-must-not-be-logged",
+                    "private-command-must-not-be-logged",
+                    "private steering",
+                    "private-tool-error",
+                    "private-stderr-must-not-be-logged",
+                    "private output",
+                ):
+                    self.assertNotIn(private, diagnostics)
+                if progress == "command":
+                    self.assertIn("command-1", warnings[0][1])
+                    self.assertNotIn("command-1", warnings[1][1])
+                if progress == "tool_result":
+                    self.assertIn(
+                        "{'call_id': 'tool-1', 'name': 'read_file', 'status': 'error'}",
+                        diagnostics,
+                    )
+
+        for progress in (
+            "notifications",
+            "user_started",
+            "user_completed",
+            "steering_ack",
+            "unrelated_turn",
+            "reasoning",
+            "agent_delta",
+            "command",
+            "command_output",
+            "tool_result",
+            "stale_command_output",
+        ):
+            with self.subTest(progress=progress):
+                _run(_scenario(progress))
 
     def test_app_server_run_turn_finishes_on_final_answer_item_without_turn_completed(self):
         async def _t():
@@ -5231,6 +5650,73 @@ def test_materialize_inherited_gateway_name_preserves_explicit_values(
     )
     assert provider["name"] == expected_name
     assert "base_url" not in provider
+
+
+@pytest.mark.parametrize("inline_providers", [False, True])
+@pytest.mark.parametrize("configured_name", [None, "", " \t", "My Gateway", 7, False])
+def test_materialize_local_gateway_name_without_a_successful_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inline_providers: bool,
+    configured_name: str | int | bool | None,
+) -> None:
+    import tomllib
+
+    import tomlkit
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    monkeypatch.setattr(
+        "omnigent.databricks_ai_gateway.DATABRICKS_TRUSTED_HOST_SUFFIXES", (".example.test",)
+    )
+    gateway = {
+        "base_url": "https://gateway.example.test/ai-gateway/codex/v1",
+        "auth": {"command": "credential-helper", "args": ["token"]},
+    }
+    if configured_name is not None:
+        gateway["name"] = configured_name
+    providers = tomlkit.inline_table() if inline_providers else tomlkit.table()
+    providers["inactive_gateway"] = gateway
+    providers["selected"] = {"name": "Selected", "base_url": "https://other.example.test/v1"}
+    providers["amazon-bedrock"] = {"aws": {"region": "us-east-1"}}
+    providers["non_gateway"] = {"base_url": "https://other.example.test/v1"}
+    document = tomlkit.document()
+    document["model_provider"] = "selected"
+    document["model_providers"] = providers
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    source_path = source_home / "config.toml"
+    original = tomlkit.dumps(document)
+    source_path.write_text(original)
+    private_home = tmp_path / "private"
+    private_home.mkdir()
+    private_path = private_home / "config.toml"
+    private_path.write_text(original)
+
+    overrides = ['model_provider="selected"']
+    assert (
+        materialize_codex_provider_config(private_home, overrides, source_home=source_home)
+        == overrides
+    )
+
+    written = tomllib.loads(private_path.read_text())
+    expected_name = (
+        "inactive_gateway"
+        if configured_name is None
+        or (isinstance(configured_name, str) and not configured_name.strip())
+        else configured_name
+    )
+    repaired = written["model_providers"]["inactive_gateway"]
+    assert repaired["name"] == expected_name
+    assert repaired["base_url"] == gateway["base_url"]
+    assert repaired["auth"] == gateway["auth"]
+    assert written["model_provider"] == "selected"
+    assert written["model_providers"]["amazon-bedrock"] == providers["amazon-bedrock"]
+    assert "name" not in written["model_providers"]["non_gateway"]
+    assert source_path.read_text() == original
+    first_write = private_path.read_text()
+    assert materialize_codex_provider_config(private_home, overrides) == overrides
+    assert private_path.read_text() == first_write
 
 
 def test_materialize_ignores_non_gateway_effective_providers(

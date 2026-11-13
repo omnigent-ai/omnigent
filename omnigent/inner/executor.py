@@ -119,6 +119,16 @@ class ExecutorEvent:
 
 
 @dataclass
+class ExecutorWait(ExecutorEvent):
+    """A checked external prerequisite is still pending before input delivery.
+
+    Yield after each successful prerequisite check to refresh only the idle
+    watchdog. This is neither model progress nor user-visible output, and must
+    not extend the absolute turn limit or acknowledge delivery.
+    """
+
+
+@dataclass
 class TextChunk(ExecutorEvent):
     """Streaming text output.
 

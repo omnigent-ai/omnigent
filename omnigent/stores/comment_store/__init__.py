@@ -1,8 +1,24 @@
 """Comments store: manages per-review comments for a conversation."""
 
+import json
 from abc import ABC, abstractmethod
+from dataclasses import asdict
 
+from omnigent.db.compression import encode
 from omnigent.entities import Comment, CommentsFingerprint
+from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES, PullRequestCommentAnchor
+
+MAX_COMMENT_PAGE_SIZE = 100
+
+
+def serialize_comment_anchor(anchor: PullRequestCommentAnchor | None) -> str | None:
+    """Serialize coordinates and validate their framed storage size before writing."""
+    if anchor is None:
+        return None
+    payload = json.dumps(asdict(anchor))
+    if len(encode(payload) or b"") > COMMENT_ANCHOR_MAX_STORED_BYTES:
+        raise ValueError("PR comment anchor exceeds the 1,024-byte storage limit")
+    return payload
 
 
 class CommentStore(ABC):
@@ -48,6 +64,7 @@ class CommentStore(ABC):
         end_index: int,
         anchor_content: str | None = None,
         created_by: str | None = None,
+        anchor_metadata: PullRequestCommentAnchor | None = None,
     ) -> Comment:
         """Create and persist a new comment.
 
@@ -65,6 +82,8 @@ class CommentStore(ABC):
             not provided.
         :param created_by: Email of the creating user, e.g.
             ``"alice@example.com"``. ``None`` in single-user mode.
+        :param anchor_metadata: Immutable provider-specific coordinates used
+            to locate the comment outside a workspace file, if applicable.
         :returns: The newly created :class:`Comment`.
         """
         ...
@@ -83,6 +102,24 @@ class CommentStore(ABC):
             e.g. ``"src/App.tsx"``. ``None`` returns all files.
         :returns: List of matching :class:`Comment` objects ordered by
             ``created_at`` ascending.
+        """
+        ...
+
+    @abstractmethod
+    def list_page(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = MAX_COMMENT_PAGE_SIZE,
+        after_id: str | None = None,
+    ) -> tuple[list[Comment], str | None]:
+        """Read a bounded session page in primary-key order.
+
+        :param conversation_id: The owning conversation.
+        :param limit: Maximum comments to return, from 1 to 100.
+        :param after_id: Exclusive continuation ID from the previous page.
+        :returns: Comments and the next cursor, or ``None`` at the end.
+            Apply path/anchor filters after paging to keep the scan bounded.
         """
         ...
 

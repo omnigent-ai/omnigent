@@ -95,6 +95,57 @@ function seedProjectFolder(client: QueryClient, project: string, ids: string[]):
   } satisfies ConversationsInfiniteData);
 }
 
+// The cached projects the folder tests file sessions under.
+function seedProjects(client: QueryClient): void {
+  client.setQueryData(
+    ["projects"],
+    [
+      { id: "proj_42", name: "Sprint 42" },
+      { id: "proj_other", name: "Other" },
+      { id: "proj_third", name: "Third" },
+    ],
+  );
+}
+
+// A project folder's own list; `filed` gives each row the folder's project id.
+function seedFolder(
+  client: QueryClient,
+  name: string,
+  ids: string[],
+  filed = false,
+  hasMore = false,
+): void {
+  const projectId = { "Sprint 42": "proj_42", Other: "proj_other", Third: "proj_third" }[name];
+  const page: ConversationsPage = {
+    data: ids.map((id, i) => ({
+      ...conv(id),
+      updated_at: 10 - i,
+      ...(filed ? { project_id: projectId } : {}),
+    })),
+    first_id: ids[0] ?? null,
+    last_id: ids.at(-1) ?? null,
+    has_more: hasMore,
+  };
+  client.setQueryData(["project-sessions", name, "updated_at", false], {
+    pages: [page],
+    pageParams: [undefined],
+  });
+}
+
+// Keys of the cached queries the spied invalidations matched, sorted.
+function invalidatedKeys(
+  client: QueryClient,
+  invalidate: { mock: { calls: unknown[][] } },
+): string[] {
+  const keys = new Set<string>();
+  for (const [filters] of invalidate.mock.calls) {
+    for (const query of client.getQueryCache().findAll(filters as object)) {
+      keys.add(JSON.stringify(query.queryKey));
+    }
+  }
+  return [...keys].sort();
+}
+
 function renderProvider(client: QueryClient, initialEntries: string[]) {
   return render(
     <QueryClientProvider client={client}>
@@ -228,6 +279,24 @@ function frameHandler(): (frame: unknown) => void {
   const call = subscribe.mock.calls.at(-1);
   if (!call) throw new Error("provider never subscribed to the socket");
   return call[0] as unknown as (frame: unknown) => void;
+}
+
+// Any refetch of the session lists, as opposed to e.g. a comments refresh.
+// Targeted rounds pass only a predicate over query hashes.
+function listInvalidations(invalidate: { mock: { calls: unknown[][] } }) {
+  return invalidate.mock.calls.filter(([filters]: unknown[]) => {
+    const { queryKey, predicate } = (filters ?? {}) as {
+      queryKey?: unknown[];
+      predicate?: unknown;
+    };
+    const key = queryKey?.[0];
+    return (
+      (queryKey === undefined && predicate !== undefined) ||
+      key === "conversations" ||
+      key === "project-sessions" ||
+      key === "archived-project-names"
+    );
+  });
 }
 
 // Wire-shaped session row carrying a comments fingerprint. Frames send full
@@ -942,13 +1011,15 @@ describe("SessionUpdatesProvider open-session row", () => {
 });
 
 describe("SessionUpdatesProvider list invalidation", () => {
-  it("invalidates the archived-project-names scan on a remote removal", () => {
-    // Another client archiving/relabeling/deleting must refresh the Archived
-    // view's project picker — only local mutations invalidate it otherwise.
+  it("refetches only the lists a remote removal emptied a slot in", () => {
+    // Another client deleting a session must backfill the lists that held it and
+    // refresh the Archived view's project picker; other folders are untouched.
     vi.useFakeTimers();
     try {
       const client = new QueryClient();
       seedConversations(client, ["conv_a"]);
+      seedFolder(client, "Alpha", ["conv_x"]);
+      client.setQueryData(["archived-project-names"], []);
       renderProvider(client, ["/"]);
       const invalidate = vi.spyOn(client, "invalidateQueries");
       const handler = frameHandler();
@@ -956,21 +1027,14 @@ describe("SessionUpdatesProvider list invalidation", () => {
       act(() => handler({ type: "removed", ids: ["conv_a"] }));
       act(() => vi.advanceTimersByTime(300)); // past the debounce
 
-      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["archived-project-names"] });
+      expect(invalidatedKeys(client, invalidate)).toEqual([
+        JSON.stringify(["archived-project-names"]),
+        JSON.stringify(["conversations", "", false]),
+      ]);
     } finally {
       vi.useRealTimers();
     }
   });
-
-  // Any refetch of the session lists, as opposed to e.g. a comments refresh.
-  function listInvalidations(invalidate: { mock: { calls: unknown[][] } }) {
-    return invalidate.mock.calls.filter(([filters]: unknown[]) => {
-      const key = (filters as { queryKey?: unknown[] } | undefined)?.queryKey?.[0];
-      return (
-        key === "conversations" || key === "project-sessions" || key === "archived-project-names"
-      );
-    });
-  }
 
   it("patches a background session's updated_at bump without refetching the lists", () => {
     // Running agents bump updated_at on every tick; each list view sorts its
@@ -1056,11 +1120,14 @@ describe("SessionUpdatesProvider list invalidation", () => {
     }
   });
 
-  it("still reconciles the lists when a watched top-level session is missing from them", () => {
+  it("refetches only the new session's folder when a filed session appears", () => {
     vi.useFakeTimers();
     try {
       const client = new QueryClient();
       seedConversations(client, ["conv_a"]);
+      seedProjects(client);
+      seedFolder(client, "Sprint 42", ["conv_s"]);
+      seedFolder(client, "Other", ["conv_o"]);
       renderProvider(client, ["/"]);
       const invalidate = vi.spyOn(client, "invalidateQueries");
       const handler = frameHandler();
@@ -1073,13 +1140,257 @@ describe("SessionUpdatesProvider list invalidation", () => {
       );
       act(() => vi.advanceTimersByTime(300)); // past the debounce
 
-      expect(invalidate).toHaveBeenCalledWith(
-        expect.objectContaining({ queryKey: ["conversations"] }),
-      );
-      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+      // The flat list placed the row itself; only its folder can't.
+      expect(invalidatedKeys(client, invalidate)).toEqual([
+        JSON.stringify(["project-sessions", "Sprint 42", "updated_at", false]),
+      ]);
     } finally {
       vi.useRealTimers();
       clearRecentlyCreated();
+    }
+  });
+
+  it("patches a label no list filters on without refetching any list", () => {
+    // Server-written error labels churn on a busy failing session.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      seedProjects(client);
+      seedFolder(client, "Sprint 42", ["conv_s"], true);
+      seedFolder(client, "Other", ["conv_o"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() =>
+        handler({
+          type: "changed",
+          items: [
+            {
+              ...conv("conv_s"),
+              project_id: "proj_42",
+              labels: { "omnigent.last_task_error_code": "rate_limited" },
+            },
+          ],
+        }),
+      );
+      act(() => vi.advanceTimersByTime(5_000));
+
+      expect(listInvalidations(invalidate)).toEqual([]);
+      const folderRows = client.getQueryData<ConversationsInfiniteData>([
+        "project-sessions",
+        "Sprint 42",
+        "updated_at",
+        false,
+      ]);
+      expect(folderRows?.pages[0].data[0].labels["omnigent.last_task_error_code"]).toBe(
+        "rate_limited",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refetches the two folders a remote move touches, and nothing else", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      seedProjects(client);
+      seedFolder(client, "Sprint 42", ["conv_s"], true);
+      seedFolder(client, "Other", ["conv_o"]);
+      seedFolder(client, "Third", ["conv_t"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() =>
+        handler({ type: "changed", items: [{ ...conv("conv_s"), project_id: "proj_other" }] }),
+      );
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(invalidatedKeys(client, invalidate)).toEqual([
+        JSON.stringify(["project-sessions", "Other", "updated_at", false]),
+        JSON.stringify(["project-sessions", "Sprint 42", "updated_at", false]),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refetches only the folder whose next-page cursor row moved", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      seedProjects(client);
+      seedFolder(client, "Sprint 42", ["conv_s1", "conv_s2"], true, true);
+      seedFolder(client, "Other", ["conv_o1", "conv_o2"], true, true);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...conv("conv_s2"), project_id: "proj_42", updated_at: 50 }],
+        }),
+      );
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(invalidatedKeys(client, invalidate)).toEqual([
+        JSON.stringify(["project-sessions", "Sprint 42", "updated_at", false]),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("merges the lists several frames name into one round", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      seedProjects(client);
+      seedFolder(client, "Sprint 42", ["conv_s"], true);
+      seedFolder(client, "Other", ["conv_o"], true);
+      seedFolder(client, "Third", ["conv_t"], true);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      // Two archives elsewhere, one frame each.
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...conv("conv_s"), project_id: "proj_42", archived: true }],
+        }),
+      );
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...conv("conv_o"), project_id: "proj_other", archived: true }],
+        }),
+      );
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(listInvalidations(invalidate)).toHaveLength(1);
+      expect(invalidatedKeys(client, invalidate)).toEqual([
+        JSON.stringify(["project-sessions", "Other", "updated_at", false]),
+        JSON.stringify(["project-sessions", "Sprint 42", "updated_at", false]),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["an unpin", { "omnigent.pinned": "1" }, {}],
+    ["a pin", {}, { "omnigent.pinned": "1" }],
+  ])("does not reconcile the pinned list for a remote %s", (_case, before, after) => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], (old) =>
+        old
+          ? { ...old, pages: [{ ...old.pages[0], data: [{ ...conv("conv_a"), labels: before }] }] }
+          : old,
+      );
+      client.setQueryData(["pinned-conversations"], {
+        conversations:
+          Object.keys(before).length > 0 ? [{ ...conv("conv_a"), labels: before }] : [],
+        filterHonored: true,
+      });
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), labels: after }] }));
+      act(() => vi.advanceTimersByTime(300));
+
+      expect(invalidatedKeys(client, invalidate)).not.toContain(
+        JSON.stringify(["pinned-conversations"]),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconciles every list when the open session's access level changes", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      seedFolder(client, "Other", ["conv_o"]);
+      renderProvider(client, ["/c/conv_a"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      client.setQueryData(["archived-project-names"], []);
+      invalidate.mockClear();
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), permission_level: 1 }] }));
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), permission_level: 4 }] }));
+      act(() => vi.advanceTimersByTime(300));
+
+      // Every session list the access change could reach; the pinned list is not reconciled.
+      expect(invalidatedKeys(client, invalidate)).toEqual([
+        JSON.stringify(["archived-project-names"]),
+        JSON.stringify(["conversations", "", false]),
+        JSON.stringify(["project-sessions", "Other", "updated_at", false]),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("SessionUpdatesProvider archived snapshot", () => {
+  it("reports a streamed unarchive once, not on every later frame", async () => {
+    vi.useFakeTimers();
+    try {
+      // No live list is cached: an unarchive that refetched one would hold the
+      // reconcile round open and hide a repeated picker transition.
+      const client = new QueryClient();
+      // The Archived scope is a snapshot: its rows stay frozen at the last read.
+      const archivedKey = ["conversations", "", false, null, "archived"];
+      client.getQueryCache().build(client, { queryKey: archivedKey, meta: { snapshot: true } });
+      client.setQueryData<ConversationsInfiniteData>(archivedKey, {
+        pages: [
+          {
+            data: [{ ...conv("conv_x"), archived: true }],
+            first_id: "conv_x",
+            last_id: "conv_x",
+            has_more: false,
+          },
+        ],
+        pageParams: [undefined],
+      });
+      client.setQueryData(["archived-project-names"], []);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "changed", items: [{ ...conv("conv_x"), archived: false }] }));
+      // Async so the round that the first frame started can settle before the next.
+      await act(async () => vi.advanceTimersByTime(300));
+      expect(invalidatedKeys(client, invalidate)).toContain(
+        JSON.stringify(["archived-project-names"]),
+      );
+
+      invalidate.mockClear();
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...conv("conv_x"), archived: false, title: "Renamed" }],
+        }),
+      );
+      // Past the reconcile pacing gap, so a repeated transition would have fired.
+      await act(async () => vi.advanceTimersByTime(3_000));
+      expect(listInvalidations(invalidate)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

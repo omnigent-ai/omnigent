@@ -758,29 +758,64 @@ _PROJECT_CONFIG_REFUSAL = (
         "config-other-path",
     ],
 )
-@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+@pytest.mark.parametrize(
+    ("active_turn_id", "refusal_stage"),
+    [(None, "turn_input"), ("turn_existing", "turn_input"), (None, "settings_update")],
+    ids=["start", "steer", "settings"],
+)
 def test_configuration_refusal_retains_input_without_changing_routing(
     draining_client,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     rpc_code: int,
     data: dict[str, str],
     message: str,
     failure_code: str | None,
     active_turn_id: str | None,
+    refusal_stage: str,
 ) -> None:
     _seed_bridge(tmp_path, active_turn_id=active_turn_id)
     before = read_bridge_state(tmp_path)
-    draining_client.delivery_errors = [
-        CodexAppServerResponseError({"code": rpc_code, "message": message, "data": data})
-    ]
+    error = CodexAppServerResponseError({"code": rpc_code, "message": message, "data": data})
+    draining_client.delivery_errors = [error]
 
-    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "keep this input")
+    if refusal_stage == "settings_update":
+        request = draining_client.request
+
+        async def reject_settings(self, method, params):
+            if method == "thread/settings/update":
+                draining_client.requests.append((method, params))
+                raise error
+            return await request(self, method, params)
+
+        monkeypatch.setattr(draining_client, "request", reject_settings)
+
+        async def run():
+            return [
+                event
+                async for event in CodexNativeExecutor(bridge_dir=tmp_path).run_turn(
+                    [{"role": "user", "content": "keep this input"}],
+                    [],
+                    "",
+                    ExecutorConfig(model="model-new"),
+                )
+            ]
+
+        [failure] = asyncio.run(run())
+    else:
+        [failure] = _collect_turn_events(
+            CodexNativeExecutor(bridge_dir=tmp_path), "keep this input"
+        )
+
+    expected_code = failure_code or (
+        "codex_settings_update_failed" if refusal_stage == "settings_update" else None
+    )
 
     assert isinstance(failure, ExecutorError)
-    assert failure.undelivered is (failure_code is not None)
-    assert failure.preserve_session is (failure_code is not None)
+    assert failure.undelivered is (expected_code is not None)
+    assert failure.preserve_session is (expected_code is not None)
     assert failure.retryable is False
-    assert failure.code == failure_code
+    assert failure.code == expected_code
     if failure_code is not None:
         assert failure.remediation is not None
         if failure_code == "codex_provider_changed":
@@ -792,7 +827,11 @@ def test_configuration_refusal_retains_input_without_changing_routing(
     assert draining_client.accepted_inputs == []
     assert draining_client.connections == draining_client.closes == 1
     assert [method for method, _ in draining_client.requests] == [
-        "turn/steer" if active_turn_id else "turn/start"
+        "thread/settings/update"
+        if refusal_stage == "settings_update"
+        else "turn/steer"
+        if active_turn_id
+        else "turn/start"
     ]
     assert read_bridge_state(tmp_path) == before
 
@@ -3907,19 +3946,37 @@ def test_run_turn_error_after_submit_is_not_marked_undelivered(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "submission", ["turn/start", "turn/steer", "live-steer", "before-send", "binding-change"]
+    "submission",
+    [
+        "turn/start",
+        "turn/steer",
+        "live-steer",
+        "before-send",
+        "binding-change",
+        "settings-rejected",
+        "settings-disconnected",
+        "settings-timeout",
+        "settings-replaced",
+    ],
 )
 async def test_transport_failure_keeps_native_work_running(
-    tmp_path: Path, submission: str
+    tmp_path: Path, submission: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failed submission cannot interrupt existing work or resend accepted input."""
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
 
-    method = "turn/start" if submission in {"turn/start", "binding-change"} else "turn/steer"
+    settings_failure = submission.startswith("settings-")
+    method = (
+        "turn/start"
+        if submission in {"turn/start", "binding-change"} or settings_failure
+        else "turn/steer"
+    )
     requests: list[str] = []
     native_running = submission == "before-send"
+    if settings_failure:
+        monkeypatch.setattr(codex_native_executor, "_DELIVERY_RPC_TIMEOUT_SECONDS", 1.0)
 
     async def handle(websocket: ServerConnection) -> None:
         nonlocal native_running
@@ -3929,6 +3986,29 @@ async def test_transport_failure_keeps_native_work_running(
             if "id" not in request:
                 continue
             requests.append(rpc_method)
+            if rpc_method == "thread/settings/update":
+                native_running = True
+                state = read_bridge_state(tmp_path)
+                assert state is not None
+                state = replace(state, active_turn_id="turn_accepted")
+                if submission == "settings-replaced":
+                    state = replace(state, session_id="conv_new", thread_id="thread_new")
+                write_bridge_state(tmp_path, state)
+                if submission == "settings-disconnected":
+                    websocket.transport.abort()
+                    return
+                if submission == "settings-timeout":
+                    await websocket.wait_closed()
+                    return
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "id": request["id"],
+                            "error": {"code": -32602, "message": "requested model unavailable"},
+                        }
+                    )
+                )
+                continue
             if submission == "before-send" and requests == ["initialize"]:
                 websocket.transport.abort()
                 return
@@ -3971,7 +4051,11 @@ async def test_transport_failure_keeps_native_work_running(
         )
         executor = CodexNativeExecutor(bridge_dir=tmp_path)
         adapter = ExecutorAdapter(executor_factory=lambda: executor)
-        request = CreateResponseRequest(model="test-agent", input="keep working")
+        request = CreateResponseRequest(
+            model="test-agent",
+            input="keep working",
+            model_override="model-new" if settings_failure else None,
+        )
         ctx = TurnContext(
             response_id="resp_delivery", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
         )
@@ -3997,12 +4081,19 @@ async def test_transport_failure_keeps_native_work_running(
             elif submission == "binding-change":
                 assert "changed" in str(caught.value)
                 assert caught.value.undelivered is True
+            elif settings_failure:
+                assert caught.value.undelivered is True
+                assert caught.value.code == "codex_settings_update_failed"
+                if submission != "settings-timeout" and submission != "settings-disconnected":
+                    assert "requested model unavailable" in str(caught.value)
             else:
                 assert "may already be running" in str(caught.value)
 
         assert requests.count(method) == (
-            0 if submission in {"before-send", "binding-change"} else 1
+            0 if submission in {"before-send", "binding-change"} or settings_failure else 1
         )
+        if settings_failure:
+            assert requests.count("thread/settings/update") == 1
         assert "turn/interrupt" not in requests
         assert native_running
         if submission != "live-steer":
