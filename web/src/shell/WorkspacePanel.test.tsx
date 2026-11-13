@@ -1737,6 +1737,21 @@ describe("WorkspacePanel mobile side chats", () => {
     expect(onMobileSideChatsOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("gives a pinned drawer tab an unpin button instead of close, as on the strip", () => {
+    isMobileMock.mockReturnValue(true);
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side_a", "conv_side_b"],
+      pinnedSideChats: ["conv_side_a"],
+    });
+    renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(within(drawer).queryByRole("button", { name: "Close Side chat 1" })).toBeNull();
+    fireEvent.click(within(drawer).getByRole("button", { name: "Unpin Side chat 1" }));
+    expect(readSessionWorkspaceState("conv_ws").pinnedSideChats).toBeUndefined();
+    expect(within(drawer).getByRole("button", { name: "Close Side chat 1" })).toBeVisible();
+  });
+
   it("renders the drawer inside the app subtree, beside the hidden rail", () => {
     // The embed scopes its stylesheet to its own root, and native shells scope
     // safe-area insets to the app shell, so a drawer portaled to the body

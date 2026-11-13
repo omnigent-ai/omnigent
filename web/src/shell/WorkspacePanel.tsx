@@ -2299,21 +2299,31 @@ function WorkspacePanelImpl({
                       {subagentSessionIdFromTab(childId) !== null && (
                         <BotIcon className="size-4 shrink-0" />
                       )}
-                      {arrangement?.pinned && <PinIcon className="size-3.5 shrink-0" />}
                       <span className="max-w-[16ch] truncate">
                         {sideChatTabsDensity === "regular"
                           ? label
                           : (chatTabCompactLabels[childId] ?? label)}
                       </span>
                     </button>
-                    <button
-                      type="button"
-                      aria-label={`Close ${label}`}
-                      className="flex size-6 items-center justify-center rounded"
-                      onClick={() => closeSideChat(childId)}
-                    >
-                      <XIcon className="size-3.5" />
-                    </button>
+                    {arrangement?.pinned ? (
+                      <button
+                        type="button"
+                        aria-label={`Unpin ${label}`}
+                        className="flex size-6 items-center justify-center rounded"
+                        onClick={() => arrangement.onPinnedChange(false)}
+                      >
+                        <PinIcon className="size-3.5" />
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        aria-label={`Close ${label}`}
+                        className="flex size-6 items-center justify-center rounded"
+                        onClick={() => closeSideChat(childId)}
+                      >
+                        <XIcon className="size-3.5" />
+                      </button>
+                    )}
                   </div>
                 </SideChatTabMenu>
               );

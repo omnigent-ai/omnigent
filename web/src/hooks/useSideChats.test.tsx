@@ -46,17 +46,21 @@ describe("side-chat soft tabs", () => {
     expect(result.current.tabs).toEqual(["conv_first", "conv_second", "conv_third"]);
   });
 
-  it("rekey to an already-open id drops the pending tab", () => {
+  it("rekey to an already-open id merges it into the pending tab's slot, name and pin", () => {
     const { result } = renderHook(() => useSideChats("session-a"));
     let pendingId = "";
     act(() => result.current.open("conv_real"));
+    act(() => result.current.open("conv_other"));
     act(() => {
       pendingId = result.current.openPending();
     });
-    expect(result.current.tabs).toEqual(["conv_real", pendingId]);
+    act(() => result.current.setPinned(pendingId, true));
+    expect(result.current.tabs).toEqual([pendingId, "conv_real", "conv_other"]);
     act(() => result.current.rekey(pendingId, "conv_real"));
-    expect(result.current.tabs).toEqual(["conv_real"]);
+    expect(result.current.tabs).toEqual(["conv_real", "conv_other"]);
     expect(result.current.selected).toBe("conv_real");
+    expect(result.current.pinned).toEqual(["conv_real"]);
+    expect(result.current.numbers).toEqual({ conv_real: 3, conv_other: 2 });
   });
 
   it("opens child ids as tabs, selecting each, and is idempotent", () => {

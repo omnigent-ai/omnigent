@@ -179,31 +179,24 @@ export function useSideChats(conversationId: string) {
 
   /** Replace a tab's id in place, preserving its position and selection. Used
    *  when a `pending:` tab's fork resolves to a real child id, so the tab does
-   *  not disappear and reappear. No-op if `oldId` isn't open; if `newId` is
-   *  already a tab, the pending one is just dropped. */
+   *  not disappear and reappear. No-op if `oldId` isn't open. The started chat
+   *  keeps the pending tab's name and pin; if `newId` was already open (restored
+   *  before the fork resolved), that duplicate tab merges into this one. */
   const rekey = useCallback(
     (oldId: string, newId: string) =>
       update((current) => {
-        const index = current.tabs.indexOf(oldId);
-        if (index === -1) return current;
-        const selected = current.selected === oldId ? newId : current.selected;
-        if (current.tabs.includes(newId)) {
-          return {
-            ...current,
-            tabs: current.tabs.filter((id) => id !== oldId),
-            pinned: current.pinned.filter((id) => id !== oldId),
-            selected,
-          };
-        }
-        const tabs = [...current.tabs];
-        tabs[index] = newId;
-        // The started chat keeps the pending tab's name and pin.
+        if (!current.tabs.includes(oldId)) return current;
+        const replace = (id: string) => (id === oldId ? newId : id);
         return {
           ...current,
-          tabs,
-          selected,
-          numbers: { ...current.numbers, [newId]: current.numbers[oldId] },
-          pinned: current.pinned.map((id) => (id === oldId ? newId : id)),
+          tabs: current.tabs.filter((id) => id !== newId).map(replace),
+          selected:
+            current.selected === oldId || current.selected === newId ? newId : current.selected,
+          numbers: {
+            ...current.numbers,
+            [newId]: current.numbers[oldId] ?? current.numbers[newId],
+          },
+          pinned: [...new Set(current.pinned.map(replace))],
         };
       }),
     [update],
