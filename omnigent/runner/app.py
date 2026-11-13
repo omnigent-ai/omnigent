@@ -8013,6 +8013,7 @@ def create_runner_app(
         app,
         _antigravity_terminal_ensure_locks=_antigravity_terminal_ensure_locks,
         _claude_terminal_ensure_locks=_claude_terminal_ensure_locks,
+        _cline_terminal_ensure_locks=_cline_terminal_ensure_locks,
         _codex_terminal_ensure_locks=_codex_terminal_ensure_locks,
         _cursor_terminal_ensure_locks=_cursor_terminal_ensure_locks,
         _devin_terminal_ensure_locks=_devin_terminal_ensure_locks,

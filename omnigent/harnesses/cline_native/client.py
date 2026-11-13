@@ -73,7 +73,10 @@ class ClineHubClient:
         client_id = client_id or f"omnigent-{_pid()}-{secrets.token_hex(3)}"
         import websockets
 
-        ws = await websockets.connect(ws_url, subprotocols=[f"cline-hub-auth.{auth_token}"])
+        ws = await websockets.connect(
+            ws_url,
+            subprotocols=[websockets.Subprotocol(f"cline-hub-auth.{auth_token}")],
+        )
         client = cls(ws=ws, client_id=client_id)
         client._recv_task = asyncio.create_task(client._recv_loop(), name="cline-hub-recv")
         try:

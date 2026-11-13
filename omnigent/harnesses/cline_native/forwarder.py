@@ -233,7 +233,7 @@ async def run_cline_forwarder(
 
     client = await ClineHubClient.connect(ws_url, auth_token)
     try:
-        with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http:
             _on_event, drain = make_event_sink(
                 http,
                 base_url=base_url,
