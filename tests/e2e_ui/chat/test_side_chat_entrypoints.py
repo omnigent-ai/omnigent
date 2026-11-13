@@ -466,7 +466,7 @@ def test_ask_in_side_chat_opens_a_quoted_side_chat_tab(
     assert followup not in str(_items(base_url, session_id))
 
     pane.locator(_ASSISTANT).get_by_text(followup_reply, exact=True).select_text()
-    reply_popup = page.get_by_role("button", name="Reply ↵", exact=True)
+    reply_popup = page.get_by_role("button", name="Reply", exact=True)
     expect(reply_popup).to_be_visible()
     popup_bounds = reply_popup.bounding_box()
     viewport = page.viewport_size
@@ -480,7 +480,7 @@ def test_ask_in_side_chat_opens_a_quoted_side_chat_tab(
     reply_question = question + " explain this reply"
     page.get_by_test_id("side-chat-input").fill(reply_question)
     pane.locator(_ASSISTANT).get_by_text(side_reply, exact=True).select_text()
-    page.get_by_role("button", name="Reply ↵", exact=True).click()
+    page.get_by_role("button", name="Reply", exact=True).click()
     expect(pane.get_by_test_id("composer-reply-quote")).to_have_count(2)
     earlier_reply = pane.get_by_role("textbox", name="Reply text before quote 2")
     expect(earlier_reply).to_have_value(reply_question)
@@ -559,7 +559,7 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     expect(drawer.get_by_role("button", name="Side chat model and effort")).to_have_count(0)
 
     drawer.locator(_ASSISTANT).get_by_text(side_reply, exact=True).select_text()
-    reply_popup = page.get_by_role("button", name="Reply ↵", exact=True)
+    reply_popup = page.get_by_role("button", name="Reply", exact=True)
     expect(reply_popup).to_be_visible()
     popup_bounds = reply_popup.bounding_box()
     viewport = page.viewport_size
@@ -572,7 +572,7 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     first_reply = question + " explain this reply"
     drawer.get_by_test_id("side-chat-input").fill(first_reply)
     drawer.locator(_ASSISTANT).get_by_text(side_detail, exact=True).select_text()
-    page.get_by_role("button", name="Reply ↵", exact=True).click()
+    page.get_by_role("button", name="Reply", exact=True).click()
     expect(drawer.get_by_test_id("composer-reply-quote")).to_have_count(2)
     earlier_reply = drawer.get_by_role("textbox", name="Reply text before quote 2")
     expect(earlier_reply).to_have_value(first_reply)

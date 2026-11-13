@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { CornerUpLeftIcon, MessagesSquareIcon } from "lucide-react";
-import { ALT_KEY, CompactShortcutKeys, ENTER_KEY } from "@/components/KeyboardShortcut";
+import { ALT_KEY, CompactShortcutKeys, ENTER_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { getEmbedRoot } from "@/lib/host";
 import { isFocusInDialogOrMenu, isKeyOwningOverlayOpen, isTextEntry } from "@/lib/hotkeys";
@@ -83,9 +83,9 @@ export function SelectionPopup({
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.repeat || event.isComposing) return;
-      const action = chordMatches({ key: "Enter" }, event)
+      const action = chordMatches({ key: "Enter", alt: true }, event)
         ? onReply
-        : chordMatches({ key: "Enter", alt: true }, event)
+        : chordMatches({ key: "Enter", alt: true, shift: true }, event)
           ? onAskInSideChat
           : undefined;
       if (
@@ -124,7 +124,7 @@ export function SelectionPopup({
     >
       <Button
         type="button"
-        aria-keyshortcuts="Enter"
+        aria-keyshortcuts="Alt+Enter"
         variant="secondary"
         size="sm"
         // Override shared-variant translucent hover — this button floats over text.
@@ -138,12 +138,13 @@ export function SelectionPopup({
         }}
       >
         <CornerUpLeftIcon className="size-3.5" />
-        Reply ↵
+        Reply
+        <CompactShortcutKeys keys={[ALT_KEY, ENTER_KEY]} />
       </Button>
       {onAskInSideChat ? (
         <Button
           type="button"
-          aria-keyshortcuts="Alt+Enter"
+          aria-keyshortcuts="Alt+Shift+Enter"
           variant="secondary"
           size="sm"
           className="gap-1 shadow-md hover:bg-secondary hover:brightness-95 dark:hover:brightness-110"
@@ -156,7 +157,7 @@ export function SelectionPopup({
         >
           <MessagesSquareIcon className="size-3.5" />
           Ask in side chat
-          <CompactShortcutKeys keys={[ALT_KEY, ENTER_KEY]} />
+          <CompactShortcutKeys keys={[ALT_KEY, SHIFT_KEY, ENTER_KEY]} />
         </Button>
       ) : null}
     </div>,

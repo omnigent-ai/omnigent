@@ -696,7 +696,7 @@ describe("side-chat selection reply", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "Remove quote" })[1]);
     const selectedText = "Ask a question here without affecting the main conversation.";
     selectText(screen.getByText(selectedText));
-    fireEvent.click(screen.getByRole("button", { name: "Reply ↵" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reply" }));
     fireEvent.change(tail, { target: { value: "After the added quote" } });
     act(() => mic.current!.onVoiceDiscard!());
 
@@ -732,7 +732,7 @@ describe("side-chat selection reply", () => {
     act(() => mic.current!.onTranscript("spoken addition"));
     expect(tail).toHaveValue("Tail answer spoken addition");
     selectText(screen.getByText("Ask a question here without affecting the main conversation."));
-    fireEvent.click(screen.getByRole("button", { name: "Reply ↵" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reply" }));
     fireEvent.change(tail, { target: { value: "After the added quote" } });
     fireEvent.change(screen.getByRole("textbox", { name: "Reply text before quote 1" }), {
       target: { value: "Edited earlier answer" },
@@ -866,12 +866,12 @@ describe("side-chat selection reply", () => {
       const pane = <SideChatPane childId={childId} fullSession={fullSession} />;
       const view = renderPane(pane);
       selectText(screen.getByText("First passage"));
-      fireEvent.click(screen.getByRole("button", { name: "Reply ↵" }));
+      fireEvent.click(screen.getByRole("button", { name: "Reply" }));
       fireEvent.change(screen.getByTestId("side-chat-input"), {
         target: { value: "First answer" },
       });
       selectText(screen.getByText("Second passage"));
-      fireEvent.click(screen.getByRole("button", { name: "Reply ↵" }));
+      fireEvent.click(screen.getByRole("button", { name: "Reply" }));
 
       const between = screen.getByRole("textbox", { name: "Reply text before quote 2" });
       expect(between).toHaveValue("First answer");
@@ -1024,7 +1024,7 @@ describe("side-chat selection reply", () => {
     });
     renderPane(<SideChatPane childId={childId} />);
     selectText(screen.getByText("Ask a question here without affecting the main conversation."));
-    fireEvent.click(screen.getByRole("button", { name: "Reply ↵" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reply" }));
 
     expect(useChatStore.getState().sideChatComposers[childId]).toEqual({
       text: "",
@@ -1039,7 +1039,7 @@ describe("side-chat selection reply", () => {
       ],
     });
     expect(screen.getByTestId("side-chat-input")).toHaveFocus();
-    expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reply" })).toBeNull();
     expect(useChatStore.getState().sideChatToOpen).toBeNull();
     expect(send).not.toHaveBeenCalled();
   });
@@ -1047,7 +1047,7 @@ describe("side-chat selection reply", () => {
   it("does not offer Reply in a read-only side chat", () => {
     renderPane(<SideChatPane childId={childId} readOnly />);
     selectText(screen.getByText("This side chat has ended and can’t be continued."));
-    expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reply" })).toBeNull();
   });
 
   it("does not offer Reply while a side chat is starting", () => {
@@ -1056,7 +1056,7 @@ describe("side-chat selection reply", () => {
     });
     renderPane(<SideChatPane childId="pending:starting" />);
     selectText(screen.getByTestId("working-indicator"));
-    expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reply" })).toBeNull();
   });
 });
 

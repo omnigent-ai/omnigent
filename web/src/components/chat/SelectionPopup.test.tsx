@@ -51,46 +51,50 @@ it.each([true, false])("portals outside the transcript (embedded: %s)", (embedde
 
   selectText(containerRef.current!);
 
-  const reply = screen.getByRole("button", { name: "Reply ↵" });
+  const reply = screen.getByRole("button", { name: "Reply" });
   expect(reply.parentElement?.parentElement).toBe(embedded ? container : document.body);
   expect(reply.parentElement).toHaveStyle({ position: "fixed", left: "50px", top: "30px" });
   fireEvent.click(reply);
   expect(onReply).toHaveBeenCalledExactlyOnceWith("Selected message");
-  expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Reply" })).toBeNull();
 });
 
-it.each([false, true])("acts on selected text with Enter (Alt: %s)", (altKey) => {
+it.each([false, true])("acts on selected text with Alt+Enter (Shift: %s)", (shiftKey) => {
   const onAskInSideChat = vi.fn();
   const { onReply } = renderPopup(onAskInSideChat);
 
-  expect(screen.getByRole("button", { name: "Reply ↵" })).toHaveAttribute(
-    "aria-keyshortcuts",
-    "Enter",
-  );
-  expect(screen.getByRole("button", { name: "Ask in side chat" })).toHaveAttribute(
+  expect(screen.getByRole("button", { name: "Reply" })).toHaveAttribute(
     "aria-keyshortcuts",
     "Alt+Enter",
   );
-  expect(fireEvent.keyDown(document.body, { key: "Enter", altKey })).toBe(false);
-  expect(altKey ? onAskInSideChat : onReply).toHaveBeenCalledExactlyOnceWith("Selected message");
-  expect(altKey ? onReply : onAskInSideChat).not.toHaveBeenCalled();
+  expect(screen.getByRole("button", { name: "Ask in side chat" })).toHaveAttribute(
+    "aria-keyshortcuts",
+    "Alt+Shift+Enter",
+  );
+  expect(fireEvent.keyDown(document.body, { key: "Enter", altKey: true, shiftKey })).toBe(false);
+  expect(shiftKey ? onAskInSideChat : onReply).toHaveBeenCalledExactlyOnceWith("Selected message");
+  expect(shiftKey ? onReply : onAskInSideChat).not.toHaveBeenCalled();
   expect(window.getSelection()!.isCollapsed).toBe(true);
-  expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Reply" })).toBeNull();
 });
 
-it("leaves Alt+Enter alone when side chat is unavailable", () => {
+it("leaves Alt+Shift+Enter alone when side chat is unavailable but still supports reply", () => {
   const { onReply } = renderPopup();
   expect(screen.queryByRole("button", { name: "Ask in side chat" })).toBeNull();
-  expect(fireEvent.keyDown(document.body, { key: "Enter", altKey: true })).toBe(true);
+  expect(fireEvent.keyDown(document.body, { key: "Enter", altKey: true, shiftKey: true })).toBe(
+    true,
+  );
   expect(onReply).not.toHaveBeenCalled();
   expect(window.getSelection()!.toString()).toBe("Selected message");
+  expect(fireEvent.keyDown(document.body, { key: "Enter", altKey: true })).toBe(false);
+  expect(onReply).toHaveBeenCalledExactlyOnceWith("Selected message");
 });
 
 it("uses the live selection even before selectionchange is delivered", () => {
   const { containerRef, onReply } = renderPopup();
   const range = selectText(containerRef.current!, false);
   range.setStart(containerRef.current!.firstChild!, 9);
-  fireEvent.keyDown(document.body, { key: "Enter" });
+  fireEvent.keyDown(document.body, { key: "Enter", altKey: true });
   expect(onReply).toHaveBeenCalledExactlyOnceWith("message");
 });
 
@@ -112,8 +116,10 @@ it.each(["outside", "cross-boundary", "collapsed", "cleared", "whitespace"])(
     } else {
       selection.getRangeAt(0).setEnd(screen.getByTestId("outside").firstChild!, 7);
     }
-    expect(fireEvent.keyDown(document.body, { key: "Enter" })).toBe(true);
     expect(fireEvent.keyDown(document.body, { key: "Enter", altKey: true })).toBe(true);
+    expect(fireEvent.keyDown(document.body, { key: "Enter", altKey: true, shiftKey: true })).toBe(
+      true,
+    );
     expect(onReply).not.toHaveBeenCalled();
     expect(onAskInSideChat).not.toHaveBeenCalled();
   },
@@ -124,18 +130,18 @@ it.each([
   { isComposing: true },
   { ctrlKey: true },
   { metaKey: true },
-  { shiftKey: true },
-  { altKey: true, shiftKey: true },
-])("ignores Enter with %j", (modifiers) => {
+  { altKey: false },
+  { altKey: false, shiftKey: true },
+])("ignores Alt+Enter with %j", (modifiers) => {
   const onAskInSideChat = vi.fn();
   const { onReply } = renderPopup(onAskInSideChat);
-  expect(fireEvent.keyDown(document.body, { key: "Enter", ...modifiers })).toBe(true);
+  expect(fireEvent.keyDown(document.body, { key: "Enter", altKey: true, ...modifiers })).toBe(true);
   expect(onReply).not.toHaveBeenCalled();
   expect(onAskInSideChat).not.toHaveBeenCalled();
 });
 
 it.each(["textarea", "input", "contenteditable", "button", "monaco-editor", "xterm"])(
-  "preserves Enter in a focused %s while transcript text is still selected",
+  "preserves selection shortcuts in a focused %s while transcript text is still selected",
   (surface) => {
     const onAskInSideChat = vi.fn();
     const { container, onReply } = renderPopup(onAskInSideChat);
@@ -147,8 +153,8 @@ it.each(["textarea", "input", "contenteditable", "button", "monaco-editor", "xte
     else target.className = surface;
     container.append(target);
     target.focus();
-    expect(fireEvent.keyDown(target, { key: "Enter" })).toBe(true);
     expect(fireEvent.keyDown(target, { key: "Enter", altKey: true })).toBe(true);
+    expect(fireEvent.keyDown(target, { key: "Enter", altKey: true, shiftKey: true })).toBe(true);
     expect(onReply).not.toHaveBeenCalled();
     expect(onAskInSideChat).not.toHaveBeenCalled();
   },
@@ -159,10 +165,15 @@ it("leaves modal and already-handled keys alone", () => {
   const modal = document.createElement("div");
   modal.setAttribute("aria-modal", "true");
   container.append(modal);
-  expect(fireEvent.keyDown(document.body, { key: "Enter" })).toBe(true);
+  expect(fireEvent.keyDown(document.body, { key: "Enter", altKey: true })).toBe(true);
   modal.remove();
 
-  const event = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+  const event = new KeyboardEvent("keydown", {
+    key: "Enter",
+    altKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
   event.preventDefault();
   fireEvent(document.body, event);
   expect(onReply).not.toHaveBeenCalled();
@@ -182,14 +193,14 @@ it("keeps Enter activation of the focused side-chat button", () => {
 it("removes the shortcut listener when unmounted", () => {
   const { unmount, onReply } = renderPopup();
   unmount();
-  expect(fireEvent.keyDown(document.body, { key: "Enter" })).toBe(true);
+  expect(fireEvent.keyDown(document.body, { key: "Enter", altKey: true })).toBe(true);
   expect(onReply).not.toHaveBeenCalled();
 });
 
 it("routes the shortcut only to the transcript containing the selection", () => {
   const first = renderPopup();
   const second = renderPopup();
-  fireEvent.keyDown(document.body, { key: "Enter" });
+  fireEvent.keyDown(document.body, { key: "Enter", altKey: true });
   expect(first.onReply).not.toHaveBeenCalled();
   expect(second.onReply).toHaveBeenCalledExactlyOnceWith("Selected message");
 });
