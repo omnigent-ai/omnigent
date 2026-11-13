@@ -549,6 +549,52 @@ async def test_each_claimed_run_shares_its_new_session_with_the_current_grants(
     assert [run.status for run in _runs(store, claimed.task)] == ["running", "running"]
 
 
+@pytest.mark.parametrize("replaced", ["before_the_recheck", "after_the_recheck"])
+async def test_a_grantee_replaced_during_a_run_is_not_given_the_session(
+    store, db_uri, monkeypatch, replaced
+) -> None:
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.server.scheduled import run_sharing
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    claimed = _claim(store)
+    accounts.create_user_with_password("alice@example.com", "first-hash")
+    _share_task(permissions, claimed.task.id, "alice@example.com", "bob@example.com")
+    announced: list[str | None] = []
+    monkeypatch.setattr(
+        run_sharing, "_announce_session_added", lambda user_id, _: announced.append(user_id)
+    )
+    # Alice's account is deleted and her name registered again: once the run has read
+    # the session's grants, or as it writes her account row after the recheck.
+    hooked = "list_for_session" if replaced == "before_the_recheck" else "ensure_user"
+    original = getattr(permissions, hooked)
+
+    def replace_alice_first(*args: Any, **kwargs: Any) -> Any:
+        if hooked == "list_for_session" or args[0] == "alice@example.com":
+            monkeypatch.setattr(permissions, hooked, original)
+            assert accounts.delete_user("alice@example.com")
+            accounts.create_user_with_password("alice@example.com", "second-hash")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(permissions, hooked, replace_alice_first)
+    conversations = _ConversationStore()
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations, permission_store=permissions),
+        launch_dispatch=AsyncMock(),
+    )
+
+    await executor.fire(claimed.task, claimed.lease)
+
+    [session_id] = conversations.ids
+    assert _session_levels(permissions, session_id) == {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        "bob@example.com": LEVEL_READ,
+    }
+    assert announced == ["bob@example.com"]
+    assert [run.status for run in _runs(store, claimed.task)] == ["running"]
+
+
 async def test_a_claimed_continue_run_syncs_its_session_once_the_automation_is_shared(
     store, db_uri
 ) -> None:

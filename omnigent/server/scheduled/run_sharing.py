@@ -24,6 +24,7 @@ import logging
 from enum import Enum
 from typing import Any
 
+from omnigent.db.account_authority import target_account_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
@@ -103,6 +104,8 @@ async def _apply_task_grants(
         for grant in existing:
             if grant.level == LEVEL_OWNER or grant.user_id in kept:
                 continue
+            if await _held_under_the_stores_comparison(permission_store, task, grant.user_id):
+                continue
             try:
                 await asyncio.to_thread(permission_store.revoke, grant.user_id, session.id)
             except Exception:
@@ -131,12 +134,7 @@ async def _apply_task_grants(
         return
     for grant in missing:
         try:
-            await asyncio.to_thread(permission_store.ensure_user, grant.user_id)
-            # Automations grant Read only (SCHEDULED_TASK_GRANT_LEVELS). A share made
-            # since the session's grants were read is kept, never lowered.
-            written = await asyncio.to_thread(
-                permission_store.grant_if_absent, grant.user_id, session.id, LEVEL_READ
-            )
+            written = await _share_with_grantee(permission_store, task, session, grant.user_id)
         except Exception:
             _logger.exception(
                 "automation %s: could not share session %s with %r",
@@ -147,6 +145,55 @@ async def _apply_task_grants(
             continue
         if written:
             _announce_session_added(grant.user_id, session.id)
+
+
+async def _held_under_the_stores_comparison(
+    permission_store: PermissionStore, task: ScheduledTask, user_id: str
+) -> bool:
+    """Whether the automation's share table matches *user_id* to one of its grantees.
+
+    Grantees otherwise match exactly. On MySQL the table's collation also matches a case
+    or accent variant, whose session grant would be revoked and re-added at Read. A
+    failed check counts as a match, so it never causes a revocation.
+    """
+    try:
+        held = await asyncio.to_thread(
+            permission_store.resolve_scheduled_task_access, [user_id], task.id
+        )
+    except Exception:
+        _logger.exception(
+            "automation %s: could not check %r against its grants; keeping their share",
+            task.id,
+            user_id,
+        )
+        return True
+    return held is not None
+
+
+async def _share_with_grantee(
+    permission_store: PermissionStore, task: ScheduledTask, session: Conversation, grantee: str
+) -> bool:
+    """Grant *grantee* Read on *session* if they still hold the automation's grant.
+
+    Pins the grantee's account as the session share route does, so an account deleted
+    and registered again since the list was read is refused, not granted.
+
+    :returns: Whether a grant was written.
+    """
+    account = await asyncio.to_thread(permission_store.get_user, grantee)
+    with target_account_scope(grantee, account.account_generation if account else None):
+        # Checked after the pin: a replaced account no longer holds the grant.
+        held = await asyncio.to_thread(
+            permission_store.resolve_scheduled_task_access, [grantee], task.id
+        )
+        if held is None:
+            return False
+        await asyncio.to_thread(permission_store.ensure_user, grantee)
+        # Automations grant Read only (SCHEDULED_TASK_GRANT_LEVELS). A share made since
+        # the session's grants were read is kept, never lowered.
+        return await asyncio.to_thread(
+            permission_store.grant_if_absent, grantee, session.id, LEVEL_READ
+        )
 
 
 async def _share_best_effort(
