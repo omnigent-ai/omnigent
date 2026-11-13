@@ -228,8 +228,7 @@ def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
     assert command == [
         str(wrapper),
         "omni",
-        "host",
-        "service-entry",
+        "host-service-entry",
         "--server",
         "https://example.com",
     ]
@@ -297,7 +296,7 @@ def test_wrapper_command_keeps_quoted_words(tmp_path: Path, by_path: bool) -> No
         },
     )
 
-    assert command == [str(wrapper), "omni cli", "--flag", "host", "service-entry", "--local"]
+    assert command == [str(wrapper), "omni cli", "--flag", "host-service-entry", "--local"]
 
 
 def test_systemd_unit_escapes_specifiers_and_literal_dollars() -> None:

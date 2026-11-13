@@ -91,7 +91,7 @@ def _service_command(server_url: str | None, environment: Mapping[str, str]) -> 
     mode = ["--server", server_url] if server_url else ["--local"]
     wrapper = _wrapper_command(environment)
     if wrapper is not None:
-        return [*wrapper, "host", "service-entry", *mode]
+        return [*wrapper, "host-service-entry", *mode]
     return [sys.executable, "-P", "-m", "omnigent.host.service_entry", *mode]
 
 

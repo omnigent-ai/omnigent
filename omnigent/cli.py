@@ -11166,7 +11166,8 @@ def host_disable() -> None:
     click.echo(f"Removed service definition: {_display_path(service.path)}")
 
 
-@host.command("service-entry", hidden=True)
+# Top-level lifecycle commands pass through wrappers that validate host subcommands.
+@cli.command("host-service-entry", hidden=True)
 @click.option("--server", default=None, help="Remote Omnigent server URL.")
 @click.option("--local", is_flag=True, default=False, help="Run a local Omnigent server.")
 def host_service_entry(server: str | None, local: bool) -> None:

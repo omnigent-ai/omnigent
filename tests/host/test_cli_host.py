@@ -561,7 +561,7 @@ def test_host_service_entry_runs_the_service_host(
 
     monkeypatch.setattr("omnigent.host.service_entry.run", _run)
 
-    result = CliRunner().invoke(cli, ["host", "service-entry", *args])
+    result = CliRunner().invoke(cli, ["host-service-entry", *args])
 
     assert result.exit_code == exit_code, result.output
     assert started == servers
