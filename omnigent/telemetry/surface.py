@@ -87,12 +87,14 @@ def classify_surface(user_agent: str | None) -> str:
     * ``None`` or absent → ``"unknown"``
     * ``"omnigent-<component>/"`` prefix → ``"cli"``, ``"runner"``, ``"host"``,
       ``"harness"``, ``"sdk"`` (``omnigent-client``), or ``"slack"``
+    * empty / bare ``"python-httpx"`` / ``"python-requests"`` → ``"cli"``: older
+      Omnigent CLIs, hosts and runners send only httpx, with no component token
     * ``"Electron"`` in UA → ``"desktop"``
     * ``"iPhone"`` or ``"iPad"`` in UA → ``"ios"``
     * ``"Android"`` in UA → ``"android"``
     * a browser (``"Mozilla/"``) → ``"web"``
-    * anything else (empty, bare ``python-httpx``, ``Python-urllib``, ``node``,
-      ``Bun``, ``curl``, ...) → ``"script"``: a client that is not Omnigent's own
+    * anything else (``Python-urllib``, ``node``, ``Bun``, ``curl``, ...)
+      → ``"script"``: a non-browser client that is not Omnigent's own
 
     :param user_agent: Raw ``User-Agent`` header value, or ``None``.
     :returns: Surface label string.
@@ -102,6 +104,8 @@ def classify_surface(user_agent: str | None) -> str:
     for prefix, surface in _OMNIGENT_USER_AGENT_SURFACES.items():
         if user_agent.startswith(prefix):
             return surface
+    if not user_agent or "python-httpx" in user_agent or "python-requests" in user_agent:
+        return "cli"
     if "Electron" in user_agent:
         return "desktop"
     if "iPhone" in user_agent or "iPad" in user_agent:

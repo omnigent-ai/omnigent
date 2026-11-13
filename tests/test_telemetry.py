@@ -62,23 +62,26 @@ def test_classify_surface_omnigent_components(user_agent: str, surface: str) -> 
 
 
 @pytest.mark.parametrize(
-    "user_agent",
+    ("user_agent", "surface"),
     [
-        "",
-        "python-httpx/0.28.1",
-        "python-requests/2.32.3",
-        "Python-urllib/3.12",
-        "node",
-        "Bun/1.1.38",
-        "porthole-mcp/1.0",
-        "curl/8.5.0",
-        "testclient",
-        "Python/3.12 websockets/14.2",
+        # Main parity: bare httpx/requests and empty UAs are the CLI, host and runner
+        # releases 0.17-0.21, which send no component token.
+        ("", "cli"),
+        ("python-httpx/0.28.1", "cli"),
+        ("python-httpx/0.27.0", "cli"),
+        ("python-requests/2.32.3", "cli"),
+        ("Python-urllib/3.12", "script"),
+        ("node", "script"),
+        ("Bun/1.1.38", "script"),
+        ("porthole-mcp/1.0", "script"),
+        ("curl/8.5.0", "script"),
+        ("testclient", "script"),
+        ("Python/3.12 websockets/14.2", "script"),
     ],
 )
-def test_classify_surface_non_browser_clients_are_scripts(user_agent: str) -> None:
-    """A non-browser UA without an Omnigent token is a script, not web or our CLI."""
-    assert classify_surface(user_agent) == "script"
+def test_classify_surface_main_parity(user_agent: str, surface: str) -> None:
+    """Bare httpx/requests and empty stay ``cli`` as on main; other non-browsers are ``script``."""
+    assert classify_surface(user_agent) == surface
 
 
 def test_classify_surface_regular_browser() -> None:
