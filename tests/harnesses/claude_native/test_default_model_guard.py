@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
+import sys
+import textwrap
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -15,9 +18,8 @@ from omnigent.harnesses.claude_native.bridge import claude_user_settings_path
 
 
 @pytest.fixture
-def paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
-    """Settings file and state dir, with the background watcher off so tests settle by hand."""
-    monkeypatch.setattr(default_model_guard, "_ensure_watcher", lambda *_args: None)
+def paths(tmp_path: Path) -> tuple[Path, Path]:
+    """Settings and state paths; the adapter fixture disables background watching."""
     return tmp_path / "settings.json", tmp_path / "state"
 
 
@@ -159,6 +161,49 @@ def test_a_second_session_does_not_take_an_unsettled_save_for_the_default(
     assert _read(settings) == {"model": "opus"}
 
 
+def test_registration_respects_another_process_holding_the_shared_lock(
+    paths: tuple[Path, Path],
+) -> None:
+    """A second process cannot register until the shared record lock is released."""
+    settings, state = paths
+    _write(settings, {"model": "opus"})
+    program = textwrap.dedent(
+        """\
+        import sys
+        from pathlib import Path
+        from omnigent.harnesses.claude_native import default_model_guard as guard
+
+        # This child does not inherit pytest's watcher-isolation fixture.
+        guard._ensure_watcher = lambda *_args: None
+        guard._LOCK_TIMEOUT_S = 0.1
+        try:
+            guard.begin_model_switch(Path(sys.argv[1]), "sonnet", state_dir=Path(sys.argv[2]))
+        except guard.ModelSwitchProtectionError:
+            print("blocked")
+        else:
+            print("registered")
+        """
+    )
+
+    def register_in_child() -> str:
+        result = subprocess.run(
+            [sys.executable, "-c", program, str(settings), str(state)],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        return result.stdout.strip()
+
+    with default_model_guard._locked_record(state, settings.resolve()):
+        assert register_in_child() == "blocked"
+        assert not list(state.glob("*.json"))
+    assert register_in_child() == "registered"
+    _write(settings, {"model": "sonnet"})
+    assert not default_model_guard.settle_default_model(settings, state_dir=state)
+    assert _read(settings) == {"model": "opus"}
+
+
 def test_symlink_aliases_share_one_default_baseline(paths: tuple[Path, Path]) -> None:
     settings, state = paths
     alias = settings.parent / "alias.json"
@@ -206,19 +251,27 @@ def test_registers_nothing_when_the_default_is_already_that_model(
     assert not list(state.glob("*.json"))
 
 
-def test_cancelling_forgets_only_that_switch(paths: tuple[Path, Path]) -> None:
+@pytest.mark.parametrize("already_settled", [False, True], ids=["both-pending", "settled"])
+def test_cancelling_forgets_only_that_switch(
+    paths: tuple[Path, Path], already_settled: bool
+) -> None:
     settings, state = paths
     _write(settings, {"model": "opus"})
     sonnet = default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
     haiku = default_model_guard.begin_model_switch(settings, "haiku", state_dir=state)
     assert sonnet is not None and haiku is not None
-    _write(settings, {"model": "sonnet"})
-    default_model_guard.settle_default_model(settings, state_dir=state)
+    if already_settled:
+        _write(settings, {"model": "sonnet"})
+        default_model_guard.settle_default_model(settings, state_dir=state)
 
-    sonnet.cancel()  # already settled while haiku keeps the record: a no-op
-    haiku.cancel()
+    sonnet.cancel()
     _write(settings, {"model": "haiku"})
 
+    assert not default_model_guard.settle_default_model(settings, state_dir=state)
+    assert _read(settings) == {"model": "opus"}
+
+    haiku.cancel()
+    _write(settings, {"model": "haiku"})
     assert not default_model_guard.settle_default_model(settings, state_dir=state)
     assert _read(settings) == {"model": "haiku"}
 

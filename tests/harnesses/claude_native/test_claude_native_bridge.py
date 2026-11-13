@@ -7240,7 +7240,6 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
-    monkeypatch.setattr(default_model_guard, "_ensure_watcher", lambda *_args: None)
 
     if outcome == "submitted":
         claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
