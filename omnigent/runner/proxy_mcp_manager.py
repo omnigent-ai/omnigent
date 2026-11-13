@@ -22,10 +22,11 @@ When to use each implementation:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from time import monotonic
 from typing import cast
@@ -35,6 +36,7 @@ import httpx
 from omnigent.debug_logging import debug_event
 from omnigent.runner import pending_approvals
 from omnigent.runner.mcp_execution_registry import (
+    MCP_INITIAL_STEP,
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     McpExecutionRegistry,
@@ -48,6 +50,7 @@ _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
 _SERVER_RECONNECT_WAIT_S = 120.0
+_SERVER_REPLY_GRACE_S = 30.0
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -55,6 +58,47 @@ def _json_object(value: object) -> _JsonObject | None:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         return None
     return cast("_JsonObject", value)
+
+
+async def _reply_unless_server_replaced(
+    request: Awaitable[httpx.Response],
+    after_generation: int,
+    runner_holds_final_result: Callable[[], Awaitable[bool]],
+) -> httpx.Response | None:
+    """
+    Await a proxy reply, or return ``None`` if it is still missing after a reconnect.
+
+    A front door can hold the old server's request open across a restart, so the
+    reconnect alone never ends it. Only a request the runner can answer from its
+    own final result is re-issued, after a grace period for a surviving server.
+
+    :param request: The pending proxy POST.
+    :param after_generation: Server generation the request was sent to.
+    :param runner_holds_final_result: Waits for the runner's execution of this
+        request and returns whether it produced the final tool result.
+    :returns: The reply, or ``None`` when the caller should re-issue the request.
+    """
+
+    async def _reconnected_without_reply() -> bool:
+        await pending_approvals.wait_for_server_reconnect(
+            after_generation, timeout_seconds=MCP_PROXY_CALL_TIMEOUT_S
+        )
+        if not await runner_holds_final_result():
+            return False
+        await asyncio.sleep(_SERVER_REPLY_GRACE_S)
+        return True
+
+    reply = asyncio.ensure_future(request)
+    replaced = asyncio.ensure_future(_reconnected_without_reply())
+    try:
+        await asyncio.wait({reply, replaced}, return_when=asyncio.FIRST_COMPLETED)
+        if reply.done() or replaced.exception() is not None or not replaced.result():
+            return await reply
+        return None
+    finally:
+        reply.cancel()
+        replaced.cancel()
+        await asyncio.gather(reply, replaced, return_exceptions=True)
 
 
 def _response_json_object(response: httpx.Response) -> _JsonObject:
@@ -306,6 +350,23 @@ class ProxyMcpManager:
 
         return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures={})
 
+    async def _runner_holds_final_result(self, operation_id: str) -> bool:
+        """Wait for this runner's execution of a call; return whether it finished the tool.
+
+        A call the server executes itself, or one awaiting external input, has
+        no final runner result and stays with the server handling it.
+        """
+        registry = self._execution_registry
+        if registry is None:
+            return False
+        retained = await registry.wait_for_step_result(
+            self._session_id, operation_id, MCP_INITIAL_STEP
+        )
+        if retained is None:
+            return False
+        result = _json_object(retained.content.get("result"))
+        return result is None or "input_required" not in result
+
     async def call_tool(
         self,
         spec: AgentSpec | None,
@@ -468,7 +529,7 @@ class ProxyMcpManager:
             failure_phase = "transport"
             resp: httpx.Response | None = None
             try:
-                resp = await self._omnigent_client.post(
+                request = self._omnigent_client.post(
                     url,
                     json=payload,
                     headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
@@ -483,6 +544,26 @@ class ProxyMcpManager:
                         pool=10.0,
                     ),
                 )
+                # An approved retry carries approval state only its issuing server holds.
+                if managed or self._execution_registry is None or approval_retries:
+                    resp = await request
+                else:
+                    resp = await _reply_unless_server_replaced(
+                        request,
+                        request_generation,
+                        lambda: self._runner_holds_final_result(operation_id),
+                    )
+                    if resp is None:
+                        _record_failure(
+                            None,
+                            phase=failure_phase,
+                            request_generation=request_generation,
+                            started=started,
+                            reattach_trigger="server_reconnect",
+                        )
+                        request_id += 1
+                        payload = cast("_JsonObject", {**payload, "id": request_id})
+                        continue
                 failure_phase = "http_status"
                 resp.raise_for_status()
                 failure_phase = "response_decode"

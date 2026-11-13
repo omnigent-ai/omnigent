@@ -27,6 +27,7 @@ _MAX_COMPLETED = 1024
 MCP_OPERATION_ID_PARAM = "_omnigent_operation_id"
 RUNNER_MCP_EXECUTION_DETACHED_CODE = -32098
 RUNNER_MCP_EXECUTION_DETACHED_MESSAGE = "Runner MCP execution detached."
+MCP_INITIAL_STEP = "initial"
 
 
 class McpExecutionConflict(RuntimeError):
@@ -135,6 +136,19 @@ class McpExecutionRegistry:
         # The surrounding ASGI dispatch belongs to one tunnel generation.
         # Its cancellation must not propagate into the external operation.
         return await asyncio.shield(entry.task)
+
+    async def wait_for_step_result(
+        self, session_id: str, operation_id: str, step: str
+    ) -> McpExecutionResult | None:
+        """Wait for a retained step to finish; ``None`` when it is absent or failed."""
+        self._prune()
+        entry = self._entries.get((session_id, operation_id, step))
+        if entry is None:
+            return None
+        await asyncio.wait({entry.task})
+        if entry.task.cancelled() or entry.task.exception() is not None:
+            return None
+        return entry.task.result()
 
     async def cancel_session(self, session_id: str) -> None:
         """Cancel and forget retained operations for a deleted session."""
