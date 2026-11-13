@@ -14,8 +14,9 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, PanelRightCloseIcon, PanelRightIcon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
-import { SideChatSettings } from "@/components/chat/SideChatSettings";
+import { COMPOSER_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
 import { ComposerPermissionPicker } from "@/components/composer/ComposerControls";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { HostBadge } from "@/components/HostBadge";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
@@ -35,7 +36,16 @@ import {
 import { terminalTabKey, useDeleteTerminal } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
 import { supportsBrowser } from "@/lib/nativeBridge";
-import { isNativeWrapper, nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
+import {
+  isNativeWrapper,
+  nativeCodingAgentForHarness,
+  nativeCodingAgentForSubagentWrapper,
+} from "@/lib/nativeCodingAgents";
+import {
+  compactModelTriggerLabel,
+  formatStatusEffortLabel,
+  formatStatusModelLabel,
+} from "@/lib/composerModelLabel";
 import { permissionChip, permissionChipKind } from "@/lib/permissionModeCycle";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import type { Session } from "@/lib/types";
@@ -482,7 +492,7 @@ export function GridSessionPane({
                         />
                       </>
                     ),
-                    trailing: session && <SideChatSettings session={session} fullSession />,
+                    trailing: session && <GridModelStatus session={session} />,
                   }}
                 />
               </RenderErrorBoundary>
@@ -651,5 +661,42 @@ function GridPermissionPicker({
           .finally(() => setBusy(false));
       }}
     />
+  );
+}
+
+/** The cell session's harness, model and effort, read-only; switch models full screen. */
+function GridModelStatus({ session }: { session: Session }) {
+  // Live state first: the snapshot misses picks made full screen or in the terminal.
+  const state = useConversationEntryState(session.id);
+  const harness = state.sessionHarness ?? session.harness ?? null;
+  const agent = nativeCodingAgentForHarness(harness);
+  const options = state.codexModelOptions.length
+    ? state.codexModelOptions
+    : (session.codexModelOptions ?? []);
+  const model =
+    state.llmModel ?? state.sessionModelOverride ?? session.llmModel ?? session.modelOverride;
+  const harnessLabel = agent?.displayName ?? session.agentName ?? "Session";
+  const modelLabel = formatStatusModelLabel(model ?? null, options);
+  const effortLabel = formatStatusEffortLabel(
+    state.sessionReasoningEffort ?? session.reasoningEffort ?? null,
+  );
+  const summary = [harnessLabel, modelLabel, effortLabel].filter(Boolean).join(" · ");
+  return (
+    <span
+      title={summary}
+      aria-label={summary}
+      data-testid="grid-model-status"
+      className="flex h-8 min-w-0 items-center gap-1 px-2 text-muted-foreground md:h-7"
+    >
+      <ComposerAgentIcon
+        agent={{
+          name: agent?.agentName ?? session.agentName ?? "",
+          harness: agent?.harness ?? harness,
+        }}
+      />
+      <span className={cn("min-w-0 truncate text-ui", COMPOSER_COLLAPSED_LABEL_CLASS)}>
+        {compactModelTriggerLabel(modelLabel ?? harnessLabel)}
+      </span>
+    </span>
   );
 }

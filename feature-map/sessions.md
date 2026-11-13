@@ -288,8 +288,8 @@ session, and drag another sidebar row over it. Hover **Split left/right/top/bott
 to preview, then drop. Split a remaining full-width or full-height pane again
 to reach three or four panes. Alternatively, use a row's menu or right-click
 menu → **Open in grid** and choose the pane and direction. Each pane has its own
-transcript and composer, whose action row shows the session's host, permission mode, and
-harness/model picker; terminal-capable sessions have a Chat/Terminal switch in
+transcript and composer, whose action row shows the session's host, permission mode,
+harness and model; terminal-capable sessions have a Chat/Terminal switch in
 each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
 only the active cell. Choices survive reloads and follow the session into full
 screen; drafts and terminal connections survive view changes. A managed session
