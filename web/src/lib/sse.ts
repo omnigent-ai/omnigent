@@ -55,6 +55,7 @@ import type {
   SessionTitleEvent,
   SessionCollaborationModeEvent,
   SessionPermissionModeEvent,
+  SessionBackgroundTasksEvent,
   SessionCodexApprovalModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
@@ -74,6 +75,7 @@ import type {
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
+import { fileEditRequestFromWire } from "./toolEditDiff";
 import { routingExtrasFromWire } from "./routingDecision";
 import type {
   AgyPermission,
@@ -568,6 +570,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           ? data.background_task_count
           : undefined;
       const backgroundTasks = parseBackgroundTasks(data.background_tasks);
+      const backgroundAgents =
+        status === "waiting" ? parseBackgroundTasks(data.background_agents) : undefined;
       const rawError = data.error;
       // Parse via parseErrorInfo so a classified failure's optional
       // title/cause/remediation flow through, but keep the guard that both
@@ -590,6 +594,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         responseId,
         backgroundTaskCount,
         ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
+        ...(backgroundAgents !== undefined ? { backgroundAgents } : {}),
         ...(blockedOn !== undefined ? { blockedOn } : {}),
         ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
@@ -699,6 +704,24 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       permissionMode,
     } satisfies SessionPermissionModeEvent;
+  }
+  if (eventType === "session.background_tasks") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const backgroundTaskCount = data.background_task_count;
+    if (
+      typeof backgroundTaskCount !== "number" ||
+      !Number.isInteger(backgroundTaskCount) ||
+      backgroundTaskCount < 0
+    ) {
+      return null;
+    }
+    return {
+      type: "session_background_tasks",
+      conversationId,
+      backgroundTaskCount,
+      backgroundTasks: parseBackgroundTasks(data.background_tasks) ?? [],
+    } satisfies SessionBackgroundTasksEvent;
   }
   if (eventType === "session.codex_approval_mode") {
     const conversationId = data.conversation_id;
@@ -882,7 +905,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       type: "session_superseded",
       conversationId,
       targetConversationId,
-      reason: "clear",
+      reason: data.reason === "rewind" ? "rewind" : "clear",
     } satisfies SessionSupersededEvent;
   }
   if (eventType === "session.btw_sidechat") {
@@ -1108,6 +1131,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       ...(p.native_delivery
         ? { nativeDelivery: parseNativePermissionDelivery(p.native_delivery) }
         : {}),
+      ...(p.is_blocking === false ? { isBlocking: false as const } : {}),
       elicitationId,
       targetSessionId:
         typeof targetSessionId === "string" && targetSessionId ? targetSessionId : null,
@@ -1131,6 +1155,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         exitPlanModeRaw && typeof exitPlanModeRaw === "object" && !Array.isArray(exitPlanModeRaw)
           ? (exitPlanModeRaw as Record<string, unknown>)
           : null,
+      fileEdit: fileEditRequestFromWire(p.file_edit),
       codexCommand:
         phase === "codex_command_approval" && typeof command === "string" && command
           ? {

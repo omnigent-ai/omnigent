@@ -388,12 +388,15 @@ _AGY_ENABLED_TOOLS = [
     "sys_os_shell",
     "sys_os_write",
     "sys_policy_registry",
+    "sys_project_list",
+    "sys_project_update",
     "sys_session_close",
     "sys_session_create",
     "sys_session_get_history",
     "sys_session_get_info",
     "sys_session_list",
     "sys_session_send",
+    "sys_session_update",
     "sys_terminal_close",
     "sys_terminal_launch",
     "sys_terminal_list",
@@ -1402,50 +1405,17 @@ def _paste_payload_bytes(text: str) -> bytes:
 
 
 def _submit_needles(content: str) -> list[str]:
-    """
-    Stable substrings confirming the paste rendered in the pane.
-
-    Returns stable needle substrings (up to 24 chars each, deduplicated) from
-    the start, end, and across the content. The composer viewport can scroll a
-    long message so its first line is no longer visible (in which case the
-    trailing needles match), or vice versa. Empty when no substantial text exists.
-
-    :param content: Message content.
-    :returns: List of needle strings; possibly empty.
-    """
+    """Sample both ends of the draft so a scrolled composer can confirm a paste."""
     lines = [line.strip() for line in content.splitlines() if len(line.strip()) >= 4]
-    stripped = content.strip()
     if not lines:
+        stripped = content.strip()
         return [stripped[:24]] if len(stripped) >= 4 else []
-
-    needles: list[str] = [lines[0][:24]]
-
-    if len(lines[0]) >= 30:
-        tail = lines[0][-24:].strip()
-        if len(tail) >= 4 and tail not in needles:
-            needles.append(tail)
-
-    if len(lines) > 1:
-        last_head = lines[-1][:24].strip()
-        if len(last_head) >= 4 and last_head not in needles:
-            needles.append(last_head)
-        if len(lines[-1]) >= 30:
-            last_tail = lines[-1][-24:].strip()
-            if len(last_tail) >= 4 and last_tail not in needles:
-                needles.append(last_tail)
-
-    if len(stripped) >= 30:
-        overall_tail = stripped[-24:].strip()
-        if len(overall_tail) >= 4 and overall_tail not in needles:
-            needles.append(overall_tail)
-
-    if len(stripped) > 120:
-        step = max(80, len(stripped) // 5)
-        for offset in range(step, len(stripped) - 30, step):
-            chunk = stripped[offset : offset + 24].strip()
-            if len(chunk) >= 12 and chunk not in needles:
-                needles.append(chunk)
-
+    needles: list[str] = []
+    for line in (lines[0], lines[-1]):
+        for sample in (line[:24], line[-24:]):
+            sample = sample.strip()
+            if len(sample) >= 4 and sample not in needles:
+                needles.append(sample)
     return needles
 
 
@@ -1503,20 +1473,15 @@ def _agy_input_region(pane: str) -> str:
     lines = pane.splitlines()
     separator_indexes = [index for index, line in enumerate(lines) if _agy_separator_line(line)]
     if len(separator_indexes) >= 2:
-        for i in range(len(separator_indexes) - 2, -1, -1):
-            start = separator_indexes[i] + 1
-            end = separator_indexes[i + 1]
-            region_lines = lines[start:end]
-            if any(line.strip().startswith(">") for line in region_lines):
-                return "\n".join(region_lines)
-
-        for i in range(len(separator_indexes) - 2, -1, -1):
-            start = separator_indexes[i] + 1
-            end = separator_indexes[i + 1]
-            region_lines = lines[start:end]
-            if not any("●" in line or "running" in line for line in region_lines):
-                return "\n".join(region_lines)
-
+        for index in range(len(separator_indexes) - 2, -1, -1):
+            start = separator_indexes[index] + 1
+            end = separator_indexes[index + 1]
+            candidate = lines[start:end]
+            if any(
+                line.strip().startswith(">") or _AGY_PASTE_PLACEHOLDER_RE.search(line)
+                for line in candidate
+            ):
+                return "\n".join(candidate)
         start = separator_indexes[-2] + 1
         end = separator_indexes[-1]
         return "\n".join(lines[start:end])

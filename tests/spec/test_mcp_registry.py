@@ -75,7 +75,7 @@ async def test_runner_does_not_start_a_local_transport_for_catalog_services(tmp_
 
 def test_registry_selection_is_isolated_and_preserves_authored_restrictions(tmp_path):
     from omnigent.mcp_selection import registry_selection_labels, selected_mcp_spec
-    from omnigent.server.mcp_compatibility import registry_services
+    from omnigent.server.runtime_compatibility import registry_services
     from omnigent.spec.types import AgentSpec, MCPServerConfig
 
     source = registry_spec(tmp_path)

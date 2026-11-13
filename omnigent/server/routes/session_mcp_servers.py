@@ -23,7 +23,13 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import MCP_SELECTION_PREFIX, selected_mcp_spec
 from omnigent.runtime import session_stream
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider, local_single_user_enabled
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    AuthProvider,
+    local_single_user_enabled,
+)
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import (
     get_user_id,
@@ -32,8 +38,11 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
+    LiveMCPServerStatus,
     MCPServerSummary,
+    ReconnectLiveMCPServerRequest,
     SessionAgentChangedEvent,
+    SessionLiveMCPServers,
     UpsertMCPServerRequest,
 )
 from omnigent.spec import AgentSpec, extract_safe
@@ -47,6 +56,14 @@ if TYPE_CHECKING:
     from omnigent.runner.routing import RunnerRouter
 
 _logger = logging.getLogger(__name__)
+
+# Above the runner's own forwarding budgets (15 s status, 60 s reconnect).
+_LIVE_MCP_STATUS_TIMEOUT_S = 20.0
+_LIVE_MCP_RECONNECT_TIMEOUT_S = 70.0
+_HARNESS_NOT_RUNNING_MESSAGE = (
+    "This session's agent isn't running yet. Send a message to start it, then reconnect."
+)
+_HARNESS_BUSY_MESSAGE = "The session's agent did not answer in time. Try again in a moment."
 
 
 @dataclass(frozen=True)
@@ -165,6 +182,113 @@ def create_session_mcp_servers_router(
                 for server in selected_mcp_spec(loaded.spec, conv.labels).mcp_servers
             ],
         }
+
+    async def _authorize(request: Request, session_id: str, required_level: int) -> None:
+        user_id = get_user_id(request, auth_provider)
+        await require_access(
+            user_id,
+            session_id,
+            required_level,
+            permission_store,
+            conversation_store,
+        )
+
+    @router.get("/sessions/{session_id}/live-mcp-servers")
+    async def get_live_mcp_servers(request: Request, session_id: str) -> SessionLiveMCPServers:
+        """Report the MCP connections the session's running harness holds.
+
+        Never starts a harness; a session whose harness has not started yet
+        answers ``live: false`` with ``reason: "not_running"``.
+        """
+        await _authorize(request, session_id, LEVEL_READ)
+        try:
+            response = await _live_mcp_runner_request(
+                runner_router,
+                session_id,
+                "GET",
+                "live-mcp-servers",
+                timeout=_LIVE_MCP_STATUS_TIMEOUT_S,
+            )
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.WRONG_REPLICA:
+                raise  # The client re-addresses the request to the runner's replica.
+            return SessionLiveMCPServers(live=False, reason="unavailable", detail=exc.message)
+        except httpx.TimeoutException:
+            return SessionLiveMCPServers(
+                live=False, reason="unavailable", detail=_HARNESS_BUSY_MESSAGE
+            )
+        # A closed host tunnel raises the built-in ConnectionError, not an httpx error.
+        except (httpx.HTTPError, ConnectionError):
+            _logger.warning(
+                "live MCP status read failed for session=%s", session_id, exc_info=True
+            )
+            return SessionLiveMCPServers(
+                live=False, reason="unavailable", detail="Could not reach the session's host."
+            )
+        if response is None:
+            return SessionLiveMCPServers(live=False, reason="not_running")
+        if response.status_code == status.HTTP_404_NOT_FOUND:
+            # The harness cannot report MCP status, or the runner predates this route.
+            return SessionLiveMCPServers(live=False, reason="unsupported")
+        if response.status_code == status.HTTP_504_GATEWAY_TIMEOUT:
+            return SessionLiveMCPServers(
+                live=False, reason="unavailable", detail=_HARNESS_BUSY_MESSAGE
+            )
+        if response.is_error:
+            return SessionLiveMCPServers(
+                live=False,
+                reason="unavailable",
+                detail=_runner_error_detail(response) or "The session's agent could not report.",
+            )
+        return _live_mcp_servers_from_runner(response)
+
+    @router.post("/sessions/{session_id}/live-mcp-servers/reconnect")
+    async def reconnect_live_mcp_server(
+        request: Request,
+        session_id: str,
+        body: ReconnectLiveMCPServerRequest,
+    ) -> SessionLiveMCPServers:
+        """Reconnect one MCP server in the session's running harness.
+
+        A refused reconnect still answers 200, with the harness's reason in
+        ``reconnect_error`` and the connections as they stand.
+        """
+        await _authorize(request, session_id, LEVEL_EDIT)
+        add_audit_attrs(server_name=body.name)
+        try:
+            response = await _live_mcp_runner_request(
+                runner_router,
+                session_id,
+                "POST",
+                "live-mcp-servers/reconnect",
+                json={"name": body.name},
+                timeout=_LIVE_MCP_RECONNECT_TIMEOUT_S,
+            )
+        except httpx.TimeoutException as exc:
+            raise OmnigentError(_HARNESS_BUSY_MESSAGE, code=ErrorCode.RUNNER_UNAVAILABLE) from exc
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise OmnigentError(
+                "Could not reach the session's host.", code=ErrorCode.RUNNER_UNAVAILABLE
+            ) from exc
+        if response is None or response.status_code == status.HTTP_409_CONFLICT:
+            raise OmnigentError(_HARNESS_NOT_RUNNING_MESSAGE, code=ErrorCode.CONFLICT)
+        if response.status_code == status.HTTP_404_NOT_FOUND:
+            if _runner_error_code(response) == "mcp_server_unknown":
+                raise OmnigentError(
+                    f"This session's agent has no MCP server named {body.name!r}.",
+                    code=ErrorCode.NOT_FOUND,
+                )
+            raise OmnigentError(
+                "This session's agent can't reconnect MCP servers.", code=ErrorCode.NOT_FOUND
+            )
+        if response.status_code == status.HTTP_504_GATEWAY_TIMEOUT:
+            raise OmnigentError(_HARNESS_BUSY_MESSAGE, code=ErrorCode.RUNNER_UNAVAILABLE)
+        if response.is_error:
+            raise OmnigentError(
+                _runner_error_detail(response) or "The session's agent could not reconnect.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        return _live_mcp_servers_from_runner(response)
 
     @router.post("/sessions/{session_id}/agent/mcp-servers")
     async def create_mcp_server(
@@ -318,7 +442,7 @@ def create_session_mcp_servers_router(
 
     async def _require_registry_runtime(request: Request, session_id: str, service: str) -> None:
         from omnigent.runner.routing import routing_host_id
-        from omnigent.server.mcp_compatibility import require_registry_mcp_runtime
+        from omnigent.server.runtime_compatibility import require_runtime_support
 
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
@@ -328,7 +452,7 @@ def create_session_mcp_servers_router(
                 "Named sub-agents use their authored MCP services",
                 code=ErrorCode.INVALID_INPUT,
             )
-        require_registry_mcp_runtime(
+        require_runtime_support(
             [service],
             host_id=await asyncio.to_thread(routing_host_id, conv, conversation_store),
             runner_id=conv.runner_id,
@@ -349,6 +473,18 @@ def create_session_mcp_servers_router(
             raise OmnigentError(
                 "Built-in agents are read-only through this endpoint.",
                 code=ErrorCode.INVALID_INPUT,
+            )
+        # A session-scoped agent row can be bound into several sessions, so
+        # editing it through a session that does not own the row needs EDIT on
+        # the owning session; READ there must not be enough to rewrite another
+        # user's private agent.
+        if agent.session_id != session_id:
+            await require_access(
+                get_user_id(request, auth_provider),
+                agent.session_id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
             )
         if artifact_store is None or agent_cache is None:
             raise OmnigentError(
@@ -471,7 +607,7 @@ async def _reset_runner_session_agent_cache(
     if runner_router is None:
         return
     try:
-        routed = runner_router.client_for_session_resources(session_id)
+        routed = await asyncio.to_thread(runner_router.client_for_session_control, session_id)
     except (LookupError, httpx.HTTPError, OmnigentError):
         # The session may not be runner-bound yet. Persisting the bundle is
         # still correct; the next runner bind resolves the updated spec.
@@ -491,6 +627,77 @@ async def _reset_runner_session_agent_cache(
             agent_id,
             exc_info=True,
         )
+
+
+async def _live_mcp_runner_request(
+    runner_router: RunnerRouter | None,
+    session_id: str,
+    method: Literal["GET", "POST"],
+    path: str,
+    *,
+    timeout: float,
+    json: dict[str, Any] | None = None,
+) -> httpx.Response | None:
+    """Send a live-MCP request to the session's runner; ``None`` when no runner holds it.
+
+    :raises OmnigentError: The session's runner is offline.
+    """
+    if runner_router is None:
+        return None
+    routed = await asyncio.to_thread(runner_router.client_for_existing_conversation, session_id)
+    if routed is None:
+        return None
+    return await routed.client.request(
+        method,
+        f"/v1/sessions/{quote(session_id, safe='')}/{path}",
+        json=json,
+        timeout=timeout,
+    )
+
+
+def _runner_error_payload(response: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _runner_error_code(response: httpx.Response) -> str | None:
+    code = _runner_error_payload(response).get("error")
+    return code if isinstance(code, str) else None
+
+
+def _runner_error_detail(response: httpx.Response) -> str | None:
+    detail = _runner_error_payload(response).get("detail")
+    return detail if isinstance(detail, str) and detail.strip() else None
+
+
+def _live_mcp_servers_from_runner(response: httpx.Response) -> SessionLiveMCPServers:
+    """Translate the runner's ``{running, servers, status_unavailable?, reconnect_error?}``."""
+    payload = _runner_error_payload(response)
+    reconnect_error = payload.get("reconnect_error")
+    reconnect_error = reconnect_error if isinstance(reconnect_error, str) else None
+    if payload.get("running") is not True:
+        return SessionLiveMCPServers(
+            live=False, reason="not_running", reconnect_error=reconnect_error
+        )
+    if payload.get("status_unavailable") is True:
+        return SessionLiveMCPServers(
+            live=False,
+            reason="unavailable",
+            detail="The session's agent could not report its MCP connections.",
+            reconnect_error=reconnect_error,
+        )
+    servers: list[LiveMCPServerStatus] = []
+    for entry in payload.get("servers") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            servers.append(LiveMCPServerStatus.model_validate(entry))
+        except ValueError:
+            _logger.debug("skipping malformed live MCP entry %r", entry)
+    return SessionLiveMCPServers(live=True, servers=servers, reconnect_error=reconnect_error)
 
 
 def _publish_agent_changed(session_id: str, agent: Agent) -> None:

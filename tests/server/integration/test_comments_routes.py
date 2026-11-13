@@ -266,6 +266,17 @@ async def test_read_only_user_cannot_mutate_comments(
     assert len(listed) == 1, (
         f"Bob should see Alice's comment in the listing, got {len(listed)} comments."
     )
+    page = await auth_client.get(
+        f"/v1/sessions/{session_id}/comments?include_pr_comments=true",
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert page.status_code == 200
+    assert page.json() == {"comments": listed, "next_cursor": None}
+    denied = await auth_client.get(
+        f"/v1/sessions/{session_id}/comments?include_pr_comments=true",
+        headers={"X-Forwarded-Email": "outsider@example.com"},
+    )
+    assert denied.status_code in (403, 404)
 
 
 async def _add_comment(

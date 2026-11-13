@@ -30,7 +30,6 @@ import {
   useRef,
   useState,
   type ReactNode,
-  type RefObject,
 } from "react";
 import {
   AlertTriangleIcon,
@@ -55,6 +54,7 @@ import {
   PencilLineIcon,
   RowsIcon,
   SearchIcon,
+  Share2Icon,
   SquareArrowOutUpRightIcon,
   Trash2Icon,
   WrapTextIcon,
@@ -79,6 +79,15 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  ALT_KEY,
+  ARROW_LEFT_KEY,
+  ARROW_RIGHT_KEY,
+  CompactShortcutKeys,
+  ESC_KEY,
+  KeyboardShortcutTooltip,
+  MOD_KEY,
+} from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { isVideoFile } from "@/lib/video";
@@ -94,12 +103,15 @@ import {
 import { CommentSenderProvider, useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useChatStore } from "@/store/chatStore";
+import { useFileMentionHarnesses } from "@/lib/agentLabels";
+import { harnessSupportsFileMentions } from "@/lib/composerMentions";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
+import { isFileComment } from "@/lib/localReviewComments";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
@@ -111,7 +123,10 @@ import {
   detectLang,
   isBinaryPath,
   isImageFile,
+  isMarkdownTooLargeForPreview,
   isMarkdownTooLargeForRichView,
+  type PreviewableViewMode,
+  resolveFileViewMode,
   isModelFile,
   isNotebookPath,
   isPdfFile,
@@ -334,6 +349,9 @@ interface FileViewerProps {
 
   /** Called when the user navigates to a different file via the prev/next buttons. */
   onNavigateTo?: (path: string) => void;
+  /** Opens session sharing with a fullscreen link to this file. */
+  onShare?: () => void;
+  shareDisabledReason?: string;
   /**
    * Numeric permission level for the current user on this session
    * (1 = read, 2 = edit, 3 = manage, 4 = owner). ``null`` means
@@ -352,7 +370,6 @@ interface FileViewerProps {
   viewport?: "desktop" | "mobile";
   /** Called after confirming unsaved edits when closing the active file tab. */
   onCloseTab?: () => void;
-  closeTabRef?: RefObject<(() => void) | null>;
   /** Called when the comments panel opens or closes inside the viewer. */
   onCommentsOpenChange?: (open: boolean) => void;
   /**
@@ -394,8 +411,9 @@ function FileViewerBody({
   path,
   onClose,
   onCloseTab,
-  closeTabRef,
   onNavigateTo,
+  onShare,
+  shareDisabledReason,
   permissionLevel,
   frameless,
   mobileOverlay = false,
@@ -406,6 +424,10 @@ function FileViewerBody({
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
   const canEdit = permissionLevel == null || permissionLevel >= 2;
+  // Same gate as the composer's "@"-mention menu, so "Attach to agent" only
+  // shows when the session's agent will open the attached path.
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const attachToAgent = harnessSupportsFileMentions(sessionHarness, useFileMentionHarnesses());
   const [searchParams, setSearchParams] = useSearchParams();
   const rebasePath = useRebasePath();
   const isMobile = useIsMobileViewport();
@@ -470,6 +492,7 @@ function FileViewerBody({
       ? navigableFiles[currentNavIdx + 1]
       : null;
   const commentsQuery = useComments(conversationId, path);
+  const sessionCommentsQuery = useComments(conversationId);
   const addComment = useAddComment(conversationId);
   const updateComment = useUpdateComment(conversationId);
   const deleteComment = useDeleteComment(conversationId);
@@ -550,7 +573,7 @@ function FileViewerBody({
   // marked seen too.
   useEffect(() => {
     if (!open || !commentsOpen || commentsQuery.data === undefined) return;
-    markCommentsSeen(commentsQuery.data.map((c) => c.id));
+    markCommentsSeen(commentsQuery.data.filter(isFileComment).map((c) => c.id));
   }, [open, commentsOpen, commentsQuery.data]);
   // Notify parent when comments panel opens or closes (e.g. so the parent
   // can widen the inline panel to fit both the code viewer and comments).
@@ -638,7 +661,10 @@ function FileViewerBody({
 
   const sender = useOptionalCommentSender();
 
-  const allComments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data]);
+  const allComments = useMemo(
+    () => (commentsQuery.data ?? []).filter(isFileComment),
+    [commentsQuery.data],
+  );
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
   const [remapFormatted, setRemapFormatted] = useState<
     ((comment: Comment, content: string) => Comment) | null
@@ -667,6 +693,20 @@ function FileViewerBody({
     () => classifyAndRemapComments(allComments, fileContent, remapFormatted),
     [allComments, fileContent, remapFormatted],
   );
+  // Address All sends Files drafts across paths; this file's own query supplies its drafts.
+  // Until both lists load, a send would silently skip the unloaded list's drafts.
+  const { ids: addressableCommentIds, fileCount: addressableFileCount } = useMemo(() => {
+    if (!commentsQuery.data || !sessionCommentsQuery.data) return { ids: [], fileCount: 0 };
+    const ids = new Set(openComments.map((c) => c.id));
+    const paths = new Set(openComments.length > 0 ? [path] : []);
+    for (const c of sessionCommentsQuery.data) {
+      if (isFileComment(c) && c.status === "draft" && c.path !== path) {
+        ids.add(c.id);
+        paths.add(c.path);
+      }
+    }
+    return { ids: [...ids], fileCount: paths.size };
+  }, [openComments, commentsQuery.data, sessionCommentsQuery.data, path]);
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {
     // Comment navigation supersedes a citation, including clicks outside the editor.
@@ -746,15 +786,6 @@ function FileViewerBody({
     return () => window.removeEventListener("keydown", handler);
   }, [syncUrl, open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
 
-  useLayoutEffect(() => {
-    if (!open || !onCloseTab || !closeTabRef) return;
-    const close = () => guardDirty(onCloseTab);
-    closeTabRef.current = close;
-    return () => {
-      if (closeTabRef.current === close) closeTabRef.current = null;
-    };
-  }, [open, onCloseTab, closeTabRef, guardDirty]);
-
   // Escape closes the active file tab (when search is not open).
   useEffect(() => {
     if (!open || !onCloseTab) return;
@@ -783,10 +814,19 @@ function FileViewerBody({
     conversationId: string;
     path: string;
     source: boolean | undefined;
-  }>({ conversationId, path, source: undefined });
+    noPreview: boolean;
+  }>({ conversationId, path, source: undefined, noPreview: false });
+  // Large Markdown has no rich editor, so its Preview/Edit choice lasts only for
+  // this file visit; persisting it would change how every small file opens.
+  const [largeMarkdownMode, setLargeMarkdownMode] = useState<{
+    conversationId: string;
+    path: string;
+    mode: "preview" | "source";
+  } | null>(null);
   // Choose once per file visit so an autosave crossing the limit cannot
   // replace the editor while it contains newer unsaved edits.
   let markdownSourceFallback = markdownRouting.source;
+  let markdownPreviewFallback = markdownRouting.noPreview;
   if (
     markdownRouting.conversationId !== conversationId ||
     markdownRouting.path !== path ||
@@ -795,10 +835,23 @@ function FileViewerBody({
     markdownSourceFallback = fileQuery.data
       ? isMarkdownTooLargeForRichView(lang, fileContent)
       : undefined;
-    setMarkdownRouting({ conversationId, path, source: markdownSourceFallback });
+    markdownPreviewFallback =
+      !!fileQuery.data &&
+      lang === "markdown" &&
+      (!!fileQuery.data.truncated || isMarkdownTooLargeForPreview(lang, fileContent));
+    setMarkdownRouting({
+      conversationId,
+      path,
+      source: markdownSourceFallback,
+      noPreview: markdownPreviewFallback,
+    });
+    // Reset the per-visit Preview/Edit choice when the file changes.
+    if (markdownRouting.conversationId !== conversationId || markdownRouting.path !== path) {
+      setLargeMarkdownMode(null);
+    }
   }
   const isPreviewable =
-    (lang === "markdown" && !markdownSourceFallback) || lang === "html" || isNotebookPath(path);
+    (lang === "markdown" && !markdownPreviewFallback) || lang === "html" || isNotebookPath(path);
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -892,8 +945,12 @@ function FileViewerBody({
   // directly (mirrors the toolbar's switchTo for the non-editor case).
   const handleRequestEditMode = useCallback(() => {
     setDeepLinkBiasPath(null);
-    setPreviewableViewMode("editor");
-  }, []);
+    if (markdownSourceFallback) {
+      setLargeMarkdownMode({ conversationId, path, mode: "source" });
+    } else {
+      setPreviewableViewMode("editor");
+    }
+  }, [markdownSourceFallback, conversationId, path]);
 
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded — it's contextual (per-open), not a sticky
@@ -912,15 +969,18 @@ function FileViewerBody({
   // falls back to the rendered preview; "preview" / "source" pass through. The shared
   // preference still carries across file types — opening markdown in source
   // then switching to an HTML file keeps you in source, etc.
-  const fileViewMode: "editor" | "preview" | "source" = isPreviewable
-    ? lang === "markdown"
-      ? deepLinkBiasPath === path
-        ? "editor"
-        : previewableViewMode
-      : previewableViewMode === "editor"
-        ? "preview"
-        : previewableViewMode
-    : "source";
+  const largeMarkdownVisitMode =
+    largeMarkdownMode?.conversationId === conversationId && largeMarkdownMode.path === path
+      ? largeMarkdownMode.mode
+      : undefined;
+  const fileViewMode = resolveFileViewMode({
+    isPreviewable,
+    lang,
+    largeMarkdown: markdownSourceFallback ?? false,
+    largeMarkdownVisitMode,
+    deepLinkedComment: deepLinkBiasPath === path,
+    preference: previewableViewMode,
+  });
   // Local state triggers rendering; the WeakSet preserves dismissal across remounts.
   const [dismissedPosition, setDismissedPosition] = useState<FilePosition>();
   const [appliedNavigation, setAppliedNavigation] = useState({ conversationId, path, position });
@@ -937,6 +997,14 @@ function FileViewerBody({
   const viewMode: "editor" | "preview" | "source" | "diff" =
     effectiveDiffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
   const diffViewActive = viewMode === "diff";
+  // A citation opens large Markdown in editable source; keep source for the visit
+  // so clearing the citation cannot drop unsaved edits by returning to Preview.
+  const citedLargeMarkdownSource = viewMode === "source" && fileViewMode === "preview";
+  useEffect(() => {
+    if (citedLargeMarkdownSource && markdownSourceFallback) {
+      setLargeMarkdownMode({ conversationId, path, mode: "source" });
+    }
+  }, [citedLargeMarkdownSource, markdownSourceFallback, conversationId, path]);
 
   const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
   useLayoutEffect(() => {
@@ -1012,11 +1080,15 @@ function FileViewerBody({
   // file makes it active) and flipped by clicks / focus moves. When the user
   // works in the chat/composer, Cmd+F falls through to the browser's find.
   const viewerIsActiveSurfaceRef = useRef(true);
+  // Mirrors the ref for rendering, which marks the viewer as owning Escape.
+  const [viewerIsActiveSurface, setViewerIsActiveSurface] = useState(true);
   useEffect(() => {
     // Opening the viewer (or switching files within it) makes it the active
     // surface again. Keyed on `open` too, so reopening the same path after the
     // user had clicked into the chat re-seeds the ref instead of staying stale.
-    if (open) viewerIsActiveSurfaceRef.current = true;
+    if (!open) return;
+    viewerIsActiveSurfaceRef.current = true;
+    setViewerIsActiveSurface(true);
   }, [open, path]);
   useEffect(() => {
     if (!open) return;
@@ -1025,6 +1097,7 @@ function FileViewerBody({
       const target = e.target;
       if (root !== null && target instanceof Node) {
         viewerIsActiveSurfaceRef.current = root.contains(target);
+        setViewerIsActiveSurface(viewerIsActiveSurfaceRef.current);
       }
     };
     window.addEventListener("mousedown", track, true);
@@ -1142,6 +1215,8 @@ function FileViewerBody({
     /** Suppress the active check mark — for toggles whose icon already reflects
      * state (e.g. the whitespace eye flips open/closed). */
     noActiveCheck?: boolean;
+    /** Chord shown beside the item; omit when the viewer surface doesn't bind it. */
+    shortcut?: readonly string[];
   }
   interface ToolbarAction {
     key: string;
@@ -1154,6 +1229,8 @@ function FileViewerBody({
     icon: ReactNode;
     onSelect?: () => void;
     active?: boolean;
+    disabled?: boolean;
+    disabledLabel?: string;
     /** When set, render a picker (dropdown/submenu) over these mutually
      * exclusive choices instead of a single button. `onSelect` is ignored. */
     options?: ToolbarOption[];
@@ -1165,59 +1242,79 @@ function FileViewerBody({
     splitMenu?: boolean;
   }
   const toolbarActions: ToolbarAction[] = [];
-  if (lang === "markdown" && !markdownSourceFallback && viewMode !== "diff") {
-    // Markdown is a segmented control over three reachable modes: the rich-text
-    // Editor (default), the rendered Preview, and raw Source. Switching away
-    // from the editor must guard unsaved edits; the read-only preview/source
-    // surfaces carry no edits, so they switch freely.
-    const switchTo = (mode: "preview" | "editor" | "source") => {
-      // No-op when already on this surface — re-selecting the active tab must
-      // not run the dirty guard (which would pop a discard dialog for nothing).
+  if (lang === "markdown" && isPreviewable && viewMode !== "diff") {
+    // Markdown is a "view mode" picker over Preview, the rich-text Editor, and raw
+    // Source. Large Markdown has no rich editor: Edit opens editable source for
+    // this visit. Leaving the editable surface guards its unsaved edits.
+    const largeMarkdown = !!markdownSourceFallback;
+    const editableMode = largeMarkdown ? "source" : "editor";
+    const switchTo = (mode: PreviewableViewMode) => {
+      // Re-selecting the active mode must not pop a discard dialog for nothing.
       if (mode === viewMode) return;
-      // Clear the deep-link bias and set the absolute mode together, and only
-      // when the switch actually proceeds — so a guarded (dirty) switch the user
-      // cancels leaves both the bias and the editor intact.
+      // Apply only when the switch proceeds, so a cancelled guard keeps the bias and editor.
       const apply = () => {
         setDeepLinkBiasPath(null);
         dismissFilePosition(position);
         setDismissedPosition(position);
-        setPreviewableViewMode(mode);
+        if (largeMarkdown) {
+          setLargeMarkdownMode({
+            conversationId,
+            path,
+            mode: mode === "preview" ? "preview" : "source",
+          });
+        } else {
+          setPreviewableViewMode(mode);
+        }
       };
-      if (viewMode === "editor") {
+      if (viewMode === editableMode) {
         guardDirty(apply);
       } else {
         apply();
       }
     };
-    // One toolbar slot: a "view mode" picker rather than three side-by-side
-    // buttons (the toolbar is tight once nav/diff/comment actions are present).
-    // The trigger shows the current surface's icon so the active mode reads at
-    // a glance; the menu lets the user pick another.
+    const modeOption = (
+      key: string,
+      label: string,
+      tooltip: string,
+      icon: ReactNode,
+      mode: PreviewableViewMode,
+    ): ToolbarOption => ({
+      key,
+      label,
+      tooltip,
+      icon,
+      active: viewMode === mode,
+      onSelect: () => switchTo(mode),
+    });
+    const editIcon = <PencilLineIcon className="size-4" />;
     const modeOptions: ToolbarOption[] = [
-      {
-        key: "md-preview",
-        label: "Preview",
-        tooltip: "Rendered preview",
-        icon: <EyeIcon className="size-4" />,
-        active: viewMode === "preview",
-        onSelect: () => switchTo("preview"),
-      },
-      {
-        key: "md-edit",
-        label: "Edit",
-        tooltip: "Rich text editor",
-        icon: <PencilLineIcon className="size-4" />,
-        active: viewMode === "editor",
-        onSelect: () => switchTo("editor"),
-      },
-      {
-        key: "md-source",
-        label: "Source",
-        tooltip: "Raw Markdown source",
-        icon: <CodeIcon className="size-4" />,
-        active: viewMode === "source",
-        onSelect: () => switchTo("source"),
-      },
+      modeOption(
+        "md-preview",
+        "Preview",
+        "Rendered preview",
+        <EyeIcon className="size-4" />,
+        "preview",
+      ),
+      largeMarkdown
+        ? modeOption(
+            "md-edit",
+            "Edit",
+            "Edit Markdown source (too large for the rich text editor)",
+            editIcon,
+            "source",
+          )
+        : modeOption("md-edit", "Edit", "Rich text editor", editIcon, "editor"),
+      ...(largeMarkdown
+        ? []
+        : [
+            modeOption(
+              "md-source",
+              "Source",
+              "Raw Markdown source",
+              <CodeIcon className="size-4" />,
+              "source",
+            ),
+          ]),
     ];
     const activeMode = modeOptions.find((o) => o.active) ?? modeOptions[0];
     toolbarActions.push({
@@ -1316,6 +1413,8 @@ function FileViewerBody({
       icon: <SearchIcon className="size-4" />,
       active: false,
       onSelect: openSearch,
+      // Cmd+F only opens find on the Monaco and code surfaces (see isMonacoFindSurface).
+      shortcut: isMonacoFindSurface ? [MOD_KEY, "F"] : undefined,
     },
   ];
   if (revealTarget && !isDeletedFile) {
@@ -1380,6 +1479,19 @@ function FileViewerBody({
     ),
     onSelect: copyFileLink,
   });
+  if (onShare) {
+    toolbarActions.push({
+      key: "share-file",
+      label: "Share file",
+      tooltip: shareDisabledReason ?? "Share file",
+      disabledLabel: shareDisabledReason
+        ? `Share file disabled: ${shareDisabledReason}`
+        : undefined,
+      icon: <Share2Icon className="size-4" />,
+      disabled: !!shareDisabledReason,
+      onSelect: onShare,
+    });
+  }
   if (openInActions.length) {
     toolbarActions.push({
       key: "open-in",
@@ -1412,6 +1524,23 @@ function FileViewerBody({
       `path:${path}`,
     ].join("|"),
   );
+
+  const renderActionButton = (action: ToolbarAction, interactive: boolean) => {
+    const button = (
+      <Button
+        type="button"
+        variant={action.active ? "default" : "ghost"}
+        size="icon-sm"
+        aria-label={action.disabledLabel ?? action.label}
+        disabled={action.disabled}
+        tabIndex={interactive ? undefined : -1}
+        onClick={interactive ? action.onSelect : undefined}
+      >
+        {action.icon}
+      </Button>
+    );
+    return action.disabled ? <span className="inline-flex">{button}</span> : button;
+  };
 
   // The expanded inline row — rendered both offscreen (for measurement) and,
   // when it fits, as the visible toolbar. `interactive` is false for the
@@ -1459,6 +1588,9 @@ function FileViewerBody({
               >
                 {item.icon}
                 {item.label}
+                {item.shortcut && (
+                  <CompactShortcutKeys keys={item.shortcut} className="ml-auto pl-4" />
+                )}
                 {item.active && !item.noActiveCheck && <CheckIcon className="ml-auto size-4" />}
               </DropdownMenuItem>
             ))}
@@ -1505,18 +1637,7 @@ function FileViewerBody({
       ) : (
         <TooltipProvider key={action.key}>
           <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant={action.active ? "default" : "ghost"}
-                size="icon-sm"
-                aria-label={action.label}
-                tabIndex={interactive ? undefined : -1}
-                onClick={interactive ? action.onSelect : undefined}
-              >
-                {action.icon}
-              </Button>
-            </TooltipTrigger>
+            <TooltipTrigger asChild>{renderActionButton(action, interactive)}</TooltipTrigger>
             <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
           </Tooltip>
         </TooltipProvider>
@@ -1536,49 +1657,57 @@ function FileViewerBody({
               the back button would be a redundant "exit viewer" mode. */}
           {(!frameless || mobileOverlay) && (
             <div ref={toolbarBackRef} className="shrink-0">
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Close file viewer"
-                      onClick={() => guardDirty(onClose)}
-                    >
-                      <ArrowLeftIcon className="size-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Close</TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
+              {/* Esc runs onCloseTab unless Find is open; the hint applies only when the
+                  back button runs that same handler. */}
+              <KeyboardShortcutTooltip
+                label="Close"
+                keys={
+                  onCloseTab !== undefined && onClose === onCloseTab && !searchOpen
+                    ? [ESC_KEY]
+                    : undefined
+                }
+              >
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Close file viewer"
+                  onClick={() => guardDirty(onClose)}
+                >
+                  <ArrowLeftIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
             </div>
           )}
           {showNavButtons && (
             <div ref={toolbarNavRef} className="flex items-center gap-0.5 shrink-0">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label="Previous file"
-                disabled={!prevPath}
-                onClick={() => prevPath && guardDirty(() => onNavigateTo(prevPath))}
-              >
-                <ChevronLeftIcon className="size-4" />
-              </Button>
+              <KeyboardShortcutTooltip label="Previous file" keys={[ALT_KEY, ARROW_LEFT_KEY]}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Previous file"
+                  disabled={!prevPath}
+                  onClick={() => prevPath && guardDirty(() => onNavigateTo(prevPath))}
+                >
+                  <ChevronLeftIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
               <span className="text-[10px] text-muted-foreground tabular-nums">
                 {currentNavIdx + 1}/{navigableFiles.length}
               </span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label="Next file"
-                disabled={!nextPath}
-                onClick={() => nextPath && guardDirty(() => onNavigateTo(nextPath))}
-              >
-                <ChevronRightIcon className="size-4" />
-              </Button>
+              <KeyboardShortcutTooltip label="Next file" keys={[ALT_KEY, ARROW_RIGHT_KEY]}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Next file"
+                  disabled={!nextPath}
+                  onClick={() => nextPath && guardDirty(() => onNavigateTo(nextPath))}
+                >
+                  <ChevronRightIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
             </div>
           )}
           {/* Always show the file path/name in the toolbar, in every view. */}
@@ -1725,6 +1854,24 @@ function FileViewerBody({
                               )}
                             </DropdownMenuItem>
                           ))
+                        ) : action.disabled ? (
+                          <TooltipProvider key={action.key}>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="block">
+                                  <DropdownMenuItem
+                                    disabled
+                                    aria-label={action.disabledLabel ?? action.label}
+                                    className="whitespace-nowrap"
+                                  >
+                                    {action.icon}
+                                    {action.label}
+                                  </DropdownMenuItem>
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
                         ) : (
                           <DropdownMenuItem
                             key={action.key}
@@ -1851,6 +1998,7 @@ function FileViewerBody({
                     activeSelection={activeSelection}
                     onSetActiveSelection={handleSetActiveSelection}
                     pendingBodyRef={pendingBodyRef}
+                    attachToAgent={attachToAgent}
                     searchOpen={searchOpen}
                     searchFocusNonce={searchFocusNonce}
                     onSearchHandled={handleSearchHandled}
@@ -1883,6 +2031,7 @@ function FileViewerBody({
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
+              attachToAgent={attachToAgent}
             />
           )}
         </div>
@@ -1907,10 +2056,11 @@ function FileViewerBody({
               );
             }}
             canAddress={canEdit && sender !== null}
+            addressCount={addressableCommentIds.length}
+            addressFileCount={addressableFileCount}
             onAddressAll={() => {
-              if (!sender) return;
-              const ids = openComments.map((c) => c.id);
-              sender.mutate({ comment_ids: ids });
+              if (!sender || addressableCommentIds.length === 0) return;
+              sender.mutate({ comment_ids: addressableCommentIds });
             }}
             onClickComment={(comment) => {
               handleSetActiveSelection({
@@ -1992,11 +2142,16 @@ function FileViewerBody({
     </>
   );
 
+  // While the viewer is the surface last used, Escape closes its Find bar, or else its
+  // tab (see above), so page-wide Escape shortcuts leave it alone.
+  const ownsEscape = open && viewerIsActiveSurface && (searchOpen || onCloseTab !== undefined);
+
   if (frameless) {
     return (
       <div
         ref={setViewerRoot}
         data-testid="file-viewer"
+        data-escape-owner={ownsEscape ? "" : undefined}
         style={{ paddingBottom: keyboardInset || undefined }}
         className={cn(
           "flex flex-col flex-1 min-h-0 overflow-hidden bg-card",
@@ -2012,6 +2167,7 @@ function FileViewerBody({
     <aside
       ref={setFramedViewerRoot}
       data-testid="file-viewer"
+      data-escape-owner={ownsEscape ? "" : undefined}
       style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
         "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",

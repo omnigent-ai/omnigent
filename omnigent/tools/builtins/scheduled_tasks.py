@@ -103,13 +103,26 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Optional permission mode for native coding agents that "
                                 "support one. Use the selected harness's vocabulary: "
                                 "Claude Code (e.g. 'acceptEdits'), Codex ('default', "
-                                "'read-only', 'full-access', 'bypass'), "
+                                "'ask-for-approval', 'approve-for-me', 'read-only'), "
                                 "Cursor (e.g. 'auto-review'), "
                                 "Antigravity ('default', 'skip'), or Devin (e.g. 'smart'). "
+                                "Other harnesses, such as claude-sdk, have no automation "
+                                "permission modes. "
                                 "Runs are unattended, so a prompting mode ('default'/'plan') "
                                 "stalls waiting for approval — prefer an auto-running mode. "
-                                "Set null for the agent default. This field is required so "
-                                "the user can review the effective task setting."
+                                "Send JSON null (not the string 'null') for the agent "
+                                "default, and always for a harness without modes. This "
+                                "field is required so the user can review the effective "
+                                "task setting."
+                            ),
+                        },
+                        "mcp_services": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Optional MCP services every run starts with, as the "
+                                "deployment's service names. The owner must already be "
+                                "connected to each one. Omit for none."
                             ),
                         },
                         "max_cost_usd": {
@@ -288,10 +301,19 @@ class SysScheduledTaskUpdateTool(Tool):
                                 "New permission mode using the selected harness's vocabulary: "
                                 "Claude Code (e.g. 'acceptEdits'), Codex (e.g. 'read-only'), "
                                 "Cursor (e.g. 'auto-review'), Antigravity ('default', 'skip'), "
-                                "or Devin (e.g. 'smart'). Set null for the agent default. "
-                                "Required for approval review; resend the current value "
-                                "when it is unchanged. When switching to a harness "
-                                "without permission-mode support, send null."
+                                "or Devin (e.g. 'smart'). Other harnesses, such as "
+                                "claude-sdk, have no automation permission modes. Send JSON "
+                                "null (not the string 'null') for the agent default, and "
+                                "always for a harness without modes. Required for approval "
+                                "review; resend the current value when it is unchanged."
+                            ),
+                        },
+                        "mcp_services": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Replaces the MCP services every run starts with. "
+                                "An empty list clears them."
                             ),
                         },
                         "max_cost_usd": {

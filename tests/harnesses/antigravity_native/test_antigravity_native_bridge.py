@@ -997,25 +997,37 @@ def test_inject_user_message_via_tui_raises_when_session_dies_before_submit(
         inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
 
 
+@pytest.mark.parametrize("background_widget", [False, True])
 def test_inject_user_message_via_tui_raises_when_paste_never_renders(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _fast_tmux_timeouts: None,
+    background_widget: bool,
 ) -> None:
     """A successful tmux paste command is not enough; the draft must render."""
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
 
+    sep = "─" * 60
+    pane = f"draft message\n{sep}\n> \n{sep}"
+    if background_widget:
+        pane += f"\n  ● pytest running\n{sep}"
+    pane += "\n? for shortcuts"
+    enters: list[str] = []
+
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Pane stays empty even after paste-buffer returns successfully."""
         del kwargs
+        if cmd[-1] == "Enter":
+            enters.append("Enter")
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout="> \n? for shortcuts", stderr="")
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(RuntimeError, match="did not render the pasted message"):
         inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
+    assert not enters
 
 
 def test_inject_user_message_via_tui_raises_when_turn_never_starts(
@@ -1076,23 +1088,38 @@ def test_draft_in_input_region_detects_collapsed_paste_placeholder() -> None:
     assert not _mod._draft_in_input_region(submitted, "Find the current weather", baseline)
 
 
+@pytest.mark.parametrize("draft_style", ["collapsed", "scrolled", "wrapped-tail"])
+@pytest.mark.parametrize("background_widget", [False, True])
 def test_inject_user_message_via_tui_submits_a_collapsed_paste(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _fast_tmux_timeouts: None,
+    draft_style: str,
+    background_widget: bool,
 ) -> None:
-    """
-    A multi-line prompt agy collapses is still submitted, not reported as lost.
-
-    Reproduces the polly sub-agent dispatch: the task prompt is long enough that
-    agy shows only the placeholder, which previously failed the render gate and
-    raised "did not render the pasted message" while the draft sat in the
-    composer.
-    """
+    """Hidden or wrapped draft text submits once even above a background widget."""
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
-    content = "\n".join(f"Find the current weather line {i}" for i in range(1, 19))
-    tui = {"pane": "> \n? for shortcuts"}
+    content = "\n".join(
+        ["Find the current weather and inspect these observations"]
+        + [f"Observation {index}: compare temperature and humidity" for index in range(16)]
+        + ["Summarize the observations and finish the report"]
+    )
+    sep = "─" * 60
+
+    def pane(composer: str, footer: str = "? for shortcuts") -> str:
+        result = f"{sep}\n> previous prompt\n{sep}\n{composer}\n{sep}"
+        if background_widget:
+            result += f"\n  ● pytest running\n{sep}"
+        return result + "\n" + footer
+
+    tail = content.splitlines()[-1]
+    rendered = {
+        "collapsed": "  [Pasted text #1 +18 lines]",
+        "scrolled": f"> ↑ 17 more lines\n  {tail}",
+        "wrapped-tail": f"> {tail[:14]}\n  {tail[14:]}",
+    }[draft_style]
+    tui = {"pane": pane("> ")}
     enters = {"n": 0}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -1103,16 +1130,16 @@ def test_inject_user_message_via_tui_submits_a_collapsed_paste(
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
-            tui["pane"] = "> [Pasted text #1 +18 lines]\n? for shortcuts"
+            tui["pane"] = pane(rendered)
         if cmd[-1] == "Enter":
             enters["n"] += 1
-            tui["pane"] = "> \nesc to cancel"
+            tui["pane"] = pane("> ", "esc to cancel")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
 
-    assert enters["n"] == 1, "the collapsed draft should submit on the first Enter"
+    assert enters["n"] == 1, "the rendered draft should submit on the first Enter"
 
 
 # ---------------------------------------------------------------------------
@@ -1447,6 +1474,9 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
     assert "sys_os_shell" in server["enabledTools"]
     assert "sys_terminal_launch" in server["enabledTools"]
     assert "sys_list_models" in server["enabledTools"]
+    assert "sys_project_list" in server["enabledTools"]
+    assert "sys_session_update" in server["enabledTools"]
+    assert "sys_project_update" in server["enabledTools"]
     assert server["enabledTools"] == sorted(server["enabledTools"])
     assert server["env"]["TMPDIR"]
     # The relay's HOME and data dir are pinned to the runner's so its bridge-root
@@ -2886,7 +2916,7 @@ def test_draft_detected_when_background_task_running() -> None:
 
 
 def test_submit_needles_for_long_single_paragraph() -> None:
-    """A long single-line paragraph yields head, tail, and intermediate needles."""
+    """A long single-line paragraph yields both head and tail needles."""
     content = (
         "Here is a long prompt that tests how agy handles text when a single "
         "long paragraph overflows the composer viewport and scrolls. "

@@ -16,6 +16,7 @@ import type {
   BackgroundTaskInfo,
   CodexPersistMode,
   ErrorInfo,
+  FileEditRequest,
   ModelUsage,
   RememberScope,
   Response,
@@ -185,6 +186,8 @@ export interface ElicitationRequest {
   nativeDelivery?: NativePermissionDelivery;
   type: "elicitation_request";
   elicitationId: string;
+  /** False when the agent keeps working while the card waits, e.g. a Codex async question. */
+  isBlocking?: false;
   /**
    * Session that owns the parked elicitation Future. Usually the
    * active session; set to a child session id when the server mirrors
@@ -234,6 +237,8 @@ export interface ElicitationRequest {
    * Optional/null for any other elicitation.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** Claude-native file-edit prompts only: the full tool call, so the card can show a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Producer-supplied extra (codex-native command approvals only):
    * structured command details that let the UI render the approval
@@ -520,8 +525,10 @@ export interface ClientTaskCancel {
  *
  * `launching` means a task/session exists but has not emitted a concrete
  * harness-start signal. `waiting` arrives when the parent agent loop parks
- * on background tools / sub-agents. The session snapshot's `status` never
- * reports `waiting`; it is live-only.
+ * on background tools / sub-agents, or when a claude-native turn ends with a
+ * background agent still running (then `backgroundAgents` names them). The
+ * session snapshot's wire status stays `running` for that claude-native case,
+ * with `background_agents` set; the API adapter turns that pair into `waiting`.
  */
 export interface SessionStatusEvent {
   type: "session_status";
@@ -536,6 +543,11 @@ export interface SessionStatusEvent {
    */
   backgroundTasks?: BackgroundTaskInfo[];
   /**
+   * Background agents a finished claude-native turn left running, on its
+   * `waiting` edge. Absent on every other edge.
+   */
+  backgroundAgents?: BackgroundTaskInfo[];
+  /**
    * Short phrase naming what a still-`running` session is parked on, e.g.
    * "permission prompt". Terminal-backed agents can block on a dialog the
    * web UI does not mirror; this says why nothing is moving. Absent when
@@ -549,6 +561,13 @@ export interface SessionStatusEvent {
    */
   error?: ErrorInfo;
 }
+
+/**
+ * Runner's `blockedOn` reason when the agent still reads as working but its
+ * terminal shows something it did not report, e.g. a dialog opened mid-reply.
+ * Inferred from the screen, so the UI words it tentatively.
+ */
+export const TERMINAL_PROMPT_BLOCKED_ON = "terminal prompt";
 
 /**
  * `session.usage` — token-usage update from a terminal-backed runtime.
@@ -654,6 +673,18 @@ export interface SessionCodexApprovalModeEvent {
   type: "session_codex_approval_mode";
   conversationId: string;
   approvalMode: string;
+}
+
+/**
+ * `session.background_tasks` — background tasks that changed between turns,
+ * e.g. a codex-native session's background terminals. The count is
+ * authoritative, like the one on a `session.status` edge.
+ */
+export interface SessionBackgroundTasksEvent {
+  type: "session_background_tasks";
+  conversationId: string;
+  backgroundTaskCount: number;
+  backgroundTasks: BackgroundTaskInfo[];
 }
 
 /**
@@ -936,9 +967,8 @@ export interface SessionPresenceEvent {
  * `session.superseded` — this conversation was superseded and the client
  * should follow to `targetConversationId`.
  *
- * Emitted when a Claude `/clear` rotates a session away: the old
- * conversation keeps its history but the live terminal moves to a fresh
- * conversation. A client actively viewing the old conversation
+ * Emitted when `/clear` or `/rewind` moves a session's work to another
+ * conversation; the old one keeps its history. A client actively viewing the old conversation
  * auto-redirects. Live-only (no SSE replay): a client connecting after
  * the rotation instead renders the persisted notice message appended to
  * the old conversation.
@@ -949,8 +979,8 @@ export interface SessionSupersededEvent {
   conversationId: string;
   /** The conversation id to redirect to. */
   targetConversationId: string;
-  /** Why the session was superseded. Currently always `"clear"`. */
-  reason: "clear";
+  /** Why the session was superseded. */
+  reason: "clear" | "rewind";
 }
 
 /**
@@ -1034,6 +1064,7 @@ export type StreamEvent =
   | SessionCollaborationModeEvent
   | SessionPermissionModeEvent
   | SessionCodexApprovalModeEvent
+  | SessionBackgroundTasksEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent

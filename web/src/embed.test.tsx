@@ -114,7 +114,7 @@ describe("macOS Electron embed", () => {
       smoothingSelector = (declaration.parent as Rule).selector;
     });
     expect(smoothingSelector).not.toBe("");
-    expect(scope.matches(smoothingSelector)).toBe(expected);
+    expect(scope.matches(smoothingSelector)).toBe(true);
 
     const controlsSelector = selectorFor(":is(");
     expect(controlsSelector).not.toContain(":has(");
