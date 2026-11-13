@@ -2607,8 +2607,10 @@ async def test_background_setup_failure_preserves_replacement_turn(
 @pytest.mark.asyncio
 async def test_runner_failed_status_carries_setup_error_message(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
 ) -> None:
-    """A SETUP-phase failure forwards its error message on the ``failed`` event.
+    """A setup failure forwards safe diagnostics on the ``failed`` event.
 
     Regression for the silent-REPL failure mode: ending the turn on a
     pre-stream error stopped the spinner but rendered no text, because the
@@ -2703,15 +2705,16 @@ async def test_runner_failed_status_carries_setup_error_message(
     [undelivered] = [event for event in events if event.get("type") == "response.failed"]
     assert undelivered["input_stable_id"] == stable_id
     assert undelivered["response"]["error"]["undelivered"] is True
-    # The failed event must carry the real setup error message — not a
-    # bare status. Without the fix ``error`` is absent and the REPL
-    # renders nothing.
     assert failed_event is not None
     error = failed_event.get("error")
     assert isinstance(error, dict)
-    # The raised OmnigentError message is wrapped as "turn setup
-    # failed: <message>" by _run_turn_bg's setup-phase handler.
-    assert raised_message in error["message"]
+    assert error["message"] == (
+        "turn setup failed: Request failed on the runner; "
+        f"see the runner log for details: {pinned_runner_log}"
+    )
+    assert undelivered["response"]["error"]["message"] == error["message"]
+    assert raised_message not in error["message"]
+    assert raised_message in caplog.text
     # Normalized shape always has a code so the wire ErrorDetail validates.
     assert error["code"]
 

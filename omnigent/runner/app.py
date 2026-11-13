@@ -5729,7 +5729,8 @@ def create_runner_app(
                 )
                 if not owns_active_turn:
                     return
-                error: dict[str, object] = {"message": f"turn setup failed: {exc}"}
+                detail = _client_safe_error_detail(exc, context="turn setup")
+                error: dict[str, object] = {"message": f"turn setup failed: {detail}"}
                 if not handed_off[0]:
                     identity = _input_identity(msg_body)
                     if identity:
