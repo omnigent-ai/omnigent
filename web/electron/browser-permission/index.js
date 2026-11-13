@@ -40,6 +40,7 @@ void bridge
     if (kind === "security-key") showSecurityKey(cookieImport);
     if (!submitted) {
       for (const button of document.querySelectorAll("footer button")) button.disabled = false;
+      document.getElementById("prompt").hidden = false;
       document.getElementById("close").focus();
     }
   })

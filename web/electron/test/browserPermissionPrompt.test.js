@@ -361,6 +361,7 @@ const PAGE_BUTTONS = ["once", "always", "deny", "open-in-browser"];
 function pageHarness(info = { kind: "permission", origin: ORIGIN, reload: true }) {
   const elements = new Map();
   for (const id of [
+    "prompt",
     "heading",
     "description",
     "origin",
@@ -373,7 +374,7 @@ function pageHarness(info = { kind: "permission", origin: ORIGIN, reload: true }
   ]) {
     elements.set(id, {
       disabled: PAGE_BUTTONS.includes(id),
-      hidden: ["reload", "cookie-hint", "security-key-choices"].includes(id),
+      hidden: ["prompt", "reload", "cookie-hint", "security-key-choices"].includes(id),
       listeners: {},
       addEventListener(name, fn) {
         this.listeners[name] = fn;
@@ -418,6 +419,7 @@ describe("permission popover page", () => {
     assert.ok(require("../package.json").build.files.includes("browser-permission/**/*"));
     for (const label of ["Allow once", "Always allow", "Deny"]) assert.ok(html.includes(label));
     assert.match(html, /default-src 'none'/);
+    assert.match(html, /<main[^>]+\bhidden>/);
     assert.doesNotMatch(html, /Okta Verify|Only allow sites you trust|Always allow and reload/);
   });
 
@@ -458,9 +460,19 @@ describe("permission popover page", () => {
     const html = fs.readFileSync(path.join(__dirname, "../browser-permission/index.html"), "utf8");
     assert.ok(html.includes("Open in browser"));
     for (const cookieImport of [true, false]) {
-      const h = pageHarness({ kind: "security-key", origin: ORIGIN, cookieImport });
+      let resolveInfo;
+      const h = pageHarness(
+        new Promise((resolve) => {
+          resolveInfo = resolve;
+        }),
+      );
+      // oxlint-disable-next-line no-await-in-loop -- inspect the page before IPC settles.
+      await tick();
+      assert.equal(h.elements.get("prompt").hidden, true);
+      resolveInfo({ kind: "security-key", origin: ORIGIN, cookieImport });
       // oxlint-disable-next-line no-await-in-loop -- each page loads its info separately.
       await tick();
+      assert.equal(h.elements.get("prompt").hidden, false);
       assert.equal(h.elements.get("heading").textContent, "Use your security key");
       assert.match(h.elements.get("description").textContent, /touch it to continue/);
       assert.equal(h.elements.get("origin").textContent, ORIGIN);
