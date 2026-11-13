@@ -107,11 +107,13 @@ def require_archive_outside_source_lineage(
     request: Request, session_id: str, conversations: ConversationStore
 ) -> None:
     """
-    Refuse an agent-tool archive of the calling session or any of its ancestors.
+    Refuse an agent-tool archive of any session the calling session runs under.
 
     Archiving stops the target's running sub-agents, so archiving an ancestor
-    would stop the caller. Cyclic or over-depth lineages are refused. Requests
-    without the orchestration-source header bypass this agent-only guard.
+    would stop the caller mid-turn. The caller may archive itself: the route
+    defers that teardown until its turn ends. Cyclic or over-depth lineages are
+    refused. Requests without the orchestration-source header bypass this
+    agent-only guard.
     """
     raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
     if not raw_source:
@@ -121,9 +123,9 @@ def require_archive_outside_source_lineage(
     current = conversations.get_conversation(source_id) if source_id else None
     seen: set[str] = set()
     while current is not None:
-        if current.id == target:
+        if current.id == target and current.id != source_id:
             raise OmnigentError(
-                "An agent cannot archive its own session or a session it runs under",
+                "An agent cannot archive a session it runs under",
                 code=ErrorCode.FORBIDDEN,
             )
         if current.id in seen or len(seen) >= _MAX_ARCHIVE_LINEAGE_DEPTH:

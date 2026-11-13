@@ -3,7 +3,14 @@ import { BUILTIN_SLASH_COMMANDS, SlashCommandMenu } from "./SlashCommandMenu";
 
 // The menu scrolls past 22rem; the session-gated built-ins would push the
 // Skills section out of frame, so show the commands every session gets.
-const SESSION_GATED_COMMANDS = new Set(["/btw", "/side", "/mcp", "/clear", "/permissions"]);
+const SESSION_GATED_COMMANDS = new Set([
+  "/btw",
+  "/side",
+  "/mcp",
+  "/clear",
+  "/permissions",
+  "/rewind",
+]);
 const defaultCommands = Object.fromEntries(
   Object.entries(BUILTIN_SLASH_COMMANDS).filter(([name]) => !SESSION_GATED_COMMANDS.has(name)),
 );

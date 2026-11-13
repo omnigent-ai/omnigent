@@ -50,6 +50,7 @@ from omnigent.cli_config import (
     _credential_label,
     _isolated_databricks_cfg,
     _print_credentials_by_harness,
+    _repair_invalid_provider_entries,
     _run_configure_databricks,
     _run_configure_harnesses_interactive,
     _warn_missing_harness_dependencies,
@@ -2248,6 +2249,13 @@ def _enforce_wrapper_guard() -> None:
         raise SystemExit(2)
 
 
+def _client_identity_headers() -> dict[str, str]:
+    """Return the User-Agent naming this CLI, for ad-hoc requests to the server."""
+    from omnigent.telemetry.request_headers import client_identity_headers
+
+    return client_identity_headers()
+
+
 @capture_cli_entry
 def main() -> None:
     """
@@ -2271,6 +2279,11 @@ def main() -> None:
     from omnigent.crash_handler import install_crash_handler
 
     install_crash_handler(app_name="omnigent", repo="omnigent-ai/omnigent")
+
+    # Overrides a component inherited from a runner, e.g. in an Omnigent terminal.
+    from omnigent.telemetry.request_headers import set_client_component
+
+    set_client_component("cli")
 
     # Operators can force all use through a wrapper (e.g. `isaac omni`) by
     # setting OMNIGENT_REQUIRE_WRAPPER; the wrapper sets OMNIGENT_WRAPPER_BYPASS
@@ -4144,7 +4157,9 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         workspace_host = load_databricks_workspace_host(server)
         if workspace_host is None and "Authorization" in headers:
             try:
-                unauthed_probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
+                unauthed_probe = _httpx.get(
+                    f"{server}/v1/me", headers=_client_identity_headers(), timeout=10.0
+                )
             except _httpx.HTTPError as error:
                 if is_workspace_hosted_url(server) and org_id is None:
                     raise click.ClickException(
@@ -4844,6 +4859,7 @@ def server(
     from omnigent.server.server_config import (
         SESSION_TITLE_INSTRUCTIONS_KEY,
         config_str_list,
+        load_server_config,
     )
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -4868,15 +4884,17 @@ def server(
                 "Invalid shared_preferences_authority_id: expected a nonempty string "
                 "of at most 128 characters without surrounding whitespace."
             ) from None
-    title_server_config = cfg
+    server_config: dict[str, Any] | None = cfg
     if config_path is None:
-        global_cfg = _load_global_config()
-        title_instructions = global_cfg.get(SESSION_TITLE_INSTRUCTIONS_KEY)
-        title_server_config = (
-            {SESSION_TITLE_INSTRUCTIONS_KEY: title_instructions}
-            if title_instructions is not None
-            else {}
-        )
+        # Without -c, create_app gets the resolved server config (OMNIGENT_CONFIG
+        # or <data_dir>/config.yaml); the user config only fills in
+        # session_title_instructions when the server config leaves it unset.
+        resolved_server_config = dict(load_server_config())
+        title_instructions = _load_global_config().get(SESSION_TITLE_INSTRUCTIONS_KEY)
+        if title_instructions is not None:
+            resolved_server_config.setdefault(SESSION_TITLE_INSTRUCTIONS_KEY, title_instructions)
+        # Pass the dict even when empty so create_app doesn't re-read the file.
+        server_config = resolved_server_config
 
     # Let the server-config reader (branding) see the same ``-c`` file.
     if config_path:
@@ -5143,7 +5161,7 @@ def server(
         mcp_registry=mcp_registry,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
-        server_config=title_server_config,
+        server_config=server_config,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
@@ -12333,8 +12351,8 @@ def setup(internal_beta: bool) -> None:
         return
 
     # --no-internal-beta: validate existing providers before entering the
-    # picker so malformed user config is reported as an actionable CLI error,
-    # not an application crash from the picker's ambient-adoption step.
+    # picker. Interactive runs can repair or remove malformed entries; other runs
+    # get an actionable CLI error, not a crash from the picker's ambient adoption.
     from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.onboarding.provider_config import load_providers
 
@@ -12343,8 +12361,11 @@ def setup(internal_beta: bool) -> None:
     except OmnigentError as exc:
         if exc.code != ErrorCode.INVALID_INPUT:
             raise
-        path = _display_config_path(_effective_global_config_path())
-        raise click.ClickException(f"Invalid provider configuration in {path}: {exc}") from None
+        if not (_stdin_is_tty() and _repair_invalid_provider_entries()):
+            path = _display_config_path(_effective_global_config_path())
+            raise click.ClickException(
+                f"Invalid provider configuration in {path}: {exc}"
+            ) from None
 
     # The picker warns about missing Node/tmux itself, configures
     # providers/defaults, and returns; the user then starts a session with
@@ -13259,7 +13280,7 @@ def _workspace_api_server_url(server: str) -> str:
     if parsed.path not in ("", "/") or parsed.scheme != "https":
         return server
     try:
-        probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
+        probe = _httpx.get(f"{server}/v1/me", headers=_client_identity_headers(), timeout=10.0)
     except (_httpx.HTTPError, _httpx.InvalidURL):
         return server
     # Already something we understand at the root: an omnigent server
@@ -13274,7 +13295,9 @@ def _workspace_api_server_url(server: str) -> str:
         return server
     candidate = urlunsplit((parsed.scheme, parsed.netloc, WORKSPACE_API_PATH, "", ""))
     try:
-        api_probe = _httpx.get(f"{candidate}/v1/me", timeout=10.0)
+        api_probe = _httpx.get(
+            f"{candidate}/v1/me", headers=_client_identity_headers(), timeout=10.0
+        )
     except _httpx.HTTPError:
         return server
     if _workspace_mount_probe_matches(candidate, api_probe):
@@ -13293,7 +13316,7 @@ def _workspace_api_server_url(server: str) -> str:
         try:
             authed_probe = _httpx.get(
                 f"{candidate}/v1/me",
-                headers={"Authorization": f"Bearer {token}"},
+                headers={**_client_identity_headers(), "Authorization": f"Bearer {token}"},
                 timeout=10.0,
             )
         except _httpx.HTTPError:
@@ -13401,7 +13424,7 @@ def _databricks_root_is_usable(server: str) -> bool:
 
     root = _probe_root(server)
     try:
-        probe = _httpx.get(f"{root}/v1/me", timeout=10.0)
+        probe = _httpx.get(f"{root}/v1/me", headers=_client_identity_headers(), timeout=10.0)
     except _httpx.HTTPError:
         return False
     if probe.status_code == 200:
@@ -13876,7 +13899,7 @@ def _verify_databricks_server_token(
     try:
         return _httpx.get(
             f"{server}/v1/me",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={**_client_identity_headers(), "Authorization": f"Bearer {token}"},
             params={"o": org_id} if org_id else None,
             timeout=10.0,
         )
@@ -14039,6 +14062,7 @@ def login(server_url: str) -> None:
         probe = _httpx.get(
             f"{server}/v1/me",
             params={"o": org_id} if org_id else None,
+            headers=_client_identity_headers(),
             timeout=10.0,
             trust_env=_trust_env_for(server),
         )
@@ -14111,6 +14135,7 @@ def login(server_url: str) -> None:
         resp = _httpx.post(
             f"{server}/auth/cli-login",
             json={"code_challenge": code_challenge, "code_challenge_method": "S256"},
+            headers=_client_identity_headers(),
             timeout=10.0,
             trust_env=_trust_env_for(server),
         )
@@ -14159,7 +14184,7 @@ def login(server_url: str) -> None:
             poll_resp = _httpx.get(
                 poll_url,
                 params={"ticket": ticket},
-                headers={"X-Omnigent-Code-Verifier": code_verifier},
+                headers={**_client_identity_headers(), "X-Omnigent-Code-Verifier": code_verifier},
                 timeout=10.0,
                 trust_env=_trust_env_for(server),
             )
@@ -14291,6 +14316,7 @@ def _accounts_login(server: str) -> None:
         resp = _httpx.post(
             f"{server}/auth/login",
             json={"username": username, "password": password, "issue_refresh": True},
+            headers=_client_identity_headers(),
             timeout=10.0,
             trust_env=_trust_env_for(server),
         )

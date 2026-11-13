@@ -12,7 +12,9 @@
 // this decoupled from the query-key convention and needs no QueryClient handle.
 // A session's host_id is fixed for its lifetime, so the recorded value can't go
 // stale. Returns `null` when the session hasn't been loaded yet or is a hostless
-// local session, leaving routing to the default.
+// local session; such requests carry the client's own key (`routingKey.ts`).
+
+import { clientRoutingKey } from "./routingKey.ts";
 
 const _sessionHosts = new Map<string, string>();
 const _hostChangeListeners = new Set<() => void>();
@@ -198,11 +200,11 @@ let _modalHostResolved = false;
  * first-seen insertion order (Map iteration order), which is stable enough for
  * a best-effort cache-affinity hint.
  */
-function pickModalHost(hosts: Map<string, string>): string | null {
+function pickModalHost(hostIds: Iterable<string>): string | null {
   const counts = new Map<string, number>();
   let best: string | null = null;
   let bestCount = 0;
-  for (const host of hosts.values()) {
+  for (const host of hostIds) {
     const next = (counts.get(host) ?? 0) + 1;
     counts.set(host, next);
     if (next > bestCount) {
@@ -225,19 +227,28 @@ function pickModalHost(hosts: Map<string, string>): string | null {
  * persisted-preference backstop, so a stale/sandbox-sentinel choice can never
  * become the slice key.
  */
-export function resolveModalHost(): void {
+export function resolveModalHost(ownListHostIds: Iterable<string>): void {
   if (_modalHostResolved) return;
-  _modalHostId = pickModalHost(_sessionHosts);
+  _modalHostId = pickModalHost(ownListHostIds);
   _modalHostResolved = true;
 }
 
 /**
- * The frozen modal host_id, or `null` (→ send no key → default route) before
- * it is resolved or when no host could be picked. Read by `authenticatedFetch`
- * (host-less routes) and `buildUpdatesUrl`.
+ * The frozen modal host_id, or `null` before it is resolved or when no host
+ * could be picked. Read through {@link updatesRoutingKey}.
  */
 export function modalHostId(): string | null {
   return _modalHostId;
+}
+
+/**
+ * Slice key for the `/updates` stream and the writes whose events it reports
+ * (project changes, a scheduled task's or run's new session). The server delivers those
+ * events only within one replica, so they share the modal host's replica, or
+ * this client's key when there is no modal host.
+ */
+export function updatesRoutingKey(): string {
+  return _modalHostId ?? clientRoutingKey();
 }
 
 /**

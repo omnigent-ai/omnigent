@@ -455,6 +455,7 @@ def test_get_session_activity(
         kind="sub_agent", title="child", parent_conversation_id=a.id
     )
     conversation_store.set_session_usage(child.id, {"total_cost_usd": 5.0})
+    conversation_store.update_conversation(b.id, archived=True)
 
     statements: list[str] = []
 
@@ -484,6 +485,8 @@ def test_get_session_activity(
     assert result[b.id].live_status is None
     assert result[b.id].runner_id is None
     assert result[b.id].total_cost_usd is None
+    assert result[a.id].archived is False
+    assert result[b.id].archived is True
     assert conversation_store.get_session_activity([]) == {}
 
 
@@ -3553,6 +3556,44 @@ def test_list_conversations_filtered_by_agent_id_returns_matching_only(
     assert returned_ids == {conv1.id, conv2.id}
 
 
+def test_list_conversations_agent_name_holds_one_connection_at_a_time(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+    db_uri: str,
+) -> None:
+    """
+    Filtering by agent name resolves the agent ids in their own session before
+    the listing session opens. Holding both at once would take two pooled
+    connections per request and can exhaust the pool under concurrency.
+
+    :param conversation_store: The conversation store fixture.
+    :param agent_store: The agent store fixture.
+    :param db_uri: The shared single-DB URI behind both stores.
+    """
+    gamma = agent_store.create(
+        agent_id="3c1f0e9b2a7d4c6e8f0a1b2c3d4e5f60",
+        name="gamma",
+        bundle_location="3c1f0e9b2a7d4c6e8f0a1b2c3d4e5f60/h",
+    )
+    conv = conversation_store.create_conversation(agent_id=gamma.id)
+    conversation_store.create_conversation()
+    engine = get_or_create_engine(db_uri)
+    peak_checked_out: list[int] = []
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        peak_checked_out.append(engine.pool.checkedout())
+
+    event.listen(engine, "checkout", _on_checkout)
+    try:
+        page = conversation_store.list_conversations(agent_name="gamma")
+    finally:
+        event.remove(engine, "checkout", _on_checkout)
+
+    assert {c.id for c in page.data} == {conv.id}
+    assert peak_checked_out, "the listing must check out a connection"
+    assert max(peak_checked_out) == 1
+
+
 def test_list_conversations_agent_id_none_disables_filter(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -6432,6 +6473,47 @@ def test_fork_conversation_truncated_drops_external_session_directive(
     assert fork.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
 
 
+@pytest.mark.parametrize("cutoff", ["up_to_response_id", "before_item_id", "cross_family"])
+def test_fork_of_a_fork_drops_inherited_native_directive(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+    cutoff: str,
+) -> None:
+    """A truncated or cross-family fork drops the native directive its source inherited.
+
+    Fork A into B, then truncate B or fork it the way a cross-family fork
+    does (``resume_source_native_session=False``): an inherited directive
+    naming A's native session would make the runner clone A's full
+    transcript, bringing back discarded turns or handing the target a
+    transcript in the wrong format.
+    """
+    from omnigent.stores.conversation_store import FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
+
+    agent_store.create(
+        agent_id="9d1f0e2c3b4a49588f7e6d5c4b3a2910",
+        name="fork-of-fork-trunc",
+        bundle_location="9d1f0e2c3b4a49588f7e6d5c4b3a2910/fakehash",
+    )
+    chat_a = conversation_store.create_conversation(agent_id="9d1f0e2c3b4a49588f7e6d5c4b3a2910")
+    conversation_store.set_external_session_id(chat_a.id, "claude-uuid-a")
+    _append_three_responses(conversation_store, chat_a.id)
+    chat_b = conversation_store.fork_conversation(chat_a.id)
+    assert chat_b.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY) == "claude-uuid-a"
+    conversation_store.set_external_session_id(chat_b.id, "claude-uuid-b")
+
+    second_prompt_id = conversation_store.list_items(chat_b.id).data[2].id
+    cutoff_kwargs: dict[str, Any] = {
+        "up_to_response_id": {"up_to_response_id": "resp_001"},
+        "before_item_id": {"before_item_id": second_prompt_id},
+        "cross_family": {"resume_source_native_session": False},
+    }[cutoff]
+    fork = conversation_store.fork_conversation(chat_b.id, **cutoff_kwargs)
+
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels, fork.labels
+    if cutoff == "cross_family":
+        assert len(conversation_store.list_items(fork.id).data) == 6
+
+
 def test_fork_conversation_cross_family_drops_external_session_directive(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -6535,6 +6617,7 @@ def test_fork_conversation_up_to_unknown_response_raises(
 def test_fork_conversation_before_item_drops_the_item_and_later_history(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
+    db_uri: str,
 ) -> None:
     """``before_item_id`` copies only the items positioned before that item.
 
@@ -6566,6 +6649,20 @@ def test_fork_conversation_before_item_drops_the_item_and_later_history(
     fork = conversation_store.fork_conversation(source.id, before_item_id=second_prompt.id)
     assert fork_texts(fork.id) == ["Q1", "A1"]
     assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels
+
+    # A rewind continues the source in place: the cutoff holds, and the fork
+    # is born on the source's host.
+    HostStore(db_uri).upsert_on_connect("f" * 32, "laptop", RESERVED_USER_LOCAL)
+    conversation_store.set_host_id(source.id, "f" * 32, "/work/repo", "main")
+    rewound = conversation_store.fork_conversation(
+        source.id, before_item_id=second_prompt.id, continue_source=True
+    )
+    assert fork_texts(rewound.id) == ["Q1", "A1"]
+    assert (rewound.host_id, rewound.workspace, rewound.git_branch) == (
+        "f" * 32,
+        "/work/repo",
+        "main",
+    )
 
     first = conversation_store.fork_conversation(source.id, before_item_id=first_prompt.id)
     assert fork_texts(first.id) == []
