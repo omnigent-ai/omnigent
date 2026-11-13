@@ -30,7 +30,7 @@ vi.mock("./SubagentsGraphView", () => ({
       data-testid="subagents-graph-view"
       data-conversation-id={props.conversationId}
       data-root-session-id={props.rootSessionId}
-      data-cost-ids={[...((props.costs as Map<string, unknown> | undefined)?.keys() ?? [])].join()}
+      data-costs={JSON.stringify([...((props.costs as Map<string, unknown> | undefined) ?? [])])}
     />
   ),
 }));
@@ -700,7 +700,10 @@ describe("SubagentsPanel view-mode toggle", () => {
     const graph = await screen.findByTestId("subagents-graph-view");
     expect(graph).toHaveAttribute("data-conversation-id", "conv_child");
     expect(graph).toHaveAttribute("data-root-session-id", "conv_root");
-    expect(graph).toHaveAttribute("data-cost-ids", "c1");
+    expect(graph).toHaveAttribute(
+      "data-costs",
+      JSON.stringify([["c1", { costUsd: 0.4, estimated: false }]]),
+    );
   });
 
   it("preserves the toggle bar across both views", async () => {

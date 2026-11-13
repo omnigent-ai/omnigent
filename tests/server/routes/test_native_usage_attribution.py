@@ -101,8 +101,8 @@ def test_subagent_cost_estimates_stay_display_only(db_uri: str) -> None:
     assert load_session_usage(parent.id, store)["total_cost_usd"] == 1.0
     tree = store.list_spawn_tree_usage(parent.id, limit=10).data
     costs = {cost.id: cost for cost in _agent_costs(tree, parent.id)}
-    assert (costs[parent.id].cost_usd, costs[parent.id].estimated) == (1.0, False)
-    assert (costs[child.id].cost_usd, costs[child.id].estimated) == (0.4, True)
+    assert (costs[parent.id].cost_usd, costs[parent.id].estimated_cost_usd) == (1.0, None)
+    assert (costs[child.id].cost_usd, costs[child.id].estimated_cost_usd) == (None, 0.4)
 
 
 @pytest.mark.parametrize(

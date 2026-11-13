@@ -1519,47 +1519,73 @@ def _agent_costs(tree: Sequence[SpawnTreeUsage], session_id: str) -> list[AgentC
     Display costs for *session_id* and its descendants from one loaded tree.
 
     An agent's cost is its priced subtree total, the figure its own session
-    displays. An agent with nothing priced falls back to its parent's
-    display-only ``subagent_costs_usd`` estimate, which no total sums.
+    displays. An agent with nothing priced instead gets the display-only
+    ``subagent_costs_usd`` estimate of its nearest ancestor that reported one
+    (a Claude session reports its nested sub-agents too), which no total sums.
 
     :param tree: The whole spawn tree, from
         :meth:`ConversationStore.list_spawn_tree_usage`.
     :param session_id: Subtree root to report, e.g. ``"conv_abc123"``.
     :returns: One :class:`AgentCost` per subtree member, in tree order.
     """
+    by_id = {row.id: row for row in tree}
     children: dict[str, list[SpawnTreeUsage]] = {}
     for row in tree:
         if row.parent_conversation_id is not None:
             children.setdefault(row.parent_conversation_id, []).append(row)
-    # Breadth-first from the subtree root (cycle-safe): every row follows its parent.
-    walk = [row for row in tree if row.id == session_id]
-    members = {row.id for row in walk}
-    for row in walk:
-        for child in children.get(row.id, ()):
-            if child.id not in members:
-                members.add(child.id)
-                walk.append(child)
+    # One depth-first walk of the whole tree (cycle-safe). A row is another's
+    # ancestor exactly when its entry/exit ticks enclose the other's, and rows
+    # exit after all their descendants.
+    enter: dict[str, int] = {}
+    leave: dict[str, int] = {}
+    exits: list[SpawnTreeUsage] = []
+    pending = [(row, False) for row in tree if row.parent_conversation_id not in by_id]
+    while pending:
+        row, done = pending.pop()
+        if done:
+            leave[row.id] = len(enter) + len(leave)
+            exits.append(row)
+        elif row.id not in enter:
+            enter[row.id] = len(enter) + len(leave)
+            pending.append((row, True))
+            pending.extend((child, False) for child in children.get(row.id, ()))
+
+    def is_ancestor(outer: str, inner: str) -> bool:
+        return (
+            outer in leave
+            and inner in leave
+            and enter[outer] < enter[inner]
+            and leave[inner] < leave[outer]
+        )
+
     totals: dict[str, float] = {}
-    for row in reversed(walk):
+    for row in exits:
         cost = _priced_cost_for_display(row.session_usage)
         if cost is not None:
             totals[row.id] = totals.get(row.id, 0.0) + cost
         parent_id = row.parent_conversation_id
-        if row.id != session_id and row.id in totals and parent_id is not None:
+        if row.id in totals and parent_id is not None and parent_id in by_id:
             totals[parent_id] = totals.get(parent_id, 0.0) + totals[row.id]
-    by_id = {row.id: row for row in tree}
-    costs: list[AgentCost] = []
+    # Each child's estimate from its nearest reporting ancestor (latest entry tick).
+    estimates: dict[str, tuple[int, float]] = {}
     for row in tree:
-        if row.id not in members:
+        reported = row.session_usage.get("subagent_costs_usd")
+        if not isinstance(reported, dict):
             continue
-        if row.id in totals:
-            costs.append(AgentCost(id=row.id, cost_usd=totals[row.id]))
-            continue
-        parent = by_id.get(row.parent_conversation_id or "")
-        estimates = parent.session_usage.get("subagent_costs_usd") if parent else None
-        estimate = estimates.get(row.id) if isinstance(estimates, dict) else None
-        costs.append(AgentCost(id=row.id, cost_usd=estimate, estimated=estimate is not None))
-    return costs
+        for child_id, estimate in reported.items():
+            if is_ancestor(row.id, child_id) and enter[row.id] > estimates.get(child_id, (-1,))[0]:
+                estimates[child_id] = (enter[row.id], estimate)
+    return [
+        AgentCost(
+            id=row.id,
+            cost_usd=totals.get(row.id),
+            estimated_cost_usd=(
+                estimates[row.id][1] if row.id not in totals and row.id in estimates else None
+            ),
+        )
+        for row in tree
+        if row.id == session_id or is_ancestor(session_id, row.id)
+    ]
 
 
 class _UnresolvedHarness:

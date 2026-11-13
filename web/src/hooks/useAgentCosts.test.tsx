@@ -70,7 +70,7 @@ describe("useAgentCosts", () => {
           JSON.stringify(
             url.searchParams.get("after") === null
               ? { data: [{ id: "conv_root", cost_usd: 1 }], last_id: "conv_root", has_more: true }
-              : { data: [{ id: "conv_child", cost_usd: 0.2, estimated: true }], has_more: false },
+              : { data: [{ id: "conv_child", estimated_cost_usd: 0.2 }], has_more: false },
           ),
         ),
       false,

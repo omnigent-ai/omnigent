@@ -1,5 +1,5 @@
 // WIP(session_overview): Codex and SDK sub-agents carry their own priced usage;
-// Claude sub-agents show the parent's transcript estimate.
+// Claude sub-agents show their Claude session's transcript estimate.
 
 import { agentCostLabel, useAgentCosts } from "@/hooks/useAgentCosts";
 import { useChildSessions } from "@/hooks/useChildSessions";

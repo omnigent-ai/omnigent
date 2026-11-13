@@ -59,7 +59,7 @@ describe("SessionOverviewSubagents", () => {
         { id: "conv_root", cost_usd: 2 },
         { id: "conv_a", cost_usd: 0.5 },
         { id: "conv_b", cost_usd: null },
-        { id: "conv_c", cost_usd: 0.25, estimated: true },
+        { id: "conv_c", cost_usd: null, estimated_cost_usd: 0.25 },
       ],
     );
     renderSection();

@@ -273,7 +273,7 @@ the header menu), and each place is a separate entry point.
   cost in Agent info.
   When the session has sub-agents, a **Sub-agents** list names each direct one
   with its cost, including its own sub-agents; an unpriced one shows no cost.
-  A Claude sub-agent shows its parent's transcript estimate as `~$x.xx`. The
+  A Claude sub-agent shows its Claude session's transcript estimate as `~$x.xx`. The
   Agents list and graph show the same costs beside each agent.
 
 ## How to get to it (user POV)

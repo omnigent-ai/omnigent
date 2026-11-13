@@ -80,15 +80,11 @@ function CurrentPath() {
   return <output data-testid="current-path">{location.pathname + location.search}</output>;
 }
 
-function renderGraph(
-  opener: (id: string) => boolean,
-  initialEntry = "/c/conv_root",
-  costs?: AgentCosts,
-) {
+function renderGraph(opener: (id: string) => boolean, initialEntry = "/c/conv_root") {
   render(
     <MemoryRouter initialEntries={[initialEntry]}>
       <SubagentPanelOpenerContext.Provider value={opener}>
-        <SubagentsGraphView conversationId="conv_root" rootSessionId="conv_root" costs={costs} />
+        <SubagentsGraphView conversationId="conv_root" rootSessionId="conv_root" />
       </SubagentPanelOpenerContext.Provider>
       <CurrentPath />
     </MemoryRouter>,
@@ -134,26 +130,27 @@ describe("SubagentsGraphView node clicks", () => {
     expect(screen.getByTestId("current-path").textContent).toBe("/c/conv_root");
   });
 
-  it("shows each node's cost, marking estimates, and omits unknown costs", () => {
-    renderGraph(
-      () => true,
-      "/c/conv_root",
-      new Map([
-        ["conv_root", { costUsd: 1.5, estimated: false }],
-        ["conv_child", { costUsd: 0.25, estimated: true }],
-      ]),
+  it("shows each node's cost, marking estimates, and drops one that becomes unknown", () => {
+    const graph = (costs: AgentCosts) => (
+      <MemoryRouter initialEntries={["/c/conv_root"]}>
+        <SubagentsGraphView conversationId="conv_root" rootSessionId="conv_root" costs={costs} />
+      </MemoryRouter>
     );
     const costOf = (id: string) =>
       screen.getByTestId(`graph-node-${id}`).querySelector('[data-testid="subagent-cost"]')
         ?.textContent ?? null;
+    const { rerender } = render(
+      graph(
+        new Map([
+          ["conv_root", { costUsd: 1.5, estimated: false }],
+          ["conv_child", { costUsd: 0.25, estimated: true }],
+        ]),
+      ),
+    );
     expect([costOf("conv_root"), costOf("conv_child")]).toEqual(["$1.50", "~$0.25"]);
 
-    cleanup();
-    renderGraph(
-      () => true,
-      "/c/conv_root",
-      new Map([["conv_root", { costUsd: null, estimated: false }]]),
-    );
-    expect([costOf("conv_root"), costOf("conv_child")]).toEqual([null, null]);
+    // A later poll updates the same graph in place.
+    rerender(graph(new Map([["conv_root", { costUsd: 2, estimated: false }]])));
+    expect([costOf("conv_root"), costOf("conv_child")]).toEqual(["$2.00", null]);
   });
 });

@@ -7,7 +7,7 @@ import { isTempConvId } from "@/lib/tempConversationId";
 import { isStaleCursorResponse, useChildSessions } from "./useChildSessions";
 
 interface AgentCostPageWire {
-  data: { id: string; cost_usd?: number | null; estimated?: boolean }[];
+  data: { id: string; cost_usd?: number | null; estimated_cost_usd?: number | null }[];
   last_id?: string | null;
   has_more?: boolean;
 }
@@ -47,7 +47,11 @@ async function fetchAgentCostPages(
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const page = (await res.json()) as AgentCostPageWire;
   for (const row of page.data) {
-    costs.set(row.id, { costUsd: row.cost_usd ?? null, estimated: row.estimated === true });
+    const estimated = row.cost_usd == null && typeof row.estimated_cost_usd === "number";
+    costs.set(row.id, {
+      costUsd: estimated ? (row.estimated_cost_usd ?? null) : (row.cost_usd ?? null),
+      estimated,
+    });
   }
   return page.has_more && page.last_id
     ? fetchAgentCostPages(sessionId, page.last_id, costs, restarted)
