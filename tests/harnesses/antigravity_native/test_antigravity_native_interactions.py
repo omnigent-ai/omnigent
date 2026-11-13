@@ -662,7 +662,19 @@ async def test_tui_dismissal_failure_does_not_undo_delivered_verdict() -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_tui_keystroke_when_rpc_already_closed_the_menu() -> None:
+@pytest.mark.parametrize(
+    "after_delivery",
+    [
+        [],
+        [_permission_step(step_index=3)],
+        [_question_step(step_index=2)],
+        [_permission_step(step_index=2, persist_pattern="different-command")],
+    ],
+    ids=["closed", "different-step", "different-kind", "changed-options"],
+)
+async def test_no_tui_keystroke_when_rpc_already_closed_the_menu(
+    after_delivery: list[dict[str, Any]],
+) -> None:
     """RPC delivery closes agy's menu, so typing the selection would become a chat prompt."""
     pending = _pending_permission(step_index=2)
     waiting = _permission_step(step_index=2)
@@ -674,8 +686,8 @@ async def test_no_tui_keystroke_when_rpc_already_closed_the_menu() -> None:
         _CASCADE,
         pending,
         port=52548,
-        # First read finds the step WAITING; the re-read after delivery finds it answered.
-        get_steps=_steps_returner([waiting], []),
+        # A different or changed menu cannot consume this verdict's keys.
+        get_steps=_steps_returner([waiting], after_delivery),
         request_elicitation=request,
         deliver=deliver,
         inject_tui=inject_tui,

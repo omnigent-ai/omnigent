@@ -1257,7 +1257,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
             programmatic_terminate=True,
             classifies_runner_by_agent=True,
             # The init container clones repos in parallel. agent-sandbox
-            # inherits this; managed Databricks launchers (Lakebox, Arca, …)
+            # inherits this; managed launchers (Lakebox, Arca, …)
             # are on the exec-model branch and stay single-repo until they
             # opt in themselves.
             multi_repo=True,

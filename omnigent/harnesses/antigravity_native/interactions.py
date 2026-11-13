@@ -340,13 +340,15 @@ async def _step_still_waiting(get_steps: GetSteps, interaction: PendingInteracti
             exc,
         )
         return False
+    waiting = _waiting_step_at(
+        steps,
+        trajectory_id=interaction["trajectory_id"],
+        step_index=interaction["step_index"],
+    )
     return (
-        _waiting_step_at(
-            steps,
-            trajectory_id=interaction["trajectory_id"],
-            step_index=interaction["step_index"],
-        )
-        is not None
+        waiting is not None
+        and waiting["kind"] == interaction["kind"]
+        and waiting["spec"] == interaction["spec"]
     )
 
 

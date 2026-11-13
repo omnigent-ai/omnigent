@@ -1,12 +1,21 @@
 # Persistent task scheduling
 
+Recurring schedules have a minimum interval
+of **10 minutes** on connected hosts in either session mode, and in sandboxes
+when continuing the existing session. Starting a new sandbox session each run
+requires **one hour**. Use `FREQ=MINUTELY;INTERVAL=10` for a ten-minute schedule.
+
 Scheduled tasks ("automations") run a saved prompt on a recurring schedule or on
 demand. `PersistentTaskScheduler` keeps the schedule in the database, so every
 occurrence runs once even with several server replicas, and an occurrence
 interrupted by a crash is still resolved instead of staying in `starting` forever.
 
-The `automations_v2` feature flag turns this scheduler on. It is off by default,
-and the server then uses the older in-memory timers ("legacy timers").
+For what automations do from a user's point of view, with worked examples, see
+[EXAMPLES.md](EXAMPLES.md).
+
+The `automations_v2` feature flag turns this scheduler on. It is on by default;
+with `OMNIGENT_FEATURES=-automations_v2` the server uses the older in-memory
+timers ("legacy timers") instead.
 
 Terms used below:
 
@@ -182,14 +191,50 @@ A task that continues a session replaces steps 2 to 4 once it has a
 `session_id`: it checks the session, wakes its runner the way a user message
 would, and sends the prompt, also while the session is busy with an earlier turn.
 It records `succeeded` once the prompt is delivered, without waiting for the turn.
+Trigger automations are the exception. A trigger automation is such a task whose
+prompt starts with the opening sentence of a Jira, Slack, GitHub, Linear or
+PagerDuty trigger template, the same check the web form uses. The database scheduler
+checks a trigger again two minutes after each poll (`TRIGGER_POLL_SECONDS`)
+instead of on its saved schedule, though never past the schedule's next
+occurrence: a schedule that ends (`COUNT` or `UNTIL`) still ends the trigger,
+and its last occurrence is sent even while the session is busy. It also
+configures the store so that a trigger
+that is created or resumed, or edited into a trigger, is first checked two
+minutes later; after an upgrade, an existing trigger switches over at its next
+saved poll. Before claiming a poll, the scheduler asks the check built by
+`build_busy_until` when the session can be polled. A session that shows as
+running (a turn in progress, or waiting on an approval or question) is checked
+again two minutes later. An idle one is polled once it has been quiet for two
+minutes after its last change (`updated_at`), since an agent can pause between
+steps. Either way, a poll goes out once the latest run went out (`fired_at`) ten
+minutes ago, so a stale status cannot stall the trigger. A skip only moves
+`next_run_at` to the next check: it writes no run row and logs
+`scheduled_run_skipped_busy`. The
+status is read from session activity, which needs no caller access check, so the
+poll does not act as the owner. A failed check sends the prompt. Other continued
+tasks, legacy timers and a scheduler with a custom `on_fire` hook (it has no busy
+check) follow the saved schedule and never skip, and neither does Run now.
 If the replica stops before recording, recovery finds no session on the run and
 records `failed`; it never resends. A first run of such a task records its
 session on the task once the session exists and its owner is granted, so a run
 never finds a recorded session it cannot continue. Of two first runs, the one that records
-second deletes its unused session and records `skipped`.
+second deletes its unused session and sends its prompt into the recorded session
+through the normal continuation path. Each run keeps its own prompt and run record.
+Sandbox tasks accept an optional repository URL in `workspace`, validated with
+the same repository grammar as a new sandbox session. The selected repository is
+passed to sandbox launch and recorded in the session's repository labels for
+relaunch. `host_id` remains forbidden. The API advertises this support as
+`scheduled_task_sandbox_workspaces`; older servers reject sandbox workspaces.
+Selecting Provider default clears a repository pin with `workspace: null`.
+Edits also clear legacy directory pins without resetting an unchanged continued
+session, since those pins already use the provider default.
+Switching execution targets clears the old workspace unless the request supplies
+a replacement, since connected-host paths and repository URLs are different inputs.
+
 A sandbox task's first run starts its sandbox under the task's host ID. If that
 host already exists, left by a reset session, the new session joins it in that
-session's workspace, or replaces its sandbox when that session is unknown.
+session's workspace, or replaces its sandbox when that session is unknown or
+the selected repository changed.
 
 Known failures record `failed` with the same `error_code` as legacy fires, such as
 `host_offline` or `launch_failed`. A managed launch records where it failed instead:
@@ -540,13 +585,38 @@ gate does not stop the scheduler: tasks created while it was on keep running,
 and can be paused or deleted only once it is on again. Omitting it enables
 automations.
 
+## Sub-hour schedule rollout
+
+API validation and both schedulers always support the target/mode minimums above.
+`/v1/info` reports the fixed `scheduled_task_subhour` capability so newer clients
+retain the hourly floor on older servers. The custom UI also needs `automations_v2`.
+
+Upgrade scheduler replicas before API replicas begin accepting sub-hour schedules,
+and avoid routing writes across mixed API versions during the rollout. Older API
+replicas reject short schedules; older schedulers can pause them as invalid.
+Keep the existing scheduler mode unchanged during the version upgrade.
+
+Updates validate the proposed recurrence, session mode and target outside the
+database transaction, then compare their saved values under the task row lock.
+A concurrent change returns HTTP 409 without applying any fields; reload and
+revalidate before retrying. Metadata-only writes do not revalidate saved cadences.
+
+Before rolling binaries back to a version with the hourly-only parser, stop
+accepting sub-hour schedules, pause them and change their recurrence to hourly
+or slower (or delete them). An old scheduler can durably pause unsupported rules
+and clear `next_run_at`, even before its host-ownership filter. Restoring the new
+binary does not automatically resume tasks paused by an old scheduler.
+
 ## Switching schedulers
 
-**Turning it on.** Set `OMNIGENT_FEATURES=automations_v2` and restart all
-scheduler replicas together. The app needs a store that supports persistent
-dispatch. Without `scheduled_task_dispatch`, it uses the built-in executor and owns
-every host, which suits a single replica. A deployment with several replicas passes
-its own `owned_hosts`.
+**Turning it on.** It is on by default, so upgrading from a release where it was
+off switches schedulers; elsewhere, remove `-automations_v2` from
+`OMNIGENT_FEATURES` (or add `automations_v2`). Either way, restart all scheduler
+replicas together. The app needs a store that supports persistent dispatch.
+Without `scheduled_task_dispatch`, it uses the built-in executor and owns every
+host, which suits a single replica. A deployment with several replicas passes its
+own `owned_hosts`. A deployment that can't do this yet, such as one on Cloudflare
+D1 (below), sets `OMNIGENT_FEATURES=-automations_v2` before upgrading.
 
 **Turning it off.**
 
@@ -750,9 +820,9 @@ UI events use the host-provided `OmnigentHostConfig.analytics` sink:
 | UI creation attempts, successes, failures, latency | `interactionKind=create_scheduled_task`: `phase=start`, then `phase=complete` with `status=success` or `failure` and duration. `name` is the template ID. |
 | UI / agent / API share | `scheduled_task_created` grouped by `creation_source`. |
 
-Template IDs are bounded: `custom`, `jira`, `slack`, `github`,
+Template IDs are bounded: `custom`, `jira`, `slack`, `github`, `linear`, `pagerduty`,
 `follow-up-monitor`, `pr-sweep`, `news-digest`, or server-side `unknown` for
-unattributed/older clients. The current gallery offers Jira, Slack, and GitHub;
+unattributed/older clients. The current gallery offers Jira, Slack, GitHub, Linear, and PagerDuty;
 the three retired suggestion IDs remain accepted for older clients. Attribution records the selected template even if
 its prompt is edited. No task name, prompt, Jira query, channel, or repository
 text is recorded in these events. Attribution headers are diagnostic client claims;

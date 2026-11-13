@@ -40,6 +40,7 @@ import hmac
 import itertools
 import json
 import logging
+import math
 import os
 import pathlib
 import re
@@ -85,6 +86,7 @@ from omnigent.pi_prompt import pi_prompt_args
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.spec.types import RetryPolicy
+from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.json_types import JsonValue
 from omnigent.util.reasoning_effort import (
@@ -114,7 +116,9 @@ from .executor import (
     ToolCallStatus,
     ToolSpec,
     TurnComplete,
+    pending_interruption_marker,
 )
+from .model_credential import _authoritative_expiry
 
 logger = logging.getLogger(__name__)
 
@@ -122,9 +126,17 @@ _GATEWAY_AUTH_REFRESH_MS = 900_000
 # Leave time for the bridge round trip within Pi's 10-second command deadline.
 _GATEWAY_AUTH_TIMEOUT_S = 7
 _GATEWAY_BRIDGE_TIMEOUT_S = 8
-# A refresh before Pi starts has no Pi deadline to fit, so a helper slowed by a busy
-# host (several agents starting at once) gets room instead of failing the turn.
+# Every refresh runs in its own task with this budget, so a helper slowed by a busy host
+# or a slow workspace can finish after a bridge request has stopped waiting for it.
 _GATEWAY_TURN_AUTH_TIMEOUT_S = 30
+# Renew a token this long before its own expiry, so a slow renewal can still serve the
+# old token. The Databricks CLI renews tokens that are within 5 minutes of expiry.
+_GATEWAY_TOKEN_RENEW_BEFORE_EXPIRY_S = 300
+# Least time between refreshes once a token is inside that window, for helpers that keep
+# returning the same token until it expires.
+_GATEWAY_TOKEN_MIN_RECHECK_S = 30
+# Reuse a token after a slow refresh only while it stays valid for at least this long.
+_GATEWAY_TOKEN_REUSE_MARGIN_S = 30
 # Tool arguments can include files; match the other adapters' bounded stream limit.
 _TOOL_REQUEST_LIMIT = 16 * 1024 * 1024
 _TOOL_REQUEST_DRAIN_TIMEOUT_S = 2
@@ -132,6 +144,28 @@ _TOOL_REQUEST_DRAIN_TIMEOUT_S = 2
 
 class _GatewayAuthError(OSError):
     """Credential failure whose message is safe to show without redaction."""
+
+
+class _GatewayAuthTimeout(_GatewayAuthError):
+    """A refresh that ran out of time, which an unexpired token can cover."""
+
+
+def _seconds_until_token_expiry(token: str) -> float | None:
+    """Return the lifetime left by a JWT's unverified ``exp`` claim, or ``None``."""
+    if token.count(".") != 2:
+        return None
+    now = time.time()
+    try:
+        expires_at = _authoritative_expiry(token, now=now, max_cache_age_s=math.inf)
+    except ValueError:
+        return None
+    return expires_at - now if math.isfinite(expires_at) else None
+
+
+def _consume_refresh_failure(refresh: asyncio.Task[str]) -> None:
+    # A request that reused the old token no longer awaits this refresh.
+    if not refresh.cancelled() and (error := refresh.exception()) is not None:
+        logger.debug("Pi gateway credential refresh failed: %s", error)
 
 
 # Each line of Pi's JSONL output; the event schema is owned by the Pi CLI
@@ -168,7 +202,7 @@ async def _fetch_shell_command_token(command: str, *, timeout_s: float | None = 
             raise _GatewayAuthError("Pi gateway auth command returned an empty token")
         return token
     except TimeoutError:
-        raise _GatewayAuthError("Pi gateway auth command timed out") from None
+        raise _GatewayAuthTimeout("Pi gateway auth command timed out") from None
 
 
 def _write_gateway_auth_client(tmp_dir: str, port: int, token: str) -> pathlib.Path:
@@ -1022,7 +1056,9 @@ def _build_models_json(
     for provider_config in config["providers"].values():
         if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
             provider_config["headers"] = gateway_attribution_headers(
-                PI_AGENT, via_ug=is_ug_route(provider_config["baseUrl"])
+                PI_AGENT,
+                via_ug=is_ug_route(provider_config["baseUrl"]),
+                client_surface=harness_client_surface(),
             )
     return config
 
@@ -1450,6 +1486,8 @@ class _PiSessionState:
     # so an unchanged effort costs no RPC and a changed one is applied live.
     applied_thinking: str | None = None
     _has_sent_prompt: bool = False
+    # Set once the current prompt has been aborted; cleared once Pi accepts the next prompt.
+    abort_requested: bool = False
 
 
 @dataclass(frozen=True)
@@ -1676,20 +1714,26 @@ def _split_pi_prompt(blocks: list[_JsonObject]) -> tuple[str, list[dict[str, str
     return "\n".join(text_parts), images
 
 
-def _build_pi_prompt(messages: list[Message], *, is_first_turn: bool) -> str | list[_JsonObject]:
+def _build_pi_prompt(
+    messages: list[Message], *, is_first_turn: bool, after_interrupt: bool = False
+) -> str | list[_JsonObject]:
     """
     Build the prompt to send to Pi.
 
     On the first turn with prior history (e.g. sub-agent with
     ``pass_history=True``), serializes the full conversation so
     the Pi process has context. Otherwise returns just the
-    latest user message content (may be multimodal).
+    latest user message content (may be multimodal), preceded by
+    the runner's interruption marker when the process's previous
+    turn was interrupted.
 
     :param messages: Omnigent conversation history for the
         turn.
     :param is_first_turn: ``True`` when this is the first turn
         against a freshly-started Pi subprocess, so the full
         history needs to be serialized into the prompt.
+    :param after_interrupt: ``True`` when the process's previous
+        prompt was aborted and no prompt has followed.
     :returns: A string prompt or a list of content block dicts.
     """
     user_messages = [m for m in messages if m.get("role") == "user"]
@@ -1706,7 +1750,13 @@ def _build_pi_prompt(messages: list[Message], *, is_first_turn: bool) -> str | l
         )
         return "\n".join(lines)
 
-    return _extract_latest_user_content(messages)
+    latest_user_content = _extract_latest_user_content(messages)
+    marker = pending_interruption_marker(messages) if after_interrupt else None
+    if marker is None:
+        return latest_user_content
+    if isinstance(latest_user_content, list):
+        return [{"type": "input_text", "text": marker}, *latest_user_content]
+    return f"{marker}\n\n{latest_user_content}"
 
 
 @dataclass(frozen=True)
@@ -2241,6 +2291,7 @@ class PiExecutor(Executor):
             raise ValueError("gateway_auth_refresh_interval_ms must be nonnegative")
         self._gateway_auth_refresh_interval_s = interval / 1000
         self._gateway_refresh_after = 0.0
+        self._gateway_refresh_task: asyncio.Task[str] | None = None
         self._gateway_auth_lock = asyncio.Lock()
         # Retry policy → Pi's .pi/settings.json before subprocess spawn.
         # See ``RetryPolicy.pi.settings()`` for the schema. Pi natively
@@ -2360,6 +2411,9 @@ class PiExecutor(Executor):
     def supports_live_message_queue(self) -> bool:
         return True
 
+    def resumes_after_interrupt(self) -> bool:
+        return True
+
     async def enqueue_session_message(  # type: ignore[explicit-any]
         self,
         session_key: str,
@@ -2406,16 +2460,16 @@ class PiExecutor(Executor):
         state = self._session_states.get(session_key)
         if state is None or state.rpc is None:
             return False
-        # Best-effort abort to halt the in-flight turn.
+        if state.abort_requested:
+            return True
+        state.abort_requested = True
         try:
             await state.rpc.send_command({"type": "abort", "id": "abort"})
+            return True
         except Exception as exc:  # noqa: BLE001 — abort is best-effort
             logger.debug("PiExecutor: interrupt abort failed: %s", exc)
-        # Always drop the session so the next turn starts fresh and replays
-        # full history. A resumed subprocess sends only the latest user
-        # message, which would bypass the runner's "[System: interrupted]"
-        # marker and silently continue the abandoned request. See
-        # claude_sdk_executor.interrupt_session for the rationale.
+        # The turn may still be running, so drop the process; the next turn
+        # replays history, including the interruption marker, in a fresh one.
         try:
             await self.close_session(session_key)
             return True
@@ -2430,6 +2484,11 @@ class PiExecutor(Executor):
         if self._tool_server is not None:
             await self._tool_server.stop()
             self._tool_server = None
+        refresh, self._gateway_refresh_task = self._gateway_refresh_task, None
+        if refresh is not None:
+            # Cancelling kills the helper's process group (see _fetch_shell_command_token).
+            refresh.cancel()
+            await asyncio.gather(refresh, return_exceptions=True)
 
     def _session_key(self, messages: list[Message]) -> str:
         if messages:
@@ -2559,47 +2618,73 @@ class PiExecutor(Executor):
         return self._tool_server.port
 
     async def _get_gateway_token(self, *, before_turn: bool = False) -> str:
-        """Refresh expired credentials under a lock; never fall back after failure.
+        """Return the cached credential, refreshing it under a lock once it is due.
 
-        A ``before_turn`` refresh runs before Pi starts and takes the longer budget;
-        the default fits the bridge's answer to Pi inside Pi's command deadline.
+        The refresh runs in its own task, so a helper too slow for Pi's command
+        deadline still finishes and serves later requests. A bridge request waits
+        only as long as that deadline allows; a ``before_turn`` request waits for the
+        refresh itself. If time runs out, including a helper that outlives its own
+        budget, the previous token is served while its ``exp`` claim leaves it valid.
+        A helper that exits with an error, or a token without an expiry, still fails
+        the request.
         """
-        if before_turn:
-            helper_timeout_s = _GATEWAY_TURN_AUTH_TIMEOUT_S
-            refresh_timeout_s = _GATEWAY_TURN_AUTH_TIMEOUT_S + 1
-        else:
-            helper_timeout_s = _GATEWAY_AUTH_TIMEOUT_S
-            refresh_timeout_s = _GATEWAY_BRIDGE_TIMEOUT_S
-        async with self._gateway_auth_lock:
-            if time.monotonic() < self._gateway_refresh_after:
+        try:
+            async with asyncio.timeout(None if before_turn else _GATEWAY_AUTH_TIMEOUT_S):
+                async with self._gateway_auth_lock:
+                    if time.monotonic() < self._gateway_refresh_after:
+                        return self._databricks_token
+                    self._gateway_refresh_after = 0.0
+                    refresh = self._gateway_refresh_task
+                    if refresh is None or refresh.done():
+                        refresh = asyncio.create_task(self._refresh_gateway_token())
+                        refresh.add_done_callback(_consume_refresh_failure)
+                        self._gateway_refresh_task = refresh
+                    return await asyncio.shield(refresh)
+        except (TimeoutError, _GatewayAuthTimeout) as exc:
+            # Read the expiry now against wall time: the monotonic clock stops while a
+            # host sleeps, so a deadline derived at fetch time could outlive the token.
+            lifetime_s = _seconds_until_token_expiry(self._databricks_token)
+            if lifetime_s is not None and lifetime_s > _GATEWAY_TOKEN_REUSE_MARGIN_S:
+                logger.warning("Pi gateway credential refresh is slow; reusing the current token")
                 return self._databricks_token
-            self._gateway_refresh_after = 0.0
-            try:
-                async with asyncio.timeout(refresh_timeout_s):
-                    if self._gateway_host_override is not None:
-                        assert self._gateway_auth_command is not None
-                        token = await _fetch_shell_command_token(
-                            self._gateway_auth_command, timeout_s=helper_timeout_s
-                        )
-                    else:
-                        creds = await run_sync_on_thread(
-                            _read_databrickscfg, self._databricks_profile
-                        )
-                        token = creds.token if creds is not None else None
-                        if creds is not None and not self._databricks_host:
-                            self._databricks_host = creds.host
-                    if not isinstance(token, str) or not token.strip():
-                        raise _GatewayAuthError("Pi gateway authentication returned no token")
-            except _GatewayAuthError:
+            if isinstance(exc, _GatewayAuthTimeout):
                 raise
-            except TimeoutError:
-                raise _GatewayAuthError("Pi gateway credential refresh timed out") from None
-            except Exception:  # noqa: BLE001 — SDK/helper exceptions may contain credentials
-                raise _GatewayAuthError("Pi gateway credential refresh failed") from None
-            self._databricks_token = token
-            self._gateway_workspace_url = self._gateway_model_service_workspace_url()
-            self._gateway_refresh_after = time.monotonic() + self._gateway_auth_refresh_interval_s
-            return token
+            raise _GatewayAuthTimeout("Pi gateway credential refresh timed out") from None
+
+    async def _refresh_gateway_token(self) -> str:
+        """Fetch a credential and cache it until its interval or expiry window comes due."""
+        try:
+            async with asyncio.timeout(_GATEWAY_TURN_AUTH_TIMEOUT_S + 1):
+                if self._gateway_host_override is not None:
+                    assert self._gateway_auth_command is not None
+                    token = await _fetch_shell_command_token(
+                        self._gateway_auth_command, timeout_s=_GATEWAY_TURN_AUTH_TIMEOUT_S
+                    )
+                else:
+                    creds = await run_sync_on_thread(_read_databrickscfg, self._databricks_profile)
+                    token = creds.token if creds is not None else None
+                    if creds is not None and not self._databricks_host:
+                        self._databricks_host = creds.host
+                if not isinstance(token, str) or not token.strip():
+                    raise _GatewayAuthError("Pi gateway authentication returned no token")
+        except _GatewayAuthError:
+            raise
+        except TimeoutError:
+            raise _GatewayAuthTimeout("Pi gateway credential refresh timed out") from None
+        except Exception:  # noqa: BLE001 — SDK/helper exceptions may contain credentials
+            raise _GatewayAuthError("Pi gateway credential refresh failed") from None
+        now = time.monotonic()
+        cache_s = self._gateway_auth_refresh_interval_s
+        lifetime_s = _seconds_until_token_expiry(token)
+        if lifetime_s is not None:
+            renew_in_s = max(
+                lifetime_s - _GATEWAY_TOKEN_RENEW_BEFORE_EXPIRY_S, _GATEWAY_TOKEN_MIN_RECHECK_S
+            )
+            cache_s = min(cache_s, renew_in_s)
+        self._databricks_token = token
+        self._gateway_workspace_url = self._gateway_model_service_workspace_url()
+        self._gateway_refresh_after = now + cache_s
+        return token
 
     async def _gate_native_tool(  # type: ignore[explicit-any]
         self,
@@ -2684,6 +2769,7 @@ class PiExecutor(Executor):
                 global_agent_dir=global_pi_agent_dir(
                     env=self._env, workspace=pathlib.Path(self._cwd) if self._cwd else None
                 ),
+                pi_env=env,
             )
             from omnigent.inner.pi_gateway import pi_gateway_extension_args
 
@@ -3042,7 +3128,11 @@ class PiExecutor(Executor):
         state = self._session_states.get(session_key)
         is_first_turn = state is not None and not state._has_sent_prompt
 
-        prompt = _build_pi_prompt(messages, is_first_turn=is_first_turn)
+        prompt = _build_pi_prompt(
+            messages,
+            is_first_turn=is_first_turn,
+            after_interrupt=state is not None and state.abort_requested,
+        )
 
         if not prompt:
             # No prompt built (e.g. empty message list on a resumed session) —
@@ -3084,6 +3174,8 @@ class PiExecutor(Executor):
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces prompt-send errors as ExecutorError
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
+        if state is not None:
+            state.abort_requested = False
 
         # Read events until the turn boundary: ``agent_settled`` on pi >= 0.80.4,
         # where one prompt may span several ``agent_end`` runs (retry, compaction,
@@ -3346,7 +3438,11 @@ class PiExecutor(Executor):
             if event_type == "agent_settled" and settled_boundary:
                 # A failed turn still reports it: the kept pi process stays compacted.
                 if compaction_result is not None:
-                    yield await self._compaction_complete(rpc, compaction_result, model)
+                    compaction = await self._compaction_complete(rpc, compaction_result, model)
+                    if state is not None and state.abort_requested:
+                        # An interrupted turn's events are discarded, so replay history instead.
+                        await self._evict_rpc(session_key, rpc)
+                    yield compaction
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
@@ -3369,6 +3465,9 @@ class PiExecutor(Executor):
                         message_usages.append(captured)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
+                    if stop == "aborted" and state is not None and state.abort_requested:
+                        # Read on to the run's boundary so the kept process is idle.
+                        continue
                     if stop == "aborted" or (
                         stop == "error" and settled_boundary and message_streamed_text
                     ):

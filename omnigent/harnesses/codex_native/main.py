@@ -11,6 +11,7 @@ import re
 import secrets
 import shutil
 import socket
+import subprocess
 import time
 import uuid
 from collections import Counter
@@ -35,6 +36,7 @@ from omnigent.entities.conversation import NON_CONTENT_ITEM_TYPES
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
+    HARNESS_CLI_UNRESPONSIVE,
     HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
     HarnessUnavailableReason,
@@ -273,7 +275,9 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     CLI can't stall the readiness refresh, and any resolver failure fails safe
     onto the ``auth.json`` check.
 
-    :returns: ``"binary-missing"`` when the CLI is absent, ``"needs-auth"``
+    :returns: ``"binary-missing"`` when the CLI is absent,
+        ``"cli-unresponsive"`` when its ``--version`` probe times out,
+        ``"version-too-low"`` when it reports an unsupported version, ``"needs-auth"``
         when a config-selected provider's declared env credential is missing
         or the launch uses Codex login without a usable ``auth.json``, and
         ``None`` when a provider will route the launch, Codex's own config is
@@ -289,8 +293,13 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
 
     if _find_codex_cli() is None:
         return HARNESS_BINARY_MISSING
-    if not harness_cli_installed(OPENAI_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
-        return HARNESS_VERSION_TOO_LOW
+    try:
+        if not harness_cli_installed(
+            OPENAI_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S, raise_on_timeout=True
+        ):
+            return HARNESS_VERSION_TOO_LOW
+    except subprocess.TimeoutExpired:
+        return HARNESS_CLI_UNRESPONSIVE
     # On a host with no configured provider this may run ambient detection.
     # configured_harness_map shares one probe across all Codex aliases.
     defers_to_codex_config = False
@@ -642,8 +651,8 @@ def _materialize_codex_agent_spec(
     return yaml_path
 
 
-def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
-    """Resolve raw author instructions from the wrapper's agent spec.
+def _wrapper_spec_startup_instructions(spec_path: Path) -> str:
+    """Compose author instructions and stable guidance for the wrapper's session.
 
     Reuses :func:`omnigent.spec.load` (the same loader
     :func:`~omnigent.cli._bundle` and the server use for both an agent-image
@@ -654,23 +663,21 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     :param spec_path: The generated/current wrapper agent spec (a
         standalone YAML file or an agent-image directory).
-    :returns: The verbatim instructions text, or ``None`` if unresolvable
-        or absent/whitespace-only. Best-effort: a malformed spec must not
-        block the terminal launch, so load failures degrade to ``None``.
+    :returns: Startup instructions, with framework guidance if the spec fails.
     """
-    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.runtime.prompt import build_native_startup_instructions
     from omnigent.spec import load as load_agent_spec
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
     except Exception:
         _logger.warning(
-            "Could not resolve raw instructions from wrapper spec %s",
+            "Could not resolve instructions from wrapper spec %s",
             spec_path,
             exc_info=True,
         )
-        return None
-    return raw_author_instructions(spec)
+        return build_native_startup_instructions(None)
+    return build_native_startup_instructions(spec)
 
 
 def _run_with_local_server(
@@ -740,7 +747,7 @@ def _run_with_local_server(
                     command=command,
                     model=model,
                     startup_progress=progress,
-                    developer_instructions=_wrapper_spec_raw_instructions(spec_path),
+                    developer_instructions=_wrapper_spec_startup_instructions(spec_path),
                 )
             if resolved_session_id is None:
                 _record_launch_for_fresh_session(prepared.session_id)
@@ -1128,7 +1135,7 @@ async def _prepare_codex_terminal(
     :param model: Optional model id.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
-    :param developer_instructions: Raw author instructions persisted into
+    :param developer_instructions: Session startup instructions persisted into
         Codex's private per-session config, applied on fresh launch and
         cold resume only — the reattach branch below returns before this
         is used, so it never relaunches or duplicates the value.
@@ -2272,7 +2279,13 @@ def _codex_rollout_records_from_session_items(
         interrupted_response_ids=interrupted_response_ids,
     )
     items = _codex_items_with_outputs_in_call_order(
-        [item for item in items if _session_item_response_id(item) not in interrupted_response_ids]
+        _codex_items_with_outputs_after_their_calls(
+            [
+                item
+                for item in items
+                if _session_item_response_id(item) not in interrupted_response_ids
+            ]
+        )
     )
     for index, item in enumerate(items):
         item_call_id = item.get("call_id")
@@ -2304,6 +2317,15 @@ def _codex_rollout_records_from_session_items(
                             message = {
                                 **message,
                                 "arguments": _codex_replayed_arguments(message["arguments"]),
+                            }
+                        elif (
+                            message.get("type")
+                            in ("function_call_output", "custom_tool_call_output")
+                            and "output" in message
+                        ):
+                            message = {
+                                **message,
+                                "output": sanitize_replayed_image_blocks(message["output"]),
                             }
                     replacement_history.append(message)
                 replacement_history = _codex_history_without_orphan_outputs(replacement_history)
@@ -2390,6 +2412,72 @@ def _codex_rollout_records_from_session_items(
         if event_msg is not None:
             records.append(event_msg)
     return records
+
+
+def _codex_items_with_outputs_after_their_calls(
+    items: list[_JsonObject],
+) -> list[_JsonObject]:
+    """
+    Move tool outputs stored after later content back up to their calls.
+
+    The forwarder persists a tool output when the tool completes, so a
+    long-running command's output can be stored after assistant messages and
+    other tool exchanges. Providers that require each call's result before the
+    next message or tool exchange (e.g. Kimi) reject that history. When a
+    content item or a new tool exchange starts, emit the stored outputs of
+    calls still waiting for one. Outputs never move across a compaction
+    snapshot.
+
+    :param items: Flat Omnigent item dicts in chronological order.
+    :returns: Items with each displaced output moved to the end of its call's
+        tool exchange.
+    """
+    first_output_positions: dict[tuple[int, str], int] = {}
+    segments: list[int] = []
+    segment = 0
+    for position, item in enumerate(items):
+        if item.get("type") == "compaction":
+            segment += 1
+        segments.append(segment)
+        call_id = item.get("call_id")
+        if item.get("type") == "function_call_output" and isinstance(call_id, str):
+            first_output_positions.setdefault((segment, call_id), position)
+    ordered: list[_JsonObject] = []
+    moved_positions: set[int] = set()
+    waiting_call_ids: list[str] = []
+    exchange_has_output = False
+
+    def close_exchange(position: int) -> None:
+        nonlocal exchange_has_output
+        for waiting_call_id in list(waiting_call_ids):
+            output_position = first_output_positions.get((segments[position], waiting_call_id))
+            if output_position is not None and output_position > position:
+                ordered.append(items[output_position])
+                moved_positions.add(output_position)
+                waiting_call_ids.remove(waiting_call_id)
+        exchange_has_output = False
+
+    for position, item in enumerate(items):
+        item_type = item.get("type")
+        call_id = item.get("call_id")
+        if item_type == "function_call_output":
+            if position in moved_positions:
+                continue
+            if isinstance(call_id, str) and call_id in waiting_call_ids:
+                waiting_call_ids.remove(call_id)
+            exchange_has_output = True
+        elif item_type == "function_call":
+            if exchange_has_output:
+                close_exchange(position)
+            if isinstance(call_id, str):
+                waiting_call_ids.append(call_id)
+        elif item_type == "compaction":
+            # Replay carries unfinished calls into the snapshot until their outputs arrive.
+            exchange_has_output = False
+        elif item_type not in NON_CONTENT_ITEM_TYPES:
+            close_exchange(position)
+        ordered.append(item)
+    return ordered
 
 
 def _codex_items_with_outputs_in_call_order(

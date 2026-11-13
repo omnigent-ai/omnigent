@@ -37,7 +37,7 @@ import {
 } from "./routingDecision";
 import type { AssistantMessagePhase } from "./conversationItems";
 import { isSystemUserContent } from "./systemMessage";
-import type { AgyPermission, CodexPersistMode, RememberScope } from "./types";
+import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -75,6 +75,8 @@ export type RenderItem =
       itemId: string | null;
       text: string;
       final: boolean;
+      /** Key for text that arrived over this page's stream; it holds while the item id commits. */
+      streamKey?: string;
       previewInterrupted?: boolean;
       /** Harness label for the message (Codex); `commentary` is progress narration. */
       phase?: AssistantMessagePhase;
@@ -153,6 +155,7 @@ export type RenderItem =
       } | null;
       askUserQuestion?: Record<string, unknown> | null;
       exitPlanMode?: Record<string, unknown> | null;
+      fileEdit?: FileEditRequest | null;
       codexCommand?: {
         command: string;
         cwd: string | null;
@@ -176,6 +179,12 @@ export type Bubble =
       pending?: boolean;
       /** Pending input sent mid-turn that the agent hasn't read yet. */
       awaitingAgent?: boolean;
+      /** Pending input whose send request has not been answered for a while. */
+      stillSending?: boolean;
+      /** Pending input the server accepted (its send request succeeded). */
+      accepted?: boolean;
+      /** Saved startup message the server never delivered (the launch failed). */
+      undelivered?: boolean;
       content: MessageContentBlock[];
       /** Shell input is literal command text, not Markdown or attachment markers. */
       shellCommand?: string;
@@ -197,6 +206,8 @@ export type Bubble =
       responseId: string;
       // Stable, sibling-unique identifier for React keying
       stableId: string;
+      /** Response id of the streamed block that opened this bubble; it keys the bubble. */
+      liveOpener?: string;
       lifecycle: ActiveResponse["state"];
       /** Free-form error message when `lifecycle === "failed"`. */
       error: string | null;
@@ -571,6 +582,14 @@ function isAnonymousRid(rid: string): boolean {
   return rid === "" || rid.startsWith(LIVE_ITEM_PREFIX);
 }
 
+/** Whether a block arrived over this page's live stream, not from history or as a `live:` preview. */
+function arrivedLive(block: AnyBlock): boolean {
+  return (
+    block.ctx.clientCreatedAtS !== undefined &&
+    !(block.ctx.itemId?.startsWith(LIVE_ITEM_PREFIX) ?? false)
+  );
+}
+
 function errorDetails(block: ErrorBlock): RelatedRenderError {
   return {
     itemId: block.ctx.itemId,
@@ -801,6 +820,13 @@ function walkBubbles(
   liveTurnId: string | null = null,
 ): { bubbles: Bubble[]; lastBubbleStart: number; lastBubbleCount: number } {
   const bubbles: Bubble[] = [...seedBubbles];
+  // Streamed bubbles already in the reused prefix keep their numbers per opener.
+  const liveIndexByOpener = new Map<string, number>();
+  for (const b of seedBubbles) {
+    if (b.kind === "assistant" && b.liveOpener !== undefined) {
+      liveIndexByOpener.set(b.liveOpener, (liveIndexByOpener.get(b.liveOpener) ?? 0) + 1);
+    }
+  }
   // One cross-bubble result index per walk: the relay backdates a
   // delayed function_call_output to its ORIGINAL turn's response id, so
   // a result can sit outside its call's bubble; pairing is keyed
@@ -1090,7 +1116,20 @@ function walkBubbles(
           bk.ctx.itemId !== null &&
           !bk.ctx.itemId.startsWith(LIVE_ITEM_PREFIX),
       )?.ctx.itemId ?? null;
-    const stableId = firstItemId ?? `${groupResponseId}:${subIndex}`;
+    // A bubble opened by a streamed block is keyed by that block's response id: ids that
+    // commit afterwards (a tool call, the id stamped onto its text) or a later step's
+    // response id would otherwise change the key and remount the reply mid-turn.
+    const opener = groupBlocks.find((bk) => bk.type !== "tool_result");
+    const liveOpener =
+      opener !== undefined && arrivedLive(opener) && !isAnonymousRid(opener.ctx.responseId)
+        ? opener.ctx.responseId
+        : undefined;
+    let stableId = firstItemId ?? `${groupResponseId}:${subIndex}`;
+    if (liveOpener !== undefined) {
+      const liveIndex = liveIndexByOpener.get(liveOpener) ?? 0;
+      liveIndexByOpener.set(liveOpener, liveIndex + 1);
+      stableId = `${liveOpener}:live:${liveIndex}`;
+    }
 
     lastBubbleStart = groupStart;
     lastBubbleCount = 1;
@@ -1127,6 +1166,7 @@ function walkBubbles(
       kind: "assistant",
       responseId: groupResponseId,
       stableId,
+      ...(liveOpener !== undefined ? { liveOpener } : {}),
       lifecycle,
       error,
       // `sessionLive` spins this turn's trailing tools when the session is
@@ -1603,6 +1643,7 @@ function buildAssistantItems(
   const hasNonEmptyTextDone = blocks.some((b) => b.type === "text_done" && b.fullText.length > 0);
 
   const items: RenderItem[] = [];
+  let textCount = 0;
   let i = 0;
   while (i < blocks.length) {
     const b = blocks[i]!;
@@ -1619,7 +1660,9 @@ function buildAssistantItems(
       for (let k = 0; k < run.length; k += 1) {
         if (run[k]!.type === "text_done") {
           const slice = run.slice(chunkStart, k + 1);
-          const item = textItem(slice);
+          // Every segment takes an ordinal, so dropping an empty one doesn't renumber the rest.
+          const item = textItem(slice, textCount);
+          textCount += 1;
           // Drop empty trailing TextDones when a non-empty one exists
           // in the same bubble. Without this, the server's empty
           // trailing message item would render as a blank bubble line.
@@ -1633,7 +1676,8 @@ function buildAssistantItems(
         }
       }
       if (chunkStart < run.length) {
-        items.push(textItem(run.slice(chunkStart)));
+        items.push(textItem(run.slice(chunkStart), textCount));
+        textCount += 1;
       }
       continue;
     }
@@ -1769,6 +1813,7 @@ function buildAssistantItems(
         response: b.response,
         askUserQuestion: b.askUserQuestion,
         exitPlanMode: b.exitPlanMode,
+        fileEdit: b.fileEdit,
         codexCommand: b.codexCommand,
         allowAllEdits: b.allowAllEdits,
         allowAutoMode: b.allowAutoMode,
@@ -1818,10 +1863,11 @@ function trailingLiveToolCallIds(
   return callIds;
 }
 
-function textItem(run: AnyBlock[]): RenderItem {
+function textItem(run: AnyBlock[], ordinal: number): RenderItem {
   // Prefer the canonical fullText from text_done if present; otherwise
   // concatenate the text_chunks. Use the text_done's itemId for keys
   // when available.
+  const streamed = run.some(arrivedLive) ? { streamKey: `text#${ordinal}` } : {};
   for (let i = run.length - 1; i >= 0; i -= 1) {
     const b = run[i]!;
     if (b.type === "text_done") {
@@ -1830,6 +1876,7 @@ function textItem(run: AnyBlock[]): RenderItem {
         itemId: b.ctx.itemId,
         text: b.fullText,
         final: true,
+        ...streamed,
         ...(b.previewInterrupted ? { previewInterrupted: true } : {}),
         ...(b.phase !== undefined ? { phase: b.phase } : {}),
       };
@@ -1839,7 +1886,7 @@ function textItem(run: AnyBlock[]): RenderItem {
     .filter((b) => b.type === "text_chunk")
     .map((b) => (b as Extract<AnyBlock, { type: "text_chunk" }>).text)
     .join("");
-  return { kind: "text", itemId: null, text, final: false };
+  return { kind: "text", itemId: null, text, final: false, ...streamed };
 }
 
 function reasoningItem(run: AnyBlock[]): RenderItem {
@@ -1962,6 +2009,9 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.itemId !== b.itemId ||
       Boolean(a.pending) !== Boolean(b.pending) ||
       Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
+      Boolean(a.stillSending) !== Boolean(b.stillSending) ||
+      Boolean(a.accepted) !== Boolean(b.accepted) ||
+      Boolean(a.undelivered) !== Boolean(b.undelivered) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
