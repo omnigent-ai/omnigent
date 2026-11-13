@@ -44,6 +44,7 @@ import { sidebarConfig } from "@/lib/sidebarConfig";
 import { SessionUpdatesProvider } from "./SessionUpdatesProvider";
 import { useSaveProjectOrder } from "./useProjectOrder";
 import * as projectsApi from "@/lib/projectsApi";
+import { modalHostId } from "@/lib/sessionHost";
 
 type SidebarDataValue = NonNullable<ContextType<typeof SidebarDataContext>>;
 const identityPendingSidebarData = {
@@ -176,6 +177,80 @@ afterEach(() => {
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
+  it("takes the modal host from the own list, not from a non-empty shared list", () => {
+    const client = new QueryClient();
+    const row = (id: string, host: string, permission_level = 4) =>
+      ({ ...conv(id), host_id: host, permission_level }) as Conversation;
+    client.setQueryData(["conversations", "", false, null, "shared"], {
+      pages: [
+        {
+          data: [row("shared_1", "host_shared", 1), row("shared_2", "host_shared", 1)],
+          first_id: "shared_1",
+          last_id: "shared_2",
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    } satisfies ConversationsInfiniteData);
+    // The unfiltered list mixes the viewer's row with two shared rows on another host.
+    client.setQueryData(["conversations", "", false], {
+      pages: [
+        {
+          data: [
+            row("mine_1", "host_own"),
+            row("shared_3", "host_shared", 1),
+            row("shared_4", "host_shared", 1),
+          ],
+          first_id: "mine_1",
+          last_id: "shared_4",
+          has_more: false,
+        },
+      ],
+      pageParams: [undefined],
+    } satisfies ConversationsInfiniteData);
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SidebarDataContext.Provider value={identityReadySidebarData}>
+            <SessionUpdatesProvider>{null}</SessionUpdatesProvider>
+          </SidebarDataContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(modalHostId()).toBe("host_own");
+    expect(start).toHaveBeenCalledOnce();
+  });
+
+  it("starts session updates from the user's own list, not an empty shared list", () => {
+    const client = new QueryClient();
+    client.setQueryData(["conversations", "", false, null, "shared"], {
+      pages: [{ data: [], first_id: null, last_id: null, has_more: false }],
+      pageParams: [undefined],
+    } satisfies ConversationsInfiniteData);
+    const { rerender } = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SidebarDataContext.Provider value={identityReadySidebarData}>
+            <SessionUpdatesProvider>{null}</SessionUpdatesProvider>
+          </SidebarDataContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(start).not.toHaveBeenCalled();
+
+    seedConversations(client, ["conv_a"]);
+    rerender(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <SidebarDataContext.Provider value={identityReadySidebarData}>
+            <SessionUpdatesProvider>{null}</SessionUpdatesProvider>
+          </SidebarDataContext.Provider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(start).toHaveBeenCalledOnce();
+  });
+
   it("waits for sidebar identity before starting session updates", () => {
     const client = new QueryClient();
     seedConversations(client, ["conv_a"]);
