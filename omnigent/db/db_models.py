@@ -31,6 +31,7 @@ from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from omnigent.db.bounded_binary import BoundedBinary
 from omnigent.db.compression import CompressedText
 from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
@@ -1664,6 +1665,8 @@ class SqlScheduledTask(OmnigentBase):
             "created_at",
             "id",
         ),
+        # Pages one agent's tasks across owners, e.g. every proactive-agent task.
+        Index("ix_scheduled_tasks_agent", "workspace_id", "agent_id", "id"),
     )
 
 
@@ -1780,6 +1783,121 @@ class SqlScheduledTaskRun(OmnigentBase):
             "conversation_id",
             "status",
             "id",
+        ),
+    )
+
+
+# Largest stored (compressed) value for a new column, per the database guide.
+_INBOX_MAX_STORED_BYTES = 16_383
+
+
+class SqlInboxItem(OmnigentBase):
+    """Agent-posted Inbox suggestions, scoped to a workspace and owner.
+
+    Agent and session relationships are maintained by application code (no DB
+    foreign key, Rule R032). What the agent wrote and how the owner answered are
+    two storage envelopes; the other columns route, order, and deduplicate.
+    """
+
+    __tablename__ = "inbox_items"
+
+    # Tenant partition key: workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # The reserved "local" user in single-user mode, so the unique index applies there too.
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # The session whose agent posted the item, and that agent.
+    source_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    agent_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    # Versioned duplicate key: a hash of the kind, primary link, and topic.
+    dedupe_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    # INBOX_ITEM_STATUS code: unread, read, done, or dismissed.
+    status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    # What the agent posted, which a deployment may encrypt, as one storage
+    # envelope: {"kind", "title", "body_md", "links", "actions", "topic",
+    # "primary_link", "media"}. Always read and written together.
+    content: Mapped[bytes] = mapped_column(BoundedBinary(_INBOX_MAX_STORED_BYTES), nullable=False)
+    # How the owner answered, in its own envelope since it is written alone:
+    # {"reason", "action", "text"}. NULL until the owner answers.
+    resolution: Mapped[bytes | None] = mapped_column(
+        BoundedBinary(_INBOX_MAX_STORED_BYTES), nullable=True
+    )
+    # Unix epoch seconds.
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    resolved_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    expires_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN (1, 2, 3, 4)", name="ck_inbox_items_status"),
+        # SQLite enforces neither declared lengths nor types; these bound what it stores.
+        CheckConstraint(
+            "user_id IS NULL OR length(CAST(user_id AS BLOB)) <= 512",
+            name="ck_inbox_items_user_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "dedupe_key IS NULL OR length(CAST(dedupe_key AS BLOB)) <= 512",
+            name="ck_inbox_items_dedupe_key_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "content IS NULL OR length(CAST(content AS BLOB)) <= 16383",
+            name="ck_inbox_items_content_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "resolution IS NULL OR length(CAST(resolution AS BLOB)) <= 16383",
+            name="ck_inbox_items_resolution_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "workspace_id IS NULL OR typeof(workspace_id) = 'integer'",
+            name="ck_inbox_items_workspace_id_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "created_at IS NULL OR typeof(created_at) = 'integer'",
+            name="ck_inbox_items_created_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "resolved_at IS NULL OR typeof(resolved_at) = 'integer'",
+            name="ck_inbox_items_resolved_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "expires_at IS NULL OR typeof(expires_at) = 'integer'",
+            name="ck_inbox_items_expires_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "length(CAST(id AS BLOB)) = 16",
+            name="ck_inbox_items_id_uuid",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "length(CAST(source_session_id AS BLOB)) = 16",
+            name="ck_inbox_items_source_session_id_uuid",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "length(CAST(agent_id AS BLOB)) = 16",
+            name="ck_inbox_items_agent_id_uuid",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # Newest-first list of all of an owner's items.
+        Index("ix_inbox_items_user_created", "workspace_id", "user_id", "created_at", "id"),
+        # Newest-first list and bounded count of an owner's items in one status.
+        Index(
+            "ix_inbox_items_user_status_created",
+            "workspace_id",
+            "user_id",
+            "status",
+            "created_at",
+            "id",
+        ),
+        # Bounded count of the items one session posted, for the per-session cap.
+        Index("ix_inbox_items_session", "workspace_id", "user_id", "source_session_id", "id"),
+        Index(
+            "uq_inbox_items_user_dedupe_key",
+            "workspace_id",
+            "user_id",
+            "dedupe_key",
+            unique=True,
         ),
     )
 
