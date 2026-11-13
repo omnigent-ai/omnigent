@@ -5,7 +5,8 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
-import type { AgentCost } from "@/hooks/useAgentCosts";
+import type * as UseAgentCostsModule from "@/hooks/useAgentCosts";
+import type { AgentCosts } from "@/hooks/useAgentCosts";
 import {
   buildTree,
   childActivity,
@@ -39,6 +40,12 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   useChildSessions: vi.fn(),
 }));
 
+// The panel reads costs through this hook; tests set what it returns.
+const agentCosts = vi.hoisted(() => ({ current: undefined as AgentCosts | undefined }));
+vi.mock("@/hooks/useAgentCosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseAgentCostsModule>()),
+  useAgentCosts: () => ({ data: agentCosts.current }),
+}));
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
 }));
@@ -111,15 +118,12 @@ function defaultSession(): ReturnType<typeof useSession> {
   };
 }
 
-function renderPanel(
-  opts: { conversationId?: string; rootSessionId?: string; costs?: Map<string, AgentCost> } = {},
-) {
+function renderPanel(opts: { conversationId?: string; rootSessionId?: string } = {}) {
   return render(
     <MemoryRouter>
       <SubagentsPanel
         conversationId={opts.conversationId ?? "conv_root"}
         rootSessionId={opts.rootSessionId ?? "conv_root"}
-        costs={opts.costs}
       />
     </MemoryRouter>,
   );
@@ -142,6 +146,7 @@ function leaf(id: string, overrides: Partial<TreeNode> = {}): TreeNode {
 // ---------------------------------------------------------------------------
 
 beforeEach(() => {
+  agentCosts.current = undefined;
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
   useSessionMock.mockReturnValue(defaultSession());
@@ -687,11 +692,8 @@ describe("SubagentsPanel view-mode toggle", () => {
       conv_root: [childInfo({ id: "c1", tool: "researcher" })],
     });
 
-    renderPanel({
-      conversationId: "conv_child",
-      rootSessionId: "conv_root",
-      costs: new Map([["c1", { costUsd: 0.4, estimated: false }]]),
-    });
+    agentCosts.current = new Map([["c1", { costUsd: 0.4, estimated: false }]]);
+    renderPanel({ conversationId: "conv_child", rootSessionId: "conv_root" });
 
     fireEvent.click(screen.getByTestId("view-mode-graph"));
 

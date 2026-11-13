@@ -94,7 +94,6 @@ import {
   MAX_TREE_DEPTH,
   useChildSessions,
 } from "@/hooks/useChildSessions";
-import { useAgentCosts } from "@/hooks/useAgentCosts";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
 import { AGENT_BROWSER_TAB_ID, browserViewOwnerId, openBrowserTab } from "@/hooks/useBrowserTabs";
@@ -1090,7 +1089,6 @@ function AppShellImpl() {
   // SubagentsPanel mounts its own polling usage of the hook against
   // the same rootSessionId, so the cache is shared.
   const { children: childSessions } = useChildSessions(rootSessionId);
-  const agentCosts = useAgentCosts(rootSessionId).data ?? undefined;
   // Remember the resolved root so a later click into one of its tree
   // members can hold it steady (see ``rootSessionId`` above).
   useEffect(() => {
@@ -3273,7 +3271,6 @@ function AppShellImpl() {
                     onMobileSideChatsOpenChange={setSideChatsPanelOpen}
                     onHasSideChatTabsChange={setHasSideChatTabs}
                     subagentPanelOpener={openSubagentInPanel}
-                    agentCosts={agentCosts}
                   />
                 )}
               </div>
@@ -3298,7 +3295,6 @@ function AppShellImpl() {
                 filesPanelSort={filesPanelSort}
                 handleFilesSortChange={handleFilesSortChange}
                 rootSessionId={rootSessionId}
-                agentCosts={agentCosts}
                 subagentsPanelOpen={subagentsPanelOpen}
                 setSubagentsPanelOpen={setSubagentsPanelOpen}
                 shellsPanelOpen={shellsPanelOpen}

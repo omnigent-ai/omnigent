@@ -72,7 +72,6 @@ import { authenticatedFetch } from "@/lib/identity";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
 import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
-import type { AgentCosts } from "@/hooks/useAgentCosts";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
 import { useCanStartSideChat } from "@/hooks/usePermissions";
@@ -807,8 +806,6 @@ interface WorkspacePanelProps {
   onHasSideChatTabsChange?: (hasSideChatTabs: boolean) => void;
   /** Opens a sub-agent from the Agents tab as a rail tab; absent where unsupported (Grid panes). */
   subagentPanelOpener?: SubagentPanelOpener;
-  /** Agent display costs for the Agents tab, keyed by session id. */
-  agentCosts?: AgentCosts;
 }
 
 /** A closed tab that Reopen Closed Tab (⇧⌘T) can bring back. */
@@ -936,7 +933,6 @@ function WorkspacePanelImpl({
   onMobileSideChatsOpenChange,
   onHasSideChatTabsChange,
   subagentPanelOpener,
-  agentCosts,
 }: WorkspacePanelProps) {
   const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
@@ -2223,11 +2219,7 @@ function WorkspacePanelImpl({
             </RenderErrorBoundary>
           ) : scopeView === "subagents" && rootSessionId ? (
             <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
-              <SubagentsPanel
-                conversationId={conversationId}
-                rootSessionId={rootSessionId}
-                costs={agentCosts}
-              />
+              <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
             </SubagentPanelOpenerContext.Provider>
           ) : scopeView === "empty" ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">

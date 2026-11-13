@@ -16,7 +16,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
-import type { AgentCost } from "@/hooks/useAgentCosts";
+import type * as UseAgentCostsModule from "@/hooks/useAgentCosts";
+import type { AgentCosts } from "@/hooks/useAgentCosts";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
@@ -27,6 +28,12 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   useChildSessions: vi.fn(),
 }));
 
+// The panel reads costs through this hook; tests set what it returns.
+const agentCosts = vi.hoisted(() => ({ current: undefined as AgentCosts | undefined }));
+vi.mock("@/hooks/useAgentCosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseAgentCostsModule>()),
+  useAgentCosts: () => ({ data: agentCosts.current }),
+}));
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
 }));
@@ -65,11 +72,10 @@ function renderPanel({
   conversationId = "conv_parent",
   rootSessionId = "conv_parent",
   initialEntries,
-  costs,
-}: RenderOptions & { initialEntries?: string[]; costs?: Map<string, AgentCost> } = {}) {
+}: RenderOptions & { initialEntries?: string[] } = {}) {
   return render(
     <MemoryRouter initialEntries={initialEntries}>
-      <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} costs={costs} />
+      <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
     </MemoryRouter>,
   );
 }
@@ -137,6 +143,7 @@ const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
 ];
 
 beforeEach(() => {
+  agentCosts.current = undefined;
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
   // Default: parent's status is idle. Tests override per-case.
@@ -177,14 +184,13 @@ describe("SubagentsPanel", () => {
       conv_parent: [childInfo({ id: "conv_a" }), childInfo({ id: "conv_b" })],
       conv_a: [childInfo({ id: "conv_c" })],
     });
-    const { container } = renderPanel({
-      costs: new Map([
-        ["conv_parent", { costUsd: 1.5, estimated: false }],
-        ["conv_a", { costUsd: 0.4, estimated: false }],
-        ["conv_b", { costUsd: null, estimated: false }],
-        ["conv_c", { costUsd: 0.25, estimated: true }],
-      ]),
-    });
+    agentCosts.current = new Map([
+      ["conv_parent", { costUsd: 1.5, estimated: false }],
+      ["conv_a", { costUsd: 0.4, estimated: false }],
+      ["conv_b", { costUsd: null, estimated: false }],
+      ["conv_c", { costUsd: 0.25, estimated: true }],
+    ]);
+    const { container } = renderPanel();
 
     const costOf = (element: Element | null) =>
       element?.querySelector('[data-testid="subagent-cost"]')?.textContent ?? null;

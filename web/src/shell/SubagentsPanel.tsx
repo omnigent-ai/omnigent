@@ -45,7 +45,7 @@ import { Button } from "@/components/ui/button";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
-import type { AgentCost, AgentCosts } from "@/hooks/useAgentCosts";
+import { useAgentCosts, type AgentCost, type AgentCosts } from "@/hooks/useAgentCosts";
 import { useSession } from "@/hooks/useSession";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type { SessionItem } from "@/lib/types";
@@ -78,14 +78,14 @@ interface SubagentsPanelProps {
    *  child it is the child's parent id. AppShell resolves this from
    *  ``activeSession.parentSessionId``. */
   rootSessionId: string;
-  /** Display costs by session id, when the session overview feature loaded them. */
-  costs?: AgentCosts;
 }
 
 type ViewMode = "list" | "graph";
 
-export function SubagentsPanel({ conversationId, rootSessionId, costs }: SubagentsPanelProps) {
+export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
   const { children, isLoading, error } = useChildSessions(rootSessionId);
+  // Loaded only with the session overview feature on.
+  const costs = useAgentCosts(rootSessionId).data ?? undefined;
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
