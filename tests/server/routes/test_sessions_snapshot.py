@@ -301,14 +301,16 @@ async def test_session_snapshot_uses_child_spec_metadata(
         ),
     }
     conv_store = _ConversationStore([], conversations=conversations)
+    event_loop_thread = threading.get_ident()
     cache_loads: list[bool] = []
+    cache_loads_on_loop: list[bool] = []
     agent_reads_on_loop: list[bool] = []
 
     class _AgentStore:
         @staticmethod
         def get(agent_id: str) -> Any:
             assert agent_id == "ag_advisor"
-            agent_reads_on_loop.append(threading.current_thread() is threading.main_thread())
+            agent_reads_on_loop.append(threading.get_ident() == event_loop_thread)
             return type(
                 "StoredAgent",
                 (),
@@ -326,6 +328,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
         def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
             assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
             cache_loads.append(expand_env)
+            cache_loads_on_loop.append(threading.get_ident() == event_loop_thread)
             return type("LoadedAgent", (), {"spec": parent_spec})()
 
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
@@ -353,6 +356,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert child.context_window == 100_000
     assert child.harness == "codex"
     assert cache_loads == [True, True, True, True]
+    assert cache_loads_on_loop == [False, False, False, False]
     assert agent_reads_on_loop == [False, False]
 
 
