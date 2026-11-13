@@ -2045,35 +2045,38 @@ class TestGatewayModelVocabulary(unittest.TestCase):
             ),
             note="",
         )
-        with patch(
-            "omnigent.models.model_catalog.listing_for_provider", return_value=listing
-        ) as lister:
-            vocabulary = _gateway_model_vocabulary(
-                "https://gw.example.com/anthropic", "printf tok"
-            )
-        self.assertEqual(
-            vocabulary.alias_pins,
-            {
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
-                "ANTHROPIC_DEFAULT_FABLE_MODEL": "databricks-claude-fable-5",
-            },
-        )
-        # Same listing, second half of the vocabulary: the canonical spelling
-        # Claude Code names itself, rewritten to what this gateway serves. The
-        # non-Claude id contributes to neither half.
-        self.assertEqual(
-            vocabulary.model_overrides,
-            {
-                "claude-opus-4-8": "databricks-claude-opus-4-8",
-                "claude-fable-5": "databricks-claude-fable-5",
-            },
-        )
-        # The listing is fetched as a gateway transport: the base URL and the
-        # auth command the CLI itself uses, not a Databricks profile.
-        provider = lister.call_args.args[0]
-        self.assertEqual(provider.base_url, "https://gw.example.com/anthropic")
-        self.assertEqual(provider.auth_command, "printf tok")
-        self.assertIsNone(provider.profile)
+        for api_key in (None, "dummy-listing-key"):
+            with self.subTest(api_key=api_key):
+                with patch(
+                    "omnigent.models.model_catalog.listing_for_provider", return_value=listing
+                ) as lister:
+                    vocabulary = _gateway_model_vocabulary(
+                        "https://gw.example.com/anthropic", "printf tok", api_key
+                    )
+                self.assertEqual(
+                    vocabulary.alias_pins,
+                    {
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
+                        "ANTHROPIC_DEFAULT_FABLE_MODEL": "databricks-claude-fable-5",
+                    },
+                )
+                # Same listing, second half of the vocabulary: the canonical spelling
+                # Claude Code names itself, rewritten to what this gateway serves. The
+                # non-Claude id contributes to neither half.
+                self.assertEqual(
+                    vocabulary.model_overrides,
+                    {
+                        "claude-opus-4-8": "databricks-claude-opus-4-8",
+                        "claude-fable-5": "databricks-claude-fable-5",
+                    },
+                )
+                # The listing is fetched as a gateway transport: the base URL and the
+                # static key or dynamic command, not a Databricks profile.
+                provider = lister.call_args.args[0]
+                self.assertEqual(provider.base_url, "https://gw.example.com/anthropic")
+                self.assertEqual(provider.auth_command, None if api_key else "printf tok")
+                self.assertEqual(provider.api_key, api_key)
+                self.assertIsNone(provider.profile)
 
     def test_nothing_when_the_listing_has_no_claude_models(self):
         from omnigent.inner.claude_sdk_executor import (

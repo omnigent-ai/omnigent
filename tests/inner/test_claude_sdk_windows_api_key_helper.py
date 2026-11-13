@@ -130,16 +130,9 @@ def test_windows_static_helper_rewritten_without_key(token: str) -> None:
     # Nothing cmd.exe or POSIX sh would reinterpret inside the double quotes.
     for ch in ("'", "%", "!", "$", "`", "^", "&", "|", "<", ">"):
         assert ch not in helper
-
-
-def test_windows_settings_payload_has_no_key() -> None:
-    token = 'dummy"quoted %key'
-    env: dict[str, str] = {}
-    helper, _ = ex._platform_safe_api_key_helper(
-        _static_cmd(token), env, is_windows=True, python_executable=_FAKE_WIN_PYTHON
-    )
     payload = ex._claude_settings_payload(helper, {})
     assert payload is not None
+    assert token not in payload
     assert "dummy" not in payload
     assert "apiKeyHelper" in payload
 
@@ -189,36 +182,6 @@ def test_windows_unsafe_python_path_falls_back(
     assert static_key is None
     assert env == {}
     assert token not in caplog.text
-
-
-def test_gateway_listing_uses_static_key_not_command(monkeypatch: pytest.MonkeyPatch) -> None:
-    """On the Windows path the listing must not shell out to the env-reading helper."""
-    seen = {}
-
-    def _fake_listing(provider: object) -> object:
-        seen["api_key"] = getattr(provider, "api_key", None)
-        seen["auth_command"] = getattr(provider, "auth_command", None)
-        raise RuntimeError("offline test: no listing")
-
-    monkeypatch.setattr(ex.model_catalog, "listing_for_provider", _fake_listing)
-    vocab = ex._gateway_model_vocabulary(
-        "https://gateway.invalid/anthropic", "unused-helper", "dummy-listing-key"
-    )
-    assert vocab == ex._EMPTY_GATEWAY_VOCABULARY
-    assert seen == {"api_key": "dummy-listing-key", "auth_command": None}
-
-
-def test_gateway_listing_default_still_uses_command(monkeypatch: pytest.MonkeyPatch) -> None:
-    seen = {}
-
-    def _fake_listing(provider: object) -> object:
-        seen["api_key"] = getattr(provider, "api_key", None)
-        seen["auth_command"] = getattr(provider, "auth_command", None)
-        raise RuntimeError("offline test: no listing")
-
-    monkeypatch.setattr(ex.model_catalog, "listing_for_provider", _fake_listing)
-    ex._gateway_model_vocabulary("https://gateway.invalid/anthropic", "my-cli print-token")
-    assert seen == {"api_key": None, "auth_command": "my-cli print-token"}
 
 
 # ── real execution of the rewritten helper (offline, local interpreter) ──
@@ -338,7 +301,8 @@ def test_windows_nul_key_falls_back_without_env_mutation(caplog: pytest.LogCaptu
     assert "dummy" not in caplog.text
 
 
-def test_windows_two_calls_do_not_share_child_env() -> None:
+def test_windows_two_calls_do_not_share_child_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_ENV, "parent-dummy-sentinel")
     first, second = {}, {}
     helper1, key1 = ex._platform_safe_api_key_helper(
         _static_cmd("first-dummy"), first, is_windows=True, python_executable=_FAKE_WIN_PYTHON
@@ -350,3 +314,4 @@ def test_windows_two_calls_do_not_share_child_env() -> None:
     assert key1 == first[_ENV] == "first-dummy"
     assert key2 == second[_ENV] == "second-dummy"
     assert first != second
+    assert os.environ[_ENV] == "parent-dummy-sentinel"
