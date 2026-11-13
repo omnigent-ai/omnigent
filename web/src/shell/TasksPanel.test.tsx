@@ -327,6 +327,25 @@ describe("TasksPanel", () => {
     );
   });
 
+  it("says a task can't start when a task it waits on failed, on its row and its card", async () => {
+    showJournal([
+      journalPlan(0, ["fix"], ["suite", ["fix"]], ["pr", ["suite"]]),
+      status(1, "fix", "failed", "Couldn't reproduce the race"),
+    ]);
+    renderPanel();
+    const steps = screen.getAllByTestId("tasks-row");
+    expect(steps.map((step) => step.dataset.state)).toEqual(["failed", "waiting", "waiting"]);
+    // pr waits on fix through suite, and names fix too.
+    expect(steps[1]).toHaveTextContent("Can't start · fix failed");
+    expect(steps[2]).toHaveTextContent("Can't start · fix failed");
+    const segments = screen.getAllByTestId("tasks-progress-segment");
+    expect(segments[2].getAttribute("aria-label")).toBe("Task 3, pr: Can't start");
+    fireEvent.focus(segments[2]);
+    expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent(
+      "Can't start · fix failed",
+    );
+  });
+
   it("offers a task's ⋯ menu on its segment's card, and keeps the card up while it's open", async () => {
     showJournal([
       journalPlan(0, ["build"], ["deploy", ["build"]]),

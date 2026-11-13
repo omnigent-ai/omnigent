@@ -194,7 +194,10 @@ with the rest of the plan. A task waiting for you has **Continue** too, which
 tells the agent it's fine to go ahead with that task, marking it started (or
 done, if its work is already done), then the rest of the plan. A failed task's
 menu has **Retry**, which asks the agent to run it again, then go on with the
-rest of the plan. While the agent works, a running task's menu has
+rest of the plan. A task that waits on a failed task, directly or through tasks
+that haven't started, says **Can't start** and names the failed task until it
+runs again; when only those tasks are left, the chat preview names the failure
+("Failed: Run the tests"). While the agent works, a running task's menu has
 **Stop**, which stops the agent as the composer's Stop does. It waits for you while a question or permission prompt in the chat
 waits for your answer. A task's history marks a restart after the task was done
 or failed. Tasks waiting for you are pink, and an idle list

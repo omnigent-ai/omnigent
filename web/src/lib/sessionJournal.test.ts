@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { journalEntry, journalPlan as plan } from "@/test/journalFixtures";
 import {
   currentPlan,
+  failedUpstream,
   finishedTaskCount,
   isRestart,
   linkedToPrevious,
@@ -182,6 +183,31 @@ describe("stepProgress", () => {
     ]);
   });
 
+  it("finds the failed tasks a task can't start for, through tasks that haven't started", () => {
+    const branching = planSteps(
+      plan(
+        0,
+        ["explore"],
+        ["fix", ["explore"]],
+        ["docs", ["explore"]],
+        ["suite", ["fix"]],
+        ["pr", ["suite", "docs"]],
+      ),
+    );
+    const blockedBy = (written: JournalEntry[]) =>
+      Object.fromEntries(failedUpstream(stepProgress(branching, written, false)));
+    const fixFailed = [status(1, "explore", "done"), status(2, "fix", "failed")];
+    // pr waits on fix through suite; docs is ready, so nothing holds it up.
+    expect(blockedBy(fixFailed)).toEqual({ suite: ["fix"], pr: ["fix"] });
+    // Two failures upstream come nearest first.
+    expect(blockedBy([...fixFailed, status(3, "docs", "failed")])).toEqual({
+      suite: ["fix"],
+      pr: ["docs", "fix"],
+    });
+    // Once fix runs again, the tasks after it are only waiting.
+    expect(blockedBy([...fixFailed, status(3, "fix", "started")])).toEqual({});
+  });
+
   it("links a step to the one before it when one waits on the other", () => {
     const linked = (...planned: [string, string[]?][]) =>
       linkedToPrevious(planSteps(plan(0, ...planned)));
@@ -310,5 +336,14 @@ describe("taskPreviewText", () => {
     expect(taskPreviewText(done)).toBe("All done");
     const failed = stepProgress(planSteps(plan(0, ["a"])), [status(1, "a", "failed")], false);
     expect(taskPreviewText(failed)).toBe("Finished, 1 failed");
+  });
+
+  it("names the failure when only tasks that can't start because of it are left", () => {
+    const heldUp = stepProgress(
+      planSteps(plan(0, ["fix"], ["suite", ["fix"]], ["pr", ["suite"]])),
+      [status(1, "fix", "failed")],
+      false,
+    );
+    expect(taskPreviewText(heldUp)).toBe("Failed: fix");
   });
 });

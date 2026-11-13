@@ -37,6 +37,7 @@ import {
   relativeTime,
 } from "@/lib/relativeTime";
 import {
+  failedUpstream,
   finishedTaskCount,
   isRestart,
   linkedToPrevious,
@@ -73,6 +74,9 @@ export const STATE_LABELS: Record<StepState, string> = {
   done: "Done",
   failed: "Failed",
 };
+
+/** What a task that hasn't started says when a task it waits on failed. */
+const CANT_START = "Can't start";
 
 export const SEGMENT_COLORS: Record<StepState, string> = {
   waiting: "bg-foreground/10",
@@ -175,11 +179,18 @@ export function StepGlyph({ state, number }: { state: StepState; number?: number
   }
 }
 
-function stepDetail(item: StepProgress): ReactNode {
+/** @param failedNames - The failed tasks it waits on, by name, when that's why it can't start. */
+function stepDetail(item: StepProgress, failedNames: readonly string[] = []): ReactNode {
   const text = item.status ? textOf(item.status) : null;
   switch (item.state) {
     case "waiting":
-      return item.step.goal;
+      if (failedNames.length === 0) return item.step.goal;
+      return (
+        <>
+          <span className="font-medium">{CANT_START}</span>
+          {` · ${listNames(failedNames)} failed`}
+        </>
+      );
     case "ready":
       return (
         <>
@@ -454,6 +465,7 @@ function StepRow({
   flash,
   onShowInChat,
   menuAction,
+  failedNames,
 }: {
   item: StepProgress;
   number: number;
@@ -466,9 +478,11 @@ function StepRow({
   onShowInChat: (markerId: string) => void;
   /** What its ⋯ menu offers: Run, Continue, Retry or Stop; absent for none. */
   menuAction?: TaskMenuAction;
+  /** The failed tasks it waits on, by name, when that's why it can't start. */
+  failedNames?: readonly string[];
 }) {
   const [open, setOpen] = useState(false);
-  const detail = stepDetail(item);
+  const detail = stepDetail(item, failedNames);
   const waiting = item.state === "waiting";
   const emphasized =
     item.state === "running" || item.state === "needs_input" || item.state === "failed";
@@ -586,12 +600,20 @@ const STATUS_LINE_COLORS: Partial<Record<StepState, string>> = {
   failed: "text-destructive",
 };
 
-/** Where a task stands in a few words, e.g. "Done · 8:56 PM" or "Waiting on Run the tests". */
-function statusLine(item: StepProgress, pending: readonly string[]): ReactNode {
+/**
+ * Where a task stands in a few words, e.g. "Done · 8:56 PM", "Waiting on Run the
+ * tests" or "Can't start · Run the tests failed".
+ */
+function statusLine(
+  item: StepProgress,
+  pending: readonly string[],
+  failedNames: readonly string[] = [],
+): ReactNode {
   const { startedAt, status } = item;
   const ended = status ? formatMessageTimestamp(status.created_at) : null;
   switch (item.state) {
     case "waiting":
+      if (failedNames.length > 0) return `${CANT_START} · ${listNames(failedNames)} failed`;
       return pending.length > 0 ? `Waiting on ${listNames(pending)}` : "Not started";
     case "ready":
       return "Ready to start";
@@ -649,6 +671,7 @@ export function ProgressStrip({
   const done = new Set(
     progress.filter((item) => item.state === "done").map((item) => item.step.id),
   );
+  const blocked = failedUpstream(progress);
   const links =
     fromPlan && progress.length <= MAX_LINKED_TASKS
       ? linkedToPrevious(progress.map((item) => item.step))
@@ -721,6 +744,7 @@ export function ProgressStrip({
         const pending = item.step.depends_on
           .filter((id) => !done.has(id))
           .map((id) => names.get(id) ?? id);
+        const failedNames = (blocked.get(item.step.id) ?? []).map((id) => names.get(id) ?? id);
         const text = item.status ? textOf(item.status) : null;
         const detail =
           item.state === "waiting" || item.state === "ready"
@@ -742,7 +766,7 @@ export function ProgressStrip({
             <HoverCardTrigger asChild>
               <button
                 type="button"
-                aria-label={`Task ${index + 1}, ${item.step.name}: ${STATE_LABELS[item.state]}`}
+                aria-label={`Task ${index + 1}, ${item.step.name}: ${failedNames.length > 0 ? CANT_START : STATE_LABELS[item.state]}`}
                 onClick={() => onSelect(item.step.id)}
                 onPointerEnter={() => setHovered(index)}
                 onFocus={() => setHovered(index)}
@@ -798,7 +822,9 @@ export function ProgressStrip({
               <span className="break-words font-medium">{item.step.name}</span>
               <span className="flex items-center gap-1.5">
                 <StepGlyph state={item.state} number={index + 1} />
-                <span className={STATUS_LINE_COLORS[item.state]}>{statusLine(item, pending)}</span>
+                <span className={STATUS_LINE_COLORS[item.state]}>
+                  {statusLine(item, pending, failedNames)}
+                </span>
               </span>
               {detail && (
                 <span className="line-clamp-3 break-words text-muted-foreground">{detail}</span>
@@ -1045,6 +1071,7 @@ function TaskList({
   /** The composer's Stop; present only while the agent works. */
   onStop?: () => void;
 }) {
+  const blocked = failedUpstream(progress);
   return (
     <section aria-label="Tasks">
       <ol className="flex flex-col">
@@ -1059,6 +1086,7 @@ function TaskList({
             flash={flashStep === item.step.id}
             onShowInChat={onShowInChat}
             menuAction={taskMenuAction(item, onTaskAction, onStop)}
+            failedNames={blocked.get(item.step.id)?.map((id) => names.get(id) ?? id)}
           />
         ))}
       </ol>
