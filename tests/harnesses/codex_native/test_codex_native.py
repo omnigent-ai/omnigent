@@ -2543,58 +2543,6 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
     assert fake_client.closed
 
 
-def test_supervise_forwarder_fails_pending_mcp_startup_when_stream_ends(
-    tmp_path: Path,
-) -> None:
-    """
-    An app-server connection that ends mid-startup fails the pending servers.
-
-    The forwarder owns every signal that resolves the round, and the runner
-    stops the app-server after it returns, so without this the web band kept
-    reading "Starting MCP servers" until the user relaunched the session.
-    """
-    from omnigent.harnesses.codex_native.bridge import read_mcp_startup, update_mcp_server_startup
-
-    update_mcp_server_startup(tmp_path, "omnigent", "ready")
-    update_mcp_server_startup(tmp_path, "jira", "starting")
-    ap_events: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        ap_events.append(json.loads(request.content))
-        return httpx.Response(200)
-
-    async def run() -> None:
-        """
-        Run the forwarder against an event stream that ends immediately.
-
-        :returns: None.
-        """
-        await codex_native_forwarder.supervise_forwarder(
-            base_url="http://127.0.0.1:1",
-            headers={},
-            session_id="conv_123",
-            bridge_dir=tmp_path,
-            app_server_url=str(tmp_path / "app-server.sock"),
-            thread_id="thread_123",
-            client=_FakeCodexAppServerClient(),  # type: ignore[arg-type]
-            ap_transport=httpx.MockTransport(handler),
-        )
-
-    asyncio.run(run())
-
-    expected = {
-        "omnigent": {"status": "ready", "error": None},
-        "jira": {
-            "status": "failed",
-            "error": "Codex app-server stopped before MCP startup finished",
-        },
-    }
-    assert read_mcp_startup(tmp_path) == expected
-    assert [event["data"] for event in ap_events if event["type"] == "external_mcp_startup"] == [
-        {"servers": expected}
-    ]
-
-
 class _BlockingEventsCodexAppServerClient(_FakeCodexAppServerClient):
     """Fake app-server client whose event stream stays open until cancelled."""
 
@@ -2621,8 +2569,18 @@ def _seed_pending_mcp_startup(bridge_dir: Path) -> None:
     update_mcp_server_startup(bridge_dir, "jira", "starting")
 
 
-async def _supervise_test_forwarder(tmp_path: Path, client: _FakeCodexAppServerClient) -> None:
-    """Run the forwarder against *client* with a server that accepts every post."""
+def _accept_every_post(_request: httpx.Request) -> httpx.Response:
+    """Answer every Omnigent post with success."""
+    return httpx.Response(200)
+
+
+async def _supervise_test_forwarder(
+    tmp_path: Path,
+    client: _FakeCodexAppServerClient,
+    *,
+    handler: Callable[[httpx.Request], httpx.Response] = _accept_every_post,
+) -> None:
+    """Run the forwarder against *client*, answering Omnigent posts with *handler*."""
     await codex_native_forwarder.supervise_forwarder(
         base_url="http://127.0.0.1:1",
         headers={},
@@ -2631,19 +2589,72 @@ async def _supervise_test_forwarder(tmp_path: Path, client: _FakeCodexAppServerC
         app_server_url=str(tmp_path / "app-server.sock"),
         thread_id="thread_123",
         client=client,  # type: ignore[arg-type]
-        ap_transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+        ap_transport=httpx.MockTransport(handler),
     )
+
+
+#: Seconds a cancellation test may wait for its suspension point; a regression
+#: that never reaches it fails fast instead of hanging the test process.
+_FORWARDER_TEST_DEADLINE_SECONDS = 5.0
+
+
+async def _cancel_and_drain(task: asyncio.Task[None]) -> None:
+    """Cancel *task* and wait for it, expecting the cancellation to propagate."""
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=_FORWARDER_TEST_DEADLINE_SECONDS)
+
+
+def test_supervise_forwarder_fails_pending_mcp_startup_when_stream_ends(
+    tmp_path: Path,
+) -> None:
+    """
+    An app-server connection that ends mid-startup fails the pending servers.
+
+    The forwarder owns every signal that resolves the round, and the runner
+    stops the app-server after it returns, so without this the web band kept
+    reading "Starting MCP servers" until the user relaunched the session.
+    """
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup
+
+    _seed_pending_mcp_startup(tmp_path)
+    ap_events: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ap_events.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    asyncio.run(_supervise_test_forwarder(tmp_path, _FakeCodexAppServerClient(), handler=handler))
+
+    expected = {
+        "omnigent": {"status": "ready", "error": None},
+        "jira": {
+            "status": "failed",
+            "error": "Codex app-server stopped before MCP startup finished",
+        },
+    }
+    assert read_mcp_startup(tmp_path) == expected
+    assert [event["data"] for event in ap_events if event["type"] == "external_mcp_startup"] == [
+        {"servers": expected}
+    ]
 
 
 def test_supervise_forwarder_cleans_up_when_the_mcp_failure_post_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A failing MCP-startup post is logged; the forwarder still closes and returns."""
-    _seed_pending_mcp_startup(tmp_path)
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup
 
-    async def failing_post(*_args: Any, **_kwargs: Any) -> None:
+    _seed_pending_mcp_startup(tmp_path)
+    attempted: list[tuple[dict[str, Any], dict[str, Any]]] = []
+
+    async def failing_post(
+        _client: Any, _session_id: str, servers: dict[str, Any], **kwargs: Any
+    ) -> None:
         """Stand in for the HTTP post so the test controls when it fails."""
+        attempted.append((servers, kwargs))
         raise RuntimeError("server unreachable")
 
     monkeypatch.setattr(codex_native_forwarder, "_post_mcp_startup", failing_post)
@@ -2651,6 +2662,15 @@ def test_supervise_forwarder_cleans_up_when_the_mcp_failure_post_fails(
 
     asyncio.run(_supervise_test_forwarder(tmp_path, client))
 
+    failed_jira = {
+        "status": "failed",
+        "error": "Codex app-server stopped before MCP startup finished",
+    }
+    assert [(servers["jira"], kwargs["max_attempts"]) for servers, kwargs in attempted] == [
+        (failed_jira, 1)
+    ]
+    assert read_mcp_startup(tmp_path)["jira"] == failed_jira
+    assert "Codex forwarder could not fail the pending MCP startup round" in caplog.text
     assert client.closed
 
 
@@ -2675,10 +2695,10 @@ def test_supervise_forwarder_cancelled_during_mcp_failure_post_still_cleans_up(
 
         monkeypatch.setattr(codex_native_forwarder, "_post_mcp_startup", hanging_post)
         task = asyncio.create_task(_supervise_test_forwarder(tmp_path, client))
-        await posting.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            await asyncio.wait_for(posting.wait(), timeout=_FORWARDER_TEST_DEADLINE_SECONDS)
+        finally:
+            await _cancel_and_drain(task)
 
     asyncio.run(run())
 
@@ -2698,10 +2718,12 @@ def test_supervise_forwarder_cancelled_stream_leaves_mcp_startup_pending(
     async def run() -> None:
         """Cancel the forwarder while it waits for app-server events."""
         task = asyncio.create_task(_supervise_test_forwarder(tmp_path, client))
-        await client.streaming.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            await asyncio.wait_for(
+                client.streaming.wait(), timeout=_FORWARDER_TEST_DEADLINE_SECONDS
+            )
+        finally:
+            await _cancel_and_drain(task)
 
     asyncio.run(run())
 

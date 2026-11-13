@@ -5850,6 +5850,9 @@ async def _settle_mcp_startup(
 
 
 _MCP_STARTUP_FORWARDER_EXIT_ERROR = "Codex app-server stopped before MCP startup finished"
+# The runner stops the app-server only after the forwarder returns, so this
+# best-effort post gets one short attempt instead of the default retries.
+_MCP_STARTUP_FORWARDER_EXIT_POST_TIMEOUT_SECONDS = 5.0
 
 
 async def _fail_mcp_startup_on_forwarder_exit(
@@ -5874,7 +5877,13 @@ async def _fail_mcp_startup_on_forwarder_exit(
     if not changed:
         return
     _logger.warning("Codex MCP startup round failed: forwarder stopped mid-startup")
-    await _post_mcp_startup(client, session_id, servers)
+    await _post_mcp_startup(
+        client,
+        session_id,
+        servers,
+        max_attempts=1,
+        timeout=_MCP_STARTUP_FORWARDER_EXIT_POST_TIMEOUT_SECONDS,
+    )
 
 
 def _is_thread_idle_status_event(method: str, params: _JsonObject) -> bool:
@@ -5989,6 +5998,9 @@ async def _post_mcp_startup(
     client: httpx.AsyncClient,
     session_id: str,
     servers: dict[str, dict[str, str | None]],
+    *,
+    max_attempts: int | None = _POST_MAX_ATTEMPTS,
+    timeout: float | None = None,
 ) -> None:
     """
     Post the current per-MCP-server startup map to Omnigent.
@@ -5997,6 +6009,8 @@ async def _post_mcp_startup(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param servers: Full startup map, e.g.
         ``{"safe": {"status": "starting", "error": None}}``.
+    :param max_attempts: Maximum POST attempts, e.g. ``1``.
+    :param timeout: Optional per-request timeout in seconds, e.g. ``5.0``.
     :returns: None.
     """
     response = await _post_session_event(
@@ -6004,6 +6018,8 @@ async def _post_mcp_startup(
         session_id,
         event_type=_EXTERNAL_MCP_STARTUP_TYPE,
         data={"servers": servers},
+        max_attempts=max_attempts,
+        timeout=timeout,
     )
     _log_failed_session_event_post(_EXTERNAL_MCP_STARTUP_TYPE, response)
 
