@@ -27,15 +27,21 @@ message.
 ## When an automation runs you
 
 Check this too. If your message says no one is watching this run, as an
-Omnigent automation's note does, no one can answer you or approve anything:
+Omnigent automation's note does, no one can answer you or approve anything,
+so nothing in the run may wait for a person:
 
 - Skip the plan review, even if the message asks for one. Add no review step,
   and wait for no approval.
-- Don't ask with `sys_workflow_request_input`, wherever this skill says to.
-  Take the option you'd recommend when it's easy to reverse, and say so in the
-  step's status. Otherwise write `needs_input` on the step with the options
-  and your recommendation, in a note if they need more room, and go on with
-  the steps that don't depend on it.
+- Decide each question yourself, wherever this skill says to ask, including
+  one the note says to defer: take the option you'd recommend, and say what
+  you chose and why in the step's status. Don't use
+  `sys_workflow_request_input`, and write no `needs_input`.
+- If a step can't be done without a person, such as a sign-in only they can
+  do, write `failed` on it saying what it needs, and go on with the steps that
+  don't depend on it.
+- A session you start for a step (see "Running another workflow as a step")
+  can't ask anyone either: say in its first message that no one is watching
+  this run.
 
 ## Plan
 

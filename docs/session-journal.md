@@ -135,9 +135,10 @@ workflow").
 To run a saved workflow on a schedule or a trigger, pick it in New
 automation's **Workflow (optional)** field. Each run follows the workflow
 without a plan review, and the automation's **Additional instructions**
-customize it. No one is watching the run, so the agent doesn't stop to ask:
-it takes the option it would recommend when that's easy to undo, or leaves
-the step **Waiting for you** and goes on with the rest.
+customize it. No one is watching the run, so nothing in it waits for you:
+the agent answers its own questions with the option it would recommend, and
+says so in the task's status. A task that needs you, such as a sign-in, fails
+saying what it needs, and the agent goes on with the rest.
 
 Click a workflow on the **Workflows** page to open it: its steps as a graph,
 and its runs, newest first. Each run links to its session and shows how many
