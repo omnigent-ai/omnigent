@@ -14,7 +14,7 @@
 // stale. Returns `null` when the session hasn't been loaded yet or is a hostless
 // local session; such requests carry the client's own key (`routingKey.ts`).
 
-import { clientRoutingKey } from "./routingKey";
+import { clientRoutingKey } from "./routingKey.ts";
 
 const _sessionHosts = new Map<string, string>();
 const _hostChangeListeners = new Set<() => void>();
