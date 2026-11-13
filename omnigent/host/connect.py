@@ -2291,7 +2291,7 @@ class HostProcess:
             # The runner exited before launch acknowledgement — its actual error
             # is in the captured log, so ship the tail with the result
             # instead of making the user go find the file on the host.
-            error = _runner_exit_error(proc.returncode, log_path)
+            error = await asyncio.to_thread(_runner_exit_error, proc.returncode, log_path)
             self._trigger_maintenance("runner_launch_failed")
             # The returned result retains the diagnostic tail, while
             # _launch_failed limits the host lifecycle line to its first line.
@@ -2803,14 +2803,18 @@ class HostProcess:
                     _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
                     return
                 # Pre-connect code 0 is a failed launch; send its cause to the server.
-                error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+                error = await asyncio.to_thread(
+                    _runner_exit_error, handle.proc.returncode, handle.log_path
+                )
                 _logger.info(
                     "Runner %s exited cleanly (code 0) before connecting; reporting exit",
                     runner_id,
                 )
                 await self._report_runner_exit(runner_id, error, had_connected=had_connected)
                 return
-            error = _runner_exit_error(handle.proc.returncode, handle.log_path)
+            error = await asyncio.to_thread(
+                _runner_exit_error, handle.proc.returncode, handle.log_path
+            )
             # A credential refusal before connecting needs renewed sign-in.
             # Other exits remain runner faults; the log tail carries the cause.
             auth_rejected = (

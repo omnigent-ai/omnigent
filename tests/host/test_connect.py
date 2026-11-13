@@ -2433,6 +2433,68 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     assert maintenance_reasons == ["runner_launch_failed"]
 
 
+@pytest.mark.parametrize("phase", ["launch", "crash", "clean_boot_exit"])
+async def test_runner_exit_diagnostics_keep_host_responsive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    """Reading one failed runner's log cannot stall unrelated host requests."""
+    from omnigent.host import connect as host_connect
+
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment]
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    log_path = tmp_path / "runner.log"
+    log_path.write_text("failure cause token=private-credential-value\n")
+    read_tail = host_connect._read_log_tail
+
+    def slow_tail(path: Path) -> str:
+        assert path == log_path
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), "log read blocked the host event loop"
+        return read_tail(path)
+
+    monkeypatch.setattr(host_connect, "_read_log_tail", slow_tail)
+    proc = Mock(spec=subprocess.Popen, pid=1234, returncode=0 if phase == "clean_boot_exit" else 7)
+    proc.poll.return_value = proc.returncode
+    if phase == "launch":
+        monkeypatch.setattr(host, "_spawn_runner_proc", lambda *_args: (proc, log_path))
+        monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+        operation = asyncio.create_task(
+            host._handle_launch(HostLaunchRunnerFrame("launch", "token", str(tmp_path)))
+        )
+    else:
+        host._runners["failed-runner"] = _RunnerHandle(
+            proc, log_path, connect_marker=tmp_path / "not-connected"
+        )
+        operation = asyncio.create_task(host._watch_runner("failed-runner"))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert not operation.done(), "diagnostics did not remain pending during the held read"
+        status = await asyncio.wait_for(
+            host._handle_runner_status(HostRunnerStatusFrame("status", "unrelated")), 1
+        )
+        assert (status.request_id, status.status) == ("status", "unknown")
+        release.set()
+        result = await asyncio.wait_for(operation, 5)
+        if phase == "launch":
+            assert isinstance(result, HostLaunchRunnerResultFrame)
+            assert result.status == "failed"
+            error = result.error
+        else:
+            [report] = [decode_host_frame(raw) for raw in tunnel.sent]
+            assert isinstance(report, HostRunnerExitedFrame)
+            error = report.error
+        assert error is not None and "failure cause" in error
+        assert "private-credential-value" not in error
+        assert f"code {proc.returncode}" in error
+    finally:
+        release.set()
+        await asyncio.gather(operation, return_exceptions=True)
+
+
 @pytest.mark.parametrize(
     "marker_state", ["connected", "not_connected", "unavailable", "unreadable"]
 )
