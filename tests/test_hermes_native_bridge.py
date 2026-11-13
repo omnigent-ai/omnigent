@@ -145,17 +145,17 @@ def test_inject_user_message_raises_when_never_confirmed(tmp_path, monkeypatch) 
     assert sum(1 for a in calls if a[0] == "load-buffer") == 2
 
 
-@pytest.mark.parametrize("initial", ["missing", "empty", "schema"])
+@pytest.mark.parametrize("initial", ["missing", "empty", "partial-schema"])
 def test_inject_user_message_waits_for_session_store(tmp_path, monkeypatch, initial) -> None:
-    """A first message stays undelivered until Hermes has committed a session row."""
+    """Wait for schema readiness; Hermes can create its first row after the paste."""
     calls: list[tuple[str, ...]] = []
     _patch_inject_tmux(monkeypatch, calls)
     db = tmp_path / "state #1.db"
     if initial == "empty":
         db.touch()
-    elif initial == "schema":
+    elif initial == "partial-schema":
         with sqlite3.connect(db) as con:
-            con.executescript(b._SESSIONS_DDL + b._MESSAGES_DDL)
+            con.executescript(b._SESSIONS_DDL)
     monkeypatch.setattr(b, "_state_db_path", lambda _bd: db)
     initialized = False
 
@@ -166,10 +166,6 @@ def test_inject_user_message_waits_for_session_store(tmp_path, monkeypatch, init
         assert calls == [], "no paste before store readiness"
         with sqlite3.connect(db) as con:
             con.executescript(b._SESSIONS_DDL + b._MESSAGES_DDL)
-            con.execute(
-                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
-                ("session", "cli", 0.0),
-            )
         initialized = True
 
     def tmux(_socket, *args) -> None:
@@ -177,6 +173,11 @@ def test_inject_user_message_waits_for_session_store(tmp_path, monkeypatch, init
         calls.append(args)
         if args[-1] == "Enter":
             with sqlite3.connect(db) as con:
+                assert con.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
+                con.execute(
+                    "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                    ("session", "cli", 0.0),
+                )
                 con.execute(
                     "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
                     ("session", "user", "do something now"),

@@ -714,10 +714,11 @@ def _state_db_path(bridge_dir: Path) -> Path | None:
 
 
 def _await_session_ready(db_path: Path, timeout_s: float) -> bool:
-    """Wait for Hermes to initialize its store and persist a session row.
+    """Wait for Hermes to initialize its session and message tables.
 
     Read-only opens leave creation to Hermes. Missing files, partial schemas,
-    and transient SQLite errors are retried until the bounded deadline.
+    and transient SQLite errors are retried until the bounded deadline. Some
+    versions create the first session row only after accepting input.
     """
     deadline = time.monotonic() + timeout_s
     while True:
@@ -727,8 +728,9 @@ def _await_session_ready(db_path: Path, timeout_s: float) -> bool:
                 f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=min(2.0, remaining)
             )
             try:
-                if con.execute("SELECT 1 FROM sessions LIMIT 1").fetchone() is not None:
-                    return True
+                con.execute("SELECT id FROM sessions LIMIT 0")
+                con.execute("SELECT id FROM messages LIMIT 0")
+                return True
             finally:
                 con.close()
         except (OSError, sqlite3.Error):
@@ -843,7 +845,7 @@ def inject_user_message(
     ``load-buffer``/``paste-buffer -p`` so interior newlines stay data, not
     submits), settles, then submits with a *single* Enter.
 
-    Wait for the session store to contain a session before the first paste.
+    Wait for the session store schema before the first paste.
     On a NEW session Hermes blocks input while cold-starting its MCP server, so
     the first paste can be silently dropped — and a dropped first message
     permanently off-by-ones the server's pending-input FIFO, scrambling every
