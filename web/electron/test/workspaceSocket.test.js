@@ -15,6 +15,7 @@ describe("workspaceSocketRequest", { skip: !unix && "needs Unix sockets" }, () =
   let socketPath;
   let server;
   let received;
+  let responseBody = Buffer.from([0, 0, 0, 0, 1, 0xff]);
 
   before(async () => {
     // Shaped like the host's: a 0700 omnigent-workspace-* directory.
@@ -26,7 +27,7 @@ describe("workspaceSocketRequest", { skip: !unix && "needs Unix sockets" }, () =
       req.on("end", () => {
         received = { url: req.url, headers: req.headers, body: Buffer.concat(chunks) };
         res.writeHead(200, { "content-type": "application/connect+proto" });
-        res.end(Buffer.from([0, 0, 0, 0, 1, 0xff]));
+        res.end(responseBody);
       });
     });
     await new Promise((resolve) => {
@@ -62,22 +63,36 @@ describe("workspaceSocketRequest", { skip: !unix && "needs Unix sockets" }, () =
 
   it("refuses anything but a workspace API call on a workspace socket", async () => {
     const otherSocket = path.join(os.tmpdir(), "workspace.sock");
+    const notASocket = /not a workspace socket/;
     const refused = {
-      "another service's socket": { socketPath: "/var/run/docker.sock" },
-      "a socket in another directory": { socketPath: otherSocket },
-      "a missing socket": {
-        socketPath: path.join(directory, "..", "omnigent-workspace-x", "workspace.sock"),
-      },
-      "a relative path": { socketPath: "omnigent-workspace-x/workspace.sock" },
-      "another method path": { path: "/v1/sessions" },
-      "a path with a query": { path: `${METHOD}?x=1` },
-      "a non-binary body": { body: "{}" },
+      "another service's socket": [{ socketPath: "/var/run/docker.sock" }, notASocket],
+      "a socket in another directory": [{ socketPath: otherSocket }, notASocket],
+      "a missing socket": [
+        {
+          socketPath: path.join(path.dirname(directory), "omnigent-workspace-x", "workspace.sock"),
+        },
+        notASocket,
+      ],
+      "an unnormalized path": [{ socketPath: `${directory}/sub/../workspace.sock` }, notASocket],
+      "a relative path": [{ socketPath: "omnigent-workspace-x/workspace.sock" }, notASocket],
+      "another method path": [{ path: "/v1/sessions" }, /not a workspace API method/],
+      "a path with a query": [{ path: `${METHOD}?x=1` }, /not a workspace API method/],
+      "a non-binary body": [{ body: "{}" }, /invalid request body/],
     };
     await Promise.all(
-      Object.entries(refused).map(([name, overrides]) =>
-        assert.rejects(call(overrides), Error, name),
+      Object.entries(refused).map(([name, [overrides, reason]]) =>
+        assert.rejects(call(overrides), reason, name),
       ),
     );
+  });
+
+  it("refuses a response larger than any capped read", async () => {
+    responseBody = Buffer.alloc(16 * 1024 * 1024 + 1);
+    try {
+      await assert.rejects(call(), /workspace API response too large/);
+    } finally {
+      responseBody = Buffer.from([0, 0, 0, 0, 1, 0xff]);
+    }
   });
 
   it("refuses a workspace socket other users can enter", async () => {
