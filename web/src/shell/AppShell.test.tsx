@@ -4696,6 +4696,11 @@ describe("AppShell file sharing", () => {
   });
 
   it("shares an in-workspace absolute path as a relative file link and resets the target for session sharing", () => {
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({ id: "conv_abc", workspace: "/repo" }),
+      isLoading: false,
+      error: null,
+    });
     withWindowOrigin("https://app.example.com", () => {
       renderShell("/c/conv_abc?file=%2Frepo%2Fartifacts%2Freport.html");
       fireEvent.click(
