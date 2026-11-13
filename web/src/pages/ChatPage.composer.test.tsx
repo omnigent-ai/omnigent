@@ -980,6 +980,9 @@ describe("Composer goal slash command", () => {
         <Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />,
       );
       fireEvent.change(textarea(), { target: { value: "/go" } });
+      if (sessionHarness === "codex-native") {
+        expect(screen.getByRole("button", { name: /^\$goal/ })).toBeInTheDocument();
+      }
       fireEvent.click(
         screen.getByRole("button", { name: /^\/goal\s*View or set the goal for this session$/ }),
       );
