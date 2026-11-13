@@ -9670,6 +9670,8 @@ def _load_agent_spec_for_session_impl(
     conv: Conversation,
     agent_store: AgentStore,
     agent: Agent | None = None,
+    *,
+    agent_cache: AgentCache | None = None,
 ) -> AgentSpec | None:
     # Split from _build_policy_engine_from_spec so callers can skip engine
     # construction when no policy could fire; both halves run in to_thread.
@@ -9680,7 +9682,8 @@ def _load_agent_spec_for_session_impl(
         agent = agent_store.get(conv.agent_id)
     if agent is None:
         return None
-    agent_cache = cast(AgentCache, get_agent_cache())
+    if agent_cache is None:
+        agent_cache = cast(AgentCache, get_agent_cache())
     spec = agent_cache.load(
         agent.id,
         agent.bundle_location,
