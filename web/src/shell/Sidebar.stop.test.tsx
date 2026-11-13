@@ -1,4 +1,4 @@
-import { renderSidebar } from "@/test/sidebarTestHelpers";
+import { renderSidebar, selectSessionFilter } from "@/test/sidebarTestHelpers";
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -166,12 +166,7 @@ describe("sidebar Stop session item", () => {
     mockConversations([{ ...HOST_SPAWNED, owner: "other@example.com" }]);
     renderSidebar();
     // Radix Tabs triggers activate on mousedown (primary button), not click.
-    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
-      button: 0,
-      ctrlKey: false,
-      pointerType: "mouse",
-    });
-    fireEvent.click(screen.getByTestId("session-filter-shared"));
+    selectSessionFilter("shared");
     openKebab();
     const item = screen.getByTestId("stop-conversation");
     expect(item).toHaveAttribute("data-disabled");

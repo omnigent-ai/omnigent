@@ -18,7 +18,7 @@ from playwright.sync_api import Locator, Page, Request, expect
 
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
-from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui, patch_session
+from tests.e2e_ui.sessions._sidebar_helpers import patch_session
 
 # The server rescans watched sessions every 4 s; this covers a frame, the
 # reconcile debounce and the refetch it starts.
@@ -80,7 +80,6 @@ def test_session_changes_refetch_only_the_folders_they_touch(
         "window.localStorage.setItem('omnigent:expanded-project-sections', "
         f"{json.dumps(json.dumps(names))});"
     )
-    enable_grouping_ui(page)
     page.on("request", record)
     # Targeted rounds don't reset the 60 s full-reconcile clock, so one can land
     # in a window; that window's exact-set check is skipped.

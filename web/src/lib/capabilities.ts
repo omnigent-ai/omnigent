@@ -62,7 +62,6 @@ export type FeatureKey =
   | "canvas"
   | "arca_shutdown_warnings"
   | "import_review"
-  | "sidebar_grouping_ui"
   | "workspace_content_search"
   | "grid_sessions_display_ui"
   | "automations_v2"
