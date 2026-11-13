@@ -4845,6 +4845,7 @@ def server(
     from omnigent.server.server_config import (
         SESSION_TITLE_INSTRUCTIONS_KEY,
         config_str_list,
+        load_server_config,
     )
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -4869,15 +4870,17 @@ def server(
                 "Invalid shared_preferences_authority_id: expected a nonempty string "
                 "of at most 128 characters without surrounding whitespace."
             ) from None
-    title_server_config = cfg
+    server_config: dict[str, Any] | None = cfg
     if config_path is None:
-        global_cfg = _load_global_config()
-        title_instructions = global_cfg.get(SESSION_TITLE_INSTRUCTIONS_KEY)
-        title_server_config = (
-            {SESSION_TITLE_INSTRUCTIONS_KEY: title_instructions}
-            if title_instructions is not None
-            else {}
-        )
+        # Without -c, create_app gets the resolved server config (OMNIGENT_CONFIG
+        # or <data_dir>/config.yaml); the user config only fills in
+        # session_title_instructions when the server config leaves it unset.
+        resolved_server_config = dict(load_server_config())
+        title_instructions = _load_global_config().get(SESSION_TITLE_INSTRUCTIONS_KEY)
+        if title_instructions is not None:
+            resolved_server_config.setdefault(SESSION_TITLE_INSTRUCTIONS_KEY, title_instructions)
+        # Pass the dict even when empty so create_app doesn't re-read the file.
+        server_config = resolved_server_config
 
     # Let the server-config reader (branding) see the same ``-c`` file.
     if config_path:
@@ -5144,7 +5147,7 @@ def server(
         mcp_registry=mcp_registry,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
-        server_config=title_server_config,
+        server_config=server_config,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
