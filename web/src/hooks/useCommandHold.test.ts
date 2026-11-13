@@ -355,6 +355,15 @@ describe("useCommandHoldTracking off macOS", () => {
     expect(result.current).toBe(true);
   });
 
+  it("reveals when Shift was already down before Ctrl", () => {
+    const { result } = renderTracking(false);
+    key("keydown", "Shift", { shiftKey: true });
+    key("keydown", "Control", { ctrlKey: true, shiftKey: true });
+
+    elapseRevealDelay();
+    expect(result.current).toBe(true);
+  });
+
   it("hides when Meta joins Ctrl, since it is not a joining key there", () => {
     const { result } = renderTracking(false);
     key("keydown", "Control", OTHER_COMMAND);
