@@ -2540,38 +2540,59 @@ async def test_permission_hook_verdict_during_gap_honored_on_repark(
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, "test-permission-gap-verdict")
     session_id = await _create_session(client, agent["id"])
-    collector = await start_session_stream_collector(session_id)
     payload = {
         **(await _claude_permission_payload(tool_name=tool_name)),
         "_omnigent_elicitation_id": _REATTACH_ELICITATION_ID,
     }
-
-    first = await client.post(
-        f"/v1/sessions/{session_id}/hooks/permission-request",
-        json=payload,
-    )
-    assert first.status_code == 200, first.text
-    assert first.content == b""
-
-    # Verdict arrives while NO wait is parked (the gap).
-    verdict = await _post_approval(client, session_id, _REATTACH_ELICITATION_ID, "accept")
-    assert verdict.status_code == 202, verdict.text
-    # The approval cleared the index even though nothing was parked.
-    assert pending_elicitations.count_for(session_id) == 0
-
-    # The retry consumes the tombstone and returns the verdict without
-    # re-publishing the prompt (it would otherwise park again and the
-    # disconnect fake would fail-ask it).
-    second = await client.post(
-        f"/v1/sessions/{session_id}/hooks/permission-request",
-        json=payload,
-    )
-    assert second.status_code == 200, second.text
-    body = second.json()
-    # "allow" proves the gap verdict was honored; an empty body here
-    # would mean the tombstone was dropped and the click lost.
-    assert body["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+    answers = None
+    if tool_name == "AskUserQuestion":
+        question = "Which option do you prefer?"
+        payload["tool_input"] = {
+            "questions": [
+                {
+                    "question": question,
+                    "header": "Choice",
+                    "options": [
+                        {"label": "Alpha", "description": "First option"},
+                        {"label": "Bravo", "description": "Second option"},
+                    ],
+                    "multiSelect": False,
+                }
+            ]
+        }
+        answers = {question: "Alpha"}
+    collector = await start_session_stream_collector(session_id)
     try:
+        first = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+        assert first.status_code == 200, first.text
+        assert first.content == b""
+
+        # Verdict arrives while NO wait is parked (the gap).
+        verdict = await _post_approval(
+            client, session_id, _REATTACH_ELICITATION_ID, "accept", content=answers
+        )
+        assert verdict.status_code == 202, verdict.text
+        # The approval cleared the index even though nothing was parked.
+        assert pending_elicitations.count_for(session_id) == 0
+
+        # The retry consumes the tombstone and returns the verdict without
+        # re-publishing the prompt (it would otherwise park again and the
+        # disconnect fake would fail-ask it).
+        second = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+        assert second.status_code == 200, second.text
+        decision = second.json()["hookSpecificOutput"]["decision"]
+        # "allow" proves the gap verdict was honored; an empty body here
+        # would mean the tombstone was dropped and the click lost.
+        assert decision["behavior"] == "allow"
+        if answers is not None:
+            assert decision["updatedInput"]["answers"] == answers
+
         resolved = await collector.next_event()
         while resolved["type"] != "response.elicitation_resolved":
             resolved = await collector.next_event()
@@ -4040,44 +4061,43 @@ async def test_gated_tool_output_clears_severed_question_card(
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, "test-terminal-resolved-severed-question")
     session_id = await _create_session(client, agent["id"])
-    collector = await start_session_stream_collector(session_id)
     payload = {
         **(await _claude_permission_payload(tool_name="AskUserQuestion")),
         "_omnigent_elicitation_id": _REATTACH_ELICITATION_ID,
     }
-
-    severed = await client.post(
-        f"/v1/sessions/{session_id}/hooks/permission-request",
-        json=payload,
-    )
-    assert severed.status_code == 200, severed.text
-    assert severed.content == b""
-    assert pending_elicitations.count_for(session_id) == 1
-
-    call_id = "toolu_question_answered_in_tui"
-    for item_type, item_data in (
-        (
-            "function_call",
-            {
-                "agent": "Claude",
-                "name": "AskUserQuestion",
-                "arguments": json.dumps(payload["tool_input"]),
-                "call_id": call_id,
-            },
-        ),
-        ("function_call_output", {"call_id": call_id, "output": "User answered: ls -la"}),
-    ):
-        mirrored = await _post_external_conversation_item(
-            client,
-            session_id,
-            item_type,
-            item_data,
-            source_id=f"src_question_{item_type}",
-            response_id="resp_question",
-        )
-        assert mirrored.status_code < 300, mirrored.text
-
+    collector = await start_session_stream_collector(session_id)
     try:
+        severed = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+        assert severed.status_code == 200, severed.text
+        assert severed.content == b""
+        assert pending_elicitations.count_for(session_id) == 1
+
+        call_id = "toolu_question_answered_in_tui"
+        for item_type, item_data in (
+            (
+                "function_call",
+                {
+                    "agent": "Claude",
+                    "name": "AskUserQuestion",
+                    "arguments": json.dumps(payload["tool_input"]),
+                    "call_id": call_id,
+                },
+            ),
+            ("function_call_output", {"call_id": call_id, "output": "User answered: ls -la"}),
+        ):
+            mirrored = await _post_external_conversation_item(
+                client,
+                session_id,
+                item_type,
+                item_data,
+                source_id=f"src_question_{item_type}",
+                response_id="resp_question",
+            )
+            assert mirrored.status_code < 300, mirrored.text
+
         async with asyncio.timeout(5):
             resolved = await collector.next_event()
             while resolved["type"] != "response.elicitation_resolved":
