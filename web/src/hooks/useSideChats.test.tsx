@@ -63,6 +63,30 @@ describe("side-chat soft tabs", () => {
     expect(result.current.numbers).toEqual({ conv_real: 3, conv_other: 2 });
   });
 
+  it.each([
+    ["an unpinned pending tab unpins it", ["conv_real"], [], ["conv_other", "conv_real"]],
+    [
+      "a pinned pending tab keeps the pending slot",
+      ["conv_real", "conv_other", "pending"],
+      ["conv_other", "conv_real"],
+      ["conv_other", "conv_real"],
+    ],
+  ])("rekey into an already-open pinned tab: %s", (_case, pinnedBefore, pinnedAfter, tabsAfter) => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    let pendingId = "";
+    act(() => result.current.open("conv_real"));
+    act(() => result.current.open("conv_other"));
+    act(() => {
+      pendingId = result.current.openPending();
+    });
+    for (const id of pinnedBefore) {
+      act(() => result.current.setPinned(id === "pending" ? pendingId : id, true));
+    }
+    act(() => result.current.rekey(pendingId, "conv_real"));
+    expect(result.current.pinned).toEqual(pinnedAfter);
+    expect(result.current.tabs).toEqual(tabsAfter);
+  });
+
   it("opens child ids as tabs, selecting each, and is idempotent", () => {
     const { result } = renderHook(() => useSideChats("session-a"));
     expect(result.current.tabs).toEqual([]);

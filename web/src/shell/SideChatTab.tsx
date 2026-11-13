@@ -34,6 +34,11 @@ export function sideChatTabDensity(tabCount: number): SideChatTabDensity {
   return "regular";
 }
 
+/** Dense strips show Close only on the selected tab; the menu still offers it. */
+export function showsSideChatCloseButton(density: SideChatTabDensity, active: boolean): boolean {
+  return density !== "dense" || active;
+}
+
 /** The pin and move actions a side-chat tab offers; absent for sub-agent tabs. */
 export interface SideChatTabArrangement {
   pinned: boolean;
@@ -179,7 +184,7 @@ export function SideChatRailTab({
             <PinIcon className="size-3" />
           </button>
         ) : (
-          (density !== "dense" || active) && (
+          showsSideChatCloseButton(density, active) && (
             <button
               type="button"
               aria-label={`Close ${label}`}

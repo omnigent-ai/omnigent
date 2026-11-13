@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   MAX_OPEN_TABS,
   readSessionWorkspaceState,
@@ -86,7 +86,9 @@ function sameSideChatGroup(state: SideChatTabsState, id: string, target: string)
 export function useSideChats(conversationId: string) {
   const [state, setState] = useState(() => readSideChatTabsState(conversationId));
   const displayedNumbers = useRef(state.numbers);
-  displayedNumbers.current = state.numbers;
+  useLayoutEffect(() => {
+    displayedNumbers.current = state.numbers;
+  }, [state.numbers]);
   // Changes a failed storage write couldn't save. Each update replays them on
   // fresh storage, so they survive without undoing other windows' changes.
   const unsaved = useRef<{ conversationId: string; changes: TabsChange[] } | null>(null);
@@ -206,7 +208,7 @@ export function useSideChats(conversationId: string) {
             ...current.numbers,
             [newId]: current.numbers[oldId] ?? current.numbers[newId],
           },
-          pinned: [...new Set(current.pinned.map(replace))],
+          pinned: current.pinned.filter((id) => id !== newId).map(replace),
         };
       }),
     [update],

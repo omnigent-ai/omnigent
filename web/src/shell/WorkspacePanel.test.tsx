@@ -1860,20 +1860,24 @@ describe("WorkspacePanel side-chat tab arrangement", () => {
   });
 
   it.each([
-    [3, "Side chat 3", 3],
-    [5, "5", 5],
-    [8, "8", 1],
+    [3, "Side chat 3", 3, false],
+    [5, "5", 5, false],
+    [8, "8", 1, false],
+    [3, "Side chat 3", 3, true],
+    [8, "8", 1, true],
   ])(
-    "packs %i side chats with visible labels like %j and %i close buttons",
-    (count, lastVisibleText, closeButtons) => {
+    "packs %i side chats with visible labels like %j and %i close buttons (mobile: %s)",
+    (count, lastVisibleText, closeButtons, mobile) => {
+      isMobileMock.mockReturnValue(mobile);
       openSideChats(Array.from({ length: count }, (_, index) => `conv_side_${index}`));
-      renderWorkspace({ rightRailTab: "sidechat" });
+      renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: mobile });
 
-      const tabs = within(rail()).getAllByRole("tab", { name: /^Side chat \d+$/ });
+      const surface = mobile ? screen.getByTestId("side-chats-panel-drawer") : rail();
+      const tabs = within(surface).getAllByRole("tab", { name: /^Side chat \d+$/ });
       expect(tabs).toHaveLength(count);
       expect(tabs.at(-1)).toHaveTextContent(new RegExp(`^${lastVisibleText}$`));
-      expect(tabs.at(-1)).toHaveAttribute("title", `Side chat ${count}`);
-      expect(within(rail()).getAllByRole("button", { name: /^Close Side chat/ })).toHaveLength(
+      if (!mobile) expect(tabs.at(-1)).toHaveAttribute("title", `Side chat ${count}`);
+      expect(within(surface).getAllByRole("button", { name: /^Close Side chat/ })).toHaveLength(
         closeButtons,
       );
     },

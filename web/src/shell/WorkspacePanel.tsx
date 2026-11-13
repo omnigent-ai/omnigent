@@ -76,6 +76,7 @@ import {
   SideChatRailTab,
   type SideChatTabArrangement,
   SideChatTabGroup,
+  showsSideChatCloseButton,
   sideChatTabDensity,
   SideChatTabMenu,
   SideChatTabsDragArea,
@@ -2315,14 +2316,16 @@ function WorkspacePanelImpl({
                         <PinIcon className="size-3.5" />
                       </button>
                     ) : (
-                      <button
-                        type="button"
-                        aria-label={`Close ${label}`}
-                        className="flex size-6 items-center justify-center rounded"
-                        onClick={() => closeSideChat(childId)}
-                      >
-                        <XIcon className="size-3.5" />
-                      </button>
+                      showsSideChatCloseButton(sideChatTabsDensity, active) && (
+                        <button
+                          type="button"
+                          aria-label={`Close ${label}`}
+                          className="flex size-6 items-center justify-center rounded"
+                          onClick={() => closeSideChat(childId)}
+                        >
+                          <XIcon className="size-3.5" />
+                        </button>
+                      )
                     )}
                   </div>
                 </SideChatTabMenu>
