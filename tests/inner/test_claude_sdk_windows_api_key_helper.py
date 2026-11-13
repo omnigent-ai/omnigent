@@ -238,6 +238,8 @@ async def test_failed_client_creation_removes_its_static_key_file(
         )
         with pytest.raises(expected) as failure:
             await create
+        if outcome in {"constructor", "connect"}:
+            assert f"{outcome} failed" in str(failure.value)
         assert "dummy-lifecycle-key" not in str(failure.value)
         assert not executor._clients
         assert options.stderr is None
