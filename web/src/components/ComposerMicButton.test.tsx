@@ -292,6 +292,27 @@ describe("ComposerMicButton", () => {
     }
   });
 
+  it("shows the dictation chord in its tooltip only while the hotkey is enabled", async () => {
+    const { unmount } = render(<ComposerMicButton onTranscript={vi.fn()} enableHotkey />);
+    const tooltip = await hoverMicTooltip(screen.getByRole("button", { name: "Voice dictation" }));
+    const keys = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+    expect(keys.map((key) => key.textContent)).toEqual([MOD_KEY, ALT_KEY, "V"]);
+    unmount();
+
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+    const plain = await hoverMicTooltip(screen.getByRole("button", { name: "Voice dictation" }));
+    expect(plain.querySelector('[data-slot="kbd"]')).toBeNull();
+  });
+
+  it("snapshots via onVoiceStart when dictation begins", () => {
+    const onVoiceStart = vi.fn();
+    render(<ComposerMicButton onTranscript={vi.fn()} onVoiceStart={onVoiceStart} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+
+    act(() => handlers.start?.({}));
+    expect(onVoiceStart).toHaveBeenCalledTimes(1);
+  });
+
   it("reports a recognizer that never responds to start and lets the next tap retry", async () => {
     vi.useFakeTimers();
     try {
@@ -335,27 +356,6 @@ describe("ComposerMicButton", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("shows the dictation chord in its tooltip only while the hotkey is enabled", async () => {
-    const { unmount } = render(<ComposerMicButton onTranscript={vi.fn()} enableHotkey />);
-    const tooltip = await hoverMicTooltip(screen.getByRole("button", { name: "Voice dictation" }));
-    const keys = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
-    expect(keys.map((key) => key.textContent)).toEqual([MOD_KEY, ALT_KEY, "V"]);
-    unmount();
-
-    render(<ComposerMicButton onTranscript={vi.fn()} />);
-    const plain = await hoverMicTooltip(screen.getByRole("button", { name: "Voice dictation" }));
-    expect(plain.querySelector('[data-slot="kbd"]')).toBeNull();
-  });
-
-  it("snapshots via onVoiceStart when dictation begins", () => {
-    const onVoiceStart = vi.fn();
-    render(<ComposerMicButton onTranscript={vi.fn()} onVoiceStart={onVoiceStart} />);
-    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
-
-    act(() => handlers.start?.({}));
-    expect(onVoiceStart).toHaveBeenCalledTimes(1);
   });
 
   it("Enter while listening stops dictation and keeps the text (no discard)", () => {
