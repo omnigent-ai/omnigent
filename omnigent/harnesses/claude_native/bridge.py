@@ -3466,7 +3466,7 @@ def _pop_caller_settings(
             if not inline and not settings_path.is_absolute() and workspace is not None:
                 settings_path = workspace / settings_path
             parsed = json.loads(value if inline else settings_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             parsed = None
         if isinstance(parsed, dict):
             found.append(parsed)

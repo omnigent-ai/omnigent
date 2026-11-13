@@ -5041,6 +5041,8 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
                 "permissions": {"allow": ["Read(first.txt)"], "deny": ["Bash(blocked)"]},
                 "deniedMcpServers": [{"serverName": "first-denial"}],
                 "cleanupPeriodDays": 21,
+                "enableAllProjectMcpServers": False,
+                "customOptions": {"nested": {"first": True}, "retained": 1},
             }
         ),
         encoding="utf-8",
@@ -5058,6 +5060,7 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
         "deniedMcpServers": [{"serverName": "later-denial"}],
         "enabledPlugins": {"other@market": False},
         "cleanupPeriodDays": 42,
+        "customOptions": {"nested": {"later": True}},
     }
     args = augment_claude_args(
         (
@@ -5081,6 +5084,8 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
     assert settings["env"]["B"] == "2"
     assert settings["enabledPlugins"] == {"extra@market": False, "other@market": False}
     assert settings["cleanupPeriodDays"] == 42
+    assert settings["enableAllProjectMcpServers"] is True
+    assert settings["customOptions"] == {"nested": {"later": True}, "retained": 1}
     assert settings["skillOverrides"] == {"custom-skill": "off", "auto-mode-setup": "off"}
     assert settings["permissions"]["allow"][:2] == ["Read(first.txt)", "Read(second.txt)"]
     assert settings["permissions"]["deny"] == ["Bash(blocked)"]
@@ -5113,16 +5118,6 @@ def test_augment_claude_args_preserves_settings_like_option_values(
     assert settings["hooks"]["PreToolUse"]
 
 
-def test_augment_claude_args_keeps_its_own_settings_on_conflict(tmp_path: Path) -> None:
-    """The bridge's own keys win a conflict, so its consent gates stay in force."""
-    args = augment_claude_args(
-        ("--settings", json.dumps({"enableAllProjectMcpServers": False})),
-        bridge_dir=tmp_path,
-    )
-
-    assert _load_invocation_settings(args)["enableAllProjectMcpServers"] is True
-
-
 @pytest.mark.parametrize("flag", ["disableAllHooks", "allowManagedHooksOnly"])
 @pytest.mark.parametrize(
     "values",
@@ -5144,21 +5139,29 @@ def test_augment_claude_args_rejects_settings_that_disable_bridge_hooks(
 
 
 @pytest.mark.parametrize(
-    "contents",
-    [None, b"{", b"[]", b"\xff"],
-    ids=["missing", "malformed", "non-object", "invalid-utf8"],
+    ("contents", "inline"),
+    [
+        (None, False),
+        (b"{", False),
+        (b"[]", False),
+        (b"\xff", False),
+        (b'{"x":' + b"[" * 10000 + b"0", False),
+        (b'{"x":' + b"[" * 10000 + b"0", True),
+    ],
+    ids=["missing", "malformed", "non-object", "invalid-utf8", "deep-file", "deep-inline"],
 )
 def test_augment_claude_args_passes_unreadable_caller_settings_through(
-    tmp_path: Path, contents: bytes | None
+    tmp_path: Path, contents: bytes | None, inline: bool
 ) -> None:
     """A ``--settings`` value that is not a readable JSON object is left to Claude."""
     missing = str(tmp_path / "missing.json")
     if contents is not None:
         Path(missing).write_bytes(contents)
 
-    args = augment_claude_args(("--settings", missing), bridge_dir=tmp_path)
+    value = contents.decode() if inline and contents is not None else missing
+    args = augment_claude_args(("--settings", value), bridge_dir=tmp_path)
 
-    assert args[:2] == ["--settings", missing]
+    assert args[:2] == ["--settings", value]
     assert args.count("--settings") == 2
 
 

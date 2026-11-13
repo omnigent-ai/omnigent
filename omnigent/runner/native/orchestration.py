@@ -9920,14 +9920,8 @@ async def _auto_create_claude_terminal(
             turn_routing=_claude_turn_router is not None,
         )
 
-        # Apply the per-harness startup command/args override from config
-        # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
-        # downstream integration can wrap this managed-host launch — e.g. a wrapper
-        # such as ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
-        # ``isaac -- <augmented args>`` (the config args prepend, and augmentation
-        # appended above, so the ``--`` stays first). Identity by default. This is
-        # the same resolver the local-CLI native launch uses (see cli_native.py), so
-        # both terminal-creation paths honour one config surface.
+        # Share startup overrides with the local CLI path. Wrapper arguments
+        # prepend the augmented Claude arguments; the default launches Claude directly.
         from omnigent.config import load_effective_config  # noqa: FlagLocalImports
         from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
             resolve_harness_args,
@@ -9964,7 +9958,7 @@ async def _auto_create_claude_terminal(
             ),
             command=launch_command,
             args=launch_args,
-            # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
+            # Tool Search env plus provider gateway env (ANTHROPIC_BASE_URL
             # etc.) when derived. Empty provider config still forces
             # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
             env={
