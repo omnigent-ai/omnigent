@@ -14,6 +14,9 @@ function Harness({ enabled = true }: { enabled?: boolean }) {
         <p data-testid="page">transcript</p>
         <textarea data-testid="composer" />
         <div data-testid="terminal" className="xterm" />
+        <div data-keeps-keyboard style={{ position: "absolute" }}>
+          <span data-testid="menu-row">/help</span>
+        </div>
         <div data-testid="popover" style={{ position: "fixed" }}>
           <span data-testid="popover-row">menu row</span>
         </div>
@@ -115,6 +118,7 @@ describe("useSwipeDownToDismissKeyboard", () => {
     ["the text field itself", "composer"],
     ["a terminal", "terminal"],
     ["a popover", "popover-row"],
+    ["a composer suggestion menu", "menu-row"],
     ["content outside the surface", "outside"],
   ])("ignores swipes that start on %s", (_name, testId) => {
     const { getByTestId, composer } = setup();

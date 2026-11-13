@@ -522,7 +522,9 @@ pickers, seeded from the source session when its harness family is kept.
 **Mobile** (either composer on a phone-sized viewport): host and harness/model
 controls live in the top-right glass group. The composer starts as one row with
 Add, hint text, microphone, and Send; focusing the textarea expands it into a
-stacked layout with permission controls. Add alone does not expand it. On the
+stacked layout with permission controls. Add alone does not expand it. While
+it has focus, swipe down on the page (not on a text field or an open suggestion
+menu) to close the keyboard; the composer collapses and keeps its draft. On the
 landing page, choose the working directory below the headline; in a session,
 find the current directory in the session-actions menu. Running background
 tasks remain accessible from the session header.

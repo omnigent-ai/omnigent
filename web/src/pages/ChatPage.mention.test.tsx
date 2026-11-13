@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import { useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import { swipeDown } from "@/test/touchGestures";
 
 // Drill-down "@"-mention browses one directory at a time, so the test stubs
 // both sources: the root listing (useWorkspaceAllFiles) and the per-directory
@@ -491,6 +492,26 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     // distinct from Enter's drill-in.
     fireEvent.keyDown(textarea(), { key: "Tab" });
     expect(tokens()).toEqual(["@src/"]);
+  });
+
+  it("keeps the keyboard up while the mobile mention menu scrolls", () => {
+    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === "(max-width: 767.98px)",
+    }));
+    renderWithTooltips(
+      <div className="app-shell">
+        <Composer {...composerProps()} />
+      </div>,
+    );
+    textarea().focus();
+    type("@");
+    swipeDown(screen.getByTestId("file-mention-menu"));
+    expect(textarea()).toHaveFocus();
+    expect(textarea()).toHaveValue("@");
+    expect(screen.getByTitle("Open src")).toBeVisible();
   });
 
   it("Escape closes the mention menu", () => {

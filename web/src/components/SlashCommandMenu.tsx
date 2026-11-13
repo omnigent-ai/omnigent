@@ -534,6 +534,7 @@ function McpServerMenu({
   return (
     <div
       data-testid="mcp-server-menu"
+      data-keeps-keyboard
       onMouseDown={(event) => event.preventDefault()}
       className="menu-surface mobile-menu-glass absolute bottom-full left-0 z-30 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
     >
@@ -815,6 +816,7 @@ export function SlashCommandMenu({
     <TooltipProvider>
       <div
         data-testid="slash-command-menu"
+        data-keeps-keyboard
         className="menu-surface mobile-menu-glass absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
       >
         <MobileMenuGlassSurface />

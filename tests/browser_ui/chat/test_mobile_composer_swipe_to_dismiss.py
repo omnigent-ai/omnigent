@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 from playwright.sync_api import CDPSession, Locator, Page, expect
 
+from tests.browser_ui.chat._geometry_helpers import scroll_with_native_touch, seed_long_transcript
 from tests.browser_ui.chat.session_contract import ChatSessionContract
 
 _CARD = "[data-composer-card]"
@@ -71,16 +72,17 @@ def test_swipe_down_dismisses_new_session_composer(page: Page, chat_session_cont
 
 
 def test_swipe_down_dismisses_session_composer(page: Page, chat_session_contract) -> None:
-    """CUJ-2: in a session, a downward swipe over the transcript blurs the composer."""
+    """CUJ-2: in a session, a downward swipe scrolls the transcript and blurs the composer."""
     chat: ChatSessionContract = chat_session_contract
-    chat.seed_transcript(6)
+    seed_long_transcript(chat)
     page.goto(chat.url)
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible()
     cdp = page.context.new_cdp_session(page)
 
     _focus(composer)
-    _swipe(cdp, page, x=200, y=300, dy=200)
+    scroll = scroll_with_native_touch(page, cdp)
+    assert scroll["settledScrollTop"] < scroll["initialScrollTop"], scroll
     expect(composer).not_to_be_focused()
     expect(page.locator(_CARD).filter(has=composer)).to_have_attribute(
         "data-mobile-composer", "collapsed"

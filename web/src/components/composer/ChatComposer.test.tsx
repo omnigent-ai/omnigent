@@ -8,22 +8,7 @@ import {
   ComposerSendButton,
   COMPOSER_LABELS_MIN_GAP_PX,
 } from "./ChatComposer";
-
-/** Drag one finger 120px down from `target`, as on a phone. */
-function swipeDown(target: Element) {
-  for (const [type, y] of [
-    ["touchstart", 200],
-    ["touchmove", 240],
-    ["touchmove", 320],
-    ["touchend", 320],
-  ] as const) {
-    const event = new Event(type, { bubbles: true });
-    Object.defineProperty(event, "touches", {
-      value: type === "touchend" ? [] : [{ clientX: 100, clientY: y }],
-    });
-    target.dispatchEvent(event);
-  }
-}
+import { swipeDown } from "@/test/touchGestures";
 
 function renderInShell() {
   render(
