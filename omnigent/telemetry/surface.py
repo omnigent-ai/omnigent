@@ -24,9 +24,12 @@ CLIENT_SURFACES = frozenset(
     }
 )
 # Surfaces a session may store as its ``omnigent.client_surface`` label. Internal
-# components and ``script`` never are: their sessions take the originating surface,
-# and ``script`` is stored as ``web``, as on main.
-SESSION_SURFACES = frozenset({"web", "desktop", "ios", "android", "mobile", "cli", "sdk", "slack"})
+# components never are: their sessions take the originating surface.
+SESSION_SURFACES = frozenset({"web", "desktop", "ios", "android", "mobile", "cli"})
+# Request surfaces stored as another session surface. SDK and Slack sessions store
+# ``cli``, as on main: runners older than those surfaces only accept main's labels.
+# ``script`` is stored as ``web``, as on main.
+_SESSION_SURFACE_ALIASES = {"sdk": "cli", "slack": "cli", "script": "web"}
 # Omnigent components acting for a session another surface created.
 _INTERNAL_SURFACES = frozenset({"runner", "host", "harness"})
 # User-Agent product tokens Omnigent's own Python clients send, e.g.
@@ -78,15 +81,16 @@ def resolve_session_surface(
     :returns: A value in :data:`SESSION_SURFACES`, or ``"unknown"``.
     """
     surface = headers.get("x-omnigent-client")
-    if surface is not None and surface in SESSION_SURFACES:
-        return surface
+    stored = _storable(surface) if surface is not None else None
+    if stored is not None:
+        return stored
     inherited = _stored_surface(parent_labels)
     if inherited is not None:
         return inherited
     user_agent = headers.get("user-agent")
     classified = classify_surface(user_agent)
     if classified not in _INTERNAL_SURFACES:
-        return "web" if classified == "script" else classified
+        return _storable(classified) or "unknown"
     # Attribution is self-reported (User-Agent and labels), not authenticated.
     for labels in (source_labels, requested_labels):
         origin = _stored_surface(labels)
@@ -95,12 +99,18 @@ def resolve_session_surface(
     return _main_surface(user_agent)
 
 
+def _storable(surface: str) -> str | None:
+    """Return the session label for a request surface, or ``None`` if it has none."""
+    stored = _SESSION_SURFACE_ALIASES.get(surface, surface)
+    return stored if stored in SESSION_SURFACES else None
+
+
 def _stored_surface(labels: Mapping[str, str] | None) -> str | None:
     """Return the session surface stored in *labels*, if it is a storable one."""
     if labels is None:
         return None
     value = labels.get(CLIENT_SURFACE_LABEL_KEY)
-    return value if value in SESSION_SURFACES else None
+    return _storable(value) if value is not None else None
 
 
 def _main_surface(user_agent: str | None) -> str:

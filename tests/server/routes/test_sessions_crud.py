@@ -172,6 +172,13 @@ MAIN_GATEWAY_BY_REQUEST_SHAPE = [
 ]
 
 
+# Session surfaces a runner from before the sdk and slack surfaces accepts. Any other
+# label reaches it as "unknown" (runner resource registry).
+_RUNNER_SESSION_SURFACES_BEFORE_SDK_SLACK = frozenset(
+    {"web", "desktop", "ios", "android", "mobile", "cli"}
+)
+
+
 @pytest.mark.parametrize(("user_agent", "gateway_surface"), MAIN_GATEWAY_BY_REQUEST_SHAPE)
 async def test_session_gateway_name_matches_main_per_request_shape(
     client: httpx.AsyncClient,
@@ -179,7 +186,11 @@ async def test_session_gateway_name_matches_main_per_request_shape(
     user_agent: str,
     gateway_surface: str,
 ) -> None:
-    """The gateway name a create-session request gets is main's, for every request shape."""
+    """The gateway name a create-session request gets is main's, for every request shape.
+
+    Also holds when the session's label reaches a runner that predates the sdk and
+    slack surfaces, so a mixed-version deployment keeps main's attribution.
+    """
     from omnigent.databricks_ai_gateway import CLIENT_SURFACES_HEADER, gateway_attribution_headers
 
     store = SqlAlchemyConversationStore(db_uri)
@@ -190,9 +201,9 @@ async def test_session_gateway_name_matches_main_per_request_shape(
     assert response.status_code == 201, response.text
     row = store.get_conversation(response.json()["id"])
     assert row is not None
-    attribution = gateway_attribution_headers(
-        "codex", client_surface=row.labels[CLIENT_SURFACE_LABEL_KEY]
-    )
+    stored = row.labels[CLIENT_SURFACE_LABEL_KEY]
+    runner_view = stored if stored in _RUNNER_SESSION_SURFACES_BEFORE_SDK_SLACK else "unknown"
+    attribution = gateway_attribution_headers("codex", client_surface=runner_view)
     assert attribution[CLIENT_SURFACES_HEADER] == gateway_surface
 
 

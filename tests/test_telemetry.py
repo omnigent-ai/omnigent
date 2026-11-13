@@ -115,11 +115,24 @@ def test_client_surface_invalid_header_uses_user_agent(header: str | None) -> No
 
 
 def test_session_surface_header_stores_only_user_surfaces() -> None:
-    """A user surface in the header is stored; an internal or script one is not."""
+    """A user surface in the header is stored; an internal one is not."""
     assert resolve_session_surface({"x-omnigent-client": "ios"}) == "ios"
-    assert resolve_session_surface({"x-omnigent-client": "sdk"}) == "sdk"
     headers = {"x-omnigent-client": "runner", "user-agent": "curl/8"}
     assert resolve_session_surface(headers) == "web"
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"x-omnigent-client": "sdk"},
+        {"x-omnigent-client": "slack"},
+        {"user-agent": "omnigent-client/0.22.0 python-httpx/0.28.1"},
+        {"user-agent": "omnigent-slack/0.1.0 python-httpx/0.28.1"},
+    ],
+)
+def test_sdk_and_slack_sessions_store_cli(headers: dict[str, str]) -> None:
+    """SDK and Slack sessions store ``cli``, the label older runners accept."""
+    assert resolve_session_surface(headers) == "cli"
 
 
 def test_session_surface_inherits_parent_before_user_agent() -> None:

@@ -237,9 +237,6 @@ _OMNIGENT_CLIENT_SURFACES: Final[dict[str, str]] = {
     "android": "omnigent-mobile",
     "mobile": "omnigent-mobile",
     "cli": "omnigent-cli",
-    # SDK and Slack sessions were ``cli`` on main; keep that gateway name.
-    "sdk": "omnigent-cli",
-    "slack": "omnigent-cli",
 }
 _ATTRIBUTION_HEADER_NAMES: Final[tuple[str, str]] = (CODING_AGENT_HEADER, CLIENT_SURFACES_HEADER)
 _ATTRIBUTION_HEADER_KEYS: Final[frozenset[str]] = frozenset(
