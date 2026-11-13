@@ -22,6 +22,7 @@ import {
   useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
 import { useSessionRowQuickActions } from "@/lib/sessionRowQuickActionsPreferences";
+import { useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
@@ -313,6 +314,7 @@ import { isRowFullyVisible } from "./sidebarRowVisibility";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { useHarnessLabels } from "@/lib/agentLabels";
 import {
+  NATIVE_CODING_AGENTS,
   nativeCodingAgentForSession,
   nativeCodingAgentForWrapper,
   type NativeCodingAgentIconKind,
@@ -934,6 +936,8 @@ function SidebarImpl({
   // for the settings section nav (see settingsNav.tsx) — entering settings
   // shouldn't replace the whole sidebar.
   const { inSettings } = useSettingsRoute();
+  // Fetched only in Settings, whose nav drops Harnesses when none is offered.
+  const curatedOutHarnesses = useCuratedOutHarnesses(inSettings);
   // Remember the pre-settings location so the Back row returns to the
   // conversation the user was viewing, not the home page. Tracked here since
   // the sidebar stays mounted across the transition into settings.
@@ -1312,7 +1316,10 @@ function SidebarImpl({
           />
         )}
         {inSettings ? (
-          <SettingsSidebarBody onNavClick={onNavClick} />
+          <SettingsSidebarBody
+            onNavClick={onNavClick}
+            harnessesOffered={curatedOutHarnesses.size < NATIVE_CODING_AGENTS.length}
+          />
         ) : (
           <>
             {/* sidebar-header-row is the hook for the macOS Electron shell. It
