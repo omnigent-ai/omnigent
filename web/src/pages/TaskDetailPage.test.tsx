@@ -18,8 +18,8 @@ import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { TaskDetailPage } from "./TaskDetailPage";
 import {
   emptyTriggerFields,
+  encodeTriggerPrompt,
   renderTriggerPrompt,
-  splitTriggerPrompt,
 } from "@/components/scheduled/triggerTemplates";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import * as hooks from "@/hooks/useScheduledTasks";
@@ -104,11 +104,19 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
   CreateScheduledTaskDialog: ({
     open,
     editingTask,
+    sessionLink,
   }: {
     open: boolean;
     editingTask?: ScheduledTask | null;
+    sessionLink?: string;
   }) =>
-    open ? <div data-testid="edit-dialog-open" data-editing-id={editingTask?.id ?? ""} /> : null,
+    open ? (
+      <div
+        data-testid="edit-dialog-open"
+        data-editing-id={editingTask?.id ?? ""}
+        data-session-link={sessionLink ?? ""}
+      />
+    ) : null,
 }));
 
 function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
@@ -151,6 +159,7 @@ function run(overrides: Partial<ScheduledTaskRun> = {}): ScheduledTaskRun {
     firedAt: 1_700_000_000,
     finishedAt: 1_700_000_102,
     errorCode: null,
+    errorDetail: null,
     conversationUpdatedAt: 1_700_000_500,
     conversationStatus: "idle",
     viewerLastSeen: null,
@@ -254,28 +263,73 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-prompt")).toHaveTextContent("None");
   });
 
-  it("shows the user prompt first and keeps generated instructions collapsed and read-only", () => {
-    const prompt = renderTriggerPrompt(
-      "slack",
-      { ...emptyTriggerFields("slack"), scope: "abc", instructions: "Summarize new messages." },
-      { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
-    );
-    setTask(task({ prompt }));
-    renderPage();
-    expect(screen.getByRole("heading", { name: "Your prompt" })).toBeVisible();
-    expect(screen.getByTestId("task-detail-prompt").textContent).toBe("Summarize new messages.");
-    const toggle = screen.getByRole("button", { name: "System prompt" });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByTestId("task-detail-system-prompt")).not.toBeInTheDocument();
+  it.each([false, true])(
+    "shows only a trigger's instructions, never its template text (header: %s)",
+    (withHeader) => {
+      const fields = {
+        ...emptyTriggerFields("slack"),
+        scope: "abc",
+        instructions: "Summarize new messages.",
+      };
+      const sessionLink = "https://example.test/c/CONVERSATION_ID";
+      const prompt = withHeader
+        ? encodeTriggerPrompt(
+            {
+              source: "slack",
+              ...fields,
+              worker: {
+                placement: "same_host",
+                agentId: null,
+                model: "",
+                effort: "",
+                permissionMode: "",
+              },
+            },
+            { sessionLink },
+          )
+        : renderTriggerPrompt("slack", fields, { placement: "same_host", sessionLink });
+      setTask(task({ prompt, sessionMode: "continue" }));
+      renderPage();
+      expect(screen.getByRole("heading", { name: "Instructions" })).toBeVisible();
+      expect(screen.getByTestId("task-detail-prompt").textContent).toBe("Summarize new messages.");
+      expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
+      expect(screen.queryByText(/This automation watches Slack/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/omnigent-trigger/)).not.toBeInTheDocument();
+    },
+  );
 
-    fireEvent.click(toggle);
-    expect(screen.getByTestId("task-detail-system-prompt").textContent).toBe(
-      splitTriggerPrompt(prompt).systemPrompt,
+  it.each([
+    [
+      "edited outside the form",
+      "continue",
+      (prompt: string) => prompt.replace("Summarize new messages.", "Do nothing."),
+    ],
+    ["on a task that starts new sessions", "new", (prompt: string) => prompt],
+  ] as const)("shows the full prompt for a header %s", (_case, sessionMode, mutate) => {
+    const prompt = mutate(
+      encodeTriggerPrompt(
+        {
+          source: "slack",
+          ...emptyTriggerFields("slack"),
+          scope: "abc",
+          instructions: "Summarize new messages.",
+          worker: {
+            placement: "same_host",
+            agentId: null,
+            model: "",
+            effort: "",
+            permissionMode: "",
+          },
+        },
+        { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+      ),
     );
-    expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
-    fireEvent.click(toggle);
-    expect(screen.queryByTestId("task-detail-system-prompt")).not.toBeInTheDocument();
-    expect(screen.getByTestId("task-detail-prompt")).toBeVisible();
+    setTask(task({ prompt, sessionMode }));
+    renderPage();
+    expect(screen.getByRole("heading", { name: "Prompt" })).toBeVisible();
+    const shown = screen.getByTestId("task-detail-prompt").textContent ?? "";
+    expect(shown).toContain("This automation watches Slack");
+    expect(shown).not.toContain("omnigent-trigger");
   });
 
   it("starts with configuration collapsed and toggles it while keeping run history visible", () => {
@@ -787,6 +841,11 @@ describe("header actions", () => {
     expect(screen.queryByTestId("edit-dialog-open")).toBeNull();
     fireEvent.click(screen.getByTestId("task-detail-edit"));
     expect(screen.getByTestId("edit-dialog-open")).toHaveAttribute("data-editing-id", "st_1");
+    // A trigger edit can render a new source's template, whose workers post this link.
+    expect(screen.getByTestId("edit-dialog-open")).toHaveAttribute(
+      "data-session-link",
+      `${window.location.origin}/c/CONVERSATION_ID`,
+    );
   });
 });
 
@@ -1010,6 +1069,28 @@ describe("run history", () => {
     expect(link).toHaveAccessibleName(/Runner · The agent didn't start\./);
     expect(within(row).getByTestId("run-failure")).toHaveTextContent(
       "Runner · The agent didn't start.",
+    );
+    // A run that recorded no failure detail shows no detail line.
+    expect(within(row).queryByTestId("run-failure-detail")).toBeNull();
+  });
+
+  it("shows a failed run's detail under its reason", () => {
+    setTask(task());
+    setRuns([
+      run({
+        status: "failed",
+        errorCode: "sandbox_registration_timeout",
+        errorDetail: "the sandbox did not register within 720 seconds — refresh your credentials",
+        conversationId: "c_7",
+      }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    expect(within(row).getByTestId("run-failure")).toHaveTextContent(
+      "Sandbox · The sandbox didn't connect in time.",
+    );
+    expect(within(row).getByTestId("run-failure-detail")).toHaveTextContent(
+      "the sandbox did not register within 720 seconds — refresh your credentials",
     );
   });
 

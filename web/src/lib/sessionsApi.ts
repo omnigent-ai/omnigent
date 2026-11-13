@@ -11,7 +11,7 @@ import type { SandboxProfile } from "./sandboxProfilesApi";
 // helpers below convert at the boundary so callers never see raw
 // wire fields.
 
-import type { ConversationItem } from "./conversationItems";
+import { isMessageItem, type ConversationItem } from "./conversationItems";
 import type { SideChatModelSettings } from "./sideChat";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
@@ -152,6 +152,13 @@ interface SessionResponseWire {
    * it. Absent when none are tracked.
    */
   background_tasks?: BackgroundTaskInfo[] | null;
+  /**
+   * Background agents a finished claude-native turn left running, while the
+   * session waits on them. `status` still reads ``"running"`` then, for older
+   * headless clients; {@link sessionFromWire} reads the pair as ``"waiting"``.
+   * Absent otherwise.
+   */
+  background_agents?: BackgroundTaskInfo[] | null;
   created_at: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
@@ -337,6 +344,19 @@ function pendingInputsFromWire(wire: PendingInputWire[] | undefined): PendingInp
   }));
 }
 
+/**
+ * The snapshot's status as the live stream would report it. The server keeps
+ * a claude-native background-agent wait at ``"running"`` so released headless
+ * clients keep polling, and names the agents beside it.
+ */
+function snapshotStatus(wire: SessionResponseWire): SessionStatus {
+  const waitingOnAgents =
+    wire.status === "running" &&
+    Array.isArray(wire.background_agents) &&
+    wire.background_agents.length > 0;
+  return waitingOnAgents ? "waiting" : wire.status;
+}
+
 function sessionFromWire(wire: SessionResponseWire): Session {
   // Record the session's host so slice-key routing (turn dispatch, terminal
   // attach) can pin to the replica holding that host's runner tunnel; a
@@ -354,9 +374,10 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     hostOnline: wire.host_online ?? undefined,
     hostResumable: wire.host_resumable ?? false,
     archived: wire.archived ?? false,
-    status: wire.status,
+    status: snapshotStatus(wire),
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
+    backgroundAgents: parseBackgroundTasks(wire.background_agents),
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,
@@ -1002,6 +1023,141 @@ export async function forkSession(
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
+/** A user prompt `/rewind` can return to. */
+export interface RewindPrompt {
+  /** The prompt's item id, e.g. "msg_abc". */
+  itemId: string;
+  /** Its text, joined from the prompt's text parts. */
+  text: string;
+  /** Epoch seconds, when the server recorded it. */
+  createdAt?: number;
+}
+
+/** Message pages `/rewind` reads per request for prompts. */
+const REWIND_PROMPT_PAGES = 5;
+const REWIND_PROMPT_PAGE_SIZE = 200;
+
+/** A batch of `/rewind` prompts, newest first. */
+export interface RewindPromptsPage {
+  prompts: RewindPrompt[];
+  /** Pass back as `after` to read older prompts; `null` once none remain. */
+  olderCursor: string | null;
+}
+
+/**
+ * List a session's user prompts, newest first, for the `/rewind` picker.
+ *
+ * Reads message items only (`GET /v1/sessions/{id}/items?type=message`, which
+ * servers advertising `session_rewind` support) and skips hidden context
+ * messages. Reads at most {@link REWIND_PROMPT_PAGES} pages per call; the
+ * returned cursor continues with older ones.
+ *
+ * @param sessionId - Session to read, e.g. "conv_abc".
+ * @param signal - Aborts the requests when the picker closes.
+ * @param after - An `olderCursor` from the previous batch; omit for the newest.
+ */
+export async function fetchRewindPrompts(
+  sessionId: string,
+  signal?: AbortSignal,
+  after: string | null = null,
+): Promise<RewindPromptsPage> {
+  const prompts: RewindPrompt[] = [];
+  let cursor = after;
+  // Each page needs the previous page's cursor.
+  /* oxlint-disable no-await-in-loop */
+  for (let page = 0; page < REWIND_PROMPT_PAGES; page++) {
+    const params = new URLSearchParams({
+      limit: String(REWIND_PROMPT_PAGE_SIZE),
+      order: "desc",
+      type: "message",
+    });
+    if (cursor) params.set("after", cursor);
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+      { signal },
+    );
+    const body = await readJsonOrThrow<SessionItemsResponseWire>(res);
+    for (const item of body.data) {
+      if (!isMessageItem(item) || item.role !== "user" || item.is_meta) continue;
+      const text = item.content
+        .flatMap((part) => (part.type === "input_text" ? [part.text] : []))
+        .join("\n");
+      prompts.push({ itemId: item.id, text, createdAt: item.created_at });
+    }
+    if (!body.has_more || body.last_id == null) return { prompts, olderCursor: null };
+    cursor = body.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return { prompts, olderCursor: cursor };
+}
+
+/** A file the chosen `/rewind` prompt attached, as the rewound session holds it. */
+export interface RewindAttachment {
+  /** The prompt's content block type. */
+  type: "input_file" | "input_image";
+  /** The rewound session's copy of the file, e.g. "file_abc"; absent for an inline attachment. */
+  fileId?: string;
+  /** An image the prompt carried inline, as a `data:image/...` URI, with no stored file. */
+  imageUrl?: string;
+  /** A document the prompt carried inline, as a base64 `data:` URI, with no stored file. */
+  fileData?: string;
+  /** The attachment's name, e.g. "diagram.png". */
+  filename: string;
+}
+
+/**
+ * Rewind a Claude session to just before one of its prompts:
+ * `POST /v1/sessions/{id}/rewind`.
+ *
+ * The server forks the history before the prompt onto the same host and
+ * runner and links the source to the fork; the caller opens the fork and puts
+ * `prompt` back in its composer.
+ *
+ * @param sessionId - Session to rewind, e.g. "conv_abc".
+ * @param itemId - The user prompt to return to, e.g. "msg_abc".
+ * @returns The rewound session's id, the prompt's text and its attachments
+ *   (empty from servers that return none).
+ */
+export async function rewindSession(
+  sessionId: string,
+  itemId: string,
+): Promise<{
+  sessionId: string;
+  prompt: string;
+  attachments: RewindAttachment[];
+  attachmentsIncomplete: boolean;
+}> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/rewind`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ item_id: itemId }),
+  });
+  const body = await readJsonOrThrow<{
+    session_id: string;
+    prompt: string;
+    attachments_incomplete?: boolean;
+    attachments?: {
+      type: RewindAttachment["type"];
+      file_id?: string | null;
+      image_url?: string | null;
+      file_data?: string | null;
+      filename: string;
+    }[];
+  }>(res);
+  return {
+    sessionId: body.session_id,
+    prompt: body.prompt,
+    attachmentsIncomplete: body.attachments_incomplete === true,
+    attachments: (body.attachments ?? []).map((attachment) => ({
+      type: attachment.type,
+      ...(attachment.file_id ? { fileId: attachment.file_id } : {}),
+      ...(attachment.image_url ? { imageUrl: attachment.image_url } : {}),
+      ...(attachment.file_data ? { fileData: attachment.file_data } : {}),
+      filename: attachment.filename,
+    })),
+  };
+}
+
 /**
  * Fork a generic side chat in the parent's current working directory.
  * Reuse the parent's live runner, relaunching the parent first if it has
@@ -1121,6 +1277,45 @@ export async function launchRunner(
   }
   const wire = (await res.json()) as { runner_id: string };
   return { runnerId: wire.runner_id };
+}
+
+/**
+ * Move an existing session onto a new server-provisioned sandbox:
+ * ``POST /v1/sessions/{sessionId}/managed-host``.
+ *
+ * The sandbox counterpart of {@link launchRunner}, so the session's runner
+ * must be released first (`updateSession(id, { runnerId: "" })`). Returns as
+ * soon as the launch is scheduled: `hostId` / `workspace` stay null and the
+ * sandbox status reads "provisioning" until the sandbox host registers.
+ *
+ * @param sessionId - The runner-released session to move, e.g. "conv_abc".
+ * @param sandbox.provider - One of the server's configured sandbox providers;
+ *   `null` takes its first.
+ * @param sandbox.workspace - `<url>[#<branch>]` repository cloned into the
+ *   sandbox; `null` gives the session an empty sandbox.
+ * @param sandbox.hostId - Id for the new sandbox host, as on a managed
+ *   create; omitted, the server mints one.
+ * @returns The session snapshot once the move is accepted.
+ * @throws ApiError carrying the server's reason (e.g. an unconfigured
+ *   provider) so the dialog can surface it inline.
+ */
+export async function launchManagedHost(
+  sessionId: string,
+  sandbox: { provider: string | null; workspace: string | null; hostId?: string },
+): Promise<Session> {
+  const body: { sandbox_provider?: string; workspace?: string; host_id?: string } = {};
+  if (sandbox.provider !== null) body.sandbox_provider = sandbox.provider;
+  if (sandbox.workspace !== null) body.workspace = sandbox.workspace;
+  if (sandbox.hostId !== undefined) body.host_id = sandbox.hostId;
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/managed-host`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
 /**

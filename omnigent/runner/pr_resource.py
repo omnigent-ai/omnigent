@@ -39,7 +39,10 @@ from omnigent.git_providers import (
 from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
+    AccountMergeFacet,
+    CommitCompareFacet,
     CommitsFacet,
+    PinnedRevisionFacet,
     ProviderCapabilities,
     PullRequestFacet,
     ReviewerRef,
@@ -799,6 +802,15 @@ def pr_merge_options(
     return facet.merge_options(root, reference)
 
 
+def _merge_request(merge_method: object, expected_head: object) -> tuple[str, str]:
+    """Validate a merge's method and head, which must reach the provider unchanged."""
+    if not isinstance(merge_method, str) or merge_method not in _MERGE_METHODS:
+        raise ValueError("Expected merge_method to be merge, squash, or rebase")
+    if not isinstance(expected_head, str) or not _COMMIT_SHA.fullmatch(expected_head):
+        raise ValueError("Expected expected_head to be the pull request's head commit SHA")
+    return merge_method, expected_head
+
+
 def merge_pr(
     root: str,
     *,
@@ -815,12 +827,43 @@ def merge_pr(
     :raises ValueError: On an unknown method or malformed SHA, without a
         selected tracked PR, or when the provider refuses the merge.
     """
-    if not isinstance(merge_method, str) or merge_method not in _MERGE_METHODS:
-        raise ValueError("Expected merge_method to be merge, squash, or rebase")
-    if not isinstance(expected_head, str) or not _COMMIT_SHA.fullmatch(expected_head):
-        raise ValueError("Expected expected_head to be the pull request's head commit SHA")
+    method, head = _merge_request(merge_method, expected_head)
     facet, reference = _merge_target(session_id, pr_url)
-    return facet.merge(root, reference, merge_method=merge_method, expected_head=expected_head)
+    return facet.merge(root, reference, merge_method=method, expected_head=head)
+
+
+def merge_pr_as(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    merge_method: object = None,
+    expected_head: object = None,
+    account: object = None,
+) -> dict[str, Any]:
+    """Merge like :func:`merge_pr`, as ``account``, the account the user confirmed.
+
+    The merge runs as ``account`` even when the panel's view of the saved account
+    is stale, and ``account`` becomes the PR's account for later requests.
+
+    :raises ValueError: Also on a missing account, or when the provider can't
+        merge as a chosen account. It never merges as the saved account instead.
+    """
+    method, head = _merge_request(merge_method, expected_head)
+    if not isinstance(account, str) or not account.strip():
+        raise ValueError("Expected account to be an account login")
+    facet, reference = _merge_target(session_id, pr_url)
+    capabilities = facet.capabilities
+    if not (
+        capabilities.account_switching
+        and capabilities.merge_as_account
+        and isinstance(facet, AccountMergeFacet)
+    ):
+        raise ValueError("This provider can't merge as a chosen account.")
+    facet.set_preference(root, reference, account=account, remote=None)
+    return facet.merge_as(
+        root, reference, merge_method=method, expected_head=head, account=account
+    )
 
 
 def disable_pr_auto_merge(
@@ -1191,16 +1234,16 @@ def pr_changed_files(
 ) -> dict[str, Any]:
     """List the selected PR's changed files; empty when no provider serves it.
 
-    Providers without :class:`ReviewThreadsFacet` (GitLab, Azure DevOps) ignore
-    ``head_sha``/``base_sha`` and list the current revision.
+    With ``head_sha``/``base_sha``, a provider with :class:`PinnedRevisionFacet` lists
+    that revision, echoing it only when verified; other providers list the current revision.
     """
     reference = _default_pr(session_id, pr_url)
     facet = _serving_facet(root, reference)
     if facet is None:
         return {"object": "list", "data": [], "has_more": False}
-    if reference and (head_sha or base_sha) and isinstance(facet, ReviewThreadsFacet):
+    if reference and (head_sha or base_sha) and isinstance(facet, PinnedRevisionFacet):
         head, base = _full_revision(head_sha, base_sha)
-        return facet.review_changed_files(root, reference, head_sha=head, base_sha=base)
+        return facet.pinned_changed_files(root, reference, head_sha=head, base_sha=base)
     return facet.changed_files(root, reference)
 
 
@@ -1217,9 +1260,9 @@ def pr_diff(
     facet = _serving_facet(root, reference)
     if facet is None:
         return {"object": PR_DIFF_OBJECT, "patch": ""}
-    if reference and (head_sha or base_sha) and isinstance(facet, ReviewThreadsFacet):
+    if reference and (head_sha or base_sha) and isinstance(facet, PinnedRevisionFacet):
         head, base = _full_revision(head_sha, base_sha)
-        return facet.review_diff(root, reference, head_sha=head, base_sha=base)
+        return facet.pinned_diff(root, reference, head_sha=head, base_sha=base)
     return facet.pr_diff(root, reference)
 
 
@@ -1276,6 +1319,30 @@ def pr_commit_diff(
     """
     facet, reference = _commits_target(session_id, pr_url)
     return facet.commit_diff(root, reference, commit_sha=_commit_sha(commit_sha, "commit_sha"))
+
+
+def pr_compare_diff(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: object = None,
+    from_sha: object = None,
+) -> dict[str, Any]:
+    """Return the selected PR's changes after one of its commits, up to its head.
+
+    :raises ValueError: Without a selected tracked PR, when its provider cannot list
+        commits, or when either commit is not a full commit id.
+    """
+    facet, reference = _commits_target(session_id, pr_url)
+    if not isinstance(facet, CommitCompareFacet):
+        raise ValueError("This provider does not show changes since a commit")
+    return facet.compare_diff(
+        root,
+        reference,
+        head_sha=_commit_sha(head_sha, "head_sha"),
+        from_sha=_commit_sha(from_sha, "from_sha"),
+    )
 
 
 def pr_file_diff(

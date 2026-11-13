@@ -153,6 +153,10 @@ class _StubResourceRegistry:
         """The stub has no sandbox environment."""
         return False
 
+    def session_has_background_agents(self, session_id: str) -> bool:
+        """No terminal is running, so no background agent outlives a turn."""
+        return False
+
     def compute_default_env_root(self, session_id: str, agent_spec: Any) -> str:
         """
         Return a fixed env root for the launched terminal.
@@ -463,6 +467,10 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_get_info",
         "sys_session_rename",
         "sys_session_message",
+        "sys_project_list",
+        "sys_session_update",
+        "sys_project_update",
+        "sys_session_link_pr",
         "ui_open_file",
         "sys_agent_list",
         "sys_agent_get",
@@ -489,6 +497,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "session_id",
         "message",
     ]
+    assert tools_by_name["sys_session_link_pr"]["parameters"]["required"] == ["url"]
     assert tools_by_name["ui_open_file"]["parameters"]["required"] == ["path"]
     assert tools_by_name["ui_open_file"]["parameters"]["additionalProperties"] is False
     # A url + token prove the localhost relay HTTP server actually started

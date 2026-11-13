@@ -4332,7 +4332,10 @@ function createBrowserRegistryForWindow(win) {
     },
   });
   win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
-    if (isMainFrame && !isInPlace) registry.setRecentSessionSwitchSupported(false);
+    if (isMainFrame && !isInPlace) {
+      registry.setRecentSessionSwitchSupported(false);
+      registry.setOpenTabSupported(false);
+    }
   });
   return registry;
 }

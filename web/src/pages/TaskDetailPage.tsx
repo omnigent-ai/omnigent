@@ -23,7 +23,8 @@ import {
   Trash2Icon,
   TriangleAlertIcon,
 } from "lucide-react";
-import { Link, useNavigate, useParams } from "@/lib/routing";
+import { Link, useNavigate, useParams, useRebasePath } from "@/lib/routing";
+import { getShareableSessionLink } from "@/lib/shareLink";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -31,7 +32,14 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
-import { isTriggerPrompt, splitTriggerPrompt } from "@/components/scheduled/triggerTemplates";
+import {
+  decodeTriggerPrompt,
+  hasTriggerHeader,
+  isTriggerPrompt,
+  SESSION_LINK_ID_PLACEHOLDER,
+  splitTriggerPrompt,
+  stripTriggerHeader,
+} from "@/components/scheduled/triggerTemplates";
 import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
@@ -81,6 +89,9 @@ export function TaskDetailPage() {
 function TaskDetail({ taskId }: { taskId: string }) {
   const navigate = useNavigate();
   const now = useNow();
+  // Saving or switching a trigger re-renders its prompt, whose workers post this share link.
+  const rebasePath = useRebasePath();
+  const sessionLink = getShareableSessionLink(SESSION_LINK_ID_PLACEHOLDER, rebasePath);
 
   // "Awaiting new run row" loading state for the Run now button. The button
   // stays in its loading state after the POST returns 202 until a new run row
@@ -279,7 +290,16 @@ function TaskDetail({ taskId }: { taskId: string }) {
 
   const triggerMode = task.sessionMode === "continue" && isTriggerPrompt(task.prompt);
   const paused = task.state === "paused";
-  const { userPrompt, systemPrompt } = splitTriggerPrompt(task.prompt);
+  const triggerConfig = triggerMode ? decodeTriggerPrompt(task.prompt) : null;
+  const legacyParts = splitTriggerPrompt(task.prompt);
+  // Generated template text is hidden only where it can be told apart from the
+  // user's instructions; otherwise the page shows the prompt the model runs.
+  const instructionsOnly =
+    triggerConfig !== null ||
+    (triggerMode && !hasTriggerHeader(task.prompt) && legacyParts.systemPrompt !== null);
+  const shownPrompt =
+    triggerConfig?.instructions ??
+    (instructionsOnly ? legacyParts.userPrompt : stripTriggerHeader(task.prompt));
   const permissionOption = nativePermissionOptions(harness).find(
     (option) => option.value === task.permissionMode,
   );
@@ -439,40 +459,18 @@ function TaskDetail({ taskId }: { taskId: string }) {
         title={
           task.sourceSessionId
             ? "Additional instructions"
-            : systemPrompt === null
-              ? "Prompt"
-              : "Your prompt"
+            : instructionsOnly
+              ? "Instructions"
+              : "Prompt"
         }
       >
         <p
           className="whitespace-pre-wrap text-sm text-foreground/90"
           data-testid="task-detail-prompt"
         >
-          {task.sourceSessionId && userPrompt.trim() === "" ? "None" : userPrompt}
+          {task.sourceSessionId && shownPrompt.trim() === "" ? "None" : shownPrompt}
         </p>
       </Section>
-
-      {systemPrompt !== null && (
-        <Collapsible className="mt-6">
-          <h2 className="mb-2 text-sm font-medium text-muted-foreground">
-            <CollapsibleTrigger className="group flex cursor-pointer items-center gap-1 rounded-sm text-left transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-              <ChevronDownIcon
-                aria-hidden="true"
-                className="size-4 transition-transform group-data-[state=closed]:-rotate-90"
-              />
-              System prompt
-            </CollapsibleTrigger>
-          </h2>
-          <CollapsibleContent>
-            <p
-              className="max-h-80 overflow-y-auto rounded-md border border-border bg-muted/40 p-3 text-sm whitespace-pre-wrap break-words text-foreground/90"
-              data-testid="task-detail-system-prompt"
-            >
-              {systemPrompt}
-            </p>
-          </CollapsibleContent>
-        </Collapsible>
-      )}
 
       {/* Saved configuration for launching sessions. */}
       <Collapsible className="mt-6">
@@ -580,7 +578,12 @@ function TaskDetail({ taskId }: { taskId: string }) {
         </ul>
       )}
 
-      <CreateScheduledTaskDialog open={editOpen} onOpenChange={setEditOpen} editingTask={task} />
+      <CreateScheduledTaskDialog
+        open={editOpen}
+        onOpenChange={setEditOpen}
+        editingTask={task}
+        sessionLink={sessionLink}
+      />
     </PageScroll>
   );
 }
@@ -728,6 +731,14 @@ function RunRow({
             )}
             {failure.stage && " · "}
             {failure.reason}
+          </span>
+        )}
+        {failure && run.errorDetail && (
+          <span
+            className="text-xs break-words text-muted-foreground [overflow-wrap:anywhere]"
+            data-testid="run-failure-detail"
+          >
+            {run.errorDetail}
           </span>
         )}
       </span>
