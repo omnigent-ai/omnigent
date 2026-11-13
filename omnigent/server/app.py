@@ -332,8 +332,7 @@ class ServerInfoResponse(BaseModel):
     # Uploaded-agent sessions accept repository lists and worktree options.
     session_bundle_workspaces: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
-    # older servers reject it. Deprecated: clients now always send it, so this
-    # flag stays only for older clients. Remove in v0.24.0.
+    # older servers reject it.
     request_managed_sandbox_host_id: bool = True
     # A managed fork accepts ``workspaces``; older servers reject the field.
     session_fork_workspaces: bool = True
@@ -3894,7 +3893,6 @@ def create_app(
                 "session_list_scoped_archives": True,
                 "scripted_sessions": app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS),
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
-                # Deprecated: kept for older clients; remove in v0.24.0.
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,

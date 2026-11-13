@@ -1563,7 +1563,7 @@ function SupportedForkSessionForm({
       // Empty title → omit so the server derives "Fork of <source title>".
       // The run-config section (native targets only) reports its ready-to-send
       // value; an empty object (non-native target) sends no run overrides.
-      const sandboxHostId = sandboxSelected ? managedSandboxHostId() : undefined;
+      const sandboxHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
       const fork = await forkSession(sourceSessionId, {
         title: trimmed === "" ? undefined : trimmed,
         agentId: switching ? agentChoice : undefined,

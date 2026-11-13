@@ -8618,7 +8618,7 @@ describe("NewChatLandingScreen", () => {
         resolveCreate = resolve;
       }),
     );
-    renderLanding({ managed_sandboxes_enabled: true });
+    renderLanding({ managed_sandboxes_enabled: true, request_managed_sandbox_host_id: true });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
@@ -8866,26 +8866,34 @@ describe("NewChatLandingScreen", () => {
     expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("sends a fresh sandbox host id on every managed JSON create", async () => {
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_new" }),
-    } as unknown as Response);
-    renderLanding({
-      managed_sandboxes_enabled: true,
-      sandbox_provider: "modal",
-    });
-    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
-      target: { value: "audit the repo" },
-    });
-    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
-    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
-    const [, init] = authenticatedFetchMock.mock.calls[0];
-    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
-    expect(body.host_type).toBe("managed");
-    expect(body.host_id).toMatch(/^[0-9a-f]{32}$/);
-  });
+  it.each([true, false])(
+    "chooses the sandbox host's id only on a server that accepts it (%s)",
+    async (accepts) => {
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "modal",
+        request_managed_sandbox_host_id: accepts,
+      });
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "audit the repo" },
+      });
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+      const [, init] = authenticatedFetchMock.mock.calls[0];
+      const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+      expect(body.host_type).toBe("managed");
+      if (accepts) {
+        expect(body.host_id).toMatch(/^[0-9a-f]{32}$/);
+      } else {
+        expect("host_id" in body).toBe(false);
+      }
+    },
+  );
 
   it("sends the added repositories as the managed workspaces list", async () => {
     authenticatedFetchMock.mockResolvedValue({
@@ -8896,6 +8904,7 @@ describe("NewChatLandingScreen", () => {
     // capability; agent_sandbox does.
     renderLanding({
       managed_sandboxes_enabled: true,
+      request_managed_sandbox_host_id: true,
       sandbox_provider: "agent_sandbox",
       sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
     });
@@ -9569,6 +9578,7 @@ describe("NewChatLandingScreen skills menu", () => {
       );
       renderLanding({
         managed_sandboxes_enabled: true,
+        request_managed_sandbox_host_id: true,
         sandbox_provider: "arclet",
         durable_initial_input: true,
       });
@@ -13363,6 +13373,7 @@ describe("managed sandbox gateway preview", () => {
   function renderGatewaySandbox() {
     return renderLanding({
       managed_sandboxes_enabled: true,
+      request_managed_sandbox_host_id: true,
       sandbox_provider: "arclet",
       sandbox_provider_capabilities: { arclet: { default_models: true } },
     });

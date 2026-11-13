@@ -311,7 +311,7 @@ function SupportedSwitchHostDialog({
         // may go to another replica's stream; the response shows where it is.
         const showLaunch = captureLaunchStatus(sessionId);
         // Route the launch by the new sandbox's host id.
-        const sandboxHostId = managedSandboxHostId();
+        const sandboxHostId = await managedSandboxHostId(info);
         const moved = await launchManagedHost(sessionId, {
           provider: sandboxProvider,
           workspace: composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ?? null,

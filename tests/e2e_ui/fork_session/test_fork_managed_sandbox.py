@@ -74,6 +74,7 @@ def _managed_info_body() -> str:
             "databricks_features": False,
             "managed_sandboxes_enabled": True,
             "session_fork_workspaces": True,
+            "request_managed_sandbox_host_id": True,
             "sandbox_provider": "modal",
             "sandbox_providers": ["modal"],
             "server_version": "0.0.0-e2e",

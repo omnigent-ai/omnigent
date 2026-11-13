@@ -15,12 +15,15 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.asyncio
-async def test_runner_managed_create_always_sends_a_host_id():
+@pytest.mark.parametrize("capability", [True, False])
+async def test_runner_managed_create_sends_host_id_only_when_server_supports_it(capability):
     session_id = uuid4().hex
     requests = []
 
     def handler(request):
         requests.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"request_managed_sandbox_host_id": capability})
         if request.url.path.endswith("/events"):
             return httpx.Response(202, json={"queued": True})
         if request.method == "GET":
@@ -56,4 +59,7 @@ async def test_runner_managed_create_always_sends_a_host_id():
     )
     body = json.loads(create.content)
     assert body["host_type"] == "managed"
-    assert _HOST_ID.fullmatch(body["host_id"]), body
+    if capability:
+        assert _HOST_ID.fullmatch(body["host_id"]), body
+    else:
+        assert "host_id" not in body
