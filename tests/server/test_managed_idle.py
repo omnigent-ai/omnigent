@@ -45,9 +45,6 @@ class AutoLauncher(FakeSandboxLauncher):
     def wait_for_idle(self, sandbox_id: str, generation: str) -> None:
         self.quiescent = (sandbox_id, generation)
 
-    def stop(self, sandbox_id: str) -> None:
-        self.stopped = sandbox_id
-
 
 @pytest.fixture
 def stack(db_uri: str):
@@ -118,7 +115,7 @@ async def test_suspended_host_wakes_with_same_identity(stack, monkeypatch):
     quiesce_reply(stack, monkeypatch)
     assert await stack.coordinator.suspend_if_idle(stack.connection)
     assert stack.store.sandbox_operation(stack.host.host_id)["phase"] == "suspended"
-    assert stack.launcher.stopped == "actor"
+    assert stack.launcher.stopped == ["actor"]
     await resume_managed_host(stack.host.host_id, stack.store, stack.config)
     assert stack.store.is_online(stack.host.host_id)
     assert stack.store.get_host(stack.host.host_id).sandbox_id == "actor"
@@ -129,7 +126,7 @@ async def test_suspended_host_wakes_with_same_identity(stack, monkeypatch):
 async def test_busy_host_is_not_suspended(stack, monkeypatch):
     quiesce_reply(stack, monkeypatch, "busy")
     assert not await stack.coordinator.suspend_if_idle(stack.connection)
-    assert not hasattr(stack.launcher, "stopped")
+    assert stack.launcher.stopped == []
     assert stack.store.sandbox_operation(stack.host.host_id)["phase"] == "active"
 
 
@@ -144,10 +141,10 @@ async def test_wake_waits_for_inflight_suspend(stack, monkeypatch, launch_reques
     def stop(sandbox_id):
         entered.set()
         assert release.wait(5)
-        stack.launcher.stopped = sandbox_id
+        stack.launcher.stopped.append(sandbox_id)
 
     def resume_after_stop(sandbox_id):
-        assert stack.launcher.stopped == sandbox_id
+        assert stack.launcher.stopped == [sandbox_id]
         resume(sandbox_id)
 
     def observe_claim(host_id, token, purpose, **kwargs):
