@@ -458,10 +458,9 @@ def resolve_reminder_time(args: dict[str, Any], now: datetime) -> datetime | str
         if when.tzinfo is None or when.utcoffset() is None:
             return "'at' needs a UTC offset or 'Z', e.g. '2026-11-12T15:00:00-08:00'."
         fraction = re.search(r"[.,](\d+)", raw)
-        if fraction is not None and fraction.group(1)[6:].strip("0"):
-            # fromisoformat drops digits past microseconds; keep the time from
-            # rounding down to a minute before the one asked for.
-            when += timedelta(microseconds=1)
+        # fromisoformat drops digits past microseconds; count them so the time
+        # can't round down to a minute before the one asked for.
+        sub_microsecond = fraction is not None and bool(fraction.group(1)[6:].strip("0"))
     else:
         delay = args["delay_seconds"]
         # bool is an int subclass; reject it like sys_timer_set does.
@@ -476,7 +475,10 @@ def resolve_reminder_time(args: dict[str, Any], now: datetime) -> datetime | str
         if delay < 0:
             return "A reminder must be at least one minute in the future."
         when = now + timedelta(seconds=delay)
+        sub_microsecond = False
     try:
+        if sub_microsecond:
+            when += timedelta(microseconds=1)
         when = when.astimezone(UTC)
         # The upper limit applies before rounding, so the largest delay is accepted;
         # the extra seconds still leave the time well under a year away.
@@ -544,8 +546,9 @@ class SysReminderSetTool(Tool):
             "requested time may be at most 364 days away, and is rounded up to the "
             "next minute, which can add less than a minute; the result must be at "
             "least a minute away. Write the message for your future self: "
-            "say what to check or do. The reminder is listed as an automation; "
-            "cancel it with sys_scheduled_task_delete and the returned "
+            "say what to check or do. The Automations page doesn't list "
+            "reminders; sys_scheduled_task_list does. Cancel one with "
+            "sys_scheduled_task_delete and the returned "
             "scheduled_task_id. Works in top-level sessions you own on a "
             "connected host, not in sub-agent sessions, managed sandboxes, or "
             "sessions running in a permission mode that skips approval. For "

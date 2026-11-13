@@ -89,6 +89,7 @@ def test_at_is_converted_to_utc() -> None:
         ({"delay_seconds": 1e300}, "at most 364 days"),
         ({"at": "0001-01-01T00:00:00+05:00"}, "outside the supported date range"),
         ({"at": "9999-12-31T23:59:59-05:00"}, "outside the supported date range"),
+        ({"at": "9999-12-31T23:59:59.9999991Z"}, "outside the supported date range"),
         # Rounding up would overflow here, but the limit is checked first.
         ({"at": "9999-12-31T23:59:59Z"}, "at most 364 days"),
     ],

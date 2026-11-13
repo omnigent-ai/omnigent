@@ -880,14 +880,10 @@ async def test_the_list_leaves_reminders_out_unless_asked(
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
-@pytest.mark.parametrize(
-    "edit",
-    [{"rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"}, {"session_id": None}],
-    ids=["recurs", "leaves_its_session"],
-)
 async def test_an_edit_that_stops_a_reminder_fitting_makes_it_an_automation(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, edit: dict[str, Any]
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
+    # The store tests cover every edit that demotes a reminder; this one checks the route.
     session_id = _owned_session(db_uri)
     rule, fire_at = _one_time_rule_in(hours=2)
     created = await auth_client.post(
@@ -915,10 +911,12 @@ async def test_an_edit_that_stops_a_reminder_fitting_makes_it_an_automation(
     assert renamed.json()["kind"] == "reminder"
 
     edited = await auth_client.patch(
-        f"/v1/scheduled-tasks/{task_id}", json=edit, headers=_headers()
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"},
+        headers=_headers(),
     )
     assert edited.status_code == 200, edited.text
-    # The marker can't keep a recurring automation, or one in no set session, off the list.
+    # The marker can't keep a recurring automation off the list.
     assert edited.json()["kind"] == "automation"
     assert SqlAlchemyScheduledTaskStore(db_uri).get(task_id).kind == "automation"
 
