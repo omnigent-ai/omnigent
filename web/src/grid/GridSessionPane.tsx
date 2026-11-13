@@ -438,7 +438,8 @@ export function GridSessionPane({
               aria-label={`${workspacePanel.open ? "Collapse" : "Expand"} grid workspace`}
               onClick={onToggleWorkspace}
               // Hidden, not removed: activating a cell must not shift its titlebar mid-click.
-              style={selected ? undefined : { visibility: "hidden" }}
+              // No transition, or visibility stays "visible" while it fades out.
+              style={selected ? undefined : { visibility: "hidden", transition: "none" }}
             >
               {workspacePanel.open ? (
                 <PanelRightCloseIcon className="size-3.5" />
