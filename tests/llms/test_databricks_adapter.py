@@ -62,7 +62,10 @@ def test_profile_auth_refreshes_with_default_or_gateway_url(
         )
 
     monkeypatch.setattr(adapter, "_get_sdk_config", get_config)
-    connection = {"profile": "gateway-profile"}
+    connection: dict[str, Any] = {
+        "profile": "gateway-profile",
+        "extra_headers": {"X-Request-ID": "test-request"},
+    }
     if base_url is not None:
         connection["base_url"] = base_url
     if api_key is not None:
@@ -89,6 +92,9 @@ def test_profile_auth_refreshes_with_default_or_gateway_url(
         "Bearer refreshed-token",
     ]
     assert connection.get("api_key") == api_key
+    assert all(
+        request.headers["X-Request-ID"] == "test-request" for request in databricks_requests
+    )
 
 
 def test_gateway_url_fallback_keeps_selected_profile(
@@ -156,7 +162,11 @@ def test_profile_token_is_not_sent_to_another_origin(
                 None,
                 False,
                 {},
-                connection_params={"profile": "gateway-profile", "base_url": base_url},
+                connection_params={
+                    "profile": "gateway-profile",
+                    "base_url": base_url,
+                    "extra_headers": {"X-Request-ID": "test-request"},
+                },
             )
         )
     assert raised.value.code == ErrorCode.INVALID_INPUT
@@ -164,8 +174,50 @@ def test_profile_token_is_not_sent_to_another_origin(
     assert databricks_requests == []
 
 
-def test_explicit_gateway_key_does_not_resolve_workspace_credentials(
-    monkeypatch: pytest.MonkeyPatch, databricks_requests: list[httpx.Request]
+@pytest.mark.parametrize(
+    "connection,expected_authorization",
+    [
+        pytest.param(
+            {
+                "base_url": "https://proxy.example.test/v1",
+                "profile": "gateway-profile",
+                "api_key": "explicit-key",
+            },
+            "Bearer explicit-key",
+            id="api-key",
+        ),
+        pytest.param(
+            {"base_url": "http://localhost:8123/v1"},
+            None,
+            id="url-only",
+        ),
+        pytest.param(
+            {
+                "base_url": "http://localhost:8123/v1",
+                "extra_headers": {"Host": "gateway.example.test", "X-Proxy-Auth": "test-context"},
+            },
+            None,
+            id="proxy-headers",
+        ),
+        *[
+            pytest.param(
+                {
+                    "base_url": "https://proxy.example.test/v1",
+                    "profile": "gateway-profile",
+                    "extra_headers": {header: "Bearer header-key"},
+                },
+                "Bearer header-key",
+                id=header,
+            )
+            for header in ("Authorization", "authorization")
+        ],
+    ],
+)
+def test_explicit_connection_does_not_resolve_workspace_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    databricks_requests: list[httpx.Request],
+    connection: dict[str, Any],
+    expected_authorization: str | None,
 ) -> None:
     adapter = DatabricksAdapter()
 
@@ -180,14 +232,13 @@ def test_explicit_gateway_key_does_not_resolve_workspace_credentials(
             None,
             False,
             {},
-            connection_params={
-                "base_url": "https://proxy.example.test/v1",
-                "api_key": "explicit-key",
-            },
+            connection_params=connection,
         )
     )
-    assert str(databricks_requests[0].url) == "https://proxy.example.test/v1/chat/completions"
-    assert databricks_requests[0].headers["Authorization"] == "Bearer explicit-key"
+    assert str(databricks_requests[0].url) == connection["base_url"] + "/chat/completions"
+    assert databricks_requests[0].headers.get("Authorization") == expected_authorization
+    for key, value in connection.get("extra_headers", {}).items():
+        assert databricks_requests[0].headers[key] == value
 
 
 def test_stream_options_stripped_from_streaming_payload() -> None:

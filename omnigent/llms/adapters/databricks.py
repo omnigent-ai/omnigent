@@ -2,8 +2,9 @@
 Databricks Model Serving adapter.
 
 Extends the OpenAI-compatible adapter with Databricks-specific
-authentication. When ``connection_params`` omits ``base_url`` or ``api_key``, the
-adapter resolves credentials via the databricks-sdk ``Config`` object,
+authentication. When ``connection_params`` omits ``base_url`` or selects a
+``profile`` without explicit authentication, the adapter resolves credentials
+via the databricks-sdk ``Config`` object,
 which handles OAuth token refresh transparently on every call. Falls
 back to :func:`~omnigent.runtime.credentials.databricks.resolve_databricks_workspace`
 when the SDK is unavailable.
@@ -28,8 +29,9 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
     Credentials are resolved in the following order:
 
     1. ``connection_params`` passed at call time (from the ``connection:``
-       block in the agent spec's ``llm:`` config), with missing URL/key values
-       filled from the credential sources below.
+       block in the agent spec's ``llm:`` config). An explicit URL without a
+       profile preserves caller-managed authentication, including proxy headers.
+       API keys and Authorization headers override profile authentication.
     2. A cached ``databricks.sdk.config.Config`` object whose
        ``authenticate()`` method is called on every request. The SDK
        handles OAuth token refresh transparently — no manual expiry
@@ -131,9 +133,10 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
         :param tools: Tool schemas or ``None``.
         :param stream: Enable streaming.
         :param extra: Additional kwargs.
-        :param connection_params: Optional ``"base_url"``, ``"api_key"`` and
-            ``"profile"``. Missing or empty URL/key values are resolved via the
-            cached SDK ``Config`` (handles OAuth refresh), then fall back
+        :param connection_params: Optional ``"base_url"``, ``"api_key"``,
+            ``"profile"`` and ``"extra_headers"``. A missing URL or a selected
+            profile without explicit authentication uses the cached SDK
+            ``Config`` (handles OAuth refresh), then falls back
             to :func:`~omnigent.runtime.credentials.databricks.resolve_databricks_workspace`.
             A URL override using resolved credentials must be HTTPS on the
             resolved workspace host.
@@ -144,8 +147,18 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
             would send resolved credentials outside their workspace.
         """
         connection_params = dict(connection_params or {})
-        if not connection_params.get("base_url") or not connection_params.get("api_key"):
-            profile = connection_params.get("profile")
+        profile = connection_params.get("profile")
+        extra_headers: object = connection_params.get("extra_headers")
+        has_auth_header = isinstance(extra_headers, dict) and any(
+            isinstance(key, str)
+            and key.lower() == "authorization"
+            and isinstance(value, str)
+            and value.strip()
+            for key, value in extra_headers.items()
+        )
+        if not connection_params.get("base_url") or (
+            profile and not connection_params.get("api_key") and not has_auth_header
+        ):
             resolved = self._resolve_via_sdk(profile)
             if resolved is None:
                 # SDK unavailable or auth failed — fall back to configparser path.
