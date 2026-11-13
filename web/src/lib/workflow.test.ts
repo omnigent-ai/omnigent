@@ -119,14 +119,18 @@ describe("parseSavedWorkflowMessage", () => {
 });
 
 describe("runSavedWorkflowPrompt", () => {
+  const workflow = { id: "0123456789abcdef0123456789abcdef", name: "Triage flaky tests" };
+
   it("asks the workflow skill to run the saved workflow by ID", () => {
-    expect(
-      runSavedWorkflowPrompt({
-        id: "0123456789abcdef0123456789abcdef",
-        name: "Triage flaky tests",
-      }),
-    ).toBe(
+    expect(runSavedWorkflowPrompt(workflow)).toBe(
       'Use the workflow skill to run the saved workflow "Triage flaky tests" (ID 0123456789abcdef0123456789abcdef).',
+    );
+    expect(runSavedWorkflowPrompt(workflow, "  \n")).toBe(runSavedWorkflowPrompt(workflow));
+  });
+
+  it("adds the run's additional instructions as their own paragraph", () => {
+    expect(runSavedWorkflowPrompt(workflow, "  Only the upload tests.\n")).toBe(
+      'Use the workflow skill to run the saved workflow "Triage flaky tests" (ID 0123456789abcdef0123456789abcdef).\n\nOnly the upload tests.',
     );
   });
 });

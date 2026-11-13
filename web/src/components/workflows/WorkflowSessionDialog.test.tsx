@@ -151,8 +151,14 @@ describe("WorkflowSessionDialog", () => {
     expect(screen.getByTestId("workflow-session-host")).toHaveTextContent("laptop");
     expect(screen.getByPlaceholderText("Type a path or browse…")).toHaveValue("/home/you/app");
     expect(screen.getByTestId("workflow-session-agent")).toHaveTextContent("Codex");
-    const instructions = screen.getByTestId("workflow-session-instructions");
-    expect(instructions).toHaveValue(runSavedWorkflowPrompt(WORKFLOW));
+    // The run request stays out of the field, which only adds to it.
+    const instructions = screen.getByLabelText("Additional instructions");
+    expect(instructions).toHaveValue("");
+    expect(instructions).toHaveAttribute(
+      "placeholder",
+      "Optional. Instructions to customize the workflow.",
+    );
+    expect(submit()).toBeEnabled();
 
     fireEvent.change(instructions, { target: { value: "Run it on the flaky suite only." } });
     fireEvent.click(submit());
@@ -171,7 +177,7 @@ describe("WorkflowSessionDialog", () => {
       reasoningEffort: undefined,
     });
     expect(consumePendingInitialPrompt("conv_run")).toEqual({
-      text: "Run it on the flaky suite only.",
+      text: runSavedWorkflowPrompt(WORKFLOW, "Run it on the flaky suite only."),
       skill: null,
       files: [],
     });
@@ -422,13 +428,17 @@ describe("WorkflowSessionDialog", () => {
     await waitFor(() => expect(navigate).toHaveBeenCalled());
     expect(consumePendingInitialPrompt("conv_run")?.text).toBe(runSavedWorkflowPrompt(WORKFLOW));
 
+    // The review request comes last, after the run's additional instructions.
     cleanup();
     renderDialog();
+    fireEvent.change(screen.getByLabelText("Additional instructions"), {
+      target: { value: "Only the upload tests." },
+    });
     fireEvent.click(screen.getByTestId("workflow-session-review-plan"));
     fireEvent.click(submit());
     await waitFor(() => expect(navigate).toHaveBeenCalledTimes(2));
     expect(consumePendingInitialPrompt("conv_run")?.text).toBe(
-      `${runSavedWorkflowPrompt(WORKFLOW)}\n\n${REVIEW_PLAN_FIRST}`,
+      `${runSavedWorkflowPrompt(WORKFLOW, "Only the upload tests.")}\n\n${REVIEW_PLAN_FIRST}`,
     );
   });
 
@@ -439,7 +449,7 @@ describe("WorkflowSessionDialog", () => {
     renderDialog({}, CREATE);
 
     expect(screen.getByRole("dialog", { name: "New workflow" })).toBeInTheDocument();
-    expect(screen.getByTestId("workflow-session-instructions")).toHaveValue(
+    expect(screen.getByLabelText("Instructions")).toHaveValue(
       createWorkflowPrompt("Upgrade a dependency", "Bump one package and fix what breaks"),
     );
     // Drafting has no plan to review.

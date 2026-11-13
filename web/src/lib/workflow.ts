@@ -127,9 +127,15 @@ export function createWorkflowPrompt(name: string, description: string): string 
  * Like {@link createWorkflowPrompt}, it names the skill rather than invoking it.
  *
  * @param workflow The saved workflow, e.g. `{ id: "0123…", name: "Triage flaky tests" }`.
+ * @param details The user's additional instructions for this run, e.g.
+ *   `"Only the tickets in PROJ-12"`, added as their own paragraph; may be empty.
  */
-export function runSavedWorkflowPrompt(workflow: { id: string; name: string }): string {
-  return `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).`;
+export function runSavedWorkflowPrompt(
+  workflow: { id: string; name: string },
+  details = "",
+): string {
+  const request = `Use the ${WORKFLOW_SKILL} skill to run the saved workflow "${workflow.name}" (ID ${workflow.id}).`;
+  return details.trim() ? `${request}\n\n${details.trim()}` : request;
 }
 
 // A savedWorkflowMessage without the plan review, as New automation stores it.

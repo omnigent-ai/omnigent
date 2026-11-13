@@ -87,8 +87,9 @@ export interface WorkflowSessionDialogProps {
  * Start a session for a workflow, to run a saved one ("Run workflow") or have
  * the agent draft a new one ("New workflow"): pick where it runs (a connected
  * host and directory, or a new sandbox and its repositories) and its agent,
- * check its first message, and start it. Laid out like the Clone session
- * dialog, whose host label and model, effort and permission fields it reuses.
+ * add instructions for the run or check the draft's first message, and start
+ * it. Laid out like the Clone session dialog, whose host label and model,
+ * effort and permission fields it reuses.
  */
 export function WorkflowSessionDialog({ request, open, onOpenChange }: WorkflowSessionDialogProps) {
   const name = request?.kind === "run" ? request.workflow.name : request?.name;
@@ -403,10 +404,10 @@ function WorkflowSessionForm({
       ? (sandboxModels.data?.error ?? `${agent?.display_name} can’t run in this sandbox.`)
       : null;
 
+  // A run's optional additional instructions, which follow its run request; or
+  // the whole first message of the session that drafts a workflow.
   const [instructions, setInstructions] = useState(() =>
-    request.kind === "run"
-      ? runSavedWorkflowPrompt(request.workflow)
-      : createWorkflowPrompt(request.name, request.description),
+    request.kind === "run" ? "" : createWorkflowPrompt(request.name, request.description),
   );
   // A saved workflow runs without a plan review unless asked.
   const [reviewPlanFirst, setReviewPlanFirst] = useState(false);
@@ -415,15 +416,22 @@ function WorkflowSessionForm({
   const targetReady = sandboxSelected
     ? profileError === null && !reposInvalid && !repoUrlPending && agentUnsupported === null
     : hostOnline && workspacePath !== null;
-  const canRun = targetReady && agent !== undefined && instructions.trim() !== "" && !submitting;
+  const canRun =
+    targetReady &&
+    agent !== undefined &&
+    (request.kind === "run" || instructions.trim() !== "") &&
+    !submitting;
 
   async function run() {
     if (!canRun || agent === undefined) return;
     setSubmitting(true);
     setError(null);
     const text =
-      request.kind === "run" && reviewPlanFirst
-        ? `${instructions.trim()}\n\n${REVIEW_PLAN_FIRST}`
+      request.kind === "run"
+        ? [
+            runSavedWorkflowPrompt(request.workflow, instructions),
+            ...(reviewPlanFirst ? [REVIEW_PLAN_FIRST] : []),
+          ].join("\n\n")
         : instructions.trim();
     // A sandbox create can carry the first message, which the server sends once the sandbox is up.
     const serverSendsText =
@@ -678,10 +686,18 @@ function WorkflowSessionForm({
           />
         )}
 
-        <Field label="Instructions" htmlFor={instructionsId}>
+        <Field
+          label={request.kind === "run" ? "Additional instructions" : "Instructions"}
+          htmlFor={instructionsId}
+        >
           <Textarea
             id={instructionsId}
             value={instructions}
+            placeholder={
+              request.kind === "run"
+                ? "Optional. Instructions to customize the workflow."
+                : undefined
+            }
             onChange={(event) => setInstructions(event.currentTarget.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void run();
