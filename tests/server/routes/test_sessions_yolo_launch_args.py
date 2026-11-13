@@ -403,23 +403,19 @@ def test_codex_native_permission_mode_maps_to_mode_launch_args(
         config["yolo"] = yolo
     spec = _spec_with_config(config)
     expected = PERMISSION_LAUNCH_ARGS["codex-native"][mode] or None
+    if mode == "approve-for-me":
+        expected = [
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "on-request",
+            "-c",
+            'approvals_reviewer="auto_review"',
+        ]
     assert (
         _derive_terminal_launch_args_from_spec(spec, headless_defaults=headless_defaults)
         == expected
     )
-
-
-def test_codex_native_approve_for_me_uses_auto_reviewer() -> None:
-    """Pin the concrete argv for ``approve-for-me`` on a headless worker."""
-    spec = _spec_with_config({"harness": "codex-native", "permission_mode": "approve-for-me"})
-    assert _derive_terminal_launch_args_from_spec(spec) == [
-        "--sandbox",
-        "workspace-write",
-        "--ask-for-approval",
-        "on-request",
-        "-c",
-        'approvals_reviewer="auto_review"',
-    ]
 
 
 @pytest.mark.parametrize("mode", ["bypass", "Approve-for-me", " approve-for-me", "auto", 1])

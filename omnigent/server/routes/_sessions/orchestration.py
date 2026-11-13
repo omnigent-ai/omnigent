@@ -12848,7 +12848,9 @@ async def _create_session_from_existing_agent(
         )
         try:
             validated_launch_args = (
-                _derive_terminal_launch_args_from_spec(sub_spec) if sub_spec is not None else None
+                _derive_terminal_launch_args_from_spec(sub_spec)
+                if sub_spec is not None and _spec_harness(sub_spec) == selected_harness
+                else None
             )
         except ValueError as exc:
             raise OmnigentError(
@@ -12918,7 +12920,11 @@ async def _create_session_from_existing_agent(
                 exc_info=True,
             )
 
-    if needs_launch_args_from_spec and own_spec is not None:
+    if (
+        needs_launch_args_from_spec
+        and own_spec is not None
+        and _spec_harness(own_spec) == selected_harness
+    ):
         try:
             validated_launch_args = _derive_terminal_launch_args_from_spec(
                 own_spec, headless_defaults=False
