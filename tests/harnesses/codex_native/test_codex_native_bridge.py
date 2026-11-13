@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from omnigent.harnesses.codex_native.bridge import (
     codex_home_for_bridge_dir,
     codex_mcp_config_overrides,
     codex_terminal_interactive,
+    fail_pending_mcp_startup,
     mcp_startup_waiting_detail,
     pending_mcp_servers,
     prepare_bridge_dir,
@@ -38,6 +40,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_home_config_model,
     read_mcp_startup,
     read_policy_hook_config,
+    record_acknowledged_turn_id,
     record_app_server_stopped,
     record_certificate_failure,
     record_child_usage_baseline,
@@ -51,6 +54,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_codex_config_model,
     write_policy_hook_config,
 )
+from omnigent.process_logging import data_dir
 
 
 def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
@@ -77,12 +81,14 @@ def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
     assert codex_terminal_interactive(bridge_dir, "Codex is starting") is False
 
 
-def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:
-    """codex launches serve-mcp with ``-I`` so the workspace can't shadow omnigent.
+def test_codex_mcp_config_overrides_isolate_the_bridge_relay(tmp_path: Path) -> None:
+    """codex launches serve-mcp with ``-I`` and the runner's data dir.
 
     The MCP server starts in the session workspace, and without ``-I`` python puts
     that cwd on ``sys.path``, so a workspace that is an omnigent checkout supplies
-    the bridge's own package. Every other native bridge passes ``-I`` here.
+    the bridge's own package. Every other native bridge passes ``-I`` here. codex
+    also drops ``OMNIGENT_DATA_DIR`` from an MCP server's env, so the relay gets it
+    pinned to find the bridge root that holds its bridge dir.
 
     :param tmp_path: Stands in for the per-session bridge dir.
     """
@@ -96,6 +102,29 @@ def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Pat
         "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",
     ]
+    env_prefix = "mcp_servers.omnigent.env.OMNIGENT_DATA_DIR="
+    raw_data_dir = next(o[len(env_prefix) :] for o in overrides if o.startswith(env_prefix))
+    assert json.loads(raw_data_dir) == str(data_dir())
+
+
+def test_codex_mcp_config_overrides_pin_a_relative_data_dir_as_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The relay starts in the session workspace, so it must get an absolute data dir.
+
+    :param tmp_path: Stands in for the host's launch directory.
+    :param monkeypatch: Sets a relative ``OMNIGENT_DATA_DIR`` and the cwd.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", "state")
+
+    overrides = codex_mcp_config_overrides(tmp_path / "bridge")
+
+    env_prefix = "mcp_servers.omnigent.env.OMNIGENT_DATA_DIR="
+    raw_data_dir = next(o[len(env_prefix) :] for o in overrides if o.startswith(env_prefix))
+    pinned = Path(json.loads(raw_data_dir))
+    assert pinned.is_absolute()
+    assert pinned == Path.cwd() / "state"
 
 
 def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
@@ -137,6 +166,72 @@ def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None
     updated = read_bridge_state(tmp_path)
     assert updated is not None
     assert updated.cwd == str(tmp_path)
+
+
+@pytest.mark.parametrize("native_turn", [None, "turn_agent", "turn_shell"])
+def test_shell_reconciliation_requires_idle_or_the_original_parent(
+    tmp_path: Path, native_turn: str | None
+) -> None:
+    """Only authoritative idle or the original model turn makes steering safe."""
+    _seed_active_turn(tmp_path, "turn_agent")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert codex_native_bridge.mark_shell_command_pending(tmp_path, state, "shell_request")
+    pending = read_bridge_state(tmp_path)
+    assert pending is not None
+    for _ in range(2):
+        codex_native_bridge.reconcile_shell_command_state(tmp_path, pending, native_turn)
+        updated = read_bridge_state(tmp_path)
+        assert updated is not None
+        assert updated.active_turn_id == "turn_agent"
+        assert (updated.pending_shell_command_id is None) == (native_turn != "turn_shell")
+        assert updated.active_shell_turn_id is None
+
+
+@pytest.mark.parametrize(
+    "changed_field", ["pending_shell_command_id", "session_id", "thread_id", "socket_path"]
+)
+def test_shell_reconciliation_does_not_clear_a_newer_submission_or_session(
+    tmp_path: Path, changed_field: str
+) -> None:
+    """A delayed fence response cannot change state that replaced its captured submission."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, None)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert codex_native_bridge.mark_shell_command_pending(tmp_path, state, "older_request")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    newer = replace(observed, **{changed_field: "newer_value"})
+    write_bridge_state(tmp_path, newer)
+
+    codex_native_bridge.reconcile_shell_command_state(tmp_path, observed, None)
+
+    assert read_bridge_state(tmp_path) == newer
+
+
+def test_shell_reconciliation_never_restores_a_completed_turn(tmp_path: Path) -> None:
+    """Completion during the probe must not create a stale standalone-shell latch."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_shell")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    observed = replace(state, pending_shell_command_id="submission")
+    write_bridge_state(tmp_path, observed)
+    clear_active_turn_id_if_matches(tmp_path, "turn_shell")
+
+    codex_native_bridge.reconcile_shell_command_state(tmp_path, observed, "turn_shell")
+
+    current = read_bridge_state(tmp_path)
+    assert current is not None
+    assert current.active_turn_id is None
+    assert current.active_shell_turn_id is None
+    assert current.pending_shell_command_id == "submission"
+    codex_native_bridge.reconcile_shell_command_state(tmp_path, current, None)
+    settled = read_bridge_state(tmp_path)
+    assert settled is not None and settled.pending_shell_command_id is None
 
 
 @pytest.mark.parametrize(
@@ -576,6 +671,129 @@ def test_active_turn_update_requires_storage_only_when_state_changes(
     assert read_bridge_state(bridge_dir) == before
 
 
+@pytest.mark.parametrize(
+    ("changed_owner", "published_turn_id", "incoming_revision", "expected_revision"),
+    [
+        pytest.param(None, "turn_a", 0, 4, id="same-owner-stale-revision"),
+        pytest.param(None, "turn_a", 4, 4, id="same-owner-noop"),
+        pytest.param(None, "turn_a", 9, 9, id="same-owner-newer-revision"),
+        pytest.param(None, "turn_b", 0, 5, id="same-owner-start"),
+        pytest.param(None, None, 0, 5, id="same-owner-clear"),
+        pytest.param(None, "turn_b", 9, 9, id="same-owner-newer-start-revision"),
+        pytest.param("session_id", "turn_b", 0, 0, id="new-session-reset"),
+        pytest.param("thread_id", "turn_b", 0, 0, id="new-thread-reset"),
+        pytest.param("socket_path", "turn_b", 0, 0, id="new-socket-reset"),
+        pytest.param("codex_home", "turn_b", 0, 0, id="new-home-reset"),
+    ],
+)
+def test_full_state_publication_preserves_revision_for_the_same_owner(
+    bridge_dir: Path,
+    changed_owner: str | None,
+    published_turn_id: str | None,
+    incoming_revision: int,
+    expected_revision: int,
+) -> None:
+    _seed_active_turn(bridge_dir, "turn_a")
+    current = read_bridge_state(bridge_dir)
+    assert current is not None
+    current = replace(current, active_turn_revision=4)
+    write_bridge_state(bridge_dir, current)
+    publication = replace(
+        current,
+        active_turn_id=published_turn_id,
+        active_turn_revision=incoming_revision,
+    )
+    if changed_owner is not None:
+        publication = replace(
+            publication, **{changed_owner: f"{getattr(current, changed_owner)}-new"}
+        )
+
+    write_bridge_state(bridge_dir, publication)
+
+    assert read_bridge_state(bridge_dir) == replace(
+        publication, active_turn_revision=expected_revision
+    )
+
+
+@pytest.mark.parametrize(
+    ("sent_turn_id", "forwarder_events", "acknowledged_turn_id", "recorded", "active_after"),
+    [
+        (None, [], "turn_a", True, "turn_a"),
+        (None, [("started", "turn_a")], "turn_a", True, "turn_a"),
+        (None, [("started", "turn_native")], "turn_unstarted", False, "turn_native"),
+        (None, [("started", "turn_a"), ("completed", "turn_a")], "turn_a", False, None),
+        (
+            None,
+            [("started", "turn_native"), ("completed", "turn_native")],
+            "turn_unstarted",
+            False,
+            None,
+        ),
+        ("turn_a", [], "turn_a", True, "turn_a"),
+        ("turn_a", [("completed", "turn_a")], "turn_a", False, None),
+        ("turn_a", [("completed", "turn_a"), ("started", "turn_b")], "turn_a", False, "turn_b"),
+        (None, [("rewritten", "session_id")], "turn_a", False, None),
+        (None, [("rewritten", "thread_id")], "turn_a", False, None),
+        (None, [("rewritten", "socket_path")], "turn_a", False, None),
+        pytest.param(
+            None,
+            [("rewritten", "codex_home")],
+            "turn_a",
+            False,
+            None,
+            id="home-only-rotation",
+        ),
+        pytest.param(
+            "turn_a",
+            [("rewritten", "codex_home")],
+            "turn_a",
+            True,
+            "turn_a",
+            id="already-recorded-home-rotation",
+        ),
+        pytest.param(
+            "turn_a",
+            [("published", "turn_a"), ("published", "turn_b"), ("published", "turn_a")],
+            "turn_unstarted",
+            False,
+            "turn_a",
+            id="full-state-publication-aba",
+        ),
+    ],
+)
+def test_acknowledged_turn_keeps_turn_changes_recorded_meanwhile(
+    bridge_dir: Path,
+    sent_turn_id: str | None,
+    forwarder_events: list[tuple[str, str]],
+    acknowledged_turn_id: str,
+    recorded: bool,
+    active_after: str | None,
+) -> None:
+    _seed_active_turn(bridge_dir, sent_turn_id)
+    sent_state = read_bridge_state(bridge_dir)
+    assert sent_state is not None
+    for event, value in forwarder_events:
+        if event == "started":
+            update_active_turn_id(bridge_dir, value)
+        elif event == "completed":
+            assert clear_active_turn_id_if_matches(bridge_dir, value)
+        elif event == "published":
+            prior = read_bridge_state(bridge_dir)
+            publication = replace(sent_state, active_turn_id=value)
+            write_bridge_state(bridge_dir, publication)
+            if publication == prior:
+                assert read_bridge_state(bridge_dir) == prior
+        else:
+            # Launch, resume and rotation write fresh state with the revision reset.
+            fresh_state = replace(sent_state, **{value: f"{getattr(sent_state, value)}-new"})
+            write_bridge_state(bridge_dir, fresh_state)
+
+    assert record_acknowledged_turn_id(bridge_dir, sent_state, acknowledged_turn_id) is recorded
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.active_turn_id == active_after
+
+
 def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path) -> None:
     """
     With no bridge state on disk, clearing reports cleared and runs ``on_cleared``.
@@ -981,6 +1199,29 @@ def test_settle_pending_mcp_startup_drops_only_starting(bridge_dir: Path) -> Non
     assert read_mcp_startup(bridge_dir) == servers
     # Fully settled → nothing to drop, nothing rewritten.
     assert settle_pending_mcp_startup(bridge_dir) == (servers, False)
+
+
+def test_fail_pending_mcp_startup_marks_only_starting(bridge_dir: Path) -> None:
+    """
+    Failing the round records the reason on ``starting`` entries only.
+
+    Ready and cancelled servers keep their outcome; once nothing is
+    ``starting`` the band has nothing to spin on, so a second call is a no-op.
+    """
+    update_mcp_server_startup(bridge_dir, "safe", "starting")
+    update_mcp_server_startup(bridge_dir, "omnigent", "ready")
+    update_mcp_server_startup(bridge_dir, "storage-console", "cancelled")
+
+    servers, changed = fail_pending_mcp_startup(bridge_dir, "app-server stopped")
+
+    assert changed is True
+    assert servers == {
+        "safe": {"status": "failed", "error": "app-server stopped"},
+        "omnigent": {"status": "ready", "error": None},
+        "storage-console": {"status": "cancelled", "error": None},
+    }
+    assert read_mcp_startup(bridge_dir) == servers
+    assert fail_pending_mcp_startup(bridge_dir, "app-server stopped") == (servers, False)
 
 
 def test_read_mcp_startup_ignores_malformed_entries(bridge_dir: Path) -> None:

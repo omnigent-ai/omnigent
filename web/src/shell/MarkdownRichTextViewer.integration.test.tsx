@@ -112,7 +112,10 @@ vi.mock("./TipTapHtmlPassthrough", () => ({ HtmlPassthrough: {} }));
 vi.mock("./tiptapMarkdownPatches", () => ({
   installMarkdownSerializerPatch: vi.fn(),
   installMarkdownParserPatch: vi.fn(),
+  // The fake editor has no source blocks, so a save serialises everything.
+  markdownKeepingSource: vi.fn((editor: { getMarkdown: () => string }) => editor.getMarkdown()),
 }));
+vi.mock("./markdownSourceBlocks", () => ({ rememberSourceBlocks: vi.fn() }));
 vi.mock("./TipTapWorkspaceImage", () => ({
   createWorkspaceImageExtension: vi.fn().mockReturnValue({}),
   ImageAwareLink: { configure: vi.fn().mockReturnValue({}) },
@@ -153,6 +156,8 @@ import { CODE_BLOCK_LANGUAGE_EDIT_META } from "./codeBlockLanguageEdit";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
 import { fetchFileContent } from "@/hooks/useFileContent";
+import { rememberSourceBlocks } from "./markdownSourceBlocks";
+import { markdownKeepingSource } from "./tiptapMarkdownPatches";
 
 const PATH = "/doc.md";
 const INITIAL = "# Doc\n\ninitial body\n";
@@ -372,6 +377,35 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     expect(screen.queryByText(/Unsaved changes/)).toBeNull();
     expect(serialize).not.toHaveBeenCalled();
     expect(mutateAsync).not.toHaveBeenCalled();
+  });
+
+  it("records the loaded source and saves the source-keeping Markdown", async () => {
+    const { rerender } = render(makeViewer());
+    expect(rememberSourceBlocks).toHaveBeenLastCalledWith(fakeEditor, INITIAL);
+    await act(async () => rerender(makeViewer(EDITED)));
+    expect(rememberSourceBlocks).toHaveBeenLastCalledWith(fakeEditor, EDITED);
+    // The server now holds the external update, so the pre-write check passes.
+    vi.mocked(fetchFileContent).mockResolvedValue({
+      object: "session.environment.filesystem.file_content",
+      path: PATH,
+      content_type: "text/markdown",
+      encoding: "utf-8",
+      content: EDITED,
+      bytes: EDITED.length,
+    });
+    vi.mocked(markdownKeepingSource).mockReturnValue("kept source\n");
+    try {
+      await act(async () => {
+        fakeEditor!.setMarkdown(`${EDITED}more`);
+        fakeEditor!.emit("update");
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: "kept source\n" });
+    } finally {
+      vi.mocked(markdownKeepingSource).mockImplementation((editor) => editor.getMarkdown());
+    }
   });
 
   it("debounced save fires after an edit (update → schedule → write)", async () => {

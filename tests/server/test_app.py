@@ -465,6 +465,7 @@ async def test_info_includes_server_version(
     # is a frozen build-time snapshot that can drift from VERSION in a stale
     # editable or "source"-placeholder install.
     assert body["server_version"] == VERSION
+    assert body["comment_anchor_metadata"] is True
 
 
 def _branding_png(color: tuple[int, int, int, int]) -> bytes:
@@ -634,6 +635,23 @@ async def test_info_evaluates_a_callable_policy_per_request(
 
     assert first == {"extensions": [".gz"], "all_types": False}
     assert second["all_types"] is True
+
+
+@pytest.mark.asyncio
+async def test_automation_trigger_poll_minutes_are_advertised(
+    db_uri: str, runtime_init: None, tmp_path: Path
+) -> None:
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "trigger-polling",
+        server_config={"automation_trigger_poll_minutes": 240},
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/info")
+    assert response.status_code == 200
+    assert response.json()["automation_trigger_poll_minutes"] == 240
 
 
 def test_session_title_instructions_are_wired_into_coordinator(
@@ -1163,6 +1181,109 @@ async def test_host_route_for_live_host_on_another_replica(
     assert resp.json()["error"]["code"] == code
 
 
+_LIVE_HOST_ID = "0123456789abcdef0123456789abcdef"
+_SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key"
+_RESEND_KEYED = f"resend with header {_SLICE_KEY_HEADER}: {_LIVE_HOST_ID}"
+_RESEND_KEYLESS = (
+    f"resend without the {_SLICE_KEY_HEADER} header or omnigent_slice_key query parameter"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "params", "resend_slice_key", "remedy"),
+    [
+        ({}, {}, _LIVE_HOST_ID, _RESEND_KEYED),
+        (
+            {_SLICE_KEY_HEADER: "fedcba9876543210fedcba9876543210"},
+            {},
+            _LIVE_HOST_ID,
+            _RESEND_KEYED,
+        ),
+        # Ingress hashes the literal key; the host dials with the bare id.
+        ({_SLICE_KEY_HEADER: f"host_{_LIVE_HOST_ID}"}, {}, _LIVE_HOST_ID, _RESEND_KEYED),
+        ({_SLICE_KEY_HEADER: _LIVE_HOST_ID}, {}, None, _RESEND_KEYLESS),
+        ({}, {"omnigent_slice_key": _LIVE_HOST_ID}, None, _RESEND_KEYLESS),
+        # Like ingress, a non-empty header wins over the query fallback.
+        (
+            {_SLICE_KEY_HEADER: "fedcba9876543210fedcba9876543210"},
+            {"omnigent_slice_key": _LIVE_HOST_ID},
+            _LIVE_HOST_ID,
+            _RESEND_KEYED,
+        ),
+        ({_SLICE_KEY_HEADER: ""}, {"omnigent_slice_key": _LIVE_HOST_ID}, None, _RESEND_KEYLESS),
+    ],
+    ids=[
+        "keyless",
+        "other_key",
+        "legacy_prefixed_key",
+        "host_key",
+        "host_query_key",
+        "other_header_over_host_query",
+        "empty_header_host_query",
+    ],
+)
+async def test_wrong_replica_names_the_slice_key_that_reaches_the_host(
+    db_uri: str,
+    tmp_path: Path,
+    headers: dict[str, str],
+    params: dict[str, str],
+    resend_slice_key: str | None,
+    remedy: str,
+) -> None:
+    """
+    A wrong-replica 400 tells the client which slice key reaches the host.
+
+    A keyless or differently keyed request must be resent keyed to the host; a
+    request already keyed to the host must be resent keyless, because its tunnel
+    dialed the default route.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.server.routes._host_launch import configure_host_sharding
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+    from tests.server.helpers import create_test_agent
+
+    host_store = HostStore(db_uri)
+    # Online and freshly seen, but its tunnel never registered on this replica.
+    host_store.upsert_on_connect(_LIVE_HOST_ID, "laptop", "local")
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    try:
+        app = create_app(
+            agent_store=SqlAlchemyAgentStore(db_uri),
+            file_store=SqlAlchemyFileStore(db_uri),
+            conversation_store=SqlAlchemyConversationStore(db_uri),
+            artifact_store=artifact_store,
+            host_store=host_store,
+            agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+            host_sharded=True,
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            agent = await create_test_agent(c)
+            responses = [
+                await c.get(
+                    f"/v1/hosts/{_LIVE_HOST_ID}/filesystem", headers=headers, params=params
+                ),
+                await c.post(
+                    "/v1/sessions",
+                    headers=headers,
+                    params=params,
+                    json={"agent_id": agent["id"], "host_id": _LIVE_HOST_ID, "workspace": "/work"},
+                ),
+            ]
+    finally:
+        configure_host_sharding(False)
+
+    for resp in responses:
+        assert resp.status_code == 400, resp.text
+        error = resp.json()["error"]
+        assert error["code"] == "wrong_replica"
+        assert error["slice_key_header"] == _SLICE_KEY_HEADER
+        assert error["slice_key"] == resend_slice_key
+        assert error["message"].endswith(remedy), error["message"]
+
+
 @dataclass(frozen=True)
 class _SeedStores:
     """
@@ -1390,6 +1511,16 @@ def test_ensure_default_acp_agents_seeds_configured_agent(
     assert "grok" in owned
     assert (seed_stores.agent_store.get_by_name("grok") is not None) == (allowlist is None)
 
+    # Startup as a whole keeps it visible too, though its row has a built-in id.
+    if allowlist is None:
+        monkeypatch.delenv(SEEDED_AGENTS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(SEEDED_AGENTS_ENV, ",".join(sorted(allowlist)))
+    suppressed = server_app._ensure_default_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+    assert "gemini-cli" not in suppressed
+
 
 def test_ensure_default_acp_agents_seeds_builtin_cli_rows_without_a_local_binary(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
@@ -1516,6 +1647,24 @@ def test_ensure_default_acp_agents_survives_unreadable_config(
     server_app._ensure_default_acp_agents(
         seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
     )
+
+    # Nor does it hide the operator's agent an earlier boot seeded under a built-in id.
+
+    server_app._ensure_builtin_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+        name="my-acp",
+        bundle_bytes=server_app._build_acp_bundle(harness="acp:my-acp", name="my-acp"),
+    )
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "claude-native-ui")
+    suppressed = server_app._ensure_default_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+    assert "my-acp" not in suppressed
+    assert seed_stores.agent_store.get_by_name("my-acp") is not None
+    # Packaged built-ins the allowlist leaves out are still hidden.
+    assert server_app._DEBBY_AGENT_NAME in suppressed
 
 
 def test_build_acp_bundle_carries_the_harness_id(tmp_path: Path) -> None:
@@ -2108,6 +2257,70 @@ def test_ensure_default_agents_never_suppresses_operator_extras(
     assert seed_stores.agent_store.get_by_name(name) is not None
     assert name not in suppressed
     assert server_app._DEBBY_AGENT_NAME in suppressed
+
+
+def test_ensure_default_agents_keeps_an_extra_whose_path_is_gone(
+    seed_stores: _SeedStores, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An extra seeded on an earlier boot isn't retired when its mount goes missing."""
+    spec = tmp_path / "house-agent.yaml"
+    spec.write_text("name: house-agent\nexecutor:\n  harness: claude-sdk\nprompt: hi\n")
+    monkeypatch.setenv(server_app._EXTRA_BUILTIN_AGENTS_ENV, str(spec))
+    stores = (seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
+    assert server_app._ensure_extra_builtin_agents(*stores) == {"house-agent"}
+    spec.unlink()
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "")
+
+    suppressed = server_app._ensure_default_agents(*stores)
+
+    assert not spec.exists()
+    assert "house-agent" not in suppressed
+
+
+@pytest.mark.parametrize(
+    ("allowlist", "devin_hidden"),
+    [("claude-native-ui", True), ("claude-native-ui,devin", False)],
+    ids=["left-out", "allowlisted"],
+)
+def test_ensure_default_agents_hides_a_built_in_row_an_earlier_version_seeded(
+    seed_stores: _SeedStores,
+    monkeypatch: pytest.MonkeyPatch,
+    allowlist: str,
+    devin_hidden: bool,
+) -> None:
+    """A retired built-in obeys the allowlist like a packaged one; other server agents don't."""
+    from omnigent.db.utils import builtin_agent_id, generate_agent_id
+
+    # Later rows sort after earlier ones, so the retired row lands past the first page.
+    ticks = iter(range(1_000, 100_000))
+    monkeypatch.setattr(
+        "omnigent.stores.agent_store.sqlalchemy_store.now_epoch", lambda: next(ticks)
+    )
+    seed_stores.agent_store.create(generate_agent_id(), "house-agent", "house/bundle")
+    for index in range(100):
+        seed_stores.agent_store.create(generate_agent_id(), f"filler-{index}", "filler/bundle")
+    stores = (seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
+    # A server-owned row outside the current seed roster.
+    server_app._ensure_builtin_agent(
+        *stores,
+        name="devin",
+        bundle_bytes=server_app._build_acp_bundle(harness="devin", name="devin"),
+    )
+    # An operator's acp: agent no longer configured, and a row whose bundle is gone.
+    server_app._ensure_builtin_agent(
+        *stores,
+        name="old-acp",
+        bundle_bytes=server_app._build_acp_bundle(harness="acp:old-acp", name="old-acp"),
+    )
+    seed_stores.agent_store.create(builtin_agent_id("unreadable"), "unreadable", "gone/bundle")
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, allowlist)
+
+    suppressed = server_app._ensure_default_agents(*stores)
+
+    assert ("devin" in suppressed) is devin_hidden
+    assert not {"house-agent", "old-acp", "unreadable"} & suppressed
+    # Hidden, not deleted: sessions bound to the old row still find it.
+    assert seed_stores.agent_store.get_by_name("devin") is not None
 
 
 def test_ensure_default_agents_warns_on_unknown_allowlist_names(
@@ -2974,3 +3187,107 @@ async def test_on_runner_connect_reassign_http_status_levels(
     assert row.levelno == level
     assert row.exc_info is None
     assert f"HTTP {status}: runner said no" in row.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_info_publishes_the_picker_curation(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """``GET /v1/info`` carries both keys as configured, so the web picker can act on them."""
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "picker",
+        server_config={
+            "restrict_to_agent_names": ["polly", "claude-native-ui"],
+            "default_agent_name": "polly",
+        },
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/v1/info")
+
+    assert resp.status_code == 200
+    assert resp.json()["picker"] == {
+        "restrict_to_agent_names": ["polly", "claude-native-ui"],
+        "default_agent_name": "polly",
+    }
+
+
+@pytest.mark.parametrize(
+    ("names", "expected", "absent"),
+    [
+        # A mistyped name is called out; the real one next to it is not.
+        (("polly", "pollly"), ["matching no server agent: pollly"], ["matches no agent"]),
+        # A user's own agent can still match, so the picker is not promised empty.
+        (("nope",), ["matches no agent this server offers (nope)"], ["will be empty"]),
+        # OMNIGENT_SEEDED_AGENTS wins: a suppressed agent is seeded but never offered.
+        (
+            ("polly", "debby"),
+            ["OMNIGENT_SEEDED_AGENTS leaves out", ": debby"],
+            ["matches no agent"],
+        ),
+        (
+            ("debby", "nope"),
+            ["leaves out, so New Chat will not offer them: debby", "(debby, nope)"],
+            ["matching no server agent"],
+        ),
+    ],
+    ids=["typo", "unknown only", "suppressed", "nothing offered"],
+)
+def test_picker_restriction_warning_names_the_agents_new_chat_cannot_offer(
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+    names: tuple[str, ...],
+    expected: list[str],
+    absent: list[str],
+) -> None:
+    """Startup names the restricted agents that are unknown or hidden by the env var."""
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.server.server_config import PickerCuration
+
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    for name in ("polly", "debby"):
+        agent_store.create(builtin_agent_id(name), name=name, bundle_location=f"test:///{name}")
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        server_app._warn_on_empty_picker_restriction(
+            agent_store,
+            PickerCuration(restrict_to_agent_names=names),
+            suppressed_agent_names=frozenset({"debby"}),
+        )
+
+    for text in expected:
+        assert text in caplog.text
+    for text in absent:
+        assert text not in caplog.text
+
+
+@pytest.mark.parametrize("mode", ["snapshot", "off", "on"])
+async def test_mcp_launch_gate_and_hidden_info(db_uri, runtime_init, tmp_path, monkeypatch, mode):
+    monkeypatch.setenv(
+        "OMNIGENT_FEATURES",
+        "mcp_disabled_servers,mcp_disabled_servers_claude,mcp_disabled_servers_codex",
+    )
+    gate = {
+        "snapshot": None,
+        "off": False,
+        "on": True,
+    }[mode]
+    app = _build_branding_app(db_uri, tmp_path, f"mcp-{mode}", mcp_disabled_servers=gate)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        info = (await client.get("/v1/info")).json()
+    assert "mcp_disabled_servers_enabled" not in info
+    assert not any(name.startswith("mcp_disabled_servers") for name in info["features"])
+    activation = app.state.host_registry.mcp_disabled_servers_active_harnesses
+    first, second = activation(), activation()
+    enabled = ["claude", "codex"]
+    assert (first, second) == {
+        "snapshot": (enabled, enabled),
+        "off": (None, None),
+        "on": (enabled, enabled),
+    }[mode]

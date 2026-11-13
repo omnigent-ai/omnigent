@@ -136,9 +136,10 @@ def watch_thread_pool(
             del frames
         summary = _summarize_locations(locations)
         _logger.warning(
-            "%s thread pool backed up: a queued job has waited %.1fs for one of %d workers; "
+            "%s thread pool %r backed up: a queued job has waited %.1fs for one of %d workers; "
             "workers are in: %s",
             process_role.capitalize(),
+            thread_name_prefix,
             waited_s,
             len(workers),
             summary or "none",
@@ -149,6 +150,7 @@ def watch_thread_pool(
                     waited_s=round(waited_s, 3),
                     threshold_s=stall_threshold_s,
                     workers=len(workers),
+                    thread_name_prefix=thread_name_prefix,
                     worker_locations=summary,
                     report_interval_s=report_interval_s,
                 ),

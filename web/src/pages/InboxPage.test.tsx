@@ -18,12 +18,23 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { InboxPage } from "./InboxPage";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as approvalCard from "@/components/blocks/ApprovalCard";
 import type { ComponentProps } from "react";
 import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
+import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
+import { resetLocalElicitationResolutionsForTests } from "@/lib/localElicitationResolutions";
 import * as sessionsApi from "@/lib/sessionsApi";
+import {
+  type AskUserQuestionDraft,
+  askUserQuestionSignature,
+  clearAskUserQuestionDraft,
+  getAskUserQuestionDraft,
+  saveAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
 import type { CommentInbox } from "@/hooks/useCommentInbox";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import {
@@ -38,7 +49,7 @@ vi.mock("@/components/blocks/ApprovalCard", async (importActual) => {
   const actual = await importActual<typeof approvalCard>();
   return {
     ApprovalCard: (props: ComponentProps<typeof actual.ApprovalCard>) => {
-      if (props.nativeDelivery || props.permissionDirectories)
+      if (props.nativeDelivery || props.permissionDirectories || props.askUserQuestion)
         return <actual.ApprovalCard {...props} />;
       const { elicitationId, message, status, allowAutoMode, onSubmit, requester } = props;
       return (
@@ -70,6 +81,7 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   ...(await importActual<typeof conversationsHook>()),
   useConversations: vi.fn(),
 }));
+vi.mock("@/hooks/useAutomationInbox", () => ({ useAutomationInbox: vi.fn() }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
 // Real exports (ApiError, codes) so failure handling sees genuine error types.
 vi.mock("@/lib/sessionsApi", async (importActual) => ({
@@ -94,6 +106,15 @@ function conversation(overrides: Partial<Conversation> = {}): Conversation {
     ...overrides,
   };
 }
+
+const draftQuestions = [{ question: "Pick a region", options: [], multiSelect: false }];
+const draftSignature = askUserQuestionSignature(draftQuestions);
+const unsentDraft: AskUserQuestionDraft = {
+  currentIndex: 0,
+  selections: { "Pick a region": "" },
+  customSelected: { "Pick a region": true },
+  customInputs: { "Pick a region": "eu-west" },
+};
 
 /** A raw `response.elicitation_request` event dict, as a snapshot replays it. */
 function rawElicitation(id: string, message: string, extra: Record<string, unknown> = {}) {
@@ -128,20 +149,39 @@ function commentInboxStub(overrides: Partial<CommentInbox> = {}): CommentInbox {
 
 function renderPage(
   queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  taskDetailsEnabled = false,
 ) {
   // Fresh client per render so cached queries never leak between tests.
   return render(
     <QueryClientProvider client={queryClient}>
-      <SidebarDataProvider>
-        <MemoryRouter>
-          <InboxPage />
-        </MemoryRouter>
-      </SidebarDataProvider>
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { automations_v2: taskDetailsEnabled } }}
+      >
+        <SidebarDataProvider>
+          <MemoryRouter>
+            <InboxPage />
+          </MemoryRouter>
+        </SidebarDataProvider>
+      </CapabilitiesProvider>
     </QueryClientProvider>,
   );
 }
 
+function automationInboxStub(overrides: Record<string, unknown> = {}) {
+  return {
+    items: [],
+    isLoading: false,
+    isError: false,
+    hasNextPage: false,
+    markRead: vi.fn(),
+    refetch: vi.fn(),
+    fetchNextPage: vi.fn(),
+    ...overrides,
+  } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>;
+}
+
 beforeEach(() => {
+  vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(automationInboxStub());
   vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([]));
   vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(commentInboxStub());
   vi.mocked(sessionsApi.getSession).mockResolvedValue({
@@ -158,7 +198,10 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   resetReadStateForTests();
+  resetLocalElicitationResolutionsForTests();
   localStorage.clear();
+  clearAskUserQuestionDraft("eli_1");
+  clearAskUserQuestionDraft("eli_question");
 });
 
 /** A finished session whose latest turn the viewer hasn't opened yet. */
@@ -288,6 +331,30 @@ describe("InboxPage approval items", () => {
     expect(toggle.textContent).not.toContain("**");
   });
 
+  it("keeps a question card's answers when its row is collapsed and reopened", async () => {
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [
+        rawElicitation("eli_question", "Claude has questions", {
+          ask_user_question: { questions: draftQuestions },
+        }),
+      ],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    fireEvent.change(await screen.findByTestId("ask-user-question-custom-input"), {
+      target: { value: "eu-west" },
+    });
+    const item = screen.getByTestId("inbox-item");
+    fireEvent.click(within(item).getByRole("button", { name: /My Session/ }));
+    await waitFor(() => expect(item).toHaveAttribute("data-expanded", "false"));
+    expect(screen.queryByTestId("ask-user-question-form")).not.toBeInTheDocument();
+    fireEvent.click(within(item).getByRole("button", { name: /My Session/ }));
+
+    expect(await screen.findByTestId("ask-user-question-custom-input")).toHaveValue("eu-west");
+  });
+
   it("previews a policy prompt's command verbatim in the collapsed row", async () => {
     // WHY: only the bridges' `**<tool>**` message is formatted; a balanced `**`
     // inside a command the user is approving must not be read as emphasis.
@@ -315,6 +382,7 @@ describe("InboxPage approval items", () => {
     vi.mocked(sessionsApi.getSession).mockResolvedValue({
       pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
     } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    saveAskUserQuestionDraft("eli_1", draftSignature, unsentDraft);
     renderPage();
 
     fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
@@ -325,6 +393,26 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
     );
+    expect(getAskUserQuestionDraft("eli_1", draftSignature)).toBeUndefined();
+  });
+
+  it("keeps an answered approval of an unseen idle session out of the unread list", async () => {
+    // WHY: answering lowers the sidebar's count at once, but the card stays listed
+    // until the server drops the prompt, so the session must not also read as unread.
+    const row = unreadConversation({ pending_elicitations_count: 1 });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    vi.mocked(sessionsApi.approve).mockReturnValue(new Promise(() => {}));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
+    );
+    expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument();
   });
 
   it("offers auto mode from a snapshot and sends the choice to the owning session", async () => {
@@ -388,6 +476,7 @@ describe("InboxPage approval items", () => {
       pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
     } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
     vi.mocked(sessionsApi.approve).mockRejectedValue(new Error("nope"));
+    saveAskUserQuestionDraft("eli_1", draftSignature, unsentDraft);
     renderPage();
 
     fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
@@ -395,6 +484,7 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "pending"),
     );
+    expect(getAskUserQuestionDraft("eli_1", draftSignature)).toEqual(unsentDraft);
   });
 
   it("clears a stale verdict when a snapshot refresh still shows the elicitation as pending", async () => {
@@ -1440,6 +1530,7 @@ it.each(
       act(async () => {
         await queryClient.refetchQueries({ queryKey: ["inbox-elicitations"] });
       });
+    saveAskUserQuestionDraft("eli_1", draftSignature, unsentDraft);
     renderPage(queryClient);
     fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
     await poll();
@@ -1466,6 +1557,10 @@ it.each(
       submissions[1]!.reject(new Error("retry failed"));
     });
     expect(await screen.findByRole("button", { name: "Retry sending approval" })).toBeEnabled();
+    // Only a success for the attempt still on screen clears the draft.
+    expect(getAskUserQuestionDraft("eli_1", draftSignature)).toEqual(
+      outcome === "success" && !retryFirst ? undefined : unsentDraft,
+    );
   },
 );
 
@@ -1510,4 +1605,70 @@ it("recovers a native request after an empty snapshot without reloading", async 
     queryClient.clear();
     vi.useRealTimers();
   }
+});
+
+describe("automation failures", () => {
+  it.each([false, true])(
+    "renders and dismisses failures with task details enabled=%s",
+    (taskDetailsEnabled) => {
+      const markRead = vi.fn();
+      vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(
+        automationInboxStub({
+          markRead,
+          items: [
+            {
+              taskId: "task",
+              taskName: "Daily report",
+              runId: "run",
+              scheduledAt: 1_700_000_000,
+              finishedAt: 1_700_000_010,
+              errorCode: "host_offline",
+            },
+          ],
+        }),
+      );
+      renderPage(undefined, taskDetailsEnabled);
+      fireEvent.click(screen.getByRole("button", { name: "Automation failed: Daily report" }));
+      expect(screen.getByText("Host · The host was offline.")).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: /Open automation/ })).toHaveAttribute(
+        "href",
+        taskDetailsEnabled ? "/tasks/task" : "/tasks",
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Mark as read" }));
+      expect(markRead).toHaveBeenCalledWith("run");
+      selectTab("Awaiting response");
+      expect(screen.queryByTestId("inbox-automation-item")).toBeNull();
+      selectTab("Unread");
+      expect(screen.getByTestId("inbox-automation-item")).toBeInTheDocument();
+    },
+  );
+
+  it.each(["loading", "error", "continuation"])("renders an independent %s feed state", (state) => {
+    const fetchNextPage = vi.fn();
+    const refetch = vi.fn();
+    vi.mocked(automationInboxHook.useAutomationInbox).mockReturnValue(
+      automationInboxStub({
+        hasNextPage: state === "continuation",
+        fetchNextPage,
+        isLoading: state === "loading",
+        isError: state === "error",
+        refetch,
+      }),
+    );
+    renderPage();
+    if (state === "loading") {
+      expect(screen.getByText("Loading inbox…")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).toBeNull();
+    } else if (state === "error") {
+      expect(screen.getByRole("alert")).toHaveTextContent("Couldn’t load automation failures.");
+      fireEvent.click(screen.getByRole("button", { name: "Retry automations" }));
+      expect(refetch).toHaveBeenCalledOnce();
+    } else {
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByText("Nothing waiting in the loaded items")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Check more automations" }));
+      expect(fetchNextPage).toHaveBeenCalledOnce();
+    }
+    if (state !== "continuation") expect(screen.queryByText(/Nothing waiting/)).toBeNull();
+  });
 });

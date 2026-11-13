@@ -31,12 +31,13 @@ import {
   type Host,
 } from "@/hooks/useHosts";
 import { ApiError } from "@/lib/sessionsApi";
-import { INVENTORY_HARNESS_IDS } from "@/hooks/useHarnessInventory";
-import { BRAND_HARNESSES } from "@/components/onboarding/harnessBrand";
+import { useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
+import { INVENTORY_HARNESS_IDS, INVENTORY_HARNESSES } from "@/hooks/useHarnessInventory";
 import {
   HARNESS_CREDENTIAL_COPY,
   harnessInstallableOnHost,
   harnessWarningBadgeText,
+  MIN_TMUX_VERSION,
   missingHarnessCredentialCopy,
   type HarnessCredentialKind,
 } from "@/lib/harnessSetup";
@@ -64,24 +65,18 @@ interface HarnessEntry {
 // (/v1/harnesses) carries no descriptions, so these live here; the rest of each
 // entry (name, icon, order) comes from NATIVE_CODING_AGENTS.
 const HARNESS_DESCRIPTIONS: Record<string, string> = {
-  "claude-native":
-    "Anthropic’s coding agent for understanding codebases, editing files, and running development workflows.",
-  "codex-native":
-    "OpenAI’s coding agent for building features, fixing bugs, and working across repositories.",
-  "opencode-native": "An open-source coding agent for the terminal, IDE, and desktop.",
-  "cursor-native":
-    "An AI code editor with agent workflows for navigating, editing, and shipping code.",
-  "pi-native": "A minimal, extensible coding agent harness built for terminal workflows.",
-  "devin-native": "Cognition’s autonomous coding agent for end-to-end software tasks.",
-  "antigravity-native":
-    "Google’s agent-first development platform for planning and executing software tasks.",
-  "kiro-native":
-    "An agentic IDE for spec-driven development, hooks, and production-ready software.",
-  "qwen-native": "An open-source terminal coding agent powered by Qwen models.",
-  "goose-native": "An open-source local AI agent for coding, automation, and extensible workflows.",
-  "kimi-native":
-    "A terminal coding agent for editing code, running commands, and completing development tasks.",
-  "hermes-native": "A self-improving AI agent that learns reusable skills from experience.",
+  "claude-native": "Anthropic’s agent for coding and development workflows.",
+  "codex-native": "OpenAI’s coding agent for building features and fixing bugs.",
+  "opencode-native": "An open-source coding agent for terminal, IDE, and desktop.",
+  "cursor-native": "An AI editor with agents for navigating and editing code.",
+  "pi-native": "A minimal, extensible terminal coding agent.",
+  "devin-native": "Cognition’s autonomous coding agent.",
+  "antigravity-native": "Google’s agent platform for software development.",
+  "kiro-native": "An agentic IDE for spec-driven development.",
+  "qwen-native": "An open-source terminal coding agent powered by Qwen.",
+  "goose-native": "An open-source local agent for coding and automation.",
+  "kimi-native": "A terminal coding agent for editing code and running commands.",
+  "hermes-native": "An agent that learns reusable skills from experience.",
 };
 
 // The harness catalog, derived from the shared native-agent registry so this
@@ -102,23 +97,36 @@ function hostHarnessKey(hostId: string, harness: string): string {
 
 /**
  * Settings → Harnesses: the harness grid at /settings/harnesses, or one
- * harness's details at /settings/harnesses/<harness>. An unknown slug shows the
- * grid. Host selection lives here so it survives grid ↔ details navigation.
+ * harness's details at /settings/harnesses/<harness>. An unknown slug, or one
+ * the deployment curated out, shows the grid. Host selection lives here so it
+ * survives grid ↔ details navigation.
  */
 export const SettingsHarnessesSection = () => {
   const { harness } = useSettingsRoute();
   const [query, setQuery] = useState("");
   const [installedOnly, setInstalledOnly] = useState(false);
   const info = useServerInfo();
+  const curatedOut = useCuratedOutHarnesses();
+  const offered = useMemo(
+    () => HARNESS_ENTRIES.filter((entry) => !curatedOut.has(entry.harness)),
+    [curatedOut],
+  );
   const queryClient = useQueryClient();
-  const { data: hosts } = useHosts({ refetchOnFocus: true });
   const [searchParams] = useSearchParams();
   const requestedHostId = searchParams.get("host");
   const [selectedHostId, setSelectedHostId] = useState<string | null>(requestedHostId);
+  // A session's link names its host, which may be a sandbox the picker otherwise hides.
+  const [linkedHostId, setLinkedHostId] = useState<string | null>(requestedHostId);
   // In-section links drop `?host`, so only a new deep link replaces the pick.
   useEffect(() => {
-    if (requestedHostId !== null) setSelectedHostId(requestedHostId);
+    if (requestedHostId === null) return;
+    setSelectedHostId(requestedHostId);
+    setLinkedHostId(requestedHostId);
   }, [requestedHostId]);
+  const { data: hosts, isPending: hostsLoading } = useHosts({
+    refetchOnFocus: true,
+    sourceHostId: linkedHostId ?? undefined,
+  });
   const [credentialKinds, setCredentialKinds] = useState<Record<string, HarnessCredentialKind>>({});
   const [readyNotice, setReadyNotice] = useState<{
     harness: string;
@@ -164,14 +172,14 @@ export const SettingsHarnessesSection = () => {
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return HARNESS_ENTRIES.filter(
+    return offered.filter(
       (h) =>
         (!installedOnly || harnessStatus(h.harness, selectedHost).ready) &&
         (!q || h.name.toLowerCase().includes(q) || h.description.toLowerCase().includes(q)),
     );
-  }, [query, installedOnly, selectedHost]);
+  }, [offered, query, installedOnly, selectedHost]);
 
-  const detail = HARNESS_ENTRIES.find((entry) => entry.harness === harness);
+  const detail = offered.find((entry) => entry.harness === harness);
 
   return (
     <div className="@container">
@@ -180,6 +188,7 @@ export const SettingsHarnessesSection = () => {
           key={detail.harness}
           entry={detail}
           host={selectedHost}
+          hostsLoading={hostsLoading}
           canSetup={canSetup}
           installable={harnessInstallableOnHost(info, detail.harness, selectedHost)}
           credentialKind={
@@ -227,10 +236,14 @@ export const SettingsHarnessesSection = () => {
               </TabsList>
             </Tabs>
           </div>
-          {!selectedHost && <NoHostNotice />}
+          {!selectedHost && <NoHostNotice loading={hostsLoading} />}
           {filtered.length === 0 && (
             <p className="text-ui text-muted-foreground">
-              {query.trim() ? `No harnesses match “${query}”.` : "No installed harnesses."}
+              {offered.length === 0
+                ? "This server offers no harnesses to set up."
+                : query.trim()
+                  ? `No harnesses match “${query}”.`
+                  : "No installed harnesses."}
             </p>
           )}
           <div
@@ -298,7 +311,8 @@ export const SettingsHarnessesSection = () => {
   );
 };
 
-function NoHostNotice() {
+function NoHostNotice({ loading }: { loading: boolean }) {
+  if (loading) return <p className="text-ui text-muted-foreground">Loading hosts…</p>;
   return (
     <p className="text-ui text-muted-foreground" data-testid="harness-no-host">
       Connect an online host to see which harnesses are installed and to set them up.
@@ -474,6 +488,14 @@ function HarnessStatusText({
       </span>
     );
   }
+  if (status.reason === "cli-unresponsive") {
+    return (
+      <span className="flex w-fit items-center gap-1 text-xs text-amber-600 dark:text-amber-500">
+        <TriangleAlertIcon className="size-3.5" aria-hidden />
+        CLI did not respond
+      </span>
+    );
+  }
   if (status.needsSetup && !enhanced) {
     const text = harnessWarningBadgeText(status.reason);
     return (
@@ -558,7 +580,8 @@ function HarnessCard({
   const status = harnessStatus(entry.harness, host);
   const mode = harnessFixMode(status.reason);
   const canFix = canSetup && !!host && !host.sandbox_provider;
-  const opensDetail = status.ready || (status.needsSetup && canFix);
+  const needsAttention = status.needsSetup || status.reason === "cli-unresponsive";
+  const opensDetail = status.ready || (needsAttention && canFix);
   const navigate = useNavigate();
   const body = (
     <>
@@ -579,8 +602,7 @@ function HarnessCard({
             />
           </div>
         </div>
-        {(status.ready ||
-          (status.needsSetup && canFix && (mode !== "install" || !installable))) && (
+        {(status.ready || (needsAttention && canFix && (mode !== "install" || !installable))) && (
           <Button
             size="icon-sm"
             variant="ghost"
@@ -600,7 +622,7 @@ function HarnessCard({
           <SetupButton entry={entry} onSetup={() => onFix("install")} />
         )}
       </div>
-      <p className="line-clamp-2 text-ui text-muted-foreground">{entry.description}</p>
+      <p className="line-clamp-2 text-sm text-muted-foreground">{entry.description}</p>
     </>
   );
   const className =
@@ -629,6 +651,7 @@ function HarnessCard({
 function HarnessDetail({
   entry,
   host,
+  hostsLoading,
   canSetup,
   installable,
   credentialKind,
@@ -637,6 +660,7 @@ function HarnessDetail({
 }: {
   entry: HarnessEntry;
   host: Host | null;
+  hostsLoading: boolean;
   canSetup: boolean;
   installable: boolean;
   credentialKind?: HarnessCredentialKind;
@@ -712,9 +736,11 @@ function HarnessDetail({
       warning={credentialProblem}
       showStatus={canSetup}
       statusLabel={
-        status.reason === "binary-missing" || status.reason === "unconfigured"
-          ? reconfigurationReason(status.reason)
-          : "Needs reconfiguration"
+        status.reason === "cli-unresponsive"
+          ? "Not checked"
+          : status.reason === "binary-missing" || status.reason === "unconfigured"
+            ? reconfigurationReason(status.reason)
+            : "Needs reconfiguration"
       }
       action={
         status.ready && canFix && canSwitchHarnessAccount(host, entry.harness)
@@ -737,7 +763,7 @@ function HarnessDetail({
           account={readyNotice.account}
         />
       )}
-      {status.needsSetup && !credentialProblem && (
+      {(status.needsSetup || status.reason === "cli-unresponsive") && !credentialProblem && (
         <HarnessWarning
           entry={entry}
           host={host}
@@ -752,7 +778,7 @@ function HarnessDetail({
     </div>
   ) : null;
   // The host inventory only covers these families' MCP servers, skills, and plugins.
-  const family = BRAND_HARNESSES.find((f) => INVENTORY_HARNESS_IDS[f] === entry.harness);
+  const family = INVENTORY_HARNESSES.find((f) => INVENTORY_HARNESS_IDS[f] === entry.harness);
   if (host && family && (status.ready || canFix)) {
     return (
       <HarnessCatalog
@@ -769,7 +795,7 @@ function HarnessDetail({
       {header}
       <div className="mt-6 flex flex-col gap-6">
         {!host ? (
-          <NoHostNotice />
+          <NoHostNotice loading={hostsLoading} />
         ) : status.ready ? (
           <>
             <p className="text-ui text-muted-foreground">
@@ -841,25 +867,32 @@ function HarnessWarning({
   onFix: (mode: HarnessFixMode) => void;
 }) {
   const copy =
-    reason === "readiness-error"
-      ? `${entry.name} isn’t working on ${host.name}. Run setup again to fix it.`
-      : mode === "update"
-        ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
-        : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
-  const action = !installable
-    ? "Set up"
-    : mode === "update"
-      ? "Update"
-      : mode === "install"
-        ? "Install"
-        : "Reconfigure";
+    reason === "cli-unresponsive"
+      ? `${entry.name}’s CLI on ${host.name} didn’t respond to a version check. New sessions still try to start it; run it on that machine and finish any setup prompt it shows.`
+      : reason === "readiness-error"
+        ? `${entry.name} isn’t working on ${host.name}. Run setup again to fix it.`
+        : mode === "tmux"
+          ? `${entry.name} needs tmux ${MIN_TMUX_VERSION} or newer on ${host.name}. Install or upgrade tmux so new sessions can use ${entry.name}.`
+          : mode === "update"
+            ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
+            : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
+  const action =
+    mode === "tmux"
+      ? "Set up tmux"
+      : !installable
+        ? "Set up"
+        : mode === "update"
+          ? "Update"
+          : mode === "install"
+            ? "Install"
+            : "Reconfigure";
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-ui">
       <div className="flex min-w-0 flex-1 items-start gap-3">
         <TriangleAlertIcon className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-500" />
         <p>{copy}</p>
       </div>
-      {!host.sandbox_provider && (
+      {!host.sandbox_provider && reason !== "cli-unresponsive" && (
         <Button size="sm" onClick={() => onFix(mode)}>
           {action}
         </Button>

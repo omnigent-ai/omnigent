@@ -21,8 +21,11 @@ loads facets without opening the panel.
 
 Declare supported controls through `ProviderCapabilities`: account switching,
 base remote selection, line counts, and diffs for linked requests outside the
-workspace's repository. Return authentication state and actionable host-side
-instructions in `auth`. A provider can authenticate without a CLI; the panel
+workspace's repository. A provider that merges and switches accounts can also
+implement the optional `AccountMergeFacet` and set `merge_as_account`. The merge
+dialog then offers the signed-in accounts, and `merge_as` must run as the chosen
+account for that call alone, never as a saved preference read back. Return
+authentication state and actionable host-side instructions in `auth`. A provider can authenticate without a CLI; the panel
 requires a CLI installation only while the provider is also signed out.
 
 Requests route to the selected association's provider. Without an association,
@@ -67,6 +70,7 @@ checks, or changes when its API failed:
 | `pr.checks.partial: true`         | Qualify check counts as incomplete; keep any loaded checks.                                                                            |
 | `pr.checks_supported: false`      | The token cannot read check runs (GitHub refuses them to fine-grained PATs); say so in the Checks area instead of showing counts.      |
 | `pr.comments_partial: true`       | Mark comments incomplete; retain loaded comments and display a `+` with their count.                                                   |
+| `pr.timeline_partial: true`       | Retain loaded commit/force-push events and show an incomplete-history message with a provider link.                                    |
 | Changed files `has_more: true`    | Mark the file list incomplete.                                                                                                         |
 | Changed files `warning: string`   | Show the provider's explanation, including a failed file-list lookup.                                                                  |
 | Diff `unavailable_reason: string` | Show an unavailable state instead of rendering an empty patch.                                                                         |
@@ -141,6 +145,79 @@ that store requests report `session_pull_requests` in `/v1/info`; against older
 servers the web reads only the live host.
 
 ## Verification
+
+### Commit and push history
+
+GitHub PR info includes optional `timeline_events`, interleaved with comments
+in the Comments tab. Entries contain `id`, `kind` (`commit` or `force_push`),
+`author`, `created_at`, `url`, `sha`, and optional `previous_sha` and `message`.
+The host fetches the latest 100 commit/force-push timeline entries and reports
+`timeline_partial` when older entries exist or the read fails. Older hosts and
+other providers can omit these fields.
+
+GitHub does not expose supported timestamps for regular pushes, so commits use
+their commit time and are labeled “committed.” Force pushes use the event time.
+Timeline-only reads use GitHub CLI's 30-second response cache. PRs with at least
+100 comments keep the existing uncached latest-comment refresh and fetch activity
+in that request. Incomplete history does not extend normal metadata polling.
+
+### Inline GitHub conversations
+
+GitHub advertises `review_threads`, `review_thread_replies` and
+`review_thread_creation`. All default to
+false for other providers and older hosts. They use the optional `ReviewThreadsFacet`
+without changing the required methods of `PullRequestFacet`.
+
+While **Changes** is visible, `GET review-threads` fetches the first 25 threads
+with up to 20 published comments each, then polls every 10 seconds. The existing
+PR metadata request continues to use `gh pr view`. Other subtabs and the closed
+panel stop thread polling. Replies and new conversations refresh the thread
+query immediately. Additional thread and comment pages load on demand.
+
+The thread response carries `data`, `has_more`, `next_cursor`, `head_sha`,
+`base_sha` and an optional `warning`. Ordinary polls replace unpaginated comments,
+retaining locally posted replies until observed in a read. Explicitly loaded
+history is retained and marked for manual reload.
+
+Patch reads verify the expected revisions before and
+after fetching; mismatches withhold inline placement. Outdated, hidden-context,
+file-level and unavailable-diff threads remain accessible with their original
+code context. Resolved threads start collapsed.
+
+Fenced `suggestion` blocks render the referenced lines as removals and the
+replacement as additions, with line numbers. They reuse the displayed patch
+and its diff renderer for syntax and word-level highlighting.
+Outdated or hidden-context threads use the saved snippet labeled **Original
+context**. If the complete original range is unavailable, the replacement is
+shown without a comparison. Suggestions are display-only and add no requests.
+
+`POST review-threads/{id}/replies` publishes immediately with the selected host
+account. The host validates thread membership and replies to its published root
+comment. Expanded conversations show a compact **Write a reply…** input. Focus it
+to open the Markdown composer; **Cancel** collapses it while retaining the draft.
+Thread reads include code excerpts and require the same file-sharing permission
+as diff reads. Reply pagination requires session read permission; writes require
+edit permission.
+Runner and host fallback use the same provider implementation. An uncertain
+write is never retried automatically. Drafts and pending/error state stay in
+memory per session, PR and thread, including through tab and layout switches.
+
+Select a line number and use the gutter **+** or **Comment on selected lines**
+to start a separate conversation, even when that line already has a thread.
+The **+** overlays the divider between line numbers and code without widening
+the gutter.
+Drag line numbers or Shift-click to select a range on the same side within one
+diff hunk. `POST review-threads` accepts `pr_url`, `body` and an `anchor` with
+`path`, `side`, `line`, optional `start_line`, `head_sha` and `base_sha`.
+The provider checks both revisions and publishes a one-thread GraphQL review
+with `event: COMMENT` and the displayed commit. Its response identifies the
+canonical thread. New drafts retain text and coordinates per session, PR and
+file; a revision change requires explicit reselection before posting.
+
+Resolving/reopening threads remains follow-up work.
+See the [browser verification recipe](../feature-map/pull-request-conversations.md).
+
+### Provider regression checks
 
 Run the existing GitHub resource and tracking suites together with provider
 dispatcher tests, then the shared panel, composer, and canvas frontend tests.

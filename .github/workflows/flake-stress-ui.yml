@@ -56,6 +56,7 @@ permissions:
   contents: read
 
 env:
+  OMNIGENT_CI_PIPELINE: flake-stress-ui
   # No SPA build during `uv sync`: the build is a dedicated step below
   # (mirrors e2e-ui.yml; the setup.py build would be a redundant npm hit).
   OMNIGENT_SKIP_WEB_UI: "true"
@@ -276,12 +277,12 @@ jobs:
           pnpm --filter web run build
 
       - name: Install Claude Code CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: claude
 
       - name: Install Codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@75d817057138bd2cf5cd5af1cd954fdaca12e03d
         with:
           harness: codex
 

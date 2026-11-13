@@ -68,6 +68,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  OMNIGENT_CI_PIPELINE: feature-blog
   SOURCE_REPO: omnigent-ai/omnigent
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
@@ -236,6 +237,7 @@ jobs:
         if: steps.guard.outputs.proceed == 'true' && steps.creds.outputs.available == 'true'
         uses: ./.github/actions/run-omnigent-agent
         with:
+          pipeline: feature-blog
           agent: feature-blog-scout
           prompt-file: /tmp/scout_prompt.txt
           output-file: /tmp/scout_out.txt
@@ -530,28 +532,22 @@ jobs:
               GATEWAY_BASE_URL='${{ secrets.GATEWAY_BASE_URL }}' \
               IMAGE_MODEL='${{ vars.OMNIGENT_CI_IMAGE_MODEL }}' \
               IMAGE_PROMPT="$image_prompt" SLUG="$slug" SITE="$SITE" POST="$post" \
-              python3 -u <<'PYEOF' || echo "::warning::hero image generation failed for ${slug}; leaving heroArt blank"
+              PYTHONPATH="${GITHUB_WORKSPACE}" python3 -u <<'PYEOF' || echo "::warning::hero image generation failed for ${slug}; leaving heroArt blank"
           import base64, json, os, pathlib, re, urllib.request
           gw = os.environ.get("GATEWAY_BASE_URL", "")
           key = os.environ.get("LLM_API_KEY", "")
           if not gw or not key:
               raise SystemExit("no gateway/key for image generation")
-          # The image model lives on the same workspace host as the anthropic
-          # gateway (GATEWAY_BASE_URL = <host>/anthropic). Derive scheme://host.
-          m = re.match(r"(https?://[^/]+)", gw)
-          if not m:
-              raise SystemExit(f"cannot parse gateway host from {gw!r}")
+          from dev.ci_usage import chat_request
           model = os.environ.get("IMAGE_MODEL", "").strip()
           if not model:
               raise SystemExit("repository variable OMNIGENT_CI_IMAGE_MODEL is empty")
-          url = f"{m.group(1)}/serving-endpoints/{model}/invocations"
           style = (" Flat vector illustration, dark navy tech background with subtle "
                    "circuit lines, teal and pink accents, 16:9 wide, no text, no words, "
                    "no logos.")
-          body = json.dumps({"messages": [{"role": "user",
-                 "content": os.environ["IMAGE_PROMPT"] + style}], "max_tokens": 4096}).encode()
-          req = urllib.request.Request(url, data=body, method="POST", headers={
-              "Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+          body = {"model": model, "messages": [{"role": "user",
+                 "content": os.environ["IMAGE_PROMPT"] + style}], "max_tokens": 4096}
+          req = chat_request(gw, key, body)
           with urllib.request.urlopen(req, timeout=120) as resp:
               data = json.load(resp)
           # The image is the content part of type image_url (a data: URI).

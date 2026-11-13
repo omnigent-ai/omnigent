@@ -512,9 +512,11 @@ class SysSessionListTool(Tool):
       ``sys_session_send`` continues rather than spawns) and to grab each
       child's ``conversation_id`` for ``sys_session_get_history`` /
       ``sys_session_get_info`` / ``sys_session_close``.
-    - ``sessions`` — a **global** view of every session the caller can
-      access (bounded by the server's per-user permission model), each
-      with its status and runner connectivity. An optional
+    - ``sessions`` — a **global** view of the caller's own sessions
+      (``visibility="mine"``, the UI sidebar's default), each with its
+      status and runner connectivity. ``visibility="shared"`` lists
+      sessions other users shared with the caller instead, and ``"all"``
+      lists both; those rows carry ``owner``. An optional
       ``agent_name`` filter narrows this list. This powers
       orchestration: discovering sessions to inspect
       (``sys_agent_get`` / ``sys_session_get_info``) or drive
@@ -538,19 +540,20 @@ class SysSessionListTool(Tool):
             "(agent, title) children under this conversation (and your "
             "parent/siblings) — use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
-            "every session "
-            "you can access, each with status, runner connectivity and "
+            "the sessions you own (visibility 'mine', the default), each "
+            "with status, runner connectivity and "
             "created_by_session_id (creation origin for independent workers). "
             "Match that field to your session ID to find workers you created. "
+            "Pass visibility 'shared' for sessions other users shared with you, "
+            "or 'all' for both; those rows carry owner, so check it before "
+            "treating a session as yours. "
             "Inspect via sys_agent_get / sys_session_get_info; use sys_session_send "
             "for children or sys_session_message for independent sessions. "
             "Pass agent_name to filter the global list to "
             "sessions running that agent, and include_archived to also list "
-            "archived sessions (marked archived). Calls without pagination keep "
-            "the complete result while it fits the tool-output budget; "
-            "larger global session lists return a page with has_more "
-            "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
-            "complete."
+            "archived sessions (marked archived). 'sessions' returns the newest 50 by "
+            "default; when more remain, pass page.next_cursor as cursor to continue. "
+            "sub_agents stays complete."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -569,6 +572,13 @@ class SysSessionListTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "project": {
+                            "type": "string",
+                            "description": (
+                                'Filter global sessions by project name; "" lists unfiled '
+                                "sessions. Sub_agents is unchanged."
+                            ),
+                        },
                         "agent_name": {
                             "type": "string",
                             "description": (
@@ -576,6 +586,16 @@ class SysSessionListTool(Tool):
                                 "list to sessions whose bound agent has "
                                 "this name, e.g. 'researcher'. Does not "
                                 "affect the 'sub_agents' view."
+                            ),
+                        },
+                        "visibility": {
+                            "type": "string",
+                            "enum": ["mine", "shared", "all"],
+                            "description": (
+                                "Optional: which sessions the global 'sessions' "
+                                "view covers. 'mine' (default): sessions you own. "
+                                "'shared': sessions other users shared with you. "
+                                "'all': both. Does not affect 'sub_agents'."
                             ),
                         },
                         "include_archived": {
@@ -591,8 +611,7 @@ class SysSessionListTool(Tool):
                             "minimum": 1,
                             "maximum": 100,
                             "description": (
-                                "Optional maximum rows returned from 'sessions'. "
-                                "Omit it to keep the complete result while it fits."
+                                "Optional maximum rows returned from 'sessions'. Defaults to 50."
                             ),
                         },
                         "cursor": {
@@ -677,7 +696,7 @@ class SysSessionGetInfoTool(Tool):
     status, title, agent binding (id + name), runner binding and live
     connectivity, host and its reported harness readiness, reasoning effort,
     effective model, parent
-    linkage, workspace / git branch, persisted last-activity time, and
+    linkage, workspace / git branch, project, persisted last-activity time, and
     the count of outstanding approval prompts. Comparing
     ``last_activity_at`` across polls distinguishes a running session that
     is advancing from one whose persisted output has stalled. For the
@@ -688,7 +707,7 @@ class SysSessionGetInfoTool(Tool):
     session is described.
 
     Runner-dispatched: the runner proxies ``GET /v1/sessions/{id}``
-    (plus best-effort runner status and host readiness lookups) and projects
+    (plus best-effort runner status, host readiness and project name lookups) and projects
     the result. Returns
     ``session_not_found`` when the id is unknown and ``access_denied``
     when the server refuses the read.
@@ -706,7 +725,7 @@ class SysSessionGetInfoTool(Tool):
             "Return a session's metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model, "
-            "parent session, workspace, "
+            "parent session, workspace, project_id, project_name, "
             "persisted last-activity time, and outstanding approval "
             "prompts. Global read — any "
             "session you can access. Pass session_id to target another "
@@ -879,7 +898,7 @@ class SysSessionCreateTool(Tool):
     The default placement forces ``parent_session_id`` to the caller.
     A child inherits the caller's runner and starts when a message is queued.
     With ``agent_id``, independent placements use the server's orchestration
-    gate and create private top-level sessions without completion forwarding.
+    gate and create private sibling sessions without completion forwarding.
 
     Two addressing modes — exactly one of ``agent_id`` or
     ``config_path`` must be given:
@@ -900,8 +919,9 @@ class SysSessionCreateTool(Tool):
     An optional ``message`` starts the session's first user turn;
     an optional ``title`` labels the session.
 
-    Returns a handle ``{conversation_id, agent_id, title, status}``. The
-    session runs asynchronously — use ``sys_session_get_history`` /
+    Returns a handle ``{conversation_id, agent_id, title, status}``, plus
+    ``project_id`` and ``project_name`` for an independent session. The session runs
+    asynchronously — use ``sys_session_get_history`` /
     ``sys_session_get_info`` to monitor it. Use ``sys_session_send`` for
     further child work and ``sys_session_message`` for independent sessions.
     """
@@ -933,17 +953,27 @@ class SysSessionCreateTool(Tool):
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
             "message. By default the new session is a child of the caller. "
-            "With agent_id, placement='same_host' creates an independent private session "
-            "on the caller's host/workspace; placement='managed' provisions a new sandbox "
-            "using the server's configured default provider. Managed creation requires a "
+            "With agent_id, placement='same_host' creates a private independent session "
+            "on the caller's host/workspace; placement='host' uses your chosen host_id "
+            "and absolute workspace, optionally creating a git worktree. "
+            "placement='managed' creates one on a new sandbox "
+            "using the server's configured default provider. These sessions are grouped as "
+            "nested agents when enabled on the server; otherwise they appear at the top level. "
+            "Managed creation requires a "
             "configured sandbox provider; use same_host for an existing connected host. "
             "These placements require orchestration enabled "
-            "and a private sending session, including its side-chat source chain. "
+            "and a sending session that is private or shared read-only, including its "
+            "side-chat source chain. "
+            "project_name files an independent session in your project with that name, "
+            "or in a new one; the project's agent, workspace and git defaults don't apply. "
+            "A project_name other than this session's project makes a standalone "
+            "session there, not a nested agent. "
             "An independent worker's optional "
             "first message must contain 1–8000 characters. "
             "Independent sessions do not forward replies: "
             "read their status/history, and use sys_session_message for subsequent work. "
-            "Returns {conversation_id, agent_id, title, status}; the "
+            "Returns {conversation_id, agent_id, title, status}, plus project_id "
+            "and project_name for an independent session; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
             "with sys_session_send for children or sys_session_message for independent sessions."
@@ -969,11 +999,59 @@ class SysSessionCreateTool(Tool):
                     "properties": {
                         "placement": {
                             "type": "string",
-                            "enum": ["child", "same_host", "managed"],
+                            "enum": ["child", "same_host", "host", "managed"],
                             "description": (
-                                "Default child; same_host or managed launches a private "
-                                "top-level session (agent_id only)."
+                                "Default child; same_host, host or managed launches a private "
+                                "independent session (agent_id only), grouped in this family "
+                                "when nested agents are enabled, unless project_name names "
+                                "another project."
                             ),
+                        },
+                        "host_id": {
+                            "type": "string",
+                            "description": "Owned host ID; required for placement='host'.",
+                        },
+                        "workspace": {
+                            "type": "string",
+                            "description": (
+                                "Absolute path on the chosen host; required for placement='host'."
+                            ),
+                        },
+                        "git": {
+                            "type": "object",
+                            "description": (
+                                "For placement='host', create a new worktree from workspace."
+                            ),
+                            "properties": {
+                                "branch_name": {"type": "string", "minLength": 1},
+                                "base_branch": {"type": "string", "minLength": 1},
+                            },
+                            "required": ["branch_name"],
+                            "additionalProperties": False,
+                        },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "Existing owned project ID for an independent session. "
+                                "Use project_id or project_name, not both. "
+                                "Project defaults do not apply."
+                            ),
+                        },
+                        "sandbox_provider": {
+                            "type": "string",
+                            "description": "Optional provider for placement='managed'.",
+                        },
+                        "sandbox_profile_id": {
+                            "type": "string",
+                            "description": (
+                                "Authorized profile ID for placement='managed', required by "
+                                "providers that manage profiles. Use a selection supplied by "
+                                "the user or discovered through GET /v1/sandbox-profiles."
+                            ),
+                        },
+                        "sandbox_profile_revision": {
+                            "type": "string",
+                            "description": "Expected catalog revision of sandbox_profile_id.",
                         },
                         "agent_id": {
                             "type": "string",
@@ -1004,6 +1082,17 @@ class SysSessionCreateTool(Tool):
                             "description": (
                                 "Optional human-readable label for the "
                                 "new session, e.g. 'auth refactor'."
+                            ),
+                        },
+                        "project_name": {
+                            "type": "string",
+                            "description": (
+                                "Optional project, by the name shown in the UI (not "
+                                "the project id), to file an independent session "
+                                "(same_host, host or managed) in: your existing project "
+                                "with this name, or a new one if you have none. "
+                                "A project other than this session's project gives a "
+                                "standalone session, not a nested agent."
                             ),
                         },
                         "message": {
@@ -1039,10 +1128,19 @@ class SysSessionCreateTool(Tool):
                             ],
                             "description": (
                                 "Optional reasoning level for the child "
-                                "session, e.g. 'high'. Only valid with "
-                                "'agent_id', and only for harnesses with "
-                                "effort plumbing; omit to use the agent's "
-                                "default."
+                                "session, e.g. 'high'. Only for harnesses "
+                                "with effort plumbing; omit to use the "
+                                "agent's default."
+                            ),
+                        },
+                        "permission_mode": {
+                            "type": "string",
+                            "description": (
+                                "Optional permission mode for the new session, in its "
+                                "harness's vocabulary, e.g. Claude Code 'auto' or Codex "
+                                "'approve-for-me' (agent_id only). Modes that skip "
+                                "approval, such as 'bypassPermissions' or 'full-access', "
+                                "are refused. Omit to use the agent's default."
                             ),
                         },
                     },

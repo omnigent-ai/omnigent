@@ -74,7 +74,10 @@ function renderRow(
   };
   render(
     <CapabilitiesProvider
-      info={{ ...FALLBACK_SERVER_INFO, features: { automations_v2: detailPage } }}
+      info={{
+        ...FALLBACK_SERVER_INFO,
+        features: { automations_v2: detailPage },
+      }}
     >
       <MemoryRouter>
         <ScheduledTaskRow {...props} />
@@ -165,5 +168,83 @@ describe("card-body navigation", () => {
     fireEvent.click(screen.getByTestId("task-run-now"));
     expect(onRunNow).toHaveBeenCalledWith(t);
     expect(navigate).not.toHaveBeenCalled();
+  });
+});
+
+describe("last-run failure warning", () => {
+  it.each(["active", "paused"] as const)("shows a red warning on a %s automation", (state) => {
+    renderRow(task({ state, lastRunStatus: "failed" }), {}, { detailPage: true });
+    const warning = screen.getByRole("img", { name: "Last run failed" });
+    expect(warning).toHaveClass("text-status-red");
+    expect(warning).toHaveAttribute("title", "Last run failed");
+    expect(screen.getByTestId("task-row-open")).toHaveAccessibleDescription("Last run failed");
+    expect(screen.getByTestId("task-row-open")).toHaveAttribute("aria-describedby", warning.id);
+    fireEvent.click(warning);
+    expect(navigate).toHaveBeenCalledWith("/tasks/st_1");
+  });
+
+  it.each([null, "succeeded", "running", "skipped"] as const)(
+    "does not warn for %s",
+    (lastRunStatus) => {
+      renderRow(task({ lastRunStatus }));
+      expect(screen.queryByRole("img", { name: "Last run failed" })).toBeNull();
+    },
+  );
+
+  it("also warns when the detail page is disabled", () => {
+    renderRow(task({ state: "paused", lastRunStatus: "failed" }));
+    expect(screen.getByRole("img", { name: "Last run failed" })).toBeInTheDocument();
+  });
+});
+
+it.each(["continue", "new"] as const)(
+  "uses trigger controls only for continued templates: %s",
+  async (sessionMode) => {
+    renderRow(
+      task({
+        prompt: "This automation watches Slack and starts one Omnigent session",
+        sessionMode,
+        nextRunAt: "2026-03-10T14:00:00Z",
+      }),
+    );
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(await screen.findByTestId("task-edit")).toBeInTheDocument();
+    if (sessionMode === "continue") {
+      expect(screen.getByTestId("task-schedule-line")).toHaveTextContent(
+        "Runs when new items match",
+      );
+      expect(screen.queryByTestId("task-next-run")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("task-run-now")).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByTestId("task-next-run")).toBeInTheDocument();
+      expect(screen.getByTestId("task-run-now")).toBeInTheDocument();
+    }
+  },
+);
+
+describe("right-click context menu", () => {
+  it("opens the same actions on right-click and dispatches the selection", () => {
+    const onDelete = vi.fn();
+    const t = task();
+    renderRow(t, { onDelete });
+    fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"));
+    expect(screen.getByTestId("task-run-now")).toBeInTheDocument();
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(screen.getByTestId("task-pause-toggle").textContent).toBe("Pause");
+    fireEvent.click(screen.getByTestId("task-delete"));
+    expect(onDelete).toHaveBeenCalledWith(t);
+  });
+
+  it("opens on the clickable card body without navigating", () => {
+    renderRow(task({ id: "st_42" }), {}, { detailPage: true });
+    fireEvent.contextMenu(screen.getByTestId("task-row-open"));
+    expect(screen.getByTestId("task-edit")).toBeInTheDocument();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("does not open while the row is busy", () => {
+    renderRow(task(), { busy: true });
+    fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"));
+    expect(screen.queryByTestId("task-run-now")).toBeNull();
   });
 });

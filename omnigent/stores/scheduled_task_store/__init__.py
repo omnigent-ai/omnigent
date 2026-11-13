@@ -8,18 +8,59 @@ table and its ``scheduled_task_runs`` history table.
 from __future__ import annotations
 
 import builtins
+import json
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.errors import ErrorCode, OmnigentError
 
 # Sentinel meaning "caller did not supply this argument; leave the column unchanged."
 # Distinct from None, which means "set the column to NULL."
 _UNSET: Any = object()
 
+
+# Width of the ``scheduled_tasks.mcp_services`` column.
+MCP_SERVICES_MAX_STORED_CHARS = 4096
+
+
+def encode_mcp_services(services: tuple[str, ...]) -> str | None:
+    """Serialize a task's MCP services for its column; empty stores NULL.
+
+    SQLite does not enforce the column width, so the limit is checked here,
+    on every write path.
+    """
+    if not services:
+        return None
+    encoded = json.dumps(list(services))
+    if len(encoded) > MCP_SERVICES_MAX_STORED_CHARS:
+        raise OmnigentError("Too many MCP services selected", code=ErrorCode.INVALID_INPUT)
+    return encoded
+
+
+def decode_mcp_services(raw: str | None) -> tuple[str, ...]:
+    """Read a task's MCP services column back; NULL is no selection."""
+    if not raw:
+        return ()
+    return tuple(json.loads(raw))
+
+
 # How :meth:`ScheduledTaskStore.adopt_session` resolved: the task now continues
 # the session, another session got there first, or the task changed under the run.
 AdoptOutcome = Literal["adopted", "taken", "stale"]
+
+
+@dataclass(frozen=True)
+class AutomationFailure:
+    """Latest sessionless failure, without prompts or raw error details."""
+
+    task_id: str
+    task_name: str
+    run_id: str
+    scheduled_at: int
+    finished_at: int | None
+    error_code: str | None
 
 
 class ScheduledTaskStore(ABC):
@@ -55,14 +96,18 @@ class ScheduledTaskStore(ABC):
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         permission_mode: str | None = None,
+        mcp_services: tuple[str, ...] = (),
         max_cost_usd: float | None = None,
         session_mode: str = "new",
         session_id: str | None = None,
+        source_session_id: str | None = None,
         workspace: str | None = None,
+        base_branch: str | None = None,
         host_id: str | None = None,
         project_id: str | None = None,
         execution_target: str = "connected_host",
         state: str = "active",
+        delegation_ref: str | None = None,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -80,11 +125,14 @@ class ScheduledTaskStore(ABC):
         :param reasoning_effort: Optional reasoning-effort hint.
         :param permission_mode: Optional native-harness permission mode
             (Claude Code), e.g. ``"acceptEdits"``.
+        :param mcp_services: MCP service names every fired session starts with.
         :param max_cost_usd: Optional per-firing cost budget in USD.
         :param session_mode: ``"new"`` (default) starts a new session per
             firing; ``"continue"`` sends each firing's prompt into one session.
         :param session_id: The existing session a ``"continue"`` task sends
             its prompt to; ``None`` lets its first firing create one.
+        :param source_session_id: The session each firing's new session starts
+            as a copy of, or ``None`` for runs that start empty.
         :param workspace: Runner start path (source repo / working dir).
         :param host_id: The connected host to pin the run to.
         :param project_id: First-class project each fired session is filed
@@ -94,6 +142,8 @@ class ScheduledTaskStore(ABC):
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
             Defaults to ``"active"``. Persistent dispatch sets ``completed``
             once a schedule has no remaining occurrences.
+        :param delegation_ref: Names the authorization grant a deployment uses to
+            act as the owner when the task fires; never a credential.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ValueError: If ``state`` is not a recognized value.
         """
@@ -118,6 +168,23 @@ class ScheduledTaskStore(ABC):
         :returns: List of :class:`ScheduledTask` instances.
         """
         ...
+
+    def list_inbox_failures(
+        self,
+        *,
+        owner_user_id: str | None,
+        generation: str | None = None,
+        check_generation: bool = False,
+        after: tuple[int, str] | None = None,
+        limit: int = 50,
+    ) -> tuple[builtins.list[AutomationFailure], tuple[int, str] | None]:
+        """Page owned tasks and return their latest failures without a session.
+
+        The cursor advances over examined tasks, including healthy/deleted tasks,
+        so an empty page can still have a continuation. Legacy stores return empty.
+        """
+        del owner_user_id, generation, check_generation, after, limit
+        return [], None
 
     @abstractmethod
     def list_active(self) -> builtins.list[ScheduledTask]:
@@ -155,36 +222,45 @@ class ScheduledTaskStore(ABC):
         model_override: str | None = _UNSET,
         reasoning_effort: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
+        mcp_services: tuple[str, ...] | None = None,
         max_cost_usd: float | None = _UNSET,
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
         workspace: str | None = _UNSET,
+        base_branch: str | None = _UNSET,
         host_id: str | None = _UNSET,
         project_id: str | None = _UNSET,
         execution_target: str | None = None,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        expected_schedule: ScheduledTask | None = None,
     ) -> ScheduledTask | None:
         """
         Update mutable fields of a task.
 
         Most parameters use ``None`` to mean "leave unchanged". For the per-task
         overrides (``model_override``, ``reasoning_effort``,
-        ``permission_mode``), ``host_id``, ``project_id``, ``max_cost_usd``, ``session_id``, and
-        ``last_run_conversation_id``, the sentinel default means "not provided /
-        leave unchanged"; passing ``None`` explicitly sets the column to NULL —
+        ``permission_mode``), ``base_branch``, ``host_id``, ``project_id``, ``max_cost_usd``,
+        ``session_id``, and ``last_run_conversation_id``, the sentinel default means
+        "not provided / leave unchanged"; passing ``None`` explicitly sets the column to NULL —
         so resetting an override to the agent default actually clears it (e.g.
         turning a set ``bypassPermissions`` back off), and clearing a host
         binding or nulling out a deleted last-run conversation.
 
         Passing ``rrule`` updates the recurring trigger; ``None``
-        leaves it unchanged.
+        leaves it unchanged. ``mcp_services`` replaces the task's MCP services
+        (an empty tuple clears them); ``None`` leaves them unchanged.
 
         Passing ``agent_id`` rebinds the task to a different agent, which
         switches the harness its future firings run. The fire path reads
         ``agent_id`` fresh on every firing and each firing owns its own
         conversation, so past runs keep the agent they actually ran.
+
+        ``expected_schedule`` guards the recurrence, session mode, execution
+        target, agent and MCP services read before validation. A mismatch raises
+        a conflict before any changes are saved; callers must reload and
+        revalidate before retrying.
 
         Returns ``None`` if the task does not exist.
 
@@ -217,6 +293,23 @@ class ScheduledTaskStore(ABC):
             that has none: the session cannot move, so every later run routes
             to that host.
         :returns: How the adoption resolved.
+        """
+        ...
+
+    @abstractmethod
+    def release_session(self, scheduled_task_id: str, session_id: str) -> bool:
+        """
+        Forget the session a ``"continue"`` task continues, if it is still *session_id*.
+
+        Used when that session was deleted, so the next firing starts a new one
+        and records it with :meth:`adopt_session`. Does not touch ``updated_at``:
+        this is housekeeping, and a firing compares that field with its own read
+        of the task before it records the session it created.
+
+        :param scheduled_task_id: Opaque task identifier.
+        :param session_id: The session the caller found missing.
+        :returns: ``True`` if the task held *session_id* and no longer does;
+            ``False`` if the task is gone or already holds another session.
         """
         ...
 
@@ -339,6 +432,22 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def has_active_run(self, scheduled_task_id: str, conversation_id: str) -> bool:
+        """
+        Whether the task has a ``starting`` or ``running`` run in a conversation.
+
+        A claimed run records its session while still ``starting``, before the
+        prompt is sent, so this also covers a run whose turn has just begun.
+        Workspace-scoped like :meth:`get_running_run_by_conversation`, and backed
+        by the same ``ix_scheduled_task_runs_conversation_status`` index.
+
+        :param scheduled_task_id: The task whose run to look for.
+        :param conversation_id: The conversation the run fired, e.g. ``"conv_1"``.
+        :returns: ``True`` if such a run exists.
+        """
+        ...
+
+    @abstractmethod
     def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
         """
         Return the ``running`` run for a conversation, or ``None``.
@@ -360,6 +469,22 @@ class ScheduledTaskStore(ABC):
         :returns: The matching ``running`` :class:`ScheduledTaskRun`, or
             ``None`` if the conversation has no run, or its run is already
             terminal.
+        """
+        ...
+
+    @abstractmethod
+    def has_starting_run_for_conversation(self, conversation_id: str) -> bool:
+        """
+        Whether a run that recorded this conversation is still ``starting``.
+
+        A run keeps that status until it settles its launch, including the
+        teardown of a sandbox that never registered, so a fire on any replica
+        can tell the session's launch is still owned. Workspace-scoped like
+        every other store read; backed by
+        ``ix_scheduled_task_runs_conversation_status``.
+
+        :param conversation_id: The session to look up.
+        :returns: ``True`` if any ``starting`` run records the session.
         """
         ...
 

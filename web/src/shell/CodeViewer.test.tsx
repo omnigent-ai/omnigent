@@ -2,16 +2,32 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import type * as fileContentModule from "@/hooks/useFileContent";
+import type * as rehypeSlugModule from "rehype-slug";
 import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
+import { BRIDGE_MSG } from "./htmlCommentBridge";
+import { connectHtmlPreviewBridge, requestedScrollRestore } from "@/test/htmlPreviewBridge";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+const slugRuns = vi.hoisted(() => ({ count: 0 }));
+vi.mock("rehype-slug", async (importOriginal) => {
+  const actual = await importOriginal<typeof rehypeSlugModule>();
+  return {
+    default: (...args: Parameters<typeof actual.default>) => {
+      const transform = actual.default(...args);
+      return (...transformArgs: Parameters<typeof transform>) => {
+        slugRuns.count += 1;
+        return transform(...transformArgs);
+      };
+    },
+  };
+});
 vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
   ...(await importOriginal<typeof fileContentModule>()),
   useFileContent: vi.fn(() => ({ data: undefined })),
@@ -116,28 +132,35 @@ const MINIMAL_NB = JSON.stringify({
   cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
 });
 
+interface ViewerOptions {
+  conversationId?: string;
+  viewMode?: "editor" | "preview" | "source" | "diff";
+  truncated?: boolean;
+  markdownSourceFallback?: boolean;
+  mediaActive?: boolean;
+  position?: { line: number; endLine?: number };
+  onRequestEditMode?: () => void;
+}
+
 function renderViewer(
   content: string,
   panelOpen = true,
   path = "notes.md",
-  opts: {
-    viewMode?: "editor" | "preview" | "source" | "diff";
-    truncated?: boolean;
-    markdownSourceFallback?: boolean;
-    mediaActive?: boolean;
-    position?: { line: number; endLine?: number };
-    onRequestEditMode?: () => void;
-  } = {},
+  opts: ViewerOptions = {},
 ) {
   // Markdown source view still renders via the Shiki DOM, where the
   // select-all/copy override under test lives. Non-markdown files now render in
   // Monaco, which handles select-all + copy natively, so this suite defaults to
   // a .md path to exercise the remaining Shiki path.
-  return render(
+  return render(viewerElement(content, panelOpen, path, opts));
+}
+
+function viewerElement(content: string, panelOpen: boolean, path: string, opts: ViewerOptions) {
+  return (
     <CodeViewer
       markdownSourceFallback={opts.markdownSourceFallback ?? false}
       position={opts.position}
-      conversationId="conv_1"
+      conversationId={opts.conversationId ?? "conv_1"}
       path={path}
       fileQuery={makeFileQuery(content, opts.truncated)}
       comments={[]}
@@ -150,7 +173,7 @@ function renderViewer(
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
       onRequestEditMode={opts.onRequestEditMode}
-    />,
+    />
   );
 }
 
@@ -832,6 +855,38 @@ describe("CodeViewer HTML preview sandbox", () => {
     // #777: every link opens in a new tab via the injected base tag.
     expect(iframe!.getAttribute("srcdoc")).toContain('<base target="_blank">');
   });
+
+  // Each case starts from its own path: the scroll cache is module-level and outlives a test.
+  it.each([
+    ["another file", "a.html", "b.html", "conv_1"],
+    ["the same path in another conversation", "shared.html", "shared.html", "conv_2"],
+  ])(
+    "opens %s at 100% zoom and without the first preview's scroll offset",
+    async (_, path, nextPath, nextConversationId) => {
+      const html = "<html><head></head><body><p>report</p></body></html>";
+      const opened = (filePath: string, conversationId: string) =>
+        viewerElement(html, true, filePath, { viewMode: "preview", conversationId });
+      const { rerender } = render(opened(path, "conv_1"));
+      expect(requestedScrollRestore()).toBeNull();
+      const { port, send } = await connectHtmlPreviewBridge(
+        screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+      );
+      send({ type: BRIDGE_MSG.scroll, top: 760 });
+      // Port messages arrive in order, so the zoom also shows the offset was handled.
+      send({ type: BRIDGE_MSG.zoom, action: "in" });
+      const zoomBox = () => screen.getByTitle("HTML preview").parentElement as HTMLElement;
+      await waitFor(() => expect(zoomBox().style.transform).toBe("scale(1.1)"));
+
+      // The content stays loaded, as it does for a cached file.
+      rerender(opened(nextPath, nextConversationId));
+      expect(zoomBox().style.transform).toBe("");
+      expect(requestedScrollRestore()).toBeNull();
+      port.close();
+
+      rerender(opened(path, "conv_1"));
+      expect(requestedScrollRestore()).toMatchObject({ top: 760 });
+    },
+  );
 });
 
 describe("CodeViewer rendered previews skip Shiki highlighting", () => {
@@ -1237,17 +1292,52 @@ it.each([true, false])(
 );
 
 describe("large Markdown source fallback", () => {
-  it.each(["editor", "preview", "source"] as const)("uses Monaco in %s mode", async (viewMode) => {
+  const large = "# Large heading\n\n" + "a".repeat(MAX_RICH_MARKDOWN_BYTES + 1);
+
+  it("edits in Monaco from source mode", async () => {
     vi.mocked(highlightCode).mockClear();
-    renderViewer("a".repeat(MAX_RICH_MARKDOWN_BYTES + 1), true, "large.md", {
-      viewMode,
-      markdownSourceFallback: true,
-    });
+    renderViewer(large, true, "large.md", { viewMode: "source", markdownSourceFallback: true });
     expect(await screen.findByTestId("monaco-editor-stub")).toBeVisible();
     expect(screen.getByTestId("monaco-editor-stub")).toHaveAttribute("data-large-markdown", "true");
     expect(highlightCode).not.toHaveBeenCalled();
     expect(screen.queryByText(/too large to load fully/)).not.toBeInTheDocument();
   });
+
+  it("renders the preview, whose edit hint opens source", async () => {
+    vi.mocked(highlightCode).mockClear();
+    const onRequestEditMode = vi.fn();
+    renderViewer(large, true, "large.md", {
+      viewMode: "preview",
+      markdownSourceFallback: true,
+      onRequestEditMode,
+    });
+    expect(await screen.findByRole("heading", { name: "Large heading" })).toBeVisible();
+    expect(screen.queryByTestId("monaco-editor-stub")).not.toBeInTheDocument();
+    expect(highlightCode).not.toHaveBeenCalled();
+    expect(document.querySelector(".markdown-preview")?.className).toContain(
+      "content-visibility:auto",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /switch to edit mode/i }));
+    expect(onRequestEditMode).toHaveBeenCalledOnce();
+  });
+});
+
+it("does not re-parse the Markdown preview when only unrelated props change", async () => {
+  slugRuns.count = 0;
+  const opts = { viewMode: "preview" } as const;
+  const view = render(viewerElement("# Stable", true, "notes.md", opts));
+  expect(await screen.findByRole("heading", { name: "Stable" })).toBeVisible();
+  const parsesAfterMount = slugRuns.count;
+  expect(parsesAfterMount).toBeGreaterThan(0);
+  view.rerender(viewerElement("# Stable", true, "notes.md", { ...opts, mediaActive: false }));
+  view.rerender(viewerElement("# Stable", false, "notes.md", opts));
+  expect(slugRuns.count).toBe(parsesAfterMount);
+  expect(document.querySelector(".markdown-preview")?.className).not.toContain(
+    "content-visibility",
+  );
+  view.rerender(viewerElement("# Changed", true, "notes.md", opts));
+  expect(await screen.findByRole("heading", { name: "Changed" })).toBeVisible();
+  expect(slugRuns.count).toBeGreaterThan(parsesAfterMount);
 });
 
 describe("CodeViewer refresh failures", () => {

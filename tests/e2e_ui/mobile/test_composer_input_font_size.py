@@ -32,6 +32,7 @@ def _metrics(element: Locator) -> dict[str, Any]:
             contentY: bounds.top + element.clientTop + px('paddingTop'),
             contentWidth: element.clientWidth - px('paddingLeft') - px('paddingRight'),
             contentHeight: element.scrollHeight - px('paddingTop') - px('paddingBottom'),
+            visibleHeight: element.clientHeight - px('paddingTop') - px('paddingBottom'),
             scrollHeight: element.scrollHeight, clientHeight: element.clientHeight,
             horizontalOverflow: element.scrollWidth - element.clientWidth,
         };
@@ -107,10 +108,16 @@ def test_composer_input_font_setting_and_alignment(
     page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
     page.goto(f"{base_url}/")
     landing = page.get_by_test_id("new-chat-landing-input")
-    hint = page.get_by_text("Describe a task, or try a skill", exact=True)
+    hint = landing if mobile else page.get_by_text("Describe a task, or try a skill", exact=True)
     expect(hint).to_be_visible(timeout=30_000)
+    if mobile:
+        expect(landing).to_have_attribute("placeholder", "Describe a task...")
     observed = {"landing-hint": _metrics(hint)}
-    skill_metrics = _metrics(page.get_by_test_id("skill-pill-context"))
+    skill_metrics = None if mobile else _metrics(page.get_by_test_id("skill-pill-context"))
+    # Visibility checks can finish before Chromium paints its first captureable frame.
+    page.evaluate(
+        "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+    )
     page.screenshot(path=tmp_path / "landing-placeholder.png", animations="disabled")
     _exercise_input(page, landing, mobile=mobile)
     observed.update(
@@ -135,7 +142,14 @@ def test_composer_input_font_setting_and_alignment(
     expect(main).to_have_attribute("data-slash-command", "true")
     overlay = page.get_by_test_id("composer-highlight-overlay")
     expect(overlay).to_be_visible()
+    # Text typed at the end of a scrolled draft must be painted under the caret.
+    main.press("Control+End")
+    page.keyboard.type(" typed")
+    draft += " typed"
     assert overlay.evaluate("element => element.textContent") == draft
+    textarea_scroll_top = main.evaluate("element => element.scrollTop")
+    assert textarea_scroll_top > 0
+    expect(overlay).to_have_js_property("scrollTop", textarea_scroll_top)
     observed.update({"slash-input": _metrics(main), "slash-overlay": _metrics(overlay)})
     page.screenshot(path=tmp_path / "slash-command-overlay.png", animations="disabled")
 
@@ -162,12 +176,13 @@ def test_composer_input_font_setting_and_alignment(
     expected_size = font_size
     for name, measured in observed.items():
         assert measured["fontSize"] == pytest.approx(expected_size, abs=0.01), (name, measured)
-        assert measured["lineHeight"] == pytest.approx(expected_size * 1.6, abs=0.02), (
+        assert measured["lineHeight"] == pytest.approx(expected_size * 1.8, abs=0.02), (
             name,
             measured,
         )
-    assert quote_metrics["fontSize"] == pytest.approx(expected_size * 0.9, abs=0.01)
-    assert skill_metrics["fontSize"] == pytest.approx(expected_size, abs=0.01)
+    assert quote_metrics["fontSize"] == pytest.approx(expected_size - 1, abs=0.01)
+    if skill_metrics is not None:
+        assert skill_metrics["fontSize"] == pytest.approx(expected_size, abs=0.01)
 
     textarea_metrics, overlay_metrics = observed["slash-input"], observed["slash-overlay"]
     for property_name in (
@@ -182,7 +197,13 @@ def test_composer_input_font_setting_and_alignment(
     for measured in (textarea_metrics, overlay_metrics):
         assert measured["scrollHeight"] > measured["clientHeight"], measured
         assert measured["horizontalOverflow"] <= 1, measured
-    for property_name in ("contentX", "contentY", "contentWidth", "contentHeight"):
+    for property_name in (
+        "contentX",
+        "contentY",
+        "contentWidth",
+        "contentHeight",
+        "visibleHeight",
+    ):
         assert textarea_metrics[property_name] == pytest.approx(
             overlay_metrics[property_name], abs=2
         ), (property_name, textarea_metrics, overlay_metrics)

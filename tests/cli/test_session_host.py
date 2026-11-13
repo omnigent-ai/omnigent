@@ -11,6 +11,54 @@ from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.session_host import get_session_host, route_session_request, set_session_host
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scheme", ["http", "https"])
+async def test_native_clients_keep_attachment_owner_after_prepare(
+    monkeypatch: pytest.MonkeyPatch,
+    scheme: str,
+) -> None:
+    """New HTTP clients and WS reconnects preserve the discovered owner."""
+    from omnigent.cli_auth import open_server_client
+    from omnigent.harnesses.claude_native.main import _websocket_connect
+
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "caller")
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test")
+    mount = f"{scheme}://127.0.0.1/api/2.0/omnigent"
+    set_session_host("attached_native", "owner")
+    headers = {OMNIGENT_SLICE_KEY_HEADER: "caller", "Authorization": "Bearer test"}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        expected = "owner" if "/attached_native/" in request.url.path else "caller"
+        assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == expected
+        assert request.headers["Authorization"] == "Bearer test"
+        return httpx.Response(200, json={})
+
+    def connect(url, **kwargs):
+        assert kwargs["additional_headers"][OMNIGENT_SLICE_KEY_HEADER] == "owner"
+        assert kwargs["additional_headers"]["Authorization"] == "Bearer test"
+
+    monkeypatch.setattr("websockets.connect", connect)
+    try:
+        async with open_server_client(
+            mount,
+            headers=headers,
+            host_id="caller",
+            auth=_DatabricksTokenAuth(server_url=mount, session_id=None),
+            transport=httpx.MockTransport(handle),
+        ) as client:
+            await client.get("/v1/sessions/attached_native/resources")
+            await client.get("/v1/hosts/caller")
+            await client.get("/v1/sessions/unmapped_native/resources")
+        _websocket_connect(
+            mount.replace("http", "ws", 1) + "/v1/sessions/attached_native/resources/t/attach",
+            headers=headers,
+        )
+        assert headers[OMNIGENT_SLICE_KEY_HEADER] == "caller"
+    finally:
+        set_session_host("attached_native", None)
+
+
 def test_set_session_host_clears_on_empty() -> None:
     """A ``None``/empty host clears any stale mapping."""
     set_session_host("conv_1", "host_abc")
@@ -35,7 +83,7 @@ def test_auth_keys_by_session_host_on_workspace_mount() -> None:
 
     The client is built for one session; it names the session (not a parsed
     URL), and the auth resolves the host from the session→host map. On the
-    workspace mount the routing header rides; an unmapped session sends none.
+    workspace mount the routing header rides; other requests carry the machine's key.
     """
     mount = "https://acme.databricks.com/api/2.0/omnigent"
     set_session_host("conv_1", "host_abc")
@@ -44,15 +92,13 @@ def test_auth_keys_by_session_host_on_workspace_mount() -> None:
     assert _slice_key(keyed, f"{mount}/v1/sessions/conv_1/events") == "host_abc"
     assert _slice_key(keyed, f"{mount}/v1/sessions/conv_1/stream") == "host_abc"
     for route in ("agents", "hosts", "runners", "sessions", "sessions-other", "me"):
-        assert _slice_key(keyed, f"{mount}/v1/{route}") is None
+        assert _slice_key(keyed, f"{mount}/v1/{route}") == "client_key"
 
-    # Unmapped session → no key (workspace fallback).
     unmapped = _DatabricksTokenAuth(server_url=mount, session_id="conv_unknown")
-    assert _slice_key(unmapped, f"{mount}/v1/sessions/conv_unknown/events") is None
+    assert _slice_key(unmapped, f"{mount}/v1/sessions/conv_unknown/events") == "client_key"
 
-    # Hostless (local / no session) client → no key.
     hostless = _DatabricksTokenAuth(server_url=mount, session_id=None)
-    assert _slice_key(hostless, f"{mount}/v1/sessions/conv_1/events") is None
+    assert _slice_key(hostless, f"{mount}/v1/sessions/conv_1/events") == "client_key"
 
 
 def test_auth_no_key_off_workspace() -> None:
@@ -99,6 +145,67 @@ async def test_request_routing_follows_the_target_session(
                 assert await client.sessions.list_launch_hosts() == []
                 assert await client.sessions.resolve_online_runner() is None
                 assert OMNIGENT_SLICE_KEY_HEADER not in client._http.headers
+
+
+@pytest.mark.asyncio
+async def test_wrong_replica_miss_is_resent_unkeyed_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A keyed miss re-sends once without a key, reaching hosts that connected unkeyed."""
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    mount = "https://workspace.example.com/api/2.0/omnigent"
+    auth = _DatabricksTokenAuth(server_url=mount, session_id="conv_unknown")
+    keys: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        keys.append(request.headers.get(OMNIGENT_SLICE_KEY_HEADER))
+        if len(keys) == 1:
+            return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
+        return httpx.Response(
+            200, json={"id": "conv_unknown", "agent_id": "ag", "status": "idle", "created_at": 0}
+        )
+
+    async with OmnigentClient(mount, auth=auth, request_hooks=[route_session_request]) as client:
+        async with httpx.MockTransport(handler) as transport:
+            with monkeypatch.context() as patcher:
+                patcher.setattr(client._http, "_transport", transport)
+                assert (await client.sessions.get("conv_unknown")).id == "conv_unknown"
+
+    assert keys == ["client_key", None]
+
+
+_WRONG_REPLICA = {"error": {"code": "wrong_replica"}}
+
+
+@pytest.mark.parametrize(
+    ("replies", "expected_keys", "status"),
+    [
+        ([_WRONG_REPLICA, None], ["client_key", None], 200),
+        ([{"error": {"code": "invalid_argument"}}], ["client_key"], 400),
+        ([_WRONG_REPLICA, _WRONG_REPLICA, None], ["client_key", None], 400),
+    ],
+    ids=["recovers", "other-400", "single-replay"],
+)
+def test_sync_client_resends_only_a_wrong_replica_miss_once(
+    monkeypatch: pytest.MonkeyPatch,
+    replies: list[dict[str, object] | None],
+    expected_keys: list[str | None],
+    status: int,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: None)
+    mount = "https://workspace.example.com/api/2.0/omnigent"
+    keys: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        keys.append(request.headers.get(OMNIGENT_SLICE_KEY_HEADER))
+        reply = replies[len(keys) - 1]
+        return httpx.Response(200, json={}) if reply is None else httpx.Response(400, json=reply)
+
+    auth = _DatabricksTokenAuth(server_url=mount, session_id="conv_unknown")
+    with httpx.Client(auth=auth, transport=httpx.MockTransport(handler)) as client:
+        assert client.get(f"{mount}/v1/sessions/conv_unknown").status_code == status
+
+    assert keys == expected_keys
 
 
 @pytest.mark.asyncio

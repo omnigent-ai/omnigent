@@ -1,6 +1,7 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CircleAlertIcon,
+  CircleXIcon,
   CommandIcon,
   LoaderCircleIcon,
   PlugIcon,
@@ -10,6 +11,9 @@ import {
 import type { SkillsStatus } from "@/lib/types";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { MobileMenuGlassSurface } from "./MobileMenuGlassSurface";
 
 /**
  * Built-in slash commands the web UI recognises directly. Each entry
@@ -25,10 +29,12 @@ import { cn } from "@/lib/utils";
 export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/compact": "Compact conversation context to free up space",
   "/clear": "Clear the context and continue in a new chat on the same machine",
+  "/rewind": "Rewind the conversation to an earlier prompt and edit it",
   "/context": "Show context window usage for this session",
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name>",
   "/mcp": "Show MCP servers enabled for this session",
+  "/permissions": "Change the approval mode for this session",
   "/new": "Start a blank session in the same project",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
   "/side":
@@ -37,6 +43,7 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
 };
 
 const DEFAULT_BUILTIN_NAMES = new Set(Object.keys(BUILTIN_SLASH_COMMANDS));
+const NO_SKILLS_WARNINGS: readonly string[] = [];
 // First token must read as a command name (`/cross-review`,
 // `/dev-productivity:simplify`) — letters/digits then word chars, `:`, `-`.
 // The leading `/` is the only slash allowed IN THE NAME, so file paths like
@@ -156,13 +163,29 @@ export function rankedSlashCommandNames(
 /** Registry connection state for a `/mcp` row; host and custom rows have none. */
 export type McpServerConnection = "connected" | "sign-in-required" | "unavailable";
 
+/** The connection a session's running harness holds for a `/mcp` row. */
+export interface McpLiveConnection {
+  /**
+   * `connected`, `failed`, `needs-auth`, `pending`, `disabled`, or `not-loaded` when the
+   * harness's answer omits the server; others show as-is.
+   */
+  status: string;
+  error?: string | null;
+}
+
 /** One row of the `/mcp` inventory. */
 export interface McpServerRow {
+  /** Unique among the rows when two share a name; defaults to `name`. */
+  key?: string;
   name: string;
   description?: string | null;
   connection?: McpServerConnection;
   /** How a `sign-in-required` row signs in; absent rows offer no action. */
   signIn?: McpSignIn;
+  /** What the session's harness reports right now; absent when it reports nothing. */
+  live?: McpLiveConnection;
+  /** The harness's name for this server, for Reconnect; set only with a reported `live`. */
+  liveName?: string;
 }
 
 /**
@@ -184,6 +207,30 @@ const MCP_CONNECTION_LABEL: Record<McpServerConnection, string> = {
   unavailable: "Not available to your account",
 };
 
+// Maps, because a harness status such as `constructor` must not match an object key.
+const MCP_LIVE_LABEL = new Map<string, string>([
+  ["connected", "Connected"],
+  ["failed", "Failed"],
+  ["needs-auth", "Needs sign-in"],
+  ["pending", "Connecting…"],
+  ["disabled", "Disabled"],
+  // The harness answered without this server: it is not loaded in the session.
+  ["not-loaded", "Not loaded"],
+]);
+
+const MCP_LIVE_TONE = new Map<string, string>([
+  ["failed", "text-destructive"],
+  ["needs-auth", "text-amber-600 dark:text-amber-500"],
+]);
+
+/** Live states a Reconnect can change, as in Claude Code's own `/mcp`. */
+const MCP_RECONNECTABLE = new Set(["failed", "needs-auth"]);
+
+function mcpLiveLabel(live: McpLiveConnection): string {
+  const label = MCP_LIVE_LABEL.get(live.status) ?? live.status;
+  return live.status === "failed" && live.error ? `${label}: ${live.error}` : label;
+}
+
 interface SlashCommandMenuProps {
   /** The text typed after the leading ``/``, used to filter suggestions. */
   query: string;
@@ -204,6 +251,8 @@ interface SlashCommandMenuProps {
   labels?: Readonly<Record<string, string>>;
   /** Absent for menus without asynchronous skill discovery. */
   skillsStatus?: SkillsStatus | null;
+  /** Sources discovery could not read, shown with the catalog they leave incomplete. */
+  skillsWarnings?: readonly string[];
   /** Context-specific guidance when discovery cannot run yet. */
   skillsUnavailableMessage?: string;
   onRetrySkills?: () => void;
@@ -218,10 +267,31 @@ interface SlashCommandMenuProps {
   /** Row whose sign-in popup is open, if any. */
   mcpAuthorizingName?: string | null;
   mcpSignInError?: McpSignInError | null;
+  /** Reconnect a failed or needs-sign-in row in the session's harness, by its `liveName`. */
+  onMcpReconnect?: (liveName: string) => void;
+  /** `liveName` of the row reconnecting now, if any. */
+  mcpReconnectingName?: string | null;
+  /** A reconnect that failed, keyed by `liveName`. */
+  mcpReconnectError?: McpSignInError | null;
 }
 
-function McpConnectionIcon({ connection }: { connection?: McpServerConnection }) {
-  if (connection === "sign-in-required")
+function McpConnectionIcon({
+  connection,
+  live,
+}: {
+  connection?: McpServerConnection;
+  live?: McpLiveConnection;
+}) {
+  if (live?.status === "failed")
+    return <CircleXIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-destructive" />;
+  if (live?.status === "pending")
+    return (
+      <LoaderCircleIcon
+        aria-hidden="true"
+        className="mt-0.5 size-3.5 shrink-0 animate-spin text-muted-foreground"
+      />
+    );
+  if (live?.status === "needs-auth" || connection === "sign-in-required")
     return (
       <TriangleAlertIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
     );
@@ -232,14 +302,43 @@ function McpConnectionIcon({ connection }: { connection?: McpServerConnection })
         className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
       />
     );
+  const connected = live ? live.status === "connected" : connection === "connected";
   return (
     <PlugIcon
       aria-hidden="true"
       className={cn(
         "mt-0.5 size-3.5 shrink-0",
-        connection === "connected" ? "text-emerald-500" : "text-muted-foreground",
+        connected ? "text-emerald-500" : "text-muted-foreground",
       )}
     />
+  );
+}
+
+function McpReconnectAction({
+  server,
+  reconnecting,
+  disabled,
+  onReconnect,
+}: {
+  server: McpServerRow;
+  reconnecting: boolean;
+  /** Any row is reconnecting: the harness handles one control request at a time. */
+  disabled: boolean;
+  onReconnect: (liveName: string) => void;
+}) {
+  const liveName = server.liveName;
+  if (liveName === undefined) return null;
+  return (
+    <button
+      type="button"
+      data-testid={`mcp-reconnect-${server.name}`}
+      disabled={disabled}
+      className="flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-0.5 text-xs text-foreground hover:bg-muted disabled:opacity-60 dark:hover:bg-muted/50"
+      onClick={() => onReconnect(liveName)}
+    >
+      {reconnecting && <LoaderCircleIcon aria-hidden="true" className="size-3 animate-spin" />}
+      {reconnecting ? "Reconnecting…" : "Reconnect"}
+    </button>
   );
 }
 
@@ -301,6 +400,9 @@ interface McpServerRowsProps {
   onSignIn?: (name: string) => void;
   authorizingName?: string | null;
   signInError?: McpSignInError | null;
+  onReconnect?: (liveName: string) => void;
+  reconnectingName?: string | null;
+  reconnectError?: McpSignInError | null;
 }
 
 function McpServerRows({
@@ -309,8 +411,17 @@ function McpServerRows({
   onSignIn,
   authorizingName,
   signInError,
+  onReconnect,
+  reconnectingName,
+  reconnectError,
 }: McpServerRowsProps) {
-  if (!servers?.length && !status) {
+  // With live status unavailable no row carries the harness's name, so the
+  // refusal shows for the panel rather than being lost.
+  const unmatchedReconnectError =
+    reconnectError && !servers?.some((server) => server.liveName === reconnectError.name)
+      ? reconnectError
+      : null;
+  if (!servers?.length && !status && !unmatchedReconnectError) {
     return (
       <div role="status" className="px-2 py-2 text-ui text-muted-foreground">
         No MCP servers enabled for this session.
@@ -321,14 +432,21 @@ function McpServerRows({
     <>
       {servers?.map((server) => {
         const needsSignIn = server.connection === "sign-in-required";
+        const live = server.live;
+        const liveTrouble = live !== undefined && MCP_RECONNECTABLE.has(live.status);
+        const rowReconnectError =
+          // Once the row recovers, an old failure no longer describes it.
+          liveTrouble && reconnectError && reconnectError.name === server.liveName
+            ? reconnectError
+            : null;
         return (
           <div
-            key={server.name}
+            key={server.key ?? server.name}
             data-testid={`mcp-server-row-${server.name}`}
             className="rounded-md px-2 py-1.5"
           >
             <div className="flex items-start gap-2">
-              <McpConnectionIcon connection={server.connection} />
+              <McpConnectionIcon connection={server.connection} live={live} />
               <div className="min-w-0 flex-1">
                 <div className="text-ui text-foreground">{server.name}</div>
                 {server.description && (
@@ -343,7 +461,19 @@ function McpServerRows({
                       needsSignIn ? "text-amber-600 dark:text-amber-500" : "text-muted-foreground",
                     )}
                   >
+                    {live ? "Account: " : ""}
                     {MCP_CONNECTION_LABEL[server.connection]}
+                  </div>
+                )}
+                {live && (
+                  <div
+                    data-testid={`mcp-live-status-${server.name}`}
+                    className={cn(
+                      "break-words text-xs leading-4",
+                      MCP_LIVE_TONE.get(live.status) ?? "text-muted-foreground",
+                    )}
+                  >
+                    In this session: {mcpLiveLabel(live)}
                   </div>
                 )}
               </div>
@@ -355,15 +485,38 @@ function McpServerRows({
                   onSignIn={onSignIn}
                 />
               )}
+              {/* Signing in comes first; the row offers Reconnect once the account is connected. */}
+              {liveTrouble && !needsSignIn && onReconnect && (
+                <McpReconnectAction
+                  server={server}
+                  reconnecting={Boolean(reconnectingName) && reconnectingName === server.liveName}
+                  disabled={Boolean(reconnectingName)}
+                  onReconnect={onReconnect}
+                />
+              )}
             </div>
             {signInError?.name === server.name && (
               <div role="alert" className="mt-1 pl-5 text-xs leading-4 text-destructive">
                 {signInError.message}
               </div>
             )}
+            {rowReconnectError && (
+              <div role="alert" className="mt-1 pl-5 text-xs leading-4 text-destructive">
+                Reconnect failed: {rowReconnectError.message}
+              </div>
+            )}
           </div>
         );
       })}
+      {unmatchedReconnectError && (
+        <div
+          role="alert"
+          data-testid="mcp-reconnect-error"
+          className="break-words px-2 py-1 text-xs leading-4 text-destructive"
+        >
+          Reconnecting {unmatchedReconnectError.name} failed: {unmatchedReconnectError.message}
+        </div>
+      )}
       {status && (
         <div role="status" className="px-2 py-2 text-ui text-muted-foreground">
           {status}
@@ -381,8 +534,9 @@ function McpServerMenu({
     <div
       data-testid="mcp-server-menu"
       onMouseDown={(event) => event.preventDefault()}
-      className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+      className="menu-surface mobile-menu-glass absolute bottom-full left-0 z-30 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
     >
+      <MobileMenuGlassSurface />
       <div className="px-2 py-1">
         <div className="font-medium text-ui text-foreground">MCP servers</div>
         <div className="text-xs leading-4 text-muted-foreground">Enabled for this session</div>
@@ -404,59 +558,170 @@ function McpServerMenu({
 interface MenuRow {
   /** Slash-prefixed command name, e.g. ``"/review-pr"``. */
   name: string;
-  /** One-line description shown in the detail card when active. */
+  /** One-line description shown beside the name; a cut-off one also opens in a tooltip. */
   description: string;
   /** Index into the flat ``matches`` list — the caller's keyboard index. */
   flatIndex: number;
   isBuiltin: boolean;
 }
 
+function RetrySkillsButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      className="underline hover:text-foreground"
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={onClick}
+    >
+      Retry
+    </button>
+  );
+}
+
+/** How long the pointer or keyboard highlight rests on a cut-off row before its tooltip opens. */
+const DESCRIPTION_TOOLTIP_DELAY_MS = 400;
+
+function isCutOff(element: HTMLElement | null): boolean {
+  return element !== null && element.scrollWidth > element.clientWidth;
+}
+
 /** A row inside a section list ("Commands" or "Skills"). */
 function MenuRowButton({
   row,
   active,
+  activeIndex,
+  tooltipOpen,
+  onTooltipOpenChange,
   onSelect,
 }: {
   /** The row to render. */
   row: MenuRow;
   /** Whether this row is the keyboard-highlighted one. */
   active: boolean;
+  /** The menu's highlighted index; moving it closes this row's tooltip. */
+  activeIndex: number;
+  /** Whether this row's description tooltip is the menu's open one. */
+  tooltipOpen: boolean;
+  /** Opens or closes this row's tooltip, called with the row's name. */
+  onTooltipOpenChange: (name: string, open: boolean) => void;
   /** Selection callback, called with the slash-prefixed name. */
   onSelect: (cmd: string) => void;
 }) {
-  const isBuiltin = row.isBuiltin;
+  const { name, isBuiltin } = row;
+  const descriptionRef = useRef<HTMLSpanElement>(null);
+  const hoverTimerRef = useRef<number | undefined>(undefined);
+  const coarsePointer = useIsCoarsePointer();
+  // A highlight resting on a cut-off row opens its tooltip, except on touch screens where most
+  // rows are cut off; a highlight move or new description closes it and drops a pending hover.
+  useEffect(() => {
+    const timer =
+      active && !coarsePointer
+        ? window.setTimeout(
+            () => onTooltipOpenChange(name, isCutOff(descriptionRef.current)),
+            DESCRIPTION_TOOLTIP_DELAY_MS,
+          )
+        : undefined;
+    return () => {
+      window.clearTimeout(timer);
+      window.clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = undefined;
+      onTooltipOpenChange(name, false);
+    };
+  }, [active, activeIndex, coarsePointer, name, onTooltipOpenChange, row.description]);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  // The composer keeps focus, so PageUp/PageDown page through a description taller than the cap.
+  useEffect(() => {
+    if (!tooltipOpen) return;
+    function pageDescription(event: KeyboardEvent) {
+      const tooltip = tooltipRef.current;
+      const direction = event.key === "PageDown" ? 1 : event.key === "PageUp" ? -1 : 0;
+      if (!tooltip || direction === 0 || event.defaultPrevented) return;
+      if (event.shiftKey || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (tooltip.scrollHeight <= tooltip.clientHeight) return;
+      event.preventDefault();
+      // Stepping two lines short of the box keeps the line cut at its edge in view.
+      const lineHeight = parseFloat(getComputedStyle(tooltip).lineHeight);
+      tooltip.scrollBy({ top: direction * (tooltip.clientHeight - 2 * lineHeight) });
+    }
+    document.addEventListener("keydown", pageDescription);
+    return () => document.removeEventListener("keydown", pageDescription);
+  }, [tooltipOpen]);
   // Wand in pink for skills (per design feedback — distinct from the
   // info-blue slash-command tint, and from plain Sparkles which marks
   // thinking/reasoning blocks), the ⌘ glyph in slate for built-ins.
   const Icon = isBuiltin ? CommandIcon : WandSparklesIcon;
   return (
-    <button
-      type="button"
-      data-testid={`slash-menu-item-${row.name.slice(1)}`}
-      data-active={active ? "true" : undefined}
-      className={cn(
-        "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-ui text-foreground hover:bg-muted dark:hover:bg-muted/50",
-        active && "bg-muted dark:bg-muted/50",
-      )}
-      // preventDefault keeps the textarea focused while the user clicks.
-      onMouseDown={(e) => e.preventDefault()}
-      onClick={() => onSelect(row.name)}
+    <Tooltip
+      open={tooltipOpen}
+      onOpenChange={(open) => onTooltipOpenChange(name, open && isCutOff(descriptionRef.current))}
     >
-      <span className="flex size-4 shrink-0 items-center justify-center">
-        <Icon
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          data-testid={`slash-menu-item-${row.name.slice(1)}`}
+          data-active={active ? "true" : undefined}
           className={cn(
-            "size-3.5",
-            isBuiltin ? "text-slate-500 dark:text-slate-400" : "text-pink-500 dark:text-pink-400",
+            "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-ui text-foreground hover:bg-muted dark:hover:bg-muted/50",
+            active && "bg-muted dark:bg-muted/50",
           )}
-        />
-      </span>
-      <span className="shrink-0">{row.name}</span>
-      {/* Description inline (matching the "+" tray), so the menu is
-          self-describing without a separate detail card. */}
+          // The menu times hovers itself, since a highlight move can't cancel Radix's timer.
+          onPointerMove={(e) => {
+            e.preventDefault();
+            if (e.pointerType === "touch" || tooltipOpen || hoverTimerRef.current !== undefined) {
+              return;
+            }
+            hoverTimerRef.current = window.setTimeout(() => {
+              hoverTimerRef.current = undefined;
+              if (isCutOff(descriptionRef.current)) onTooltipOpenChange(name, true);
+            }, DESCRIPTION_TOOLTIP_DELAY_MS);
+          }}
+          onPointerLeave={() => {
+            window.clearTimeout(hoverTimerRef.current);
+            hoverTimerRef.current = undefined;
+          }}
+          // preventDefault keeps the textarea focused while the user clicks.
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => onSelect(row.name)}
+        >
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <Icon
+              className={cn(
+                "size-3.5",
+                isBuiltin
+                  ? "text-slate-500 dark:text-slate-400"
+                  : "text-pink-500 dark:text-pink-400",
+              )}
+            />
+          </span>
+          <span className="shrink-0">{row.name}</span>
+          {/* Description inline (matching the "+" tray), so the menu is
+              self-describing without a separate detail card. */}
+          {row.description && (
+            <span
+              ref={descriptionRef}
+              data-testid={`slash-menu-description-${row.name.slice(1)}`}
+              className="truncate text-xs leading-4 text-muted-foreground"
+            >
+              {row.description}
+            </span>
+          )}
+        </button>
+      </TooltipTrigger>
       {row.description && (
-        <span className="truncate text-xs leading-4 text-muted-foreground">{row.description}</span>
+        <TooltipContent
+          ref={tooltipRef}
+          side="top"
+          align="end"
+          data-testid={`slash-menu-tooltip-${row.name.slice(1)}`}
+          // Top-aligned so a description taller than the cap scrolls from its first line.
+          className="max-h-64 max-w-[min(28rem,calc(100vw-2rem))] items-start overflow-y-auto break-words text-xs leading-4"
+          // Pressing inside the tooltip keeps the textarea focused, so the menu stays open.
+          onMouseDown={(e) => e.preventDefault()}
+        >
+          {row.description}
+        </TooltipContent>
       )}
-    </button>
+    </Tooltip>
   );
 }
 
@@ -464,9 +729,9 @@ function MenuRowButton({
  * Floating suggestions menu rendered above the composer when the user
  * starts a slash command, shared by the in-session composer (ChatPage)
  * and the new-chat landing composer (NewChatDialog). Cursor-style
- * layout: a narrow panel with "Commands" / "Skills" section headers and
- * icon + name rows, plus a detail card beside the panel showing the
- * highlighted entry's full description (hidden on small screens).
+ * layout: a panel with "Commands" / "Skills" section headers and icon +
+ * name + one-line description rows. Resting the pointer or keyboard
+ * highlight on a cut-off row shows its full description in a tooltip.
  * Only commands whose name (sans ``/``) contains the current query as a
  * case-insensitive substring are shown.
  * Positioned via ``absolute bottom-full`` relative to the rounded
@@ -480,6 +745,7 @@ export function SlashCommandMenu({
   builtinNames = DEFAULT_BUILTIN_NAMES,
   labels,
   skillsStatus,
+  skillsWarnings = NO_SKILLS_WARNINGS,
   skillsUnavailableMessage = "Skills unavailable while disconnected.",
   onRetrySkills,
   showMcpServers = false,
@@ -489,9 +755,17 @@ export function SlashCommandMenu({
   onMcpSignIn,
   mcpAuthorizingName,
   mcpSignInError,
+  onMcpReconnect,
+  mcpReconnectingName,
+  mcpReconnectError,
 }: SlashCommandMenuProps) {
   const matchedNames = rankedSlashCommandNames(commands, query, builtinNames, labels);
   const listRef = useRef<HTMLDivElement>(null);
+  // One description tooltip at a time, so a hover never leaves one beside the highlighted row's.
+  const [tooltipRow, setTooltipRow] = useState<string | null>(null);
+  const setRowTooltipOpen = useCallback((name: string, open: boolean) => {
+    setTooltipRow((current) => (open ? name : current === name ? null : current));
+  }, []);
   // Keep the keyboard-highlighted row visible as the user arrows past the
   // visible window of this capped-height, scrollable list. Without this the
   // selection silently moves off-screen. Mirrors the WorkspacePathField
@@ -509,6 +783,9 @@ export function SlashCommandMenu({
         onSignIn={onMcpSignIn}
         authorizingName={mcpAuthorizingName}
         signInError={mcpSignInError}
+        onReconnect={onMcpReconnect}
+        reconnectingName={mcpReconnectingName}
+        reconnectError={mcpReconnectError}
       />
     );
   if (matchedNames.length === 0 && skillsStatus == null) return null;
@@ -534,64 +811,76 @@ export function SlashCommandMenu({
   // with section headers and icon + name + inline description rows. No separate
   // detail card — each row is self-describing.
   return (
-    <div
-      data-testid="slash-command-menu"
-      className="menu-surface absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
-    >
-      <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
-        {builtinRows.length > 0 && sectionHeader("Commands")}
-        {builtinRows.map((row) => (
-          <MenuRowButton
-            key={row.name}
-            row={row}
-            active={row.flatIndex === activeIndex}
-            onSelect={onSelect}
-          />
-        ))}
-        {(skillRows.length > 0 || skillsStatus != null) && sectionHeader("Skills")}
-        {skillsStatus === "loading" && (
-          <div
-            role="status"
-            className="flex items-center gap-2 px-1.5 py-1 text-ui text-muted-foreground"
-          >
-            <LoaderCircleIcon aria-hidden="true" className="size-3.5 shrink-0 animate-spin" />
-            Loading skills…
-          </div>
-        )}
-        {skillsStatus === "error" && (
-          <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-            Couldn’t load skills.{" "}
-            {onRetrySkills && (
-              <button
-                type="button"
-                className="underline hover:text-foreground"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={onRetrySkills}
-              >
-                Retry
-              </button>
+    <TooltipProvider>
+      <div
+        data-testid="slash-command-menu"
+        className="menu-surface mobile-menu-glass absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
+      >
+        <MobileMenuGlassSurface />
+        <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
+          {builtinRows.length > 0 && sectionHeader("Commands")}
+          {builtinRows.map((row) => (
+            <MenuRowButton
+              key={row.name}
+              row={row}
+              active={row.flatIndex === activeIndex}
+              activeIndex={activeIndex}
+              tooltipOpen={tooltipRow === row.name}
+              onTooltipOpenChange={setRowTooltipOpen}
+              onSelect={onSelect}
+            />
+          ))}
+          {(skillRows.length > 0 || skillsStatus != null) && sectionHeader("Skills")}
+          {skillsStatus === "loading" && (
+            <div
+              role="status"
+              className="flex items-center gap-2 px-1.5 py-1 text-ui text-muted-foreground"
+            >
+              <LoaderCircleIcon aria-hidden="true" className="size-3.5 shrink-0 animate-spin" />
+              Loading skills…
+            </div>
+          )}
+          {skillsStatus === "error" && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              Couldn’t load skills. {onRetrySkills && <RetrySkillsButton onClick={onRetrySkills} />}
+            </div>
+          )}
+          {skillsStatus === "unavailable" && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              {skillsUnavailableMessage}
+            </div>
+          )}
+          {/* An incomplete catalog explains itself; "No skills available" is only claimed when complete. */}
+          {skillsStatus === "ready" && skillsWarnings.length > 0 && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              {skillsWarnings.map((warning) => (
+                <span key={warning} className="block break-words">
+                  {warning}
+                </span>
+              ))}
+              {onRetrySkills && <RetrySkillsButton onClick={onRetrySkills} />}
+            </div>
+          )}
+          {skillsStatus === "ready" &&
+            skillRows.length === 0 &&
+            (query !== "" || skillsWarnings.length === 0) && (
+              <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+                {query ? "No matching skills" : "No skills available"}
+              </div>
             )}
-          </div>
-        )}
-        {skillsStatus === "unavailable" && (
-          <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-            {skillsUnavailableMessage}
-          </div>
-        )}
-        {skillsStatus === "ready" && skillRows.length === 0 && (
-          <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-            {query ? "No matching skills" : "No skills available"}
-          </div>
-        )}
-        {skillRows.map((row) => (
-          <MenuRowButton
-            key={row.name}
-            row={row}
-            active={row.flatIndex === activeIndex}
-            onSelect={onSelect}
-          />
-        ))}
+          {skillRows.map((row) => (
+            <MenuRowButton
+              key={row.name}
+              row={row}
+              active={row.flatIndex === activeIndex}
+              activeIndex={activeIndex}
+              tooltipOpen={tooltipRow === row.name}
+              onTooltipOpenChange={setRowTooltipOpen}
+              onSelect={onSelect}
+            />
+          ))}
+        </div>
       </div>
-    </div>
+    </TooltipProvider>
   );
 }

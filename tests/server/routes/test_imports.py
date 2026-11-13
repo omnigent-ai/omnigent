@@ -7,6 +7,7 @@ import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -332,13 +333,16 @@ async def test_concurrent_identical_imports_return_one_session(
     assert imported is not None
 
 
+@pytest.mark.parametrize("replacement", ["unbound", "managed", "native", "interrupted"])
 async def test_force_import_replaces_existing_session(
     client: httpx.AsyncClient,
     db_uri: str,
+    replacement: str,
+    monkeypatch,
 ) -> None:
     """A forced retry replaces the transcript while retaining its stable id."""
     _seed_claude_agent(db_uri)
-    payload = {
+    payload: dict[str, Any] = {
         "source": "claude",
         "external_session_id": "claude-force-1",
         "workspace": "/repo/old",
@@ -353,7 +357,45 @@ async def test_force_import_replaces_existing_session(
             }
         ],
     }
+    host_id = "0123456789abcdef0123456789abcdef"
+    hosts = HostStore(db_uri)
+    managed_host = replacement != "unbound"
+    if managed_host:
+        from omnigent.db.utils import now_epoch
+
+        hosts.register_managed_host(
+            host_id=host_id,
+            name="import-sandbox",
+            user_id="local",
+            token="import-token",
+            provider="modal",
+            sandbox_id="import-sandbox",
+            token_expires_at=now_epoch() + 3600,
+        )
+        payload["host_id"] = host_id
     created = await client.post("/v1/imports", json=payload)
+    assert created.status_code == 201, created.text
+    store = SqlAlchemyConversationStore(db_uri)
+    original_id = created.json()["session_id"]
+    native_id = None
+    if replacement == "native":
+        native = store.fork_conversation(original_id, continue_source=True)
+        native_id = native.id
+        store.set_external_session_id(native.id, payload["external_session_id"])
+        await store.delete_conversation(original_id)
+    elif replacement == "interrupted":
+        await store.delete_conversation(original_id, preserve_host_binding=host_id)
+
+    original_delete = SqlAlchemyConversationStore.delete_conversation
+
+    async def observe_replacement(self, session_id, **kwargs):
+        deleted = await original_delete(self, session_id, **kwargs)
+        if kwargs.get("preserve_host_binding") is not None:
+            assert hosts.delete_host(host_id, keep_if_bound=True) is None
+            assert hosts.resolve_launch_token(host_id, "import-token") is not None
+        return deleted
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "delete_conversation", observe_replacement)
     payload["force"] = True
     payload["workspace"] = "/repo/new"
     payload["items"] = [
@@ -372,12 +414,17 @@ async def test_force_import_replaces_existing_session(
     assert created.status_code == 201
     assert replaced.status_code == 201
     assert replaced.json()["session_id"] == created.json()["session_id"]
+    if native_id is not None:
+        assert store.get_conversation(native_id) is None
     conversation = SqlAlchemyConversationStore(db_uri).get_conversation(
         replaced.json()["session_id"]
     )
     assert conversation is not None
     assert conversation.workspace == "/repo/new"
     assert conversation.title == "new prompt"
+    if managed_host:
+        assert conversation.host_id == host_id
+        assert hosts.resolve_launch_token(host_id, "import-token") is not None
     items = await client.get(f"/v1/sessions/{conversation.id}/items")
     assert items.status_code == 200
     assert [item["content"][0]["text"] for item in items.json()["data"]] == ["new prompt"]
@@ -870,12 +917,14 @@ async def test_local_import_stream_reports_failure_reasons(
     """Failed sessions surface a per-session reason, not just a count.
 
     Covers both failure origins: a session the server can't normalize (malformed
-    frame) and one the host couldn't read (reported on the done frame). Each gets
-    a ``failed`` line, the tally counts them, and ``done.failures`` lists reasons.
+    frame, or more items than the import cap) and one the host couldn't read
+    (reported on the done frame). Each gets a ``failed`` line, the tally counts
+    them, and ``done.failures`` lists reasons.
     """
     from omnigent.server.routes import imports as imports_module
 
     _seed_claude_agent(db_uri)
+    monkeypatch.setattr(imports_module, "MAX_IMPORT_ITEMS", 1)
 
     async def _fake_stream(**kwargs: object):
         stats = kwargs.get("stats")
@@ -899,6 +948,19 @@ async def test_local_import_stream_reports_failure_reasons(
             "items": "not-a-list",
             "title": None,
             "source": "claude",
+        }
+        # Over the item cap, as a Codex thread with no compaction to trim to arrives.
+        message = {
+            "type": "message",
+            "response_id": "codex:1",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        }
+        yield {
+            "external_session_id": "too-big-1",
+            "workspace": None,
+            "items": [message, message],
+            "title": "Too big",
+            "source": "codex",
         }
         # A session the host enumerated but couldn't read (no frame, only a
         # reason on the terminal done frame).
@@ -952,12 +1014,13 @@ async def test_local_import_stream_reports_failure_reasons(
     # The host-read failure keeps its source-session identity through the wire.
     assert {(f["external_session_id"], f["source"]) for f in failed} == {
         ("bad-1", "claude"),
+        ("too-big-1", "codex"),
         ("unreadable-1", "codex"),
     }
     done = events[-1]
     assert done["event"] == "done"
-    assert (done["imported"], done["failed"]) == (1, 2)
-    assert len(done["failures"]) == 2
+    assert (done["imported"], done["failed"]) == (1, 3)
+    assert len(done["failures"]) == 3
 
 
 async def test_local_import_id_collision_counts_as_already_imported(
@@ -1195,3 +1258,208 @@ async def test_import_local_offline_host_is_conflict(db_uri: str) -> None:
         )
     assert res.status_code == 409
     assert res.json()["error"]["code"] == ErrorCode.CONFLICT
+
+
+async def test_local_import_archives_sessions_the_harness_had_archived(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host session flagged ``archived`` lands archived; one without the flag stays active."""
+    from fastapi import FastAPI
+
+    from omnigent.server.routes import imports as imports_module
+    from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY
+
+    _seed_claude_agent(db_uri)
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+
+    def _session(external_session_id: str, title: str, **extra: object) -> dict[str, object]:
+        return {
+            "external_session_id": external_session_id,
+            "workspace": "/repo/on/host",
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "claude:turn-1",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "inspect TODO.md"}],
+                    },
+                }
+            ],
+            "title": title,
+            "source": "claude",
+            **extra,
+        }
+
+    async def _fake_stream(**_kwargs: object):
+        yield _session("claude-archived", "Archived thread", archived=True)
+        yield _session("claude-active", "Active thread")
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    host_registry = SimpleNamespace(get=lambda host_id: host_conn)
+    host_store = SimpleNamespace(get_host=lambda host_id: SimpleNamespace(user_id=None))
+
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            conversation_store,
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=host_registry,  # type: ignore[arg-type]
+            host_store=host_store,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(
+            "/v1/imports/local",
+            json={
+                "host_id": "host_0123456789abcdef0123456789abcdef",
+                "source": "claude",
+                "limit": 5,
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["imported"] == 2
+    by_title = {ref["title"]: ref["session_id"] for ref in body["sessions"]}
+
+    archived = conversation_store.get_conversation(by_title["Archived thread"])
+    assert archived is not None
+    assert archived.archived is True
+    assert ARCHIVED_AT_LABEL_KEY in archived.labels
+
+    active = conversation_store.get_conversation(by_title["Active thread"])
+    assert active is not None
+    assert active.archived is False
+    assert ARCHIVED_AT_LABEL_KEY not in active.labels
+
+
+@pytest.mark.parametrize("force", [False, True], ids=["first-import", "force-replace"])
+async def test_import_session_archives_when_requested(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    force: bool,
+) -> None:
+    """The CLI's ``archived`` flag files the imported session under Archived sessions.
+
+    A forced re-import of an active copy replaces it with an archived one; a re-import
+    without ``force`` is refused and leaves the archived copy as it is.
+    """
+    _seed_claude_agent(db_uri)
+    payload: dict[str, object] = {
+        "source": "claude",
+        "external_session_id": "claude-archived-1",
+        "items": [
+            {
+                "type": "message",
+                "response_id": "claude:turn-1",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "inspect TODO.md"}],
+                },
+            }
+        ],
+    }
+    if force:
+        active = await client.post("/v1/imports", json=payload)
+        assert active.status_code == 201
+
+    created = await client.post("/v1/imports", json={**payload, "archived": True, "force": force})
+
+    assert created.status_code == 201
+    if force:
+        assert created.json()["session_id"] == active.json()["session_id"]
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(
+        created.json()["session_id"]
+    )
+    assert conversation is not None
+    assert conversation.archived is True
+    again = await client.post("/v1/imports", json={**payload, "archived": False})
+    assert again.status_code == 409
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(conversation.id)
+    assert conversation is not None
+    assert conversation.archived is True
+
+
+@pytest.mark.parametrize(
+    "before",
+    [["turn"], [], ["turn", "compaction"], ["compaction"]],
+    ids=["after-a-turn", "leading", "adjacent-compactions", "after-a-leading-compaction"],
+)
+async def test_import_anchors_compactions_to_the_item_before_them(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    before: list[str],
+) -> None:
+    """An imported compaction's cursor names a stored item, so history loads from it.
+
+    A compaction imported first names itself, since nothing is stored before it, and
+    one right after another compaction names that compaction, reusing its id when the
+    earlier one already named itself.
+    """
+    from omnigent.runtime.workflow import _load_initial_history
+
+    _seed_claude_agent(db_uri)
+
+    def message(role: str, text: str) -> dict[str, object]:
+        content_type = "input_text" if role == "user" else "output_text"
+        data: dict[str, object] = {"role": role, "content": [{"type": content_type, "text": text}]}
+        if role == "assistant":
+            data["agent"] = "claude-native-ui"
+        return {"type": "message", "response_id": "claude:turn", "data": data}
+
+    def compaction(summary: str) -> dict[str, object]:
+        return {
+            "type": "compaction",
+            "response_id": "claude:compaction",
+            "data": {
+                "summary": summary,
+                "last_item_id": "import:compaction",
+                "token_count": 0,
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": summary}],
+                    }
+                ],
+            },
+        }
+
+    prefix = {
+        "turn": [message("user", "before compaction"), message("assistant", "answer")],
+        "compaction": [compaction("earlier summary")],
+    }
+    payload = {
+        "source": "claude",
+        "external_session_id": f"claude-compacted-{'-'.join(before)}",
+        "items": [
+            *(item for kind in before for item in prefix[kind]),
+            compaction("summary of the first turn"),
+            message("user", "after compaction"),
+            message("assistant", "answer after compaction"),
+        ],
+    }
+
+    created = await client.post("/v1/imports", json=payload)
+
+    assert created.status_code == 201, created.text
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = created.json()["session_id"]
+    stored = store.list_items(session_id, limit=10, order="asc").data
+    compactions = [index for index, item in enumerate(stored) if item.type == "compaction"]
+    assert len(compactions) == before.count("compaction") + 1
+    for index in compactions:
+        boundary = stored[index - 1] if index else stored[index]
+        assert stored[index].data.last_item_id == boundary.id
+    loaded = _load_initial_history(store, session_id)
+    assert loaded.last_compaction_created_at is not None
+    assert [item.id for item in loaded.items[-2:]] == [item.id for item in stored[-2:]]

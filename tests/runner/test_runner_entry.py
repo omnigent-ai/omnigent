@@ -12,8 +12,10 @@ import queue
 import signal
 import sys
 import tarfile
+import tempfile
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -25,6 +27,7 @@ import pytest
 from omnigent.errors import OmnigentError
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.native import native_terminal
+from omnigent.runner import subagent_work
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
@@ -32,6 +35,7 @@ from omnigent.runner._entry import (
     _AgentSpecCache,
     _apply_host_interactive_shells,
     _host_interactive_shells_from_env,
+    _ignore_finish_work_signal_until_handled,
     _InitialAuthTokenFactory,
     _install_crash_logging,
     _install_signal_handlers,
@@ -52,6 +56,7 @@ from omnigent.runner._entry import (
     _runner_workspace_from_env,
     _RunnerDatabricksAuth,
     _server_url_from_env,
+    _work_still_active,
     main,
 )
 from omnigent.runner.identity import (
@@ -74,6 +79,7 @@ from omnigent.runner.transports.ws_tunnel.serve import (
 from omnigent.util import event_loop_watchdog as watchdog
 from tests._helpers.session import bundle_files
 from tests.budgets import budget
+from tests.runner.helpers import make_test_terminal_instance
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -2032,6 +2038,62 @@ def test_load_runner_idle_timeout_reads_nested_runner_config(
     assert _load_runner_idle_timeout_s_from_config() == 12.5
 
 
+@pytest.mark.parametrize("timeout_s", [86400, 0])
+def test_create_app_native_pane_idle_windows_follow_runner_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, timeout_s: int
+) -> None:
+    """Top-level native terminals survive the runner's idle window; sub-agent ones last an hour."""
+    import omnigent.runner._entry as entry_mod
+
+    class _FakeProcessManager:
+        instance_dir = tmp_path
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP", "1")
+    monkeypatch.delenv("OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S", raising=False)
+    (tmp_path / "config.yaml").write_text(f"runner:\n  idle_timeout_s: {timeout_s}\n")
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.HarnessProcessManager", _FakeProcessManager
+    )
+    monkeypatch.setattr(entry_mod.httpx, "AsyncClient", _TrackingAsyncClient)
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+
+    app = entry_mod.create_app(auth_resolved=True)
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    assert reaper._idle_timeout_s == timeout_s
+    if not timeout_s:
+        assert reaper._sub_agent_idle_timeout_s == 0
+        return
+    resource_registry = app.state.session_resource_registry
+    for conv in ("conv_idle", "conv_child"):
+        resource_registry.terminal_registry._by_conversation[conv] = {
+            ("codex", "main"): make_test_terminal_instance("codex", "main", tmp_path / conv)
+        }
+    monkeypatch.setattr(resource_registry, "terminal_resource_role", lambda *_args: "codex-native")
+    subagent_work.register_child_session(
+        "conv_child",
+        parent_session_id="conv_parent",
+        title="worker:child",
+        tool="worker",
+        session_name="child",
+    )
+    try:
+        panes = reaper._list_native_panes()
+
+        def reapable_at(now: float) -> set[str]:
+            return {pane.conversation_id for pane in reaper._classify(now, panes, set())}
+
+        assert reapable_at(0.0) == set()
+        assert reapable_at(3599.0) == set()
+        assert reapable_at(3600.0) == {"conv_child"}
+        assert reapable_at(float(timeout_s)) == {"conv_idle", "conv_child"}
+    finally:
+        subagent_work.unregister_child_session("conv_child")
+
+
 def test_load_runner_idle_timeout_zero_disables_watchdog(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2499,6 +2561,155 @@ def test_run_parent_death_killer_logs_reason_before_hard_exit(
     ), f"expected a parent-death exit log line, got {[r.message for r in caplog.records]}"
 
 
+def _finish_work_killer(
+    has_active_work: Callable[[], bool],
+    *,
+    finish_work_set: bool = True,
+    finish_work_max_s: float = 5.0,
+    signal_wait_s: float = 2.0,
+) -> list[str]:
+    """Run an already-orphaned killer with the finish-work path wired; return events."""
+    import threading
+
+    events: list[str] = []
+    finish_work = threading.Event()
+    if finish_work_set:
+        finish_work.set()
+    _run_parent_death_killer(
+        os.getppid() + 100000,  # already "orphaned"
+        lambda: events.append("stop"),
+        finish_work=finish_work,
+        has_active_work=has_active_work,
+        request_idle_shutdown=lambda: events.append("idle_close"),
+        poll_interval_s=0.01,
+        grace_s=0.01,
+        idle_grace_s=0.01,
+        signal_wait_s=signal_wait_s,
+        finish_work_max_s=finish_work_max_s,
+        exit_fn=lambda code: events.append("exit"),
+    )
+    return events
+
+
+def test_run_parent_death_killer_finishes_in_flight_work_after_hangup() -> None:
+    """A hung-up host's runner closes as idle only after its turn finishes."""
+    probes: list[str] = []
+
+    def has_active_work() -> bool:
+        probes.append("probe")
+        if len(probes) == 2:
+            raise RuntimeError("dictionary changed size during iteration")
+        return len(probes) < 5
+
+    events = _finish_work_killer(has_active_work)
+
+    assert len(probes) == 5, "shutdown must wait until the work reports idle"
+    assert events == ["idle_close", "exit"]
+
+
+def test_run_parent_death_killer_without_hangup_stops_despite_active_work() -> None:
+    """A plain parent death (``host stop``) waits out only the short finish-work
+    grace window, then stops a busy runner instead of finishing its turn.
+
+    The window lets a lagging hangup signal become visible; a plain death never
+    sets it, so the runner stops once the window elapses.
+    """
+    started = time.monotonic()
+    events = _finish_work_killer(lambda: True, finish_work_set=False, signal_wait_s=0.2)
+    elapsed = time.monotonic() - started
+
+    assert events == ["stop", "exit"]
+    assert elapsed >= 0.2, "a busy non-hangup orphan must wait out the finish-work grace window"
+    assert elapsed < 3.0, "it must stop at the grace window, not enter the finishing deadline"
+
+
+def test_run_parent_death_killer_bounds_finishing_work(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Work that never finishes is stopped once the bound passes."""
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner._entry"):
+        events = _finish_work_killer(lambda: True, finish_work_max_s=0.05)
+    elapsed = time.monotonic() - started
+
+    assert events == ["stop", "exit"]
+    assert any("did not finish" in record.message for record in caplog.records)
+    assert elapsed < 2.0, "finishing work must stop at its bound, not run unbounded"
+
+
+def test_run_parent_death_killer_idle_runner_exits_immediately_after_hangup() -> None:
+    """An idle runner exits on a hangup exactly as on any parent death."""
+    started = time.monotonic()
+    events = _finish_work_killer(lambda: False)
+    elapsed = time.monotonic() - started
+
+    assert events == ["stop", "exit"]
+    assert elapsed < 1.0, "an idle runner must skip the grace and finishing waits"
+
+
+def test_run_parent_death_killer_waits_for_a_late_finish_work_signal() -> None:
+    """A finish-work signal landing just after parent death still saves the turn.
+
+    The signal is delivered through the event loop, which can lag the
+    parent-death probe; the killer must not tear down a busy runner before a
+    just-delivered hangup request becomes visible.
+    """
+    import threading
+
+    events: list[str] = []
+    finish_work = threading.Event()
+    probes: list[str] = []
+
+    def has_active_work() -> bool:
+        probes.append("probe")
+        return len(probes) < 4
+
+    # The signal becomes visible only after the killer has already observed
+    # the orphaned parent and begun waiting for it.
+    threading.Timer(0.05, finish_work.set).start()
+
+    _run_parent_death_killer(
+        os.getppid() + 100000,  # already "orphaned"
+        lambda: events.append("stop"),
+        finish_work=finish_work,
+        has_active_work=has_active_work,
+        request_idle_shutdown=lambda: events.append("idle_close"),
+        poll_interval_s=0.01,
+        grace_s=0.5,
+        signal_wait_s=0.5,
+        idle_grace_s=0.01,
+        finish_work_max_s=5.0,
+        exit_fn=lambda code: events.append("exit"),
+    )
+
+    assert events == ["idle_close", "exit"], (
+        "a finish-work signal arriving after parent death must still finish the turn"
+    )
+
+
+def test_work_still_active_treats_any_exception_as_active() -> None:
+    """A probe failure of any type counts as active so the watchdog never dies."""
+
+    def boom() -> bool:
+        raise ValueError("state mutated during probe")
+
+    assert _work_still_active(boom) is True
+
+
+def test_ignore_finish_work_signal_until_handled_masks_the_default_kill() -> None:
+    """A boot-time finish-work signal is ignored so it cannot kill the runner."""
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    if RUNNER_FINISH_WORK_SIGNAL is None:
+        pytest.skip("no finish-work signal on this platform")
+    previous = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+    try:
+        _ignore_finish_work_signal_until_handled()
+        assert signal.getsignal(RUNNER_FINISH_WORK_SIGNAL) is signal.SIG_IGN
+    finally:
+        signal.signal(RUNNER_FINISH_WORK_SIGNAL, previous)
+
+
 def test_install_crash_logging_records_uncaught_exception(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2564,6 +2775,150 @@ async def test_install_signal_handlers_records_signal_reason() -> None:
             loop.remove_signal_handler(sig)
 
     assert reasons == ["received SIGTERM"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGUSR2") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_finish_work_signal_sets_event() -> None:
+    """The host's hangup signal flags in-flight work to finish, without stopping."""
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    assert RUNNER_FINISH_WORK_SIGNAL is not None
+    stop_event = asyncio.Event()
+    finish_work = threading.Event()
+    _install_signal_handlers(stop_event, finish_work_event=finish_work)
+    loop = asyncio.get_running_loop()
+    try:
+        os.kill(os.getpid(), RUNNER_FINISH_WORK_SIGNAL)
+        deadline = time.monotonic() + 2.0
+        while not finish_work.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM, RUNNER_FINISH_WORK_SIGNAL):
+            loop.remove_signal_handler(sig)
+
+    assert finish_work.is_set()
+    assert not stop_event.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGUSR2") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_degraded_finish_work_replaces_sig_ign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A degraded loop installs a plain finish-work handler, never leaving SIG_IGN.
+
+    SIG_IGN survives exec, so a persisted boot-time ignore would silently leak
+    into agent subprocesses. When loop registration fails, a plain handler must
+    take its place: it resets to the default on exec and still records the
+    hangup for the parent-death backstop.
+    """
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    assert RUNNER_FINISH_WORK_SIGNAL is not None
+    loop = asyncio.get_running_loop()
+
+    def _broken_add_signal_handler(sig: int, *args: Any) -> None:
+        raise RuntimeError("the fd 6 must be in non-blocking mode")
+
+    monkeypatch.setattr(loop, "add_signal_handler", _broken_add_signal_handler)
+    # Boot ignores the signal; the degraded install must swap SIG_IGN out.
+    previous = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+    signal.signal(RUNNER_FINISH_WORK_SIGNAL, signal.SIG_IGN)
+    finish_work = threading.Event()
+    try:
+        _install_signal_handlers(asyncio.Event(), finish_work_event=finish_work)
+        handler = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+        assert handler is not signal.SIG_IGN
+        assert callable(handler)
+        os.kill(os.getpid(), RUNNER_FINISH_WORK_SIGNAL)
+        deadline = time.monotonic() + 2.0
+        while not finish_work.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert finish_work.is_set()
+    finally:
+        signal.signal(RUNNER_FINISH_WORK_SIGNAL, previous)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGUSR2") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_replaces_sig_ign_when_loop_lacks_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loop that cannot register signals still swaps the boot-time SIG_IGN out.
+
+    ``add_signal_handler`` raises ``NotImplementedError`` on loops without signal
+    support. That is suppressed without marking the install degraded, so the
+    inherited SIG_IGN must still be replaced or it would survive exec and stop
+    the runner from ever observing a hangup.
+    """
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    assert RUNNER_FINISH_WORK_SIGNAL is not None
+    loop = asyncio.get_running_loop()
+
+    def _unsupported_add_signal_handler(sig: int, *args: Any) -> None:
+        raise NotImplementedError("signals are not supported on this loop")
+
+    monkeypatch.setattr(loop, "add_signal_handler", _unsupported_add_signal_handler)
+    previous = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+    signal.signal(RUNNER_FINISH_WORK_SIGNAL, signal.SIG_IGN)
+    finish_work = threading.Event()
+    try:
+        _install_signal_handlers(asyncio.Event(), finish_work_event=finish_work)
+        handler = signal.getsignal(RUNNER_FINISH_WORK_SIGNAL)
+        assert handler is not signal.SIG_IGN
+        assert callable(handler)
+        os.kill(os.getpid(), RUNNER_FINISH_WORK_SIGNAL)
+        deadline = time.monotonic() + 2.0
+        while not finish_work.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert finish_work.is_set()
+    finally:
+        signal.signal(RUNNER_FINISH_WORK_SIGNAL, previous)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGHUP") or sys.platform == "win32",
+    reason="POSIX signal dispositions",
+)
+async def test_install_signal_handlers_leaves_sighup_alone() -> None:
+    """SIGHUP keeps its disposition, so a standalone or adopted runner still dies by it.
+
+    Host-managed runners live in their own session and learn about a hangup
+    through the host's finish-work signal instead.
+    """
+    import threading
+
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    before = signal.getsignal(signal.SIGHUP)
+    finish_work = threading.Event()
+    loop = asyncio.get_running_loop()
+    _install_signal_handlers(asyncio.Event(), finish_work_event=finish_work)
+    try:
+        assert signal.getsignal(signal.SIGHUP) is before
+        assert not finish_work.is_set()
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM, RUNNER_FINISH_WORK_SIGNAL):
+            if sig is not None:
+                loop.remove_signal_handler(sig)
 
 
 @pytest.mark.asyncio
@@ -3735,6 +4090,43 @@ def test_runner_global_cleanup_ownership_is_explicit(
 
 
 @pytest.mark.asyncio
+async def test_runner_hides_scheduled_task_tools_only_when_server_turns_automations_off(tmp_path):
+    from omnigent.automations_availability import AUTOMATIONS_HEADER
+    from omnigent.tools.manager import ToolManager
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle("automations-agent")
+    # "1" is on; no header is an older server, which keeps the tools.
+    gate_headers = [{AUTOMATIONS_HEADER: "0"}, {AUTOMATIONS_HEADER: "1"}, {}]
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=bundle,
+            headers={
+                "X-Agent-Version": "1",
+                "X-Agent-Session-Scoped": "true",
+                **gate_headers.pop(0),
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        results = [
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_automations", session_id="session"
+            )
+            for _ in range(3)
+        ]
+
+    def advertised(spec):
+        names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
+        return "sys_scheduled_task_create" in names and "sys_scheduled_task_list" in names
+
+    assert [advertised(result.spec) for result in results] == [False, True, True]
+
+
 async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path):
     import json
 

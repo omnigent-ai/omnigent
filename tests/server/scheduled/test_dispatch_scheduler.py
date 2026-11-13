@@ -5,19 +5,23 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 import uuid
-from unittest.mock import AsyncMock
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.scheduled.dispatch_scheduler import (
+    TRIGGER_POLL_SECONDS,
     PersistentTaskScheduler,
     ScheduledTaskDispatchHooks,
     StartupLease,
     StartupLeaseLost,
 )
 from omnigent.server.scheduled.schedule import (
+    next_scheduled_time,
     occurrence_host_id,
     sandbox_host_id,
     scheduled_trigger_key,
@@ -37,12 +41,16 @@ def store(db_uri: str) -> SqlAlchemyScheduledTaskStore:
 
 
 def _task(
-    store: SqlAlchemyScheduledTaskStore, seed: str = "task", rrule: str = "FREQ=HOURLY", **kwargs
+    store: SqlAlchemyScheduledTaskStore,
+    seed: str = "task",
+    rrule: str = "FREQ=HOURLY",
+    prompt: str = "prompt",
+    **kwargs,
 ):
     task = store.create(
         uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex,
         seed,
-        "prompt",
+        prompt,
         rrule,
         None,
         uuid.uuid4().hex,
@@ -50,6 +58,18 @@ def _task(
         **kwargs,
     )
     return store.get(task.id)
+
+
+def _create_tasks_half_past_the_hour(monkeypatch) -> None:
+    """Pin task creation to half past an hour.
+
+    ``store.create`` schedules from the wall clock, so a test clock a minute past
+    ``created_at`` reaches the next hourly occurrence whenever the test runs in the
+    last minute of an hour, and that occurrence fires beside the run under test.
+    """
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_800_000_000 + 30 * 60)
 
 
 def _events(caplog, event_name: str) -> list[dict]:
@@ -159,8 +179,18 @@ async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
     assert len(fired) == 1
 
 
-async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store, caplog) -> None:
-    tasks = [_task(store, str(i), host_id=uuid.uuid4().hex) for i in range(3)]
+async def test_scan_pages_past_unowned_tasks_and_ownership_errors(
+    store, caplog, monkeypatch
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    caplog.set_level(logging.INFO)
+    clock = FakeClock()
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: int(clock.now()))
+    tasks = []
+    for seed in range(3):
+        tasks.append(_task(store, str(seed), host_id=uuid.uuid4().hex))
+        clock.advance(1)
     clock = FakeClock(max(task.next_run_at for task in tasks))
     ordered = store.list_due_tasks(int(clock.now()))
     own = ordered[-1]
@@ -187,6 +217,27 @@ async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store, caplog)
     assert [event["operation"] for event in failures] == ["claim"]
     assert store.list_runs(own.id)[0][0].status == "running"
     assert store.list_runs(ordered[0].id)[0] == []
+    observed = _events(caplog, "scheduled_run_occurrence_observed")
+    assert {event["task_id"] for event in observed} == {task.id for task in tasks}
+    assert all(event["observed_at"] == int(clock.now()) for event in observed)
+    assert all(event["rrule"] == tasks[0].rrule for event in observed)
+    created_at_by_task_id = {task.id: task.created_at for task in tasks}
+    assert all(
+        event["schedule_anchor"] == created_at_by_task_id[event["task_id"]] for event in observed
+    )
+
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert len(_events(caplog, "scheduled_run_occurrence_observed")) == len(observed)
+    clock.advance(3600)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    later = _events(caplog, "scheduled_run_occurrence_observed")[len(observed) :]
+    assert len(later) == 1
+    assert later[0]["task_id"] == own.id
+    assert later[0]["scheduled_at"] != next(
+        e["scheduled_at"] for e in observed if e["task_id"] == own.id
+    )
 
 
 async def test_startup_limit_leaves_unclaimed_work_for_next_poll(store) -> None:
@@ -544,6 +595,9 @@ async def test_interrupted_executor_stops_and_preserves_run_state(
         await asyncio.wait_for(asyncio.gather(*startups, return_exceptions=True), 10)
         assert exited.is_set()
         assert all(startup.cancelled() or startup.exception() is None for startup in startups)
+        # gather can return without yielding when startups are already done, so yield once
+        # to run the scheduler's done callback that forgets each finished startup.
+        await asyncio.sleep(0)
         assert scheduler._startups == {}
         run = store.list_runs(task.id)[0][0]
         expected_status = (
@@ -678,6 +732,9 @@ async def test_expiry_cancels_old_executor_and_reconciles_without_refiring(store
     try:
         await scheduler.poll_once()
         await asyncio.wait_for(started.wait(), 10)
+        # Let the first poll's sweep finish, so the next poll starts a fresh one.
+        assert scheduler._recovery is not None
+        await scheduler._recovery
         clock.advance(120)
         await scheduler.poll_once()
         await _drain(scheduler)
@@ -1280,10 +1337,10 @@ async def test_schedule_search_failure_preserves_next_run_at_and_retries(
     original_validate = dispatch_scheduler.validate_rrule
     failing = True
 
-    def validate(rule):
+    def validate(rule, **kwargs):
         if failing and failure == "validation" and rule == "FREQ=HOURLY":
             raise RRuleSearchError("RRULE validation exceeds the supported time limit")
-        return original_validate(rule)
+        return original_validate(rule, **kwargs)
 
     def calculate(rule, after, tz, *, anchor=None):
         # Distinguish the task without replacing schedule error handling.
@@ -1571,6 +1628,10 @@ async def test_debug_events_cover_fire_success_delays_and_recovery(store, caplog
 
     names = {task.id: name for name, task in tasks.items()}
     claimed = _events(caplog, "scheduled_run_claimed")
+    attempted = _events(caplog, "scheduled_run_claim_attempted")
+    assert {event["task_id"] for event in attempted} == {task.id for task in tasks.values()}
+    assert all(event["trigger_key"] == f"schedule:{event['scheduled_at']}" for event in attempted)
+    assert all(event["trigger_key"] == f"schedule:{event['scheduled_at']}" for event in claimed)
     assert sorted(names[event["task_id"]] for event in claimed) == [
         "delivered",
         "failed",
@@ -1597,6 +1658,7 @@ async def test_debug_events_cover_fire_success_delays_and_recovery(store, caplog
         "interrupted": "interrupted",
     }
     assert ended["delivered"]["prompt_delay_seconds"] == 10
+    assert ended["delivered"]["startup_delay_seconds"] == 10
     assert ended["delivered"]["session_id"] == session_id
     assert ended["failed"]["error_code"] == "host_offline"
     # Both unresolved startups are handed to recovery.
@@ -1702,6 +1764,11 @@ async def test_failed_operations_log_debug_events(store, monkeypatch, caplog, fa
     try:
         await scheduler.start()
         await poll_until_async(matching)
+        if failure == "claim":
+            [attempt] = _events(caplog, "scheduled_run_claim_attempted")
+            assert attempt["trigger_key"] == matching()[0]["trigger_key"]
+            assert matching()[0]["scheduled_at"] == task.next_run_at
+            assert matching()[0]["failure_stage"] == "claim"
         if failure == "initialize_scan":
             assert all("task_id" not in event for event in matching())
         if failure == "lease_renewal":
@@ -1996,9 +2063,7 @@ def test_dispatch_hooks_replace_the_built_in_executor_only_as_a_whole() -> None:
         ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock(), fire_identity=AsyncMock())
 
 
-async def test_run_now_starts_a_manual_run_here_when_this_replica_owns_its_host(
-    store, monkeypatch
-) -> None:
+async def test_run_now_records_a_manual_run_that_the_next_poll_starts(store) -> None:
     task = store.update(_task(store).id, state="paused")
     clock = FakeClock(task.created_at + 60)
     fired = []
@@ -2008,12 +2073,15 @@ async def test_run_now_starts_a_manual_run_here_when_this_replica_owns_its_host(
         await lease.finish("running")
 
     scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now, poll_seconds=3600)
-    # Only the request itself may start the run in this test.
-    monkeypatch.setattr(scheduler, "_claim_pending", AsyncMock())
     await scheduler.start()
     try:
+        # The request only records the run, even on the replica that owns its host.
         run = await scheduler.run_now(task)
-        await asyncio.gather(*list(scheduler._startups.values()))
+        assert run.status == "scheduled"
+        assert scheduler._startups == {}
+        assert fired == []
+        await scheduler.poll_once()
+        await _drain(scheduler)
     finally:
         await scheduler.stop()
 
@@ -2027,7 +2095,8 @@ async def test_run_now_starts_a_manual_run_here_when_this_replica_owns_its_host(
     assert store.get(task.id).next_run_at is None
 
 
-async def test_run_now_waits_for_the_host_owner_to_start_it(store) -> None:
+async def test_run_now_waits_for_the_host_owner_to_start_it(store, monkeypatch) -> None:
+    _create_tasks_half_past_the_hour(monkeypatch)
     task = _task(store)
     clock = FakeClock(task.created_at + 60)
     owned = False
@@ -2053,35 +2122,6 @@ async def test_run_now_waits_for_the_host_owner_to_start_it(store) -> None:
     assert store.list_pending_runs() == []
     # Run now never moves the schedule of an active task.
     assert store.get(task.id).next_run_at == task.next_run_at
-
-
-async def test_run_now_keeps_a_recorded_request_when_starting_it_here_fails(store) -> None:
-    task = _task(store)
-    clock = FakeClock(task.created_at + 60)
-    calls = 0
-
-    async def owned_hosts(keys):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise RuntimeError("ownership lookup unavailable")
-        return keys
-
-    fire = AsyncMock()
-    scheduler = PersistentTaskScheduler(
-        store, fire, AsyncMock(), owned_hosts=owned_hosts, now=clock.now, poll_seconds=3600
-    )
-    await scheduler.start()
-    try:
-        # Recorded, so the caller must not retry and create a second run.
-        run = await scheduler.run_now(task)
-        assert run is not None
-        await scheduler.poll_once()
-        await _drain(scheduler)
-    finally:
-        await scheduler.stop()
-    [(_snapshot, lease)] = [call.args for call in fire.await_args_list]
-    assert lease.run.id == run.id
 
 
 async def test_pending_runs_cost_each_poll_one_page_and_still_make_progress(store) -> None:
@@ -2168,10 +2208,11 @@ async def test_run_now_moves_to_the_new_host_owner_after_a_target_change(store) 
 
 
 async def test_a_continue_task_runs_where_its_session_host_is_not_the_workspace_owner(
-    store,
+    store, monkeypatch
 ) -> None:
     """Replica A holds the session's host and B owns the workspace key. Once the
     first run records the session, its host is pinned, so A claims every run."""
+    _create_tasks_half_past_the_hour(monkeypatch)
     task = _task(store, "continue_unpinned", session_mode="continue")
     assert task.host_id is None
     session_host = uuid.uuid4().hex
@@ -2288,3 +2329,348 @@ async def test_recovery_ownership_lookup_is_bounded_and_retried(store, caplog) -
     assert len(_events(caplog, "scheduled_task_operation_failed")) == 1
     with workspace_scope(7):
         assert store.list_runs(task.id)[0][0].status == "failed"
+
+
+# Every read a poll makes to find work; none may run while dispatch is paused.
+_DISPATCH_READS = (
+    "list_uninitialized_tasks",
+    "list_due_tasks",
+    "list_pending_runs",
+    "list_expired_starting_runs",
+    "purge_deleted_tasks",
+)
+
+
+async def test_paused_dispatch_reads_nothing_and_resumes_without_catching_up(
+    store, monkeypatch
+) -> None:
+    task = _task(store)
+    clock = FakeClock(task.next_run_at + 7200)
+    enabled = False
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(lease.run)
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(
+        store,
+        fire,
+        AsyncMock(),
+        dispatch_enabled=lambda: enabled,
+        now=clock.now,
+        poll_seconds=3600,
+    )
+    await scheduler.start()
+    try:
+        with monkeypatch.context() as paused:
+            for name in _DISPATCH_READS:
+                paused.setattr(store, name, Mock(side_effect=AssertionError(name)))
+            await scheduler.poll_once()
+        # Run now records the request but leaves it for a later poll.
+        requested = await scheduler.run_now(task)
+        assert requested.status == "scheduled"
+        assert fired == []
+        assert scheduler._recovery is None
+        assert store.get(task.id).next_run_at == task.next_run_at
+
+        enabled = True
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    finally:
+        await scheduler.stop()
+
+    # The overdue occurrence runs once, not once per missed hour, plus the request.
+    scheduled = [run for run in fired if not run.trigger_key.startswith("manual:")]
+    assert [run.scheduled_at for run in scheduled] == [task.next_run_at]
+    assert [run.id for run in fired if run.trigger_key.startswith("manual:")] == [requested.id]
+    assert store.get(task.id).next_run_at > clock.now()
+
+
+async def test_failing_dispatch_check_keeps_dispatching(store, caplog) -> None:
+    task = _task(store)
+    clock = FakeClock(task.next_run_at + 60)
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(snapshot.id)
+        await lease.finish("running")
+
+    def broken_check() -> bool:
+        raise RuntimeError("flag service unavailable")
+
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), dispatch_enabled=broken_check, now=clock.now
+    )
+    with caplog.at_level(logging.ERROR, logger=_SCHEDULER_LOGGER):
+        await scheduler.poll_once()
+        await _drain(scheduler)
+
+    assert fired == [task.id]
+    assert "Could not check whether dispatch is enabled" in caplog.text
+
+
+async def test_live_poll_interval_overrides_poll_seconds(store, monkeypatch) -> None:
+    polls = 0
+    polled = asyncio.Event()
+
+    async def poll_once() -> None:
+        nonlocal polls
+        polls += 1
+        if polls == 3:
+            polled.set()
+
+    # With poll_seconds alone the loop would wait an hour after its first poll.
+    scheduler = PersistentTaskScheduler(
+        store, AsyncMock(), AsyncMock(), poll_interval=lambda: 0.01, poll_seconds=3600
+    )
+    monkeypatch.setattr(scheduler, "poll_once", poll_once)
+    await scheduler.start()
+    try:
+        await asyncio.wait_for(polled.wait(), 10)
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.parametrize(
+    "reading",
+    [0.0, -1.0, float("nan"), float("inf"), RuntimeError("flag service unavailable")],
+    ids=["zero", "negative", "nan", "infinite", "raises"],
+)
+def test_unusable_poll_interval_waits_poll_seconds(store, caplog, reading) -> None:
+    readings = [reading, 7.0]
+
+    def poll_interval() -> float:
+        value = readings.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    scheduler = PersistentTaskScheduler(
+        store, AsyncMock(), AsyncMock(), poll_interval=poll_interval, poll_seconds=30
+    )
+    with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
+        assert scheduler._next_poll_delay() == 30
+    assert caplog.records
+    # Only that wait falls back; the next reading applies again.
+    assert scheduler._next_poll_delay() == 7.0
+
+
+@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
+@pytest.mark.parametrize("session_mode", ["new", "continue"])
+async def test_ten_minute_persisted_schedule_by_execution(store, session_mode, execution_target):
+    eligible = session_mode == "continue" or execution_target == "connected_host"
+    store.configure_dispatch(not eligible)
+    task = _task(
+        store,
+        rrule="FREQ=MINUTELY;INTERVAL=10",
+        session_mode=session_mode,
+        execution_target=execution_target,
+    )
+    store.configure_dispatch(True)
+    clock = FakeClock(task.created_at if eligible else task.next_run_at)
+
+    async def fire(task, lease):
+        await lease.finish("running")
+
+    executor = AsyncMock(side_effect=fire)
+    scheduler = PersistentTaskScheduler(
+        store, executor, AsyncMock(return_value=None), now=clock.now
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    saved = store.get(task.id)
+    if eligible:
+        assert task.next_run_at is None
+        executor.assert_not_awaited()
+        assert saved.state == "active"
+        assert 0 < saved.next_run_at - clock.now() <= 600
+        initialized_at = saved.next_run_at
+        clock.advance(initialized_at - clock.now())
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        executor.assert_awaited_once()
+        assert store.get(task.id).next_run_at == initialized_at + 600
+        # A recreated scheduler dispatches the next persisted occurrence once.
+        scheduler = PersistentTaskScheduler(
+            store, executor, AsyncMock(return_value=None), now=clock.now
+        )
+        clock.advance(600)
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert executor.await_count == 2
+    else:
+        executor.assert_not_awaited()
+        assert saved.state == "paused"
+        assert saved.next_run_at is None
+
+
+_TRIGGER_PROMPT = "This automation watches Slack and starts one Omnigent session per message."
+
+
+async def test_busy_trigger_automation_skips_its_poll_without_a_run(store, caplog) -> None:
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(
+        store, rrule="FREQ=MINUTELY;INTERVAL=10", prompt=_TRIGGER_PROMPT, session_mode="continue"
+    )
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    # The session went quiet 30 seconds ago, so it is checked again in 90.
+    busy = AsyncMock(return_value=task.next_run_at + 90)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    busy.assert_awaited_once_with(task, task.next_run_at)
+    fire.assert_not_awaited()
+    assert store.list_runs(task.id)[0] == []
+    saved = store.get(task.id)
+    assert saved.state == "active"
+    assert saved.next_run_at == task.next_run_at + 90
+    [skipped] = _events(caplog, "scheduled_run_skipped_busy")
+    assert skipped["scheduled_at"] == task.next_run_at
+    assert skipped["next_check_at"] == task.next_run_at + 90
+    assert skipped["advanced"] is True
+
+
+@pytest.mark.parametrize(
+    "busy",
+    [AsyncMock(return_value=None), AsyncMock(side_effect=RuntimeError("status unavailable"))],
+    ids=["idle", "check-failed"],
+)
+async def test_trigger_automations_poll_every_two_minutes_whatever_their_schedule(
+    store, busy
+) -> None:
+    task = _task(store, rrule="FREQ=HOURLY", prompt=_TRIGGER_PROMPT, session_mode="continue")
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_awaited_once()
+    [run] = store.list_runs(task.id)[0]
+    assert run.scheduled_at == task.next_run_at
+    assert store.get(task.id).next_run_at == task.next_run_at + TRIGGER_POLL_SECONDS
+
+
+async def test_an_uninitialized_trigger_automation_polls_within_two_minutes(
+    store, monkeypatch
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    # Half past the hour, so the hourly schedule's next occurrence is not sooner.
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_800_000_000 + 30 * 60)
+    store.configure_dispatch(False)
+    task = _task(store, prompt=_TRIGGER_PROMPT, session_mode="continue")
+    store.configure_dispatch(True)
+    clock = FakeClock(task.created_at)
+    scheduler = PersistentTaskScheduler(
+        store,
+        AsyncMock(),
+        AsyncMock(return_value=None),
+        now=clock.now,
+        busy_until=AsyncMock(return_value=None),
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert store.get(task.id).next_run_at == task.created_at + TRIGGER_POLL_SECONDS
+
+
+@pytest.mark.parametrize("busy_check", [True, False], ids=["busy-check", "no-busy-check"])
+async def test_a_saved_trigger_polls_two_minutes_out_only_with_a_busy_check(
+    store, busy_check, monkeypatch
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    # Half past the hour, so the hourly schedule's next occurrence is not sooner.
+    clock = FakeClock(1_800_000_000 + 30 * 60)
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: int(clock.now()))
+    PersistentTaskScheduler(
+        store,
+        AsyncMock(),
+        AsyncMock(return_value=None),
+        busy_until=AsyncMock(return_value=None) if busy_check else None,
+    )
+    created = _task(store, prompt=_TRIGGER_PROMPT, session_mode="continue")
+    clock.advance(60)
+    store.update(created.id, state="paused")
+    resumed = store.update(created.id, state="active")
+    for saved, at in ((created, created.created_at), (resumed, resumed.updated_at)):
+        if busy_check:
+            assert saved.next_run_at == at + TRIGGER_POLL_SECONDS
+        else:
+            # Without a busy check, the hourly saved schedule still applies.
+            assert saved.next_run_at == next_scheduled_time(saved, at)
+
+
+def _last_occurrence(task) -> int:
+    last, after = None, task.created_at
+    while (occurrence := next_scheduled_time(task, after)) is not None:
+        last, after = occurrence, occurrence
+    assert last is not None
+    return last
+
+
+@pytest.mark.parametrize("busy", [False, True], ids=["idle", "busy"])
+@pytest.mark.parametrize("end", ["COUNT=2", "UNTIL"])
+async def test_a_trigger_still_ends_when_its_saved_schedule_does(store, end, busy) -> None:
+    if end == "UNTIL":
+        until = datetime.fromtimestamp(int(time.time()) + 25 * 60, UTC)
+        end = "UNTIL=" + until.strftime("%Y%m%dT%H%M%SZ")
+    rrule = f"FREQ=MINUTELY;INTERVAL=10;{end}"
+    task = _task(store, rrule=rrule, prompt=_TRIGGER_PROMPT, session_mode="continue")
+    last = _last_occurrence(task)
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    # A busy session is always checked again two minutes later.
+    check = AsyncMock(side_effect=lambda task, now: now + TRIGGER_POLL_SECONDS if busy else None)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=check
+    )
+    for _ in range(25):
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        clock.advance(TRIGGER_POLL_SECONDS)
+    saved = store.get(task.id)
+    assert saved.state == "completed"
+    assert saved.next_run_at is None
+    runs = store.list_runs(task.id)[0]
+    # Nothing polls after the schedule's last occurrence, which is sent even while busy.
+    assert max(run.scheduled_at for run in runs) == last
+    if busy:
+        assert [run.scheduled_at for run in runs] == [last]
+    else:
+        assert len(runs) > 2
+
+
+async def test_other_continued_sessions_keep_their_schedule_and_send_while_busy(store) -> None:
+    task = _task(store, rrule="FREQ=MINUTELY;INTERVAL=10", session_mode="continue")
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    busy = AsyncMock(return_value=task.next_run_at + 90)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, busy_until=busy
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    busy.assert_not_awaited()
+    fire.assert_awaited_once()
+    [run] = store.list_runs(task.id)[0]
+    assert run.scheduled_at == task.next_run_at
+    assert store.get(task.id).next_run_at == task.next_run_at + 600
+
+
+async def test_without_a_busy_check_a_trigger_keeps_its_saved_schedule(store) -> None:
+    task = _task(
+        store, rrule="FREQ=MINUTELY;INTERVAL=10", prompt=_TRIGGER_PROMPT, session_mode="continue"
+    )
+    clock = FakeClock(task.next_run_at)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(return_value=None), now=clock.now)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_awaited_once()
+    assert store.get(task.id).next_run_at == task.next_run_at + 600

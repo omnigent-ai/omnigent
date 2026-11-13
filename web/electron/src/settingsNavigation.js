@@ -53,20 +53,26 @@ function aboutMenuItem(productName, openAbout) {
 }
 
 /**
- * Add About and Settings to the conventional macOS application menu.
+ * The conventional macOS application menu: About and update checks, Settings,
+ * the standard app roles, then the shell's Quit items.
  *
  * @param {string} appName
- * @param {Electron.MenuItemConstructorOptions} aboutItem
- * @param {Electron.MenuItemConstructorOptions} settingsItem
+ * @param {{
+ *   about: Electron.MenuItemConstructorOptions,
+ *   updates: Electron.MenuItemConstructorOptions[],
+ *   settings: Electron.MenuItemConstructorOptions,
+ *   quit: Electron.MenuItemConstructorOptions[],
+ * }} items
  * @returns {Electron.MenuItemConstructorOptions}
  */
-function macApplicationMenu(appName, aboutItem, settingsItem) {
+function macApplicationMenu(appName, { about, updates, settings, quit }) {
   return {
     label: appName,
     submenu: [
-      aboutItem,
+      about,
+      ...updates,
       { type: "separator" },
-      settingsItem,
+      settings,
       { type: "separator" },
       { role: "services" },
       { type: "separator" },
@@ -74,7 +80,7 @@ function macApplicationMenu(appName, aboutItem, settingsItem) {
       { role: "hideOthers" },
       { role: "unhide" },
       { type: "separator" },
-      { role: "quit" },
+      ...quit,
     ],
   };
 }

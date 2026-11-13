@@ -11,7 +11,7 @@ import sys
 import threading
 import types
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +21,7 @@ import click
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
 from omnigent.entities.agent import Agent
@@ -32,6 +32,9 @@ from omnigent.onboarding.sandboxes.base import (
 )
 from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
+from omnigent.onboarding.sandboxes.lambda_microvm import (
+    managed_token_ttl_s as lambda_microvm_managed_token_ttl_s,
+)
 from omnigent.onboarding.sandboxes.registry import (
     COMMUNITY_MODULE_PREFIX,
     SandboxProviderContribution,
@@ -82,6 +85,7 @@ from tests.server.helpers import (
     install_fake_e2b_launcher,
     install_fake_islo_launcher,
     install_fake_kubernetes_launcher,
+    install_fake_lambda_microvm_launcher,
     install_fake_microsandbox_launcher,
     install_fake_modal_launcher,
     install_fake_openshell_launcher,
@@ -118,6 +122,22 @@ def _injected_config(
             host_config=host_config,
         )
     )
+
+
+async def test_direct_launch_without_catalog_rejects_missing_selection_before_prepare(
+    db_uri: str,
+) -> None:
+    class ProfileLauncher(FakeSandboxLauncher):
+        manages_profiles: ClassVar[bool] = True
+
+        def prepare(self) -> None:
+            pytest.fail("Unselected provider must not prepare")
+
+    with pytest.raises(HTTPException) as caught:
+        await launch_managed_host(
+            config=_injected_config(ProfileLauncher()), owner=_OWNER, host_store=HostStore(db_uri)
+        )
+    assert caught.value.status_code == 422
 
 
 class _ClassifyingFakeSandboxLauncher(FakeSandboxLauncher):
@@ -163,6 +183,28 @@ class _StubAgentStore:
 def test_parse_absent_section_disables_managed_hosts() -> None:
     """No ``sandbox:`` section → managed hosts simply not configured."""
     assert parse_sandbox_config(None) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_ttl"),
+    [(None, MODAL_MANAGED_TOKEN_TTL_S), (300, 300), (3600, 3600), (31_536_000, 31_536_000)],
+)
+def test_parse_token_ttl_override(value: int | None, expected_ttl: int) -> None:
+    config = parse_sandbox_config(
+        {"provider": "modal", "server_url": "https://s.example.com", "token_ttl_s": value}
+    )
+    assert config is not None
+    assert config.default.token_ttl_s == expected_ttl
+
+
+@pytest.mark.parametrize(
+    "value", [False, True, 300.0, 300.5, "3600", 0, -1, 299, 31_536_001, 10**400]
+)
+def test_parse_token_ttl_rejects_malformed_value(value: object) -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.token_ttl_s"):
+        parse_sandbox_config(
+            {"provider": "modal", "server_url": "https://s.example.com", "token_ttl_s": value}
+        )
 
 
 def test_parse_reaper_defaults_disabled_with_thirty_day_cutoff() -> None:
@@ -1113,6 +1155,108 @@ def test_parse_kubernetes_without_pvc_mounts_is_none(monkeypatch: pytest.MonkeyP
     install_fake_kubernetes_launcher(monkeypatch, fake)
     assert cfg.launcher_factory() is fake
     assert fake.pvc_mounts is None
+
+
+def test_parse_valid_lambda_microvm_config_builds_parameterized_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The documented lambda_microvm YAML shape parses into a config whose factory
+    constructs Lambda MicroVM launchers carrying region / image / version /
+    execution role / env, with the lifetime-derived token TTL.
+    """
+    cfg = parse_sandbox_config(
+        {
+            "provider": "lambda_microvm",
+            "server_url": "https://srv.example.com/",
+            "lambda_microvm": {
+                "region": "us-east-1",
+                "image_identifier": "omnigent-host",
+                "image_version": "1.0",
+                "execution_role_arn": "arn:aws:iam::123456789012:role/omnigent-microvm-exec",
+                "env": ["ANTHROPIC_API_KEY", "GIT_TOKEN"],
+                "egress_network_connectors": [
+                    "arn:aws:lambda:us-east-1:123456789012:network-connector:nc-abc",
+                    "arn:aws:lambda:us-east-1:123456789012:network-connector:nc-def",
+                ],
+            },
+        }
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    assert cfg.server_url == "https://srv.example.com"
+    assert cfg.token_ttl_s == lambda_microvm_managed_token_ttl_s()
+    assert cfg.managed_launch_supported is True
+    assert cfg.provider == "lambda_microvm"
+    fake = FakeSandboxLauncher()
+    install_fake_lambda_microvm_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.region == "us-east-1"
+    assert fake.image_identifier == "omnigent-host"
+    assert fake.image_version == "1.0"
+    assert fake.execution_role_arn == "arn:aws:iam::123456789012:role/omnigent-microvm-exec"
+    assert fake.env == ["ANTHROPIC_API_KEY", "GIT_TOKEN"]
+    assert fake.egress_network_connectors == [
+        "arn:aws:lambda:us-east-1:123456789012:network-connector:nc-abc",
+        "arn:aws:lambda:us-east-1:123456789012:network-connector:nc-def",
+    ]
+
+
+def test_parse_lambda_microvm_egress_connectors_rejects_non_list() -> None:
+    """A malformed egress_network_connectors field fails parse loud."""
+    with pytest.raises(ValueError, match=r"sandbox\.lambda_microvm\.egress_network_connectors"):
+        parse_sandbox_config(
+            {
+                "provider": "lambda_microvm",
+                "server_url": "https://srv.example.com",
+                "lambda_microvm": {"egress_network_connectors": "not-a-list"},
+            }
+        )
+
+
+def test_parse_lambda_microvm_without_section_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    `provider: lambda_microvm` + `server_url` parses: optional fields reach the
+    launcher as None so its env-var fallbacks apply (image/role required at
+    launch, surfaced by the launcher's own prepare()).
+    """
+    cfg = parse_sandbox_config(
+        {"provider": "lambda_microvm", "server_url": "https://srv.example.com"}
+    )
+    assert cfg is not None
+    cfg = cfg.default
+    assert cfg.provider == "lambda_microvm"
+    fake = FakeSandboxLauncher()
+    install_fake_lambda_microvm_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.region is None
+    assert fake.image_identifier is None
+    assert fake.execution_role_arn is None
+    assert fake.env is None
+
+
+def test_parse_lambda_microvm_rejects_non_string_field() -> None:
+    """A malformed lambda_microvm field fails parse loud, not at launch."""
+    with pytest.raises(ValueError, match=r"sandbox\.lambda_microvm\.region"):
+        parse_sandbox_config(
+            {
+                "provider": "lambda_microvm",
+                "server_url": "https://srv.example.com",
+                "lambda_microvm": {"region": 123},
+            }
+        )
+
+
+def test_parse_lambda_microvm_rejects_unknown_key() -> None:
+    """A typo in the lambda_microvm block stops startup instead of being ignored."""
+    with pytest.raises(ValueError, match=r"sandbox\.lambda_microvm"):
+        parse_sandbox_config(
+            {
+                "provider": "lambda_microvm",
+                "server_url": "https://srv.example.com",
+                "lambda_microvm": {"image_identifer": "omnigent-host"},
+            }
+        )
 
 
 def test_parse_kubernetes_tolerations_normalizes_and_reaches_launcher(
@@ -2216,9 +2360,73 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "single": {"multi_repo": False},
-        "multi": {"multi_repo": True},
+        "single": {"multi_repo": False, "accepts_session_move": True},
+        "multi": {"multi_repo": True, "accepts_session_move": True},
     }
+
+
+class _NoticeLauncher(FakeSandboxLauncher):
+    """A provider whose unattended runs need the owner to keep a credential fresh."""
+
+    automation_notice = "Keep your laptop's credentials fresh."
+
+
+def test_provider_automation_notices_list_only_launchable_providers_that_set_one() -> None:
+    """A launchable provider's automation notice reaches /v1/info for the automation
+    form; a provider without one, or one that can't launch, is absent."""
+
+    def unlaunchable_factory() -> _NoticeLauncher:
+        raise AssertionError("a provider that can't launch must not be instantiated")
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            *(
+                ManagedSandboxConfig(
+                    server_url="https://s",
+                    provider=provider,
+                    token_ttl_s=3600,
+                    launcher_factory=factory,
+                )
+                for provider, factory in (
+                    ("noted", _NoticeLauncher),
+                    ("plain", FakeSandboxLauncher),
+                )
+            ),
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider="unlaunchable",
+                token_ttl_s=3600,
+                launcher_factory=unlaunchable_factory,
+                managed_launch_supported=False,
+            ),
+        )
+    )
+
+    assert deployment.provider_automation_notices() == {
+        "noted": "Keep your laptop's credentials fresh."
+    }
+
+
+def test_provider_ui_capabilities_report_which_providers_take_a_moved_session() -> None:
+    """A provider that manages sandbox profiles is reported as no destination for
+    a move, which the move route refuses, whether profile discovery is on or not."""
+    deployment = ManagedSandboxDeployment(
+        configs=tuple(
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider=provider,
+                token_ttl_s=3600,
+                launcher_factory=FakeSandboxLauncher,
+                manages_profiles=manages_profiles,
+            )
+            for provider, manages_profiles in (("plain", False), ("profiled", True))
+        )
+    )
+
+    capabilities = deployment.provider_ui_capabilities()
+
+    assert capabilities["plain"]["accepts_session_move"] is True
+    assert capabilities["profiled"]["accepts_session_move"] is False
 
 
 def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -> None:
@@ -2244,9 +2452,13 @@ def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "kubernetes": {"multi_repo": False},
-        "modal": {"multi_repo": False},
-        "agent_sandbox": {"multi_repo": False, "inference_models": True},
+        "kubernetes": {"multi_repo": False, "accepts_session_move": True},
+        "modal": {"multi_repo": False, "accepts_session_move": True},
+        "agent_sandbox": {
+            "multi_repo": False,
+            "accepts_session_move": True,
+            "inference_models": True,
+        },
     }
 
 
@@ -2298,12 +2510,12 @@ def test_provider_ui_capabilities_advertise_default_models_for_unbound_discovery
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "hooked": {"multi_repo": False, "default_models": True},
-        "discovered": {"multi_repo": False, "default_models": True},
-        "static": {"multi_repo": False},
-        "bound": {"multi_repo": False, "inference_models": True},
-        "malformed": {"multi_repo": False},
-        "malformed-inference": {"multi_repo": False},
+        "hooked": {"multi_repo": False, "accepts_session_move": True, "default_models": True},
+        "discovered": {"multi_repo": False, "accepts_session_move": True, "default_models": True},
+        "static": {"multi_repo": False, "accepts_session_move": True},
+        "bound": {"multi_repo": False, "accepts_session_move": True, "inference_models": True},
+        "malformed": {"multi_repo": False, "accepts_session_move": True},
+        "malformed-inference": {"multi_repo": False, "accepts_session_move": True},
     }
 
 
@@ -2367,16 +2579,13 @@ async def test_lifespan_gates_one_deployment_wide_managed_sandbox_reaper(
 
     async with app.router.lifespan_context(app):
         reaper = getattr(app.state, "managed_sandbox_reaper", None)
-        if enabled:
-            assert isinstance(reaper, ManagedSandboxReaper)
-            assert reaper._sandbox_config is config
-            assert reaper._task is not None
-            assert not reaper._task.done()
-        else:
-            assert reaper is None
+        assert isinstance(reaper, ManagedSandboxReaper)
+        assert reaper._sandbox_config is config
+        assert reaper._reap_offline is enabled
+        assert reaper._task is not None
+        assert not reaper._task.done()
 
-    if enabled:
-        assert reaper._task is None
+    assert reaper._task is None
 
 
 @pytest.mark.parametrize(
@@ -2419,6 +2628,7 @@ async def test_info_reports_managed_sandboxes_capability(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["managed_sandboxes_enabled"] is expected
+    assert body["session_fork_workspaces"] is True
     # The provider name is surfaced only when the option is offered; a
     # staged/absent config leaks nothing (provider stays None), so the
     # daytona/none cases never name a backend.
@@ -2454,6 +2664,33 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
     assert body["sandbox_provider"] is None
 
 
+async def test_info_reports_a_providers_automation_notice_apart_from_its_flags(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """``GET /v1/info`` reports a provider's text notice in its own map, so the
+    capability map keeps its boolean-valued contract."""
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://s.example.com",
+            provider="noted",
+            launcher_factory=_NoticeLauncher,
+            token_ttl_s=3600,
+        )
+    )
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/info")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sandbox_provider_automation_notices"] == {
+        "noted": "Keep your laptop's credentials fresh."
+    }
+    capabilities = body["sandbox_provider_capabilities"]
+    assert capabilities == {"noted": {"multi_repo": False, "accepts_session_move": True}}
+    TypeAdapter(dict[str, dict[str, bool]]).validate_python(capabilities, strict=True)
+
+
 # ── launch_managed_host ─────────────────────────────────────
 
 
@@ -2473,9 +2710,12 @@ async def test_launch_success_registers_host_and_returns_workspace(
     online poll observes a genuine hosts-table transition.
     """
     host_store = HostStore(db_uri)
+    state = ManagedLaunch(settled=asyncio.Event())
 
     def _register(invocation: HostStartInvocation) -> None:
         """Simulate the sandbox host connecting over the tunnel."""
+        assert state.host_online_failure_hint is not None
+        assert state.host_online_failure_hint() is None
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
@@ -2489,8 +2729,10 @@ async def test_launch_success_registers_host_and_returns_workspace(
         owner=_OWNER,
         host_store=host_store,
         host_id=requested_host_id,
+        launch_state=state,
     )
 
+    assert state.host_online_failure_hint is None
     assert fake.prepared is True
     # Only a requested id needs the host to key off its default here.
     config_writes = [cmd for cmd in fake.commands if cmd.startswith("python3 -c")]
@@ -2742,6 +2984,12 @@ async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_ho
     fake = _LegacySignatureLauncher(on_host_start=_register, can_resume=True)
     config = _injected_config(fake)
 
+    def construct() -> _LegacySignatureLauncher:
+        assert threading.current_thread() is threading.main_thread()
+        return fake
+
+    config.default.launcher_factory = construct
+
     result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
     host_store.set_offline(result.host_id)
     await resume_managed_host(result.host_id, host_store, config)
@@ -2775,6 +3023,12 @@ async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
     fake = _AcmeLauncher(on_host_start=_register)
     config = _injected_config(fake)
 
+    def construct() -> _AcmeLauncher:
+        assert threading.current_thread() is threading.main_thread()
+        return fake
+
+    config.default.launcher_factory = construct
+
     result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
 
     host = host_store.get_host(result.host_id)
@@ -2782,11 +3036,273 @@ async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
     assert host.sandbox_provider == "acme-cloud"
     assert host.sandbox_id == "sb-fake-1"
 
+    await relaunch_managed_host(host=host, host_store=host_store, config=config)
+    host = host_store.get_host(result.host_id)
+    assert host is not None
+
     # Teardown resolves the launcher through the same config factory
     # (provider matches the row) — the custom launcher's terminate runs.
     await terminate_managed_host(host, host_store, config)
-    assert fake.terminated == ["sb-fake-1"]
+    assert fake.terminated == ["sb-fake-1", "sb-fake-2"]
     assert host_store.get_host(result.host_id) is None
+
+
+def _registering_host(host_store: HostStore) -> Callable[[HostStartInvocation], None]:
+    """Simulate the sandbox host connecting over the tunnel as soon as it starts."""
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    return _register
+
+
+async def test_launch_persists_start_assigned_sandbox_id(db_uri: str) -> None:
+    """
+    A provider that assigns the real sandbox id only at start (Lambda
+    MicroVMs' run-microvm) has that id persisted over the reserved
+    provision id, so terminate keys off the id the provider knows.
+    """
+    host_store = HostStore(db_uri)
+    # provision returns "sb-fake-1"; the host start surfaces the real id.
+    fake = FakeSandboxLauncher(
+        on_host_start=_registering_host(host_store), started_sandbox_id="microvm-real-1"
+    )
+    config = _injected_config(fake)
+
+    result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+
+    host = host_store.get_host(result.host_id)
+    assert host is not None
+    assert host.sandbox_id == result.sandbox_id == "microvm-real-1"
+
+    await terminate_managed_host(host, host_store, config)
+    assert fake.terminated == ["microvm-real-1"]
+    assert host_store.get_host(result.host_id) is None
+
+
+async def test_launch_failure_terminates_start_assigned_sandbox_id(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    When a start-assigned-id provider fails AFTER the host starts (the online
+    poll times out), failure cleanup terminates the REAL id, not the reserved
+    one, so the just-started sandbox does not leak.
+    """
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr("omnigent.server.managed_hosts._ONLINE_POLL_INTERVAL_S", 0.01)
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(started_sandbox_id="microvm-real-2")
+    config = _injected_config(fake)
+
+    with pytest.raises(HTTPException):
+        await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+
+    assert fake.terminated == ["microvm-real-2"]
+
+
+async def test_launch_terminates_real_sandbox_when_id_write_fails(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    If persisting the start-assigned id fails, the row still names the reserved
+    id. Cleanup must still release the real sandbox the provider just started,
+    and the first launch's row must not survive.
+    """
+    host_store = HostStore(db_uri)
+
+    def _failing_write(*_args: object, **_kwargs: object) -> Host | None:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(host_store, "update_sandbox_id", _failing_write)
+    fake = FakeSandboxLauncher(
+        on_host_start=_registering_host(host_store), started_sandbox_id="microvm-real-3"
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await launch_managed_host(
+            config=_injected_config(fake), owner=_OWNER, host_store=host_store
+        )
+
+    assert exc.value.status_code == 502
+    assert "microvm-real-3" in fake.terminated
+    assert len(fake.host_starts) == 1
+    assert host_store.get_host(fake.host_starts[0].host_id) is None
+
+
+@pytest.mark.parametrize("superseded", [False, True])
+async def test_relaunch_terminates_real_sandbox_when_id_write_fails(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, superseded: bool
+) -> None:
+    """A relaunch keeps its row on failure, and still releases the real new sandbox."""
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(
+        on_host_start=_registering_host(host_store), started_sandbox_id="microvm-gen-1"
+    )
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host = host_store.get_host(first.host_id)
+    assert host is not None and host.sandbox_id == "microvm-gen-1"
+
+    original_update = host_store.update_sandbox_id
+
+    def _failing_write(host_id: str, **kwargs: Any) -> Host | None:
+        if not superseded:
+            raise RuntimeError("database unavailable")
+        armed = host_store.get_host(host_id)
+        assert armed is not None and armed.sandbox_id is not None
+        replacement = host_store.rearm_managed_host(
+            host_id,
+            sandbox_id=armed.sandbox_id,
+            expected_updated_at=armed.updated_at,
+            token="replacement-token",
+            token_expires_at=now_epoch() + 3600,
+        )
+        assert replacement is not None
+        return original_update(host_id, **kwargs)
+
+    monkeypatch.setattr(host_store, "update_sandbox_id", _failing_write)
+    fake._started_sandbox_id = "microvm-gen-2"
+
+    with pytest.raises(HTTPException):
+        await relaunch_managed_host(host=host, host_store=host_store, config=config)
+
+    assert "microvm-gen-2" in fake.terminated
+    kept = host_store.get_host(first.host_id)
+    assert kept is not None
+    if superseded:
+        assert kept.sandbox_id == "sb-fake-2"
+        assert host_store.resolve_launch_token(first.host_id, "replacement-token") is not None
+        assert fake.terminated == ["microvm-gen-1", "microvm-gen-2"]
+
+
+async def test_relaunch_timeout_releases_the_start_assigned_sandbox(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A relaunch whose host never comes online detaches and terminates the id
+    start_host assigned. The row holds that id by then, not the reserved one,
+    so cleanup keyed off the reserved id would leave the new sandbox running.
+    """
+    host_store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(
+        on_host_start=_registering_host(host_store), started_sandbox_id="microvm-gen-1"
+    )
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host_store.set_offline(first.host_id)
+    host = host_store.get_host(first.host_id)
+    assert host is not None and host.sandbox_id == "microvm-gen-1"
+
+    # The replacement starts but its host never connects.
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr("omnigent.server.managed_hosts._ONLINE_POLL_INTERVAL_S", 0.01)
+    fake._on_host_start = None
+    fake._started_sandbox_id = "microvm-gen-2"
+
+    with pytest.raises(HTTPException):
+        await relaunch_managed_host(host=host, host_store=host_store, config=config)
+
+    assert fake.terminated == ["microvm-gen-1", "microvm-gen-2"]
+    kept = host_store.get_host(first.host_id)
+    assert kept is not None
+    assert kept.sandbox_id is None and kept.terminating_sandbox_id is None
+    relaunch = fake.host_starts[-1]
+    assert host_store.resolve_launch_token(relaunch.host_id, relaunch.token) is None
+
+
+class _NoStartedIdLauncher(FakeSandboxLauncher):
+    """A launcher with no ``started_sandbox_id``, like a duck-typed one an
+    embedding deployment injects."""
+
+    @property
+    def started_sandbox_id(self) -> str | None:
+        raise AttributeError("started_sandbox_id")
+
+
+async def test_launch_accepts_a_launcher_without_started_sandbox_id(db_uri: str) -> None:
+    """
+    A launcher that lacks the attribute keeps its provision-time id. Reading it
+    directly would raise after start_host succeeded and tear down the sandbox
+    that just started.
+    """
+    host_store = HostStore(db_uri)
+    fake = _NoStartedIdLauncher(on_host_start=_registering_host(host_store))
+
+    result = await launch_managed_host(
+        config=_injected_config(fake), owner=_OWNER, host_store=host_store
+    )
+
+    host = host_store.get_host(result.host_id)
+    assert host is not None and host.sandbox_id == "sb-fake-1"
+    assert fake.terminated == []
+
+
+@pytest.mark.parametrize("rearmed", [False, True])
+async def test_update_sandbox_id_is_fenced_to_the_armed_generation(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, rearmed: bool
+) -> None:
+    """An ID swap preserves both the armed credential and the last liveness observation."""
+    import omnigent.stores.host_store as hosts
+
+    observed_at = now_epoch()
+    monkeypatch.setattr(hosts, "now_epoch", lambda: observed_at)
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="5d2f0d1a9a6c4c0f8f3b7e2a1c4d6e8f",
+        name="managed-fence",
+        user_id=_OWNER,
+        token="tok-fence",
+        provider="lambda_microvm",
+        sandbox_id="managed-fence",
+        token_expires_at=observed_at + 3600,
+    )
+    stale = host_store.update_sandbox_id(
+        host.host_id,
+        expected_sandbox_id="some-other-generation",
+        expected_token="tok-fence",
+        sandbox_id="microvm-x",
+    )
+    assert stale is None
+    assert host_store.get_host(host.host_id) == host
+
+    token = "tok-replacement" if rearmed else "tok-fence"
+    if rearmed:
+        replacement = host_store.rearm_managed_host(
+            host.host_id,
+            sandbox_id="managed-fence",
+            expected_updated_at=host.updated_at,
+            token=token,
+            token_expires_at=observed_at + 3600,
+        )
+        assert replacement is not None
+    connected = host_store.upsert_on_connect(
+        host_id=host.host_id, name=host.name, user_id=_OWNER, managed_token=token
+    )
+    monkeypatch.setattr(hosts, "now_epoch", lambda: observed_at + hosts.HOST_LIVENESS_TTL_S + 1)
+    assert not host_store.is_online(host.host_id)
+    if rearmed:
+        delayed = host_store.update_sandbox_id(
+            host.host_id,
+            expected_sandbox_id="managed-fence",
+            expected_token="tok-fence",
+            sandbox_id="microvm-old-launch",
+        )
+        assert delayed is None
+        assert host_store.get_host(host.host_id) == connected
+        assert host_store.resolve_launch_token(host.host_id, "tok-fence") is None
+
+    swapped = host_store.update_sandbox_id(
+        host.host_id,
+        expected_sandbox_id="managed-fence",
+        expected_token=token,
+        sandbox_id="microvm-x",
+    )
+    assert swapped is not None and swapped.sandbox_id == "microvm-x"
+    assert swapped.updated_at == connected.updated_at
+    assert not host_store.is_online(host.host_id)
+    assert host_store.resolve_launch_token(host.host_id, token) is not None
 
 
 async def test_launch_unsupported_yaml_provider_rejects_before_provisioning(
@@ -2843,14 +3359,73 @@ async def test_launch_host_start_failure_terminates_and_deletes_host(db_uri: str
     """
     fake = FakeSandboxLauncher(fail_on_host_start=True)
     host_store = HostStore(db_uri)
+    state = ManagedLaunch(settled=asyncio.Event())
 
     with pytest.raises(HTTPException) as exc:
         await launch_managed_host(
-            config=_injected_config(fake), owner=_OWNER, host_store=host_store
+            config=_injected_config(fake), owner=_OWNER, host_store=host_store, launch_state=state
         )
+    assert state.host_online_failure_hint is None
     assert exc.value.status_code == 502
     assert "simulated in-sandbox host start failure" in exc.value.detail
     assert fake.terminated == ["sb-fake-1"]
+    assert host_store.list_hosts(_OWNER) == []
+
+
+@pytest.mark.parametrize("relaunch", [False, True])
+async def test_cancelled_launch_releases_provider_recovery_hint(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, relaunch: bool
+) -> None:
+    from omnigent.server.routes._sessions.helpers import _provision_managed_sandbox
+
+    tracker = ManagedLaunchTracker()
+    tracker.begin("conv-hint")
+    state = tracker.get("conv-hint")
+    assert state is not None
+    host_started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    fake = FakeSandboxLauncher(
+        on_host_start=lambda _invocation: loop.call_soon_threadsafe(host_started.set)
+    )
+    monkeypatch.setattr(
+        fake, "host_online_failure_hint", lambda sandbox_id: f"Inspect logs for {sandbox_id}"
+    )
+    host_store = HostStore(db_uri)
+    existing = None
+    if relaunch:
+        existing = host_store.register_managed_host(
+            host_id=uuid.uuid4().hex,
+            name="durable-host",
+            user_id=_OWNER,
+            token="old-token",
+            token_expires_at=now_epoch() + 3600,
+            provider=fake.provider,
+            sandbox_id="old-sandbox",
+        )
+    launch = asyncio.create_task(
+        _provision_managed_sandbox(
+            session_id="conv-hint",
+            owner=_OWNER,
+            sandbox_config=_injected_config(fake),
+            repos=(),
+            tracker=tracker,
+            host_store=host_store,
+            relaunch_host=existing,
+        )
+    )
+    try:
+        await asyncio.wait_for(host_started.wait(), 5)
+        assert state.host_online_failure_hint is not None
+        assert state.host_online_failure_hint() == "Inspect logs for sb-fake-1"
+    finally:
+        launch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+    assert state.host_online_failure_hint is None
+    # Cancellation leaves the sandbox for its caller's cleanup.
+    [host] = host_store.list_hosts(_OWNER)
+    await terminate_managed_host(host, host_store, _injected_config(fake))
+    assert fake.terminated == (["old-sandbox"] if relaunch else []) + ["sb-fake-1"]
     assert host_store.list_hosts(_OWNER) == []
 
 
@@ -3114,7 +3689,9 @@ class _ReusedIdFakeLauncher(FakeSandboxLauncher):
         return name
 
 
-async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str) -> None:
+async def test_relaunch_rejects_pending_reused_id_then_allows_retry(
+    db_uri: str, monkeypatch
+) -> None:
     host_store = HostStore(db_uri)
 
     def _register(invocation: HostStartInvocation) -> None:
@@ -3137,12 +3714,19 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
     )
     pending = host_store.get_host(active.host_id)
     assert pending is not None
+    terminate = fake.terminate
+
+    def unavailable(sandbox_id):
+        raise RuntimeError("provider cleanup unavailable")
+
+    monkeypatch.setattr(fake, "terminate", unavailable)
 
     with pytest.raises(HTTPException) as exc:
         await relaunch_managed_host(config=config, host=pending, host_store=host_store)
 
-    assert exc.value.status_code == 409
-    assert "host lifecycle" in exc.value.detail
+    assert exc.value.status_code == 502
+    assert "cleanup failed" in exc.value.detail
+    assert len(fake.provisioned_names) == 1
     assert len(fake.host_starts) == 1
     assert fake.terminated == []
     still_pending = host_store.get_host(active.host_id)
@@ -3150,6 +3734,7 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
     assert still_pending.sandbox_id is None
     assert still_pending.terminating_sandbox_id == active.name
 
+    monkeypatch.setattr(fake, "terminate", terminate)
     reaper = ManagedSandboxReaper(host_store=host_store, sandbox_config=config)
     assert await reaper.sweep_once() == 1
     assert fake.terminated == [active.name]
@@ -3219,7 +3804,21 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
     assert host_store.resolve_launch_token(fake.host_starts[0].host_id, gen1_token) is None
 
 
-async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) -> None:
+@pytest.mark.parametrize(
+    "connected_then_failed,cleanup_error,pending_cleanup",
+    [(False, None, None), (True, None, None), (True, None, "ready"), (True, None, "blocked")]
+    + [
+        (True, method, None)
+        for method in ("get_host", "detach_stale_managed_sandbox", "mark_sandbox_terminated")
+    ],
+)
+async def test_relaunch_failure_keeps_host_row_and_revokes_token(
+    db_uri: str,
+    monkeypatch,
+    connected_then_failed: bool,
+    cleanup_error: str | None,
+    pending_cleanup,
+) -> None:
     """
     A FAILED relaunch must not delete the durable host row — deleting
     it would null the session's host binding (FK SET NULL) and make
@@ -3229,45 +3828,86 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
     row.
     """
     host_store = HostStore(db_uri)
+    fail_launch = False
 
     def _register(invocation: HostStartInvocation) -> None:
         """Simulate the sandbox host connecting over the tunnel."""
+        if fail_launch:
+            monkeypatch.setattr(
+                "omnigent.stores.host_store.now_epoch", lambda: gen1.updated_at + 1
+            )
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
         )
+        if fail_launch:
+            host_store.set_offline(invocation.host_id)
+            if cleanup_error:
+                original = getattr(host_store, cleanup_error)
+
+                def fail_cleanup_once(*args, **kwargs):
+                    monkeypatch.setattr(host_store, cleanup_error, original)
+                    raise RuntimeError("cleanup database unavailable")
+
+                monkeypatch.setattr(host_store, cleanup_error, fail_cleanup_once)
+            raise RuntimeError("Host disconnected during startup")
 
     fake = FakeSandboxLauncher(on_host_start=_register)
     config = _injected_config(fake)
     first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
     gen1 = host_store.get_host(first.host_id)
     assert gen1 is not None
+    if pending_cleanup:
+        host_store.set_offline(gen1.host_id)
+        gen1 = host_store.get_host(gen1.host_id)
+        assert host_store.detach_stale_managed_sandbox(
+            gen1.host_id, sandbox_id=gen1.sandbox_id, expected_updated_at=gen1.updated_at
+        )
+        gen1 = host_store.get_host(gen1.host_id)
+    terminate = fake.terminate
+    if pending_cleanup == "blocked":
 
-    fake.fail_on_host_start = True
+        def fail_termination(sandbox_id):
+            raise RuntimeError("provider cleanup unavailable")
+
+        monkeypatch.setattr(fake, "terminate", fail_termination)
+
+    fail_launch = True
+    fake.fail_on_host_start = not connected_then_failed
     with pytest.raises(HTTPException) as exc:
         await relaunch_managed_host(config=config, host=gen1, host_store=host_store)
 
     assert exc.value.status_code == 502
+    if pending_cleanup == "blocked":
+        assert "cleanup failed" in exc.value.detail
+        assert len(fake.provisioned_names) == 1
+        assert host_store.get_host(first.host_id).terminating_sandbox_id == "sb-fake-1"
+        monkeypatch.setattr(fake, "terminate", terminate)
+        with pytest.raises(HTTPException) as exc:
+            await relaunch_managed_host(config=config, host=gen1, host_store=host_store)
+    if connected_then_failed:
+        assert "Host disconnected during startup" in exc.value.detail
+    host = host_store.get_host(first.host_id)
+    assert host is not None
+    if cleanup_error in ("get_host", "detach_stale_managed_sandbox"):
+        # Unknown ownership must retain the sandbox for a later recovery attempt.
+        assert fake.terminated == ["sb-fake-1"]
+        assert host.sandbox_id == "sb-fake-2"
+        return
     # Both the dead generation 1 and the failed generation 2 sandboxes
     # were terminated — nothing leaks until the provider lifetime cap.
     assert fake.terminated == ["sb-fake-1", "sb-fake-2"]
     # The row SURVIVES the failure (contrast the first-launch failure
     # tests, which delete it), so the session binding stays relaunchable.
-    host = host_store.get_host(first.host_id)
-    assert host is not None
-    # No credential of ANY generation is live: gen 1's was replaced by
-    # the re-arm, and the re-armed token was revoked by the failure
-    # cleanup (revoke_launch_token — covered directly in the host-store
-    # suite). Gen 1's raw token is the only one observable here (the
-    # failed start never executed), so assert on it.
-    assert (
-        host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
-        is None
-    )
+    for invocation in fake.host_starts:
+        assert host_store.resolve_launch_token(invocation.host_id, invocation.token) is None
 
 
-async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
+@pytest.mark.parametrize("during_provision", [False, True])
+async def test_relaunch_does_not_recreate_deleted_host(
+    db_uri: str, during_provision, monkeypatch
+) -> None:
     """A relaunch that loses to full teardown cleans up its new sandbox."""
     host_store = HostStore(db_uri)
     host = host_store.register_managed_host(
@@ -3279,8 +3919,17 @@ async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
         sandbox_id="sb-deleted-old",
         token_expires_at=now_epoch() + 3600,
     )
-    host_store.delete_host(host.host_id)
     fake = FakeSandboxLauncher()
+    if during_provision:
+        provision = fake.provision
+
+        def delete_during_provision(name):
+            host_store.delete_host(host.host_id)
+            return provision(name)
+
+        monkeypatch.setattr(fake, "provision", delete_during_provision)
+    else:
+        host_store.delete_host(host.host_id)
 
     with pytest.raises(HTTPException) as exc:
         await relaunch_managed_host(
@@ -3290,9 +3939,11 @@ async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
         )
 
     assert exc.value.status_code == 409
-    assert "no longer exists" in exc.value.detail
-    assert fake.terminated == ["sb-deleted-old", "sb-fake-1"]
+    assert fake.terminated == (["sb-deleted-old", "sb-fake-1"] if during_provision else [])
     assert host_store.get_host(host.host_id) is None
+    if not during_provision:
+        tombstone = host_store.get_host(host.host_id, include_deleted=True)
+        assert tombstone is not None and tombstone.sandbox_id == "sb-deleted-old"
 
 
 async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
@@ -4082,6 +4733,234 @@ async def test_resume_managed_host_does_not_recreate_deleted_host(
     assert host_store.get_host(host.host_id) is None
 
 
+class _LambdaFakeLauncher(FakeSandboxLauncher):
+    """A host-preserving resumable fake under the lambda_microvm provider name."""
+
+    provider: ClassVar[str] = "lambda_microvm"
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(can_resume=True, resume_preserves_host=True, **kwargs)
+
+
+async def test_resume_preserves_host_keeps_token_and_skips_restart(db_uri: str) -> None:
+    """
+    A snapshot-preserving provider (Lambda MicroVMs) thaws the whole guest, so
+    the wake resumes the sandbox, keeps the launch token the thawed host still
+    holds, and never restarts the host.
+    """
+    host_store = HostStore(db_uri)
+    fake = _LambdaFakeLauncher(on_host_start=_registering_host(host_store))
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    first_token = fake.host_starts[0].token
+    host_store.set_offline(first.host_id)
+
+    # The thawed host reconnects on its own with its original token.
+    def _resume_then_reconnect(sandbox_id: str) -> None:
+        fake.resumed.append(sandbox_id)
+        assert host_store.resolve_launch_token(first.host_id, first_token) is not None
+        host_store.upsert_on_connect(
+            host_id=first.host_id, name="managed-x", user_id=_OWNER, managed_token=first_token
+        )
+
+    fake.resume = _resume_then_reconnect  # type: ignore[method-assign]
+
+    await resume_managed_host(first.host_id, host_store, config)
+
+    assert fake.resumed == ["sb-fake-1"]
+    assert len(fake.host_starts) == 1
+    woke = host_store.get_host(first.host_id)
+    assert woke is not None
+    assert woke.status == "online"
+    assert host_store.resolve_launch_token(first.host_id, first_token) is not None
+
+
+@pytest.mark.parametrize("stale", [False, True])
+@pytest.mark.parametrize("heartbeat", [False, True])
+async def test_lambda_forced_wake_preserves_existing_tunnel_liveness(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, stale: bool, heartbeat: bool
+) -> None:
+    """Exercise the real launcher and SQL claim with only AWS's response stubbed."""
+    import boto3
+    from botocore.stub import Stubber
+
+    import omnigent.server.managed_hosts as managed
+    import omnigent.stores.host_store as hosts
+    from omnigent.onboarding.sandboxes.lambda_microvm import LambdaMicroVMSandboxLauncher
+
+    store = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    token = "existing-host-token"
+    observed_at = now_epoch() - (hosts.HOST_LIVENESS_TTL_S + 1 if stale else 1)
+    with monkeypatch.context() as clock:
+        clock.setattr(hosts, "now_epoch", lambda: observed_at)
+        store.register_managed_host(
+            host_id=host_id,
+            name="running-host",
+            user_id=_OWNER,
+            token=token,
+            provider="lambda_microvm",
+            sandbox_id="microvm-running",
+            token_expires_at=now_epoch() + 3600,
+        )
+        store.upsert_on_connect(
+            host_id=host_id,
+            name="running-host",
+            user_id=_OWNER,
+            managed_token=token,
+        )
+    launcher = LambdaMicroVMSandboxLauncher(
+        image_identifier="arn:aws:lambda:us-east-1:123456789012:microvm-image:test",
+        execution_role_arn="arn:aws:iam::123456789012:role/test",
+    )
+    client = boto3.client(
+        "lambda-microvms",
+        region_name="us-east-1",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+    )
+    launcher._client = client
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://srv.example.com",
+            launcher_factory=lambda: launcher,
+            token_ttl_s=3600,
+        )
+    )
+    monkeypatch.setattr(managed, "MANAGED_HOST_ONLINE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(managed, "_ONLINE_POLL_INTERVAL_S", 0.005)
+
+    def after_resume(**kwargs: Any) -> None:
+        # The claim has completed. A host on another replica keeps heartbeating
+        # over its existing authenticated tunnel; no reconnect is forced.
+        claimed = store.get_host(host_id)
+        assert claimed is not None and claimed.updated_at == observed_at
+        assert claimed.status == "online"
+        if heartbeat:
+            store.heartbeat(host_id, managed_token=token, token_ttl_s=3600)
+
+    client.meta.events.register("after-call.*.ResumeMicrovm", after_resume)
+    with Stubber(client) as stub:
+        stub.add_client_error(
+            "resume_microvm",
+            service_error_code="ConflictException",
+            service_message="MicroVM is already running",
+            http_status_code=409,
+            expected_params={"microvmIdentifier": "microvm-running"},
+        )
+        if heartbeat:
+            await resume_managed_host(host_id, store, config, force=True)
+        else:
+            with pytest.raises(HTTPException, match="did not come online") as caught:
+                await resume_managed_host(host_id, store, config, force=True)
+            assert caught.value.status_code == 502
+        stub.assert_no_pending_responses()
+    current = store.get_host(host_id)
+    assert current is not None and current.status == "online"
+    assert current.sandbox_id == "microvm-running"
+    assert current.updated_at > observed_at if heartbeat else current.updated_at == observed_at
+    assert store.resolve_launch_token(host_id, token) is not None
+
+
+@pytest.mark.parametrize("value", [None, "1", "600", "1800", "0", "1801", "nan", "1.5"])
+async def test_managed_online_timeout_environment(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    import omnigent.server.managed_hosts as managed
+
+    name = "OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S"
+    monkeypatch.delenv(name, raising=False)
+    if value is not None:
+        monkeypatch.setenv(name, value)
+    if value in {"0", "1801", "nan", "1.5"}:
+        with pytest.raises(ValueError, match=name):
+            managed._managed_host_online_timeout_s()
+    else:
+        assert managed._managed_host_online_timeout_s() == (120 if value is None else int(value))
+
+
+async def test_managed_online_timeout_is_applied_at_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S", "600")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from omnigent.server.managed_hosts import "
+            "MANAGED_HOST_ONLINE_TIMEOUT_S, MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S; "
+            "print(MANAGED_HOST_ONLINE_TIMEOUT_S, MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S)",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "600 720"
+
+
+async def test_resume_preserving_host_claims_before_asking_the_provider(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generation the reaper detached first is never resumed, only released."""
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="9b1e3c5a7d9f4b2e8c6a4e2c0a8f6d4b",
+        name="managed-preserve-race",
+        user_id=_OWNER,
+        token="tok-preserve-race",
+        provider="lambda_microvm",
+        sandbox_id="microvm-race",
+        token_expires_at=now_epoch() + 3600,
+    )
+    original_claim = host_store.claim_managed_host_resume
+
+    def _detach_before_claim(
+        requested_host_id: str, *, sandbox_id: str, expected_updated_at: int
+    ) -> Host | None:
+        assert host_store.detach_stale_managed_sandbox(
+            requested_host_id, sandbox_id=sandbox_id, expected_updated_at=expected_updated_at
+        )
+        return original_claim(
+            requested_host_id, sandbox_id=sandbox_id, expected_updated_at=expected_updated_at
+        )
+
+    monkeypatch.setattr(host_store, "claim_managed_host_resume", _detach_before_claim)
+    fake = _LambdaFakeLauncher()
+
+    await resume_managed_host(host.host_id, host_store, _injected_config(fake))
+
+    assert fake.resumed == []
+    assert fake.terminated == ["microvm-race"]
+    assert fake.host_starts == []
+
+
+async def test_resume_preserving_host_propagates_gone(db_uri: str) -> None:
+    """A VM past its lifetime surfaces as SandboxGoneError so the caller relaunches."""
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="1f3e5d7c9b2a4f6e8d0c2b4a6f8e0d2c",
+        name="managed-preserve-gone",
+        user_id=_OWNER,
+        token="tok-preserve-gone",
+        provider="lambda_microvm",
+        sandbox_id="microvm-gone",
+        token_expires_at=now_epoch() + 3600,
+    )
+    fake = _LambdaFakeLauncher()
+
+    def _gone(sandbox_id: str) -> None:
+        raise SandboxGoneError(f"Lambda MicroVM '{sandbox_id}' no longer exists")
+
+    fake.resume = _gone  # type: ignore[method-assign]
+
+    with pytest.raises(SandboxGoneError):
+        await resume_managed_host(host.host_id, host_store, _injected_config(fake))
+
+    kept = host_store.get_host(host.host_id)
+    assert kept is not None and kept.sandbox_id == "microvm-gone"
+    assert fake.host_starts == []
+
+
 # ── terminate_managed_host ──────────────────────────────────
 
 
@@ -4561,14 +5440,14 @@ def test_deployment_rejects_empty_configs() -> None:
 
 def test_parse_multi_provider_shares_top_level_keys() -> None:
     """
-    ``server_url`` / ``host_config`` are written once and ride into
-    every entry.
+    Shared server, host, and token settings apply to every entry.
     """
     host_config: dict[str, object] = {"telemetry": {"enabled": False}}
     config = parse_sandbox_config(
         {
             "server_url": "https://s.example.com",
             "host_config": host_config,
+            "token_ttl_s": 3600,
             "providers": [{"provider": "modal"}, {"provider": "e2b"}],
         }
     )
@@ -4576,6 +5455,27 @@ def test_parse_multi_provider_shares_top_level_keys() -> None:
     for entry in config.offered():
         assert entry.server_url == "https://s.example.com"
         assert entry.host_config == host_config
+        assert entry.token_ttl_s == 3600
+
+
+def test_parse_multi_provider_token_ttl_overrides_shared_value() -> None:
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "token_ttl_s": 3600,
+            "providers": [
+                {"provider": "modal", "token_ttl_s": 600},
+                {"provider": "daytona", "token_ttl_s": None},
+                {"provider": "blaxel", "token_ttl_s": None, "blaxel": {"ttl": "24h"}},
+            ],
+        }
+    )
+    assert config is not None
+    assert [entry.token_ttl_s for entry in config.offered()] == [
+        600,
+        DAYTONA_MANAGED_TOKEN_TTL_S,
+        blaxel_managed_token_ttl_s("24h"),
+    ]
 
 
 def test_parse_multi_provider_validates_provider_blocks() -> None:
@@ -5568,7 +6468,13 @@ async def test_recreated_sandbox_records_and_publishes_workspace_reset_notice(
             assert session_id == "conv_1"
             assert host_id == "host_1"
             assert workspace == "/root/workspace/omnigent"
-            return SimpleNamespace(id=session_id, host_id=host_id, workspace=workspace)
+            return SimpleNamespace(
+                id=session_id,
+                host_id=host_id,
+                workspace=workspace,
+                labels={},
+                terminal_launch_args=None,
+            )
 
         def append(self, session_id: str, items: list[object]) -> list[object]:
             assert session_id == "conv_1"
@@ -5871,13 +6777,25 @@ def contributed_acme_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     reset_plugin_state_for_tests()
 
 
+@pytest.mark.parametrize("manages_profiles", [False, True])
 def test_parse_contributed_provider_builds_registry_backed_factory(
     contributed_acme_provider: None,
+    monkeypatch: pytest.MonkeyPatch,
+    manages_profiles: bool,
 ) -> None:
     """
     A provider contributed through the entry point group is configurable and
     serves managed sessions, without being named in this module.
     """
+    from omnigent.onboarding.sandboxes import registry
+
+    metadata = registry.get_provider_metadata("acme")
+    assert metadata is not None
+    monkeypatch.setitem(
+        registry.plugin_state().providers,
+        "acme",
+        replace(metadata, manages_profiles=manages_profiles),
+    )
     cfg = parse_sandbox_config(
         {
             "provider": "acme",
@@ -5892,12 +6810,69 @@ def test_parse_contributed_provider_builds_registry_backed_factory(
     # told the sandbox option works rather than offered one that 400s.
     assert cfg.managed_launch_supported is True
     assert cfg.token_ttl_s == 1234
+    with monkeypatch.context() as no_import:
+        no_import.delitem(sys.modules, f"{COMMUNITY_MODULE_PREFIX}acme")
+        assert cfg.manages_profiles is manages_profiles
 
     launcher = cfg.launcher_factory()
     assert isinstance(launcher, _AcmeLauncher)
     # The `sandbox.acme` block reached the launcher through the config_model
     # the registry documents, rather than being silently dropped.
     assert launcher.config.namespace == "sandboxes"
+
+
+@pytest.mark.parametrize(
+    ("manages_profiles", "default_profile_id", "error"),
+    [
+        (True, "build", None),
+        (True, None, None),
+        (False, "build", "requires a provider that manages sandbox profiles"),
+        (True, "Build!", "must be a profile id"),
+        (True, 7, "must be a profile id"),
+    ],
+)
+def test_parse_default_profile_id(
+    contributed_acme_provider: None,
+    monkeypatch: pytest.MonkeyPatch,
+    manages_profiles: bool,
+    default_profile_id: object,
+    error: str | None,
+) -> None:
+    """`sandbox.default_profile_id` names a profile only for a profile-managing provider."""
+    from omnigent.onboarding.sandboxes import registry
+
+    metadata = registry.get_provider_metadata("acme")
+    assert metadata is not None
+    monkeypatch.setitem(
+        registry.plugin_state().providers,
+        "acme",
+        replace(metadata, manages_profiles=manages_profiles),
+    )
+    raw = {
+        "provider": "acme",
+        "server_url": "https://s.example.com",
+        "acme": {"namespace": "sandboxes"},
+        "default_profile_id": default_profile_id,
+    }
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            parse_sandbox_config(raw)
+        return
+    cfg = parse_sandbox_config(raw)
+    assert cfg is not None
+    assert cfg.default.default_profile_id == default_profile_id
+
+
+def test_default_profile_id_belongs_inside_a_provider_entry() -> None:
+    """Shared keys reach every listed provider, so a top-level default would mis-apply."""
+    with pytest.raises(ValueError, match=r"inside that provider's 'sandbox\.providers' entry"):
+        parse_sandbox_config(
+            {
+                "server_url": "https://s.example.com",
+                "default_profile_id": "build",
+                "providers": [{"provider": "kubernetes"}],
+            }
+        )
 
 
 def test_contributed_provider_config_is_validated(
@@ -6062,3 +7037,173 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
         await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=hosts)
     assert len(fake.terminated) == 1
     assert fake.host_starts == []
+
+
+@pytest.mark.parametrize("waiter_timeout", [False, True])
+@pytest.mark.parametrize("started_sandbox_id", [None, "microvm-recovered"])
+async def test_siblings_share_one_recovery_across_host_stores(
+    db_uri, monkeypatch, waiter_timeout, started_sandbox_id
+) -> None:
+    if waiter_timeout:
+        monkeypatch.setattr(
+            "omnigent.server.managed_hosts.MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S", 0.05
+        )
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 1)
+    store = HostStore(db_uri)
+    host = store.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="shared-recovery",
+        user_id=_OWNER,
+        token="old-token",
+        provider="modal",
+        sandbox_id="old-sandbox",
+        token_expires_at=now_epoch() + 3600,
+    )
+    from omnigent.server.routes._sessions.orchestration import _run_managed_launch
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    sessions = [conversations.create_conversation() for _ in range(2)]
+    workspaces = ["/root/workspace/repo", "/root/workspace/repo/tests"]
+    for session, workspace in zip(sessions, workspaces, strict=True):
+        conversations.set_host_id(session.id, host.host_id, workspace)
+
+    recovered: list[ManagedHostLaunch] = []
+
+    async def capture_recovery(**kwargs):
+        result = await relaunch_managed_host(**kwargs)
+        recovered.append(result)
+        return result
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.relaunch_managed_host", capture_recovery)
+
+    async def recover(index, host_store):
+        tracker = ManagedLaunchTracker()
+        tracker.begin(sessions[index].id)
+        await _run_managed_launch(
+            session_id=sessions[index].id,
+            owner=_OWNER,
+            sandbox_config=_injected_config(fake),
+            repos=[],
+            tracker=tracker,
+            conversation_store=conversations,
+            host_store=host_store,
+            host_registry=None,
+            tunnel_registry=None,
+            relaunch_host=host,
+        )
+        if index == 1 and waiter_timeout:
+            state = tracker.get(sessions[index].id)
+            assert state is not None and state.error is not None
+            assert "Timed out waiting for shared sandbox recovery" in state.error
+        else:
+            assert tracker.get(sessions[index].id) is None
+
+    gate = threading.Event()
+    fake = FakeSandboxLauncher(
+        provision_gate=gate,
+        started_sandbox_id=started_sandbox_id,
+        on_host_start=lambda invocation: store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        ),
+    )
+    first = asyncio.create_task(recover(0, store))
+    second_store = HostStore(db_uri)
+    joined = asyncio.Event()
+    original = second_store.claim_managed_recovery
+    loop = asyncio.get_running_loop()
+
+    def claim(snapshot: Host, token: str) -> bool:
+        result = original(snapshot, token)
+        assert not result
+        loop.call_soon_threadsafe(joined.set)
+        return result
+
+    monkeypatch.setattr(second_store, "claim_managed_recovery", claim)
+    second = None
+    try:
+        async with asyncio.timeout(10):
+            while not fake.prepared:
+                await asyncio.sleep(0.01)
+            second = asyncio.create_task(recover(1, second_store))
+            await joined.wait()
+            if waiter_timeout:
+                await second
+                assert not first.done()
+            else:
+                await asyncio.sleep(1.1)
+                assert not second.done()
+            gate.set()
+            await asyncio.gather(first, second)
+        restored = [conversations.get_conversation(session.id) for session in sessions]
+        assert [session.workspace for session in restored] == workspaces
+        assert {session.host_id for session in restored} == {host.host_id}
+        assert len(recovered) == (1 if waiter_timeout else 2)
+        assert {result.sandbox_id for result in recovered} == {started_sandbox_id or "sb-fake-1"}
+        assert len(fake.provisioned_names) == 1
+        assert fake.terminated == ["old-sandbox"]
+    finally:
+        gate.set()
+        if second is not None and not second.done():
+            second.cancel()
+        await asyncio.gather(
+            first, *([second] if second is not None else []), return_exceptions=True
+        )
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+async def test_recovery_bookkeeping_errors_preserve_launch_outcome(db_uri, monkeypatch, outcome):
+    from omnigent.server import managed_hosts
+
+    store = HostStore(db_uri)
+    host = store.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="recovery-errors",
+        user_id=_OWNER,
+        token="initial",
+        provider="modal",
+        sandbox_id="old",
+        token_expires_at=now_epoch() + 3600,
+    )
+    heartbeat_seen = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    updates = []
+
+    def unavailable(*args, **kwargs):
+        updates.append(kwargs.get("finished", False))
+        loop.call_soon_threadsafe(heartbeat_seen.set)
+        raise RuntimeError("transient lease database failure")
+
+    expected = ManagedHostLaunch(
+        host_id=host.host_id, workspace="/work", sandbox_id="new", sandbox_provider="modal"
+    )
+
+    async def launch(**kwargs):
+        await asyncio.wait_for(heartbeat_seen.wait(), timeout=2)
+        if outcome == "error":
+            raise ValueError("original provision failure")
+        if outcome == "cancel":
+            task = asyncio.current_task()
+            assert task is not None
+            loop.call_soon(task.cancel)
+        return expected
+
+    monkeypatch.setattr(store, "update_managed_recovery", unavailable)
+    monkeypatch.setattr(managed_hosts, "_MANAGED_RECOVERY_HEARTBEAT_S", 0.001)
+    monkeypatch.setattr(managed_hosts, "_relaunch_managed_host", launch)
+    request = asyncio.create_task(
+        relaunch_managed_host(
+            config=_injected_config(FakeSandboxLauncher()), host=host, host_store=store
+        )
+    )
+    if outcome == "error":
+        with pytest.raises(ValueError, match="original provision failure"):
+            await request
+    elif outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await request
+    else:
+        assert await request == expected
+    assert updates[0] is False and updates[-1] is True

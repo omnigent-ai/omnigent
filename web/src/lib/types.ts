@@ -1,3 +1,4 @@
+import type { SandboxProfile } from "./sandboxProfilesApi";
 // Mirrors the response/error/usage types in
 // sdks/python-client/omnigent_client/_types.py.
 //
@@ -30,6 +31,12 @@ export interface ConversationRef {
 export interface RememberScope {
   tool: string;
   host?: string;
+}
+
+/** The untruncated file-edit tool call an approval gates, for rendering as a diff. */
+export interface FileEditRequest {
+  toolName: string;
+  toolInput: Record<string, unknown>;
 }
 
 /** Persistence scopes advertised by Codex for MCP tool approvals. */
@@ -273,8 +280,28 @@ export interface BackgroundTaskInfo {
   command?: string;
 }
 
+export interface SessionFamily {
+  id: string;
+  representative_id: string | null;
+  representative_title?: string | null;
+  pinned: boolean;
+  pinned_at?: string | null;
+}
+
 export interface Session {
+  family?: SessionFamily | null;
+  sandboxProfile?: SandboxProfile | null;
   projectId?: string | null;
+  /**
+   * The session whose Workspace rail lists this one as a side chat; `null` for
+   * anything else, including side chats from before the rail was server-listed.
+   */
+  sideChatParentId?: string | null;
+  /**
+   * Whether the viewer may start side chats here (only the owner of the
+   * session's root can); `null` when the server didn't say.
+   */
+  sideChatAllowed?: boolean | null;
   id: string;
   agentId: string;
   /**
@@ -301,10 +328,9 @@ export interface Session {
   /** Current host reachability; absent when the snapshot omits liveness. */
   hostOnline?: boolean;
   /**
-   * Whether this session's host is a dormant resumable managed host the
-   * server can wake on the next message. Carried on the snapshot so the open
-   * view shows a wakeable "asleep" state instead of the terminal host_offline
-   * dead-end. `false`/absent otherwise.
+   * Whether this session's host is a managed host the server can resume on
+   * the next message. Lets the open view show a resumable state instead of a
+   * terminal host_offline. `false`/absent otherwise.
    */
   hostResumable?: boolean;
   /**
@@ -326,6 +352,11 @@ export interface Session {
    * the count).
    */
   backgroundTasks?: BackgroundTaskInfo[];
+  /**
+   * Background agents a finished claude-native turn left running, while
+   * {@link status} is ``"waiting"``. Absent otherwise.
+   */
+  backgroundAgents?: BackgroundTaskInfo[];
   createdAt: number;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
@@ -458,6 +489,12 @@ export interface Session {
    */
   pendingInputs?: PendingInput[];
   /**
+   * Saved startup messages that were never delivered, e.g. because the
+   * managed sandbox host didn't come online. Their file blocks still resolve
+   * under this session. Empty when nothing failed or on older servers.
+   */
+  failedInputs?: PendingInput[];
+  /**
    * Requesting user's numeric permission level on this session
    * (1=read, 2=edit, 3=manage, 4=owner). ``null`` when permissions
    * are disabled or the user has no grant. For sub-agent (child)
@@ -521,8 +558,7 @@ export interface Session {
    * Managed-sandbox launch progress. Present while the session's
    * background sandbox launch is in flight or has failed; `null` for
    * sessions without a managed launch and once the launch succeeds.
-   * Sourced from the server's `_session_sandbox_status_cache` at
-   * snapshot build time so a client opening the session mid-launch
+   * Included in the snapshot so a client that opens the session mid-launch
    * sees the current stage.
    */
   sandboxStatus?: SandboxStatus | null;
@@ -582,6 +618,13 @@ export interface SkillSummary {
   description: string;
   /** Frontmatter ``name`` label, e.g. ``"Triage Issues"``; absent from older servers. */
   display_name?: string | null;
+}
+
+/** A host's discovered catalog plus the sources it could not read. */
+export interface SkillsCatalog {
+  skills: SkillSummary[];
+  /** User-facing notes, e.g. a failed `codex plugin list`; empty when complete. */
+  warnings: string[];
 }
 
 export type SkillsStatus = "loading" | "ready" | "error" | "unavailable";

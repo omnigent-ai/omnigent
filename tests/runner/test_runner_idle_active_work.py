@@ -9,6 +9,10 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
+import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -25,16 +29,23 @@ from omnigent.runner.app import (
     register_timer,
     unregister_timer,
 )
+from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import NullServerClient
+
+_HUMAN_WAIT_HOLD_ENV = "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S"
 
 
 @pytest.fixture(autouse=True)
-def _clean_global_active_work_state() -> None:
+def _clean_global_active_work_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Reset module-global timer / approval registries between tests.
 
+    Also clears an ambient human-wait hold so the default applies.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    monkeypatch.delenv(_HUMAN_WAIT_HOLD_ENV, raising=False)
     pending_approvals.reset_for_tests()
     for session_timers in list(_session_timers.values()):
         for task in list(session_timers.values()):
@@ -374,17 +385,22 @@ async def _post_status(client: Any, conv_id: str, status: str) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["running", "waiting"])
-async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: str) -> None:
+async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
     """A native terminal's in-flight status holds the watchdog until it settles.
 
     Native delivery leaves ``active_turns`` once the prompt is typed, so the
     terminal's ``running`` / ``waiting`` edge is the only sign of live work.
+    It is agent work, so a human-wait hold shorter than the check never ends it.
 
+    :param monkeypatch: Pytest monkeypatch fixture.
     :param status: In-flight native status to exercise.
     :returns: None.
     """
     from tests.runner.conftest import _runner_client
 
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0.01")
     conv_id = "conv_native_in_flight"
     app = await _native_app_with_session(conv_id)
     async with _runner_client(app) as client:
@@ -401,6 +417,358 @@ async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: s
             has_active_work=app.state.has_active_work,
             release=_release,
         )
+
+
+class _AdvanceableClock:
+    """Stand-in for the runner module's ``time`` whose monotonic clock can jump ahead."""
+
+    def __init__(self) -> None:
+        self._ahead_s = 0.0
+
+    def advance(self, seconds: float) -> None:
+        """Move the monotonic clock forward by *seconds*."""
+        self._ahead_s += seconds
+
+    def monotonic(self) -> float:
+        """Return the real monotonic time plus every advance so far."""
+        return time.monotonic() + self._ahead_s
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+def _publish_native_status(
+    app: FastAPI, conv_id: str, status: str, blocked_on: str | None
+) -> None:
+    """Publish one native watcher edge, as the claude-native pane watcher does.
+
+    :param app: Runner app under test.
+    :param conv_id: Session id, e.g. ``"conv_native"``.
+    :param status: Native status, e.g. ``"running"``.
+    :param blocked_on: Dialog the turn is parked on, e.g. ``"permission prompt"``.
+    :returns: None.
+    """
+    publish = app.state.session_resource_registry._session_status_publisher
+    assert publish is not None
+    publish(conv_id, status, blocked_on)
+
+
+@contextlib.asynccontextmanager
+async def _claude_native_pane_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, conv_id: str
+) -> AsyncIterator[tuple[FastAPI, Any]]:
+    """Serve a runner app whose session has a claude-native pane and no turn.
+
+    The pane shows no recent output or input until a test sets its mocks, and
+    approval-wait markers live under ``tmp_path / "approval-waits"``.
+
+    :param tmp_path: Pytest temp dir for the pane and the marker root.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param conv_id: Session id, e.g. ``"conv_native"``.
+    :returns: The app and the pane's terminal instance.
+    """
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.runner.native import NativeLaunchContext
+    from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.runner.helpers import make_test_terminal_instance
+
+    terminals = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", Mock())
+    monkeypatch.setattr(instance, "close", AsyncMock())
+    monkeypatch.setattr(instance, "screen_changed_within", Mock(return_value=False))
+    monkeypatch.setattr(instance, "client_interaction_within", Mock(return_value=False))
+    approval_root = tmp_path / "approval-waits"
+    approval_root.mkdir()
+    monkeypatch.setattr(bridge, "_APPROVAL_WAIT_ROOT", approval_root)
+    spec = AgentSpec(
+        spec_version=1,
+        name="claude-native-ui",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def launch(ctx: NativeLaunchContext):
+        terminals._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+        return await ctx.resource_registry.observe_required_terminal(
+            conv_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+        )
+
+    monkeypatch.setattr("omnigent.runner.native._launch_claude", launch)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"id": conv_id, "agent_id": "ag"})
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as server_client:
+        app = create_runner_app(
+            spec_resolver=await _spec_resolver_returning(spec),
+            server_client=server_client,
+            terminal_registry=terminals,
+        )
+        async with _runner_client(app) as client:
+            ensured = await client.post(
+                f"/v1/sessions/{conv_id}/resources/terminals",
+                json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+            )
+            assert ensured.status_code == 200, ensured.text
+            yield app, instance
+
+
+@pytest.mark.asyncio
+async def test_native_dialog_hold_zero_keeps_it_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``0`` restores the old behavior: a dialog holds the watchdog until it settles.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "0")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr("omnigent.runner.app.time", clock)
+    conv_id = "conv_native_dialog_unbounded"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        assert app.state.has_active_work() is True
+        clock.advance(10 * 24 * 60 * 60)
+        assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_native_dialog_hold_is_bounded_and_fresh_after_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn parked on a dialog holds the watchdog only for the hold, per dialog.
+
+    An unanswered dialog is not agent work, so it must not pin the runner
+    forever; once it is answered the running turn holds the watchdog again. The
+    watchdog does not check while a turn runs, so the next dialog's hold must
+    start fresh from its own edge, not from a check that happens to see it.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr("omnigent.runner.app.time", clock)
+    conv_id = "conv_native_dialog_episode"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        assert app.state.has_active_work() is True
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
+
+        # The answered dialog resumes the turn, which then parks on another dialog;
+        # nothing polls the watchdog in between.
+        _publish_native_status(app, conv_id, "running", None)
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        assert app.state.has_active_work() is True
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
+
+        _publish_native_status(app, conv_id, "running", None)
+        assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_permission_hook_wait_is_bounded_per_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permission hook parked on its verdict holds the watchdog only for the hold.
+
+    The parked turn still reads ``running``, so the hook's marker marks the human
+    wait. Each hook owns its marker, so a later hook gets a fresh hold, and a
+    hook that hands off to Claude's own prompt leaves a dialog with its own.
+
+    :param tmp_path: Pytest temp dir for the approval-wait marker root.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.harnesses.claude_native import bridge
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr("omnigent.runner.app.time", clock)
+    conv_id = "conv_parked_permission_hook"
+    async with _claude_native_pane_app(tmp_path, monkeypatch, conv_id) as (app, _instance):
+        first_hook = bridge.approval_wait_marker_path(conv_id)
+        assert first_hook.parent == tmp_path / "approval-waits"
+        second_hook = first_hook.with_name(f"{first_hook.name.split('.')[0]}.999999.wait")
+        _publish_native_status(app, conv_id, "running", None)
+        bridge.touch_approval_wait_marker(first_hook)
+        assert app.state.has_active_work() is True
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
+        assert app.state.has_sandbox_work() is False
+
+        bridge.touch_approval_wait_marker(second_hook)
+        assert app.state.has_active_work() is True
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
+
+        # Both hooks give up and Claude shows its own permission prompt.
+        bridge.clear_approval_wait_marker(first_hook)
+        bridge.clear_approval_wait_marker(second_hook)
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        assert app.state.has_active_work() is True
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
+
+        # Answering it resumes the running turn, which is agent work again.
+        _publish_native_status(app, conv_id, "running", None)
+        assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_a_check_on_another_thread_cannot_change_a_dialog_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale check from another thread neither ages nor restarts a dialog's hold.
+
+    The parent-death thread checks for active work off the event loop. Here it
+    reads a dialog and pauses while that dialog is answered and the next one
+    opens and starts its hold. When it resumes, the new dialog must keep its
+    original deadline.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import threading
+
+    from omnigent.runner import app as runner_app
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr(runner_app, "time", clock)
+    read_dialog = threading.Event()
+    resume = threading.Event()
+    real_is_native_harness = runner_app.is_native_harness
+
+    def pause_probe_after_reading_dialog(name: str | None) -> bool:
+        if threading.current_thread().name == "active-work-probe" and not read_dialog.is_set():
+            read_dialog.set()
+            assert resume.wait(5)
+        return real_is_native_harness(name)
+
+    monkeypatch.setattr(runner_app, "is_native_harness", pause_probe_after_reading_dialog)
+    conv_id = "conv_dialog_thread_race"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        probe = threading.Thread(target=app.state.has_active_work, name="active-work-probe")
+        probe.start()
+        assert await asyncio.to_thread(read_dialog.wait, 5)
+        # While the probe is paused, the dialog is answered and the next one opens.
+        _publish_native_status(app, conv_id, "running", None)
+        _publish_native_status(app, conv_id, "running", "permission prompt")
+        assert app.state.has_active_work() is True
+        resume.set()
+        await asyncio.to_thread(probe.join, 5)
+        assert not probe.is_alive()
+
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_replaced_prompt_waiter_gets_a_fresh_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An expired prompt waiter is stopped, and a later waiter starts a fresh hold.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr("omnigent.runner.app.time", clock)
+    monkeypatch.setattr("omnigent.runner.app._server_accepts_input_only_failures", True)
+    app = _scaffold_app()
+    sid = "conv_wait_episode_waiter"
+    tasks: list[asyncio.Task[None]] = []
+    try:
+        first = asyncio.create_task(asyncio.sleep(3600))
+        tasks.append(first)
+        app.state.claude_prompt_waiters[sid] = first
+        assert app.state.has_active_work() is True
+        clock.advance(59)
+        assert app.state.has_active_work() is True
+        clock.advance(2)
+        # Expired: the runner first reports any queued messages (none here) and
+        # stops the waiter on the loop, then lets go.
+        assert app.state.has_active_work() is True
+        await asyncio.sleep(0)
+        assert sid not in app.state.claude_prompt_waiters
+        assert app.state.has_active_work() is False
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        second = asyncio.create_task(asyncio.sleep(3600))
+        tasks.append(second)
+        app.state.claude_prompt_waiters[sid] = second
+        assert app.state.has_active_work() is True
+    finally:
+        for task in tasks:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 86400.0),
+        ("", 86400.0),
+        ("abc", 86400.0),
+        ("-1", 86400.0),
+        ("nan", 86400.0),
+        ("inf", 86400.0),
+        ("-inf", 86400.0),
+        ("0", 0.0),
+        ("30", 30.0),
+    ],
+)
+def test_resolve_human_wait_hold_s(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: float
+) -> None:
+    """The hold honors the env var and falls back to one day on a bad value.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param raw: Env var value, e.g. ``"30"``; ``None`` leaves it unset.
+    :param expected: Resolved hold in seconds.
+    :returns: None.
+    """
+    from omnigent.runner.app import _resolve_human_wait_hold_s
+
+    if raw is None:
+        monkeypatch.delenv(_HUMAN_WAIT_HOLD_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, raw)
+    assert _resolve_human_wait_hold_s() == expected
 
 
 @pytest.mark.asyncio
@@ -494,8 +862,24 @@ async def test_terminal_only_native_work_idle_accounting(
             )
 
 
+_API_ERROR_CAUSE = "The request exceeded the model's context window."
+# Longer than the published message's 1,024-character clip, so the raw envelope cannot
+# stand in for the cause it carries.
+_LONG_API_ERROR_ENVELOPE = "API Error: 500 " + json.dumps(
+    {"error": {"type": "api_error", "message": _API_ERROR_CAUSE}, "details": "x" * 1200}
+)
+_PANE_FAILURE_DETAILS = {
+    "pane_detail": "API Error: 499 Authorization: Bearer synthetic-secret-token",
+    "pane_envelope": _LONG_API_ERROR_ENVELOPE,
+    # Claude's own refusal of a turn whose context is full; no StopFailure hook follows.
+    "pane_overflow": "Prompt is too long",
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_source", ["forwarder", "pane"])
+@pytest.mark.parametrize(
+    "status_source", ["forwarder", "pane", "pane_detail", "pane_envelope", "pane_overflow"]
+)
 async def test_native_failed_status_releases_idle_pin(status_source: str) -> None:
     """A native ``failed`` edge settles the turn for the watchdog."""
     from tests.runner.conftest import _runner_client
@@ -507,22 +891,52 @@ async def test_native_failed_status_releases_idle_pin(status_source: str) -> Non
         assert created.status_code == 201, created.text
         await _post_status(client, conv_id, "running")
         assert app.state.has_active_work() is True
-        if status_source == "pane":
+        if status_source.startswith("pane"):
             from omnigent.runner.app import _session_event_queues_ref
 
             queue = _session_event_queues_ref[conv_id]
             while not queue.empty():
                 queue.get_nowait()
-            publish = app.state.session_resource_registry._session_status_publisher
-            assert publish is not None
-            publish(conv_id, "failed", None)
+            if status_source in _PANE_FAILURE_DETAILS:
+                publish_failure = app.state.session_resource_registry._session_failure_publisher
+                assert publish_failure is not None
+                publish_failure(conv_id, _PANE_FAILURE_DETAILS[status_source])
+            else:
+                publish = app.state.session_resource_registry._session_status_publisher
+                assert publish is not None
+                publish(conv_id, "failed", None)
             events = []
             while not queue.empty():
                 events.append(queue.get_nowait())
             failures = [event for event in events if event and event.get("status") == "failed"]
             assert len(failures) == 1
-            assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
-            assert "Open the terminal" in failures[0]["error"]["message"]
+            if status_source == "pane_detail":
+                assert failures[0]["error"]["code"] == "native_turn_error"
+                assert failures[0]["error"]["message"].startswith("API Error: 499")
+                assert "synthetic-secret-token" not in str(failures)
+                context = failures[0]["failure_context"]
+                assert context["http_status"] == 499
+                assert context["failure_source"] == "claude_program_status"
+                assert context["detail_source"] == "program_status_error"
+                assert "native_hook_event" not in context
+            elif status_source == "pane_envelope":
+                assert len(_LONG_API_ERROR_ENVELOPE) > 1024
+                assert failures[0]["error"]["code"] == "native_turn_error"
+                assert failures[0]["error"]["message"] == _API_ERROR_CAUSE
+                context = failures[0]["failure_context"]
+                assert context["native_error_message"] == _API_ERROR_CAUSE
+                assert context["http_status"] == 500
+                assert context["failure_source"] == "claude_program_status"
+            elif status_source == "pane_overflow":
+                assert failures[0]["error"]["code"] == "context_length_exceeded"
+                assert failures[0]["error"]["message"].startswith("Context limit reached")
+                assert "/compact" in failures[0]["error"]["message"]
+                context = failures[0]["failure_context"]
+                assert context["native_error_message"] == "Prompt is too long"
+                assert context["failure_source"] == "claude_program_status"
+            else:
+                assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
+                assert "Open the terminal" in failures[0]["error"]["message"]
         else:
             await _post_status(client, conv_id, "failed")
         assert app.state.has_active_work() is False
@@ -548,6 +962,249 @@ async def test_native_pane_idle_after_mid_turn_follow_up_releases_pin() -> None:
         app.state.begin_turn_slot(conv_id)
         app.state.active_turns.pop(conv_id, None)
         publish_pane_status(conv_id, "idle", None)
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_only_pane_inferred_status_is_marked_inferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server checks this mark before an edge may reopen a turn.
+
+    The runner checks it too: an inferred reason (a hidden input box, as in a
+    transcript view while a reply streams) does not show that the turn stopped,
+    so it never starts a bounded human wait.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr("omnigent.runner.app.time", clock)
+    conv_id = "conv_native_inferred_reason"
+    app = await _native_app_with_session(conv_id)
+    publish = app.state.session_resource_registry._session_status_publisher
+    assert publish is not None
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        publish(conv_id, "running", "dialog open")
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        queue = _session_event_queues_ref[conv_id]
+        events = [queue.get_nowait() for _ in range(queue.qsize())]
+
+        # An inferred reason neither ends nor restarts the authoritative dialog's hold.
+        assert app.state.has_sandbox_work() is True
+        clock.advance(59)
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        assert app.state.has_sandbox_work() is True
+        clock.advance(2)
+        assert app.state.has_sandbox_work() is False
+
+        # The dialog is answered, then the pane hides its input box mid-reply.
+        publish(conv_id, "running", None)
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        assert app.state.has_sandbox_work() is True
+        clock.advance(120)
+        assert app.state.has_sandbox_work() is True
+        assert app.state.has_active_work() is True
+    assert [
+        (event["blocked_on"], event.get("inferred"))
+        for event in events
+        if event.get("type") == "session.status" and "blocked_on" in event
+    ] == [("dialog open", None), ("terminal prompt", True)]
+
+
+@pytest.mark.asyncio
+async def test_pane_inference_is_scoped_to_the_server_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A current server's init envelope enables pane-inferred status until a reconnect.
+
+    An id-only init for another session leaves it on. After a reconnect, an
+    inferred edge still queued is dropped until the new server accepts them,
+    either in an init envelope or when its relay reopens the session stream.
+    """
+    from omnigent.entities import Conversation
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PAYLOAD_KEY,
+        build_runner_session_init_payload,
+    )
+    from tests.runner.conftest import _runner_client
+
+    def envelope_init(session_id: str) -> dict[str, object]:
+        conversation = Conversation(
+            id=session_id,
+            created_at=1,
+            updated_at=1,
+            agent_id="ag",
+            root_conversation_id=session_id,
+        )
+        return build_runner_session_init_payload(conversation, server_version="0.22.0")
+
+    async def streamed_statuses(
+        session_id: str, *, relay_accepts_inferred: bool = False
+    ) -> list[tuple[str, str | None, bool]]:
+        app.state.session_event_queues[session_id].put_nowait(None)
+        params = {"accepts_inferred_status": "true"} if relay_accepts_inferred else None
+        response = await client.get(f"/v1/sessions/{session_id}/stream", params=params)
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        return [
+            (event["status"], event.get("blocked_on"), event.get("inferred") is True)
+            for event in events
+            if event.get("type") == "session.status"
+        ]
+
+    conv_id = "conv_native_current_server"
+    monkeypatch.setattr("omnigent.runner.app._server_accepts_inferred_status", False)
+    app = await _native_app_with_session(conv_id)
+    registry = app.state.session_resource_registry
+    accepts_inferred_status = registry._accepts_inferred_status
+    publish = registry._session_status_publisher
+    assert publish is not None
+    assert accepts_inferred_status() is False
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json=envelope_init(conv_id))
+        assert created.status_code == 201, created.text
+        assert accepts_inferred_status() is True
+        # A current server falls back to this body when it cannot build an envelope.
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_native_id_only_init", "agent_id": "ag"}
+        )
+        assert created.status_code == 201, created.text
+        assert accepts_inferred_status() is True
+        await streamed_statuses(conv_id)
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        assert await streamed_statuses(conv_id) == [("running", "terminal prompt", True)]
+
+        publish(conv_id, "running", None, inferred=True)
+        await app.state.catch_up_scan()
+        assert accepts_inferred_status() is False
+        publish(conv_id, "running", None)
+        assert await streamed_statuses(conv_id) == [("running", None, False)]
+        # A reconnect while every session is idle reopens the relay before any init.
+        assert await streamed_statuses(conv_id, relay_accepts_inferred=True) == []
+        assert accepts_inferred_status() is True
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        assert await streamed_statuses(conv_id) == [("running", "terminal prompt", True)]
+
+        await app.state.catch_up_scan()
+        older_init = envelope_init("conv_native_older_server")
+        older_envelope = older_init[SESSION_INIT_PAYLOAD_KEY]
+        assert isinstance(older_envelope, dict)
+        older_envelope.pop("accepts_inferred_status")
+        created = await client.post("/v1/sessions", json=older_init)
+        assert created.status_code == 201, created.text
+        assert accepts_inferred_status() is False
+        created = await client.post("/v1/sessions", json=envelope_init("conv_native_new_server"))
+        assert created.status_code == 201, created.text
+        assert accepts_inferred_status() is True
+
+
+@pytest.mark.asyncio
+async def test_input_only_failure_support_is_scoped_to_the_server_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a server whose init envelope advertises it gets input-only failures.
+
+    An older server's envelope lacks the field, and a reconnect forgets it until
+    the new server says so again. A report queued for a capable server before
+    a reconnect to an older one is held, keeping the runner up, until a capable
+    server's stream takes it once.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.entities import Conversation
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PAYLOAD_KEY,
+        build_runner_session_init_payload,
+    )
+    from tests.runner.conftest import _runner_client
+
+    def envelope_init(session_id: str, *, advertise: bool) -> dict[str, object]:
+        conversation = Conversation(
+            id=session_id,
+            created_at=1,
+            updated_at=1,
+            agent_id="ag",
+            root_conversation_id=session_id,
+        )
+        payload = build_runner_session_init_payload(conversation, server_version="0.22.0")
+        if not advertise:
+            envelope = payload[SESSION_INIT_PAYLOAD_KEY]
+            assert isinstance(envelope, dict)
+            envelope.pop("accepts_input_only_failures")
+        return payload
+
+    async def streamed_failures(session_id: str, *, capable: bool) -> list[dict[str, Any]]:
+        runner_app._session_event_queues_ref[session_id].put_nowait(None)
+        params = {"accepts_input_only_failures": "true"} if capable else None
+        response = await client.get(f"/v1/sessions/{session_id}/stream", params=params)
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        return [event for event in events if event.get("type") == "response.failed"]
+
+    monkeypatch.setenv(_HUMAN_WAIT_HOLD_ENV, "60")
+    clock = _AdvanceableClock()
+    monkeypatch.setattr(runner_app, "time", clock)
+    monkeypatch.setattr(runner_app, "_server_accepts_input_only_failures", False)
+    app = await _native_app_with_session("conv_input_only_new_server")
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json=envelope_init("conv_input_only_older_server", advertise=False)
+        )
+        assert created.status_code == 201, created.text
+        assert runner_app._server_accepts_input_only_failures is False
+        created = await client.post(
+            "/v1/sessions", json=envelope_init("conv_input_only_new_server", advertise=True)
+        )
+        assert created.status_code == 201, created.text
+        assert runner_app._server_accepts_input_only_failures is True
+
+        # A message queued behind an unanswered prompt expires for the capable
+        # server while no stream is reading.
+        sid = "conv_input_only_new_server"
+        pending_id = f"pending_{'a' * 32}"
+        waiter = asyncio.create_task(asyncio.sleep(3600))
+        app.state.claude_prompt_waiters[sid] = waiter
+        app.state.session_message_buffers[sid] = [
+            {
+                "type": "message",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "pending_id": pending_id,
+            }
+        ]
+        assert app.state.has_active_work() is True
+        clock.advance(61)
+        assert app.state.has_active_work() is True
+        await poll_until_async(lambda: sid not in app.state.claude_prompt_waiters, timeout_s=5)
+        with contextlib.suppress(asyncio.CancelledError):
+            await waiter
+
+        # The runner reconnects to an older server: the report is held, not sent.
+        await app.state.catch_up_scan()
+        assert runner_app._server_accepts_input_only_failures is False
+        assert await streamed_failures(sid, capable=False) == []
+        assert app.state.has_active_work() is True
+
+        # A capable server's stream takes it, once, and the runner can idle.
+        assert [f["pending_id"] for f in await streamed_failures(sid, capable=True)] == [
+            pending_id
+        ]
+        assert await streamed_failures(sid, capable=True) == []
         assert app.state.has_active_work() is False
 
 
@@ -621,3 +1278,68 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
             await asyncio.sleep(0.01)
         app.state.native_pane_status[conv_id] = "running"
         assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "permission_prompt",
+        "background_agent",
+        "background_shell",
+        "pane_output",
+        "pane_input",
+        "no_evidence",
+    ],
+)
+async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence: str,
+) -> None:
+    """A pane that reads idle but shows live work keeps the idle watchdog open.
+
+    The pane watcher publishes ``idle`` once the pane goes quiet, which a
+    permission prompt does too, and so does a turn that left a background agent
+    working. The pane reaper spares such a pane for the prompt marker, the agent,
+    or recent output and input; the watchdog must do the same.
+
+    :param tmp_path: Pytest temp dir for the approval-wait marker root.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param evidence: Live-work signal to stage, e.g. ``"permission_prompt"``. ``"no_evidence"``
+        leaves the pane idle.
+    :returns: None.
+    """
+    from omnigent.harnesses.claude_native import bridge
+
+    conv_id = "conv_idle_edge_live_pane"
+    async with _claude_native_pane_app(tmp_path, monkeypatch, conv_id) as (app, instance):
+        instance.screen_changed_within.return_value = evidence == "pane_output"
+        instance.client_interaction_within.return_value = evidence == "pane_input"
+        if evidence == "permission_prompt":
+            bridge.touch_approval_wait_marker(bridge.approval_wait_marker_path(conv_id))
+        monkeypatch.setattr(
+            app.state.session_resource_registry,
+            "session_has_background_agents",
+            lambda session_id: evidence == "background_agent" and session_id == conv_id,
+        )
+        publish = app.state.session_resource_registry._session_status_publisher
+        publish(conv_id, "running", None)
+        publish(conv_id, "idle", None)
+        background = app.state.session_resource_registry._session_background_publisher
+        if evidence == "background_shell":
+            # Claude reports ``shell`` (idle) while a background command it
+            # started outlives the turn; that command is still agent work.
+            background(conv_id, True)
+        assert app.state.native_pane_status[conv_id] == "idle"
+        assert app.state.has_active_work() is (evidence != "no_evidence")
+        # Sandbox keepalive counts agent work only: recent pane input or output
+        # also comes from someone viewing the pane, so only the prompt, a
+        # background agent and a background shell count.
+        assert app.state.has_sandbox_work() is (
+            evidence in ("permission_prompt", "background_agent", "background_shell")
+        )
+        if evidence == "background_shell":
+            background(conv_id, False)
+            assert app.state.has_active_work() is False
+            assert app.state.has_sandbox_work() is False

@@ -7,8 +7,11 @@ import { copyText } from "@/lib/clipboard";
 import { getEmbedRoot } from "@/lib/host";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
+import { ShellCommandContext } from "@/shell/ShellCommandContext";
+import type { Comment } from "@/hooks/useComments";
+import { LOCAL_REVIEW_COMMENT_LANGUAGE, parseLocalReviewComment } from "@/lib/localReviewComments";
 import type { UIMessage } from "ai";
-import { ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
+import { ChevronLeftIcon, ChevronRightIcon, PlayIcon, XIcon } from "lucide-react";
 import type { ComponentProps, HTMLAttributes, ReactElement, ReactNode } from "react";
 import {
   cloneElement,
@@ -24,10 +27,15 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import {
+  Block,
+  CodeBlock,
+  CodeBlockDownloadButton,
   Streamdown,
   StreamdownContext,
   TableCopyDropdown,
   TableDownloadDropdown,
+  useIsCodeFenceIncomplete,
+  type BlockProps,
   type ControlsConfig,
   type StreamdownProps,
 } from "streamdown";
@@ -42,6 +50,7 @@ import {
   GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS,
   SECURE_STREAMDOWN_REHYPE_PLUGINS,
   STREAMDOWN_PLUGINS,
+  WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS,
 } from "./streamdown-security";
 
 export type MessageProps = HTMLAttributes<HTMLDivElement> & {
@@ -83,7 +92,7 @@ export const MessageContent = ({ children, className, ...props }: MessageContent
 export type MessageActionsProps = ComponentProps<"div">;
 
 export const MessageActions = ({ className, children, ...props }: MessageActionsProps) => (
-  <div className={cn("flex items-center gap-3", className)} {...props}>
+  <div className={cn("flex items-center gap-3 mobile-app:gap-0", className)} {...props}>
     {children}
   </div>
 );
@@ -107,7 +116,11 @@ export const MessageAction = ({
       size={size}
       type="button"
       variant={variant}
-      className={cn("text-muted-foreground hover:text-foreground", className)}
+      className={cn(
+        "mobile-touch-target mobile-app:[&_svg]:size-5!",
+        "text-muted-foreground hover:text-foreground",
+        className,
+      )}
       {...props}
     >
       {children}
@@ -317,9 +330,48 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
    * Opt-in: only callers that supply that override may set it.
    */
   markFileLinks?: boolean;
-  /** Show images hosted as GitHub attachments, e.g. in a PR description; others stay blocked. */
+  /** Show GitHub attachment images and videos, e.g. in a PR description; others stay blocked. */
   allowGitHubAttachmentImages?: boolean;
+  /** Preserve workspace images for a session-aware, authenticated component override. */
+  allowWorkspaceImages?: boolean;
+  /** Allow shell drafts in assistant chat when a shell action is available. */
+  allowShellCommands?: boolean;
+  /** The text is still growing, so its last code fence may be open. */
+  isStreaming?: boolean;
+  /** Render sent review snapshots as cards; nested comment bodies remain ordinary Markdown. */
+  renderLocalReviewComment?: (comment: Comment) => ReactNode;
 };
+
+const LocalReviewCommentRendererContext =
+  createContext<MessageResponseProps["renderLocalReviewComment"]>(undefined);
+
+// Up to three spaces of indent; a tab counts as four columns, so it never does.
+const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)/;
+
+/**
+ * Whether the text ends inside a code fence. A closing fence repeats the opening
+ * character at least as many times, with only whitespace after it.
+ */
+export function hasOpenCodeFence(text: string): boolean {
+  let open: string | null = null;
+  for (const line of text.split("\n")) {
+    const [, fence, rest = ""] = FENCE_LINE.exec(line) ?? [];
+    if (fence === undefined) continue;
+    if (open === null) open = fence;
+    else if (fence[0] === open[0] && fence.length >= open.length && rest.trim() === "") open = null;
+  }
+  return open !== null;
+}
+
+const StreamingTextContext = createContext(false);
+
+// Streamdown marks a block's open fence only while `isAnimating`, which also
+// disables its copy and download buttons, so mark it here for streaming text.
+function StreamingTextBlock(props: BlockProps) {
+  const isStreaming = useContext(StreamingTextContext);
+  const isIncomplete = props.isIncomplete || (isStreaming && hasOpenCodeFence(props.content));
+  return <Block {...props} isIncomplete={isIncomplete} />;
+}
 
 function getChatCodeControls(controls: StreamdownProps["controls"]): StreamdownProps["controls"] {
   if (typeof controls === "object" && controls !== null) {
@@ -589,34 +641,114 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
   );
 }
 
-function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+export function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
+  const renderLocalReviewComment = useContext(LocalReviewCommentRendererContext);
   const getCode = useCallback(() => code, [code]);
+  const shellCommands = useContext(ShellCommandContext);
+  const codeProps = isValidElement<{ language?: string; className?: string }>(children)
+    ? children.props
+    : undefined;
+  const language = (
+    codeProps?.language ??
+    /\blanguage-(\S+)/.exec(codeProps?.className ?? "")?.[1] ??
+    ""
+  ).toLowerCase();
+  const showShellAction = shellCommands && /^(bash|sh|zsh|fish|shell)$/.test(language);
   // Soft-wrap long lines by default so users don't have to scroll horizontally
   // to read code blocks. The toggle restores Streamdown's native
   // horizontal-scroll view for when column alignment matters.
   const [wrap, setWrap] = useState(true);
   const toggleWrap = useCallback(() => setWrap((w) => !w), []);
+  const isMermaid = isMermaidPre(children);
+  const fenceOpen = useIsCodeFenceIncomplete();
+  // A diagram drawn from a fence that is still streaming redraws on every update,
+  // so in streaming text its source shows while the fence is open and stays until
+  // the diagram draws. The fence's language can arrive after the fence opens.
+  const isStreaming = useContext(StreamingTextContext);
+  const [streamed, setStreamed] = useState(false);
+  const [showsSource, setShowsSource] = useState(false);
+  if (isMermaid && isStreaming && !streamed) {
+    setStreamed(true);
+    setShowsSource(true);
+  }
+  const hideSource = useCallback(() => setShowsSource(false), []);
+  const { lineNumbers } = useContext(StreamdownContext);
   const block = isValidElement(children)
     ? cloneElement(children, { "data-block": "true" } as Record<string, unknown>)
     : children;
 
-  // Mermaid renders its own toolbar (download/copy); we replace Streamdown's
-  // broken fullscreen with our own button (portaled correctly), positioned as
-  // the last item in that toolbar's row. Word-wrap/copy don't apply to a diagram.
-  if (isMermaidPre(children)) {
-    return <MermaidBlock block={block} />;
-  }
-
-  return (
-    <div className={cn("chat-code-block relative", wrap && "chat-code-wrap")}>
-      {block}
+  const codeBlock = (body: ReactNode) => (
+    <div
+      className={cn(
+        "chat-code-block relative",
+        wrap && "chat-code-wrap",
+        showShellAction && "[&_[data-streamdown=code-block-header]]:pr-32",
+      )}
+    >
+      {body}
       {/* Match Streamdown's action-pill height and reserve its rightmost slot
           for download. All controls stay anchored to the header. */}
       <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
+        {showShellAction && (
+          <Button
+            aria-label="Open in a new shell"
+            className={CODE_BLOCK_OVERLAY_BUTTON_CLASS}
+            disabled={shellCommands.disabled || isStreaming || fenceOpen || !code.trim()}
+            onClick={() => shellCommands.open(code, language)}
+            size="icon-sm"
+            title="Open in a new shell"
+            type="button"
+            variant="ghost"
+          >
+            <PlayIcon aria-hidden="true" />
+          </Button>
+        )}
         <ChatCodeBlockCopyButton getCode={getCode} />
       </div>
+    </div>
+  );
+
+  if (
+    renderLocalReviewComment &&
+    isValidElement<{ className?: string }>(children) &&
+    children.props.className?.split(/\s+/).includes(`language-${LOCAL_REVIEW_COMMENT_LANGUAGE}`)
+  ) {
+    const comment = parseLocalReviewComment(code);
+    if (comment) return renderLocalReviewComment(comment);
+  }
+
+  if (!isMermaid) return codeBlock(block);
+
+  // Mermaid renders its own toolbar (download/copy); we replace Streamdown's
+  // broken fullscreen with our own button (portaled correctly), positioned as
+  // the last item in that toolbar's row. Word-wrap/copy don't apply to a diagram.
+  if (!streamed) return <MermaidBlock block={block} />;
+
+  const drawing = showsSource && !fenceOpen;
+  return (
+    // Clip rather than hide the overflow, so the code block's margins still collapse.
+    <div className={cn("relative", drawing && "overflow-clip")}>
+      {showsSource &&
+        codeBlock(
+          <CodeBlock
+            code={code}
+            language="mermaid"
+            isIncomplete={fenceOpen}
+            lineNumbers={lineNumbers}
+          >
+            <CodeBlockDownloadButton code={code} language="mermaid" />
+          </CodeBlock>,
+        )}
+      {!fenceOpen && (
+        <MermaidBlock
+          block={block}
+          // The diagram draws behind its source, clipped to it, then takes its place.
+          className={drawing ? "invisible absolute inset-x-0 top-0" : undefined}
+          onDrawn={drawing ? hideSource : undefined}
+        />
+      )}
     </div>
   );
 }
@@ -628,45 +760,66 @@ export const MessageResponse = memo(
     controls,
     markFileLinks = false,
     allowGitHubAttachmentImages = false,
+    allowWorkspaceImages = false,
+    allowShellCommands = false,
+    isStreaming = false,
+    renderLocalReviewComment,
     ...props
   }: MessageResponseProps) => {
     const themeMode = useResolvedThemeMode();
+    const shellCommands = useContext(ShellCommandContext);
+    const shellAction = useMemo(
+      () =>
+        allowShellCommands && shellCommands
+          ? {
+              ...shellCommands,
+              disabled: shellCommands.disabled || hasOpenCodeFence(props.children ?? ""),
+            }
+          : null,
+      [allowShellCommands, shellCommands, props.children],
+    );
     const messageComponents = useMemo(
-      () => ({ ...components, pre: ChatCodeBlockPre, table: ChatTable }),
+      () => ({ ...components, pre: components?.pre ?? ChatCodeBlockPre, table: ChatTable }),
       [components],
     );
 
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
     const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
+    let rehypePlugins = SECURE_STREAMDOWN_REHYPE_PLUGINS;
+    if (allowWorkspaceImages) rehypePlugins = WORKSPACE_IMAGE_STREAMDOWN_REHYPE_PLUGINS;
+    else if (markFileLinks) rehypePlugins = FILE_LINK_STREAMDOWN_REHYPE_PLUGINS;
+    else if (allowGitHubAttachmentImages)
+      rehypePlugins = GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS;
 
     return (
       <MarkdownErrorBoundary source={props.children}>
-        {/* Streamdown is memoized and its comparator ignores the mermaid prop,
-            so remount on theme change to recolor already-rendered diagrams. */}
-        <Streamdown
-          key={themeMode}
-          // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
-          className={cn(
-            "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-            className,
-          )}
-          plugins={STREAMDOWN_PLUGINS}
-          // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-          // instead of Streamdown's default "Open external link?" modal.
-          linkSafety={CHAT_LINK_SAFETY}
-          {...props}
-          components={messageComponents}
-          controls={messageControls}
-          mermaid={mermaidOptions}
-          // Block remote image fetches that can exfiltrate data through URLs.
-          rehypePlugins={
-            markFileLinks
-              ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
-              : allowGitHubAttachmentImages
-                ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
-                : SECURE_STREAMDOWN_REHYPE_PLUGINS
-          }
-        />
+        <ShellCommandContext.Provider value={shellAction}>
+          <LocalReviewCommentRendererContext.Provider value={renderLocalReviewComment}>
+            <StreamingTextContext.Provider value={isStreaming}>
+              {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+              so remount on theme change to recolor already-rendered diagrams. */}
+              <Streamdown
+                key={themeMode}
+                // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+                className={cn(
+                  "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+                  className,
+                )}
+                plugins={STREAMDOWN_PLUGINS}
+                // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+                // instead of Streamdown's default "Open external link?" modal.
+                linkSafety={CHAT_LINK_SAFETY}
+                {...props}
+                BlockComponent={StreamingTextBlock}
+                components={messageComponents}
+                controls={messageControls}
+                mermaid={mermaidOptions}
+                // Block remote image fetches that can exfiltrate data through URLs.
+                rehypePlugins={rehypePlugins}
+              />
+            </StreamingTextContext.Provider>
+          </LocalReviewCommentRendererContext.Provider>
+        </ShellCommandContext.Provider>
       </MarkdownErrorBoundary>
     );
   },

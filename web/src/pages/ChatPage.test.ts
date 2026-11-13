@@ -1,8 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
-import type { ServerInfo } from "@/lib/capabilities";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -13,11 +14,15 @@ import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
   buildSlashCommandMap,
+  composerOffersClear,
+  composerOffersRewind,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
   collectPendingElicitations,
   computeIsWorking,
   computeShowsWorking,
+  hasSentNativeInputPending,
+  useWorkingSignals,
   containsMarkdownTable,
   dispatchInitialPrompt,
   failedSessionLastError,
@@ -26,6 +31,7 @@ import {
   isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
+  opensResumePicker,
   reorderCommittedRequestElicitations,
   shouldSendInitialPrompt,
   shouldShowAuthorBadge,
@@ -43,6 +49,7 @@ import {
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { modelPickerKindForConv } from "@/lib/composerCapabilities";
 import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
@@ -980,6 +987,53 @@ describe("computeShowsWorking", () => {
     );
   });
 
+  it("counts only input this tab sent to a native terminal as awaiting pickup", () => {
+    // A claude-native send's response completes once the message reaches the terminal,
+    // ~200ms before the agent reports running; the indicator must not drop in between.
+    const sent = { tempId: "pend_1", content: [], createdAtS: 1_700_000_000 };
+    const replayed = { tempId: "pi_1", content: [] };
+    expect(hasSentNativeInputPending(true, [sent])).toBe(true);
+    expect(hasSentNativeInputPending(false, [sent])).toBe(false);
+    // Snapshot-replayed input may wait on an offline runner; it doesn't count.
+    expect(hasSentNativeInputPending(true, [replayed])).toBe(false);
+    expect(
+      hasSentNativeInputPending(true, [{ ...sent, initialDraft: { text: "hi", files: [] } }]),
+    ).toBe(false);
+  });
+
+  describe("useWorkingSignals", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+    const signals = (overrides: Partial<Parameters<typeof useWorkingSignals>[0]> = {}) => ({
+      status: "idle" as const,
+      sessionStatus: "idle" as const,
+      hasPendingInitialMessage: false,
+      nativeInputPending: false,
+      conversationId: "conv-a",
+      ...overrides,
+    });
+
+    it("keeps Working lit for a first message held past the terminal's ready idle", () => {
+      const { result } = renderHook(() =>
+        useWorkingSignals(signals({ hasPendingInitialMessage: true })),
+      );
+      expect(result.current.indicatorSendInFlight).toBe(true);
+    });
+
+    it("lights Working, not Stop, while a native agent picks up input, for at most 3s", () => {
+      const { result, rerender } = renderHook((props) => useWorkingSignals(props), {
+        initialProps: signals({ nativeInputPending: true }),
+      });
+      expect(result.current).toEqual({ isWorking: false, indicatorSendInFlight: true });
+      act(() => vi.advanceTimersByTime(3_000));
+      expect(result.current.indicatorSendInFlight).toBe(false);
+
+      // Another session's pickup gets its own window.
+      rerender(signals({ nativeInputPending: true, conversationId: "conv-b" }));
+      expect(result.current.indicatorSendInFlight).toBe(true);
+    });
+  });
+
   it("an in-flight local send lights the indicator before any server edge", () => {
     // Pressing Enter sets chatStore.status = "streaming" synchronously, while
     // `sessionStatus` stays `idle` until the server publishes `running` (for
@@ -1125,6 +1179,20 @@ describe("workingIndicatorLabel — parked on a dialog", () => {
     // the terminal tab. A bare "Blocked on: dialog open" leaves the user with
     // no idea where to respond, so the label must guide them to the terminal.
     expect(workingIndicatorLabel(2, "dialog open")).toMatch(/terminal/i);
+  });
+
+  it("tentatively points at the terminal when a hidden prompt replaced its input box", () => {
+    expect(workingIndicatorLabel(0, TERMINAL_PROMPT_BLOCKED_ON)).toBe(
+      "Something in the agent's terminal may need your input.",
+    );
+    expect(
+      workingIndicatorLabel(0, TERMINAL_PROMPT_BLOCKED_ON, {
+        terminalView: true,
+        answerableInChat: true,
+      }),
+    ).toBe(
+      "Something in the agent's terminal may need your input. Open the Terminal view to check.",
+    );
   });
 
   it("falls back to the normal label when not parked", () => {
@@ -1397,18 +1465,65 @@ describe("collectBubbleMarkdown", () => {
 
 // ── Slash command map (skills + built-ins) ────────────────────────────
 
+describe("composer /clear and /rewind gating", () => {
+  const info = (overrides: Partial<ServerInfo>) => ({ ...FALLBACK_SERVER_INFO, ...overrides });
+
+  it.each([
+    ["claude-native", true],
+    ["codex-native", true],
+    ["claude-sdk", false],
+    ["openai-agents", false],
+    [null, false],
+  ] as const)(
+    "offers native /clear for %s when the server lists the control",
+    (harness, offered) => {
+      expect(composerOffersClear(harness, info({ session_event_types: ["clear"] }))).toBe(offered);
+      expect(composerOffersClear(harness, info({ session_event_types: ["message"] }))).toBe(false);
+      expect(composerOffersClear(harness, "loading")).toBe(false);
+    },
+  );
+
+  it("offers claude-sdk /clear only when the server continues it in a new session", () => {
+    const sdkClear = info({ session_event_types: ["clear"], session_claude_sdk_clear: true });
+    expect(composerOffersClear("claude-sdk", sdkClear)).toBe(true);
+    expect(composerOffersClear("openai-agents", sdkClear)).toBe(false);
+    // An older server lists "clear" for native sessions only.
+    expect(composerOffersClear("claude-sdk", info({ session_event_types: ["clear"] }))).toBe(false);
+  });
+
+  it.each([
+    ["claude-sdk", true],
+    ["claude-native", true],
+    ["codex-native", false],
+    ["openai-agents", false],
+  ] as const)("offers /rewind for %s when the server has the endpoint", (harness, offered) => {
+    expect(composerOffersRewind(harness, info({ session_rewind: true }))).toBe(offered);
+    expect(composerOffersRewind(harness, info({}))).toBe(false);
+    expect(composerOffersRewind(harness, "loading")).toBe(false);
+  });
+});
+
 describe("buildSlashCommandMap", () => {
+  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions", "/rewind"];
+
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
     // Session- and harness-specific commands are gated off by default.
     expect(Object.keys(map)).toEqual(
-      Object.keys(BUILTIN_SLASH_COMMANDS).filter(
-        (name) => !["/btw", "/side", "/mcp", "/clear"].includes(name),
-      ),
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => !gatedOffByDefault.includes(name)),
     );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
+  });
+
+  it("includes /permissions only when showPermissions is true (codex-native)", () => {
+    expect(buildSlashCommandMap([], true, true)["/permissions"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, false, true)[
+        "/permissions"
+      ],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/permissions"]);
   });
 
   it("includes /side only when showSide is true (codex-native)", () => {
@@ -1426,6 +1541,32 @@ describe("buildSlashCommandMap", () => {
     expect(
       buildSlashCommandMap([], true, true, true, false, false, "/", false, false, true)["/clear"],
     ).toBe(BUILTIN_SLASH_COMMANDS["/clear"]);
+  });
+
+  it("includes /rewind only when showRewind is true", () => {
+    expect(buildSlashCommandMap([], true, true)["/rewind"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap(
+        [],
+        true,
+        true,
+        true,
+        false,
+        false,
+        "/",
+        false,
+        false,
+        false,
+        false,
+        true,
+      )["/rewind"],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/rewind"]);
+    // The /permissions slot right before it doesn't turn on /rewind.
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, false, true)[
+        "/rewind"
+      ],
+    ).toBeUndefined();
   });
 
   it("includes /btw only when showBtw is true (claude-native)", () => {
@@ -1494,9 +1635,7 @@ describe("buildSlashCommandMap", () => {
     // Built-ins first, then skills in their input order — the menu
     // surfaces built-ins above user skills. Session- and harness-specific commands are gated off.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter(
-        (name) => !["/btw", "/side", "/mcp", "/clear"].includes(name),
-      ),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => !gatedOffByDefault.includes(name)),
       "/triage-issues",
       "/mlflow-bug",
     ]);
@@ -1907,6 +2046,26 @@ describe("unboundSessionResumableInApp", () => {
     for (const src of ["kimi", "kiro", "qwen"]) {
       expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(false);
     }
+  });
+});
+
+describe("opensResumePicker", () => {
+  it("opens for an unbound fork or a resumable host-less session", () => {
+    const idle = { unboundFork: false, resumableUnbound: false, sandboxLaunching: false };
+    expect(opensResumePicker({ ...idle, unboundFork: true })).toBe(true);
+    expect(opensResumePicker({ ...idle, resumableUnbound: true })).toBe(true);
+    expect(opensResumePicker(idle)).toBe(false);
+  });
+
+  it("stays closed while a managed-sandbox launch places the session", () => {
+    // A sandbox clone remains unbound until its sandbox registers; the server
+    // places it and holds the first send for the launch.
+    expect(
+      opensResumePicker({ unboundFork: true, resumableUnbound: true, sandboxLaunching: true }),
+    ).toBe(false);
+    expect(
+      opensResumePicker({ unboundFork: false, resumableUnbound: true, sandboxLaunching: true }),
+    ).toBe(false);
   });
 });
 

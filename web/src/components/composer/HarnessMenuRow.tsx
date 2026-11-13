@@ -9,11 +9,17 @@ export const COMPOSER_HARNESS_MENU_SIZE = "w-[17.5rem]";
 export const HARNESS_MENU_ROW_CLASS_NAME =
   "composer-agent-row group/agent relative flex min-h-8 w-full items-center rounded-lg";
 
-export function PickerSectionHeader({ children }: { children: ReactNode }) {
+export function PickerSectionHeader({
+  children,
+  className,
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
   return (
     <div
       data-harness-menu-section-label=""
-      className="px-2 py-1 text-xs leading-5 font-normal text-muted-foreground"
+      className={cn("px-2 py-1 text-xs leading-5 font-normal text-muted-foreground", className)}
     >
       {children}
     </div>
@@ -68,7 +74,7 @@ export function HarnessMenuRowContent({
         );
   return (
     <>
-      <span className="composer-agent-choice flex min-w-0 flex-1 items-center gap-2 py-1 pr-1 pl-2 text-[13px] leading-5">
+      <span className="composer-agent-choice flex min-w-0 flex-1 items-center gap-2 py-1 pr-1 pl-2 text-ui leading-5">
         {icon}
         <span className={cn("flex min-w-0 items-center gap-1 text-left", active && "font-medium")}>
           <span data-harness-menu-choice-label="" className="truncate">
@@ -114,7 +120,7 @@ export function HarnessMenuRowContent({
           data-harness-edit=""
           onPointerDown={onEditPointerDown}
           className={cn(
-            "composer-agent-edit flex h-8 shrink-0 cursor-pointer items-center rounded-none px-0 py-0 text-xs leading-4 text-muted-foreground underline-offset-2 hover:underline focus:bg-transparent data-open:bg-transparent [&>svg]:hidden",
+            "composer-agent-edit mobile-touch-target mobile-app:justify-center flex h-8 shrink-0 cursor-pointer items-center rounded-none px-0 py-0 text-xs leading-4 text-muted-foreground underline-offset-2 hover:underline focus:bg-transparent data-open:bg-transparent [&>svg]:hidden",
             summaryVisibility,
             isMobile && "opacity-100",
           )}
