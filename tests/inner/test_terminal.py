@@ -6,6 +6,7 @@ import asyncio
 import errno
 import json
 import logging
+import shlex
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,7 @@ import omnigent.util.tmux_compat as tmux_compat
 from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import (
     TerminalInstance,
     _apply_utf8_locale_default,
@@ -1862,6 +1864,7 @@ async def test_is_alive_false_when_probe_communication_fails(
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
 @pytest.mark.parametrize("start_on_attach", [False, True])
+@pytest.mark.parametrize("program_status_app", [None, "claude-code"])
 @pytest.mark.parametrize(
     "prompt",
     [
@@ -1872,10 +1875,16 @@ async def test_is_alive_false_when_probe_communication_fails(
         "it's a test",
         "$(printf expanded); $HOME",
         "test",
+        pytest.param("x" * 20_000, id="large-ascii"),
+        pytest.param("🧪 'quoted'\n$HOME;\\tail " * 1_000, id="large-unicode"),
     ],
 )
 async def test_launch_preserves_prompt_and_following_args_real_tmux(
-    tmp_path: Path, short_tmp_parent: Path, prompt: str, start_on_attach: bool
+    tmp_path: Path,
+    short_tmp_parent: Path,
+    prompt: str,
+    start_on_attach: bool,
+    program_status_app: str | None,
 ) -> None:
     """Prompt text must stay one argument without consuming later connection flags."""
     output = tmp_path / "argv.json"
@@ -1898,6 +1907,7 @@ async def test_launch_preserves_prompt_and_following_args_real_tmux(
         args=["-c", script, str(output), *expected],
         keep_alive_after_exit=True,
         tmux_start_on_attach=start_on_attach,
+        program_status_app=program_status_app,
     )
     try:
         await instance.launch(cwd=tmp_path)
@@ -1911,6 +1921,8 @@ async def test_launch_preserves_prompt_and_following_args_real_tmux(
         assert instance.last_exit_status() == 0
     finally:
         await instance.close()
+
+    assert not (tmp_path / "launch.sh").exists()
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="requires a real tmux binary")
@@ -2198,7 +2210,10 @@ async def _capture_launch_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    keep_alive_after_exit: bool,
+    keep_alive_after_exit: bool = False,
+    command: str = "bash",
+    args: list[str] | None = None,
+    sandbox_policy: SandboxPolicy | None = None,
 ) -> list[str]:
     """
     Launch a terminal with mocked tmux and return the single setup argv.
@@ -2206,6 +2221,9 @@ async def _capture_launch_argv(
     :param tmp_path: Temporary directory for the fake tmux socket.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param keep_alive_after_exit: Value for the instance's opt-in flag.
+    :param command: Executable to run in the pane.
+    :param args: Arguments passed to the pane executable.
+    :param sandbox_policy: Optional policy applied before the pane executable.
     :returns: The flattened tmux launch argv.
     """
     captured: list[list[str]] = []
@@ -2231,15 +2249,54 @@ async def _capture_launch_argv(
     )
 
     instance = TerminalInstance(
-        name="bash",
+        name=command,
         session_key="s1",
         socket_path=tmp_path / "tmux.sock",
         private_dir=tmp_path,
+        command=command,
+        args=args or [],
         keep_alive_after_exit=keep_alive_after_exit,
+        sandbox_policy=sandbox_policy,
     )
     await instance.launch(cwd=tmp_path)
     assert len(captured) == 1
     return captured[0]
+
+
+@pytest.mark.parametrize("sandbox_active", [False, True])
+@pytest.mark.parametrize("prompt", ["short", pytest.param("🧪" * 5_000, id="large-unicode")])
+async def test_launch_preserves_arguments_and_sandbox_under_tmux_command_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: str,
+    sandbox_active: bool,
+) -> None:
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", lambda *_: "/test/launcher")
+    args = ["--append-system-prompt", prompt]
+    command = await _capture_launch_argv(
+        tmp_path,
+        monkeypatch,
+        command="claude",
+        args=args,
+        sandbox_policy=SandboxPolicy(
+            backend_type="none",
+            active=sandbox_active,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        ),
+    )
+    assert sum(len(argument.encode("utf-8")) + 1 for argument in command) < 16_000
+    pane_argv = ["/test/launcher" if sandbox_active else "claude", *args]
+    script_path = tmp_path / "launch.sh"
+    if prompt == "short":
+        assert shlex.join(pane_argv) in command
+        assert not script_path.exists()
+    else:
+        assert shlex.join(["/bin/sh", str(script_path)]) in command
+        assert script_path.read_text() == f"#!/bin/sh\nexec {shlex.join(pane_argv)}\n"
+        assert script_path.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.parametrize("launch_fails", [False, True])

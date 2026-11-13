@@ -485,6 +485,10 @@ _IDLE_WATCHER_JOIN_TIMEOUT_S = 1.0
 # pane in submission order, so the program sees one contiguous stream.
 _SEND_KEYS_LITERAL_CHARS_PER_CALL = 1024
 
+# Leave room for tmux options and protocol framing under its 16KB command cap.
+_LAUNCH_COMMAND_BYTES_MAX = 8192
+_LAUNCH_SCRIPT_FILENAME = "launch.sh"
+
 
 class _IdleDetector:
     """
@@ -1632,6 +1636,20 @@ class TerminalInstance:
             conversation_link or "",
         )
 
+    def _materialize_launch_script(self, inner_str: str) -> str:
+        """Keep oversized argv in an owner-only file with the terminal's lifetime."""
+        script_path = self.private_dir / _LAUNCH_SCRIPT_FILENAME
+        descriptor, temporary = tempfile.mkstemp(dir=self.private_dir)
+        temporary_path = Path(temporary)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(f"#!/bin/sh\nexec {inner_str}\n")
+            temporary_path.replace(script_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        # Reading through sh also works when the temporary filesystem is noexec.
+        return shlex.join(["/bin/sh", str(script_path)])
+
     async def launch(self, *, cwd: Path | None = None) -> None:
         """Start the tmux session."""
         try:
@@ -1716,6 +1734,8 @@ class TerminalInstance:
                 *inner_cmd,
             ]
         inner_str = shlex.join(inner_cmd)
+        if len(inner_str.encode("utf-8")) > _LAUNCH_COMMAND_BYTES_MAX:
+            inner_str = self._materialize_launch_script(inner_str)
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
 

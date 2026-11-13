@@ -10,7 +10,9 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -37,6 +39,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
+from omnigent.terminals import TerminalRegistry
 from tests._helpers.providers import isolate_provider_resolution
 from tests.budgets import budget
 from tests.runner.conftest import (
@@ -52,7 +55,7 @@ from tests.runner.conftest import (
     _spec_resolver_returning,
     _sse,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 
 @pytest.mark.asyncio
@@ -384,10 +387,11 @@ class _FakeTerminalRegistry:
 
     def __init__(self, existing: bool = False) -> None:
         self._existing = existing
+        self.instance = SimpleNamespace(running=True, is_alive=AsyncMock(return_value=True))
         self.cleaned: list[str] = []
 
     def get(self, session_id: str, terminal_name: str, session_key: str) -> object | None:
-        return object() if self._existing else None
+        return self.instance if self._existing else None
 
     async def cleanup_conversation(self, session_id: str) -> None:
         self.cleaned.append(session_id)
@@ -542,6 +546,147 @@ async def test_launch_native_terminal_skips_when_terminal_exists(
     assert result is True
 
 
+@pytest.mark.parametrize("terminal_name", ["claude", "codex"])
+@pytest.mark.parametrize(
+    "state",
+    [
+        "healthy",
+        "stopped",
+        "dead_pane",
+        "closed_during_probe",
+        "withdrawn",
+        "replaced",
+        "registry_replaced",
+        "withdrawn_pre_launch",
+        "replaced_pre_launch",
+        "closed_pre_launch",
+    ],
+)
+async def test_launch_native_terminal_checks_current_owned_instance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    terminal_name: str,
+    state: str,
+) -> None:
+    from omnigent.runner.native import PreLaunchResult, _launch_native_terminal
+
+    terminals = TerminalRegistry()
+    resources = SessionResourceRegistry(terminal_registry=terminals)
+    instance = make_test_terminal_instance(
+        terminal_name, "main", tmp_path, running=state != "stopped"
+    )
+    replacement = make_test_terminal_instance(terminal_name, "main", tmp_path / "replacement")
+    slot = terminals._by_conversation.setdefault("conv_x", {})
+    slot[(terminal_name, "main")] = instance
+    other = make_test_terminal_instance(terminal_name, "main", tmp_path / "other")
+    terminals._by_conversation["other-session"] = {(terminal_name, "main"): other}
+    slot[(terminal_name, "other-key")] = other
+    slot[("other-terminal", "main")] = other
+    created: list[str] = []
+    observed: list[bool] = []
+
+    async def alive() -> bool:
+        if state == "dead_pane":
+            instance._remember_exit_status("1 23")
+            instance._last_exit_snapshot = "launcher failed before startup"
+            instance.running = False
+        elif state == "closed_during_probe":
+            instance.running = False
+            return True
+        elif state == "withdrawn":
+            slot.pop((terminal_name, "main"))
+        elif state == "replaced":
+            slot[(terminal_name, "main")] = replacement
+        elif state == "registry_replaced":
+            resources._terminal_registry = TerminalRegistry()
+        return instance.running
+
+    monkeypatch.setattr(instance, "is_alive", alive)
+
+    async def launch(ctx: NativeLaunchContext) -> object:
+        created.append(ctx.session_id)
+        slot[(terminal_name, "main")] = replacement
+        return object()
+
+    async def pre_launch(has_terminal: bool) -> PreLaunchResult:
+        observed.append(has_terminal)
+        if state == "withdrawn_pre_launch":
+            slot.pop((terminal_name, "main"))
+        elif state == "replaced_pre_launch":
+            slot[(terminal_name, "main")] = replacement
+        elif state == "closed_pre_launch":
+            instance.running = False
+        return PreLaunchResult()
+
+    monkeypatch.setattr(f"omnigent.runner.native._launch_{terminal_name}", launch)
+    result = await _launch_native_terminal(
+        f"{terminal_name}-native",
+        _launch_ctx(resource_registry=resources),
+        ensure_locks={},
+        pre_launch=pre_launch,
+    )
+
+    raced = state in {
+        "withdrawn",
+        "replaced",
+        "registry_replaced",
+        "withdrawn_pre_launch",
+        "replaced_pre_launch",
+    }
+    should_launch = state in {"stopped", "dead_pane", "closed_during_probe", "closed_pre_launch"}
+    assert result is not raced
+    assert created == (["conv_x"] if should_launch else [])
+    assert observed == (
+        []
+        if raced and not state.endswith("pre_launch")
+        else [
+            state
+            in {"healthy", "withdrawn_pre_launch", "replaced_pre_launch", "closed_pre_launch"}
+        ]
+    )
+    assert terminals.get("other-session", terminal_name, "main") is other
+    assert terminals.get("conv_x", terminal_name, "other-key") is other
+    assert terminals.get("conv_x", "other-terminal", "main") is other
+    if state == "dead_pane":
+        assert instance.last_exit_status() == 23
+        assert instance._last_exit_snapshot == "launcher failed before startup"
+
+
+async def test_launch_native_terminal_serializes_stopped_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.runner.native import _launch_native_terminal
+
+    terminals = TerminalRegistry()
+    slot = terminals._by_conversation.setdefault("conv_x", {})
+    slot[("pi", "main")] = make_test_terminal_instance("pi", "main", tmp_path, running=False)
+    resources = SessionResourceRegistry(terminal_registry=terminals)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    launches: list[str] = []
+
+    async def launch(ctx: NativeLaunchContext) -> object:
+        launches.append(ctx.session_id)
+        started.set()
+        await release.wait()
+        slot[("pi", "main")] = make_test_terminal_instance("pi", "main", tmp_path / "new")
+        return object()
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", launch)
+    locks: dict[str, asyncio.Lock] = {}
+    ctx = _launch_ctx(resource_registry=resources)
+    first = asyncio.create_task(_launch_native_terminal("pi-native", ctx, ensure_locks=locks))
+    try:
+        await asyncio.wait_for(started.wait(), budget(2))
+        second = asyncio.create_task(_launch_native_terminal("pi-native", ctx, ensure_locks=locks))
+        release.set()
+        assert await asyncio.gather(first, second) == [True, True]
+    finally:
+        release.set()
+        await asyncio.gather(first, return_exceptions=True)
+    assert launches == ["conv_x"]
+
+
 @pytest.mark.asyncio
 async def test_launch_native_terminal_force_recreate_tears_down_existing(
     monkeypatch: pytest.MonkeyPatch,
@@ -632,9 +777,11 @@ async def test_launch_native_terminal_skip_and_needs_terminal_return_false(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("existing", [False, True])
 async def test_launch_native_terminal_publishes_start_error_on_failure(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    existing: bool,
 ) -> None:
     """A builder failure returns False and publishes a terminal-start error."""
     from omnigent.runner.native import _launch_native_terminal
@@ -643,10 +790,16 @@ async def test_launch_native_terminal_publishes_start_error_on_failure(
         raise RuntimeError("launch blew up")
 
     monkeypatch.setattr("omnigent.runner.native._launch_pi", _boom)
+    registry = _FakeTerminalRegistry(existing=existing)
+    registry.instance.running = False
+    registry.instance.is_alive.return_value = False
     events: list[tuple[str, dict[str, Any]]] = []
     result = await _launch_native_terminal(
         "pi-native",
-        _launch_ctx(publish_event=lambda name, event: events.append((name, event))),
+        _launch_ctx(
+            resource_registry=_FakeResourceRegistry(registry),
+            publish_event=lambda name, event: events.append((name, event)),
+        ),
         ensure_locks={},
     )
 

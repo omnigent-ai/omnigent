@@ -10869,11 +10869,26 @@ async def _launch_native_terminal(
     lock = ensure_locks.setdefault(ctx.session_id, asyncio.Lock())
     async with lock:
         registry = ctx.resource_registry.terminal_registry
-        has_terminal = (
-            registry is not None
-            and registry.get(ctx.session_id, agent.terminal_name, "main") is not None
+        instance = (
+            registry.get(ctx.session_id, agent.terminal_name, "main")
+            if registry is not None
+            else None
         )
+
+        def still_registered() -> bool:
+            return ctx.resource_registry.terminal_registry is registry and (
+                registry is None
+                or registry.get(ctx.session_id, agent.terminal_name, "main") is instance
+            )
+
+        has_terminal = instance is not None and await instance.is_alive()
+        if not still_registered():
+            return False
+        has_terminal = has_terminal and instance is not None and instance.running
         decision = await pre_launch(has_terminal) if pre_launch is not None else PreLaunchResult()
+        if not still_registered():
+            return False
+        has_terminal = has_terminal and instance is not None and instance.running
         if has_terminal and decision.force_recreate:
             if registry is not None:
                 await registry.cleanup_conversation(ctx.session_id)
