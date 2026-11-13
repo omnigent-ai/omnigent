@@ -32,6 +32,7 @@ import {
 import type * as UnseenModule from "@/hooks/useUnseenConversations";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type * as RoutingModule from "@/lib/routing";
+import type * as SavedWorkflowsModule from "@/hooks/useSavedWorkflows";
 import type {
   ScheduledTask,
   ScheduledTaskRun,
@@ -118,6 +119,16 @@ vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => {
 // Freeze the ticking clock so relative next-run text is deterministic.
 vi.mock("@/hooks/useNow", () => ({
   useNow: () => new Date("2026-07-27T12:00:00Z"),
+}));
+// A run's workflow button names its workflow from the saved ones.
+vi.mock("@/hooks/useSavedWorkflows", async (importOriginal) => ({
+  ...(await importOriginal<typeof SavedWorkflowsModule>()),
+  useSavedWorkflows: () => ({
+    workflows: [{ id: "9".repeat(32), name: "Triage", description: "" }],
+    isLoading: false,
+    isError: false,
+    refresh: () => undefined,
+  }),
 }));
 
 // Stub the edit dialog to a marker that reports open + the task it edits.
@@ -1418,6 +1429,37 @@ describe("runs of a saved workflow", () => {
     expect(overlay).toHaveTextContent("explore:done fix:ready");
     fireEvent.click(within(overlay).getByRole("button", { name: "Close graph" }));
     expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+  });
+
+  it("opens the run's workflow left of the graph button, with the Workflows page on", () => {
+    setTask(task({ prompt: WORKFLOW_PROMPT }));
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    const renderRun = (steps: ScheduledTaskRunSteps, workflowsPage: boolean) => {
+      vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", steps]]));
+      return render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows_page: workflowsPage } }}
+        >
+          {pageTree()}
+        </CapabilitiesProvider>,
+      );
+    };
+
+    renderRun(STEPS, true);
+    const row = screen.getByTestId("task-detail-run");
+    const link = within(row).getByRole("link", { name: "Open workflow “Triage”" });
+    expect(link).toHaveAttribute("href", `/workflows/${"9".repeat(32)}`);
+    expect(link.nextElementSibling).toBe(within(row).getByTestId("run-graph-button"));
+    cleanup();
+
+    // Not without the Workflows page, nor for a run whose plan names no workflow.
+    renderRun(STEPS, false);
+    expect(screen.getByTestId("run-graph-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("run-workflow-button")).toBeNull();
+    cleanup();
+    renderRun({ ...STEPS, workflowId: null }, true);
+    expect(screen.getByTestId("run-graph-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("run-workflow-button")).toBeNull();
   });
 
   it("asks for no plans when the automation runs no saved workflow", () => {

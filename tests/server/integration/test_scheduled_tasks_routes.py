@@ -2465,14 +2465,23 @@ async def test_list_tasks_leaves_young_running_run_untouched(
 def _seed_running_run_for_conv(db_uri: str, conversation_id: str) -> tuple[str, str]:
     """Create a task + a ``running`` run bound to ``conversation_id``.
 
+    The session holds the run's prompt and its agent's reply, so the turn's
+    idle edge ends the run.
+
     :returns: ``(task_id, run_id)``.
     """
     import uuid
 
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
 
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.create_conversation(conversation_id=conversation_id)
+    conversations.append(
+        conversation_id, [_message("user", "resp_1", "p"), _message("assistant", "resp_1", "done")]
+    )
     store = SqlAlchemyScheduledTaskStore(db_uri)
     task_id = uuid.uuid4().hex
     store.create(

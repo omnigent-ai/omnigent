@@ -37,7 +37,7 @@ import {
   SESSION_LINK_ID_PLACEHOLDER,
   splitTriggerPrompt,
 } from "@/components/scheduled/triggerTemplates";
-import { RunGraphButton, RunTimeline } from "@/components/workflows/RunTasks";
+import { RunGraphButton, RunTimeline, RunWorkflowButton } from "@/components/workflows/RunTasks";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
 import {
   useDeleteScheduledTask,
@@ -70,7 +70,7 @@ import {
   formatRunTimestamp,
 } from "@/lib/scheduleText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type { ScheduledTaskRun, ScheduledTaskRunSteps } from "@/lib/scheduledTasksApi";
 import { stepProgress } from "@/lib/sessionJournal";
@@ -722,6 +722,10 @@ function RunRow({
   const sessionId = run.conversationId;
   const showTasks = progress.length > 0 && sessionId != null;
   const [graphOpen, setGraphOpen] = useState(false);
+  // The saved workflow the run's plan follows, when the Workflows page can open it.
+  const workflowId = isFeatureEnabled(useServerInfo(), "workflows_page")
+    ? (steps?.workflowId ?? null)
+    : null;
   const duration = formatRunDuration(run.firedAt, run.finishedAt);
   // Unread only applies to a succeeded run that produced a conversation.
   const unread = useRunUnread(run);
@@ -812,7 +816,7 @@ function RunRow({
           className={cn(
             commonClassName,
             "cursor-pointer transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none",
-            showTasks && "pr-11",
+            showTasks && (workflowId ? "pr-18" : "pr-11"),
           )}
         >
           {body}
@@ -823,11 +827,13 @@ function RunRow({
       {showTasks && (
         <>
           <RunTimeline sessionId={sessionId} progress={progress} className="pr-3 pb-2.5 pl-10" />
-          <RunGraphButton
-            runName={`the ${timestamp ?? ""} run`}
-            className="absolute top-1.5 right-2"
-            onClick={() => setGraphOpen(true)}
-          />
+          <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
+            {workflowId && <RunWorkflowButton workflowId={workflowId} />}
+            <RunGraphButton
+              runName={`the ${timestamp ?? ""} run`}
+              onClick={() => setGraphOpen(true)}
+            />
+          </div>
         </>
       )}
       {graphOpen && showTasks && steps && (
