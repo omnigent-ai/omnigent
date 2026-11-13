@@ -171,6 +171,8 @@ class UploadHelperClient(_HelperProcessClient):
                 env_passthrough=None,
                 git_ssh=None,
                 git_ssh_socket_path=None,
+                tcp_egress=None,
+                tcp_egress_socket_path=None,
             ),
             egress_rules=None,
             egress_allow_private_destinations=False,
