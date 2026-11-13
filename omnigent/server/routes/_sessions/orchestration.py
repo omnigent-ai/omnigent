@@ -392,6 +392,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
 from omnigent.server.schemas import (
+    AgentCost,
     BackgroundTaskInfo,
     ChildSessionSummary,
     CreatedSessionResponse,
@@ -439,6 +440,7 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
+    SpawnTreeUsage,
     pinned_label_key,
     runner_seen_is_fresh,
 )
@@ -1510,6 +1512,41 @@ def _publish_subtree_cost_to_ancestors(
             payload["usage_by_model"] = usage_by_model
         event = SessionUsageEvent(**payload)
         session_stream.publish(ancestor_id, event.model_dump(exclude_none=True))
+
+
+def _agent_costs(tree: Sequence[SpawnTreeUsage], session_id: str) -> list[AgentCost]:
+    """
+    Display costs for *session_id* and its descendants from one loaded tree.
+
+    An agent's cost is its priced subtree total, the figure its own session
+    displays, or ``None`` when nothing in that subtree is priced.
+
+    :param tree: The whole spawn tree, from
+        :meth:`ConversationStore.list_spawn_tree_usage`.
+    :param session_id: Subtree root to report, e.g. ``"conv_abc123"``.
+    :returns: One :class:`AgentCost` per subtree member, in tree order.
+    """
+    children: dict[str, list[SpawnTreeUsage]] = {}
+    for row in tree:
+        if row.parent_conversation_id is not None:
+            children.setdefault(row.parent_conversation_id, []).append(row)
+    # Breadth-first from the subtree root (cycle-safe): every row follows its parent.
+    walk = [row for row in tree if row.id == session_id]
+    members = {row.id for row in walk}
+    for row in walk:
+        for child in children.get(row.id, ()):
+            if child.id not in members:
+                members.add(child.id)
+                walk.append(child)
+    totals: dict[str, float] = {}
+    for row in reversed(walk):
+        cost = _priced_cost_for_display(row.session_usage)
+        if cost is not None:
+            totals[row.id] = totals.get(row.id, 0.0) + cost
+        parent_id = row.parent_conversation_id
+        if row.id != session_id and row.id in totals and parent_id is not None:
+            totals[parent_id] = totals.get(parent_id, 0.0) + totals[row.id]
+    return [AgentCost(id=row.id, cost_usd=totals.get(row.id)) for row in tree if row.id in members]
 
 
 class _UnresolvedHarness:
