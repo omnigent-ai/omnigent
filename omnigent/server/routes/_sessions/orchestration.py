@@ -8843,6 +8843,11 @@ _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S: float = 30.0
 # failure. ``waiting`` counts because the turn's background work (shells,
 # sub-agents) outlives the turn and dies with the runner.
 _MID_TURN_STATUSES = ("running", "waiting")
+# How long this replica's last live-status write gets to reach the row before a
+# disconnect decision reads a settled row as another replica's newer edge. The
+# single live-state worker normally lands a write in well under a second; a
+# runner is swept only after its 90-second liveness lease anyway.
+_LIVE_STATUS_WRITE_SETTLE_S = 5.0
 # A laptop that sleeps or loses its network takes its runner with it and often
 # resumes the turn hours later, so a turn interrupted that way waits this long.
 # Three days covers a laptop closed over a weekend.
@@ -9013,6 +9018,15 @@ async def _runner_disconnect_requires_failure(
     needs a fresh row: an offline sweep's snapshot may predate a child's idle
     observation. Recheck the cache after the read, even when the read fails.
 
+    A cached mid-turn status needs a fresh row too. The cache is replica-local:
+    when the runner finished its turn through another replica, that replica
+    published and persisted ``idle`` while this one still holds ``running``
+    (its relay only saw the transport drop). A settled row that this replica's
+    own last write had time to reach is that newer edge, so the departed runner
+    interrupted nothing. A row read within :data:`_LIVE_STATUS_WRITE_SETTLE_S`
+    of this replica's last write may predate it, and a cached edge this replica
+    never wrote cannot be ordered against the row; neither overrides the cache.
+
     If the read is unavailable, use the sweep or relay's adoption snapshot.
     Without any known state, preserve the session: a failed read does not
     establish that a turn was interrupted.
@@ -9027,7 +9041,7 @@ async def _runner_disconnect_requires_failure(
     cached = _session_status_cache.get(session_id)
     persisted: Conversation | None = None
     lookup = "not_needed"
-    if cached is None:
+    if cached is None or cached in _MID_TURN_STATUSES:
         try:
             persisted = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             lookup = "found" if persisted is not None else "missing"
@@ -9057,6 +9071,16 @@ async def _runner_disconnect_requires_failure(
 
     conv = persisted if persisted is not None else fallback
     runner_id = handle.runner_id if handle is not None else conv.runner_id if conv else None
+    write_age_s = session_live_state.live_status_write_age_s(session_id)
+    settled_elsewhere = (
+        source == "cache"
+        and live in _MID_TURN_STATUSES
+        and persisted is not None
+        and persisted.live_status is not None
+        and persisted.live_status not in _MID_TURN_STATUSES
+        and write_age_s is not None
+        and write_age_s >= _LIVE_STATUS_WRITE_SETTLE_S
+    )
     if (
         snapshot is not None
         and snapshot.runner_id is not None
@@ -9069,6 +9093,14 @@ async def _runner_disconnect_requires_failure(
         # owns the turn. A failed or stale local read must not fail a turn that
         # is still running there.
         decision = "handed_off"
+    elif settled_elsewhere:
+        # Another replica carried this turn to its end after the transport
+        # dropped here; the stale local edge must not fail finished work. Drop
+        # it so reads fall back to the row, as for a session this replica
+        # never observed.
+        decision = "settled_on_another_replica"
+        _session_status_cache.pop(session_id, None)
+        _session_active_response_cache.pop(session_id, None)
     elif live in _MID_TURN_STATUSES and source != "cache" and _owned_by_parent_runtime(conv):
         decision = "subagent_unobserved"
     elif live in _MID_TURN_STATUSES:
@@ -9139,6 +9171,7 @@ async def _runner_disconnect_requires_failure(
             persisted_session_status=persisted.live_status if persisted is not None else None,
             snapshot_session_status=fallback.live_status if fallback is not None else None,
             status_lookup=lookup,
+            live_status_write_age_s=None if write_age_s is None else round(write_age_s, 3),
             session_kind=conv.kind if conv is not None else None,
             parent_session_id=conv.parent_conversation_id if conv is not None else None,
             runner_id=runner_id,

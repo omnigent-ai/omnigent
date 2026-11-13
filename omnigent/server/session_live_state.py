@@ -74,6 +74,10 @@ _executor: ThreadPoolExecutor | None = None
 # already logged, so repeats of either are suppressed. Unbounded like the
 # in-memory caches these writes mirror; entries live for the process.
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+# Monotonic time this process last enqueued a live-status write per session.
+# Lets a disconnect decision tell a write that has had time to land from one
+# still in flight (see :func:`live_status_write_age_s`).
+_last_status_at: WorkspaceScopedCache[str, float] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 # Last parked reason persisted per session (``""`` = not parked), for dedupe.
@@ -190,6 +194,7 @@ def persist_live_status(session_id: str, status: str) -> None:
     if _last_status.get(session_id) == status:
         return
     _last_status[session_id] = status
+    _last_status_at[session_id] = time.monotonic()
 
     def _evict() -> None:
         # A dropped write must not leave the dedupe cache asserting this
@@ -245,7 +250,24 @@ def forget_live_status(session_id: str) -> None:
     """Drop this process's dedupe state and queued writes for a session handed off."""
     _handoffs[session_id] = _handoffs.get(session_id, 0) + 1
     _last_status.pop(session_id, None)
+    _last_status_at.pop(session_id, None)
     _last_blocked_on.pop(session_id, None)
+
+
+def live_status_write_age_s(session_id: str) -> float | None:
+    """
+    Return how long ago this process last enqueued a live-status write.
+
+    Writes apply in submission order on a single worker, so an age well past
+    the worker's usual latency means the row carries at least this process's
+    last edge; anything newer in the row was written by another replica.
+
+    :param session_id: Session/conversation identifier.
+    :returns: Seconds since the last enqueued write, or ``None`` when this
+        process never enqueued one (or forgot it on handoff).
+    """
+    enqueued_at = _last_status_at.get(session_id)
+    return None if enqueued_at is None else time.monotonic() - enqueued_at
 
 
 def persist_scheduled_run_completion(
