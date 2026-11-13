@@ -467,6 +467,7 @@ async def test_filesystem_allows_the_owner_outside_the_workspace(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scope", [None, "workspace"])
 @pytest.mark.parametrize(
     "caller,url,marked",
     [
@@ -500,14 +501,26 @@ async def test_filesystem_marks_reach_scope_for_the_owner_only(
     caller: str,
     url: str,
     marked: bool,
+    scope: str | None,
 ) -> None:
     """Only effective owners receive reach scope for relative reads, including
     ownership inherited through a parent; an absolute path needs no mark."""
-    resp = await client.get(url, headers={"X-Forwarded-Email": caller})
+    resp = await client.get(
+        url,
+        headers={"X-Forwarded-Email": caller},
+        params={"scope": scope} if scope is not None else None,
+    )
 
+    if scope == "workspace" and url == _FS_ABSOLUTE:
+        assert resp.status_code == 400, resp.text
+        assert runner_client.gets == []
+        return
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
-    assert ("scope=reach" in runner_client.gets[0]) is marked
+    assert ("scope=reach" in runner_client.gets[0]) is (marked and scope is None)
+    assert resp.headers.get("X-Omnigent-File-Scope") == scope
+    if scope == "workspace":
+        assert "scope=workspace" in runner_client.gets[0]
 
 
 @pytest.mark.asyncio
@@ -1037,6 +1050,8 @@ _MERGE_PATH = "/v1/sessions/conv_share/resources/github/merge"
 _MERGE_OPTIONS_PATH = "/v1/sessions/conv_share/resources/github/merge-options"
 _DISABLE_AUTO_MERGE_PATH = "/v1/sessions/conv_share/resources/github/disable-auto-merge"
 _MERGE_BODY = {"pr_url": _LABELS_PR_URL, "merge_method": "squash", "expected_head": "a" * 40}
+_MERGE_AS_PATH = "/v1/sessions/conv_share/resources/github/merge-as"
+_MERGE_AS_BODY = {**_MERGE_BODY, "account": "personal"}
 _COMMENTS_PATH = "/v1/sessions/conv_share/resources/github/comments"
 _REVIEW_REPLY_PATH = "/v1/sessions/conv_share/resources/github/review-threads/thread-1/replies"
 _DETAILS_PATH = "/v1/sessions/conv_share/resources/github/details"
@@ -1061,21 +1076,24 @@ async def test_pr_merge_routes_require_edit(
         _MERGE_OPTIONS_PATH, params={"pr_url": _LABELS_PR_URL}, headers=headers
     )
     merged = await client.post(_MERGE_PATH, json=_MERGE_BODY, headers=headers)
+    merged_as = await client.post(_MERGE_AS_PATH, json=_MERGE_AS_BODY, headers=headers)
     disabled = await client.post(
         _DISABLE_AUTO_MERGE_PATH, json={"pr_url": _LABELS_PR_URL}, headers=headers
     )
 
-    assert (options.status_code, merged.status_code, disabled.status_code) == (
-        expected,
-        expected,
-        expected,
-    ), merged.text
+    assert (
+        options.status_code,
+        merged.status_code,
+        merged_as.status_code,
+        disabled.status_code,
+    ) == (expected, expected, expected, expected), merged.text
     if expected == 403:
         assert runner_client.gets == runner_client.posts == []
         return
     assert runner_client.gets == [_MERGE_OPTIONS_PATH]
     assert runner_client.posts == [
         (_MERGE_PATH, _MERGE_BODY),
+        (_MERGE_AS_PATH, _MERGE_AS_BODY),
         (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
     ]
 
@@ -1145,9 +1163,19 @@ async def test_pr_attachment_upload_refuses_viewers_before_the_runner(
         (_COMMENTS_PATH, {"pr_url": _LABELS_PR_URL, "body": "Hello"}),
         (_REVIEW_REPLY_PATH, {"pr_url": _LABELS_PR_URL, "body": "Hello"}),
         (_MERGE_PATH, _MERGE_BODY),
+        (_MERGE_AS_PATH, _MERGE_AS_BODY),
         (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
     ],
-    ids=["labels", "reviewers", "details", "comments", "reply", "merge", "disable-auto-merge"],
+    ids=[
+        "labels",
+        "reviewers",
+        "details",
+        "comments",
+        "reply",
+        "merge",
+        "merge-as",
+        "disable-auto-merge",
+    ],
 )
 async def test_pr_edit_requires_a_json_body(
     client: httpx.AsyncClient,

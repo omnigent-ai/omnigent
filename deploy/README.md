@@ -99,6 +99,13 @@ deploy/
 ├── microsandbox/      ← microsandbox sandbox-provider guide (local libkrun
 │   └── README.md         microVMs, embedded SDK, no daemon); NOT a server target.
 │
+├── aws-lambda-microvm/ ← AWS Lambda MicroVMs sandbox-provider guide + MicroVM
+│   ├── Dockerfile        image build inputs (hooks shim on the host image);
+│   ├── entrypoint.sh     server-managed only. NOT a server deploy target.
+│   ├── hooks_server.py
+│   ├── start_host.sh
+│   └── README.md
+│
 ├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
 │   ├── databricks.yml     bundle declarative config
 │   ├── deploy.py          build + `bundle deploy`/`run` orchestrator
@@ -301,6 +308,10 @@ For an IdP that cannot supply a fresh `auth_time` (for example, Cloudflare
 Access), set `OMNIGENT_OIDC_REQUIRE_REAUTH=0`. The server still sends
 `prompt=login` and requires PKCE, ticket-specific sign-in, and approval, but it
 no longer verifies that the IdP asked for credentials again.
+If the IdP fails the sign-in when asked to re-authenticate (for example,
+self-managed GitLab), also set `OMNIGENT_OIDC_REAUTH_PROMPT=0` to stop sending
+`prompt=login` and `max_age`. The IdP then reuses its session, so only the
+ticket-specific approval screen confirms the request.
 Polling responses forbid caching, including successful credential responses.
 CLI and Slack display a comparison code; native mobile apps currently rely
 on explicit browser approval without displaying that code in the app. Include
@@ -368,6 +379,51 @@ Gensee reads `GENSEE_CONTROLLER_API_TOKEN`; see
 All credentials come from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
+
+**Host token expiry.** Set `sandbox.token_ttl_s` to control the token validity
+window in seconds. Omitted or `null` keeps the provider default (seven days
+for most providers; Modal uses 25 hours, and Blaxel, E2B, and CoreWeave derive
+it from sandbox lifetime). Values must be integers from `300` to `31536000`
+(5 minutes to 365 days). Allow enough time for sandbox startup and repository
+setup before the first host connection.
+
+```yaml
+sandbox:
+  server_url: https://your-host
+  token_ttl_s: 86400                 # shared default: 1 day
+  providers:
+    - provider: daytona
+    - provider: kubernetes
+      token_ttl_s: 604800            # override: 7 days
+```
+
+With a single `provider`, put `token_ttl_s` beside it. In a `providers` list,
+an entry can override the shared value or use `null` to restore its provider
+default. Restart the server after editing the configuration. The setting
+applies to newly issued tokens and future renewals; lowering it does not
+shorten an expiry already granted to an existing token.
+
+Connected hosts renew the same token halfway through this window, on the next
+heartbeat. Ordinary heartbeats keep their existing cost. Expiry is measured
+from the last renewal; disconnected hosts receive no renewals, and an expired
+token cannot open a new connection. Renewal also extends the validity of any
+leaked copy of that token. This setting does not change sandbox lifetime or
+Mac/Arca user-login credentials.
+
+**Stopping archived sessions' sandboxes.** Set `sandbox.stop_on_archive: true`
+(off by default) to stop a session's sandbox when the session is archived, after
+its runner is stopped. It is a per-provider setting: in a `providers:` list, a
+value next to `providers` is every entry's default, and an entry can override it.
+The sandbox is stopped, not deleted, so unarchiving the session and sending a
+message resumes the same sandbox. It applies only to providers that can resume
+a stopped sandbox (`capabilities.resume_stopped`) and implement `stop()`; on a
+provider whose `stop()` raises `SandboxCapabilityError`, the option has no
+effect (the server logs that at debug level). Only a sandbox no other session
+uses is stopped: another session on the same host, or a side chat or sub-agent
+of the session, keeps it running even when archived, and so does a scheduled
+task run's sandbox. Deleting the session still terminates the sandbox, and so does
+the reaper below once a stopped sandbox's host passes its offline limit; the
+next message then starts a fresh sandbox instead.
 
 The optional reaper runs once for the whole `sandbox:` deployment, including
 multi-provider configurations. It queries managed host rows directly and
@@ -675,8 +731,8 @@ shows the Omnigent mascot, never your logo.
 `server_name` names this particular server, so people who connect the desktop
 app to several servers can tell them apart. It is published in the
 unauthenticated `GET /.well-known/omnigent.json` manifest, not in `/v1/info`.
-Desktop builds that read it always show the host next to it, and an MDM-provided
-name (`omnigentServerName`) takes precedence. When unset, the desktop shows the
+Desktop builds that read it always show the host next to it, and a name set by
+device policy (`omnigentServerName`) takes precedence. When unset, the desktop shows the
 host; it does not fall back to `app_name`.
 
 ## Curating the New Chat picker

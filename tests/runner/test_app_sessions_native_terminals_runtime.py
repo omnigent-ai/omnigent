@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -45,11 +45,15 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.runner.session_init_protocol import (
+    SESSION_INIT_PAYLOAD_KEY,
+    SESSION_INIT_PROTOCOL_VERSION,
     RunnerSessionInitEnvelope,
     RunnerSessionInitSnapshot,
 )
+from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store import CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
+from omnigent.terminals import TerminalRegistry
 from tests.budgets import budget
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -57,7 +61,7 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
     _sse,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 # Synthetic id of the session whose Codex bridge a rotated session shares.
 _ROTATED_BRIDGE_ID = "5f1c0a9e7b2d4c36a8e4d1f0b9a72c15"
@@ -814,6 +818,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         retain_client: bool = False,
         cwd: Path | None = None,
         model_provider: str | None = None,
+        rollout_path: Path | None = None,
     ) -> Any:
         """
         Record preloading of the known Codex thread.
@@ -938,7 +943,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
     assert build_calls[0]["trust_project"] is True
     assert build_calls[0]["reconcile_process_registry"] is False
-    assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
+    assert build_calls[0]["developer_instructions"] == (
+        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    )
     # Persisted pass-through args must reach launch resolution (--profile layering).
     assert resolve_calls and all(
         call["terminal_launch_args"] == ["--config", "approval_policy=on-request"]
@@ -1266,6 +1273,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         retain_client: bool = False,
         cwd: Path | None = None,
         model_provider: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -1564,6 +1572,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         retain_client: bool = False,
         cwd: Path | None = None,
         model_provider: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         assert terminal_launch_args is None
@@ -1908,7 +1917,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "mean the session snapshot workspace was ignored."
     )
     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
-    assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
+    assert build_calls[0]["developer_instructions"] == (
+        f"Be a concise, careful coding assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    )
 
     # Sandbox-override regression: the launched Codex terminal must inherit
     # the agent's sandbox: none rather than falling back to the platform
@@ -2398,14 +2409,22 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["cancel", "ready", "rejected", "expired"])
 async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
 ) -> None:
-    """A cold bridge does not block dispatch or strand a cancelled worker."""
+    """A cold bridge does not block dispatch, occupy a worker, or outlive cancellation."""
+    from omnigent.runner import app as runner_app_mod
     from omnigent.runner.slow_io import run_slow_io
+    from omnigent.util.dedicated_executor import DedicatedExecutor
     from tests._helpers.polling import poll_until_async
 
+    notification_pool = DedicatedExecutor(max_workers=1, thread_name_prefix="test-bridge-notify")
+    monkeypatch.setattr(runner_app_mod, "_BRIDGE_NOTIFICATIONS", notification_pool)
+    if outcome == "expired":
+        monkeypatch.setattr(claude_native_bridge, "TOOLS_CHANGED_READY_TIMEOUT_S", budget(2))
     session_id = uuid.uuid4().hex
     # claude-native pins the bridge tree under /tmp (see _ensure_secure_dir);
     # use the real per-user bridge dir like tests/runner/test_comment_relay.py
@@ -2421,6 +2440,9 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
     notification_task: asyncio.Task[Any] | None = None
     read_json = claude_native_bridge._read_json_file
     post_tools_changed = claude_native_bridge.post_tools_changed
+    connection = Mock()
+    connection.getresponse.return_value.status = 503 if outcome == "rejected" else 200
+    monkeypatch.setattr(claude_native_bridge, "_control_connection", lambda _: connection)
 
     def _observe_read(path: Path) -> dict[str, Any]:
         result = read_json(path)
@@ -2428,11 +2450,16 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
             polling_started.set()
         return result
 
-    def _observe_notification(target: Path, *, cancelled: threading.Event) -> None:
+    def _observe_notification(
+        target: Path,
+        *,
+        cancelled: threading.Event,
+        timeout_s: float = 30.0,
+    ) -> None:
         nonlocal cancellation_event
         cancellation_event = cancelled
         try:
-            post_tools_changed(target, cancelled=cancelled)
+            post_tools_changed(target, cancelled=cancelled, timeout_s=timeout_s)
         finally:
             worker_finished.set()
 
@@ -2492,7 +2519,10 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
                     break
                 await asyncio.sleep(0.01)
             assert polling_started.is_set(), "notification never reached bridge readiness polling"
-            assert not worker_finished.is_set()
+            assert await asyncio.to_thread(worker_finished.wait, budget(1)), (
+                "cold-bridge readiness polling occupied a notification worker"
+            )
+            assert await asyncio.wait_for(notification_pool.run(lambda: True), budget(1))
 
             # The absent bridge must not prevent the first turn reaching the harness.
             for _ in range(300):
@@ -2505,7 +2535,7 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
                 "cold-bridge notification."
             )
             assert not (bridge_dir / "server.json").exists()
-            assert not worker_finished.is_set()
+            assert worker_finished.is_set()
 
             tasks = [
                 task
@@ -2514,9 +2544,30 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
             ]
             assert len(tasks) == 1
             notification_task = tasks[0]
-            notification_task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await notification_task
+            if outcome == "cancel":
+                notification_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await notification_task
+                connection.request.assert_not_called()
+            elif outcome == "expired":
+                await asyncio.wait_for(notification_task, budget(4))
+                connection.request.assert_not_called()
+                assert not (bridge_dir / "server.json").exists()
+            else:
+                (bridge_dir / "server.json").write_text(
+                    json.dumps({"token": "notification-token", "socket": "/unused.sock"})
+                )
+                await asyncio.wait_for(notification_task, budget(1))
+                connection.request.assert_called_once_with(
+                    "POST",
+                    "/tools-changed",
+                    body=b"{}",
+                    headers={
+                        "Authorization": "Bearer notification-token",
+                        "Content-Type": "application/json",
+                    },
+                )
+                connection.close.assert_called_once()
             assert await asyncio.to_thread(worker_finished.wait, 1.0), (
                 "cancelling the notification task left its readiness worker running"
             )
@@ -2534,6 +2585,7 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
             async with _runner_client(app) as cleanup_client:
                 await cleanup_client.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
+        notification_pool._get_executor().shutdown(wait=True)
 
 
 async def _run_antigravity_auto_create(
@@ -3567,6 +3619,10 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
 
     session_id = "1fd85439049bbfc88cbf04221bad5079"
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    # Keep a developer's real ~/.gemini MCP servers out of the relay config.
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: real_home))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
     (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
@@ -3881,6 +3937,60 @@ async def test_codex_session_needs_runner_terminal_false_without_client() -> Non
         await _codex_session_needs_runner_terminal(None, "8af356d908005a65f872c246158c6293")
         is False
     )
+
+
+@pytest.mark.asyncio
+async def test_codex_child_from_init_envelope_gets_sub_agent_idle_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Codex child identified only by its init envelope's parent is reaped after an hour."""
+    monkeypatch.delenv("OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S", raising=False)
+    terminal_registry = TerminalRegistry()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+        native_pane_idle_timeout_s=86400,
+    )
+    resource_registry = app.state.session_resource_registry
+    async with _runner_client(app) as client:
+        for session_id, parent_id in (("conv_top", None), ("conv_child", "conv_parent")):
+            envelope = RunnerSessionInitEnvelope(
+                protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+                server_version="0.16.0",
+                session_id=session_id,
+                agent_id="ag_worker",
+                snapshot=RunnerSessionInitSnapshot(
+                    created_at=1, updated_at=1, parent_session_id=parent_id
+                ),
+            )
+            response = await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": session_id,
+                    "agent_id": "ag_worker",
+                    SESSION_INIT_PAYLOAD_KEY: envelope.model_dump(mode="json"),
+                },
+            )
+            assert response.status_code == 201, response.text
+            terminal_registry._by_conversation[session_id] = {
+                ("codex", "main"): make_test_terminal_instance(
+                    "codex", "main", tmp_path / session_id
+                )
+            }
+    monkeypatch.setattr(
+        resource_registry, "terminal_resource_role", lambda *_args: CODEX_NATIVE_TERMINAL_ROLE
+    )
+    reaper = app.state.native_pane_reaper
+    panes = reaper._list_native_panes()
+
+    def reapable_at(now: float) -> set[str]:
+        return {pane.conversation_id for pane in reaper._classify(now, panes, set())}
+
+    assert reapable_at(0.0) == set()
+    assert reapable_at(3599.0) == set()
+    assert reapable_at(3600.0) == {"conv_child"}
+    assert reapable_at(86400.0) == {"conv_top", "conv_child"}
 
 
 @pytest.mark.asyncio
@@ -4957,6 +5067,11 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
 
     # A bare subscription default shape, with the real store-backed catalog
     # serving the seeded rows; the re-probe is stubbed off the real CLI.
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: sys.executable)
+    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: sys.executable)
     monkeypatch.setattr(
         codex_app_mod,
         "resolve_native_codex_launch",
@@ -5092,6 +5207,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         retain_client: bool = False,
         cwd: Path | None = None,
         model_provider: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -5332,6 +5448,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         retain_client: bool = False,
         cwd: Path | None = None,
         model_provider: str | None = None,
+        rollout_path: Path | None = None,
     ) -> None:
         """Accept preloading of the known Codex thread."""
         del transport, loaded_thread_id, terminal_launch_args

@@ -85,6 +85,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
   vi.useRealTimers();
 });
 
@@ -372,8 +373,8 @@ describe("useCanvasSessions", () => {
     );
     expect(keys).toEqual(
       expect.arrayContaining([
-        expect.stringMatching(/:server-a:me$/),
-        expect.stringMatching(/:server-b:me$/),
+        expect.stringMatching(/:server-a:me:true$/),
+        expect.stringMatching(/:server-b:me:true$/),
       ]),
     );
   });
@@ -438,9 +439,10 @@ describe("useCanvasSessions", () => {
     });
   });
 
-  it("waits for identity before restoring only owned rows from a legacy reload cache", async () => {
+  it.each([true, false])("restores owned rows only for matching view %s", async (enabled) => {
+    if (!enabled) document.cookie = "omnigent_admin_view=off; Path=/";
     window.sessionStorage.setItem(
-      "omnigent:canvas-sessions:server-a:me",
+      "omnigent:canvas-sessions:server-a:me:true",
       JSON.stringify({
         version: 1,
         sessions: [
@@ -463,13 +465,18 @@ describe("useCanvasSessions", () => {
     });
 
     // Do not flash the short preview while the persisted cache's viewer resolves.
-    expect(reloaded.result.current).toMatchObject({ sessions: [], loaded: false });
+    expect(reloaded.result.current.sessions.map((row) => row.id)).toEqual(
+      enabled ? [] : ["preview"],
+    );
+    expect(reloaded.result.current.loaded).toBe(!enabled);
     await waitFor(() =>
-      expect(reloaded.result.current.sessions.map((row) => row.id)).toEqual(["a", "b"]),
+      expect(reloaded.result.current.sessions.map((row) => row.id)).toEqual(
+        enabled ? ["a", "b"] : ["preview"],
+      ),
     );
     expect(reloaded.result.current).toMatchObject({
       loaded: true,
-      complete: true,
+      complete: enabled,
       networkConfirmed: false,
     });
   });
@@ -501,7 +508,7 @@ describe("useCanvasSessions", () => {
       window.sessionStorage.key(index),
     );
     expect(keys).toHaveLength(1);
-    expect(keys[0]).toMatch(/:me$/);
+    expect(keys[0]).toMatch(/:me:true$/);
     expect(keys[0]).not.toContain(":anonymous");
   });
 
@@ -624,13 +631,56 @@ describe("useCanvasSessions", () => {
     expect(result.current.sessions.map((row) => row.id)).toEqual(["a"]);
     expect(result.current.error).toBeNull();
 
-    await act(async () => {
-      window.dispatchEvent(new Event("focus"));
-      await Promise.resolve();
-    });
-    await waitFor(() => expect(result.current.error).toContain("502"));
+    // Focus refreshes only once a poll interval has passed since the last one.
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + SESSION_POLL_INTERVAL_MS);
+    try {
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(result.current.error).toContain("502"));
+    } finally {
+      now.mockRestore();
+    }
     expect(result.current.sessions.map((row) => row.id)).toEqual(["a"]);
     expect(result.current.loadingMore).toBe(false);
     expect(identity.authenticatedFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("skips focus and visibility refreshes within a poll interval of the last one", async () => {
+    // Each refresh walks every session, and focus flips every time the user
+    // switches windows.
+    const client = new QueryClient();
+    vi.mocked(identity.authenticatedFetch).mockResolvedValue(
+      jsonResponse(page([session("a", 1)], null, false)),
+    );
+    const { result } = renderHook(() => useCanvasSessions(), { wrapper: wrapper(client) });
+    await waitFor(() => expect(result.current.complete).toBe(true));
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
+
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now() + SESSION_POLL_INTERVAL_MS);
+    try {
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(identity.authenticatedFetch).toHaveBeenCalledTimes(2));
+      // A tab coming back into view after another interval also refreshes.
+      now.mockReturnValue(Date.now() + SESSION_POLL_INTERVAL_MS);
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(identity.authenticatedFetch).toHaveBeenCalledTimes(3));
+    } finally {
+      now.mockRestore();
+    }
   });
 });
