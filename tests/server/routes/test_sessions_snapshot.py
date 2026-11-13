@@ -2587,17 +2587,9 @@ async def test_session_snapshot_fills_cold_pi_catalog_from_host(
     inherited_host: bool,
     first_host_failure: bool,
 ) -> None:
-    """
-    A cold pi-native catalog falls back to the session's host.
-
-    The extension pushes the pi catalog once, at session start, into an
-    in-memory cache. A server restart while the session sleeps empties it and
-    nothing re-pushes until the session is resumed, so the picker would stay
-    hidden. The snapshot asks the session's host instead (the same source the
-    new-session picker uses) and fills the pushed cache, which a later
-    extension push still replaces.
-    """
+    """Cold Pi snapshots refill from direct or inherited hosts and retry failed lookups."""
     from omnigent.server.routes import sessions as _mod
+    from omnigent.server.schemas import SessionEventInput
 
     session_id = "conv_pi_host_catalog"
     _mod._session_status_cache.clear()
@@ -2684,6 +2676,15 @@ async def test_session_snapshot_fills_cold_pi_catalog_from_host(
     assert [m.id for m in snapshot.model_options] == ["provider/test-model"]
     # Not stale-marked: pi's picker reads only the pushed cache.
     assert session_id not in _mod._model_options_stale
+
+    _mod._persist_external_model_options(
+        session_id,
+        conv,
+        SessionEventInput(type="external_model_options", data={"models": [{"id": "extension"}]}),
+    )
+    replaced = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert [model.id for model in replaced.model_options] == ["extension"]
+    assert session_id not in _mod._model_options_inflight
 
 
 @pytest.mark.asyncio
