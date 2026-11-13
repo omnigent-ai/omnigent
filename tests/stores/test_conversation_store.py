@@ -14,10 +14,12 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
+from omnigent.db.db_models import SqlConversationItem, current_workspace_id
+from omnigent.db.enum_codecs import encode_item_type
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
     CompactionData,
@@ -598,10 +600,10 @@ def test_list_latest_message_items_for_conversations(
     assert result["5eca720dc2bc6cdc3a99028d7bd0f917"] == []
 
 
-def test_ranked_latest_message_items_omits_search_text(
+def test_latest_message_items_statement_omits_search_text(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """The ranked-message subquery must not select the heavy ``search_text``
+    """The latest-message statement must not select the heavy ``search_text``
     column — the preview caller never reads it, and pulling it roughly doubles
     the bytes transferred per row on a chatty child.
 
@@ -611,11 +613,11 @@ def test_ranked_latest_message_items_omits_search_text(
     still carries the visible text, proving the preview reads ``data``.
     """
     from omnigent.stores.conversation_store.sqlalchemy_store import (
-        _ranked_latest_message_items,
+        _latest_message_items_statement,
     )
 
-    ranked = _ranked_latest_message_items(["8af356d908005a65f872c246158c6293"])
-    columns = {c.key for c in ranked.c}
+    statement = _latest_message_items_statement(["8af356d908005a65f872c246158c6293"], 10)
+    columns = {c.key for c in statement.selected_columns}
     assert "search_text" not in columns
     # The columns _to_item + the preview actually consume must all be present.
     assert {
@@ -628,7 +630,6 @@ def test_ranked_latest_message_items_omits_search_text(
         "type",
         "data",
         "created_by",
-        "row_num",
     } <= columns
 
     conv = conversation_store.create_conversation(title="chatty")
@@ -652,6 +653,262 @@ def test_ranked_latest_message_items_omits_search_text(
     item = result[conv.id][0]
     assert isinstance(item.data, MessageData)
     assert item.data.content[0]["text"] == "visible reply"
+
+
+def _window_reference_ids(
+    store: SqlAlchemyConversationStore,
+    conversation_ids: list[str],
+    limit: int,
+) -> dict[str, list[str]]:
+    """Newest ``limit`` message item ids per conversation via the retired window query.
+
+    Used as the oracle that the bounded per-id statement must match exactly.
+
+    :param store: Store whose database holds the seeded items.
+    :param conversation_ids: Conversation ids to query.
+    :param limit: Maximum message items per conversation.
+    :returns: Mapping from each input id to its item ids, newest first.
+    """
+    ranked = (
+        select(
+            SqlConversationItem.conversation_id,
+            SqlConversationItem.id,
+            SqlConversationItem.position,
+            func.row_number()
+            .over(
+                partition_by=SqlConversationItem.conversation_id,
+                order_by=SqlConversationItem.position.desc(),
+            )
+            .label("row_num"),
+        )
+        .where(
+            SqlConversationItem.workspace_id == current_workspace_id(),
+            SqlConversationItem.conversation_id.in_(conversation_ids),
+            SqlConversationItem.type == encode_item_type("message"),
+        )
+        .subquery()
+    )
+    with store._conv_session("test_window_reference_ids") as session:
+        rows = session.execute(
+            select(ranked.c.conversation_id, ranked.c.id)
+            .where(ranked.c.row_num <= limit)
+            .order_by(ranked.c.conversation_id, ranked.c.position.desc())
+        ).all()
+    grouped: dict[str, list[str]] = {cid: [] for cid in conversation_ids}
+    for row in rows:
+        grouped[row.conversation_id].append(row.id)
+    return grouped
+
+
+def test_latest_message_items_matches_window_query_for_mixed_items(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The bounded per-id statement returns exactly the window query's rows.
+
+    Covers interleaved non-message items, ``is_meta`` messages (kept, as before),
+    a child with fewer messages than the cap, a child with only non-message
+    items, an empty child, and an unknown id.
+    """
+    busy = conversation_store.create_conversation(title="busy")
+    short = conversation_store.create_conversation(title="short")
+    no_messages = conversation_store.create_conversation(title="no-messages")
+    empty = conversation_store.create_conversation(title="empty")
+
+    busy_items: list[NewConversationItem] = []
+    for i in range(14):
+        busy_items.append(
+            NewConversationItem(
+                type="message",
+                response_id="resp_busy",
+                data=MessageData(
+                    role="user" if i % 2 else "assistant",
+                    content=[{"type": "output_text", "text": f"busy {i}"}],
+                    agent="worker",
+                    is_meta=i % 4 == 3,
+                ),
+            )
+        )
+        busy_items.append(
+            NewConversationItem(
+                type="reasoning",
+                response_id="resp_busy",
+                data=ReasoningData(
+                    agent="worker",
+                    summary=[{"type": "summary_text", "text": f"thought {i}"}],
+                ),
+            )
+        )
+    conversation_store.append(busy.id, busy_items)
+    conversation_store.append(
+        short.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_short",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": f"short {i}"}],
+                    agent="worker",
+                    is_meta=i == 1,
+                ),
+            )
+            for i in range(3)
+        ]
+        + [
+            NewConversationItem(
+                type="reasoning",
+                response_id="resp_short",
+                data=ReasoningData(
+                    agent="worker",
+                    summary=[{"type": "summary_text", "text": "short thought"}],
+                ),
+            )
+        ],
+    )
+    conversation_store.append(
+        no_messages.id,
+        [
+            NewConversationItem(
+                type="reasoning",
+                response_id="resp_none",
+                data=ReasoningData(
+                    agent="worker",
+                    summary=[{"type": "summary_text", "text": "only thought"}],
+                ),
+            )
+        ],
+    )
+
+    ids = [busy.id, short.id, no_messages.id, empty.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
+    for limit in (10, 2):
+        result = conversation_store.list_latest_message_items_for_conversations(ids, limit)
+        actual = {cid: [item.id for item in items] for cid, items in result.items()}
+        assert actual == _window_reference_ids(conversation_store, ids, limit)
+
+    result = conversation_store.list_latest_message_items_for_conversations(ids, 10)
+    assert len(result[busy.id]) == 10
+    assert len(result[short.id]) == 3
+    assert result[no_messages.id] == []
+    assert any(item.data.is_meta for item in result[short.id])
+
+
+def test_latest_message_items_reads_only_the_cap_per_child(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rows decoded per call stay at the cap, not the child's history length.
+
+    A child with 60 messages must contribute 10 rows, and the statement must
+    carry a LIMIT per child rather than reading the full history.
+    """
+    chatty = conversation_store.create_conversation(title="chatty")
+    quiet = conversation_store.create_conversation(title="quiet")
+    conversation_store.append(
+        chatty.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_chatty",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": f"chatty {i}"}],
+                    agent="worker",
+                ),
+            )
+            for i in range(60)
+        ],
+    )
+    conversation_store.append(
+        quiet.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_quiet",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": f"quiet {i}"}],
+                    agent="worker",
+                ),
+            )
+            for i in range(3)
+        ],
+    )
+
+    decoded_counts: list[int] = []
+    original_decode = conversation_store._decode_item_data_batch
+
+    def counting_decode(stored: list[bytes]) -> list[str]:
+        decoded_counts.append(len(stored))
+        return original_decode(stored)
+
+    statements: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+        if "conversation_items" in statement:
+            statements.append(statement)
+
+    monkeypatch.setattr(conversation_store, "_decode_item_data_batch", counting_decode)
+    event.listen(conversation_store._conv_engine, "before_cursor_execute", record)
+    try:
+        result = conversation_store.list_latest_message_items_for_conversations(
+            [chatty.id, quiet.id], 10
+        )
+    finally:
+        event.remove(conversation_store._conv_engine, "before_cursor_execute", record)
+
+    assert len(result[chatty.id]) == 10
+    assert result[chatty.id][0].data.content[0]["text"] == "chatty 59"
+    assert len(result[quiet.id]) == 3
+    assert decoded_counts == [13]
+    assert len(statements) == 1
+    assert statements[0].upper().count("LIMIT") == 2
+
+
+def test_latest_message_items_batches_large_id_lists(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Id lists larger than one chunk return the same rows as a single query.
+
+    Each UNION ALL statement is capped at ``_LATEST_MESSAGE_UNION_CHUNK`` members
+    so SQLite's compound-select limit is never hit.
+    """
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        _LATEST_MESSAGE_UNION_CHUNK,
+    )
+
+    conv = conversation_store.create_conversation(title="needle")
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_needle",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "needle"}],
+                    agent="worker",
+                ),
+            )
+        ],
+    )
+    missing = [f"{i:032x}" for i in range(_LATEST_MESSAGE_UNION_CHUNK * 2 + 5)]
+    ids = [*missing[:300], conv.id, *missing[300:]]
+
+    statements: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+        if "conversation_items" in statement:
+            statements.append(statement)
+
+    event.listen(conversation_store._conv_engine, "before_cursor_execute", record)
+    try:
+        result = conversation_store.list_latest_message_items_for_conversations(ids, 10)
+    finally:
+        event.remove(conversation_store._conv_engine, "before_cursor_execute", record)
+
+    assert [item.data.content[0]["text"] for item in result[conv.id]] == ["needle"]
+    assert len(result) == len(ids)
+    assert len(statements) == 3
 
 
 def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:

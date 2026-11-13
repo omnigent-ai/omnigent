@@ -27,11 +27,11 @@ from sqlalchemy import (
     select,
     text,
     tuple_,
+    union_all,
     update,
 )
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
-from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.account_authority import AccountAuthority, require_active_account
@@ -866,25 +866,30 @@ def _remap_item_file_references(
     return changed
 
 
-def _ranked_latest_message_items(conversation_ids: list[str]) -> Subquery:
-    """
-    Build a ranked latest-message subquery for multiple conversations.
+# Conversation ids per UNION ALL statement; keeps each statement under SQLite's
+# default compound-select limit of 500 members.
+_LATEST_MESSAGE_UNION_CHUNK = 250
 
-    Selects only the columns :func:`_to_item` needs (plus ``conversation_id``
-    and ``position`` for grouping/ordering) and a per-conversation ``row_num``
-    so the caller can filter to the top-N rows without a join back to the base
-    table. Avoiding the join is critical: the primary key is
-    ``(workspace_id, conversation_id, id)``, so a join on ``id`` alone forces a
-    full table scan. The heavy ``search_text`` column is deliberately omitted —
-    the message-preview caller never reads it, and it roughly doubles the bytes
-    pulled per row on a chatty conversation.
+
+def _latest_message_items_statement(conversation_ids: list[str], limit: int) -> Select:
+    """
+    Build one statement returning the newest ``limit`` message items per id.
+
+    Each conversation is a derived table ``ORDER BY position DESC LIMIT n``
+    filtered on ``(workspace_id, conversation_id, type)``, so the index scan
+    can stop after ``limit`` messages instead of covering a window over the
+    full history. The derived tables are unioned and ordered by conversation
+    then position. The heavy ``search_text`` column is omitted because the
+    preview never reads it.
 
     :param conversation_ids: Conversation ids to fetch messages for,
         e.g. ``["conv_child1", "conv_child2"]``.
-    :returns: SQLAlchemy subquery with the projected item columns plus
-        per-conversation ``row_num``, newest message first.
+    :param limit: Maximum messages per conversation, e.g. ``10``.
+    :returns: Select over the union with the projected item columns.
     """
-    return (
+    workspace_id = current_workspace_id()
+    message_type = encode_item_type("message")
+    members = [
         select(
             SqlConversationItem.conversation_id,
             SqlConversationItem.id,
@@ -895,20 +900,19 @@ def _ranked_latest_message_items(conversation_ids: list[str]) -> Subquery:
             SqlConversationItem.type,
             SqlConversationItem.data,
             SqlConversationItem.created_by,
-            func.row_number()
-            .over(
-                partition_by=SqlConversationItem.conversation_id,
-                order_by=desc(SqlConversationItem.position),
-            )
-            .label("row_num"),
         )
         .where(
-            SqlConversationItem.workspace_id == current_workspace_id(),
-            SqlConversationItem.conversation_id.in_(conversation_ids),
-            SqlConversationItem.type == encode_item_type("message"),
+            SqlConversationItem.workspace_id == workspace_id,
+            SqlConversationItem.conversation_id == conversation_id,
+            SqlConversationItem.type == message_type,
         )
+        .order_by(desc(SqlConversationItem.position))
+        .limit(limit)
         .subquery()
-    )
+        for conversation_id in conversation_ids
+    ]
+    union = union_all(*(select(member) for member in members)).subquery()
+    return select(union).order_by(union.c.conversation_id, union.c.position.desc())
 
 
 class SqlAlchemyConversationStore(ConversationStore):
@@ -2959,11 +2963,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Return newest message items for multiple conversations.
 
-        Uses ``row_number() over (partition by conversation_id order by
-        position desc)`` so the database returns at most
-        ``per_conversation_limit`` message rows per conversation. This keeps
-        child-session summary rendering to one query instead of an N+1
-        ``list_items`` fan-out.
+        Uses a ``LIMIT`` per id rather than a window over every message, so
+        reads stop at ``per_conversation_limit`` messages per conversation.
+        Ids are batched into chunks of ``_LATEST_MESSAGE_UNION_CHUNK`` to keep
+        each statement small, avoiding an N+1 ``list_items`` fan-out.
 
         :param conversation_ids: Conversation ids to fetch messages for,
             e.g. ``["conv_child1", "conv_child2"]``.
@@ -2978,12 +2981,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             return result
 
         with self._conv_session("list_latest_message_items_for_conversations") as session:
-            ranked = _ranked_latest_message_items(unique_ids)
-            rows = session.execute(
-                select(ranked)
-                .where(ranked.c.row_num <= per_conversation_limit)
-                .order_by(ranked.c.conversation_id, ranked.c.position.desc())
-            ).all()
+            rows: list[Any] = []
+            for chunk in batched(unique_ids, _LATEST_MESSAGE_UNION_CHUNK):
+                statement = _latest_message_items_statement(list(chunk), per_conversation_limit)
+                rows.extend(session.execute(statement).all())
             decoded = self._decode_item_data_batch([row.data for row in rows])
             for row, data_json in zip(rows, decoded, strict=True):
                 result[row.conversation_id].append(_to_item(row, data_json))  # type: ignore[arg-type]
