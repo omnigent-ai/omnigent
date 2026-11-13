@@ -635,6 +635,9 @@ do not open the notice. Conditional (autofill) requests do not open it.
 Options with accessor-backed `publicKey` or `mediation` properties also bypass
 observation so the preload does not evaluate page getters a second time. Those
 requests still run through Chromium, but they do not open the notice.
+For observed requests, tracking completion marks rejected promises as handled,
+so the page does not receive an `unhandledrejection` event for them. Callers
+still receive the original rejected promise.
 Windows already shows its own WebAuthn dialog, so the shell skips this notice
 there.
 
