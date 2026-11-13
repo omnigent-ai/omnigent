@@ -5147,18 +5147,38 @@ def test_augment_claude_args_rejects_settings_that_disable_bridge_hooks(
         (b"\xff", False),
         (b'{"x":' + b"[" * 10000 + b"0", False),
         (b'{"x":' + b"[" * 10000 + b"0", True),
+        (b" " * claude_native_bridge._CALLER_SETTINGS_MAX_BYTES + b"{}", False),
+        pytest.param(
+            "fifo",
+            False,
+            marks=[
+                pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFOs"),
+                pytest.mark.timeout(5, method="signal"),
+            ],
+        ),
     ],
-    ids=["missing", "malformed", "non-object", "invalid-utf8", "deep-file", "deep-inline"],
+    ids=[
+        "missing",
+        "malformed",
+        "non-object",
+        "invalid-utf8",
+        "deep-file",
+        "deep-inline",
+        "oversized",
+        "fifo",
+    ],
 )
 def test_augment_claude_args_passes_unreadable_caller_settings_through(
-    tmp_path: Path, contents: bytes | None, inline: bool
+    tmp_path: Path, contents: bytes | str | None, inline: bool
 ) -> None:
     """A ``--settings`` value that is not a readable JSON object is left to Claude."""
     missing = str(tmp_path / "missing.json")
-    if contents is not None:
+    if contents == "fifo":
+        os.mkfifo(missing)
+    elif isinstance(contents, bytes):
         Path(missing).write_bytes(contents)
 
-    value = contents.decode() if inline and contents is not None else missing
+    value = contents.decode() if inline and isinstance(contents, bytes) else missing
     args = augment_claude_args(("--settings", value), bridge_dir=tmp_path)
 
     assert args[:2] == ["--settings", value]

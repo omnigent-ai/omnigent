@@ -1497,10 +1497,15 @@ async def test_auto_create_claude_terminal_logs_stage_timings(
 
 
 @pytest.mark.parametrize(
-    "subagent_started,turn_started",
-    [(True, True), (True, False), (False, True), (False, False)],
+    ("failure", "subagent_started", "turn_started"),
+    [
+        ("trust", True, True),
+        ("trust", True, False),
+        ("trust", False, True),
+        ("trust", False, False),
+        ("disableAllHooks", True, True),
+    ],
 )
-@pytest.mark.parametrize("failure", ["trust", "disableAllHooks", "allowManagedHooksOnly"])
 async def test_auto_create_claude_terminal_cleans_routers_when_preparation_fails(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

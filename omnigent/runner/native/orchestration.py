@@ -9921,7 +9921,7 @@ async def _auto_create_claude_terminal(
         )
 
         # Share startup overrides with the local CLI path. Wrapper arguments
-        # prepend the augmented Claude arguments; the default launches Claude directly.
+        # prepend the augmented Claude arguments; their settings bypass the caller merge.
         from omnigent.config import load_effective_config  # noqa: FlagLocalImports
         from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
             resolve_harness_args,

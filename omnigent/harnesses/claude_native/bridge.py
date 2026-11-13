@@ -596,6 +596,7 @@ _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 _TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
+_CALLER_SETTINGS_MAX_BYTES = 1024 * 1024
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
@@ -3425,6 +3426,21 @@ _CLAUDE_REQUIRED_VALUE_FLAGS = frozenset(
 )
 
 
+def _read_caller_settings(path: Path) -> str:
+    """Read at most 1 MiB from a regular file without blocking on a FIFO."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _CALLER_SETTINGS_MAX_BYTES:
+            raise ValueError("caller settings require a regular file of at most 1 MiB")
+        data = os.read(fd, _CALLER_SETTINGS_MAX_BYTES + 1)
+        if len(data) > _CALLER_SETTINGS_MAX_BYTES:
+            raise ValueError("caller settings exceed 1 MiB")
+        return data.decode("utf-8")
+    finally:
+        os.close(fd)
+
+
 def _pop_caller_settings(
     args: list[str], *, workspace: Path | None
 ) -> tuple[list[str], list[dict[str, Any]]]:
@@ -3433,7 +3449,8 @@ def _pop_caller_settings(
 
     Claude Code honours only the LAST ``--settings`` flag, so a caller's flag would
     be silently replaced by the invocation settings Omnigent appends. Each value
-    is a JSON object or a path to one; unreadable values stay in ``args`` untouched.
+    is a JSON object or a regular file of at most 1 MiB. Unsupported or unreadable
+    values stay in ``args`` untouched.
 
     :param args: Claude CLI argument list.
     :param workspace: Terminal workspace for relative settings paths.
@@ -3465,7 +3482,7 @@ def _pop_caller_settings(
             settings_path = Path(value)
             if not inline and not settings_path.is_absolute() and workspace is not None:
                 settings_path = workspace / settings_path
-            parsed = json.loads(value if inline else settings_path.read_text(encoding="utf-8"))
+            parsed = json.loads(value if inline else _read_caller_settings(settings_path))
         except (OSError, ValueError, RecursionError):
             parsed = None
         if isinstance(parsed, dict):
