@@ -184,7 +184,7 @@ The Runs list shows **Session needs approval · Open to review** when the linked
 
 `status` says whether a run finished, not whether it did what the prompt asked. The agent records that in its session's [journal](session-journal.md): the plan it follows and each step's status. Before each run's prompt is sent, the session is labeled `omnigent.scheduled_task_run` with the run's ID, so every entry the agent writes during the run carries it. If a continued run fails before its prompt goes in, the label goes back to the previous run, which may still be working in the session. Clients can't set the label, and forks drop it.
 
-When the automation runs a saved workflow, each of its runs shows the plan it started with: the Tasks tab's timeline of its tasks, and a button that shows the run on the workflow's graph. `GET /v1/scheduled-tasks/{id}/run-steps` supplies them. It pages like `/runs`, and lists, for each run that wrote a plan, that plan's steps and each step's newest status.
+When the automation runs a saved workflow, each of its runs shows the plan it started with: the Tasks tab's timeline of its tasks, and a button that shows the run on the workflow's graph. With the Workflows page on, the button to its left opens the workflow's page. `GET /v1/scheduled-tasks/{id}/run-steps` supplies them. It pages like `/runs`, and lists, for each run that wrote a plan, that plan's steps and each step's newest status.
 
 ## Lifecycle
 
