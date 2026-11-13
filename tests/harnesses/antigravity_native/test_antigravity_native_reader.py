@@ -3137,35 +3137,57 @@ def test_turn_close_true_for_error_planner() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("continuation_retry", [False, True], ids=["normal", "continuation-retry"])
 async def test_a_streamed_tool_turn_stays_running_until_the_answer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     patched_discovery: None,
+    continuation_retry: bool,
 ) -> None:
-    """
-    REGRESSION: the spinner must not clear when agy dispatches a tool.
-
-    The whole streamed turn, in the live order: the user's prompt, the planner
-    that dispatches a tool, the tool's result, then the answering planner. IDLE
-    belongs at the END of that sequence — one edge, after the answer.
-
-    The predicate test below pins the cause; this pins the symptom the user
-    actually saw, which is what the suite was missing: the dispatching planner
-    fired IDLE, so the session showed idle while its tools kept running, and
-    RUNNING could not re-open (it is gated on USER_INPUT).
-    """
+    """A tool turn stays running through a transient retry until its final answer."""
+    frames = [_frame([_load("user_input")])]
+    if continuation_retry:
+        frames.append(
+            _frame(
+                [
+                    {
+                        "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+                        "status": "CORTEX_STEP_STATUS_DONE",
+                        "metadata": {
+                            "sourceTrajectoryStepInfo": {
+                                "trajectoryId": _CASCADE_ID,
+                                "stepIndex": 5,
+                            }
+                        },
+                        "errorMessage": {
+                            "error": {
+                                "modelErrorMessage": (
+                                    "model output error: model output must contain either "
+                                    "output text or tool calls, these cannot both be empty, "
+                                    "please try again"
+                                ),
+                                "fullError": (
+                                    "google3/third_party/jetski/cortex/executors/posthooks/"
+                                    "posthooks.NewEmptyOutputContinuationCheckHookWithMaxRetries.func1"
+                                ),
+                            }
+                        },
+                    }
+                ]
+            )
+        )
+    frames.extend(
+        [
+            _frame([_load("stream_planner_tool_call")]),
+            _frame([_load("stream_run_command_done")]),
+            _frame([_load("stream_planner_text_done")]),
+        ]
+    )
     sink = _PostSink()
     await _run_stream(
         bridge_dir=_bridge_dir(tmp_path),
         sink=sink,
-        stream=_FrameScript(
-            [
-                _frame([_load("user_input")]),
-                _frame([_load("stream_planner_tool_call")]),
-                _frame([_load("stream_run_command_done")]),
-                _frame([_load("stream_planner_text_done")]),
-            ]
-        ),
+        stream=_FrameScript(frames),
         poll_steps=_StepScript([[]]),
         monkeypatch=monkeypatch,
         iterations=1,
@@ -3187,6 +3209,23 @@ async def test_a_streamed_tool_turn_stays_running_until_the_answer(
     assert timeline.index("status:idle") > timeline.index("item:function_call_output"), (
         f"IDLE fired before the tool finished — the spinner cleared mid-turn: {timeline}"
     )
+    messages = [
+        data
+        for kind, data in sink.posts
+        if kind == "external_conversation_item"
+        and data.get("item_type") == "message"
+        and data["item_data"].get("role") == "assistant"
+    ]
+    assert len(messages) == 1
+    assert "error" not in str(messages[0]).lower()
+    assert "error" not in sink.item_types()
+    answer_index = sink.posts.index(("external_conversation_item", messages[0]))
+    idle_index = next(
+        index
+        for index, (kind, data) in enumerate(sink.posts)
+        if kind == "external_session_status" and data.get("status") == "idle"
+    )
+    assert answer_index < idle_index
 
 
 def test_turn_close_false_for_streamed_planner_that_dispatched_a_tool() -> None:
@@ -4973,64 +5012,3 @@ async def test_subagent_idle_check_failure_keeps_mirroring(
 
     monkeypatch.setattr(reader, "get_all_cascade_trajectories", _raise)
     assert await reader._subagent_cascade_is_idle(4242, "child-aaa") is False
-
-
-@pytest.mark.asyncio
-async def test_empty_output_continuation_retry_turn_stays_running_and_closes_idle(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    patched_discovery: None,
-) -> None:
-    """An empty-output continuation retry must not fail the turn or emit an error box."""
-    retry = {
-        "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
-        "status": "CORTEX_STEP_STATUS_DONE",
-        "metadata": {"sourceTrajectoryStepInfo": {"trajectoryId": _CASCADE_ID, "stepIndex": 5}},
-        "errorMessage": {
-            "error": {
-                "modelErrorMessage": (
-                    "model output error: model output must contain either "
-                    "output text or tool calls, these cannot both be empty, please try again"
-                ),
-                "fullError": (
-                    "google3/third_party/jetski/cortex/executors/posthooks/"
-                    "posthooks.NewEmptyOutputContinuationCheckHookWithMaxRetries.func1"
-                ),
-            }
-        },
-    }
-    sink = _PostSink()
-    await _run_stream(
-        bridge_dir=_bridge_dir(tmp_path),
-        sink=sink,
-        stream=_FrameScript(
-            [
-                _frame([_load("user_input")]),
-                _frame([retry]),
-                _frame([_load("stream_planner_tool_call")]),
-                _frame([_load("stream_run_command_done")]),
-                _frame([_load("stream_planner_text_done")]),
-            ]
-        ),
-        poll_steps=_StepScript([[]]),
-        monkeypatch=monkeypatch,
-        iterations=1,
-    )
-    assert sink.statuses() == ["running", "idle"]
-    messages = [
-        d
-        for kind, d in sink.posts
-        if kind == "external_conversation_item"
-        and d.get("item_type") == "message"
-        and d["item_data"].get("role") == "assistant"
-    ]
-    assert len(messages) == 1
-    assert "error" not in str(messages[0]).lower()
-    assert "error" not in sink.item_types()
-    answer_index = sink.posts.index(("external_conversation_item", messages[0]))
-    idle_index = next(
-        index
-        for index, (kind, data) in enumerate(sink.posts)
-        if kind == "external_session_status" and data.get("status") == "idle"
-    )
-    assert answer_index < idle_index

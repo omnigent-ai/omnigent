@@ -1112,8 +1112,55 @@ def test_draft_in_input_region_detects_collapsed_paste_placeholder() -> None:
     assert not _mod._draft_in_input_region(submitted, "Find the current weather", baseline)
 
 
+_LONG_PASTE_CONTENT = "\n".join(
+    ["Find the current weather and inspect these observations"]
+    + [f"Observation {index}: compare temperature and humidity" for index in range(16)]
+    + ["Summarize the observations and finish the report"]
+)
+_LONG_PASTE_TAIL = _LONG_PASTE_CONTENT.splitlines()[-1]
+_PASTE_COMPOSERS = {
+    "collapsed": "  [Pasted text #1 +18 lines]",
+    "scrolled": f"> ↑ 17 more lines\n  {_LONG_PASTE_TAIL}",
+    "wrapped-tail": f"> {_LONG_PASTE_TAIL[:14]}\n  {_LONG_PASTE_TAIL[14:]}",
+}
+
+
+def _paste_pane(composer: str, *, background_widget: bool, footer: str = "? for shortcuts") -> str:
+    """Render a composer below transcript history and above an optional task widget."""
+    sep = "─" * 60
+    pane = f"{sep}\n> previous prompt\n{sep}\n{composer}\n{sep}"
+    if background_widget:
+        pane += f"\n  ● pytest running\n{sep}"
+    return pane + "\n" + footer
+
+
 @pytest.mark.parametrize("draft_style", ["collapsed", "scrolled", "wrapped-tail"])
 @pytest.mark.parametrize("background_widget", [False, True])
+def test_draft_in_input_region_detects_hidden_and_wrapped_pastes(
+    draft_style: str, background_widget: bool
+) -> None:
+    """Layout variants recognize a changed draft and reject unchanged or cleared regions."""
+    empty = _paste_pane("> ", background_widget=background_widget)
+    baseline = _mod._agy_input_region(empty)
+    rendered = _PASTE_COMPOSERS[draft_style]
+    pane = _paste_pane(rendered, background_widget=background_widget)
+    assert _mod._agy_input_region(pane) == rendered
+    needles = _mod._submit_needles(_LONG_PASTE_CONTENT)
+    extra_needles = tuple(needles[1:])
+    assert _mod._draft_in_input_region(pane, needles[0], baseline, extra_needles)
+    assert not _mod._draft_in_input_region(pane, needles[0], rendered, extra_needles)
+    assert not _mod._draft_in_input_region(empty, needles[0], baseline, extra_needles)
+    if draft_style == "wrapped-tail":
+        assert not _mod._draft_in_input_region(pane, needles[0], baseline)
+
+
+@pytest.mark.parametrize(
+    ("draft_style", "background_widget"),
+    [
+        pytest.param("collapsed", True, id="collapsed-widget"),
+        pytest.param("wrapped-tail", False, id="wrapped-tail"),
+    ],
+)
 def test_inject_user_message_via_tui_submits_a_collapsed_paste(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1124,26 +1171,10 @@ def test_inject_user_message_via_tui_submits_a_collapsed_paste(
     """Hidden or wrapped draft text submits once even above a background widget."""
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
-    content = "\n".join(
-        ["Find the current weather and inspect these observations"]
-        + [f"Observation {index}: compare temperature and humidity" for index in range(16)]
-        + ["Summarize the observations and finish the report"]
-    )
-    sep = "─" * 60
-
-    def pane(composer: str, footer: str = "? for shortcuts") -> str:
-        result = f"{sep}\n> previous prompt\n{sep}\n{composer}\n{sep}"
-        if background_widget:
-            result += f"\n  ● pytest running\n{sep}"
-        return result + "\n" + footer
-
-    tail = content.splitlines()[-1]
-    rendered = {
-        "collapsed": "  [Pasted text #1 +18 lines]",
-        "scrolled": f"> ↑ 17 more lines\n  {tail}",
-        "wrapped-tail": f"> {tail[:14]}\n  {tail[14:]}",
-    }[draft_style]
-    tui = {"pane": pane("> ")}
+    rendered = _paste_pane(_PASTE_COMPOSERS[draft_style], background_widget=background_widget)
+    submitted = _paste_pane("> ", background_widget=background_widget, footer="esc to cancel")
+    tui = {"pane": _paste_pane("> ", background_widget=background_widget)}
+    captures: list[str] = []
     enters = {"n": 0}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -1152,18 +1183,21 @@ def test_inject_user_message_via_tui_submits_a_collapsed_paste(
         if "has-session" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "capture-pane" in cmd:
+            captures.append(tui["pane"])
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
-            tui["pane"] = pane(rendered)
+            tui["pane"] = rendered
         if cmd[-1] == "Enter":
+            assert rendered in captures, "observe the rendered draft before Enter"
             enters["n"] += 1
-            tui["pane"] = pane("> ", "esc to cancel")
+            tui["pane"] = submitted
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+    inject_user_message_via_tui(bridge_dir, content=_LONG_PASTE_CONTENT, timeout_s=0.5)
 
     assert enters["n"] == 1, "the rendered draft should submit on the first Enter"
+    assert captures[-1] == submitted, "observe the consumed draft after Enter"
 
 
 # ---------------------------------------------------------------------------
