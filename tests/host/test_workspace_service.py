@@ -170,7 +170,7 @@ def _server_app(
     if remote_host:
         app.state.host_store = SimpleNamespace(get_host=lambda _host_id: object())
         monkeypatch.setattr(
-            "omnigent.server.routes._host_launch.host_absent_error",
+            "omnigent.server.routes.sessions.routes_resources.host_absent_error",
             lambda _host: WrongReplicaError("host is on another replica", host_id="host_ws"),
         )
     if flag:
