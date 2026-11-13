@@ -9867,133 +9867,138 @@ async def _auto_create_claude_terminal(
         routing_enabled=launch_metadata.routing_enabled,
         auto_harness=launch_metadata.auto_harness,
     )
-    # First-message model routing. Advertised in the same bridge dir the
-    # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of its
-    # own), and live before the terminal launches because the hook can fire on
-    # the very first prompt the user types.
-    _claude_turn_router = _start_turn_router_for_native_session(
-        session_id,
-        bridge_dir=bridge_dir,
-        harness="claude-native",
-        server_client=server_client,
-        turn_routing=launch_metadata.turn_routing,
-    )
-    # Crash recovery for a blocked-but-never-replayed prompt is not wired here:
-    # the pending record on disk is the seam if it ever is, and the recovery's
-    # default readiness probe waits on a codex bridge thread.
-    # Only an auto-harness session's spawns can be re-routed across harness
-    # families, so only it needs the routed-spawn note and the pre-approval for
-    # the three Omnigent tools that carry out the re-route. A pinned session's
-    # argv must stay byte-identical.
-    routed_spawn_note, routed_spawn_tools = _routed_spawn_launch_args(
-        launch_metadata.auto_harness,
-        router_started=subagent_router_dir is not None,
-    )
-    if bundle_dir is None:
-        # Reuse the bridge's owned directory across retries and terminal transfers.
-        # Its dead-owner cleanup also reclaims these generated skill links.
-        bundle_dir = bridge_dir / "skill-bundle"
-        _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
-    claude_args = augment_claude_args(
-        base_claude_args,
-        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
-        bridge_dir=bridge_dir,
-        workspace=Path(workspace),
-        ap_server_url=server_url,
-        ap_auth_headers=_runner_headers,
-        bundle_dir=bundle_dir,
-        agent_name=agent_name,
-        skills_filter=skills_filter,
-        api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
-        model_overrides=claude_config.model_overrides if claude_config is not None else None,
-        subagent_router_dir=subagent_router_dir,
-        append_system_prompt="\n\n".join(
-            x for x in [_native_startup_instructions_from_spec(agent_spec), routed_spawn_note] if x
-        ),
-        allowed_tools=routed_spawn_tools,
-        # The route-turn hook is registered only when this session can
-        # actually route; otherwise every submit would pay its round trip.
-        turn_routing=_claude_turn_router is not None,
-    )
-
-    # Apply the per-harness startup command/args override from config
-    # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
-    # downstream integration can wrap this managed-host launch — e.g. a wrapper
-    # such as ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
-    # ``isaac -- <augmented args>`` (the config args prepend, and augmentation
-    # appended above, so the ``--`` stays first). Identity by default. This is
-    # the same resolver the local-CLI native launch uses (see cli_native.py), so
-    # both terminal-creation paths honour one config surface.
-    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
-    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
-        resolve_harness_args,
-        resolve_harness_command,
-    )
-
-    _harness_cfg = load_effective_config(workspace=workspace)
-    launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
-    launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
-    # Validate the binary this terminal will actually spawn: ``launch_command``
-    # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
-    # name resolves against this process's inherited PATH (same lookup tmux's
-    # pane shell and omnigent.inner.terminal perform). Mirrors
-    # ``_preflight_local_tools`` on the local-CLI path.
-    resolved_claude = resolve_cli_binary(launch_command)
-    if resolved_claude is not None:
-        validate_claude_hook_interpreter_compatibility(resolved_claude)
-
-    claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
-
-    # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
-    # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
-    # and ``parent_os_env`` below, launch_terminal falls back to
-    # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
-    # ``agent_os_env`` was already resolved above for ``prepare_bridge_dir``,
-    # so the terminal process and the bridge's sys_os_* tools agree.
-    env_spec = TerminalEnvSpec(
-        os_env=OSEnvSpec(
-            type="caller_process",
-            cwd=workspace,
-            sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
-        ),
-        command=launch_command,
-        args=launch_args,
-        # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
-        # etc.) when derived. Empty provider config still forces
-        # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env={
-            **build_native_claude_terminal_env(
-                claude_config,
-                client_surface=resource_registry.client_surface(session_id),
-            ),
-            **claude_terminal_relay_env(bridge_dir),
-        },
-        # Names to strip (see ``_claude_terminal_env_unset``). Dropping
-        # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
-        # inherit this env and several build ``WorkspaceClient`` without pinning
-        # ``auth_type``: a set profile makes the SDK prefer that profile's cached
-        # OAuth token over the MCP's explicit token, 400ing against the wrong
-        # workspace. Claude itself ignores the var (routing is
-        # ``ANTHROPIC_BASE_URL`` / ``apiKeyHelper``), so this affects only MCPs;
-        # ones needing a specific profile must set it in their own per-MCP env.
-        env_unset=claude_terminal_env_unset,
-        scrollback=50000,
-        # Keep the private tmux server alive if the `claude` CLI exits (e.g. a
-        # sub-agent worker whose CLI exits right after rendering its prompt on
-        # some hosts — #540). Without this, that exit reaps the server and every
-        # later control command (send-keys / model / effort / interrupt / stop)
-        # fails with "no server running", and the delegated message is silently
-        # lost. With it, the dead pane persists (capturable for diagnostics) and
-        # the watcher reports the exit deterministically via `#{pane_dead}`.
-        keep_alive_after_exit=True,
-    )
-    # Seed trust and onboarding in the config selected by the terminal's launch environment.
+    _claude_turn_router = None
     try:
+        # First-message model routing. Advertised in the same bridge dir the
+        # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of its
+        # own), and live before the terminal launches because the hook can fire on
+        # the very first prompt the user types.
+        _claude_turn_router = _start_turn_router_for_native_session(
+            session_id,
+            bridge_dir=bridge_dir,
+            harness="claude-native",
+            server_client=server_client,
+            turn_routing=launch_metadata.turn_routing,
+        )
+        # Crash recovery for a blocked-but-never-replayed prompt is not wired here:
+        # the pending record on disk is the seam if it ever is, and the recovery's
+        # default readiness probe waits on a codex bridge thread.
+        # Only an auto-harness session's spawns can be re-routed across harness
+        # families, so only it needs the routed-spawn note and the pre-approval for
+        # the three Omnigent tools that carry out the re-route. A pinned session's
+        # argv must stay byte-identical.
+        routed_spawn_note, routed_spawn_tools = _routed_spawn_launch_args(
+            launch_metadata.auto_harness,
+            router_started=subagent_router_dir is not None,
+        )
+        if bundle_dir is None:
+            # Reuse the bridge's owned directory across retries and terminal transfers.
+            # Its dead-owner cleanup also reclaims these generated skill links.
+            bundle_dir = bridge_dir / "skill-bundle"
+            _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
+        claude_args = augment_claude_args(
+            base_claude_args,
+            active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+            bridge_dir=bridge_dir,
+            workspace=Path(workspace),
+            ap_server_url=server_url,
+            ap_auth_headers=_runner_headers,
+            bundle_dir=bundle_dir,
+            agent_name=agent_name,
+            skills_filter=skills_filter,
+            api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+            model_overrides=claude_config.model_overrides if claude_config is not None else None,
+            subagent_router_dir=subagent_router_dir,
+            append_system_prompt="\n\n".join(
+                x
+                for x in [_native_startup_instructions_from_spec(agent_spec), routed_spawn_note]
+                if x
+            ),
+            allowed_tools=routed_spawn_tools,
+            # The route-turn hook is registered only when this session can
+            # actually route; otherwise every submit would pay its round trip.
+            turn_routing=_claude_turn_router is not None,
+        )
+
+        # Apply the per-harness startup command/args override from config
+        # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
+        # downstream integration can wrap this managed-host launch — e.g. a wrapper
+        # such as ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
+        # ``isaac -- <augmented args>`` (the config args prepend, and augmentation
+        # appended above, so the ``--`` stays first). Identity by default. This is
+        # the same resolver the local-CLI native launch uses (see cli_native.py), so
+        # both terminal-creation paths honour one config surface.
+        from omnigent.config import load_effective_config  # noqa: FlagLocalImports
+        from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
+            resolve_harness_args,
+            resolve_harness_command,
+        )
+
+        _harness_cfg = load_effective_config(workspace=workspace)
+        launch_command = resolve_harness_command(
+            "claude-native", default="claude", cfg=_harness_cfg
+        )
+        launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
+        # Validate the binary this terminal will actually spawn: ``launch_command``
+        # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
+        # name resolves against this process's inherited PATH (same lookup tmux's
+        # pane shell and omnigent.inner.terminal perform). Mirrors
+        # ``_preflight_local_tools`` on the local-CLI path.
+        resolved_claude = resolve_cli_binary(launch_command)
+        if resolved_claude is not None:
+            validate_claude_hook_interpreter_compatibility(resolved_claude)
+
+        claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
+
+        # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
+        # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
+        # and ``parent_os_env`` below, launch_terminal falls back to
+        # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
+        # ``agent_os_env`` was already resolved above for ``prepare_bridge_dir``,
+        # so the terminal process and the bridge's sys_os_* tools agree.
+        env_spec = TerminalEnvSpec(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=workspace,
+                sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+            ),
+            command=launch_command,
+            args=launch_args,
+            # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
+            # etc.) when derived. Empty provider config still forces
+            # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
+            env={
+                **build_native_claude_terminal_env(
+                    claude_config,
+                    client_surface=resource_registry.client_surface(session_id),
+                ),
+                **claude_terminal_relay_env(bridge_dir),
+            },
+            # Names to strip (see ``_claude_terminal_env_unset``). Dropping
+            # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
+            # inherit this env and several build ``WorkspaceClient`` without pinning
+            # ``auth_type``: a set profile makes the SDK prefer that profile's cached
+            # OAuth token over the MCP's explicit token, 400ing against the wrong
+            # workspace. Claude itself ignores the var (routing is
+            # ``ANTHROPIC_BASE_URL`` / ``apiKeyHelper``), so this affects only MCPs;
+            # ones needing a specific profile must set it in their own per-MCP env.
+            env_unset=claude_terminal_env_unset,
+            scrollback=50000,
+            # Keep the private tmux server alive if the `claude` CLI exits (e.g. a
+            # sub-agent worker whose CLI exits right after rendering its prompt on
+            # some hosts — #540). Without this, that exit reaps the server and every
+            # later control command (send-keys / model / effort / interrupt / stop)
+            # fails with "no server running", and the delegated message is silently
+            # lost. With it, the dead pane persists (capturable for diagnostics) and
+            # the watcher reports the exit deterministically via `#{pane_dead}`.
+            keep_alive_after_exit=True,
+        )
+        # Seed trust and onboarding in the config selected by the terminal's launch environment.
         ensure_claude_workspace_trusted(
             _claude_terminal_launch_cwd(env_spec, agent_os_env),
             env=_claude_terminal_launch_env(env_spec),
         )
-    except BaseException as seed_error:
+    except BaseException as prepare_error:
         # No forwarder owns the routers yet, so release the ones this launch started.
         # A ``None`` handle would shut down whichever router is registered now.
         cleanups: list[Coroutine[Any, Any, None]] = []
@@ -10008,15 +10013,15 @@ async def _auto_create_claude_terminal(
             except asyncio.CancelledError as exc:
                 # Release the other router before honoring the cancellation.
                 cancelled = exc
-            except Exception:  # keep the seeding failure as the error.
+            except Exception:  # keep the preparation failure as the error.
                 _logger.warning(
-                    "Router cleanup failed after Claude trust seeding failed: session=%s",
+                    "Router cleanup failed after Claude preparation failed: session=%s",
                     session_id,
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
         if cancelled is not None:
-            raise cancelled from seed_error
+            raise cancelled from prepare_error
         raise
     _logger.info(
         "Claude terminal tmux launch requested: session=%s command=%s args_count=%d "

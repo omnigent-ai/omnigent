@@ -5023,8 +5023,8 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
     """
     A caller ``--settings`` is merged into the invocation settings, not dropped.
 
-    Claude Code honours only the last ``--settings`` flag, so before the merge a
-    caller's env, hooks and statusLine silently lost to the bridge's own file.
+    Caller settings must be merged into the bridge settings because Claude Code
+    honours only the last settings flag.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -5094,6 +5094,23 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
     assert settings["statusLine"]["padding"] == 3
     for event, entries in baseline["hooks"].items():
         assert all(entry in settings["hooks"][event] for entry in entries)
+
+
+@pytest.mark.parametrize("flag", ["--append-system-prompt", "--system-prompt", "--name"])
+def test_augment_claude_args_preserves_settings_like_option_values(
+    tmp_path: Path, flag: str
+) -> None:
+    """A settings-looking operand remains prompt text or an option value."""
+    literal = '--settings={"env":{"EXAMPLE_KEY":"value"}}'
+    args = augment_claude_args(
+        (flag, literal),
+        bridge_dir=tmp_path,
+        ap_server_url="https://example.test",
+    )
+    assert literal in args[args.index(flag) + 1]
+    settings = _load_invocation_settings(args)
+    assert "EXAMPLE_KEY" not in settings.get("env", {})
+    assert settings["hooks"]["PreToolUse"]
 
 
 def test_augment_claude_args_keeps_its_own_settings_on_conflict(tmp_path: Path) -> None:

@@ -3383,6 +3383,48 @@ def _merge_append_system_prompt(
     return args
 
 
+# Required operands may start with "--"; optional operands stop at the next option.
+_CLAUDE_REQUIRED_VALUE_FLAGS = frozenset(
+    {
+        "--add-dir",
+        "--agent",
+        "--agents",
+        "--allowedTools",
+        "--allowed-tools",
+        "--append-system-prompt",
+        "--append-system-prompt-file",
+        "--autocompact",
+        "--betas",
+        "--debug-file",
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--effort",
+        "--environment",
+        "--fallback-model",
+        "--file",
+        "--input-format",
+        "--json-schema",
+        "--max-budget-usd",
+        "--mcp-config",
+        "--model",
+        "--name",
+        "-n",
+        "--output-format",
+        "--permission-mode",
+        "--permission-prompts",
+        "--plugin-dir",
+        "--plugin-url",
+        "--remote-control-session-name-prefix",
+        "--session-id",
+        "--setting-sources",
+        "--system-prompt",
+        "--system-prompt-file",
+        "--system-prompt-snapshot",
+        "--tools",
+    }
+)
+
+
 def _pop_caller_settings(
     args: list[str], *, workspace: Path | None
 ) -> tuple[list[str], list[dict[str, Any]]]:
@@ -3402,6 +3444,13 @@ def _pop_caller_settings(
     i = 0
     while i < len(args):
         arg = args[i]
+        if arg == "--":
+            kept.extend(args[i:])
+            break
+        if arg in _CLAUDE_REQUIRED_VALUE_FLAGS:
+            kept.extend(args[i : i + 2])
+            i += 2
+            continue
         if arg == "--settings" and i + 1 < len(args):
             value, step = args[i + 1], 2
         elif arg.startswith("--settings="):

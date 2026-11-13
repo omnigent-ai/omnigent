@@ -1500,16 +1500,18 @@ async def test_auto_create_claude_terminal_logs_stage_timings(
     "subagent_started,turn_started",
     [(True, True), (True, False), (False, True), (False, False)],
 )
-async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fails(
+@pytest.mark.parametrize("failure", ["trust", "disableAllHooks", "allowManagedHooksOnly"])
+async def test_auto_create_claude_terminal_cleans_routers_when_preparation_fails(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     subagent_started: bool,
     turn_started: bool,
+    failure: str,
 ) -> None:
     """
-    A trust-seeding failure releases only the routers this launch started.
+    A preparation failure releases only the routers this launch started.
 
-    Seeding runs after the subagent and turn routers start but before the
+    Argument augmentation and trust seeding run after routers start but before the
     forwarder that normally shuts them down exists, so a malformed config must
     not leave them running. A router this launch did not start is not shut
     down, because a ``None`` handle would close whichever router a replacement
@@ -1552,7 +1554,14 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
     registry = Mock(spec=SessionResourceRegistry)
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
-    with pytest.raises(ValueError, match="config is not a JSON object"):
+    if failure != "trust":
+        monkeypatch.setattr(
+            orchestration,
+            "_build_claude_native_base_args",
+            lambda **_kwargs: ("--settings", json.dumps({failure: True})),
+        )
+    expected_error = "config is not a JSON object" if failure == "trust" else failure
+    with pytest.raises(ValueError, match=expected_error):
         await _auto_create_claude_terminal_for_test(
             monkeypatch,
             session_id="conv_seed_failure_routers",
