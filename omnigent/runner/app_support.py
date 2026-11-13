@@ -13,12 +13,13 @@ import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
+from omnigent.errors import OmnigentError
 from omnigent.inner.native_attachments import (
     framework_notice_block,
     has_unresolved_file_id,
     resolve_file_id_block,
 )
-from omnigent.inner.sandbox import UnsupportedHarnessSandboxError
+from omnigent.inner.sandbox import HarnessSandboxValidationError
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.native import ResolvedSpec
 from omnigent.spec.types import AgentSpec
@@ -85,11 +86,9 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     )
     log_reference = process_log_reference("runner")
     detail = f"Request failed on the runner; see the runner log for details: {log_reference}"
-    if isinstance(exc, UnsupportedHarnessSandboxError):
-        return (
-            "The selected harness cannot enforce os_env.sandbox. "
-            f"Choose a sandbox-capable harness. {detail}"
-        )
+    policy_error = exc.__cause__ if isinstance(exc, OmnigentError) else exc
+    if isinstance(policy_error, HarnessSandboxValidationError):
+        return f"{policy_error.client_message} {detail}"
     return detail
 
 

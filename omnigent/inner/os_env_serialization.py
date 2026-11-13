@@ -54,12 +54,18 @@ def resolve_harness_os_env(env_var: str) -> OSEnvSpec:
 
 def validate_sandbox_scan_options(sandbox: OSEnvSandboxSpec) -> None:
     """Reject scan settings that would silently fall back to partial masking."""
+    from omnigent.inner.sandbox import HarnessSandboxValidationError
+
     limit = sandbox.cwd_hidden_scan_max_entries
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
-        raise ValueError("os_env.sandbox.cwd_hidden_scan_max_entries must be a positive integer")
+        raise HarnessSandboxValidationError(
+            "os_env.sandbox.cwd_hidden_scan_max_entries must be a positive integer",
+            reason="scan_limit",
+        )
     if sandbox.cwd_hidden_scan_overflow not in ("error", "warn", "unlimited"):
-        raise ValueError(
-            "os_env.sandbox.cwd_hidden_scan_overflow must be error, warn or unlimited"
+        raise HarnessSandboxValidationError(
+            "os_env.sandbox.cwd_hidden_scan_overflow must be error, warn or unlimited",
+            reason="scan_overflow",
         )
 
 

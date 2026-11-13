@@ -96,7 +96,8 @@ async def test_harness_rejection_has_a_valid_queued_failure(status_code: int) ->
 
 
 @pytest.mark.asyncio
-async def test_spec_resolution_error_has_a_valid_queued_failure() -> None:
+@pytest.mark.parametrize("has_mcp_servers", [False, True])
+async def test_spec_resolution_error_has_a_valid_queued_failure(has_mcp_servers: bool) -> None:
     async def fail_resolution(agent_id: str, session_id: str | None = None) -> AgentSpec:
         raise RuntimeError("synthetic spec resolution failure")
 
@@ -127,7 +128,7 @@ async def test_spec_resolution_error_has_a_valid_queued_failure() -> None:
         app,
         source="execution",
         agent_id="22222222222222222222222222222222",
-        has_mcp_servers=True,
+        has_mcp_servers=has_mcp_servers,
         pending_id="pending_" + "a" * 32,
         delivery_attempt_id="b" * 32,
     )
