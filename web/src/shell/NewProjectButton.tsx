@@ -17,7 +17,7 @@ import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { useCreateProject, useProjects } from "@/hooks/useConversations";
 import { useCloneHostRepository, useCreateHostDirectory } from "@/hooks/useHostFilesystem";
 import type { Host } from "@/hooks/useHosts";
-import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   SANDBOX_HOST_CHOICE,
@@ -187,7 +187,7 @@ export function NewProjectButton({
   const isComposingRef = useRef(false);
   const serverInfo = useServerInfo();
   const repositoryCreation =
-    serverInfo !== "loading" && serverInfo.project_repository_creation === true;
+    serverInfo !== "loading" && isFeatureEnabled(serverInfo, "project_repository_creation");
   const sandboxProviders =
     repositoryCreation && serverInfo.managed_sandboxes_enabled === true
       ? sandboxProviderOptions(serverInfo)

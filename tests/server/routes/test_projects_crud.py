@@ -229,9 +229,9 @@ async def test_repository_config_is_stored_opaquely(
 async def test_info_advertises_project_repository_creation(
     project_client: httpx.AsyncClient,
 ) -> None:
-    """The server tells the web app it can save and clone a project repository."""
+    """The release feature that shows repository creation in the web app is on by default."""
     info = (await project_client.get("/v1/info")).json()
-    assert info["project_repository_creation"] is True
+    assert info["features"]["project_repository_creation"] is True
 
 
 async def test_patch_replaces_config(project_client: httpx.AsyncClient) -> None:

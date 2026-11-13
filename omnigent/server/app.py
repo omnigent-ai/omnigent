@@ -386,7 +386,6 @@ class ServerInfoResponse(BaseModel):
     sibling_other_project_standalone: bool = False
     # A project may save a repository and sandbox provider; older servers ignore
     # the saved repository, so the New project dialog keeps folder-only.
-    project_repository_creation: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -3921,7 +3920,6 @@ def create_app(
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,
-                "project_repository_creation": True,
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),

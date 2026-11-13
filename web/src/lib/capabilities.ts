@@ -70,6 +70,7 @@ export type FeatureKey =
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
   | "session_overview"
+  | "project_repository_creation"
   | "session_orchestration";
 
 /** Deployment-wide release-feature values advertised by the server. */
@@ -338,8 +339,6 @@ export interface ServerInfo {
   filesystem_attachments?: FilesystemAttachmentsInfo | null;
   /** Scheduled tasks accept a project; absent on older servers (off). */
   scheduled_task_projects?: boolean;
-  /** Projects can save a repository and sandbox provider; absent on older servers (off). */
-  project_repository_creation?: boolean;
   /** Latest sessionless automation failures can be listed for Inbox. */
   scheduled_task_inbox?: boolean;
   /** Scheduled permissions support native harnesses beyond Claude Code. */
@@ -699,7 +698,6 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           comment_anchor_metadata: data.comment_anchor_metadata === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
-          project_repository_creation: data.project_repository_creation === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:

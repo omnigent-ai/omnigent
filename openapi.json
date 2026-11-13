@@ -6832,11 +6832,6 @@
               "restrict_to_agent_names": []
             }
           },
-          "project_repository_creation": {
-            "default": false,
-            "title": "Project Repository Creation",
-            "type": "boolean"
-          },
           "public_sharing_enabled": {
             "title": "Public Sharing Enabled",
             "type": "boolean"

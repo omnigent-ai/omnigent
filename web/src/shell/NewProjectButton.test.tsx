@@ -64,7 +64,7 @@ vi.mock("./WorkspacePickerDialog", () => ({
 const laptop = { host_id: "host_1", name: "Laptop", owner: "me", status: "online" } as Host;
 const desktop = { host_id: "host_2", name: "Desktop", owner: "me", status: "online" } as Host;
 const projectServerInfo = {
-  project_repository_creation: true,
+  features: { project_repository_creation: true },
   managed_sandboxes_enabled: true,
   sandbox_provider: "modal",
   sandbox_providers: ["modal", "daytona"],
@@ -658,8 +658,11 @@ describe("NewProjectButton project repositories", () => {
     expect(screen.queryByLabelText("Repository URL")).toBeNull();
   });
 
-  it("keeps the folder-only dialog when the server does not advertise repositories", () => {
-    mocks.serverInfo = { managed_sandboxes_enabled: true, sandbox_providers: ["modal"] };
+  it.each([
+    ["an older server omits the feature", {}],
+    ["the feature is turned off", { project_repository_creation: false }],
+  ])("keeps the folder-only dialog when %s", (_label, features) => {
+    mocks.serverInfo = { managed_sandboxes_enabled: true, sandbox_providers: ["modal"], features };
     renderButton([laptop]);
 
     expect(screen.queryByLabelText("Run on")).toBeNull();

@@ -109,7 +109,7 @@ the header menu), and each place is a separate entry point.
   Agents file sessions the same way with `sys_session_update` (see
   [session orchestration](session-orchestration.md)).
 - `project-create-run-on`: New project's **Run on** picks a connected host or a
-  sandbox provider (behind the `project_repository_creation` server capability).
+  sandbox provider (behind the `project_repository_creation` release feature, on by default).
   On a host, **Folder** keeps the optional working directory; **Repository** clones
   a URL and optional branch into **Clone into** (default `~/<repo>`) before the
   project is saved, and the dialog stays locked until the clone and save finish.
