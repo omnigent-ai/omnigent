@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -362,7 +363,10 @@ async def test_enforce_sandbox_survives_agent_revision(
     ids=["stream", "stream-with-caller-env", "background"],
 )
 async def test_agent_revision_with_unevaluable_start_policy_blocks_dispatch(
-    stream: bool, caller_spawn_env: bool, caplog: pytest.LogCaptureFixture
+    stream: bool,
+    caller_spawn_env: bool,
+    caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
 ) -> None:
     """A policy broken by a revision must stop dispatch to the existing worker."""
     resolve_count = 0
@@ -391,6 +395,7 @@ async def test_agent_revision_with_unevaluable_start_policy_blocks_dispatch(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     session_id = f"conv_broken_start_policy_{stream}"
+    input_id = "a" * 32
 
     async with _runner_client(app) as client:
         response = await client.post(
@@ -408,6 +413,7 @@ async def test_agent_revision_with_unevaluable_start_policy_blocks_dispatch(
                 "role": "user",
                 "agent_id": "ag_test",
                 "agent_revision": "broken",
+                "input_stable_id": input_id,
                 "content": [{"type": "input_text", "text": "Check sandbox policy."}],
                 **(
                     {
@@ -435,9 +441,21 @@ async def test_agent_revision_with_unevaluable_start_policy_blocks_dispatch(
             if event.get("type") == "session.status" and event.get("status") == "failed"
         ]
         assert len(failures) == 1
-        assert ("AgentStartPolicyError" if stream else "broken_start_policy") in failures[0][
-            "error"
-        ]["message"]
+        failure_message = failures[0]["error"]["message"]
+        safe_detail = (
+            f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+        )
+        assert failure_message.endswith(safe_detail)
+        if stream:
+            assert "AgentStartPolicyError" in failure_message
+        else:
+            assert failure_message == f"turn setup failed: {safe_detail}"
+            terminal = [event for event in events if event.get("type") == "response.failed"]
+            assert len(terminal) == 1
+            assert terminal[0]["input_stable_id"] == input_id
+            assert terminal[0]["response"]["error"]["message"] == failure_message
+        assert "broken_start_policy" not in failure_message
+        assert "does_not_exist" not in failure_message
         assert "broken_start_policy" in caplog.text
         assert resolve_count > 1
         assert len(manager.get_client_calls) == 1, "broken policy must not spawn a replacement"
