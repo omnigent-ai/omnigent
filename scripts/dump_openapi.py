@@ -351,6 +351,7 @@ def _build_app_with_stub_stores() -> Any:
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
     from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
@@ -378,6 +379,7 @@ def _build_app_with_stub_stores() -> Any:
         policy_store=SqlAlchemyPolicyStore(db_uri),
         project_store=SqlAlchemyProjectStore(db_uri),
         scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
+        memory_store=SqlAlchemyMemoryStore(db_uri),
     )
 
 

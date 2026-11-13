@@ -4127,6 +4127,57 @@ async def test_runner_hides_scheduled_task_tools_only_when_server_turns_automati
     assert [advertised(result.spec) for result in results] == [False, True, True]
 
 
+@pytest.mark.asyncio
+async def test_runner_offers_memory_tools_only_when_the_server_says_memory_is_available(tmp_path):
+    from omnigent.memory_availability import MEMORY_HEADER, MEMORY_SEARCH_HEADER
+    from omnigent.tools.manager import ToolManager
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle("memory-agent")
+    # "1" is on; "0" and no header (an older server, with no /v1/memory) are off.
+    # The search header adds memory_search on top of the other four.
+    gate_headers = [
+        {MEMORY_HEADER: "1", MEMORY_SEARCH_HEADER: "1"},
+        {MEMORY_HEADER: "1", MEMORY_SEARCH_HEADER: "0"},
+        {MEMORY_HEADER: "1"},
+        {MEMORY_HEADER: "0", MEMORY_SEARCH_HEADER: "1"},
+        {},
+    ]
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=bundle,
+            headers={
+                "X-Agent-Version": "1",
+                "X-Agent-Session-Scoped": "true",
+                **gate_headers.pop(0),
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        results = [
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_memory", session_id="session"
+            )
+            for _ in range(5)
+        ]
+
+    def advertised(spec):
+        names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
+        return ("memory_write" in names, "memory_search" in names)
+
+    assert [advertised(result.spec) for result in results] == [
+        (True, True),
+        (True, False),
+        (True, False),
+        (False, False),
+        (False, False),
+    ]
+
+
 async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path):
     import json
 

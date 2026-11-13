@@ -1511,6 +1511,59 @@ def _apply_bind_auth_defaults(host: str) -> None:
             click.echo(f"  ⚠ {_exposure}", err=True)
 
 
+def _create_memory_store(backend: str | None, db_uri: str, memory_config: object) -> Any:  # type: ignore[explicit-any]  # returns MemoryStore (optional deps)
+    """
+    Create the long-term memory backend.
+
+    The ``--memory-backend`` flag wins over ``memory.backend`` in the config file;
+    the default is :class:`SqlAlchemyMemoryStore` on *db_uri*. The Hindsight
+    credential is a secret *reference* (``env:`` or ``keychain:``) resolved here on
+    the server, never read from agent specs or sent to a sandbox::
+
+        memory:
+          backend: hindsight
+          hindsight:
+            api_url: https://api.hindsight.vectorize.io   # optional
+            api_key: env:HINDSIGHT_API_KEY
+
+    :param backend: ``"sqlalchemy"``, ``"hindsight"`` or ``None`` for the config file's choice.
+    :param db_uri: The server database, used by the SQLAlchemy backend.
+    :param memory_config: The config file's ``memory`` block, or ``None``.
+    :returns: A :class:`omnigent.stores.memory_store.MemoryStore`.
+    :raises click.ClickException: On an unknown backend or an incomplete Hindsight config.
+    """
+    config = memory_config if isinstance(memory_config, dict) else {}
+    chosen = backend or config.get("backend") or "sqlalchemy"
+    if chosen == "sqlalchemy":
+        from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
+
+        return SqlAlchemyMemoryStore(db_uri)
+    if chosen != "hindsight":
+        raise click.ClickException(
+            f"Unknown memory backend {chosen!r}; expected 'sqlalchemy' or 'hindsight'."
+        )
+    hindsight_config = config.get("hindsight")
+    hindsight_config = hindsight_config if isinstance(hindsight_config, dict) else {}
+    key_ref = hindsight_config.get("api_key")
+    if not isinstance(key_ref, str) or not key_ref:
+        raise click.ClickException(
+            "The hindsight memory backend needs memory.hindsight.api_key in the config "
+            "file, as a secret reference such as 'env:HINDSIGHT_API_KEY'."
+        )
+    from omnigent.errors import OmnigentError
+    from omnigent.onboarding.provider_config import resolve_secret
+    from omnigent.stores.memory_store.hindsight_store import (
+        HindsightMemoryStore,
+        create_hindsight_client,
+    )
+
+    try:
+        client = create_hindsight_client(hindsight_config.get("api_url"), resolve_secret(key_ref))
+    except OmnigentError as exc:
+        raise click.ClickException(str(exc)) from exc
+    return HindsightMemoryStore(client)
+
+
 def _create_artifact_store(location: str) -> Any:  # type: ignore[explicit-any]  # returns ArtifactStore protocol (optional deps)
     """
     Create an artifact store based on the location URI scheme.
@@ -4616,6 +4669,14 @@ def _bind_server_listener(host: str, port: int) -> Iterator[socket.socket]:
     help="Path for artifact storage.  [default: <data-dir>/artifacts]",
 )
 @click.option(
+    "--memory-backend",
+    type=click.Choice(["sqlalchemy", "hindsight"]),
+    default=None,
+    help="Long-term memory backend.  sqlalchemy stores memory in --database-uri; "
+    "hindsight needs `omnigent[hindsight]` and a `memory.hindsight` config block.  "
+    "[default: sqlalchemy]",
+)
+@click.option(
     "--config",
     "-c",
     "config_path",
@@ -4692,6 +4753,7 @@ def server(
     database_uri: str | None,
     conversation_database_uri: str | None,
     artifact_location: str | None,
+    memory_backend: str | None,
     config_path: str | None,
     execution_timeout: int | None,
     agent_dirs: tuple[str, ...],
@@ -4755,6 +4817,13 @@ def server(
         os.environ["OMNIGENT_WEB_BASE_PATH"] = base_path
 
     if background:
+        if memory_backend is not None:
+            # The detached server is spawned without this command's options; it
+            # reads memory.backend from the global config instead.
+            raise click.UsageError(
+                "--memory-backend can't be combined with --background: set memory.backend "
+                f"in {_display_path(_effective_global_config_path())} instead."
+            )
         # `omnigent server --background` is the canonical spelling for the
         # detached server; the deprecated ``server start`` alias routes to the
         # same helper so both spellings can never drift.
@@ -4913,6 +4982,7 @@ def server(
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
+    memory_store = _create_memory_store(memory_backend, db_uri, cfg.get("memory"))
     preference_store = None
     if authority_id is not None:
         from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
@@ -5131,6 +5201,7 @@ def server(
         scheduled_task_store=scheduled_task_store,
         project_store=project_store,
         preference_store=preference_store,
+        memory_store=memory_store,
         auth_provider=auth_provider,
         host_store=host_store,
         account_store=account_store,

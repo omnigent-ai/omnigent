@@ -45,6 +45,7 @@ class Feature(StrEnum):
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
+    MEMORY = "memory"
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,14 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Split the main terminal view into several shell panes",
         owner="web",
         review_by_release="0.22.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MEMORY,
+        description="Long-term memory: the memory_* tools and the /v1/memory routes",
+        owner="server",
+        review_by_release="0.24.0",
+        frontend_visible=False,
+        default_enabled=False,
     ),
     FeatureDefinition(
         feature=Feature.USAGE_PAGE,

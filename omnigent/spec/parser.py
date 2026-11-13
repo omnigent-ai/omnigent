@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
 import sys
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -38,6 +39,7 @@ from omnigent.inner.git_ssh_policy import parse_git_ssh_bindings as _parse_git_s
 from omnigent.inner.sandbox import containment_prefix
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
+    MEMORY_TOOL_NAMES,
     AgentSpec,
     ApiKeyAuth,
     BuiltinToolConfig,
@@ -335,6 +337,13 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     mcp_servers = mcp_servers + _parse_inline_mcp_servers(raw_tools, expand_env=expand_env)
     local_tools = _discover_local_tools(root / "tools")
     sub_agents = _discover_sub_agents(root / "agents", expand_env=expand_env)
+    tool_groups = resolve_memory_tool_group(
+        tool_groups,
+        raw.get("tool_groups"),
+        builtins=tools_config.builtins,
+        own_tool_names=_own_tool_names(root, local_tools, mcp_servers),
+        agent_name=raw.get("name"),
+    )
 
     return AgentSpec(
         spec_version=spec_version,
@@ -559,6 +568,68 @@ def parse_tool_groups(raw: object, *, spawn: bool) -> ToolGroupsConfig:
     groups = ToolGroupsConfig(**enabled)
     _reject_orphaned_agent_id_tools(groups, spawn=spawn)
     return groups
+
+
+_LEGACY_HINDSIGHT_TOOLS = frozenset({"hindsight_retain", "hindsight_recall", "hindsight_reflect"})
+
+
+def resolve_memory_tool_group(
+    tool_groups: ToolGroupsConfig,
+    raw_tool_groups: object,
+    *,
+    builtins: Iterable[BuiltinToolConfig],
+    own_tool_names: Iterable[str],
+    agent_name: str | None,
+) -> ToolGroupsConfig:
+    """
+    Turn the memory group off for an agent that brings its own memory tools.
+
+    Either case keeps one memory surface in front of the model:
+
+    - The deprecated ``hindsight_*`` builtins: the agent keeps them, with a
+      deprecation warning.
+    - A local tool or MCP server named like a memory tool: the agent's tool keeps
+      the name. The runner routes those names to the memory server only for an
+      agent with memory on, so the tool works as it would without memory.
+
+    Setting ``tool_groups.memory: true`` in either case is ambiguous and is rejected.
+
+    :param tool_groups: The parsed groups.
+    :param raw_tool_groups: The raw ``tool_groups:`` value, to tell an explicit
+        ``memory: true`` from the default.
+    :param builtins: The spec's ``tools.builtins`` entries.
+    :param own_tool_names: Names of the spec's local tools and MCP servers.
+    :param agent_name: The spec's name, for the warning.
+    :returns: *tool_groups*, with ``memory`` off in either case.
+    :raises OmnigentError: If ``memory: true`` is set in either case.
+    """
+    explicit_on = isinstance(raw_tool_groups, dict) and raw_tool_groups.get("memory") is True
+    hindsight = sorted({b.name for b in builtins} & _LEGACY_HINDSIGHT_TOOLS)
+    clashes = sorted(set(own_tool_names) & MEMORY_TOOL_NAMES)
+    if hindsight and explicit_on:
+        raise OmnigentError(
+            f"tool_groups.memory: true conflicts with the deprecated {', '.join(hindsight)} "
+            "builtins: they would give the model two memory systems. Remove the hindsight_* "
+            "builtins and configure the Hindsight backend on the server "
+            "(`omnigent server --memory-backend hindsight`), or set tool_groups.memory: false.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if clashes and explicit_on:
+        raise OmnigentError(
+            f"tool_groups.memory: true conflicts with this agent's own {', '.join(clashes)} "
+            "tool or MCP server: rename it, or set tool_groups.memory: false.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if hindsight and tool_groups.memory:
+        _log.warning(
+            "Agent %r declares the deprecated hindsight_* builtins; tool_groups.memory is "
+            "off for it. Use the memory_* tools with the Hindsight backend instead "
+            "(`omnigent server --memory-backend hindsight`).",
+            agent_name,
+        )
+    if hindsight or clashes:
+        return replace(tool_groups, memory=False)
+    return tool_groups
 
 
 def _reject_orphaned_agent_id_tools(groups: ToolGroupsConfig, *, spawn: bool) -> None:
@@ -3329,6 +3400,62 @@ def _discover_local_tools(
             rel_path = str(tool_file.relative_to(tools_dir.parent))
             tools.append(LocalToolInfo(name=tool_name, path=rel_path, language=language))
     return tools
+
+
+def _own_tool_names(
+    root: Path, local_tools: list[LocalToolInfo], mcp_servers: list[MCPServerConfig]
+) -> list[str]:
+    """
+    Every name an agent's own tools may register under.
+
+    A Python tool file registers each ``@tool`` function under the function's own
+    name, which can differ from the file name, so the names a file defines count
+    too.
+
+    :param root: The agent directory, e.g. ``Path("/agents/researcher")``.
+    :param local_tools: The discovered local tools.
+    :param mcp_servers: The configured MCP servers.
+    :returns: Tool and MCP server names, plus the names each Python tool file
+        defines.
+    """
+    names = [tool.name for tool in local_tools] + [server.name for server in mcp_servers]
+    for tool in local_tools:
+        if tool.language == "python" and tool.path is not None:
+            names.extend(_names_defined_in(root / tool.path))
+    return names
+
+
+def _names_defined_in(source: Path) -> list[str]:
+    """
+    The module-scope names a Python file binds, read without importing it.
+
+    ``@tool`` only accepts module-scope functions and registers each under its own
+    name, which may be defined inside a module-level ``if``, ``try`` or ``with``
+    block. So every statement at module scope is searched, but not function or
+    class bodies. Importing the file instead would run the agent's code while
+    parsing its spec.
+
+    :param source: The file, e.g. ``Path("/agents/a/tools/python/helpers.py")``.
+    :returns: Function, class and assigned names; ``[]`` for a file that can't be
+        read or parsed (loading the tool reports that).
+    """
+    try:
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
+        return []
+    names: list[str] = []
+    pending: list[ast.AST] = list(tree.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.append(node.name)  # its body is another scope
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.append(node.id)
+        pending.extend(ast.iter_child_nodes(node))
+    return names
 
 
 def _discover_sub_agents(

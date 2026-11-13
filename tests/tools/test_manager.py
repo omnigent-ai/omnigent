@@ -101,6 +101,13 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "browser_click",
         "browser_type",
         "browser_screenshot",
+        # Long-term memory tools are always auto-registered unless the spec
+        # sets ``tool_groups.memory: false``. Runner-dispatched to ``/v1/memory``.
+        "memory_search",
+        "memory_get",
+        "memory_list",
+        "memory_write",
+        "memory_delete",
     }
 )
 

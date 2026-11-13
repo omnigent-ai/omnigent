@@ -874,6 +874,13 @@ class ToolsConfig:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
 
 
+# The tools behind ``ToolGroupsConfig.memory``. The runner routes calls with
+# these names to the memory server only for an agent whose memory group is on.
+MEMORY_TOOL_NAMES: frozenset[str] = frozenset(
+    {"memory_search", "memory_get", "memory_list", "memory_write", "memory_delete"}
+)
+
+
 @dataclass
 class ToolGroupsConfig:
     """
@@ -892,6 +899,7 @@ class ToolGroupsConfig:
     :param agent_discovery: The read-only ``sys_agent_*`` tools (3).
     :param projects: ``sys_project_list``, ``sys_project_update`` and
         ``sys_session_update``.
+    :param memory: The ``memory_*`` long-term memory tools (5).
     """
 
     browser: bool = True
@@ -900,6 +908,7 @@ class ToolGroupsConfig:
     policies: bool = True
     agent_discovery: bool = True
     projects: bool = True
+    memory: bool = True
 
 
 @dataclass
@@ -1593,6 +1602,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         an absent block changes nothing; a spec sets a group to
         ``false`` to drop tools it cannot use from the advertised
         payload. See :class:`ToolGroupsConfig` for the groups.
+    :param memory_search_available: Whether the server's memory backend can
+        search, so ``memory_search`` is offered with the other memory tools.
+        Set by the runner from the bundle download, never from YAML.
     :param agent_session_sharing: Authority for the agent to share the
         session it is running in, via ``sys_session_share``. YAML key is
         ``agent_session_sharing:`` (top-level, like ``spawn:``). This
@@ -1655,6 +1667,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     timers: bool = False
     spawn: bool = False
     tool_groups: ToolGroupsConfig = field(default_factory=ToolGroupsConfig)
+    # Not read from YAML: the runner clears it when the server's memory backend
+    # has no search, which drops ``memory_search`` from the memory tools.
+    memory_search_available: bool = True
     agent_session_sharing: SharePolicy = SharePolicy.NONE
     source_rel_dir: str | None = field(default=None, compare=False)
 

@@ -87,6 +87,8 @@ def test_no_sandbox_section_keeps_managed_hosts_off(
 
     assert exit_codes == []
     assert create_app.call_args.kwargs["sandbox_config"] is None
+    # The app wires a memory store into its Lakebase database; memory itself is opt-in.
+    assert create_app.call_args.kwargs["memory_store"] is not None
 
 
 def test_invalid_sandbox_section_fails_startup(

@@ -130,6 +130,7 @@ from omnigent.server.routes.extension_assets import create_extension_assets_rout
 from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
+from omnigent.server.routes.memory import create_memory_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
 from omnigent.server.routes.projects import create_projects_router
@@ -187,6 +188,7 @@ from omnigent.stores.conversation_store import (
     runner_seen_is_fresh,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.memory_store import MemoryStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.preference_store import PreferenceStore
@@ -383,6 +385,8 @@ class ServerInfoResponse(BaseModel):
     # An agent's create that names a project other than its source's project makes a
     # standalone session; older servers refuse it while sibling sessions are on.
     sibling_other_project_standalone: bool = False
+    # ``/v1/memory`` is mounted and enabled; the runner offers the memory_* tools only then.
+    memory: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -1802,6 +1806,7 @@ def create_app(
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
     session_mcp_selection: SessionMcpSelection | None = None,
+    memory_store: MemoryStore | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1840,6 +1845,7 @@ def create_app(
         a :class:`ScheduledTaskScheduler` that arms a timer per active task.
         ``None`` disables the scheduler entirely, in either mode.
     :param preference_store: Optional shared-preference API; no launcher adoption.
+    :param memory_store: Optional long-term memory backend; mounts ``/v1/memory`` when set.
     :param automations: Whether this request's caller can use automations. A static
         bool or a zero-arg callable resolved per request; ``None`` enables them.
         When off, the ``/v1/scheduled-tasks`` routes return 404 and ``GET /v1/info``
@@ -2559,6 +2565,12 @@ def create_app(
         )
 
     app.state.automations_available = automations_available
+    app.state.memory_available = lambda: (
+        memory_store is not None and app.state.feature_flags.enabled(Feature.MEMORY)
+    )
+    app.state.memory_search_available = lambda: (
+        app.state.memory_available() and memory_store is not None and memory_store.supports_search
+    )
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
@@ -3920,6 +3932,7 @@ def create_app(
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,
+                "memory": app.state.memory_available(),
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
@@ -4233,6 +4246,17 @@ def create_app(
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
+        )
+    if memory_store is not None:
+        app.include_router(
+            create_memory_router(
+                memory_store,
+                auth_provider=auth_provider,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["memory"],
         )
     # Admin control for the server-wide sharing settings. Always mounted (the
     # handlers self-gate on admin); PUT is a no-op-reject unless this server

@@ -21,6 +21,11 @@ from omnigent.tools.base import Tool, ToolContext, is_valid_tool_name
 from omnigent.tools.builtins import (
     ListCommentsTool,
     LoadSkillTool,
+    MemoryDeleteTool,
+    MemoryGetTool,
+    MemoryListTool,
+    MemorySearchTool,
+    MemoryWriteTool,
     ReadSkillFileTool,
     SysAdviseModelsTool,
     SysAgentDownloadTool,
@@ -195,6 +200,7 @@ class ToolManager:
         self._register_comment_tools()
         self._register_policy_tools()
         self._register_scheduled_task_tools()
+        self._register_memory_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -232,6 +238,29 @@ class ToolManager:
             SysScheduledTaskUpdateTool(),
             SysScheduledTaskDeleteTool(),
         ):
+            self._tools[tool.name()] = tool
+
+    def _register_memory_tools(self) -> None:
+        """
+        Auto-register the long-term memory builtins.
+
+        Registered without spec opt-in so every agent can save and recall memory
+        across sessions; ``tool_groups.memory: false`` drops all five, and
+        ``memory_search`` is left out when the server's backend cannot search.
+        The runner dispatches them via the Omnigent server's ``/v1/memory`` REST
+        endpoints.
+        """
+        if not self._spec.tool_groups.memory:
+            return
+        tools: list[Tool] = [
+            MemoryGetTool(),
+            MemoryListTool(),
+            MemoryWriteTool(),
+            MemoryDeleteTool(),
+        ]
+        if self._spec.memory_search_available:
+            tools.insert(0, MemorySearchTool())
+        for tool in tools:
             self._tools[tool.name()] = tool
 
     def _register_async_inbox_tools(self) -> None:
