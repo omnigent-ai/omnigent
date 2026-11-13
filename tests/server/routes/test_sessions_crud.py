@@ -163,6 +163,7 @@ MAIN_GATEWAY_BY_REQUEST_SHAPE = [
     ("omnigent-client/0.22.0 python-httpx/0.28.1", "omnigent-cli"),
     ("omnigent-slack/0.1.0 python-httpx/0.28.1", "omnigent-cli"),
     ("python-httpx/0.28.1", "omnigent-cli"),
+    ("python-requests/2.32.3", "omnigent-cli"),
     ("Python-urllib/3.12", "omnigent-web"),
     ("curl/7.68.0", "omnigent-web"),
     ("node", "omnigent-web"),
