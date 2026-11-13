@@ -1170,7 +1170,7 @@ type ModelCatalogAvailability = "available" | "unavailable" | "unknown";
 // list from whatever is launchable rather than showing an empty group.
 const PRIMARY_HARNESS_ORDER: readonly string[] = ["claude", "cursor", "codex"];
 // Preferred order within the "Other..." submenu.
-const SECONDARY_HARNESS_ORDER: readonly string[] = ["opencode", "pi"];
+const SECONDARY_HARNESS_ORDER: readonly string[] = ["opencode", "pi", "omp"];
 // How many rows the backfill promotes — matches the inline list's usual size.
 const INLINE_HARNESS_FALLBACK = PRIMARY_HARNESS_ORDER.length;
 
@@ -4376,7 +4376,7 @@ function NewChatLandingContent({
           ? claudeModelOptions
           : native.iconKind === "codex"
             ? codexModelOptions
-            : native.iconKind === "pi"
+            : native.key === "pi" || native.key === "omp"
               ? native.harness === thinkingNativeHarness
                 ? piModelOptions
                 : []
@@ -4400,7 +4400,8 @@ function NewChatLandingContent({
             ? nativeModelLabel(model)
             : defaultModelLabel(catalog),
       );
-      const efforts = native.iconKind === "pi" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
+      const efforts =
+        native.key === "pi" || native.key === "omp" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
       const effort =
         native.iconKind === "codex"
           ? normalizeEffortLabel(saved.effort ?? "")

@@ -7,7 +7,7 @@ under `/releases`.
 
 ## Unreleased
 
-- [Feature] Add the native OMP (Oh My Pi) TUI harness, `omnigent omp`, independent provider setup, centralized tool approvals, session controls, and native child-session isolation.
+- [Feature] Add the native OMP (Oh My Pi) TUI harness, `omnigent omp`, official OMP branding, independent provider setup, centralized tool approvals, session controls, and native child-session isolation.
 
 ## [v0.21.0] — 2026-11-05
 

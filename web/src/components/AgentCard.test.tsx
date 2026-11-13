@@ -23,6 +23,7 @@ vi.mock("@/components/icons/KiroIcon", () => ({ KiroIcon: stub("kiro") }));
 vi.mock("@/components/icons/NessieIcon", () => ({ NessieIcon: stub("nessie") }));
 vi.mock("@/components/icons/OpenCodeIcon", () => ({ OpenCodeIcon: stub("opencode") }));
 vi.mock("@/components/icons/PiIcon", () => ({ PiIcon: stub("pi") }));
+vi.mock("@/components/icons/OmpIcon", () => ({ OmpIcon: stub("omp") }));
 vi.mock("@/components/icons/AntigravityIcon", () => ({ AntigravityIcon: stub("antigravity") }));
 vi.mock("lucide-react", () => ({ BotIcon: stub("bot") }));
 
@@ -54,7 +55,7 @@ describe("AgentCard icon selection", () => {
     { name: "opencode-native-ui", harness: "opencode-native", expected: "opencode" },
     { name: "claude-native-ui", harness: "claude-native", expected: "claude" },
     { name: "pi-native-ui", harness: "pi-native", expected: "pi" },
-    { name: "omp-native-ui", harness: "omp-native", expected: "pi" },
+    { name: "omp-native-ui", harness: "omp-native", expected: "omp" },
     { name: "cursor-native-ui", harness: "cursor-native", expected: "cursor" },
     { name: "goose-native-ui", harness: "goose-native", expected: "goose" },
     // A goose-harnessed agent also reads as Goose via the harness fallback —

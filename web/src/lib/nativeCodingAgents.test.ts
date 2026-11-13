@@ -30,7 +30,7 @@ describe("nativeCodingAgentForHarness", () => {
         key: "omp",
         harness: "omp-native",
         displayName: "OMP",
-        iconKind: "pi",
+        iconKind: "omp",
       });
       expect(nativeWrapperLabelsForAgent(agent)).toEqual({
         [UI_MODE_LABEL_KEY]: UI_MODE_TERMINAL_VALUE,

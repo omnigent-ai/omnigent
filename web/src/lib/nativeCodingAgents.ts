@@ -67,6 +67,7 @@ export type NativeCodingAgentIconKind =
   | "codex"
   | "opencode"
   | "pi"
+  | "omp"
   | "cursor"
   | "kiro"
   | "goose"
@@ -85,7 +86,7 @@ export type NativeCodingAgentCapability =
   | "devinPermission";
 
 export interface NativeCodingAgentSpec {
-  key: NativeCodingAgentIconKind | "omp";
+  key: NativeCodingAgentIconKind;
   agentName: string;
   harness: string;
   wrapperLabel: string;
@@ -206,7 +207,7 @@ export const NATIVE_CODING_AGENTS = [
     wrapperLabel: "omp-native-ui",
     subagentWrapperLabel: "omp-native-ui-subagent",
     displayName: "OMP",
-    iconKind: "pi",
+    iconKind: "omp",
     sortRank: 42,
     capabilities: ["modelPicker"],
   },
