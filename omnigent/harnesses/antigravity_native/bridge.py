@@ -1852,20 +1852,12 @@ def send_interaction_keys_via_tui(
     """
     Send raw key arguments to the agy TUI pane to answer its in-process prompt.
 
-    The companion to :func:`inject_user_message_via_tui` for the OTHER thing the
-    attended agy TUI maintains in parallel with the RPC step state: its
-    **in-process permission / question prompt**. When agy runs attended (the
-    web/mobile path types every turn into the TUI), an approval surfaces in the
-    Omnigent web UI AND as agy's own numbered TUI prompt ("Do you want to
-    proceed?", 1.Yes … 4.No). Delivering the verdict over
-    :func:`omnigent.harnesses.antigravity_native.rpc.handle_user_interaction` flips the
-    backend trajectory step to DONE and the command runs, but the **TUI prompt
-    for that interaction can stay open** — and the next typed turn then lands in
-    that stale prompt's filter/amend buffer instead of starting a fresh turn
-    (live-verified; see ``docs/claude/antigravity-rpc-spike-notes.md`` §"attended
-    TUI"). So the bridge ALSO types the selection into the pane to dismiss the
-    prompt, mirroring cursor-native's
-    :func:`omnigent.harnesses.cursor_native.bridge.send_cursor_pane_keys`.
+    RPC and terminal prompt state can diverge. Callers must confirm the same
+    interaction is still waiting before sending post-RPC dismissal keys: a
+    closed prompt would accept those keys as a new chat message. Clients whose
+    trajectory is already DONE while their terminal prompt remains open need
+    manual dismissal; the RPC state cannot safely distinguish that stale menu
+    from an active composer.
 
     Each argument is a tmux ``send-keys`` key argument — a bare ``"1"`` / ``"4"``
     selects a numbered option, ``"Enter"`` confirms, ``"Escape"`` cancels — sent

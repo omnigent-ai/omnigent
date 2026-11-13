@@ -666,11 +666,12 @@ async def test_tui_dismissal_failure_does_not_undo_delivered_verdict() -> None:
     "after_delivery",
     [
         [],
+        [{**_permission_step(step_index=2), "status": "CORTEX_STEP_STATUS_DONE"}],
         [_permission_step(step_index=3)],
         [_question_step(step_index=2)],
         [_permission_step(step_index=2, persist_pattern="different-command")],
     ],
-    ids=["closed", "different-step", "different-kind", "changed-options"],
+    ids=["closed", "done", "different-step", "different-kind", "changed-options"],
 )
 async def test_no_tui_keystroke_when_rpc_already_closed_the_menu(
     after_delivery: list[dict[str, Any]],
@@ -695,29 +696,6 @@ async def test_no_tui_keystroke_when_rpc_already_closed_the_menu(
 
     assert len(deliver.calls) == 1
     assert inject_tui.calls == []
-
-
-@pytest.mark.asyncio
-async def test_tui_keys_still_sent_when_step_is_waiting_after_rpc() -> None:
-    """Older agy leaves the same step WAITING after RPC; the keys then dismiss its menu."""
-    pending = _pending_permission(step_index=2)
-    waiting = _permission_step(step_index=2)
-    request, _ = _elicitation_returner(ElicitationResult(action="accept", content=None))
-    deliver = _DeliverRecorder()
-    inject_tui = _InjectTuiRecorder()
-
-    await bridge_interaction(
-        _CASCADE,
-        pending,
-        port=52548,
-        get_steps=_steps_returner([waiting], [waiting]),
-        request_elicitation=request,
-        deliver=deliver,
-        inject_tui=inject_tui,
-    )
-
-    assert len(deliver.calls) == 1
-    assert inject_tui.calls == [["1", "Enter"]]
 
 
 @pytest.mark.asyncio

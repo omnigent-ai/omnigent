@@ -497,8 +497,8 @@ async def bridge_interaction(
                 step_index=fresh["step_index"],
                 payload=payload,
             )
-            # Older agy versions can leave the attended prompt open after RPC;
-            # newer ones close it, and typing then submits a stray chat prompt.
+            # Dismiss only an unchanged WAITING interaction; DONE does not prove
+            # the terminal still has a menu that can safely consume these keys.
             if keys and await _step_still_waiting(get_steps, fresh):
                 try:
                     await inject_tui(keys)
