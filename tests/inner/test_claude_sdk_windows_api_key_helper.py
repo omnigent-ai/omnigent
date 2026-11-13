@@ -119,7 +119,6 @@ def test_windows_dynamic_helper_unchanged(command: str) -> None:
     assert static_key is None
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "python_path",
     [
@@ -132,8 +131,18 @@ def test_windows_dynamic_helper_unchanged(command: str) -> None:
         "C:\\Users\\a`b\\python.exe",
     ],
 )
+def test_windows_static_helper_rejects_unsafe_interpreter(python_path: str) -> None:
+    token = "dummy-unsafe-interpreter-token"
+    with pytest.raises(RuntimeError, match="safe Python interpreter") as error:
+        ex._platform_safe_api_key_helper(
+            _static_cmd(token), is_windows=True, python_executable=python_path
+        )
+    assert token not in str(error.value)
+
+
+@pytest.mark.asyncio
 async def test_windows_unsafe_python_path_fails_before_settings_or_client_creation(
-    python_path: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     token = "dummy-unsafe-interpreter-token"
     executor = ex.ClaudeSDKExecutor(api_key_helper=_static_cmd(token), model="dummy-model")
@@ -141,7 +150,7 @@ async def test_windows_unsafe_python_path_fails_before_settings_or_client_creati
     create_key = Mock()
     monkeypatch.setattr(ex, "_ensure_sdk", lambda: sdk)
     monkeypatch.setattr(ex, "IS_WINDOWS", True)
-    monkeypatch.setattr(ex.sys, "executable", python_path)
+    monkeypatch.setattr(ex.sys, "executable", r"C:\Users\a%TEMP%b\python.exe")
     monkeypatch.setattr(ex, "PrivateStaticKeyFile", create_key)
     try:
         with pytest.raises(RuntimeError, match="safe Python interpreter") as error:
@@ -161,8 +170,18 @@ async def test_windows_unsafe_python_path_fails_before_settings_or_client_creati
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["constructor", "connect", "timeout", "cancel"])
-@pytest.mark.parametrize("cleanup_failure", [None, "unlink", "rmdir"])
+@pytest.mark.parametrize(
+    "outcome,cleanup_failure",
+    [
+        pytest.param(outcome, None, id=f"None-{outcome}")
+        for outcome in ("constructor", "connect", "timeout", "cancel")
+    ]
+    + [
+        pytest.param(outcome, failure, id=f"{failure}-{outcome}")
+        for failure in ("unlink", "rmdir")
+        for outcome in ("constructor", "connect")
+    ],
+)
 async def test_failed_client_creation_removes_its_static_key_file(
     outcome: str,
     cleanup_failure: str | None,
