@@ -5306,6 +5306,15 @@ async def _execute_reminder_set(
         agent_id = snapshot.get("agent_id")
         if not isinstance(agent_id, str) or not agent_id:
             return json.dumps({"error": f"{tool_name}: this session has no agent to remind"})
+        if snapshot.get("side_chat_parent_id"):
+            # A side chat runs on its source's runner, which a reminder can't wake
+            # once it has stopped, so the reminder could fail unseen.
+            return json.dumps(
+                {
+                    "error": f"{tool_name}: reminders can't be set from a side chat; "
+                    "set it in the session the side chat belongs to"
+                }
+            )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"{tool_name} failed: {exc}"})
     try:

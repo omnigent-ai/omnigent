@@ -862,8 +862,13 @@ async def test_reminder_argument_errors_make_no_server_calls(
     [
         (_Resp(status_code=404, body={"error": "not found"}), "could not read this session"),
         (_Resp(body={"id": "conv_1"}), "this session has no agent to remind"),
+        # A side chat's runner is its source's, which a reminder can't wake.
+        (
+            _Resp(body={"id": "conv_1", "agent_id": "ag_1", "side_chat_parent_id": "conv_0"}),
+            "can't be set from a side chat",
+        ),
     ],
-    ids=["unreadable", "no_agent"],
+    ids=["unreadable", "no_agent", "side_chat"],
 )
 async def test_reminder_needs_a_readable_session_with_an_agent(session: _Resp, error: str) -> None:
     client = _ReminderClient(session=session)

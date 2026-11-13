@@ -192,6 +192,44 @@ def test_an_edit_that_stops_a_reminder_fitting_makes_it_an_automation(
     assert restored.kind == "automation"
 
 
+@pytest.mark.parametrize("arrival", ["on_time", "late", "late_and_exhausted"])
+def test_first_run_at_is_checked_against_the_saved_schedule(
+    store: SqlAlchemyScheduledTaskStore, monkeypatch: pytest.MonkeyPatch, arrival: str
+) -> None:
+    from datetime import UTC, datetime
+
+    from omnigent.stores.scheduled_task_store import (
+        ScheduledTaskFirstRunMismatchError,
+        sqlalchemy_store,
+    )
+    from omnigent.tools.builtins.scheduled_tasks import reminder_rrule
+
+    store.configure_dispatch(True)
+    fire_at = 1_800_000_000 + 7200 - (1_800_000_000 + 7200) % 60
+    when = datetime.fromtimestamp(fire_at, UTC)
+    rule = reminder_rrule(when)
+    if arrival == "late_and_exhausted":
+        # Ends at the requested minute, so a late create leaves no run at all.
+        rule = rule.replace(";COUNT=1", f";UNTIL={when.strftime('%Y%m%dT%H%M%SZ')}")
+    # On time, the task is created two hours early; late, a second after its minute.
+    created_at = fire_at - 7200 if arrival == "on_time" else fire_at + 1
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: created_at)
+    fields = _reminder_fields(rrule=rule, kind="automation", first_run_at=fire_at)
+    if arrival == "on_time":
+        task = store.create(scheduled_task_id=_uid("st_first_run"), **fields)
+        assert task.next_run_at == fire_at
+        return
+    with pytest.raises(ScheduledTaskFirstRunMismatchError) as caught:
+        store.create(scheduled_task_id=_uid("st_first_run"), **fields)
+    assert caught.value.expected == fire_at
+    # A late COUNT=1 rule would move to the same minute a year later; nothing is saved.
+    if arrival == "late":
+        assert caught.value.actual is not None and caught.value.actual > fire_at
+    else:
+        assert caught.value.actual is None
+    assert store.list() == []
+
+
 # ── state enum ────────────────────────────────────────────────────────────────
 
 
