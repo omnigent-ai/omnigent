@@ -22,9 +22,10 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
   })),
 }));
 
+let loadedConversations: unknown = undefined;
 vi.mock("@/hooks/useSidebarData", () => ({
-  useLoadedConversations: () => ({ data: undefined, isLoading: false }),
-  useOptionalLoadedConversations: () => undefined,
+  useLoadedConversations: () => ({ data: loadedConversations, isLoading: false }),
+  useOptionalLoadedConversations: () => loadedConversations,
 }));
 
 vi.mock("@/hooks/useSkills", () => ({
@@ -49,6 +50,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { newSessionLocation } from "@/lib/newSessionHandoff";
+import { setPendingInitialPrompt } from "@/store/chatStore";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 
 let searchParams = new URLSearchParams();
@@ -195,6 +197,8 @@ beforeEach(() => {
   serverIdentity = "workspace:1";
   vi.mocked(getCurrentUserId).mockReturnValue(null);
   vi.mocked(authenticatedFetch).mockReset();
+  vi.mocked(setPendingInitialPrompt).mockReset();
+  loadedConversations = undefined;
   searchParams = new URLSearchParams("o=123&prompt=hello_world");
   replaceSearchParamsMock.mockImplementation((next: URLSearchParams) => {
     searchParams = new URLSearchParams(next);
@@ -205,6 +209,43 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
+
+/** Make a create possible: a claude-sdk agent on an online host with a recent workspace. */
+function allowSessionStart(response: { ok: boolean; body: unknown }) {
+  window.localStorage.setItem(
+    "omnigent:recent-workspaces",
+    JSON.stringify({ host_1: ["/work/repo"] }),
+  );
+  vi.mocked(useAvailableAgents).mockReturnValue({
+    data: [
+      {
+        id: "ag_hello",
+        name: "hello_world",
+        display_name: "Hello World",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      } as AvailableAgent,
+    ],
+  } as ReturnType<typeof useAvailableAgents>);
+  vi.mocked(authenticatedFetch).mockResolvedValue({
+    ok: response.ok,
+    status: response.ok ? 200 : 500,
+    json: async () => response.body,
+  } as unknown as Response);
+}
+
+async function submitWhenReady() {
+  await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).not.toBeDisabled());
+  fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+  await waitFor(() =>
+    expect(
+      vi
+        .mocked(authenticatedFetch)
+        .mock.calls.some(([url, init]) => url === "/v1/sessions" && init?.method === "POST"),
+    ).toBe(true),
+  );
+}
 
 describe("embedded prompt link", () => {
   it("keeps the prompt when the host remounts the composer in the same commit", () => {
@@ -230,12 +271,16 @@ describe("embedded prompt link", () => {
     expect(composer()).toHaveValue("");
   });
 
-  it("ignores a kept prompt once it is stale", () => {
+  it.each([
+    [59_999, "hello_world"],
+    [60_000, ""],
+  ])("restores a kept prompt only within 60 s (%i ms)", (elapsed, expected) => {
     const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
     renderLanding();
-    vi.spyOn(Date, "now").mockReturnValue(now + 5 * 60_000);
+    vi.spyOn(Date, "now").mockReturnValue(now + elapsed);
     reloadPage();
-    expect(composer()).toHaveValue("");
+    expect(composer()).toHaveValue(expected);
   });
 
   it("keeps the prompt over an older parked draft when the composer remounts", () => {
@@ -257,12 +302,19 @@ describe("embedded prompt link", () => {
     expect(composer()).toHaveValue("");
   });
 
-  it("does not restore a prompt kept for another viewer", () => {
-    vi.mocked(getCurrentUserId).mockReturnValue("alice");
+  it.each([
+    ["alice", "bob", ""],
+    ["alice", "alice", "hello_world"],
+    // Identity resolves after first render, so an unknown viewer on either side
+    // is not tied to the prompt.
+    [null, "bob", "hello_world"],
+    ["alice", null, "hello_world"],
+  ])("restores a prompt kept for viewer %s when %s reads it", (keptBy, readBy, expected) => {
+    vi.mocked(getCurrentUserId).mockReturnValue(keptBy);
     renderLanding();
-    vi.mocked(getCurrentUserId).mockReturnValue("bob");
+    vi.mocked(getCurrentUserId).mockReturnValue(readBy);
     reloadPage();
-    expect(composer()).toHaveValue("");
+    expect(composer()).toHaveValue(expected);
   });
 
   it("keeps nothing across a reload without a server identity", () => {
@@ -291,40 +343,44 @@ describe("embedded prompt link", () => {
     expect(composer()).toHaveValue("hello_world");
   });
 
-  it("drops the kept prompt once a session is started", async () => {
-    window.localStorage.setItem(
-      "omnigent:recent-workspaces",
-      JSON.stringify({ host_1: ["/work/repo"] }),
-    );
-    vi.mocked(useAvailableAgents).mockReturnValue({
-      data: [
-        {
-          id: "ag_hello",
-          name: "hello_world",
-          display_name: "Hello World",
-          description: null,
-          harness: "claude-sdk",
-          skills: [],
-        } as AvailableAgent,
-      ],
-    } as ReturnType<typeof useAvailableAgents>);
-    vi.mocked(authenticatedFetch).mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_new" }),
-    } as unknown as Response);
+  it("drops the kept prompt once a session is created", async () => {
+    allowSessionStart({ ok: true, body: { id: "conv_new" } });
     renderLanding();
-    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).not.toBeDisabled());
-    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-    await waitFor(() =>
-      expect(
-        vi
-          .mocked(authenticatedFetch)
-          .mock.calls.some(([url, init]) => url === "/v1/sessions" && init?.method === "POST"),
-      ).toBe(true),
-    );
-    expect(window.sessionStorage.length).toBe(0);
+    await submitWhenReady();
+    await waitFor(() => expect(window.sessionStorage.length).toBe(0));
     reloadPage();
     expect(composer()).toHaveValue("");
+  });
+
+  it("keeps the prompt when the create fails", async () => {
+    allowSessionStart({ ok: false, body: { error: { message: "boom" } } });
+    renderLanding();
+    await submitWhenReady();
+    await waitFor(() => expect(composer()).toHaveValue("hello_world"));
+    reloadPage();
+    expect(composer()).toHaveValue("hello_world");
+  });
+
+  it("sends the link's text literally after a mounted link and a remount", async () => {
+    allowSessionStart({ ok: true, body: { id: "conv_new" } });
+    loadedConversations = {
+      pages: [{ data: [{ id: "s_parked", object: "conversation", title: "Plan", labels: {} }] }],
+    };
+    searchParams = new URLSearchParams("o=123");
+    const { rerender } = renderLanding();
+    fireEvent.change(composer(), { target: { value: "Read @pla", selectionStart: 9 } });
+    fireEvent.click(screen.getByTitle("Tag session Plan"));
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@Plan");
+    searchParams = new URLSearchParams("o=123&prompt=Ask+%40Plan");
+    rerender(<Landing visit={1} />);
+    expect(composer()).toHaveValue("Ask @Plan");
+    rerender(<Landing visit={2} />);
+    expect(composer()).toHaveValue("Ask @Plan");
+    await submitWhenReady();
+    await waitFor(() => expect(setPendingInitialPrompt).toHaveBeenCalled());
+    expect((vi.mocked(setPendingInitialPrompt).mock.calls[0]![1] as { text: string }).text).toBe(
+      "Ask @Plan",
+    );
   });
 
   it("drops the kept prompt when the text changes after a remount", () => {
@@ -355,7 +411,7 @@ describe("embedded prompt link", () => {
     searchParams = new URLSearchParams(newSessionLocation("Handed off", []).split("?")[1]);
     renderLanding();
     expect(composer()).toHaveValue("Handed off");
-    fireEvent.change(composer(), { target: { value: "" } });
+    expect(window.sessionStorage.length).toBe(0);
     reloadPage();
     expect(composer()).toHaveValue("");
   });

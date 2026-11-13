@@ -2559,10 +2559,8 @@ function NewChatLandingContent({
           autoSeededBranch: "",
         };
 
-  // A fresh page has no parked draft, so a prompt consumed just before a reload
-  // comes back from sessionStorage. A remount restores it from the parked draft
-  // instead, but still takes over the kept copy so its edits and session start
-  // forget it.
+  // Restore from storage only without a parked draft; a remount still takes over
+  // cleanup of the kept copy.
   const [keptLinkedPrompt] = useState(() =>
     handoff === null && !linkedPrompt?.trim() ? readKeptLinkedPrompt(siblingSourceId) : null,
   );
@@ -2588,7 +2586,12 @@ function NewChatLandingContent({
     if (linkedPrompt?.trim()) {
       setMessage(linkedPrompt);
       clearTaggedMentionsRef.current();
-      writeLandingDraft(draftState, { ...draftRef.current, message: linkedPrompt });
+      // The link's text is literal, so the parked copy carries none of the old tags.
+      writeLandingDraft(draftState, {
+        ...draftRef.current,
+        message: linkedPrompt,
+        mentions: undefined,
+      });
       keepLinkedPrompt(siblingSourceId, linkedPrompt);
       keptLinkedTextRef.current = linkedPrompt;
     } else if (handoff !== null) {
@@ -6117,7 +6120,6 @@ function NewChatLandingContent({
       // Spend the draft only once provisioning starts, after the laptop credential check.
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
-      releaseKeptLinkedPrompt();
       if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
@@ -6704,6 +6706,7 @@ function NewChatLandingContent({
       appendPromptHistoryEntry(initialPrompt, data.id);
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
+      releaseKeptLinkedPrompt();
       if (submittedDraftRevisionRef.current === draftState.revision) {
         writeLandingDraft(draftState, null);
       }
