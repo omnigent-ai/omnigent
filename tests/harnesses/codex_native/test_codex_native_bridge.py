@@ -189,7 +189,8 @@ def test_shell_reconciliation_requires_idle_or_the_original_parent(
 
 
 @pytest.mark.parametrize(
-    "changed_field", ["pending_shell_command_id", "session_id", "thread_id", "socket_path"]
+    "changed_field",
+    ["pending_shell_command_id", "session_id", "thread_id", "socket_path", "codex_home"],
 )
 def test_shell_reconciliation_does_not_clear_a_newer_submission_or_session(
     tmp_path: Path, changed_field: str
@@ -209,6 +210,23 @@ def test_shell_reconciliation_does_not_clear_a_newer_submission_or_session(
     codex_native_bridge.reconcile_shell_command_state(tmp_path, observed, None)
 
     assert read_bridge_state(tmp_path) == newer
+
+
+@pytest.mark.parametrize("changed_field", ["session_id", "thread_id", "socket_path", "codex_home"])
+def test_shell_submission_rejects_a_replaced_native_session(
+    tmp_path: Path, changed_field: str
+) -> None:
+    """A stale preflight cannot reserve a shell submission in a replacement session."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, None)
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    replacement = replace(observed, **{changed_field: "replacement_value"})
+    write_bridge_state(tmp_path, replacement)
+
+    assert not codex_native_bridge.mark_shell_command_pending(tmp_path, observed, "submission")
+    assert read_bridge_state(tmp_path) == replacement
 
 
 def test_shell_reconciliation_never_restores_a_completed_turn(tmp_path: Path) -> None:
