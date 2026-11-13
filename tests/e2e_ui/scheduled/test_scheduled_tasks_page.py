@@ -18,6 +18,7 @@ never exercised.
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
@@ -27,9 +28,10 @@ from typing import Any
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests._helpers.host import Host, isolated_host
+from tests._helpers.live_server import terminate_process
 
 
 def _builtin_agent_id(base_url: str, name: str) -> str:
@@ -81,9 +83,9 @@ def _create_task(
     ``model_override`` / ``reasoning_effort`` / ``permission_mode`` are optional
     so a test can seed a task carrying the overrides the create/edit dialog
     persists — used by the edit-prefill tests, where the dialog must read them
-    back onto the ``task-model-trigger`` / ``task-effort-trigger`` /
-    ``task-permission-trigger`` controls. Left ``None`` they are omitted from the
-    body (the row persists null, the agent's own defaults).
+    back onto the agent picker and ``task-permission-trigger``. Left ``None``
+    they are omitted from the body (the row persists null, the agent's own
+    defaults).
 
     :returns: The created task id.
     """
@@ -202,19 +204,6 @@ def claude_ready_host(
 def _row_by_name(page: Page, name: str):
     """The scheduled-task row whose title matches ``name``."""
     return page.locator('[data-testid="scheduled-task-row"]').filter(has_text=name)
-
-
-def _pick_minute(page: Page, minute: int) -> None:
-    """Pick a minute and close the popover before the caller submits."""
-    popover_content = page.locator('[data-slot="popover-content"]').filter(
-        has=page.get_by_test_id("schedule-time-picker")
-    )
-    expect(popover_content).to_have_count(0)
-    page.get_by_test_id("schedule-time-picker-trigger").click()
-    expect(popover_content).to_have_attribute("data-state", "open")
-    page.get_by_test_id(f"schedule-minute-{minute:02d}").click()
-    page.keyboard.press("Escape")
-    expect(popover_content).to_have_count(0)
 
 
 def _open_automations_page(page: Page, base_url: str) -> None:
@@ -403,35 +392,33 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
 
     page.get_by_test_id("new-task-button").click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("task-name-input")).to_be_focused()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
     page.get_by_test_id("task-name-input").fill(typed_name)
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
-    agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
-        "new-chat-landing-agent-select"
-    )
-    expect(agent_trigger).to_contain_text("Claude Code", timeout=30_000)
+    agent_trigger = _agent_picker(page)
+    expect(agent_trigger).to_have_accessible_name(re.compile(r"^Claude Code\b"), timeout=30_000)
     agent_trigger.click()
     page.get_by_role("menuitem").filter(has_text="Claude Code").click()
+    page.get_by_test_id("task-schedule-trigger").click()
     expect(page.get_by_test_id("schedule-preset-trigger")).to_contain_text("Every day")
 
     time_input = page.get_by_test_id("schedule-time")
-    page.get_by_test_id("schedule-time-picker-trigger").click()
-    expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
-    page.get_by_test_id("schedule-time-picker-trigger").click()
-    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
     time_input.click()
-    expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
     expect(time_input).to_be_focused()
+    expect(page.get_by_test_id("schedule-time-picker-trigger")).to_have_count(0)
+    expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
     time_input.press("ControlOrMeta+A")
     time_input.press_sequentially("9:37")
     assert time_input.input_value() == "9:37"
+    time_input.blur()
+    expect(time_input).to_have_value("09:37 AM")
     page.keyboard.press("Escape")
     expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
-    page.get_by_test_id("task-name-input").click()
-    expect(time_input).to_have_value("09:37 AM")
-    # Pick a minute the typed input did NOT already produce, so this proves the
-    # picker applied the click rather than re-reading the value typing had set.
-    _pick_minute(page, 45)
+    time_input.fill("9:45 AM")
+    time_input.blur()
     expect(time_input).to_have_value("09:45 AM")
+    _close_schedule_popover(page)
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     created_row = _row_by_name(page, typed_name)
@@ -451,6 +438,7 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     edit_row.hover()
     edit_row.get_by_test_id("task-row-menu").click()
     page.get_by_test_id("task-edit").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
 
     dialog = page.get_by_test_id("create-scheduled-task-dialog")
     submit = page.get_by_test_id("create-scheduled-task-submit")
@@ -463,6 +451,7 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     assert submit_box is not None
     assert submit_box["y"] + submit_box["height"] <= dialog_box["y"] + dialog_box["height"] + 1
 
+    page.get_by_test_id("task-schedule-trigger").click()
     expect(time_input).to_have_value("09:00 AM")
     time_input.click()
     expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
@@ -470,10 +459,11 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     time_input.press("ControlOrMeta+A")
     time_input.press_sequentially("10:37")
     assert time_input.input_value() == "10:37"
-    page.keyboard.press("Escape")
-    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
-    page.get_by_test_id("task-name-input").click()
+    expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
+    time_input.blur()
     expect(time_input).to_have_value("10:37 AM")
+    page.keyboard.press("Escape")
+    _close_schedule_popover(page)
     submit.click()
 
     expect(edit_row.get_by_test_id("task-schedule-line")).to_contain_text(
@@ -482,9 +472,11 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     )
 
 
+@pytest.mark.parametrize("native_ios", [False, True], ids=["browser", "ios-safe-area"])
 def test_scheduled_task_row_run_controls(
     page: Page,
     live_server: str,
+    native_ios: bool,
 ) -> None:
     """Run controls: relative next-run label, and Run now → a run is recorded.
 
@@ -493,11 +485,38 @@ def test_scheduled_task_row_run_controls(
     POST /v1/scheduled-tasks/{id}/run path (the ⋯-menu action) end-to-end and
     confirms the run row is written, without ever dispatching an agent turn. The
     completion pill was removed from the row UI, so completion is asserted via the
-    server-side run record rather than a visible badge.
+    server-side run record rather than a visible badge. The iOS case also keeps
+    the confirmation toast below the status-bar safe area.
     """
+    if native_ios:
+        page.set_viewport_size({"width": 420, "height": 912})
+        page.add_init_script("""
+            window.omnigentNative = {
+              kind: "ios",
+              setBadgeCount: function () {},
+              notify: function () { return Promise.resolve(false); },
+              onNotificationActivated: function () { return function () {}; },
+              onNativeInsets: function () { return function () {}; },
+              onSidebarDrag: function () { return function () {}; },
+              onViewModeChanged: function () { return function () {}; },
+              setViewMode: function () {},
+              setServerSwitcherHidden: function () {},
+              setSidebarOpen: function () {},
+            };
+        """)
+        cdp = page.context.new_cdp_session(page)
+        cdp.send(
+            "Emulation.setSafeAreaInsetsOverride",
+            {"insets": {"top": 59, "left": 0, "bottom": 34, "right": 0}},
+        )
+
     agent_id = _builtin_agent_id(live_server, "hello_world")
+    scheduled_time = datetime.now(UTC) + timedelta(hours=2)
     task_id = _create_task(
-        live_server, agent_id, "Run-now target", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
+        live_server,
+        agent_id,
+        "Run-now target",
+        f"FREQ=DAILY;BYHOUR={scheduled_time.hour};BYMINUTE={scheduled_time.minute}",
     )
 
     _open_automations_page(page, live_server)
@@ -516,6 +535,27 @@ def test_scheduled_task_row_run_controls(
     row.hover()
     row.get_by_test_id("task-row-menu").click()
     page.get_by_test_id("task-run-now").click()
+
+    toast = page.get_by_test_id("toast")
+    expect(toast).to_contain_text("Run triggered, it will start shortly")
+    if native_ios:
+        expect(toast).to_have_attribute("data-mounted", "true")
+        minimum_toast_top = 59 + 16 - 1
+        page.wait_for_function(
+            """expectedTop => {
+              const toast = document.querySelector('[data-testid="toast"]');
+              return toast !== null && toast.getBoundingClientRect().top >= expectedTop;
+            }""",
+            arg=minimum_toast_top,
+            timeout=5_000,
+        )
+        toast_box = toast.bounding_box()
+        assert toast_box is not None
+        assert toast_box["y"] >= minimum_toast_top, (
+            f"toast starts at y={toast_box['y']:.0f}, inside the 59px status-bar "
+            "safe area or without its normal 16px gap"
+        )
+        assert toast_box["y"] + toast_box["height"] <= 912
 
     # The manual fire runs through the shared fire path and records a run row.
     # With no online host it resolves to a ``failed`` run. Poll the history until
@@ -546,35 +586,59 @@ def test_scheduled_task_row_run_controls(
 # only the create/edit dialog, REST, and the rendered row — no agent turn fires.
 
 
+def _agent_picker(page: Page) -> Locator:
+    """The automation dialog's agent picker trigger, named "<agent>, Model …, Effort …"."""
+    return page.get_by_test_id("task-agent-picker").get_by_test_id("new-chat-landing-agent-select")
+
+
+def _open_agent_config(page: Page, agent_id: str) -> None:
+    """Open the picker's Models / Effort flyout through the selected agent's Edit link."""
+    _agent_picker(page).click()
+    page.get_by_test_id(f"new-chat-landing-agent-config-{agent_id}").click()
+    expect(page.get_by_test_id("task-agent-models")).to_be_visible()
+
+
+def _close_schedule_popover(page: Page) -> None:
+    """Dismiss the schedule popover once its nested pickers have unmounted.
+
+    Escape closes only the topmost layer, so a nested menu still animating out
+    would otherwise absorb it.
+    """
+    expect(page.get_by_role("listbox")).to_have_count(0)
+    expect(page.get_by_role("menu")).to_have_count(0)
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("schedule-fields")).to_have_count(0)
+
+
 def _open_create_dialog(page: Page) -> None:
     """Open the New-automation dialog and confirm Claude Code is the pick.
 
     The picker auto-selects the first agent (Claude Code, sortRank 10) on open,
-    so the model/effort row's capability gate is satisfied without any explicit
-    selection — this just asserts that default holds before a test reads the
-    row. Mirrors the setup in ``test_scheduled_task_create_edit_modal_and_time_picker``.
+    so its model/effort settings are available without any explicit selection —
+    this just asserts that default holds before a test reads them. Mirrors the
+    setup in ``test_scheduled_task_create_edit_modal_and_time_picker``.
 
     :param page: Playwright page already navigated to ``/tasks``.
     """
     page.get_by_test_id("new-task-button").click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
-    agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
-        "new-chat-landing-agent-select"
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
+    expect(_agent_picker(page)).to_have_accessible_name(
+        re.compile(r"^Claude Code\b"), timeout=30_000
     )
-    expect(agent_trigger).to_contain_text("Claude Code", timeout=30_000)
 
 
 def _pick_select_option(page: Page, trigger_test_id: str, option_label: str) -> None:
     """Open a Radix ``Select`` by its trigger test-id and click an option.
 
-    The model/effort Selects portal their listbox OUTSIDE the dialog, but the
-    dialog's dismiss guard (``handleSelectOpenChange``) keeps it open across the
-    open/pick, so this never closes the modal. Radix items expose
-    ``role="option"``; ``exact`` avoids "Sonnet 4.6" matching "Sonnet 5".
+    Selects portal their listbox OUTSIDE the dialog, but the dialog's dismiss
+    guard (``handleSelectOpenChange``) keeps it open across the open/pick, so
+    this never closes the modal. Radix items expose ``role="option"``; ``exact``
+    keeps a short label from matching a longer one.
 
     :param page: Playwright page with the create/edit dialog open.
-    :param trigger_test_id: ``"task-model-trigger"`` or ``"task-effort-trigger"``.
-    :param option_label: The exact rendered option label, e.g. ``"Opus"``.
+    :param trigger_test_id: E.g. ``"task-permission-trigger"``.
+    :param option_label: The exact rendered option label, e.g. ``"Accept edits"``.
     """
     page.get_by_test_id(trigger_test_id).click()
     page.get_by_role("option", name=option_label, exact=True).click()
@@ -582,52 +646,46 @@ def _pick_select_option(page: Page, trigger_test_id: str, option_label: str) -> 
 
 @pytest.mark.usefixtures("automations_v2_host")
 def test_scheduled_task_custom_schedule_round_trip(page: Page, automations_v2_server: str) -> None:
-    """Nested schedule pickers stay open and persist the visual recurrence and timezone."""
+    """Inline custom rows preserve recurrence, timezone and ending limits across edits."""
     name = f"Custom schedule {uuid.uuid4().hex[:8]}"
     _open_automations_page(page, automations_v2_server)
     _open_create_dialog(page)
     page.get_by_test_id("task-name-input").fill(name)
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
-    _pick_select_option(page, "schedule-preset-trigger", "Custom schedule")
+    page.get_by_test_id("task-schedule-trigger").click()
+    page.get_by_test_id("schedule-preset-option-custom").click()
+    expect(page.get_by_role("button", name="Apply", exact=True)).to_have_count(0)
     page.get_by_label("Repeat every", exact=True).fill("2")
-    page.get_by_test_id("schedule-time").click()
-    page.get_by_test_id("schedule-hour-10").click()
-    page.get_by_test_id("schedule-time").click()
-    page.keyboard.press("Escape")
-    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
-    expect(page.get_by_label("Repeat every", exact=True)).to_be_visible()
-    expect(page.get_by_label("Repeat every", exact=True)).to_have_value("2")
-    expect(page.get_by_test_id("schedule-time")).to_have_value("10:00 AM")
-    page.keyboard.press("Escape")
-    expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
-    expect(page.get_by_label("Frequency", exact=True)).to_have_text("Every day")
-    _pick_select_option(page, "schedule-preset-trigger", "Custom schedule")
-    page.get_by_label("Repeat every", exact=True).fill("2")
-    _pick_select_option(page, "custom-freq-trigger", "Months")
+    _pick_select_option(page, "custom-freq-trigger", "Monthly")
     page.get_by_test_id("custom-freq-trigger").click()
     expect(page.get_by_role("listbox")).to_be_visible()
     page.keyboard.press("Escape")
     expect(page.get_by_role("listbox")).to_have_count(0)
-    expect(
-        page.locator('[data-slot="popover-content"]').filter(
-            has=page.get_by_label("Repeat every", exact=True)
-        )
-    ).to_have_attribute("data-state", "open")
+    expect(page.get_by_label("Repeat every", exact=True)).to_have_value("2")
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
+    page.get_by_role("button", name="Days of the month", exact=True).click()
     days = page.get_by_role("group", name="Days of the month")
     days.get_by_role("button", name="15", exact=True).click()
-    page.get_by_test_id("schedule-time").fill("23:37")
     page.keyboard.press("Escape")
+    expect(days).to_have_count(0)
+    expect(page.get_by_role("button", name="Days of the month", exact=True)).to_have_text("1, 15")
+    page.get_by_test_id("schedule-time").fill("23:37")
     expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
-    page.get_by_role("button", name="Apply", exact=True).click()
-    expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
 
     page.get_by_test_id("task-timezone-trigger").click()
+    zones = page.get_by_role("menu")
+    zones.hover()
+    page.mouse.wheel(0, 400)
+    page.wait_for_function("document.querySelector('[role=menu]').scrollTop > 0")
     page.get_by_placeholder("Search timezones…").fill("Singapore")
-    page.get_by_role("option", name="Asia/Singapore", exact=True).click()
+    page.get_by_role("menuitemradio", name="Asia/Singapore", exact=True).click()
     expect(page.get_by_test_id("task-timezone-trigger")).to_contain_text("Asia/Singapore")
-    page.get_by_role("combobox", name="Schedule ends", exact=True).click()
-    page.get_by_role("option", name="After", exact=True).click()
+    _close_schedule_popover(page)
+    page.get_by_test_id("task-ending-trigger").click()
+    page.get_by_role("menuitemradio", name="After", exact=True).click()
     page.get_by_label("Occurrences", exact=True).fill("4")
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("menu")).to_have_count(0)
     page.get_by_test_id("create-scheduled-task-submit").click()
     row = _row_by_name(page, name)
     expect(row).to_be_visible(timeout=30_000)
@@ -640,24 +698,34 @@ def test_scheduled_task_custom_schedule_round_trip(page: Page, automations_v2_se
     row.hover()
     row.get_by_test_id("task-row-menu").click()
     page.get_by_test_id("task-edit").click()
-    page.get_by_test_id("custom-schedule-trigger").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
+    page.get_by_test_id("task-schedule-trigger").click()
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_text("Custom schedule")
     expect(page.get_by_label("Repeat every", exact=True)).to_have_value("2")
-    expect(page.get_by_test_id("custom-freq-trigger")).to_have_text("Months")
+    expect(page.get_by_test_id("custom-freq-trigger")).to_have_text("Monthly")
     expect(page.get_by_test_id("schedule-time")).to_have_value("11:37 PM")
+    page.get_by_role("button", name="Days of the month", exact=True).click()
     expect(days.get_by_role("button", name="15", exact=True)).to_have_attribute(
         "aria-pressed", "true"
     )
-    page.get_by_label("Repeat every", exact=True).fill("3")
     page.keyboard.press("Escape")
-    expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
-    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible()
-    page.get_by_test_id("custom-schedule-trigger").click()
+    expect(days).to_have_count(0)
+    page.get_by_label("Repeat every", exact=True).fill("3")
+    _close_schedule_popover(page)
+    page.get_by_role("button", name="Cancel", exact=True).click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_have_count(0)
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
+    page.get_by_test_id("task-schedule-trigger").click()
     expect(page.get_by_label("Repeat every", exact=True)).to_have_value("2")
-    page.get_by_role("button", name="Apply", exact=True).click()
-    page.get_by_role("combobox", name="Schedule ends", exact=True).click()
-    page.get_by_role("option", name="On date", exact=True).click()
+    _close_schedule_popover(page)
+    page.get_by_test_id("task-ending-trigger").click()
+    page.get_by_role("menuitemradio", name="On date", exact=True).click()
     end_date = f"{datetime.now(UTC).year + 2}-06-10"
     page.get_by_label("End date", exact=True).fill(end_date)
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("menu")).to_have_count(0)
     page.get_by_test_id("create-scheduled-task-submit").click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()
     response = httpx.get(f"{automations_v2_server}/v1/scheduled-tasks/{task['id']}", timeout=10.0)
@@ -673,20 +741,19 @@ def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
     page: Page,
     live_server: str,
 ) -> None:
-    """Claude Code offers model, effort, and permission settings with no overrides."""
+    """Claude Code offers model, effort, and permission settings; a new task starts on Auto."""
     _open_automations_page(page, live_server)
     _open_create_dialog(page)
 
-    expect(page.get_by_test_id("task-model-effort-row")).to_be_visible(timeout=30_000)
-    model_trigger = page.get_by_test_id("task-model-trigger")
-    effort_trigger = page.get_by_test_id("task-effort-trigger")
-    permission_trigger = page.get_by_test_id("task-permission-trigger")
-    expect(model_trigger).to_be_visible()
-    expect(effort_trigger).to_be_visible()
-    expect(permission_trigger).to_be_visible()
-    expect(model_trigger).to_have_text("Default")
-    expect(effort_trigger).to_have_text("Default")
-    expect(permission_trigger).to_have_text("Default")
+    expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Auto")
+    _open_agent_config(page, _builtin_agent_id(live_server, "claude-native-ui"))
+    expect(page.get_by_test_id("task-agent-efforts")).to_be_visible()
+    expect(page.get_by_test_id("task-agent-model-default")).to_have_attribute(
+        "aria-checked", "true"
+    )
+    expect(page.get_by_test_id("task-agent-effort-default")).to_have_attribute(
+        "aria-checked", "true"
+    )
 
 
 @pytest.mark.parametrize(
@@ -710,20 +777,20 @@ def test_scheduled_task_settings_follow_harness_capabilities(
     row.hover()
     row.get_by_test_id("task-row-menu").click()
     page.get_by_test_id("task-edit").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
 
     dialog = page.get_by_test_id("create-scheduled-task-dialog")
     expect(dialog).to_be_visible(timeout=30_000)
+    agent_trigger = _agent_picker(page)
+    permission_trigger = page.get_by_test_id("task-permission-trigger")
     if has_settings:
-        expect(page.get_by_test_id("task-model-effort-row")).to_be_visible()
-        expect(page.get_by_test_id("task-permission-control")).to_be_visible()
-        expect(page.get_by_test_id("task-model-trigger")).to_have_text("Default")
-        expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Default")
+        # With no pinned host/catalog, Codex cannot advertise model-specific efforts.
+        expect(agent_trigger).to_have_accessible_name("Codex, Model Default", timeout=30_000)
+        expect(permission_trigger).to_have_text("Default permissions")
     else:
-        expect(page.get_by_test_id("task-model-effort-row")).to_be_hidden()
-        expect(page.get_by_test_id("task-permission-control")).to_be_hidden()
-        expect(dialog.get_by_text("Uses this agent")).to_be_visible()
-    # With no pinned host/catalog, Codex cannot advertise model-specific efforts.
-    expect(page.get_by_test_id("task-effort-control")).to_be_hidden()
+        expect(agent_trigger).to_be_enabled(timeout=30_000)
+        expect(agent_trigger).not_to_have_accessible_name(re.compile(r"\bModel\b"))
+        expect(permission_trigger).to_have_count(0)
 
 
 def test_scheduled_task_create_persists_model_and_effort(
@@ -743,14 +810,18 @@ def test_scheduled_task_create_persists_model_and_effort(
     options = response.json()["models"]
     assert options, "The configured mock host must expose a model"
     selected_model = options[0]
-    model_label = selected_model.get("displayName") or selected_model["id"]
 
     page.get_by_test_id("task-name-input").fill("Model effort create")
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
-    _pick_select_option(page, "task-model-trigger", model_label)
-    _pick_select_option(page, "task-effort-trigger", "High")
-    expect(page.get_by_test_id("task-model-trigger")).to_have_text(model_label)
-    expect(page.get_by_test_id("task-effort-trigger")).to_have_text("High")
+    _open_agent_config(page, _builtin_agent_id(live_server, "claude-native-ui"))
+    model_choice = page.get_by_test_id(f"task-agent-model-{selected_model['id']}")
+    effort_choice = page.get_by_test_id("task-agent-effort-high")
+    model_choice.click()
+    effort_choice.click()
+    expect(model_choice).to_have_attribute("aria-checked", "true")
+    expect(effort_choice).to_have_attribute("aria-checked", "true")
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("menu")).to_have_count(0)
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     expect(_row_by_name(page, "Model effort create")).to_be_visible(timeout=30_000)
@@ -791,13 +862,12 @@ def test_scheduled_task_edit_prefills_model_and_effort(
     page: Page,
     live_server: str,
 ) -> None:
-    """The edit dialog prefills the Model/Effort controls from the loaded task.
+    """The edit dialog prefills the Model/Effort settings from the loaded task.
 
     Seeds a Claude Code task carrying ``model_override="opus"`` +
-    ``reasoning_effort="high"``, opens its Edit dialog, and asserts the
-    ``task-model-trigger`` / ``task-effort-trigger`` render the stored picks
-    ("Opus" / "High"), not the "Default" sentinel — the round-trip the create
-    test's persistence feeds into.
+    ``reasoning_effort="high"``, opens its Edit dialog, and asserts the agent
+    picker names the stored picks ("Opus" / "High"), not the "Default"
+    sentinel — the round-trip the create test's persistence feeds into.
     """
     claude_agent_id = _builtin_agent_id(live_server, "claude-native-ui")
     _create_task(
@@ -815,12 +885,13 @@ def test_scheduled_task_edit_prefills_model_and_effort(
     row.hover()
     row.get_by_test_id("task-row-menu").click()
     page.get_by_test_id("task-edit").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
 
     dialog = page.get_by_test_id("create-scheduled-task-dialog")
     expect(dialog).to_be_visible(timeout=30_000)
-    expect(page.get_by_test_id("task-model-effort-row")).to_be_visible()
-    expect(page.get_by_test_id("task-model-trigger")).to_have_text("Opus")
-    expect(page.get_by_test_id("task-effort-trigger")).to_have_text("High")
+    expect(_agent_picker(page)).to_have_accessible_name(
+        "Claude Code, Model Opus, Effort High", timeout=30_000
+    )
 
 
 def test_scheduled_task_edit_switches_the_harness(
@@ -851,19 +922,18 @@ def test_scheduled_task_edit_switches_the_harness(
     row.hover()
     row.get_by_test_id("task-row-menu").click()
     page.get_by_test_id("task-edit").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
 
     dialog = page.get_by_test_id("create-scheduled-task-dialog")
     expect(dialog).to_be_visible(timeout=30_000)
-    agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
-        "new-chat-landing-agent-select"
-    )
+    agent_trigger = _agent_picker(page)
     # Seeded from the task's own agent, not the first listed one.
-    expect(agent_trigger).to_contain_text("Codex", timeout=30_000)
+    expect(agent_trigger).to_have_accessible_name(re.compile(r"^Codex\b"), timeout=30_000)
     agent_trigger.click()
     expect(agent_trigger).to_have_attribute("aria-expanded", "true")
     expect(page.get_by_role("menuitem", name="Codex", exact=True)).to_be_focused()
     page.get_by_role("menuitem").filter(has_text="Claude Code").click()
-    expect(agent_trigger).to_contain_text("Claude Code")
+    expect(agent_trigger).to_have_accessible_name(re.compile(r"^Claude Code\b"))
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     expect(dialog).to_be_hidden(timeout=30_000)
@@ -873,15 +943,9 @@ def test_scheduled_task_edit_switches_the_harness(
 
 
 # ── Permission-mode selector ───────────────────────────────────────────────
-#
-# The dialog renders a Permission-mode select alongside Model/Effort, gated on
-# the same ``permissionMode`` capability (Claude Code). Because an automation
-# fires a fresh session each run, the whole launch vocabulary is offered —
-# including the launch-only ``dontAsk`` / ``bypassPermissions``. Left on
-# "Default" the field is omitted (agent default); a concrete pick persists
-# ``permission_mode``, which the fire path turns into the runner's
-# ``--permission-mode`` launch arg. Like the sibling tests these are LLM-free:
-# they exercise only the dialog, REST, and the rendered row.
+# Claude Code's picker offers every launch mode, including ``dontAsk`` and
+# ``bypassPermissions``; "Default" omits ``permission_mode``. LLM-free: these
+# exercise only the dialog, REST, and the rendered row.
 
 
 @pytest.mark.usefixtures("online_host")
@@ -917,18 +981,18 @@ def test_scheduled_task_create_default_omits_permission_mode(
     page: Page,
     live_server: str,
 ) -> None:
-    """Leaving the Permission control on 'Default' persists a null mode.
+    """Picking 'Default' in the Permission control persists a null mode.
 
-    A create that never touches the permission control must omit the field so
-    the row inherits the agent's configured mode. Confirms the "Default"
-    sentinel maps to a null override, not the literal sentinel string.
+    A new automation starts on an auto-approve mode; choosing Default must omit
+    the field so the row inherits the agent's configured mode. Confirms the
+    "Default" sentinel maps to a null override, not the literal sentinel string.
     """
     _open_automations_page(page, live_server)
     _open_create_dialog(page)
 
     page.get_by_test_id("task-name-input").fill("Default permission")
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
-    # Permission control left on its default "Default" sentinel — no pick.
+    _pick_select_option(page, "task-permission-trigger", "Default")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     expect(_row_by_name(page, "Default permission")).to_be_visible(timeout=30_000)
@@ -963,10 +1027,10 @@ def test_scheduled_task_edit_prefills_permission_mode(
     row.hover()
     row.get_by_test_id("task-row-menu").click()
     page.get_by_test_id("task-edit").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
 
     dialog = page.get_by_test_id("create-scheduled-task-dialog")
     expect(dialog).to_be_visible(timeout=30_000)
-    expect(page.get_by_test_id("task-permission-control")).to_be_visible()
     expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Bypass permissions")
 
 
@@ -982,10 +1046,8 @@ def test_scheduled_task_create_persists_continuing_one_session(
     page.get_by_test_id("task-name-input").fill("Continue create")
     page.get_by_test_id("task-prompt-input").fill("Continue the log.")
     page.get_by_test_id("task-session-mode-trigger").click()
-    page.get_by_test_id("task-session-mode-continue").click()
-    expect(page.get_by_test_id("task-session-mode-trigger")).to_contain_text(
-        "Continue in the same session"
-    )
+    page.get_by_role("menuitemradio", name="Continue one session", exact=True).click()
+    expect(page.get_by_test_id("task-session-mode-trigger")).to_have_text("Continue one session")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     expect(_row_by_name(page, "Continue create")).to_be_visible(timeout=30_000)
@@ -994,15 +1056,22 @@ def test_scheduled_task_create_persists_continuing_one_session(
     assert (created["session_mode"], created["session_id"]) == ("continue", None), created
 
 
-@pytest.mark.usefixtures("online_host")
-@pytest.mark.parametrize("entry", ["preview", "templates"])
-def test_scheduled_task_trigger_template_creates_hourly_manager_task(
+@pytest.mark.usefixtures("automations_v2_host")
+@pytest.mark.parametrize(
+    "entry", ["preview", "templates", "new-automation", "new-automation-mobile"]
+)
+def test_scheduled_task_trigger_template_creates_polling_manager_task(
     page: Page,
-    live_server: str,
+    automations_v2_server: str,
     entry: str,
 ) -> None:
-    """Gallery and preview save a task and keep suggestions available afterward."""
+    """Create from the galleries or trigger selector and reopen both editors."""
+    live_server = automations_v2_server
     name = f"Jira trigger {uuid.uuid4().hex[:8]}"
+    scope = "ES, OPS" if entry == "templates" else "ES"
+    project_query = 'project in ("ES", "OPS")' if entry == "templates" else 'project = "ES"'
+    mobile = entry in {"preview", "new-automation-mobile"}
+    page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
     _open_automations_page(page, live_server)
     if entry == "templates":
         page.set_viewport_size({"width": 1280, "height": 650})
@@ -1021,9 +1090,11 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
         expect(templates_tab).to_have_css("outline-style", "none")
         page.keyboard.press("ArrowLeft")
         expect(yours_tab).to_be_focused()
+        expect(yours_tab).to_have_attribute("aria-selected", "true")
         expect(yours_tab).to_have_css("outline-style", "solid")
         page.keyboard.press("ArrowRight")
         expect(templates_tab).to_be_focused()
+        expect(templates_tab).to_have_attribute("aria-selected", "true")
         expect(templates_tab).to_have_css("outline-style", "solid")
         templates_tab.click()
         expect(templates_tab).to_have_css("outline-style", "none")
@@ -1041,27 +1112,181 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
         expect(page.get_by_role("tab", name="Templates", exact=True)).to_have_attribute(
             "aria-selected", "true"
         )
-    page.get_by_test_id("suggestion-trigger-jira").click()
+    if entry.startswith("new-automation"):
+        if mobile:
+            page.get_by_role("tab", name="Templates", exact=True).click()
+        page.get_by_test_id("new-task-button").click()
+        expect(page.get_by_label("Trigger type", exact=True)).to_have_text("Schedule")
+        expect(page.get_by_test_id("task-schedule-trigger")).to_be_visible()
+        page.get_by_test_id("task-prompt-input").fill("Triage the incoming item.")
+        _pick_select_option(page, "task-trigger-type", "Slack")
+        expect(page.get_by_test_id("task-trigger-instructions")).to_have_value(
+            "Triage the incoming item."
+        )
+        page.get_by_test_id("task-trigger-scope").fill("support")
+        _pick_select_option(page, "task-trigger-type", "Schedule")
+        expect(page.get_by_test_id("task-schedule-trigger")).to_be_visible()
+        _pick_select_option(page, "task-trigger-type", "Slack")
+        expect(page.get_by_test_id("task-trigger-scope")).to_have_value("support")
+        _pick_select_option(page, "task-trigger-type", "Jira")
+    else:
+        page.get_by_test_id("suggestion-trigger-jira").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
     expect(page.get_by_test_id("task-name-input")).to_have_value("Jira tickets")
-    expect(page.get_by_test_id("task-template-trigger")).to_have_count(0)
+    expect(page.get_by_label("Trigger type", exact=True)).to_have_text("Jira")
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
     page.get_by_test_id("task-name-input").fill(name)
-    page.get_by_test_id("task-trigger-scope").fill("ES")
+    expect(page.get_by_test_id("task-trigger-scope-operator")).to_have_text("equals")
+    if entry == "templates":
+        _pick_select_option(page, "task-trigger-scope-operator", "in")
+    page.get_by_test_id("task-trigger-scope").fill(scope)
     page.get_by_test_id("task-trigger-add-condition").click()
     page.get_by_test_id("task-trigger-condition-0-value").fill("omnigent")
+    page.get_by_role("tab", name="Instructions", exact=True).click()
     page.get_by_test_id("task-trigger-instructions").fill("Triage the ticket.")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     expect(page.get_by_test_id("create-scheduled-task-dialog")).not_to_be_visible()
-    if entry == "templates":
+    if entry in {"templates", "new-automation-mobile"}:
         page.get_by_role("tab", name="Your automations", exact=True).click()
     expect(_row_by_name(page, name)).to_be_visible(timeout=30_000)
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == name)
     assert created["session_mode"] == "continue", created
-    assert created["rrule"].startswith("FREQ=HOURLY"), created
+    projects = httpx.get(f"{live_server}/v1/projects", timeout=10).json()["data"]
+    automation_projects = [p for p in projects if p["name"] == "Omnigent Automation"]
+    assert len(automation_projects) == 1
+    assert created["project_id"] == automation_projects[0]["id"]
+    assert created["rrule"].startswith("FREQ=MINUTELY;INTERVAL=10"), created
+    expect(_row_by_name(page, name)).to_contain_text("Runs when new items match")
+    expect(_row_by_name(page, name).get_by_test_id("task-next-run")).to_have_count(0)
     # The prompt's details are covered by the dialog and renderer tests.
-    assert '(project = "ES" AND labels = "omnigent")' in created["prompt"], created
+    assert f'({project_query} AND labels = "omnigent")' in created["prompt"], created
     expect(page.get_by_role("region", name="Suggested Automations")).to_be_visible()
+    if entry.startswith("new-automation"):
+        return
+
+    row = _row_by_name(page, name)
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
+    # The edit dialog reopens the trigger form from the prompt's header.
+    instructions = page.get_by_test_id("task-trigger-instructions")
+    condition = page.get_by_test_id("task-trigger-condition-0-value")
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0)
+    expect(page.get_by_test_id("task-trigger-cadence")).to_have_count(0)
+    expect(page.get_by_test_id("task-trigger-scope")).to_have_value(scope)
+    expect(condition).to_have_value("omnigent")
+    expect(instructions).to_have_value("Triage the ticket.")
+    expect(page.get_by_role("button", name="System prompt", exact=True)).to_have_count(0)
+    expect(page.get_by_test_id("task-trigger-preview")).to_have_count(0)
+    page.get_by_role("tab", name="Instructions", exact=True).click()
+    instructions.fill("Investigate the ticket and propose a fix.")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    saved = httpx.get(f"{live_server}/v1/scheduled-tasks/{created['id']}", timeout=10).json()
+    assert saved["prompt"].startswith("<!-- omnigent-trigger v1 "), saved
+    assert "Investigate the ticket and propose a fix." in saved["prompt"], saved
+    assert "Triage the ticket." not in saved["prompt"], saved
+
+    row.get_by_test_id("task-row-open").click()
+    expect(page.get_by_test_id("task-detail-prompt")).to_have_text(
+        "Investigate the ticket and propose a fix."
+    )
+    expect(page.get_by_role("button", name="System prompt", exact=True)).to_have_count(0)
+    page.get_by_test_id("task-detail-edit").click()
+    expect(instructions).to_have_value("Investigate the ticket and propose a fix.")
+    condition.fill("triage")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    updated = httpx.get(f"{live_server}/v1/scheduled-tasks/{created['id']}", timeout=10).json()
+    assert 'labels = "triage"' in updated["prompt"], updated
+    assert 'labels = "omnigent"' not in updated["prompt"], updated
+    page.get_by_test_id("task-detail-edit").click()
+    expect(condition).to_have_value("triage")
+    page.get_by_role("button", name="Cancel", exact=True).click()
+    page.goto(f"{live_server}/tasks")
     page.get_by_test_id("suggestion-trigger-slack").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
     expect(page.get_by_test_id("task-name-input")).to_have_value("Slack messages")
+    expect(page.get_by_test_id("task-trigger-scope-operator")).to_have_text("equals")
+    expect(page.get_by_test_id("task-trigger-scope")).to_have_attribute(
+        "placeholder", "eng-support"
+    )
+    _pick_select_option(page, "task-trigger-scope-operator", "in")
+    expect(page.get_by_test_id("task-trigger-scope")).to_have_attribute(
+        "placeholder", "eng-support, bugs"
+    )
+    expect(page.locator("[role='listbox']")).to_have_count(0)
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_count(0)
+    expect(page.get_by_test_id("task-trigger-cadence")).to_have_count(0)
+    page.get_by_test_id("task-trigger-scope").fill("#support")
+    page.get_by_role("tab", name="Instructions", exact=True).click()
+    page.get_by_test_id("task-trigger-instructions").fill("Summarize new messages.")
+    # The rendered prompt is never shown or editable as text.
+    expect(page.get_by_test_id("task-trigger-preview")).to_have_count(0)
+    expect(page.get_by_test_id("task-trigger-edit-as-prompt")).to_have_count(0)
+    page.get_by_role("button", name="Cancel", exact=True).click()
+
+
+def test_ten_minute_host_schedule_round_trip(
+    page: Page, automations_v2_server: str, automations_v2_host: Host
+) -> None:
+    """Host tasks save and round-trip minute schedules in either session mode."""
+    name = f"Ten minute schedule {uuid.uuid4().hex[:8]}"
+    _open_automations_page(page, automations_v2_server)
+    _open_create_dialog(page)
+    page.get_by_test_id("task-name-input").fill(name)
+    page.get_by_test_id("task-prompt-input").fill("Check for updates.")
+    page.get_by_test_id("task-schedule-trigger").click()
+    page.get_by_test_id("schedule-preset-option-custom").click()
+    _pick_select_option(page, "custom-freq-trigger", "Minutely")
+    interval = page.get_by_label("Repeat every", exact=True)
+    expect(interval).to_have_value("10")
+    interval.fill("9")
+    expect(page.get_by_test_id("create-scheduled-task-submit")).to_be_disabled()
+    interval.fill("10")
+    expect(page.get_by_label("Repeat every", exact=True)).to_have_value("10")
+    _close_schedule_popover(page)
+    # Stop the pinned host before creation, so even a boundary cannot launch an agent.
+    terminate_process(automations_v2_host.proc)
+    assert automations_v2_host.proc.poll() is not None
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()
+    response = httpx.get(f"{automations_v2_server}/v1/scheduled-tasks", timeout=10.0)
+    response.raise_for_status()
+    task = next(task for task in response.json()["scheduled_tasks"] if task["name"] == name)
+    assert (task["rrule"], task["session_mode"]) == ("FREQ=MINUTELY;INTERVAL=10", "new")
+    assert task["host_id"] == automations_v2_host.host_id
+    assert task["session_id"] is None
+    # An offline-host occurrence is harmless; pause the task before editing.
+    httpx.patch(
+        f"{automations_v2_server}/v1/scheduled-tasks/{task['id']}",
+        json={"state": "paused"},
+        timeout=10,
+    ).raise_for_status()
+    row = _row_by_name(page, name)
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    page.get_by_role("button", name="Advanced settings (optional)", exact=True).click()
+    page.get_by_test_id("task-schedule-trigger").click()
+    expect(page.get_by_label("Repeat every", exact=True)).to_have_value("10")
+    _close_schedule_popover(page)
+    page.get_by_test_id("task-session-mode-trigger").click()
+    page.get_by_role("menuitemradio", name="Continue one session", exact=True).click()
+    page.get_by_test_id("task-schedule-trigger").click()
+    expect(page.get_by_label("Repeat every", exact=True)).to_have_value("10")
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_have_text("Interval")
+    schedule_fields = page.get_by_test_id("schedule-fields")
+    expect(schedule_fields.get_by_text("minutes", exact=True)).to_be_visible()
+    _close_schedule_popover(page)
+    expect(page.get_by_test_id("create-scheduled-task-submit")).to_be_enabled()
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()
+    updated = httpx.get(f"{automations_v2_server}/v1/scheduled-tasks/{task['id']}", timeout=10)
+    updated.raise_for_status()
+    assert (updated.json()["rrule"], updated.json()["session_mode"]) == (
+        "FREQ=MINUTELY;INTERVAL=10",
+        "continue",
+    )

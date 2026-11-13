@@ -25,9 +25,15 @@ class Feature(StrEnum):
 
     SANDBOX_PROFILES = "sandbox_profiles"
     SESSION_ORCHESTRATION = "session_orchestration"
+    SCRIPTED_SESSIONS = "scripted_sessions"
+    SIBLING_SESSIONS = "sibling_sessions"
+    PEER_SESSION_MESSAGING = "peer_session_messaging"
     CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
+    MCP_DISABLED_SERVERS = "mcp_disabled_servers"
+    MCP_DISABLED_SERVERS_CLAUDE = "mcp_disabled_servers_claude"
+    MCP_DISABLED_SERVERS_CODEX = "mcp_disabled_servers_codex"
     CANVAS = "canvas"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     IMPORT_REVIEW = "import_review"
@@ -38,6 +44,7 @@ class Feature(StrEnum):
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
+    SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
 
 
 @dataclass(frozen=True)
@@ -76,12 +83,38 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         default_enabled=True,
     ),
     FeatureDefinition(
+        feature=Feature.SCRIPTED_SESSIONS,
+        description="Explicit host placement and PR linking for scripted sessions",
+        owner="server",
+        review_by_release="0.24.0",
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.SIBLING_SESSIONS,
+        description="Create nested agents on shared or separate compute",
+        owner="server",
+        review_by_release="0.24.0",
+        default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.PEER_SESSION_MESSAGING,
+        description=(
+            "sys_session_message to non-child sessions; both the server and the runner "
+            "must leave it enabled"
+        ),
+        owner="server",
+        review_by_release="0.24.0",
+        frontend_visible=False,
+        default_enabled=True,
+    ),
+    FeatureDefinition(
         feature=Feature.AUTOMATIONS_V2,
         description=(
             "Automation improvements across scheduling, run management, execution targets and UI"
         ),
         owner="server",
         review_by_release="0.20.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,
@@ -108,6 +141,27 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.11.0",
     ),
     FeatureDefinition(
+        feature=Feature.MCP_DISABLED_SERVERS,
+        frontend_visible=False,
+        description="Per-harness MCP enablement in Omnigent sessions",
+        owner="server",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MCP_DISABLED_SERVERS_CLAUDE,
+        frontend_visible=False,
+        description="Claude MCP enablement at launch",
+        owner="server",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MCP_DISABLED_SERVERS_CODEX,
+        frontend_visible=False,
+        description="Codex MCP enablement at launch",
+        owner="server",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
         feature=Feature.CANVAS,
         description="Web Canvas page: sessions as draggable cards grouped by project",
         owner="web",
@@ -130,13 +184,16 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.CUSTOM_AGENTS_SETTINGS_UI,
         description="Manage reusable custom agents from Settings",
         owner="web",
-        review_by_release="0.18.0",
+        review_by_release="0.24.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.SIDEBAR_GROUPING_UI,
         description="Sidebar grouping, ordering and row metadata options, Shared section",
         owner="web",
-        review_by_release="0.19.0",
+        # On by default; remove the flag and its off path in 0.23.0.
+        review_by_release="0.23.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.CLAUDE_OSC_STATUS,
@@ -151,6 +208,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Search workspace file contents through the session runner",
         owner="web",
         review_by_release="0.20.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SIDEBAR_WINDOWED_ROWS,
+        description="Mount only the sidebar session rows near the viewport",
+        owner="web",
+        review_by_release="0.24.0",
     ),
 )
 
@@ -181,6 +244,7 @@ class FeatureFlags:
 # A deployment's per-request gate: a static bool, or a callable read on each request.
 DeploymentGate = bool | Callable[[], bool]
 HarnessInstallGate = DeploymentGate
+McpDisabledServersGate = DeploymentGate
 
 
 def deployment_gate_enabled(gate: DeploymentGate, name: str) -> bool:
@@ -195,6 +259,30 @@ def deployment_gate_enabled(gate: DeploymentGate, name: str) -> bool:
 def harness_install_enabled(gate: HarnessInstallGate) -> bool:
     """Resolve the harness-install gate for the current request."""
     return deployment_gate_enabled(gate, "harness_install")
+
+
+def mcp_disabled_servers_enabled(gate: McpDisabledServersGate) -> bool:
+    """Resolve the MCP deployment gate for the current request, failing closed."""
+    return deployment_gate_enabled(gate, "mcp_disabled_servers")
+
+
+MCP_DISABLED_SERVERS_HARNESS_FEATURES = {
+    "claude": Feature.MCP_DISABLED_SERVERS_CLAUDE,
+    "codex": Feature.MCP_DISABLED_SERVERS_CODEX,
+}
+
+
+def active_harnesses(master: McpDisabledServersGate, features: FeatureFlags) -> list[str]:
+    """Harnesses with complete launch hooks and both release gates enabled."""
+    from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS
+
+    if not mcp_disabled_servers_enabled(master):
+        return []
+    return [
+        harness
+        for harness in HARNESS_EXECUTORS
+        if features.enabled(MCP_DISABLED_SERVERS_HARNESS_FEATURES[harness])
+    ]
 
 
 def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFlags:

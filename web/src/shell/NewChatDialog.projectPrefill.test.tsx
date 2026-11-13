@@ -22,7 +22,10 @@ import {
   useProjects,
 } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => useTestConversations(),
+  useOptionalLoadedConversations: () => useTestConversations().data,
+}));
 
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
@@ -72,8 +75,10 @@ const REPO = "/Users/corey/projects/alpha";
 // Mutable so a test can simulate clicking another project's pencil (the
 // screen stays mounted; only the param changes).
 let searchParams = new URLSearchParams("project=Alpha");
+const replaceSearchParamsMock = vi.fn();
 vi.mock("@/lib/routing", () => ({
   useLocation: () => ({ hash: "", state: null }),
+  useReplaceSearchParams: () => replaceSearchParamsMock,
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));
@@ -542,9 +547,8 @@ describe("NewChatLandingScreen project prefill", () => {
 
     fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
     fireEvent.click(screen.getByRole("button", { name: RECENT_WORKSPACE }));
-    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
-      "title",
-      RECENT_WORKSPACE,
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+      `Working directory: ${RECENT_WORKSPACE}`,
     );
     await waitFor(() =>
       expect(screen.queryByTestId("new-chat-landing-branch-chip")).not.toBeInTheDocument(),
@@ -661,17 +665,15 @@ describe("NewChatLandingScreen project prefill", () => {
     rerender(<NewChatLandingScreen />);
 
     // The sticky host pick re-selects the sandbox, but Alpha's staged repo
-    // is gone.
+    // is gone. The profile picked in Alpha is the last picked, so Beta starts on it.
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("Repository"),
     );
-    const picker = screen.getByRole("button", { name: "Sandbox profile: Choose profile" });
+    expect(
+      await screen.findByRole("button", { name: "Sandbox profile: Large workspace" }),
+    ).toBeVisible();
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
-    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
-    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-    expect(authenticatedFetch).not.toHaveBeenCalled();
-    fireEvent.click(picker);
-    fireEvent.click(screen.getByRole("option", { name: "Large workspace" }));
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
     const body = await submitAndReadBody();
     expect(body.host_type).toBe("managed");
     // No repos carried over → an empty workspaces list; workspace stays pinned
@@ -791,10 +793,12 @@ describe("NewChatLandingScreen project prefill", () => {
 
     const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
     const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
-    await waitFor(() => expect(workspaceTrigger).toHaveAttribute("title", LINKED_WORKTREE));
+    await waitFor(() =>
+      expect(workspaceTrigger).toHaveAccessibleName(`Working directory: ${LINKED_WORKTREE}`),
+    );
     expect(workspaceTrigger).toHaveTextContent("gamma");
     expect(worktreeTrigger).toHaveTextContent("feature-x");
-    expect(worktreeTrigger).toHaveAttribute("title", "Existing worktree branch: feature/x");
+    expect(worktreeTrigger).toHaveAccessibleName("Existing worktree branch: feature/x");
     const body = await submitAndReadBody();
     // Bound straight to the worktree dir; the worktree's branch rides along and
     // no base branch is set (it's a bind, not a fork).

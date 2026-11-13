@@ -102,6 +102,7 @@ from omnigent.inner.executor import Executor
 from omnigent.inner.model_egress import UCODE_SIGNER_BINDING_ID, registered_model_provider_binding
 from omnigent.inner.model_signer import SignerLaunchConfig
 from omnigent.inner.os_env_serialization import decode_sandbox_spec
+from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.spec.types import RetryPolicy
 
@@ -112,6 +113,7 @@ _logger = logging.getLogger(__name__)
 # so misconfigurations surface as a single grep target.
 _ENV_MODEL = "HARNESS_CODEX_MODEL"
 _ENV_GATEWAY = "HARNESS_CODEX_GATEWAY"
+_ENV_BROKERED_GATEWAY = "HARNESS_CODEX_BROKERED_GATEWAY"
 _ENV_DATABRICKS_PROFILE = "HARNESS_CODEX_DATABRICKS_PROFILE"
 _ENV_MODEL_PROVIDER = "HARNESS_CODEX_MODEL_PROVIDER"
 _ENV_GATEWAY_HOST = "HARNESS_CODEX_GATEWAY_HOST"
@@ -394,11 +396,13 @@ def _build_codex_executor() -> Executor:
     signer_launch_config = _resolve_signer_launch_config()
     route = _codex_route(os.environ)
     return CodexExecutor(
+        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
         codex_path=resolve_harness_path("codex"),
         gateway=route.gateway,
+        brokered_gateway=_parse_truthy(_ENV_BROKERED_GATEWAY, default=False),
         databricks_profile=None
         if signer_launch_config is not None
         else os.environ.get(_ENV_DATABRICKS_PROFILE),

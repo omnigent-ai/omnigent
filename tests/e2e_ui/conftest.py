@@ -58,10 +58,13 @@ import pytest
 from playwright.sync_api import APIResponse, Error, Locator, Page, Route, expect
 
 from tests._helpers.compat import (
+    COMPAT_SERVER_VERSION_ENV,
     apply_runner_env,
     apply_server_env,
     compat_runner_cwd,
     compat_server_cwd,
+    compat_server_python,
+    meets_min_server_version,
     runner_executable,
     server_executable,
 )
@@ -1108,6 +1111,14 @@ def live_server(
     # drop PYTHONPATH so the pinned old build in the compat venv resolves
     # instead of being shadowed by the worktree.
     apply_server_env(env, _REPO_ROOT)
+    # The shared server keeps per-task timers; dedicated v2 suites start their own.
+    # Pre-0.22 compatibility servers already default to the timers.
+    features = env.get("OMNIGENT_FEATURES", "")
+    compat_version = env.get(COMPAT_SERVER_VERSION_ENV) or "0"
+    if "automations_v2" not in features and (
+        compat_server_python() is None or meets_min_server_version(compat_version, "0.22.0")
+    ):
+        env["OMNIGENT_FEATURES"] = ",".join(filter(None, (features, "-automations_v2")))
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     server_argv = [
         server_executable(),
@@ -2802,6 +2813,7 @@ def _create_native_codex_session(
     *,
     model: str | None = None,
     labels: dict[str, str] | None = None,
+    terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Register the ``codex-native`` wrapper agent and bind its session.
 
@@ -2826,15 +2838,19 @@ def _create_native_codex_session(
     :param runner_id: The token-bound runner id to bind.
     :param model: Optional Codex model to pin in the wrapper spec.
     :param labels: Extra session labels set at create, before Codex launches.
+    :param terminal_launch_args: Codex launch flags, e.g. a permission preset's.
     :returns: The new session/conversation id.
     """
     # Keep workspace session-local; runner-wide cwd changes other file surfaces.
+    metadata: dict[str, object] = {"workspace": str(_REPO_ROOT), "labels": labels or {}}
+    if terminal_launch_args is not None:
+        metadata["terminal_launch_args"] = terminal_launch_args
     created = create_native_session(
         httpx,
         base_url,
         harness="codex",
         model=model,
-        metadata={"workspace": str(_REPO_ROOT), "labels": labels or {}},
+        metadata=metadata,
     )
     session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)

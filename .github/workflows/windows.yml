@@ -106,6 +106,7 @@ jobs:
         run: >-
           uv run pytest
           tests/inner/test_proc_and_platform.py
+          tests/inner/test_claude_sdk_windows_api_key_helper.py
           tests/runtime/test_process_manager.py
           -p no:cacheprovider -q
 

@@ -52,6 +52,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     WSOpenFrame,
     encode_frame,
 )
+from omnigent.server.runtime_compatibility import RuntimeSupportError
 
 if TYPE_CHECKING:
     from omnigent.runner.routing import RunnerRouter
@@ -75,6 +76,25 @@ class WrongReplicaWSError(RuntimeError):
     ``RuntimeError`` so existing ``except Exception`` fallbacks that close
     ``4500`` still catch it.
     """
+
+
+class RunnerUnavailableWSError(RuntimeError):
+    """Raised by the tunnel factory when the pinned runner's tunnel is not connected.
+
+    The session is bound to a runner whose tunnel is absent
+    (``RUNNER_UNAVAILABLE``), e.g. while it reconnects after a server or
+    runner restart. The terminal-attach route maps it to WS close code
+    ``1013`` so the client re-dials with backoff instead of dead-ending on
+    the generic ``4500``.
+    """
+
+
+class RunnerRuntimeSupportWSError(RuntimeError):
+    """Carry runtime admission failures to terminal clients with an actionable remedy."""
+
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # Match the runner-side WS attach path that
@@ -111,6 +131,8 @@ def make_direct_attach_resolver(
     live tunnel session) but only reads the hello advert; installed via
     :func:`omnigent.runtime.set_runner_direct_attach_resolver` so the
     terminals API can hand same-machine browsers a relay-free attach URL.
+
+    Async callers must offload this resolver: admission may load the agent bundle.
 
     :param router: Routes conversation ids to pinned runner ids.
     :param registry: Tunnel registry that owns the live runner sessions.
@@ -149,6 +171,8 @@ def make_tunnel_ws_factory(
     what :mod:`omnigent.server.routes.terminal_attach` already
     expects.
 
+    Async callers must offload this factory: admission may load the agent bundle.
+
     :param router: Routes conversation ids to pinned runner ids.
     :param registry: Tunnel registry that owns the live runner WS
         sessions.
@@ -165,12 +189,19 @@ def make_tunnel_ws_factory(
         except OmnigentError as exc:
             if exc.code == ErrorCode.WRONG_REPLICA:
                 raise WrongReplicaWSError(str(exc)) from exc
+            if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+                raise RunnerUnavailableWSError(str(exc)) from exc
+            if (
+                isinstance(exc, RuntimeSupportError)
+                or exc.code == ErrorCode.RUNNER_CAPABILITY_MISMATCH
+            ):
+                raise RunnerRuntimeSupportWSError(str(exc), exc.code) from exc
             raise RuntimeError(str(exc)) from exc
         if routed is None:
             raise RuntimeError(f"no runner pinned for conversation {conversation_id!r}")
         session = registry.get(routed.runner_id)
         if session is None:
-            raise RuntimeError(
+            raise RunnerUnavailableWSError(
                 f"runner {routed.runner_id!r} is offline for conversation {conversation_id!r}"
             )
         return _TunneledWSConn(

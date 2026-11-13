@@ -1,12 +1,17 @@
 # Workspace content search
 
 Users search the session workspace's file contents from the desktop Workspace
-panel, then open a matching file at its line. Filename search remains in Files.
+panel or the mobile session menu, then open a matching file at its line.
+Filename search remains in Files.
 
 ## Sub-features
 
 - `search`: submit a literal query with Enter or Search, optionally matching case
   or using a ripgrep regular expression; results show paths, lines and previews.
+- `whole-word`: check **Whole word** to skip matches inside longer words. The
+  panel sends it as a ripgrep regular expression on the same route; a search
+  whose expression would exceed the 4,096-character query limit shows an error
+  and disables Search.
 - `filter`: click **Filter files** (the funnel button between the query and
   Search) to show or hide **Include** and **Exclude** globs. The button is
   highlighted while filters are set, even when the fields are hidden.
@@ -22,10 +27,13 @@ panel, then open a matching file at its line. Filename search remains in Files.
 - Desktop web and desktop app: open a session's Workspace panel and select the
   **Content search** magnifying-glass tab.
 - Workspace panel picker: choose **Select panel → Content search**.
+- Mobile web and mobile apps: open the session's **Conversation actions** menu
+  and choose **Content search**; it opens as a full-screen drawer.
 - Keyboard: **Cmd+Shift+F** on macOS (**Ctrl+Shift+F** on Windows/Linux) opens
   the Workspace panel, selects **Content search**, and focuses its input. It
-  also works from the editor and terminal. The tab strip's arrows and numbered
-  shortcuts can select the tab too.
+  also works from the editor and terminal. The tab strip's arrows can select the
+  tab too, and so can its number: **Ctrl+1–9** on macOS (**Alt+1–9** on
+  Windows/Linux, except in a terminal) from anywhere in the app.
 
 ## Driving it with the repro environment
 
@@ -52,6 +60,9 @@ shortcut should be unavailable.
 - Browser navigation through the tab, picker and search shortcut:
   `tests/browser_ui/files/test_file_line_navigation.py::test_content_search_opens_line_and_preserves_results`.
   This uses a mocked API and proves line navigation and preserved search state.
+- Whole word patterns through real ripgrep:
+  `tests/runner/test_environment_filesystem.py::test_content_search_whole_word_patterns`
+  and `web/src/lib/contentSearch.test.ts` share `web/src/lib/__fixtures__/contentSearchWholeWord.json`.
 - Runner search and limits:
   `tests/runner/test_environment_filesystem.py::test_content_search_live_workspace`,
   `tests/runner/test_environment_filesystem.py::test_content_search_limits_errors_and_hidden_files`,
@@ -65,6 +76,11 @@ shortcut should be unavailable.
 ## Gotchas
 
 - **Find files by name** in Files searches paths; **Content search** searches text.
+- Whole word follows ripgrep's Unicode word characters. A literal that starts or
+  ends with punctuation matches as typed on that side (`C++` also finds `C++x`);
+  a regular expression always needs a word boundary at both ends. An expression
+  that closes a group it never opened (`foo)|(bar`) or turns on verbose mode
+  (`(?x)`) is refused with Whole word on.
 - Search state stays in memory per conversation until the page reloads. Returning
   to a conversation restores its last search; submit again to refresh the results.
 - Search covers the session workspace on disk, including hidden and untracked
@@ -80,5 +96,5 @@ shortcut should be unavailable.
   runners or missing ripgrep show an error. Search has no host-daemon fallback.
 - Workspace file-sharing permissions apply. A shared conversation alone does not
   grant access to its file contents.
-- This entry is in the desktop Workspace panel. Mobile file drawers do not
-  expose content search yet.
+- On mobile, tapping a result opens the file viewer; its back button returns
+  to the drawer with the preserved search.

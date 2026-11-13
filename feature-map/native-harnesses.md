@@ -23,12 +23,27 @@ implements them separately, so a fix for one harness does not reach the others.
   Settings > Appearance apply to the curated list too. A remembered pick the curation drops falls back to the
   configured default carrying that agent's own brain harness, never the
   rejected agent's, and a project's configured agent outside the curation is
-  reported unavailable until the user picks an offered one. Display only,
-  and New Chat only: the scheduled-task and project-settings pickers are untouched.
-- `agent-instructions`: Pi native delivers authored instructions at launch/resume;
-  authors can keep or replace Pi's base prompt and disable automatic context files.
+  reported unavailable until the user picks an offered one. Display only;
+  [automations](automation-templates.md) share this curation while preserving
+  saved selections on edit. Project-settings pickers are unchanged.
+- `agent-instructions`: supported native startup paths preserve authored instructions
+  and add shared guidance for showing workspace screenshots; Pi authors can keep
+  or replace its base prompt and disable automatic context files.
+- `pi-host-mcp`: managed Pi sessions (pi-native with an Omnigent provider, and the
+  Pi gateway executor) also get the MCP servers configured for Claude Code, Codex
+  and Cursor; the user's own `~/.pi/agent/mcp.json` entries win and it is not written.
+- `claude-managed-mcp-relay`: on a machine with Claude Code's enterprise
+  `managed-mcp.json`, Claude Code refuses `--mcp-config`, so Claude native
+  sessions (web-launched and `omnigent claude`) reach Omnigent's tools through
+  the file's `omnigent` relay entry (`docs/CLAUDE_MANAGED_MCP.md`). Without a
+  usable entry the session still launches, without Omnigent's tools, and the
+  launch logs a warning naming the missing entry. claude-sdk applies the same
+  check (see [Composer](./composer.md)).
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
-  an Omnigent session behind it.
+  an Omnigent session behind it. With `OMNIGENT_SESSION_ENV_PASSTHROUGH=NAME,...`
+  the named shell variables reach only the new runner that command launches; a
+  reused live runner keeps its launch values, and a later server-driven restart
+  starts without them.
 - `gateway-attribution`: Unity Gateway requests name the coding agent and the
   interface that created its session: desktop app, web UI, mobile, or CLI.
 - `gemini-gateways`: configure native Gemini URL/key or Databricks profile routing,
@@ -38,6 +53,14 @@ implements them separately, so a fix for one harness does not reach the others.
   host has not configured can be hidden from the picker. When harness repair is
   enabled, Settings → Harnesses shows the missing credential as an actionable
   card; its Reconfigure control and full-card click replace a separate banner action.
+- `cli-unresponsive`: a host CLI that resolves but does not answer its
+  `--version` check (for example, a wrapper waiting at a setup prompt) reads as
+  "did not respond", not outdated. New Chat keeps the harness selectable with a
+  notice and no **Set up** action, and launches and resumes still start the CLI,
+  so its own prompt shows in the terminal. Settings → Harnesses labels the card
+  **CLI did not respond**. With `harness_install` enabled on a non-sandbox host,
+  the card and its gear open the harness settings, whose warning offers no
+  Install, Update or Reconfigure action and marks the credential **Not checked**.
 - `new-chat-setup`: with `harness_install` enabled, New Chat’s **Set up**
   action opens the shared Reconfigure flow in place for native agents on
   connected user hosts when a fix is available. Missing binaries install before
@@ -76,6 +99,10 @@ implements them separately, so a fix for one harness does not reach the others.
   approval waits from the five-minute execution budget. A pending approval
   stays pending past five minutes; rejection or expiry does not run the tool.
   Cancellation or a disconnected caller releases that call's pending approval.
+- `questions`: Claude's questions show an answer form in chat. An answer
+  submitted during a brief Omnigent outage still reaches Claude. If the web
+  question can't be shown or its wait expires, Claude receives a request to
+  ask in chat text.
 - `devin-questions`: Devin's native question picker appears in Chat and Inbox;
   selected options and custom answers return to the running tool.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
@@ -97,14 +124,53 @@ implements them separately, so a fix for one harness does not reach the others.
   Settings terminal theme.
 - `working-status`: quiet work stays working; waiting for input is explained;
   completion, interruption and process exit settle the indicator. A following
-  turn and reconnect must not leave a stale idle or working state.
+  turn and reconnect must not leave a stale idle or working state. The sidebar
+  status follows these rules:
+  - Claude: the status Claude Code reports for itself (OSC 7501) decides
+    working, idle and waiting for input, with four exceptions. A background
+    shell still running after its turn keeps the session working until it
+    exits. A background agent still running after its turn reports `waiting`:
+    the sidebar keeps the session working, Chat says "Background agent running"
+    with the agent's description instead of "Working…", a follow-up is sent at
+    once rather than queued, and a headless `-p` run keeps waiting until the
+    agent finishes. A prompt that a turn waits on in Claude's terminal, with no
+    card in Chat, shows "Needs response" and its tooltip names the prompt. A
+    sign-in block after a failed turn shows the turn as failed, not working.
+  - Codex: an active goal keeps the session working between turns, and a
+    background terminal keeps it working after its turn until it exits. A goal
+    stopped by its usage or budget limit fails the session, and so does a
+    system error that Codex reports outside a turn; during a turn, the turn's
+    own outcome decides.
+  - Background work shows the working spinner with the tooltip "Working in the
+    background". The composer lists running Claude background shells and Codex
+    background terminals as "1 background task" with each one's command. Claude's
+    list changes when a turn ends; Codex's changes within a few seconds of a
+    terminal starting or stopping.
+  - Answering a prompt in Chat or the Inbox clears "Needs response" from the
+    row, its status group, the dock badge and the Inbox count at once. If the
+    answer fails to send, the prompt shows again. A session the sidebar had not
+    loaded yet, such as one in a collapsed project folder, updates with the
+    next session-list refresh instead.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
   including those sent while it works, stay in that thread, and closing it
   leaves the parent usable.
+- `codex-async-questions`: each Codex `request_user_input_async` question shows
+  a card in Chat and Inbox that leaves the composer usable, like the Codex TUI's
+  queued-question picker. A card closes when the question is answered from the
+  card or the TUI picker, when the user sends any other message, when Cancel is
+  pressed (Codex keeps working), or when the turn ends. A server whose
+  `/v1/info` lacks `codex_nonblocking_decline` shows no card, so answer in the
+  terminal.
 - `codex-plan-mode`: Codex starts in, or switches to, its own Plan mode from the
   composer's Plan row; see `plan-mode` in [composer.md](./composer.md).
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
+- `claude-rewind`: Claude Code native `/rewind` from the web composer (see
+  `slash-rewind` in [composer.md](./composer.md)) opens a new session whose own
+  Claude pane resumes a transcript rebuilt from the kept items. The original
+  session's pane is neither rewound nor stopped: it keeps the full
+  conversation, a message sent there resumes it, and otherwise it closes on
+  idle reap. Unlike a native `/clear`, the terminal does not move to the new session.
 - `idle-reap`: a finished native pane left alone past the idle window closes
   with its forwarder, helper server and tool relay; the next message brings it
   back with the conversation. Kimi is exempt; live work and open prompts stay.
@@ -134,9 +200,13 @@ implements them separately, so a fix for one harness does not reach the others.
   with connected/auth/timeout/unreachable/unsupported and mixed-version states.
 
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
-- `harness-settings-navigation`: Harnesses is always available in Settings and
-  through direct links. The import review modal's See more opens Harnesses and
-  dismisses the modal. Import sessions contains only session imports.
+- `harness-settings-navigation`: Harnesses is available in Settings and through
+  direct links. On a deployment that trims built-ins with
+  `OMNIGENT_SEEDED_AGENTS`, it lists only harnesses whose agent is kept or that
+  a pickable agent runs on; a direct link to another one shows the grid, and
+  Settings drops Harnesses when none is left. The import review modal's See
+  more opens Harnesses and dismisses the modal. Import sessions contains only
+  session imports.
 
 ## How to get to it (user POV)
 
@@ -148,11 +218,18 @@ view appear in the session.
 desktop app, browser, iOS/Android app, and CLI. The session keeps that creating
 interface across resumes; backend children inherit it, and a fork records the
 interface creating the fork. Gateway requests carry `Databricks-Custom-Coding-Agent`
-(`claude-code` or `codex`) and `Databricks-Custom-Client-Surfaces`: `omnigent`
-followed by `omnigent-desktop`, `omnigent-web`, `omnigent-mobile`, or `omnigent-cli`.
+(`claude-code` or `codex`) and `Databricks-Custom-Client-Surfaces`: `omnigent-desktop`,
+`omnigent-web`, `omnigent-mobile`, or `omnigent-cli`. Sessions with no known
+creating interface use `omnigent` as a fallback.
 Routes configured by ug retain the additional `ug` surface.
 
-**Agent instructions (Pi native):** launch an agent whose spec contains inline
+**Agent instructions:** supported native startup paths add Omnigent's guidance
+to embed existing workspace screenshots in replies using their real file paths.
+After upgrading, start a new session or restart/cold-resume an existing one to
+load this guidance. Reopening the Terminal view alone does not update a running
+process.
+
+For Pi native, launch an agent whose spec contains inline
 instructions or references a bundled instruction file. Reopen its terminal and
 check the same authored role is present once. For a custom Pi-native agent,
 `executor.context_files: false` excludes automatic workspace/global notes, and
@@ -160,12 +237,33 @@ check the same authored role is present once. For a custom Pi-native agent,
 instructions remain; these options do not restrict file access or extensions.
 The `omnigent pi` wrapper also appends its own startup instructions.
 
+**Managed MCP config (Claude):** on a disposable machine whose Claude Code
+reads an enterprise `managed-mcp.json` containing the documented `omnigent`
+entry, start a Claude Code session from New Chat and another with
+`omnigent claude`, then ask each to use an Omnigent tool. Remove the entry and
+start another session from each surface.
+
 **Working status:** watch the session's Chat indicator after sending from the
 new-session composer, an existing-session composer, or the agent terminal.
 Switch Terminal → Chat, close/reopen the viewer, and reload during quiet work.
 Repeat the Chat and header-menu Terminal paths at phone width. A locally
 launched `omnigent claude` session is a separate launch path; inspect its linked
 Chat session as well as the local terminal.
+
+**Sidebar status rules:** keep the sidebar in view. In a Claude session, ask
+for `sleep 60` in a background shell and let the turn end: the row keeps its
+spinner until the sleep exits. In a Codex session, set a goal with several
+steps, then have Codex start `python3 -m http.server 8765` in the background:
+the row stays working between turns and while the server runs, and goes idle
+once both end. While the server runs, the composer shows "1 background task"
+with its command, the same list Codex shows for `/ps` in its terminal.
+Answer an approval in Chat and another from the Inbox: "Needs response" clears
+at once. Block the answer request in the browser's developer tools and answer
+again: the prompt comes back. Claude's own terminal prompts also get a Chat
+card within about a second. A dialog the user opens during a turn, such as
+`/model`, leaves Claude reporting working, so after about 15 seconds the row
+shows "May need input" in Needs attention until the dialog closes. Claude
+reports done after the turn, so a dialog opened then leaves the row unchanged.
 
 **Pi Smart Routing:** enable Smart Routing for the session, then send a task
 from Chat or type it into the native Pi terminal. Follow a completed tool call
@@ -232,14 +330,48 @@ select its namespaced suggestion. See the
 then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
 Probes run only on expansion.
 
+**MCP enablement:** the switch on configured Claude/Codex servers and plugin MCP
+rows applies only to Omnigent launches, including new sessions and cold resumes.
+It does not stop a running harness or edit the harness's configuration. Off rows
+cannot expand or probe; turning a server off collapses it, and re-enabling leaves
+it collapsed. Managed server names are locked across matching rows in that
+harness, including plugin rows. A failed save rolls the switch back and shows the
+error. Refreshing inventory updates switches on an already-open plugin page.
+
+The server's `mcp_disabled_servers` master gate and each harness's
+`mcp_disabled_servers_claude` / `mcp_disabled_servers_codex` flag must be enabled.
+Older hosts without the enablement capability have no switches. For rollback,
+disable the master gate or a harness flag: switches disappear for that scope,
+future launches ignore its saved preferences, and running sessions remain
+unchanged. Saved preferences remain available when the flags are re-enabled.
+
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
-shown for a newly connected or requested host → See more. The modal auto-opens
+shown once for the host desktop onboarding just connected → See more. It opens
 only when the server enables the `import_review` release feature.
+A session's `/mcp` panel → Go to Settings opens the harness page for that
+session's host (`?host=<id>`), and keeps that host selected even when it is a
+sandbox host the host pickers hide.
 
 **Harness credential repair:** Settings → Harnesses → a needs-auth harness →
 Settings. Activate either the credential card or its Reconfigure affordance;
 both open the same repair flow.
+
+**Native tmux repair:** use a host whose tmux is missing, older than 3.3, or
+prints no readable version. Ready native harnesses then show **needs tmux** in
+the New Chat picker and Settings → Harnesses (CLI install, update and sign-in
+problems still show first). Open **Set up tmux** in Settings, or the picker's
+setup action, to reach the tmux step: copy `brew install tmux` (on Linux, use
+the package manager), then press **Check again**. Without Check again, the host
+picks tmux up on its next periodic readiness refresh, about a minute later.
+The desktop app keeps the PATH it started with, so if tmux went into a new PATH
+directory, quit and reopen the app. Signing in or saving a credential on a host
+without tmux continues to the same tmux step.
+
+**Unresponsive harness CLI:** put a harness wrapper that never answers
+`--version` first on the host's PATH and restart the host. Open New Chat with
+that agent, then Settings → Harnesses → the **CLI did not respond** card or its
+gear, then send a message in an existing session for that harness.
 
 **Harness account sign-in and switching:** Settings → Harnesses → Codex or
 Claude. Use **Sign in again** on an expired Codex card, or open the configured
@@ -266,6 +398,20 @@ turn, and Stop separately. For an offline host use the reconnect paths in
 **Codex side chat:** type `/side <question>` in the parent composer, send a
 follow-up in the side pane, then close its tab. The parent conversation stays
 separate. See [sessions](./sessions.md) for all side-chat entry points.
+
+**Codex async question:** in Default mode, ask Codex to call
+`request_user_input_async` and keep working. The cards follow the Codex TUI's
+queued questions (shift+← in the terminal): one card per question, its options
+plus a free-text "Other" row, and the composer stays usable. Answer a card in
+Chat or Inbox: the answer is sent as an ordinary message in the TUI picker's
+reply format, which steers Codex's current turn, and the transcript shows it as
+the TUI does (`↪ Re: <question>` above the answer). So does an answer picked
+in the TUI. A card closes when its question is answered there or in the card,
+when any other user message is sent from either side, on Cancel (Codex keeps
+working, like the TUI's skip), or when the turn ends. Cancel does not clear the
+question in the terminal. If the answer can't be sent, a notice asks the user
+to answer in the terminal. An open question is not restored after the
+forwarder reconnects.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -345,6 +491,18 @@ Run with a real Pi CLI on PATH and retries disabled. Composer API evidence
 does not cover browser clicks; scripted routing does not establish live judge
 quality. Broader Smart Routing journeys remain outside this Pi-specific recipe.
 
+**Claude subscription authentication (`launch-cli`, `launch-web`):** with a
+valid Claude login and an explicit subscription provider, start `omnigent claude`
+and a new Claude session from the web picker. Even when the host inherits
+`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`, `/status` should show the login.
+Restart existing hosts and terminals to pick up the change. Claude-configured
+gateways and cloud transports continue to own their authentication.
+`tests/harnesses/claude_native/test_claude_native.py::test_resolve_native_claude_config_subscription_uses_cli_login`
+checks CLI child-process credentials;
+`tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_claude_terminal_subscription_ignores_inherited_api_credentials`
+checks the hosted launch specification. These use synthetic credentials and do
+not prove live sign-in or artifact publishing.
+
 **Launch settings (own environment):** connect a host with Claude/Codex
 configured, and put a command and two args under
 `harness.claude-native` / `harness.codex-native` in its `~/.omnigent/config.yaml`.
@@ -375,6 +533,24 @@ live external-gateway compatibility remains unverified. See [the gateway
 guide](../docs/native-agy-gateways.md) for live smoke steps.
 The reader/server replay regression is
 `tests/server/integration/test_sessions_external_item_idempotency.py::test_agy_reader_restart_preserves_messages_and_tool_pairs`.
+
+**`claude-managed-mcp-relay`, both Claude native launch paths:** the launch
+environment and the entry check are covered by
+`tests/harnesses/claude_native/test_claude_native.py::test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config`
+(`omnigent claude`),
+`tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_claude_terminal_points_a_managed_relay_entry_at_its_bridge`
+(web launch) and
+`tests/harnesses/claude_native/test_claude_native.py::test_managed_relay_entry_must_launch_serve_mcp_for_the_session_bridge`.
+No browser test drives a native session under a managed file. Manually, in a
+disposable container or VM where Claude Code's managed directory
+(`/etc/claude-code` on Linux, `/Library/Application Support/ClaudeCode` on
+macOS) is writable, deploy the documented entry, start a session from each
+surface, and expect `claude mcp list` in its terminal to report `omnigent`
+connected and an Omnigent tool call such as `sys_session_get_info` to
+succeed. With the entry removed, expect each launch to succeed without
+`mcp__omnigent__*` tools, and the launching process (the runner for web, the
+`omnigent claude` process locally) to log that the relay entry is missing.
+Remove the file afterwards.
 
 Cross-harness journeys:
 
@@ -413,12 +589,46 @@ Cross-harness journeys:
   Machine-managed Claude provider settings can prevent the scripted endpoint
   from being used: report that blocker or use an isolated test container.
   Do not change machine policy to obtain a passing run.
+- **`working-status`, sidebar status rules (component and server checks):**
+  each rule above has regression tests. They use scripted Claude status files
+  and a scripted Codex app-server, not the real CLIs.
+  - Claude background shell:
+    `tests/harnesses/claude_native/test_claude_native_status_file.py::test_background_signal_follows_shell_and_idle_only`,
+    `tests/runner/test_session_resources.py::test_background_shell_reports_reach_the_server_as_session_events`
+    and
+    `tests/server/integration/test_sessions_endpoints.py::test_external_background_work_sets_sidebar_flag_without_status_edge`.
+  - Claude terminal-only prompt:
+    `tests/server/test_session_live_state.py::test_status_edges_set_and_clear_the_parked_reason`.
+  - Claude sign-in block:
+    `tests/harnesses/claude_native/test_claude_native_program_status.py::test_auth_block_is_a_failed_turn_while_a_prompt_block_is_work`.
+  - Codex goal and its limits:
+    `tests/harnesses/codex_native/forwarder/test_background_work.py::test_active_goal_keeps_the_session_working_until_it_ends`
+    and
+    `tests/harnesses/codex_native/forwarder/test_background_work.py::test_goal_stopped_by_a_limit_fails_the_session_once`.
+  - Codex background terminal, in the sidebar and the composer:
+    `tests/harnesses/codex_native/forwarder/test_background_work.py::test_running_background_terminal_keeps_the_session_working_after_its_turn`
+    and
+    `tests/server/integration/test_sessions_endpoints.py::test_external_background_work_lists_tasks_for_the_composer`.
+  - Codex system error:
+    `tests/harnesses/codex_native/forwarder/test_turn_errors.py::test_system_error_fails_a_thread_no_turn_is_running`
+    and
+    `tests/harnesses/codex_native/forwarder/test_turn_errors.py::test_system_error_during_a_turn_waits_for_the_turn_outcome`.
+  - How each state shows in the sidebar, and answering a prompt: from `web`,
+    `pnpm exec vitest run src/hooks/useSessionState.test.ts src/shell/sidebarNav.test.ts src/hooks/useSidebarWorkingIds.test.ts src/components/SessionStateBadge.test.tsx src/lib/localElicitationResolutions.test.ts src/hooks/useSidebarData.test.tsx src/pages/InboxPage.test.tsx`.
 - **`working-status`, browser presentation only:** the existing
   `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
   injects a status event through the real server to check the blocked hint.
   It does not launch Claude or verify OSC production. Shared terminal launch
   and cleanup checks, including Codex-role and auxiliary-shell controls, are
   in [Terminals](./terminals.md); they do not establish full harness acceptance.
+
+- **`steer`, Claude questions in a narrow terminal:**
+  `tests/harnesses/claude_native/test_claude_native_copy_mode.py::test_question_with_a_footer_word_split_by_tmux_keeps_waiting`
+  uses real tmux and a stand-in question picker. Chat input and settings leave
+  the question open when wrapping splits a footer word; an explicit terminal
+  answer releases the composer for one message. Manually, narrow Claude's
+  terminal while a question is pending, send an unrelated Chat message, then
+  answer the question and verify that the held message arrives once.
 
 - **Antigravity permission choices (Chat and Inbox):**
   `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`
@@ -470,16 +680,32 @@ Cross-harness journeys:
   model context, distinct native threads on one runner, transcript isolation,
   follow-ups that switch model and effort on the same thread, and a working
   parent after side-chat closure.
+- **`codex-async-questions`:**
+  `tests/harnesses/codex_native/session/test_elicitation.py` (the
+  `*codex_async_question*` tests) drives the forwarder with a fake app-server
+  client: one card per question, each answer sent as its own user message, a
+  skipped or closed card, an older server, the notice when the answer can't be
+  sent, and the cards closing on a tagged reply, any other user message, and
+  the turn's end.
+  `tests/server/integration/test_sessions_permission_request_hook.py::test_codex_request_user_input_decline_interrupts_only_blocking_questions`
+  covers Cancel on the server. `web/src/lib/codexAsyncQuestionReply.test.ts`
+  covers the `↪ Re:` transcript, `web/src/lib/blockStream.test.ts` and
+  `web/src/lib/blocks.test.ts` the non-blocking card,
+  `web/src/pages/ChatPage.composer.test.tsx` the composer,
+  `web/src/pages/ChatPage.indicators.test.tsx` the working indicator's terminal
+  guidance, and `web/src/components/chat/chatBubbleParts.test.tsx` Retry. No
+  test drives a real Codex CLI, the browser, Inbox, or a child thread.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus
   `web/src/shell/settingsNav.test.tsx` and
-  `tests/e2e_ui/onboarding/test_import_review_modal.py::test_import_modal_opens_once_and_links_to_harnesses`.
+  `tests/e2e_ui/onboarding/test_import_review_modal.py::test_import_modal_opens_after_onboarding`.
   Start the isolated instance without release flags. Check the Harnesses sidebar
   link and direct links to the catalog and a harness detail page. Stop it, then
   use `OMNIGENT_FEATURES=import_review verify-env start`; without that feature the
-  import review modal never opens. Connect a new host, then click See more
-  beside Confirm. Check that the modal closes and Harnesses opens. Open Import
+  import review modal never opens. Finish desktop onboarding (or stub the
+  shell's `takeOnboardingRunner` as the E2E does), then click See more beside
+  Confirm. Check that the modal closes and Harnesses opens. Open Import
   sessions and check that only session imports remain. The Harnesses sidebar
   and direct links remain available without the import-review flag. The server
   response contract is covered by
@@ -499,6 +725,13 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
+- **`cli-unresponsive`:**
+  `tests/onboarding/test_harness_readiness.py::test_unanswered_pi_version_probe_is_not_reported_as_outdated`,
+  `tests/host/test_connect.py::test_handle_launch_does_not_ask_to_install_a_resolvable_pi_that_never_answers`,
+  `tests/onboarding/test_harness_install.py::test_missing_harness_cli_lets_a_slow_kimi_through_sub_agent_dispatch`,
+  and the "did not respond" cases in
+  `web/src/pages/settings/SettingsHarnessesSection.test.tsx` and
+  `web/src/shell/NewChatDialog.test.tsx`.
 - **`model-and-effort`, Claude runtime selection (own environment):**
   `tests/e2e/test_claude_native_managed_model_switch.py::test_runner_switches_managed_glm_in_a_real_claude_terminal`
   uses real Claude catalog discovery, tmux, statusLine and the runner event
@@ -572,6 +805,12 @@ Cross-harness journeys:
   unchanged. Databricks codex launch discovery skips models whose
   `supported_api_types` list omits `codex/v1/responses`.
 - **`model-and-effort`, Codex runtime settings:**
+  A model/effort update before message delivery has a 30-second RPC budget.
+  If its reply is rejected or lost, the message remains unsent even if the
+  settings already changed; no request is replayed automatically. The real
+  loopback cases in
+  `tests/inner/test_codex_native_executor.py::test_transport_failure_keeps_native_work_running`
+  cover failed settings, concurrent native work and replacement ownership.
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_preserves_supported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_switch_clamps_inherited_effort`,
@@ -653,6 +892,11 @@ Cross-harness journeys:
   (`tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_late_settings_ack_still_reaches_an_older_server`).
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
+- **`questions` (`claude-native`):**
+  `tests/e2e_ui/approvals/test_native_claude_question.py::test_native_question_reaches_chat_and_returns_to_claude`
+  sends from both chat and the embedded terminal, answers the web form, and
+  separately injects the server's empty-200 timeout response to check the
+  chat-text fallback.
 - **`approvals`, Claude directory access:**
   `tests/e2e_ui/approvals/test_claude_permission_auto_mode.py::test_permission_card_grants_directories_without_changing_auto_mode`
   checks Chat (including reload), Inbox, and standalone approval links against
@@ -931,6 +1175,10 @@ Cross-harness journeys:
   `tests/server/routes/test_mcp_tools.py`, and the real-host test
   `tests/e2e/test_host_mcp_tools_e2e.py::test_host_mcp_tools` with plain pytest.
   Web coverage is in `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  For enablement, also run `tests/host/test_mcp_inventory.py` and
+  `tests/server/routes/test_mcp_servers.py`. The non-browser journey
+  `tests/e2e/test_mcp_disabled_servers.py` checks both native CLIs, a disabled
+  fixture, an enabled control, and the Omnigent relay without building the SPA.
   Disabled plugin MCP rows stay visible without expansion or probes. Check
   same-name plugins from different marketplaces return their respective tools.
   HTTP probes honor the host's proxy and certificate environment settings.
@@ -944,6 +1192,14 @@ Cross-harness journeys:
   A 501 shows an update hint; inject a 404 from the tools route to retain plain
   rows without expansion. Confirm no raw config, schemas or synthetic secrets
   appear in responses/logs and no probe processes survive cancellation/timeout.
+- **`pi-host-mcp`:** run `tests/inner/test_pi_mcp.py` and, with Pi 0.99 or newer
+  on `PATH` or in `OMNIGENT_PI_PATH`, `tests/e2e/test_pi_native_host_mcp_e2e.py`
+  (it skips on older Pi). Manually, add a server to `~/.claude.json` only, start
+  `omnigent pi` with an Omnigent provider, and run `/mcp`: the server is listed
+  and connected. A same-name entry in `~/.pi/agent/mcp.json` replaces it, and
+  `{"name": {"enabled": false}}` there turns it off. `~/.pi/agent` stays unchanged.
+  A server whose env or headers use `${VAR}` connects only when the runner gets
+  that variable, for example through `OMNIGENT_RUNNER_ENV_PASSTHROUGH=VAR`.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
@@ -977,6 +1233,10 @@ Cross-harness journeys:
   the session stays idle and the released reply never appears, then completes
   a follow-up. The harness bench does not register opencode-native, so its
   interrupt probe does not apply.
+- **opencode-native usage (component checks):**
+  `tests/test_opencode_native_forwarder.py::test_usage_dedupes_identical_posts`
+  checks that a rejected report can be retried at turn completion while
+  accepted totals remain deduplicated. It controls HTTP responses locally.
 - **opencode-native journeys (own environment, scripted model):** needs
   `@opencode/cli` 2.0.18–2.0.x and tmux on `PATH`, in e2e mock mode:
   `uv run --no-sync pytest tests/e2e/test_host_opencode_native_mock_e2e.py --reruns 0 -v`.
@@ -1010,6 +1270,11 @@ Cross-harness journeys:
   failing-operation evidence when tmux exits after readiness. These tests
   exercise the injection used by existing-session and first-message composers;
   CLI typing bypasses the web injection gate. They do not run a vendor model.
+  `tests/harnesses/claude_native/test_claude_native_overdrawn_prompt.py` checks
+  redraw recovery in single and split tmux windows, the requested pane's exit
+  while its neighbor stays alive, a missing target, and a suspended background
+  job staying paused during redraw. It uses a scripted TUI
+  and real tmux; it does not establish browser or vendor-model compatibility.
 - **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**
   `tests/e2e/test_codex_native_event_stream_disconnect_e2e.py` covers waiting
   consumers, buffered events, explicit close, and startup discovery without a
@@ -1096,6 +1361,12 @@ prompt and tool turn, then reload Chat: each persisted item appears once.
 Stall a history POST and confirm policy ALLOW/DENY still runs. A result must
 wait for its call to be accepted. Retries retain item IDs; repeated tool/message
 callbacks coalesce, while a repeated input callback is a separate prompt.
+A terminal prompt appears in Chat as soon as Pi accepts it, before turn
+routing or a pending settings change completes, and a queued steer stays
+visible while the current tool runs. A prompt Pi consumes without an `input`
+callback still appears once; an expanded skill or prompt template does not
+appear a second time, and prompts Pi discarded before consuming them do not
+hide later ones.
 For a Pi child, stall final-answer delivery: idle may update, but the parent
 must receive no completion until the answer is saved. Exhaust delivery and
 expect a failed result instead of an old answer. A later prompt must not extend
@@ -1170,6 +1441,13 @@ With the default client deadline, cancellation must clear the approval without
 creating the automation. Record the client configuration with the evidence.
 
 ## Gotchas
+
+- An enterprise `managed-mcp.json` applies to every Claude Code process on the
+  machine, whatever its `HOME` or `CLAUDE_CONFIG_DIR`, including other test
+  runs and the developer's own sessions. Drive `claude-managed-mcp-relay` only on
+  a disposable machine, and never overwrite a file an administrator deployed.
+  Outside Omnigent the relay entry's variables are unset, so a hand-started
+  `claude mcp list` reports `omnigent` as failed; that is expected.
 
 - Relay approval waits retain one pending request slot. Vendor clients that do not
   honor MCP progress notifications can still impose their own shorter deadline;

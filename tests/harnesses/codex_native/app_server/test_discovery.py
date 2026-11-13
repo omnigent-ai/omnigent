@@ -226,15 +226,13 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
     monkeypatch.setattr(
         codex_native_app_server,
         "_databricks_launch_materialization",
-        lambda *, model, profile, codex_path: (
-            codex_native_app_server._DatabricksLaunchMaterialization(
-                config_overrides=[
-                    'model="databricks-gpt-5-4"',
-                    'model_provider="omnigent_databricks"',
-                ],
-                model="databricks-gpt-5-4",
-                host="https://ws.example",
-            )
+        lambda *, model, profile: codex_native_app_server._DatabricksLaunchMaterialization(
+            config_overrides=[
+                'model="databricks-gpt-5-4"',
+                'model_provider="omnigent_databricks"',
+            ],
+            model="databricks-gpt-5-4",
+            host="https://ws.example",
         ),
     )
     monkeypatch.setattr(codex_native_app_server, "_clean_codex_env", lambda: {"PATH": "/bin"})
@@ -959,7 +957,7 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
     if outcome == "inherited":
         assert providers["Inherited.Provider"]["http_headers"] == {
             "Databricks-Custom-Coding-Agent": "codex",
-            "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-desktop, ug",
+            "Databricks-Custom-Client-Surfaces": "omnigent-desktop, ug",
         }
         assert "base_url" not in providers["Inherited.Provider"]
     else:
@@ -985,10 +983,20 @@ async def test_provider_attribution_probes_only_when_codex_may_pick_the_provider
 ) -> None:
     from omnigent.harnesses.codex_native import app_server
 
+    codex_home = tmp_path / "home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    monkeypatch.setattr(
+        "omnigent.databricks_ai_gateway.DATABRICKS_TRUSTED_HOST_SUFFIXES", (".example.test",)
+    )
+    config_path.write_text(
+        '[model_providers.inactive_gateway]\nname = ""\n'
+        'base_url = "https://gateway.example.test/ai-gateway/codex/v1"\n'
+    )
     started = AsyncMock(side_effect=OSError("probe started"))
     monkeypatch.setattr(app_server, "_start_codex_model_discovery_process", started)
     result = await app_server.prepare_codex_provider_config(
-        tmp_path / "home",
+        codex_home,
         overrides,
         codex_path="/codex",
         cwd=tmp_path,
@@ -997,3 +1005,7 @@ async def test_provider_attribution_probes_only_when_codex_may_pick_the_provider
     )
     assert result == overrides
     assert started.await_count == int(probed)
+    assert (
+        tomllib.loads(config_path.read_text())["model_providers"]["inactive_gateway"]["name"]
+        == "inactive_gateway"
+    )

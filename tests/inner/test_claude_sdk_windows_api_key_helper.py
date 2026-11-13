@@ -29,6 +29,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -52,10 +53,6 @@ DUMMY_TOKENS = [
     "dummy\nnewline",
     "dummy-\u00fcn\u00efcode",
 ]
-
-# Tokens safe to round-trip through a real child process's stdout on any
-# platform (no newline -> no CRLF translation; ASCII -> no codepage issues).
-EXEC_TOKENS = [t for t in DUMMY_TOKENS if "\n" not in t and t.isascii()]
 
 
 def _static_cmd(token: str) -> str:
@@ -140,7 +137,7 @@ def test_windows_static_helper_rewritten_without_key(token: str) -> None:
     assert "dummy" not in helper
     assert helper == (
         f'"{_FAKE_WIN_PYTHON}" -I -S -c '
-        '"import os,sys;sys.stdout.write(os.environ[sys.argv[1]])" '
+        '"import os,sys;sys.stdout.buffer.write(os.environ[sys.argv[1]].encode())" '
         f"{_ENV}"
     )
     # Nothing cmd.exe or POSIX sh would reinterpret inside the double quotes.
@@ -250,7 +247,7 @@ def _helper_for_this_interpreter(token: str) -> tuple[str, dict[str, str]]:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX sh execution test")
-@pytest.mark.parametrize("token", EXEC_TOKENS)
+@pytest.mark.parametrize("token", DUMMY_TOKENS)
 def test_rewritten_helper_prints_exact_key_under_posix_sh(token: str) -> None:
     helper, child_env = _helper_for_this_interpreter(token)
     sh = shutil.which("sh") or "/bin/sh"
@@ -261,7 +258,7 @@ def test_rewritten_helper_prints_exact_key_under_posix_sh(token: str) -> None:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="cmd.exe execution test (Windows only)")
-@pytest.mark.parametrize("token", EXEC_TOKENS)
+@pytest.mark.parametrize("token", DUMMY_TOKENS)
 def test_rewritten_helper_prints_exact_key_under_cmd_exe(token: str) -> None:
     helper, child_env = _helper_for_this_interpreter(token)
     comspec = os.environ.get("COMSPEC", "cmd.exe")
@@ -275,6 +272,30 @@ def test_rewritten_helper_prints_exact_key_under_cmd_exe(token: str) -> None:
         check=True,
     )
     assert result.stdout.decode("utf-8") == token
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows interpreter-path test")
+def test_windows_helper_uses_interpreter_path_with_spaces(tmp_path: Path) -> None:
+    """Execute through cmd.exe with a real interpreter in a spaced path."""
+    venv = tmp_path / "helper interpreter"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(venv)],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    helper = ex._windows_static_key_helper_command(str(venv / "Scripts" / "python.exe"))
+    assert helper is not None
+    child_env = {**os.environ, _ENV: "dummy-quoted-path-key"}
+    comspec = os.environ.get("COMSPEC", "cmd.exe")
+    result = subprocess.run(
+        f'"{comspec}" /d /s /c "{helper}"',
+        env=child_env,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    assert result.stdout == b"dummy-quoted-path-key"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="cmd.exe execution test (Windows only)")
@@ -304,7 +325,9 @@ def test_rewritten_helper_fails_loudly_without_env_under_posix_sh() -> None:
 # -- security boundaries: reserved env, malformed tokens, per-call isolation --
 
 
-def test_windows_reserved_env_collision_is_not_overwritten(caplog: pytest.LogCaptureFixture) -> None:
+def test_windows_reserved_env_collision_is_not_overwritten(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     env = {_ENV: "different-dummy-token"}
     command = _static_cmd("desired-dummy-token")
     with caplog.at_level("WARNING"):
