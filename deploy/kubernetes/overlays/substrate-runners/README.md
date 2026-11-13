@@ -308,9 +308,12 @@ python -m tests.e2e.integrations.deploy.substrate.e2e_lifecycle \
   --server https://omnigent.example.com \
   --config /etc/omnigent/config.yaml \
   --database-uri sqlite:////data/test-chat.db \
-  --agent-id YOUR_REGISTERED_AGENT_ID
+  --agent-id YOUR_REGISTERED_AGENT_ID \
+  --timeout 900
 ```
 
+The timeout must exceed the configured runner idle interval; 900 seconds leaves
+five minutes for suspension after the sample configuration's 600-second interval.
 Use `--ca /path/to/test-ca.pem` for a private test CA. The scenario waits for both
 host **and runner** readiness before suspension; an online host alone does not
 mean initial runner startup is finished. It sends a message to trigger wake, but
