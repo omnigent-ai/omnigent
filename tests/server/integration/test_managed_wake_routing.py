@@ -256,7 +256,7 @@ async def test_single_replica_is_unaffected_by_a_foreign_key(
 async def test_live_local_tunnel_bypasses_the_guard(
     two_replica_stack: Any, managed_wake: Any
 ) -> None:
-    arrange, _events = managed_wake
+    arrange, events = managed_wake
     # An unkeyed host dials the default route, so its live tunnel can sit on this replica.
     session_id = await arrange(keyed=False, dial_replica="keyless", local_tunnel_on_keyless=True)
 
@@ -265,6 +265,35 @@ async def test_live_local_tunnel_bypasses_the_guard(
     )
 
     assert not _wrong_replica(response), response.text
+    # The local tunnel passes the guard, so the wake continues here as it did before.
+    assert events.index("resume") < events.index("launch") < events.index("ready"), events
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+async def test_non_resumable_relaunch_is_rerouted_before_the_kick(
+    two_replica_stack: Any, managed_wake: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-resumable host reaches the guard inside the relaunch helper."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    arrange, events = managed_wake
+    # Non-resumable hosts skip the stale-wake check, so only the relaunch guard runs.
+    monkeypatch.setattr(orchestration, "host_resume_supported", lambda _host, _config: False)
+
+    def record_relaunch(**_kwargs: object) -> None:
+        events.append("relaunch")
+
+    monkeypatch.setattr(orchestration, "_kick_managed_relaunch", record_relaunch)
+    monkeypatch.setattr(sessions_module, "_kick_managed_relaunch", record_relaunch)
+    session_id = await arrange(keyed=True)
+
+    response = await two_replica_stack.keyless_client.post(
+        f"/v1/sessions/{session_id}/events", headers=_headers(FOREIGN_KEY), json=MESSAGE
+    )
+
+    assert _wrong_replica(response), response.text
+    assert response.json()["error"]["slice_key"] == HOST_ID
+    assert events == [], events
 
 
 @pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)

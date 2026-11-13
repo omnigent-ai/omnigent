@@ -5381,8 +5381,8 @@ async def _maybe_relaunch_managed_sandbox(
             return False
     launch = tracker.get(session_id)
     if launch is None or launch.settled.is_set():
-        await _raise_if_managed_wake_misses_host_tunnel(
-            conv=conv, request=request, app_state=app_state
+        _raise_if_managed_wake_misses_host_tunnel(
+            conv=conv, host=host, request=request, app_state=app_state
         )
         # A resumable managed host whose sandbox merely idle-stopped is WOKEN
         # in place (resume: same sandbox + workspace volume) rather than
@@ -5444,9 +5444,10 @@ async def _maybe_relaunch_managed_sandbox(
     return True
 
 
-async def _raise_if_managed_wake_misses_host_tunnel(
+def _raise_if_managed_wake_misses_host_tunnel(
     *,
     conv: Conversation,
+    host: Host,
     request: Any,
     app_state: Any,
 ) -> None:
@@ -5461,8 +5462,9 @@ async def _raise_if_managed_wake_misses_host_tunnel(
     routing key; internal callers pass nothing and skip this check.
 
     :param conv: Session row whose host may need a wake.
+    :param host: The session's managed host row, already loaded by the caller.
     :param request: The inbound request, or ``None``/a non-HTTP context to skip.
-    :param app_state: ``request.app.state`` — supplies the host registry and store.
+    :param app_state: ``request.app.state`` — supplies the host registry.
     :raises WrongReplicaError: For a keyed host whose key the request does not carry.
     :raises OmnigentError: ``WRONG_REPLICA`` (no key to resend) for an unkeyed host
         reached through a keyed request.
@@ -5474,21 +5476,14 @@ async def _raise_if_managed_wake_misses_host_tunnel(
 
     if not isinstance(request, Request):
         return
-    host_store = getattr(app_state, "host_store", None)
     host_registry = getattr(app_state, "host_registry", None)
-    if (
-        conv.host_id is None
-        or host_store is None
-        or host_registry is None
-        or not _deployment_is_sharded()
-    ):
+    if conv.host_id is None or host_registry is None or not _deployment_is_sharded():
         return
     keyed = host_slice_key_enabled(conv.labels, conv.host_id)
     expected_key = conv.host_id if keyed else None
     if routed_slice_key(request) == expected_key or host_registry.get(conv.host_id) is not None:
         return
-    host = await asyncio.to_thread(host_store.get_host, conv.host_id)
-    if host is None or host.sandbox_provider is None:
+    if host.sandbox_provider is None:
         return
     if keyed:
         raise WrongReplicaError(
@@ -5532,8 +5527,8 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or not host_resume_supported(host, sandbox_config):
         return False
-    await _raise_if_managed_wake_misses_host_tunnel(
-        conv=conv, request=request, app_state=app_state
+    _raise_if_managed_wake_misses_host_tunnel(
+        conv=conv, host=host, request=request, app_state=app_state
     )
     host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
     tunnel_registry = cast(TunnelRegistry | None, getattr(app_state, "tunnel_registry", None))
