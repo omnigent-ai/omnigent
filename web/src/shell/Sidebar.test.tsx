@@ -43,6 +43,7 @@ import type * as PullRequestsModule from "@/hooks/usePullRequests";
 import {
   markConversationRead,
   markConversationSeen,
+  markConversationUnread,
   resetReadStateForTests,
   seedReadState,
 } from "@/hooks/useUnseenConversations";
@@ -1225,6 +1226,18 @@ describe("Sidebar session list", () => {
       }
     },
   );
+
+  it.each(["/", "/inbox"])("counts an unread session in the Inbox badge on %s", (route) => {
+    seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
+    mockConversations([conv("conv_unread", "Codex", { status: "idle", updated_at: 200 })]);
+    renderSidebar(true, route);
+
+    const row = screen.getByRole("link", { name: /conv_unread/ }).closest("li")!;
+    expect(within(row).getByRole("img", { name: "New messages" })).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("inbox-button")).getByLabelText("1 inbox item waiting"),
+    ).toHaveTextContent("1");
+  });
 
   it("lets the active Inbox row show through the count badge", () => {
     // On /inbox the row itself paints the translucent --sidebar-active wash.
@@ -3996,6 +4009,22 @@ describe("Sidebar active-row auto-scroll", () => {
 
     const row = screen.getByText("Active draft").closest("li")!;
     expect(within(row).queryByTestId("conversation-draft-indicator")).toBeNull();
+    vi.restoreAllMocks();
+  });
+
+  it("leaves the open session out of the Inbox badge until it is marked unread", () => {
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(() => {});
+    seedReadState([{ id: "conv_active", viewer_last_seen: 199 }]);
+    mockConversations([conv("conv_active", "Codex", { status: "idle", updated_at: 200 })]);
+
+    renderAtRoute("/c/conv_active");
+
+    const inbox = screen.getByTestId("inbox-button");
+    expect(within(inbox).queryByLabelText(/inbox items? waiting/)).toBeNull();
+    act(() => markConversationUnread("conv_active", 200));
+    expect(within(inbox).getByLabelText("1 inbox item waiting")).toHaveTextContent("1");
+    act(() => markConversationRead("conv_active", 200));
+    expect(within(inbox).queryByLabelText(/inbox items? waiting/)).toBeNull();
     vi.restoreAllMocks();
   });
 

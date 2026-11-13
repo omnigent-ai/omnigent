@@ -290,9 +290,7 @@ class SqlFile(OmnigentBase):
     source_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
-        # Files are only ever listed per session (WHERE session_id = ?),
-        # so a session-scoped composite is the only index needed. There is
-        # no session-less "all files" listing.
+        # Session lists use creation order; shared-blob ownership uses equality.
         Index(
             "ix_files_session_id_created_at",
             "workspace_id",
@@ -300,6 +298,7 @@ class SqlFile(OmnigentBase):
             "created_at",
             "id",
         ),
+        Index("ix_files_blob_reference", "workspace_id", "blob_key", "id"),
     )
 
 

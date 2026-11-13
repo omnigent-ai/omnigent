@@ -11894,9 +11894,10 @@ def _child_session_summary_from_conversation(
         child-message lookup, or ``None`` when no visible message exists.
     :param cached_status: Session status to derive ``busy`` /
         ``current_task_status`` from, e.g. ``"running"``. ``None`` reads the
-        live ``_session_status_cache``; a status-edge publisher passes the
-        edge's own value so a burst of transitions fans out one summary per
-        edge instead of the latest status repeated.
+        live ``_session_status_cache``, then the row's ``live_status``; a
+        status-edge publisher passes the edge's own value so a burst of
+        transitions fans out one summary per edge instead of the latest status
+        repeated.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -11943,9 +11944,12 @@ def _child_session_summary_from_conversation(
         tool = display_title or None
         session_name = None
 
-    # Derive busy from the relay-fed cache; tasks table is gone.
+    # Derive busy from the relay-fed cache, falling back to the persisted row
+    # status on a replica without the runner's tunnel.
     if cached_status is None:
         cached_status = _session_status_cache.get(conv.id)
+    if cached_status is None:
+        cached_status = conv.live_status
     if cached_status in ("running", "waiting"):
         busy = True
     else:

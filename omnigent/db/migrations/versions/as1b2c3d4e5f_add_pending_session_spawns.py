@@ -109,15 +109,15 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # Receipts fence retries and reserved IDs; do not erase them while work exists.
-    table = sa.table("session_spawn_epochs", sa.column("parent_id", Uuid16()))
-    if op.get_bind().execute(sa.select(table.c.parent_id).limit(1)).first() is not None:
-        raise RuntimeError("Cannot remove retained child spawn receipts")
-    markers = sa.table("session_spawn_materializations", sa.column("child_id", Uuid16()))
-    if op.get_bind().execute(sa.select(markers.c.child_id).limit(1)).first() is not None:
-        raise RuntimeError("Cannot remove retained child materialization markers")
-    payloads = sa.table("session_spawn_payloads", sa.column("id", Uuid16()))
-    if op.get_bind().execute(sa.select(payloads.c.id).limit(1)).first() is not None:
-        raise RuntimeError("Cannot remove retained child payload cleanup records")
+    for name, key in (
+        ("session_spawn_epochs", "parent_id"),
+        ("session_spawns", "nonce"),
+        ("session_spawn_materializations", "child_id"),
+        ("session_spawn_payloads", "id"),
+    ):
+        table = sa.table(name, sa.column(key, Uuid16()))
+        if op.get_bind().execute(sa.select(table.c[key]).limit(1)).first() is not None:
+            raise RuntimeError(f"Cannot remove retained rows from {name}")
     op.drop_table("session_spawn_materializations")
     op.drop_table("session_spawn_payloads")
     op.drop_table("session_spawns")
