@@ -5396,10 +5396,16 @@ class HostProcess:
         # (no OpenSSL default cert path), which fails handshake verification.
         # ``ssl=None`` for ws:// is the library default (no TLS).
         ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
+        # websockets adds its own User-Agent on top of additional_headers; send only ours.
+        ws_headers = dict(headers)
+        from omnigent.telemetry.request_headers import pop_client_user_agent
+
+        user_agent = pop_client_user_agent(ws_headers)
         try:
             ws_cm = websockets.asyncio.client.connect(
                 url,
-                additional_headers=headers,
+                additional_headers=ws_headers,
+                user_agent_header=user_agent,
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
                 open_timeout=(
@@ -6281,8 +6287,11 @@ def run_host_process(
         to stderr first.
     """
     from omnigent.cli_auth import pin_databricks_org_id
+    from omnigent.telemetry.request_headers import set_client_component
     from omnigent.util.server_url import ServerUrl, is_workspace_hosted_url
 
+    # Foreground (`omnigent host`) and daemon hosts both identify as the host.
+    set_client_component("host")
     if is_workspace_hosted_url(server_url):
         # Foreground hosts need the same snapshot as auto-launched daemons.
         # Pinning absence prevents later login metadata retargeting runners.
