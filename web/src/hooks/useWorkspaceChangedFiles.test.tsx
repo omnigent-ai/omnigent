@@ -709,7 +709,8 @@ describe("useWorkspaceEnvironment runner bind", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const tree = () => <QueryClientProvider client={qc}>{probe()}</QueryClientProvider>;
     const view = render(tree());
-    return () => view.rerender(tree());
+    const environmentStatus = () => qc.getQueryState(["workspace-environment", "conv_new"])?.status;
+    return { rerender: () => view.rerender(tree()), environmentStatus };
   }
 
   it("refetches a pre-bind 409 once the snapshot reports the bound runner", async () => {
@@ -720,7 +721,7 @@ describe("useWorkspaceEnvironment runner bind", () => {
       .mockResolvedValueOnce(environmentResponse())
       .mockResolvedValue(changedFilesResponse());
 
-    const rerender = renderShared(() => (
+    const { rerender } = renderShared(() => (
       <>
         <ChangedFilesProbe id="conv_new" />
         <EnvironmentProbe id="conv_new" />
@@ -736,6 +737,7 @@ describe("useWorkspaceEnvironment runner bind", () => {
     rerender();
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await flushMicrotasks();
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       environmentUrl,
       environmentUrl,
@@ -743,13 +745,29 @@ describe("useWorkspaceEnvironment runner bind", () => {
     ]);
   });
 
-  it("does not treat the first loaded snapshot as a bind", async () => {
+  it("refetches a 409 when the first loaded snapshot already reports a runner", async () => {
     onlineMock.mockReturnValue(true);
     sessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
-    fetchMock.mockResolvedValue(notBound());
+    fetchMock.mockResolvedValueOnce(notBound()).mockResolvedValue(environmentResponse());
 
-    const rerender = renderShared(() => <EnvironmentProbe id="conv_new" />);
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const { rerender, environmentStatus } = renderShared(() => <EnvironmentProbe id="conv_new" />);
+    await waitFor(() => expect(environmentStatus()).toBe("error"));
+    stubSession({ runnerId: "runner_1" });
+    rerender();
+
+    await waitFor(() => expect(environmentStatus()).toBe("success"));
+    rerender();
+    await flushMicrotasks();
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([environmentUrl, environmentUrl]);
+  });
+
+  it("does not refetch a loaded environment when the first snapshot arrives", async () => {
+    onlineMock.mockReturnValue(true);
+    sessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    fetchMock.mockResolvedValue(environmentResponse());
+
+    const { rerender, environmentStatus } = renderShared(() => <EnvironmentProbe id="conv_new" />);
+    await waitFor(() => expect(environmentStatus()).toBe("success"));
     stubSession({ runnerId: "runner_1" });
     rerender();
     rerender();

@@ -1044,7 +1044,7 @@ async function fetchWorkspaceEnvironment(conversationId: string): Promise<Worksp
 function useRefetchEnvironmentOnRunnerBind(conversationId: string | undefined) {
   const queryClient = useQueryClient();
   const { session } = useSession(conversationId);
-  // `undefined` while the snapshot is unknown, so the first load is not a bind.
+  // `undefined` while the snapshot is unknown.
   const runnerId = session ? (session.runnerId ?? null) : undefined;
   const lastKnown = useRef<{ id: string | undefined; runnerId: string | null | undefined }>({
     id: conversationId,
@@ -1057,12 +1057,12 @@ function useRefetchEnvironmentOnRunnerBind(conversationId: string | undefined) {
       id: conversationId,
       runnerId: runnerId === undefined ? previous : runnerId,
     };
-    if (!conversationId || !runnerId || previous === undefined || runnerId === previous) return;
+    if (!conversationId || !runnerId || runnerId === previous) return;
+    const queryKey = ["workspace-environment", conversationId];
+    // The first loaded snapshot can report a runner that bound after the GET failed.
+    if (previous === undefined && queryClient.getQueryState(queryKey)?.status !== "error") return;
     // Several panels share this query; let them join one refetch.
-    void queryClient.invalidateQueries(
-      { queryKey: ["workspace-environment", conversationId] },
-      { cancelRefetch: false },
-    );
+    void queryClient.invalidateQueries({ queryKey }, { cancelRefetch: false });
   }, [conversationId, runnerId, queryClient]);
 }
 

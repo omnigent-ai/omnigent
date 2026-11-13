@@ -7,6 +7,7 @@ After the bind, the Changes tab must load without needing another turn.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.live_server import terminate_process
 from tests._helpers.native_session import create_native_session
 from tests._helpers.session import bind_session_runner
 from tests.e2e_ui.conftest import (
@@ -61,26 +63,29 @@ def unbound_native_claude_session(
     workspace = _git_workspace(tmp_path)
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
-    with _temp_omnigent_mock_config(
-        mock_llm_server_url, "claude", workflow_owned=bool(_server_state.get("workflow_owned"))
-    ):
-        created = create_native_session(
-            httpx,
-            live_server,
-            harness="claude",
-            metadata={
-                "workspace": str(workspace),
-                "terminal_launch_args": ["--permission-mode", "acceptEdits"],
-            },
-        )
-        session_id = str(created["session_id"])
-        try:
+    session_id: str | None = None
+    try:
+        with _temp_omnigent_mock_config(
+            mock_llm_server_url, "claude", workflow_owned=bool(_server_state.get("workflow_owned"))
+        ):
+            created = create_native_session(
+                httpx,
+                live_server,
+                harness="claude",
+                metadata={
+                    "workspace": str(workspace),
+                    "terminal_launch_args": ["--permission-mode", "acceptEdits"],
+                },
+            )
+            session_id = str(created["session_id"])
             yield (live_server, session_id, runner_id)
+    finally:
+        try:
+            if session_id is not None:
+                with contextlib.suppress(httpx.HTTPError):
+                    httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
         finally:
-            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-            if respawned is not None:
-                respawned.terminate()
-                respawned.wait(timeout=10)
+            terminate_process(respawned)
 
 
 @pytest.mark.nightly
@@ -116,6 +121,11 @@ def test_changes_tab_recovers_after_runner_binds(
     expect(load_error).to_be_visible(timeout=15_000)
 
     bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
+    # No file event follows the bind, so only the bind itself can clear the error.
+    expect(load_error).to_have_count(0, timeout=_RECOVERY_WINDOW_MS)
+    no_changes = rail.get_by_text("No workspace changes yet")
+    expect(no_changes).to_be_visible(timeout=10_000)
+
     # Stay in Chat view: toggling views remounts the panel and masks the stale error.
     expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(
         timeout=_TERMINAL_READY_TIMEOUT_MS
@@ -130,9 +140,7 @@ def test_changes_tab_recovers_after_runner_binds(
             has_text="PR 1 has no merge conflicts.",
         ).last
     ).to_be_visible(timeout=120_000)
-
-    # The reply edited nothing, so no file event can refresh the panel.
-    expect(load_error).to_have_count(0, timeout=_RECOVERY_WINDOW_MS)
-    expect(rail.get_by_text("No workspace changes yet")).to_be_visible(timeout=10_000)
+    expect(load_error).to_have_count(0)
+    expect(no_changes).to_be_visible()
     # Hold the outcome on screen for the recording.
     page.wait_for_timeout(3_000)
