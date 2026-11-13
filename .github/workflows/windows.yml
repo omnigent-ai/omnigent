@@ -111,10 +111,71 @@ jobs:
           -p no:cacheprovider -q
 
       - name: Native Windows Claude SDK static-key session (mock gateway)
-        run: >-
-          uv run pytest
-          tests/inner/test_claude_sdk_windows_static_helper_session.py
-          --reruns 0 -p no:cacheprovider -q -s
+        env:
+          OMNI_WINDOWS_HELPER_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-helper-evidence'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $script = Join-Path $evidence 'session.ps1'
+          @'
+          Set-Location $env:GITHUB_WORKSPACE
+          $Host.UI.RawUI.WindowTitle = 'Native Windows Claude SDK static-key session (mock)'
+          Write-Output "PR head: $env:OMNI_WINDOWS_HELPER_HEAD_SHA"
+          uv run pytest tests/inner/test_claude_sdk_windows_static_helper_session.py --reruns 0 -p no:cacheprovider -q -s 2>&1 |
+            Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'windows-helper-evidence/session.txt')
+          $testCode = $LASTEXITCODE
+          $testCode | Set-Content (Join-Path $env:RUNNER_TEMP 'windows-helper-evidence/exit.txt')
+          Start-Sleep -Seconds 15
+          exit $testCode
+          '@ | Set-Content $script
+          $console = Start-Process (Get-Command pwsh).Source -PassThru -WindowStyle Maximized `
+            -ArgumentList @('-NoProfile', '-File', "`"$script`"")
+          try {
+            $exitFile = Join-Path $evidence 'exit.txt'
+            $deadline = (Get-Date).AddSeconds(180)
+            while (!(Test-Path $exitFile) -and !$console.HasExited -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Milliseconds 200
+            }
+            if (!(Test-Path $exitFile)) { throw 'Native SDK session did not report an exit code' }
+            Get-Content (Join-Path $evidence 'session.txt')
+            try {
+              Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+              $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $bitmap = [System.Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
+              try {
+                $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                try {
+                  $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+                } finally { $graphics.Dispose() }
+                $colors = [System.Collections.Generic.HashSet[int]]::new()
+                foreach ($x in 0..9) {
+                  foreach ($y in 0..9) {
+                    [void]$colors.Add($bitmap.GetPixel([int]($x * $bounds.Width / 10), [int]($y * $bounds.Height / 10)).ToArgb())
+                  }
+                }
+                if ($colors.Count -le 1) { throw 'Windows desktop capture is blank' }
+                $bitmap.Save((Join-Path $evidence 'session.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+              } finally { $bitmap.Dispose() }
+            } catch {
+              Write-Warning "Native console capture unavailable: $($_.Exception.Message)"
+            }
+            if ([int](Get-Content $exitFile) -ne 0) { throw 'Native SDK session test failed' }
+            [void]$console.WaitForExit(20000)
+          } finally {
+            if (!$console.HasExited) { Stop-Process -Id $console.Id -Force }
+          }
+
+      - name: Upload native Windows SDK session evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: windows-helper-session-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/windows-helper-evidence/session.txt
+            ${{ runner.temp }}/windows-helper-evidence/session.png
+            ${{ runner.temp }}/windows-helper-evidence/exit.txt
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Codex skill junction regressions (hard)
         run: >-

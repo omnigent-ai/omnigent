@@ -367,6 +367,12 @@ foreach ($path in @($env:OMNI_TEST_KEY_DIRECTORY, $env:OMNI_TEST_KEY_PATH)) {
         $rules[0].FileSystemRights -ne 'FullControl') { throw 'Wrong rights' }
 }
 Write-Output 'owner-only ACL verified'
+$directory = $env:OMNI_TEST_KEY_DIRECTORY
+$acl = Get-Acl -LiteralPath $directory
+$world = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($world, 'Read', 'Allow')
+$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $directory -AclObject $acl
 """
     try:
         result = subprocess.run(
@@ -388,6 +394,8 @@ Write-Output 'owner-only ACL verified'
         )
         assert b"owner-only ACL verified" in result.stdout
         assert key_file.path.read_bytes() == b"dummy-acl-key"
+        with pytest.raises(OSError, match="unexpected access"):
+            key_files._WindowsOwnerAcl().verify(key_file.directory, directory=True)
     finally:
         key_file.close()
     assert not key_file.directory.exists()
