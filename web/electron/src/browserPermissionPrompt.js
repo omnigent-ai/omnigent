@@ -57,6 +57,21 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
     cookieImport,
   }) {
     if (!parent || parent.isDestroyed() || signal.aborted) return Promise.resolve("dismiss");
+    if (kind === "security-key" && parent.webContents.isLoadingMainFrame?.()) {
+      return new Promise((resolve) => {
+        const finish = (choice) => {
+          parent.webContents.removeListener("did-stop-loading", ready);
+          parent.removeListener("closed", aborted);
+          signal.removeEventListener("abort", aborted);
+          resolve(choice);
+        };
+        const ready = () => finish("suppressed");
+        const aborted = () => finish("dismiss");
+        parent.webContents.once("did-stop-loading", ready);
+        parent.once("closed", aborted);
+        signal.addEventListener("abort", aborted, { once: true });
+      });
+    }
     const current = prompts.get(parent);
     // The advisory security-key notice yields to a permission decision; "suppressed" asks it
     // to retry once that decision is made.

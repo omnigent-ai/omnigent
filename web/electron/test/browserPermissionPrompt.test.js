@@ -30,6 +30,7 @@ class Window extends EventEmitter {
     this.webContents = new EventEmitter();
     this.webContents.mainFrame = { url: "" };
     this.webContents.isDestroyed = () => this.destroyed;
+    this.webContents.isLoadingMainFrame = () => Boolean(this.loadingMainFrame);
     this.webContents.setWindowOpenHandler = (handler) => {
       this.openHandler = handler;
     };
@@ -270,17 +271,28 @@ describe("browser permission popover", () => {
       });
       await hideThenReturn(() => h.parent.emit("hide"));
       await hideThenReturn(() => h.parent.emit("minimize"));
-      await hideThenReturn(() =>
-        h.parent.webContents.emit("did-start-navigation", {}, "https://app.example", false, true),
-      );
+      const beforeNavigation = h.windows.length;
+      h.parent.loadingMainFrame = true;
+      h.parent.webContents.emit("did-start-navigation", {}, "https://app.example", false, true);
+      await wait();
+      assert.equal(visible, true, "the shell stays visible while navigating");
+      assert.equal(h.windows.at(-1).destroyed, true);
+      assert.equal(h.windows.length, beforeNavigation, "navigation prevents immediate reopening");
+      await wait();
+      assert.equal(h.windows.length, beforeNavigation, "the notice waits for navigation to finish");
+      h.parent.loadingMainFrame = false;
+      h.parent.webContents.emit("did-stop-loading");
+      await wait();
+      assert.equal(h.windows.length, beforeNavigation + 1, "the notice returns after navigation");
       h.windows.at(-1).emit("blur");
       await wait();
       assert.equal(h.windows.at(-1).destroyed, false, "focus leaving keeps the notice");
+      const beforeDismiss = h.windows.length;
       h.choose("dismiss");
-      await wait();
-      await wait();
+      mock.timers.tick(SHOW_DELAY_MS * 2);
+      await tick();
       assert.equal(h.windows.at(-1).destroyed, true);
-      assert.equal(h.windows.length, 5);
+      assert.equal(h.windows.length, beforeDismiss, "explicit dismissal does not retry");
     } finally {
       mock.timers.reset();
     }
