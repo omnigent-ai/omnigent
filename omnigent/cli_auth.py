@@ -29,9 +29,9 @@ import os
 import stat
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from omnigent.process_logging import data_dir
@@ -900,7 +900,11 @@ def open_server_client(
     kwargs: dict[str, Any] = {}
     from omnigent.session_host import route_known_session_request
 
-    kwargs["event_hooks"] = {"request": [route_known_session_request]}
+    request_hooks: list[Callable[[httpx.Request], Awaitable[None]]] = [route_known_session_request]
+    request_hook = getattr(auth, "server_request_hook", None)
+    if callable(request_hook):
+        request_hooks.append(cast(Callable[[httpx.Request], Awaitable[None]], request_hook))
+    kwargs["event_hooks"] = {"request": request_hooks}
     if timeout is not _TIMEOUT_UNSET:
         kwargs["timeout"] = timeout
     if transport is not None:

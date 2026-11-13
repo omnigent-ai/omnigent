@@ -1670,6 +1670,73 @@ def test_runner_databricks_auth_noop_without_factory() -> None:
     assert "Authorization" not in sent.headers
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "redirect",
+    [
+        "https://outside.test/v1/sessions/s/events",
+        "https://server.test/serving-endpoints/m/invocations",
+    ],
+)
+async def test_runner_binding_identity_stays_inside_its_server_api_on_redirect(
+    monkeypatch: pytest.MonkeyPatch, redirect: str
+) -> None:
+    from omnigent.cli_auth import open_server_client
+    from omnigent.runner.identity import (
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "synthetic-private-runner-binding")
+    observed: list[tuple[str, str | None]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        observed.append((str(request.url), request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)))
+        if len(observed) == 1:
+            return httpx.Response(302, headers={"location": redirect})
+        return httpx.Response(200)
+
+    async with open_server_client(
+        "https://server.test",
+        auth=_RunnerDatabricksAuth(None, server_url="https://server.test"),
+        transport=httpx.MockTransport(handle),
+        follow_redirects=True,
+    ) as client:
+        response = await client.get("/v1/sessions/s/events")
+    assert response.status_code == 200
+    assert observed == [
+        ("https://server.test/v1/sessions/s/events", "synthetic-private-runner-binding"),
+        (redirect, None),
+    ]
+
+
+def test_runner_binding_identity_is_not_added_to_model_or_third_party_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.identity import (
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "synthetic-private-runner-binding")
+    auth = _RunnerDatabricksAuth(
+        lambda: "workspace-bearer", server_url="https://server.test/api/omni"
+    )
+    owned = next(
+        auth.auth_flow(httpx.Request("POST", "https://server.test/api/omni/v1/sessions/s/events"))
+    )
+    assert owned.headers[RUNNER_TUNNEL_TOKEN_HEADER] == "synthetic-private-runner-binding"
+    for url in (
+        "https://server.test/serving-endpoints/m/invocations",
+        "https://outside.test/api/omni/v1/catalog",
+        "https://server.test/api/omni/v1/%2e%2e/%2e%2e/serving-endpoints/m/invocations",
+    ):
+        request = httpx.Request("POST", url)
+        sent = next(auth.auth_flow(request))
+        assert RUNNER_TUNNEL_TOKEN_HEADER not in sent.headers
+        assert sent.headers["Authorization"] == "Bearer workspace-bearer"
+
+
 def _drive_auth_flow(
     auth: _RunnerDatabricksAuth,
     request: httpx.Request,
