@@ -332,15 +332,14 @@ def _discover_codex(model_services: list[dict[str, object]]) -> tuple[str, ...]:
     [None, ["codex/v1/responses"], ["codex/v1/responses", "openai/v1/responses"]],
     ids=["legacy", "codex-route", "both-routes"],
 )
-def test_discover_codex_models_filters_non_codex_and_ranks_curated_first(
+def test_discover_codex_models_filters_non_codex_and_ranks_newest_first(
     api_types: list[str] | None,
 ) -> None:
-    """Codex discovery keeps only codex-servable ids, curated catalog first.
+    """Codex discovery keeps only codex-servable ids, newest generation first.
 
     The listing says what a workspace *can* serve, not which to launch on:
-    the owned curated codex catalog leads (in its declared order), then
-    versioned GPT ids newest-first, then the rest — and non-codex families
-    (Claude) are dropped entirely.
+    versioned GPT ids lead newest-first, then the rest — and non-codex
+    families (Claude) are dropped entirely.
     """
     services: list[dict[str, object]] = [
         {"name": "model-services/system.ai.gpt-5-5"},
@@ -357,12 +356,11 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first(
     servable = _discover_codex(services)
 
     assert servable == (
-        # Curated (cheapest-safe-first) beats a newer non-curated generation.
+        # A newer generation leads; no release-pinned arm outranks it.
+        "system.ai.gpt-6-1",
         "system.ai.gpt-5-6-sol",
         "system.ai.gpt-5-6-luna",
         "system.ai.gpt-5-5",
-        # Non-curated GPT, newest generation next.
-        "system.ai.gpt-6-1",
         # Codex-compatible but unversioned, last.
         "system.ai.kimi-k2",
         "system.ai.glm-9",
@@ -404,6 +402,56 @@ def test_discover_codex_models_drops_models_without_the_codex_route() -> None:
         "system.ai.gpt-5-4",
         "system.ai.gpt-5-4-mini",
     )
+
+
+@pytest.mark.parametrize(
+    ("catalog", "expected"),
+    [
+        pytest.param(
+            [
+                {"slug": "gpt-daybreak-latest", "priority": 0, "visibility": "hide"},
+                {"slug": "gpt-6-astra", "priority": 2, "visibility": "list"},
+                {"slug": "gpt-6.1-terra", "priority": 7, "visibility": "list"},
+                {"slug": "gpt-6.1-sol", "priority": 1, "visibility": "list"},
+                {"slug": "gpt-5.6-sol", "priority": 5, "visibility": "list"},
+            ],
+            (
+                "system.ai.gpt-6-1-sol",
+                "system.ai.gpt-5-6-sol",
+                "system.ai.gpt-6-1-terra",
+                "system.ai.gpt-daybreak-latest",
+                "system.ai.glm-5-2",
+            ),
+            id="codex-priority",
+        ),
+        pytest.param(
+            [],
+            (
+                "system.ai.gpt-6-1-terra",
+                "system.ai.gpt-6-1-sol",
+                "system.ai.gpt-5-6-sol",
+                "system.ai.gpt-daybreak-latest",
+                "system.ai.glm-5-2",
+            ),
+            id="unreadable-catalog",
+        ),
+    ],
+)
+def test_order_by_codex_catalog_follows_codex_priority(
+    catalog: list[dict[str, object]], expected: tuple[str, ...]
+) -> None:
+    """Servable ids follow Codex's visible catalog priority; the rest keep their order."""
+    from omnigent.models.databricks_model_discovery import order_by_codex_catalog
+
+    servable = (
+        "system.ai.gpt-6-1-terra",
+        "system.ai.gpt-6-1-sol",
+        "system.ai.gpt-5-6-sol",
+        "system.ai.gpt-daybreak-latest",
+        "system.ai.glm-5-2",
+    )
+
+    assert order_by_codex_catalog(servable, catalog) == expected
 
 
 def test_discover_codex_models_empty_listing_is_authoritative() -> None:

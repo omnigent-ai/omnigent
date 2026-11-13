@@ -252,7 +252,13 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } = {}) {
+function render(
+  ui: Parameters<typeof renderBase>[0],
+  {
+    expandAdvanced = true,
+    info = {},
+  }: { expandAdvanced?: boolean; info?: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> } = {},
+) {
   const view = renderBase(ui, {
     wrapper: ({ children }) => (
       <CapabilitiesProvider
@@ -262,6 +268,7 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
           scheduled_task_harness_settings: true,
           scheduled_task_approval_skipping_modes: true,
           scheduled_task_worktrees: true,
+          ...info,
         }}
       >
         {children}
@@ -302,10 +309,13 @@ function renderDialog(onOpenChange: (open: boolean) => void = vi.fn()) {
 }
 
 /** Render inside a CapabilitiesProvider that advertises managed sandboxes. */
-function renderWithSandboxes(onOpenChange: (open: boolean) => void = vi.fn()) {
+function renderWithSandboxes(
+  onOpenChange: (open: boolean) => void = vi.fn(),
+  info: Partial<ServerInfo> = {},
+) {
   return render(
     <CapabilitiesProvider
-      info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true }}
+      info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true, ...info }}
     >
       <CreateScheduledTaskDialog open onOpenChange={onOpenChange} />
     </CapabilitiesProvider>,
@@ -1130,14 +1140,29 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
   });
 
   it("starts a new task in sandbox mode when sandboxes are offered, and a host pick sticks", () => {
-    renderWithSandboxes();
+    renderWithSandboxes(vi.fn(), {
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_automation_notices: {
+        agent_sandbox: "Keep your laptop's credentials fresh.",
+        other_sandbox: "Another provider's notice.",
+      },
+    });
     // The sandbox default wins over the online host and shows the fresh-sandbox
-    // copy; the connected-host workspace picker never appears.
+    // copy and the provider's notice; the connected-host workspace picker never appears.
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Sandbox");
+    // Only the run target's provider notice shows.
+    expect(screen.getByTestId("task-sandbox-automation-notice")).toHaveTextContent(
+      "Keep your laptop's credentials fresh.",
+    );
+    expect(screen.queryByText("Another provider's notice.")).not.toBeInTheDocument();
     expect(screen.queryByText("pick-workspace")).not.toBeInTheDocument();
     openHostSelect();
     fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
     expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("laptop");
+    expect(screen.queryByTestId("task-sandbox-automation-notice")).not.toBeInTheDocument();
+    openHostSelect();
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+    expect(screen.getByTestId("task-sandbox-automation-notice")).toBeInTheDocument();
   });
 
   it.each([
@@ -3070,7 +3095,10 @@ describe("CreateScheduledTaskDialog session mode", () => {
 });
 
 describe("automation trigger type", () => {
-  function dialog(props: Partial<React.ComponentProps<typeof CreateScheduledTaskDialog>> = {}) {
+  function dialog(
+    props: Partial<React.ComponentProps<typeof CreateScheduledTaskDialog>> = {},
+    info: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> = {},
+  ) {
     return (
       <CapabilitiesProvider
         info={{
@@ -3079,6 +3107,7 @@ describe("automation trigger type", () => {
           scheduled_task_subhour: true,
           automation_trigger_poll_minutes: 30,
           features: { automations_v2: true, session_orchestration: true },
+          ...info,
         }}
       >
         <CreateScheduledTaskDialog open onOpenChange={vi.fn()} {...props} />
@@ -3297,7 +3326,7 @@ describe("automation trigger type", () => {
         { ...emptyTriggerFields("slack"), scope: "support", instructions: "Answer the question." },
         { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
       ),
-      { agentId: "ag_claude_native", model: "opus", effort: "" },
+      { agentId: "ag_claude_native", model: "opus", effort: "", permissionMode: "" },
     )!;
     const slackTask = scheduledTask({
       name: "Slack messages",
@@ -3430,6 +3459,26 @@ describe("automation trigger type", () => {
       expect(readTriggerWorkerSettings(input.prompt)).toMatchObject({ agentId: "ag_1" });
       expect(splitTriggerPrompt(input.prompt).userPrompt).toBe("Answer the question.");
       expect(input).not.toHaveProperty("sessionId");
+    });
+
+    it("keeps a worker permission mode chosen while switched when switching back", async () => {
+      render(dialog({ editingTask: slackTask }, { session_create_permission_modes: true }));
+      await choose("Jira");
+      await choose("Auto", "task-permission-trigger");
+      await choose("Slack");
+      expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Auto");
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(triggerPromptSource(input.prompt)).toBe("slack");
+      // Only the mode changed, so the restored prompt must still pick it up.
+      expect(readTriggerWorkerSettings(input.prompt)).toEqual({
+        agentId: "ag_claude_native",
+        model: "opus",
+        effort: "",
+        permissionMode: "auto",
+      });
+      expect(input).not.toHaveProperty("permissionMode");
     });
 
     it("keeps sandboxed workers beside a host poller on the new source", async () => {
@@ -3571,6 +3620,7 @@ describe("automation trigger type", () => {
         agentId: "ag_claude_native",
         model: "opus",
         effort: "",
+        permissionMode: "",
       });
       expect(readTriggerWorkerPlacement(prompt)).toBe("managed");
     });
@@ -4172,6 +4222,39 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     );
   });
 
+  it.each([
+    ["the server applies it", { session_create_permission_modes: true }, "Auto", true],
+    ["the server would ignore it", {}, "Auto", false],
+    // The server refuses an approval-skipping mode for a session an agent starts.
+    [
+      "it skips approval",
+      { session_create_permission_modes: true, scheduled_task_approval_skipping_modes: true },
+      "Bypass permissions",
+      false,
+    ],
+  ])(
+    "gives new workers the automation's permission mode unless %s",
+    async (_case, extraInfo, permission, passed) => {
+      renderTrigger("jira", extraInfo);
+      if (permission !== "Auto") {
+        fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: permission }));
+      }
+      type("task-trigger-scope", "ES");
+      type("task-trigger-instructions", "Triage it.");
+      const prompt = await submittedPrompt();
+      const mode = mutateAsync.mock.calls[0][0].permissionMode;
+      expect(mode).toBe(permission === "Auto" ? "auto" : "bypassPermissions");
+      if (passed) {
+        expect(prompt).toContain(
+          'title "Jira <ticket key>", permission_mode "auto", and a message',
+        );
+      } else {
+        expect(prompt).not.toContain("permission_mode");
+      }
+    },
+  );
+
   it("separates the rendered system and user prompts on Edit as prompt", async () => {
     renderTrigger("github");
     expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");
@@ -4206,6 +4289,17 @@ describe("CreateScheduledTaskDialog trigger template", () => {
 });
 
 describe("editing template prompts", () => {
+  function withCodexAgent() {
+    vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+      data: [
+        ...AGENTS,
+        testAgent("ag_codex", "codex-native-ui", {
+          display_name: "Codex",
+          harness: "codex-native",
+        }),
+      ],
+    } as ReturnType<typeof agentsHook.useAvailableAgents>);
+  }
   function templatePrompt(taskSessionMode: "new" | "continue" = "new") {
     return renderTriggerPrompt(
       "jira",
@@ -4263,6 +4357,7 @@ describe("editing template prompts", () => {
         agentId: "ag_claude_native",
         model: "opus",
         effort: "high",
+        permissionMode: "",
       });
       for (const key of [
         "agentId",
@@ -4295,7 +4390,137 @@ describe("editing template prompts", () => {
         agentId: "ag_1",
         model: "",
         effort: "",
+        permissionMode: "",
       });
+    },
+  );
+
+  it.each([
+    ["ag_claude_native", "auto", "Auto"],
+    // Hand-written, so no picker offers it, but it still overrides the agent's own opt-ins.
+    ["ag_codex", "default", "Default"],
+  ])(
+    "lets a saved %s worker mode %s be cleared on a server that can't apply it",
+    async (agentId, permissionMode, label) => {
+      const saved = updateTriggerWorkerSettings(original, {
+        agentId,
+        model: "",
+        effort: "",
+        permissionMode,
+      })!;
+      withCodexAgent();
+      const task = scheduledTask({ prompt: saved, sessionMode: "continue", sessionId: "poller" });
+      render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />);
+      expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
+      expect(screen.getByTestId("task-worker-permission-unapplied")).toHaveTextContent(
+        `Matching sessions are set to start in ${label}, which this server can't apply`,
+      );
+      fireEvent.click(screen.getByTestId("task-worker-permission-clear"));
+      expect(screen.queryByTestId("task-worker-permission-unapplied")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(readTriggerWorkerSettings(input.prompt)).toEqual({
+        agentId,
+        model: "",
+        effort: "",
+        permissionMode: "",
+      });
+      expect(input.prompt).not.toContain("permission_mode");
+    },
+  );
+
+  it.each([
+    // Claude's mode, written by hand into a Codex worker call.
+    ["auto", "Matching sessions are set to start in auto, which this harness doesn't offer here"],
+    // Codex's own default is valid; it overrides the agent's opt-ins, so nothing to warn about.
+    ["default", null],
+  ])(
+    "flags a saved Codex worker mode %s only when Codex doesn't offer it",
+    async (permissionMode, warning) => {
+      withCodexAgent();
+      const saved = updateTriggerWorkerSettings(original, {
+        agentId: "ag_codex",
+        model: "",
+        effort: "",
+        permissionMode,
+      })!;
+      const task = scheduledTask({ prompt: saved, sessionMode: "continue", sessionId: "poller" });
+      render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />, {
+        info: { session_create_permission_modes: true },
+      });
+      if (warning === null) {
+        expect(screen.queryByTestId("task-worker-permission-unapplied")).not.toBeInTheDocument();
+        return;
+      }
+      expect(screen.getByTestId("task-worker-permission-unapplied")).toHaveTextContent(warning);
+      fireEvent.click(screen.getByTestId("task-worker-permission-clear"));
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      expect(updateMutateAsync.mock.calls[0][0].input.prompt).not.toContain("permission_mode");
+    },
+  );
+
+  it("clears the workers' permission mode when their harness changes", async () => {
+    withCodexAgent();
+    const task = scheduledTask({ prompt: original, sessionMode: "continue", sessionId: "poller" });
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />, {
+      info: { session_create_permission_modes: true },
+    });
+    const select = async (id: string, name: string) => {
+      fireEvent.keyDown(screen.getByTestId(id), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name }));
+    };
+    await select("task-worker-agent-trigger", "Claude Code");
+    await select("task-permission-trigger", "Auto");
+    // Claude's Auto isn't a Codex mode.
+    await select("task-worker-agent-trigger", "Codex");
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    expect(readTriggerWorkerSettings(input.prompt)).toMatchObject({ permissionMode: "" });
+    expect(input.prompt).not.toContain("permission_mode");
+    expect(input).not.toHaveProperty("permissionMode");
+  });
+
+  it.each([true, false])(
+    "saves the workers' permission mode, offering only modes that keep approval (server applies it: %s)",
+    async (supported) => {
+      const task = scheduledTask({
+        prompt: original,
+        sessionMode: "continue",
+        sessionId: "poller",
+      });
+      render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />, {
+        info: { session_create_permission_modes: supported },
+      });
+      fireEvent.keyDown(screen.getByTestId("task-worker-agent-trigger"), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: "Claude Code" }));
+      if (!supported) {
+        expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
+        return;
+      }
+      expect(screen.getByTestId("task-worker-settings")).toHaveTextContent(
+        "Modes that skip approval aren't available here.",
+      );
+      fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+      expect(await screen.findByRole("option", { name: "Auto" })).toBeInTheDocument();
+      // The server refuses these for a session an agent starts.
+      for (const name of ["Bypass permissions", "Don't ask"])
+        expect(screen.queryByRole("option", { name })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("option", { name: "Auto" }));
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const input = updateMutateAsync.mock.calls[0][0].input;
+      expect(readTriggerWorkerSettings(input.prompt)).toEqual({
+        agentId: "ag_claude_native",
+        model: "",
+        effort: "",
+        permissionMode: "auto",
+      });
+      // The polling session's own mode is unchanged.
+      expect(input).not.toHaveProperty("permissionMode");
     },
   );
 

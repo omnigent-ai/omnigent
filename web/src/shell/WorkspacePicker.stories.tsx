@@ -11,9 +11,6 @@ import {
   workspaceStoryProjects,
 } from "./workspaceStoryFixtures";
 
-// Keep relative age labels stable as the calendar advances.
-const worktreeUpdatedAt = Math.floor(Date.now() / 1000) - 2 * 365 * 24 * 60 * 60;
-
 const projectEntries = [
   storyDirectory(`${workspaceStoryProjects}/api`),
   storyDirectory(`${workspaceStoryProjects}/app`),
@@ -46,6 +43,7 @@ const meta = {
     (Story, context) => (
       <StoryQueryRouter
         seed={(queryClient) => {
+          const twoYearsAgo = Math.floor(Date.now() / 1000) - 2 * 365 * 24 * 60 * 60;
           seedFilesystem(queryClient, workspaceStoryProjects, projectEntries);
           seedFilesystem(queryClient, "", [
             storyDirectory(`${workspaceStoryHome}/projects`),
@@ -70,21 +68,21 @@ const meta = {
                           branch: "agentic/layouts",
                           is_main: false,
                           detached: false,
-                          updated_at: worktreeUpdatedAt,
+                          updated_at: twoYearsAgo,
                         },
                         {
                           path: `${workspaceStoryHome}/worktrees/command-palette`,
                           branch: "feature/command-palette",
                           is_main: false,
                           detached: false,
-                          updated_at: worktreeUpdatedAt - 7200,
+                          updated_at: twoYearsAgo - 2 * 60 * 60,
                         },
                         {
                           path: `${workspaceStoryHome}/worktrees/streaming-status`,
                           branch: "feature/streaming-status",
                           is_main: false,
                           detached: false,
-                          updated_at: worktreeUpdatedAt - 86_400,
+                          updated_at: twoYearsAgo - 24 * 60 * 60,
                         },
                       ]),
                 ],

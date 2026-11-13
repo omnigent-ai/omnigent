@@ -102,7 +102,11 @@ export function PermissionsModal({
   // In "off" mode never fetch the grant list — the modal short-circuits to a
   // notice below, so the request would be wasted (and the server rejects any
   // grant anyway).
-  const { data: permissions, isLoading } = usePermissions(open && !sharingOff ? sessionId : null);
+  const {
+    data: permissions,
+    isLoading,
+    refetch: refreshPermissions,
+  } = usePermissions(open && !sharingOff ? sessionId : null);
   const grant = useGrantPermission(sessionId);
   const revoke = useRevokePermission(sessionId);
 
@@ -110,6 +114,7 @@ export function PermissionsModal({
   const [newLevel, setNewLevel] = useState("1");
   const [error, setError] = useState<string | null>(null);
   const [showQr, setShowQr] = useState(false);
+  const [checkingPermissions, setCheckingPermissions] = useState(false);
   const blockedNoticeId = useId();
 
   // Whether the owner shared the workspace files with view-level collaborators.
@@ -131,7 +136,8 @@ export function PermissionsModal({
   const hasWorkspace = !!session?.workspace;
   const workspaceShared = session?.shareWorkspaceFiles ?? false;
   const fileShareUnavailable = !!filePath && (!session || workspaceBlocked);
-  const shareBusy = grant.isPending || revoke.isPending || shareWorkspace.isPending;
+  const shareBusy =
+    checkingPermissions || grant.isPending || revoke.isPending || shareWorkspace.isPending;
   const visibleError = error ?? (fileShareUnavailable ? sessionError?.message : null);
 
   async function prepareFileShare() {
@@ -183,16 +189,27 @@ export function PermissionsModal({
     const trimmed = newUserId.trim();
     if (
       !trimmed ||
+      shareBusy ||
       workspaceBlocked ||
       fileShareUnavailable ||
       (!!filePath && permissions === undefined)
     )
       return;
     setError(null);
-    const existingGrant = filePath ? userGrants.find((p) => p.user_id === trimmed) : undefined;
-    if (await grantAccess(trimmed, parseInt(newLevel, 10), existingGrant?.level)) {
-      setNewUserId("");
-      setNewLevel("1");
+    setCheckingPermissions(!!filePath);
+    try {
+      const currentPermissions = filePath
+        ? (await refreshPermissions({ throwOnError: true })).data
+        : undefined;
+      const existingGrant = currentPermissions?.find((p) => p.user_id === trimmed);
+      if (await grantAccess(trimmed, parseInt(newLevel, 10), existingGrant?.level)) {
+        setNewUserId("");
+        setNewLevel("1");
+      }
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setCheckingPermissions(false);
     }
   }
 
@@ -438,7 +455,7 @@ export function PermissionsModal({
           <Button
             type="submit"
             size="sm"
-            loading={grant.isPending || shareWorkspace.isPending}
+            loading={checkingPermissions || grant.isPending || shareWorkspace.isPending}
             disabled={
               workspaceBlocked ||
               !newUserId.trim() ||

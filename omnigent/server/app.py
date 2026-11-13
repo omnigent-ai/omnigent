@@ -33,6 +33,7 @@ from starlette.routing import Match, Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
+from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.debug_logging import (
     add_audit_attrs,
@@ -53,6 +54,7 @@ from omnigent.errors import (
     ErrorImpact,
     ErrorPhase,
     OmnigentError,
+    WrongReplicaError,
     is_cancelled_rpc_error,
     is_permission_denied_rpc_error,
 )
@@ -87,6 +89,7 @@ from omnigent.server import (
 )
 from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
+    AdminViewMiddleware,
     AuthProvider,
     SharingMode,
     auth_mode,
@@ -108,6 +111,7 @@ from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
 from omnigent.server.mcp_pool import ServerMcpPool
+from omnigent.server.openapi_stream_events import install_stream_event_schemas
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
     ServerPerformanceMetrics,
@@ -167,6 +171,7 @@ from omnigent.server.server_config import (
     RESTRICT_TO_AGENT_NAMES_KEY,
     PickerCuration,
 )
+from omnigent.server.session_mcp_selection import SessionMcpSelection
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -195,8 +200,9 @@ from omnigent.stores.user_settings_store import (
 from omnigent.util.event_loop_watchdog import monitor_event_loop
 
 if TYPE_CHECKING:
-    from omnigent.entities import Conversation
+    from omnigent.entities import Agent, Conversation
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
 
 _logger = logging.getLogger(__name__)
 
@@ -268,6 +274,10 @@ class ServerInfoResponse(BaseModel):
     # ``{"agent_sandbox": {"multi_repo": true}}``. The web branches on these
     # (multi-repo picker vs single). Providers absent from the map default off.
     sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+    # What each launchable provider's unattended runs need from their owner, e.g.
+    # ``{"agent_sandbox": "Keep your laptop signed in."}``. The automation form
+    # shows the run target's notice. Providers without one are absent.
+    sandbox_provider_automation_notices: dict[str, str] = {}
     enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
@@ -299,11 +309,16 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``source_session_id``: each run starts from a copy
     # of a session. Older servers reject it.
     scheduled_task_source_sessions: bool = True
+    # Scheduled tasks accept ``mcp_services``; older servers reject it.
+    scheduled_task_mcp_services: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
     automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
+    # Session creates accept ``permission_mode``; older servers ignore it.
+    session_create_permission_modes: bool = True
+    scripted_sessions: bool = False
     # Scheduled tasks accept explicit modes that skip approval; servers that omit
     # this may reject them, so clients hide those modes.
     scheduled_task_approval_skipping_modes: bool = True
@@ -320,6 +335,9 @@ class ServerInfoResponse(BaseModel):
     # A multipart create's metadata accepts ``model_override``; older servers
     # reject it.
     session_bundle_model_override: bool = True
+    # POST /v1/sessions/{id}/managed-host moves a session onto a new sandbox;
+    # absent on older servers, which clients treat as unsupported.
+    move_to_managed_sandbox: bool = False
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
@@ -332,12 +350,21 @@ class ServerInfoResponse(BaseModel):
     # A claude-sdk ``clear`` continues in a new session; older servers only clear native
     # sessions, so clients treat absent as unsupported.
     session_claude_sdk_clear: bool = False
+    # Declining a non-blocking Codex question card leaves the turn running; older
+    # servers interrupt Codex, so the forwarder keeps those questions in the terminal.
+    codex_nonblocking_decline: bool = False
+    # POST /v1/sessions/{id}/rewind and GET .../items?type=; absent on older servers,
+    # which clients treat as unsupported.
+    session_rewind: bool = False
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
+    admin_view: bool = False
+    # Session comments accept and preserve immutable PR coordinates.
+    comment_anchor_metadata: bool = True
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
@@ -706,6 +733,41 @@ def _error_audit_extra(
         phase=phase,
         **attributes,
     )
+
+
+def _wrong_replica_error_body(request: Request, exc: WrongReplicaError) -> dict[str, Any]:
+    """Name the slice key that reaches the replica holding the host's tunnel.
+
+    A request not keyed to the host must resend keyed to it. A request already
+    keyed to it missed because the tunnel dialed the default route, so it must
+    resend without the key in either form, as first-party clients do.
+
+    :param request: The rejected request; its slice-key header, or the query
+        parameter ingress falls back to when the header is empty, is compared
+        with the host.
+    :param exc: The wrong-replica error naming the host.
+    :returns: The ``error`` object: code, message ending in the remedy,
+        ``slice_key_header``, and ``slice_key`` to resend with (``None`` to
+        resend without the header).
+    """
+    request_slice_key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER) or (
+        request.query_params.get("omnigent_slice_key")
+    )
+    if request_slice_key == exc.host_id:
+        resend_slice_key = None
+        remedy = (
+            f"resend without the {OMNIGENT_SLICE_KEY_HEADER} header "
+            "or omnigent_slice_key query parameter"
+        )
+    else:
+        resend_slice_key = exc.host_id
+        remedy = f"resend with header {OMNIGENT_SLICE_KEY_HEADER}: {exc.host_id}"
+    return {
+        "code": exc.code,
+        "message": f"{exc.message}; {remedy}",
+        "slice_key_header": OMNIGENT_SLICE_KEY_HEADER,
+        "slice_key": resend_slice_key,
+    }
 
 
 # polly's and debby's multi-file bundles are packaged under
@@ -1109,6 +1171,62 @@ def _warn_on_empty_picker_restriction(
         )
 
 
+def _retired_builtin_agent_names(
+    agent_store: AgentStore, agent_cache: Any, owned: frozenset[str]
+) -> frozenset[str]:
+    """
+    Name the built-in rows an earlier version seeded that no current seeding owns.
+
+    A built-in row has a server-scope id derived from its name
+    (:func:`~omnigent.db.utils.builtin_agent_id`), which no other agent gets.
+    An operator's ``acp:`` agent is never one, even while its config can't be
+    read, and neither is a row whose bundle can't be read.
+
+    :param agent_store: Store for agent metadata.
+    :param agent_cache: Cache for loaded agent specs.
+    :param owned: Names this boot's seeding owns, e.g. ``{"polly", "devin-acp"}``.
+    :returns: The retired names, e.g. ``{"devin"}``.
+    """
+    from omnigent.db.utils import builtin_agent_id
+
+    retired: set[str] = set()
+    after: str | None = None
+    while True:
+        page = agent_store.list(limit=100, after=after, order="asc")
+        retired.update(
+            agent.name
+            for agent in page.data
+            if agent.session_id is None
+            and agent.id == builtin_agent_id(agent.name)
+            and agent.name not in owned
+            and not _may_be_operator_acp_agent(agent, agent_cache)
+        )
+        if not page.has_more or page.last_id is None:
+            return frozenset(retired)
+        after = page.last_id
+
+
+def _may_be_operator_acp_agent(agent: "Agent", agent_cache: Any) -> bool:
+    """
+    Whether a stored built-in row is an operator's ``acp:<slug>`` agent, or might be.
+
+    Packaged ACP rows run on their catalog id (e.g. ``devin``); configured ones
+    run on ``acp:<slug>``. A bundle that can't be read can't be told apart.
+
+    :param agent: The stored row.
+    :param agent_cache: Cache for loaded agent specs.
+    :returns: ``True`` unless its bundle loads and runs on another harness.
+    """
+    try:
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+    except Exception:
+        _logger.debug("could not read the bundle of built-in row %r", agent.name, exc_info=True)
+        return True
+    return loaded.spec.executor.harness_kind.startswith("acp:")
+
+
 def _ensure_default_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
@@ -1126,8 +1244,10 @@ def _ensure_default_agents(
     ``OMNIGENT_SEEDED_AGENTS`` trims the packaged roster. Each helper
     returns the packaged names it owns (seeded or not), so whatever the
     allowlist leaves out is returned here and hidden from ``GET /v1/agents``
-    by the caller that stores it. A row seeded by an earlier boot is
-    suppressed rather than deleted: sessions look their agent up by
+    by the caller that stores it. A built-in row an earlier version seeded,
+    which no helper or configured ACP agent owns any more, counts as packaged
+    too. A row seeded by an earlier boot is suppressed rather than deleted:
+    sessions look their agent up by
     ``conversations.agent_id``, so dropping the row would leave them without one.
 
     Extras from ``OMNIGENT_BUILTIN_AGENT_DIRS`` are deliberately outside
@@ -1149,6 +1269,13 @@ def _ensure_default_agents(
     extras = _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
     if allowlist is None:
         return frozenset()
+    # Configured ACP agents and listed extras use built-in IDs but remain
+    # operator-owned, even when an extra fails to seed.
+    operator_owned = frozenset(agent.slug for agent in _configured_acp_agents()[0])
+    operator_owned |= _listed_extra_builtin_agent_names()
+    packaged |= _retired_builtin_agent_names(
+        agent_store, agent_cache, packaged | extras | operator_owned
+    )
     unknown = allowlist - packaged
     if unknown:
         _logger.warning(
@@ -1178,6 +1305,20 @@ def _ensure_default_agents(
 # or an e2e fixture — ship custom always-available agents (e.g. a plain
 # claude-sdk chat agent that a fork can switch into).
 _EXTRA_BUILTIN_AGENTS_ENV = "OMNIGENT_BUILTIN_AGENT_DIRS"
+
+
+def _listed_extra_builtin_agent_names() -> frozenset[str]:
+    """
+    Name every agent :data:`_EXTRA_BUILTIN_AGENTS_ENV` lists, seeded or not.
+
+    A path that is missing this boot may still name a row an earlier boot
+    seeded, as its stem (``house.yaml`` → ``house``) or directory name.
+
+    :returns: Candidate names, e.g. ``{"house", "house.yaml"}``.
+    """
+    raw = os.environ.get(_EXTRA_BUILTIN_AGENTS_ENV, "")
+    entries = [Path(entry.strip()) for entry in raw.split(os.pathsep) if entry.strip()]
+    return frozenset({entry.stem for entry in entries} | {entry.name for entry in entries})
 
 
 def _ensure_extra_builtin_agents(
@@ -1371,6 +1512,24 @@ def _build_acp_bundle(*, harness: str, name: str) -> bytes:
         return _tar_gz_dir(bundle_dir)
 
 
+def _configured_acp_agents() -> tuple[list["AcpAgentEntry"], frozenset[str]]:
+    """
+    Read the operator's ``acp:`` agents and the builtin ACP rows they shadow.
+
+    :returns: The configured agents, and the builtin ACP row keys they claim,
+        e.g. ``([AcpAgentEntry(slug="devin", ...)], {"devin"})``; empty when
+        the ``acp:`` block is unreadable, which must never break startup.
+    """
+    try:
+        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
+
+        configured = list(acp_agents())
+        return configured, shadowed_builtin_acp_rows(configured)
+    except Exception:
+        _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
+        return [], frozenset()
+
+
 def _ensure_default_acp_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
@@ -1418,15 +1577,7 @@ def _ensure_default_acp_agents(
     owned: set[str] = set()
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
-    try:
-        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
-
-        configured = list(acp_agents())
-        shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:  # a malformed acp: block must never break startup
-        _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
-        configured = []
-        shadowed = frozenset()
+    configured, shadowed = _configured_acp_agents()
     for agent in configured:
         # Key the built-in by the slug, not the display label: agent names must be
         # ``[a-zA-Z0-9_-]+`` (the spec validator rejects spaces/dots), and a label
@@ -1647,6 +1798,7 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    session_mcp_selection: SessionMcpSelection | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1693,6 +1845,9 @@ def create_app(
     :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
         the owner identity fires act under, or a replacement executor. ``None``
         uses the built-in executor with every host owned by this replica.
+    :param session_mcp_selection: How sessions the server creates for an owner
+        (scheduled-task fires and the workers a session starts) record their MCP
+        services. ``None`` uses the MCP registry's labels.
     :param scheduled_task_scheduler_config: Overrides the server config's
         scheduled_task_scheduler section. With automations_v2 off, only
         startup_retry_seconds applies. Changes require restarting the app.
@@ -1809,9 +1964,8 @@ def create_app(
         and runner tunnels by host_id. When ``True``, a host-scoped request
         for a live host whose tunnel is on another replica returns 400
         ``wrong_replica``; otherwise it returns 409 "host is offline". The
-        400 recovers only for a client that sent the slice-key header and
-        retries without it, which the web client does only for requests it
-        keyed itself.
+        400 names the slice key to resend with, or says to resend without it
+        when the request was already keyed to the host.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -2350,8 +2504,10 @@ def create_app(
     app.state.startup_inputs = startup_inputs
     app.state.permission_store = permission_store
     app.state.host_store = host_store
+    app.state.scheduled_task_store = scheduled_task_store
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
+    app.state.session_mcp_selection = session_mcp_selection
     app.state.mcp_registry_auth = auth_provider
     app.state.runner_tunnel_tokens = runner_tunnel_tokens
 
@@ -2656,6 +2812,11 @@ def create_app(
     # outermost WS middleware — a forbidden origin is closed without even
     # reaching the metrics counter (which only counts on accept anyway).
     app.add_middleware(WebSocketOriginMiddleware)
+    admin_view_supported = (
+        authentication_requires_identity(auth_provider) and permission_store is not None
+    )
+    if admin_view_supported:
+        app.add_middleware(AdminViewMiddleware)
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
     # request/route closure) the runner router so it can reach the bound
@@ -2948,10 +3109,12 @@ def create_app(
                     error_phase=exc.phase.value,
                 ),
             )
-        return JSONResponse(
-            status_code=exc.http_status,
-            content={"error": {"code": exc.code, "message": exc.message}},
+        error = (
+            _wrong_replica_error_body(request, exc)
+            if isinstance(exc, WrongReplicaError)
+            else {"code": exc.code, "message": exc.message}
         )
+        return JSONResponse(status_code=exc.http_status, content={"error": error})
 
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(
@@ -3628,11 +3791,13 @@ def create_app(
         sandbox_provider = None
         sandbox_providers: list[str] = []
         sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+        sandbox_provider_automation_notices: dict[str, str] = {}
         if sandbox_config is not None and sandbox_config.managed_launch_supported:
             managed_sandboxes_enabled = True
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
             sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
+            sandbox_provider_automation_notices = sandbox_config.provider_automation_notices()
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
@@ -3713,6 +3878,7 @@ def create_app(
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
+                "sandbox_provider_automation_notices": sandbox_provider_automation_notices,
                 "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
@@ -3729,19 +3895,24 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "session_list_scoped_archives": True,
+                "scripted_sessions": app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS),
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,
+                "move_to_managed_sandbox": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
                 "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
                 "session_claude_sdk_clear": True,
+                "codex_nonblocking_decline": True,
+                "session_rewind": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
                 "session_title_instructions": user_settings_store is not None,
+                "admin_view": admin_view_supported,
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,
@@ -5491,6 +5662,7 @@ def create_app(
         # no per-request cost.
         app.add_middleware(BasePathMiddleware, base_path=resolved_base_path)
 
+    install_stream_event_schemas(app)
     return app
 
 

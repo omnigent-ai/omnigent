@@ -299,14 +299,43 @@ def test_missing_base_fails_closed(repository: Path) -> None:
 
 
 @pytest.mark.parametrize("push_context", ["flag", "hook"])
+@pytest.mark.parametrize(
+    "upstream_state", ["missing", "dangling", "rebased", "ahead", "stale", "stacked"]
+)
 def test_cli_uses_push_range_and_does_not_echo_values(
-    repository: Path, prohibited_name: str, push_context: str
+    repository: Path, prohibited_name: str, push_context: str, upstream_state: str
 ) -> None:
     script = Path(__file__).resolve().parents[3] / "dev/lint/lint_reference_policy.py"
     base = git(repository, "rev-parse", "HEAD").decode().strip()
     (repository / "notes.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
     git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "change")
+    if upstream_state == "dangling":
+        git(repository, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    elif upstream_state != "missing":
+        old_head = git(repository, "rev-parse", "HEAD").decode().strip()
+        git(repository, "switch", "-c", "upstream", base)
+        (repository / "upstream.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
+        git(repository, "add", ".")
+        git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "upstream")
+        git(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+        git(repository, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        if upstream_state == "stacked":
+            git(repository, "switch", "-c", "rebased", old_head)
+            git(repository, "-c", "core.hooksPath=/dev/null", "merge", "--no-edit", "upstream")
+        else:
+            git(repository, "switch", "-c", "rebased")
+            git(repository, "-c", "core.hooksPath=/dev/null", "cherry-pick", old_head)
+        if upstream_state == "ahead":
+            git(repository, "switch", "upstream")
+            (repository / "later.txt").write_text("safe\n", encoding="utf-8")
+            git(repository, "add", ".")
+            git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "later")
+            git(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+            git(repository, "switch", "rebased")
+        elif upstream_state == "stale":
+            git(repository, "update-ref", "refs/remotes/origin/main", base)
+        base = old_head
     arguments = ["--pre-push"] if push_context == "flag" else []
     environment = {**os.environ, "PRE_COMMIT_FROM_REF": base, "PRE_COMMIT_TO_REF": "HEAD"}
     if push_context == "hook":
@@ -321,6 +350,7 @@ def test_cli_uses_push_range_and_does_not_echo_values(
     )
     assert result.returncode == 1
     assert "notes.txt:1: prohibited reference" in result.stdout
+    assert ("upstream.txt:1: prohibited reference" in result.stdout) == (upstream_state == "stale")
     assert prohibited_name not in result.stdout
     for missing in [
         ("PRE_COMMIT_FROM_REF",),

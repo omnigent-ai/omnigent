@@ -1557,9 +1557,11 @@ describe("PermissionsModal", () => {
     it.each([1, 2, 3, 4])(
       "preserves an existing level %i grant when sharing a file",
       async (level) => {
-        listMock.mockResolvedValue([
-          { user_id: "alice@example.com", conversation_id: "conv_abc", level },
-        ]);
+        listMock
+          .mockResolvedValueOnce([])
+          .mockResolvedValue([
+            { user_id: "alice@example.com", conversation_id: "conv_abc", level },
+          ]);
 
         render(
           <PermissionsModal
@@ -1571,7 +1573,7 @@ describe("PermissionsModal", () => {
           { wrapper: createWrapper() },
         );
 
-        await screen.findByText("alice@example.com");
+        await screen.findByText("No grants yet.");
         fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
           target: { value: "alice@example.com" },
         });
@@ -1584,24 +1586,68 @@ describe("PermissionsModal", () => {
       },
     );
 
-    it("waits for existing permissions before granting file access", () => {
-      listMock.mockReturnValue(new Promise(() => {}));
+    it.each([
+      [false, true],
+      [true, true],
+      [true, false],
+    ])(
+      "waits for fresh permissions before granting file access (cached: %s, refresh succeeds: %s)",
+      async (cached, succeeds) => {
+        const queryClient = new QueryClient({
+          defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+        });
+        if (cached) queryClient.setQueryData(["permissions", "conv_abc"], []);
+        let finishPermissions!: () => void;
+        listMock.mockImplementation(
+          () =>
+            new Promise((resolve, reject) => {
+              finishPermissions = () => {
+                if (succeeds) {
+                  resolve([
+                    { user_id: "alice@example.com", conversation_id: "conv_abc", level: 3 },
+                  ]);
+                } else {
+                  reject(new Error("Could not refresh permissions"));
+                }
+              };
+            }),
+        );
+        render(
+          <PermissionsModal
+            sessionId="conv_abc"
+            filePath="report.md"
+            open={true}
+            onOpenChange={() => {}}
+          />,
+          { wrapper: createWrapper(queryClient) },
+        );
 
-      render(
-        <PermissionsModal
-          sessionId="conv_abc"
-          filePath="report.md"
-          open={true}
-          onOpenChange={() => {}}
-        />,
-        { wrapper: createWrapper() },
-      );
+        const input = screen.getByPlaceholderText("alice@example.com");
+        const grantButton = screen.getByRole("button", { name: "Grant" });
+        fireEvent.change(input, { target: { value: "alice@example.com" } });
+        if (!cached) {
+          expect(grantButton).toBeDisabled();
+          finishPermissions();
+          await screen.findByText("alice@example.com");
+        }
+        fireEvent.click(grantButton);
+        await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
+        expect(grantButton).toBeDisabled();
+        expect(screen.getByRole("button", { name: "Copy file link" })).toBeDisabled();
+        expect(grantMock).not.toHaveBeenCalled();
+        expect(updateSessionMock).not.toHaveBeenCalled();
 
-      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
-        target: { value: "alice@example.com" },
-      });
-      expect(screen.getByRole("button", { name: "Grant" })).toBeDisabled();
-    });
+        finishPermissions();
+        if (succeeds) {
+          await waitFor(() => expect(input).toHaveValue(""));
+        } else {
+          expect(await screen.findByText("Could not refresh permissions")).toBeInTheDocument();
+          expect(input).toHaveValue("alice@example.com");
+        }
+        expect(grantMock).not.toHaveBeenCalled();
+        expect(revokeMock).not.toHaveBeenCalled();
+      },
+    );
 
     it("copies an encoded fullscreen file link without current viewer parameters", async () => {
       listMock.mockResolvedValue([]);
