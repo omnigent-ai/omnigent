@@ -29,10 +29,10 @@ from omnigent.runtime.filesystem_registry import (
     GitFilesystemRegistry,
     GitStatusUnavailable,
     MultiRepositoryFilesystemRegistry,
+    _count_untracked_lines,
     _git_timeout_seconds,
     _normalize_path,
     _parse_git_porcelain_line,
-    _read_regular_file,
     _unquote_git_path,
     create_filesystem_registry,
 )
@@ -1879,17 +1879,13 @@ def test_git_line_counts_untracked_is_none(tmp_path: Path) -> None:
 
 
 def test_git_untracked_lines_count_text_files_only(tmp_path: Path) -> None:
-    """Untracked text files report their own lines, counted as numstat would.
-
-    Tracked files keep ``lines_added``; binaries, links and FIFOs get ``None``.
-    """
+    """Untracked text files report their own lines; tracked files keep ``lines_added``."""
     _init_git_with_commit(tmp_path, "tracked.py", "x\n")
     (tmp_path / "tracked.py").write_text("x\ny\n")
     (tmp_path / "text.py").write_text("one\ntwo\nthree")
     (tmp_path / "empty.txt").write_text("")
     (tmp_path / "blob.bin").write_bytes(b"a\0b\n")
     os.symlink("text.py", tmp_path / "link.py")
-    os.mkfifo(tmp_path / "pipe")
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     records = {r["path"]: r for r in reg.list_changed_files("any-conv", limit=100)}
@@ -1902,7 +1898,23 @@ def test_git_untracked_lines_count_text_files_only(tmp_path: Path) -> None:
     }
     assert "untracked_lines" not in records["tracked.py"]
     assert records["text.py"]["lines_added"] is None
-    assert _read_regular_file(tmp_path / "pipe", 10) is None
+
+
+def test_git_untracked_lines_never_read_through_links_or_fifos(tmp_path: Path) -> None:
+    """A directory swapped for a symlink after ``git status`` must not redirect the read."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("a\nb\n")
+    workspace = tmp_path / "workspace"
+    (workspace / "real").mkdir(parents=True)
+    (workspace / "real" / "new.txt").write_text("a\nb\n")
+    os.symlink(outside, workspace / "swapped")
+    os.mkfifo(workspace / "pipe")
+    paths = ["real/new.txt", "swapped/secret.txt", "pipe"]
+    records = [{"path": path, "bytes": 4} for path in paths]
+
+    _count_untracked_lines(workspace, records, set(paths))
+    assert [r["untracked_lines"] for r in records] == [2, None, None]
 
 
 def test_git_untracked_lines_stop_at_the_caps(tmp_path: Path, monkeypatch) -> None:
@@ -1913,10 +1925,9 @@ def test_git_untracked_lines_stop_at_the_caps(tmp_path: Path, monkeypatch) -> No
     )
     monkeypatch.setattr("omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_FILES", 2)
     _init_git_with_commit(tmp_path, "committed.py", "x\n")
-    # (name, content) newest first: the second file no longer fits the budget
-    # left by the first, the third exceeds the per-file cap, the fourth still
-    # fits, and the fifth is past the file-count cap.
-    files = [("a.txt", "1\n2\n3\n4\n"), ("b.txt", "1\n2\n3\n4\n"), ("c.txt", "x" * 11)]
+    # Newest first: over the per-file cap, read, over the remaining total
+    # budget, read, then past the file-count cap.
+    files = [("c.txt", "x" * 11), ("a.txt", "1\n2\n3\n4\n"), ("b.txt", "1\n2\n3\n4\n")]
     files += [("d.txt", "1\n"), ("e.txt", "1\n")]
     for age, (name, content) in enumerate(files):
         (tmp_path / name).write_text(content)
@@ -1925,9 +1936,9 @@ def test_git_untracked_lines_stop_at_the_caps(tmp_path: Path, monkeypatch) -> No
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     records = reg.list_changed_files("any-conv", limit=100)
     assert [(r["path"], r["untracked_lines"]) for r in records] == [
+        ("c.txt", None),
         ("a.txt", 4),
         ("b.txt", None),
-        ("c.txt", None),
         ("d.txt", 1),
         ("e.txt", None),
     ]

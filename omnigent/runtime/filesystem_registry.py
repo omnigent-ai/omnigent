@@ -29,7 +29,6 @@ import dataclasses
 import fnmatch
 import logging
 import os
-import stat
 import subprocess
 import threading
 import time
@@ -174,7 +173,7 @@ _SKIP_DIRS: frozenset[str] = frozenset(
 _UNTRACKED_LINES_MAX_FILES = 1_000
 _UNTRACKED_LINES_MAX_FILE_BYTES = 1024 * 1024
 _UNTRACKED_LINES_MAX_TOTAL_BYTES = 8 * 1024 * 1024
-# Git's binary heuristic: a NUL byte within the first 8000 bytes.
+# Git's content heuristic for binary files: a NUL within the first 8000 bytes.
 _BINARY_SNIFF_BYTES = 8000
 
 # Cursor plumbing Omnigent writes into ``<workspace>/.cursor`` at session launch
@@ -189,38 +188,21 @@ _CURSOR_PLUMBING_PATHS: frozenset[str] = frozenset(
 )
 
 
-def _read_regular_file(path: Path, max_bytes: int) -> bytes | None:
-    """Read at most ``max_bytes + 1`` bytes of a regular file, or ``None``.
-
-    Links are not followed and a FIFO cannot block the open.
-    """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError:
-        return None
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
-        return os.read(fd, max_bytes + 1)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
-
-
 def _count_untracked_lines(root: Path, records: list[dict[str, Any]], untracked: set[str]) -> None:
     """Set ``untracked_lines`` on each untracked record, newest first.
 
-    Counts lines as ``git diff --numstat`` would once the file is added.
-    Binary, oversized, unreadable and over-budget files get ``None``; one
-    budget bounds the reads of a whole listing. Tracked records are left
-    alone, so ``lines_added`` keeps meaning "tracked lines".
+    Counts newline-terminated lines (plus an unterminated last line) in files
+    that pass Git's NUL-byte content check; ``.gitattributes`` overrides are
+    not applied. Binary, oversized, unsafe, unreadable and over-budget files
+    get ``None``; one budget bounds the reads of a whole listing. Tracked
+    records are left alone, so ``lines_added`` keeps meaning "tracked lines".
 
     :param root: Directory the record paths are relative to.
     :param records: Records to annotate in place, newest first.
     :param untracked: Record paths ``git status`` reported as ``??``.
     """
+    from omnigent.runner.environment_filesystem import read_regular_file_beneath
+
     budget = _UNTRACKED_LINES_MAX_TOTAL_BYTES
     files_left = _UNTRACKED_LINES_MAX_FILES
     for record in records:
@@ -231,7 +213,7 @@ def _count_untracked_lines(root: Path, records: list[dict[str, Any]], untracked:
         data = None
         if files_left > 0 and size is not None and size <= cap:
             files_left -= 1
-            data = _read_regular_file(root / record["path"], cap)
+            data = read_regular_file_beneath(root, record["path"], cap)
         if data is not None:
             budget -= len(data)
         if data is None or len(data) > cap or b"\0" in data[:_BINARY_SNIFF_BYTES]:
