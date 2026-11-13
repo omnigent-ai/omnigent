@@ -27,19 +27,29 @@ pytestmark = pytest.mark.skipif(os.name != "nt", reason="native Windows SDK laun
 async def test_windows_static_key_gateway_completes_real_sdk_turns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    token = "dummy-native-static-helper-key"
+    initial_token = "dummy-native-static-helper-key"
+    refreshed_token = "dummy-native-static-helper-refreshed-key"
+    token = initial_token
+    allow_previous = False
     marker = "WINDOWS_STATIC_HELPER_OK"
     model = "sonnet"
     authenticated: list[bool] = []
+    refreshed_requests: list[bool] = []
 
     async def credential_checked_gateway(scope, receive, send) -> None:
         if scope["type"] == "http" and scope["path"] == "/v1/messages":
             headers = dict(scope["headers"])
-            valid = (
+            current = (
                 headers.get(b"x-api-key") == token.encode()
                 or headers.get(b"authorization") == f"Bearer {token}".encode()
             )
+            previous = allow_previous and (
+                headers.get(b"x-api-key") == initial_token.encode()
+                or headers.get(b"authorization") == f"Bearer {initial_token}".encode()
+            )
+            valid = current or previous
             authenticated.append(valid)
+            refreshed_requests.append(current and token == refreshed_token)
             if not valid:
                 await send({"type": "http.response.start", "status": 401, "headers": []})
                 await send({"type": "http.response.body", "body": b"dummy credential required"})
@@ -79,7 +89,7 @@ async def test_windows_static_key_gateway_completes_real_sdk_turns(
             await poll_until_async(lambda: server.started, timeout_s=15)
             async with httpx.AsyncClient(base_url=base_url) as control:
                 response = await control.post(
-                    "/mock/configure", json={"responses": [{"text": marker}] * 12}
+                    "/mock/configure", json={"responses": [{"text": marker}] * 128}
                 )
                 response.raise_for_status()
             executor = ClaudeSDKExecutor(
@@ -95,38 +105,59 @@ async def test_windows_static_key_gateway_completes_real_sdk_turns(
             print(f"Harness: claude-sdk {version('claude-agent-sdk')}; provider: loopback mock")
             print("Deployment: OSS; transport: real SDK and Claude CLI subprocess")
             client = None
-            for turn in range(2):
-                if turn:
-                    assert key_file is not None
-                    token = "dummy-native-static-helper-refreshed-key"
-                    key_file.path.write_bytes(token.encode("utf-8"))
-                    await asyncio.sleep(0.05)
-                    print("Updated dummy credential in the same private file for helper refresh.")
-                requests_before_turn = len(authenticated)
-                prompt = f"Return exactly {marker}. Turn {turn + 1}."
-                print(f"Prompt: {prompt}")
-                messages.append(
-                    {"role": "user", "content": prompt, "session_id": "windows-helper"}
-                )
-                events = [event async for event in executor.run_turn(messages, [], "")]
-                errors = [event for event in events if isinstance(event, ExecutorError)]
-                assert not errors, (errors, authenticated)
-                completed = [event for event in events if isinstance(event, TurnComplete)]
-                assert completed and completed[-1].response == marker
-                assert len(authenticated) > requests_before_turn
-                assert all(authenticated[requests_before_turn:])
-                print(f"Reply: {completed[-1].response}")
-                messages.append({"role": "assistant", "content": marker})
-                state = executor._clients["windows-helper"]
-                assert client is None or state.client is client
-                client = state.client
-                process = client._transport._process
-                assert process is not None and process.returncode is None
-                assert state.static_key_file is not None
-                assert key_file is None or state.static_key_file is key_file
-                key_file = state.static_key_file
-                assert key_file.path.read_bytes() == token.encode("utf-8")
-            assert len(authenticated) >= 2 and all(authenticated)
+            refresh_observed = False
+            turn = 0
+            # An expired helper cache returns its old key during background refresh.
+            async with asyncio.timeout(30):
+                while True:
+                    if turn == 1:
+                        assert key_file is not None
+                        token = refreshed_token
+                        key_file.path.write_bytes(token.encode("utf-8"))
+                        allow_previous = True
+                        print(
+                            "Rotated dummy key in the same private file; allowing cache overlap."
+                        )
+                    if turn:
+                        await asyncio.sleep(0.25)
+                    strict_refresh = refresh_observed
+                    requests_before_turn = len(authenticated)
+                    prompt = f"Return exactly {marker}. Turn {turn + 1}."
+                    print(f"Prompt: {prompt}")
+                    messages.append(
+                        {"role": "user", "content": prompt, "session_id": "windows-helper"}
+                    )
+                    events = [event async for event in executor.run_turn(messages, [], "")]
+                    errors = [event for event in events if isinstance(event, ExecutorError)]
+                    assert not errors, (errors, authenticated)
+                    completed = [event for event in events if isinstance(event, TurnComplete)]
+                    assert completed and completed[-1].response == marker
+                    assert len(authenticated) > requests_before_turn
+                    assert all(authenticated[requests_before_turn:])
+                    print(f"Reply: {completed[-1].response}")
+                    messages.append({"role": "assistant", "content": marker})
+                    state = executor._clients["windows-helper"]
+                    assert client is None or state.client is client
+                    client = state.client
+                    process = client._transport._process
+                    assert process is not None and process.returncode is None
+                    assert state.static_key_file is not None
+                    assert key_file is None or state.static_key_file is key_file
+                    key_file = state.static_key_file
+                    assert key_file.path.read_bytes() == token.encode("utf-8")
+                    if strict_refresh:
+                        assert all(refreshed_requests[requests_before_turn:])
+                        print(
+                            "Strict refreshed-key-only turn authenticated on the same client/file."
+                        )
+                        break
+                    if turn and any(refreshed_requests[requests_before_turn:]):
+                        refresh_observed = True
+                        allow_previous = False
+                        print("Gateway observed the refreshed dummy key; ending cache overlap.")
+                    turn += 1
+            assert len(authenticated) >= 3 and all(authenticated)
+            assert refresh_observed
         finally:
             try:
                 if executor is not None:
@@ -137,5 +168,7 @@ async def test_windows_static_key_gateway_completes_real_sdk_turns(
                 assert not worker.is_alive()
     assert process is not None and process.returncode is not None
     assert key_file is not None and not key_file.directory.exists()
-    print("Two real SDK turns authenticated with different dummy keys; helper refresh verified.")
+    print(
+        f"{turn + 1} real SDK turns authenticated; background helper refresh verified within 30s."
+    )
     print("CLI exited and private key file was removed.")
