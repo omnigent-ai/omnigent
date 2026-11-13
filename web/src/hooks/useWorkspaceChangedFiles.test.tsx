@@ -804,14 +804,23 @@ describe("useWorkspaceEnvironment runner bind", () => {
         }),
     );
 
-    const { environmentStatus } = renderShared(() => <EnvironmentProbe id="conv_new" />);
+    const settle = () =>
+      new Promise((resolve) => {
+        setTimeout(resolve, 50);
+      });
+
+    const { rerender, environmentStatus } = renderShared(() => <EnvironmentProbe id="conv_new" />);
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(environmentStatus()).toBe("error"));
-    await new Promise((resolve) => {
-      setTimeout(resolve, 50);
-    });
-
+    await settle();
     expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    stubSession({ runnerId: "runner_2" });
+    rerender();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(environmentStatus()).toBe("error"));
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("does not refetch a loaded environment when the first snapshot arrives", async () => {
