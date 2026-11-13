@@ -2926,6 +2926,7 @@ def test_submit_needles_for_long_single_paragraph() -> None:
     needles = _mod._submit_needles(content)
     assert len(needles) >= 2
     assert needles[0] == "Here is a long prompt th"
+    assert needles[-1] == "the entire prompt body."
     assert _mod._submit_needle(content) == needles[0]
 
 

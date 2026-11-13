@@ -5026,3 +5026,11 @@ async def test_empty_output_continuation_retry_turn_stays_running_and_closes_idl
     ]
     assert len(messages) == 1
     assert "error" not in str(messages[0]).lower()
+    assert "error" not in sink.item_types()
+    answer_index = sink.posts.index(("external_conversation_item", messages[0]))
+    idle_index = next(
+        index
+        for index, (kind, data) in enumerate(sink.posts)
+        if kind == "external_session_status" and data.get("status") == "idle"
+    )
+    assert answer_index < idle_index
