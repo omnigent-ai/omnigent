@@ -413,8 +413,8 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach"
-        ):
-            pass
+        ) as socket:
+            socket.receive()
 
     # The recreate ran exactly once, for this session. [] means the
     # route still closes 4404 (the pre-fix dead-end); a wrong id means
@@ -435,8 +435,8 @@ def test_runner_resource_attach_recreates_dead_repl_terminal(
     with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_abc/resources/terminals/terminal_tui_main/attach"
-        ):
-            pass
+        ) as socket:
+            socket.receive()
 
     assert auto_create_sessions == ["conv_abc"]
     assert attach_sockets[1] == str(fresh_dir / "tui-main.sock")

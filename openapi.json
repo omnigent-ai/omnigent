@@ -3475,6 +3475,12 @@
       "GrantPermissionRequest": {
         "description": "Request body for `PUT /v1/sessions/{id}/permissions`.",
         "properties": {
+          "ensure_minimum": {
+            "default": false,
+            "description": "Preserve a stronger existing grant atomically.",
+            "title": "Ensure Minimum",
+            "type": "boolean"
+          },
           "level": {
             "description": "Numeric permission level: `1` = read, `2` = edit, `3` = manage.",
             "format": "int64",
@@ -9171,7 +9177,7 @@
                 "type": "null"
               }
             ],
-            "description": "Id for the new sandbox host, 32 lowercase hex characters, sent only when `GET /v1/info` reports `request_managed_sandbox_host_id`; `None` lets the server mint one.",
+            "description": "Id for the new sandbox host, 32 lowercase hex characters; `None` lets the server mint one.",
             "title": "Host Id"
           },
           "sandbox_provider": {
@@ -19764,7 +19770,7 @@
         ]
       },
       "put": {
-        "description": "Grant or update a permission on a session.\n\nRequires manage-level access. Upserts the grant \u2014 can\nupgrade or downgrade an existing level. Auto-creates the\ngrantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting `PermissionObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 401 if unauthenticated.",
+        "description": "Grant or update a permission on a session.\n\nRequires manage-level access. Upserts the grant \u2014 can\nupgrade or downgrade an existing level unless `ensure_minimum`\npreserves stronger access. Auto-creates the\ngrantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting `PermissionObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 401 if unauthenticated.",
         "operationId": "grant_permission_v1_sessions__session_id__permissions_put",
         "parameters": [
           {

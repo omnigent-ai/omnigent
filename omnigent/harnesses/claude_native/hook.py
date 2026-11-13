@@ -452,9 +452,7 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
     # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
     # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
     # explicit host_id; emitted only on the workspace mount).
-    from omnigent.cli_auth import databricks_request_headers
-
-    headers.update(databricks_request_headers(ap_server_url))
+    _merge_identity_headers(headers, ap_server_url)
     from omnigent.native.native_policy_hook import is_loopback_url
 
     try:
@@ -514,9 +512,7 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     # _RunnerDatabricksAuth, so key the reused headers dict from the runner-env
     # host_id (databricks_request_headers reads OMNIGENT_RUNNER_SLICE_KEY when no
     # explicit host_id; emitted only on the workspace mount).
-    from omnigent.cli_auth import databricks_request_headers
-
-    headers.update(databricks_request_headers(ap_server_url))
+    _merge_identity_headers(headers, ap_server_url)
     from omnigent.native.native_policy_hook import is_loopback_url
 
     try:
@@ -743,6 +739,23 @@ def _sleep_before_retry(backoff_s: float, retry_by: float) -> None:
         start after, e.g. the retry deadline.
     """
     time.sleep(max(0.0, min(backoff_s, retry_by - time.monotonic())))
+
+
+def _merge_identity_headers(headers: dict[str, str], server_url: str) -> None:
+    """Merge this hook's routing and identity headers into *headers*, in place.
+
+    *headers* is often a snapshot persisted by the CLI that launched Claude, whose
+    ``user-agent`` names that CLI. The hook's own User-Agent replaces it in any casing,
+    so the request carries exactly one.
+
+    :param headers: Request headers, mutated in place.
+    :param server_url: Omnigent server URL the request targets.
+    """
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.telemetry.request_headers import pop_client_user_agent
+
+    headers.update(databricks_request_headers(server_url))
+    headers["User-Agent"] = pop_client_user_agent(headers)
 
 
 def _post_hook_with_reattach(
@@ -1083,9 +1096,7 @@ def _main_permission_request(argv: list[str]) -> int:
     # registry on the replica holding this session's runner tunnel; an unkeyed
     # POST lands elsewhere and the approval is silently lost. Key from the
     # runner-env host_id (reads OMNIGENT_RUNNER_SLICE_KEY; workspace mount only).
-    from omnigent.cli_auth import databricks_request_headers
-
-    headers.update(databricks_request_headers(ap_server_url))
+    _merge_identity_headers(headers, ap_server_url)
     url = (
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
@@ -1261,9 +1272,7 @@ def _main_evaluate_policy(argv: list[str]) -> int:
         # This posts to the session's policy registry on the replica holding its
         # tunnel; key from the runner-env host_id so it isn't misrouted. (The
         # relay branch above targets a relay token URL, so it needs no key.)
-        from omnigent.cli_auth import databricks_request_headers
-
-        headers.update(databricks_request_headers(ap_server_url))
+        _merge_identity_headers(headers, ap_server_url)
         session_component = url_component(session_id)
         url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
         reauth = policy_hook_reauth(ap_server_url, headers)

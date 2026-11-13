@@ -2532,6 +2532,9 @@ def main() -> None:
     # hangup cannot kill the runner while they run.
     _ignore_finish_work_signal_until_handled()
     from omnigent.process_logging import configure_process_logging
+    from omnigent.telemetry.request_headers import set_client_component
+
+    set_client_component("runner")
 
     configure_process_logging("runner", force=True)
     _install_crash_logging()

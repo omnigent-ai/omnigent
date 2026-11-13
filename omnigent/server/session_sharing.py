@@ -17,6 +17,10 @@ from omnigent.server.sharing_settings import PublicSharingMaxLevel
 # Levels a read-only sharing mode allows. Downstream deployments may patch this to add levels.
 READ_ONLY_MODE_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
 
+# Levels an automation may grant; Edit would turn off its runs' orchestration. The
+# permission store enforces it; widening it needs no migration.
+SCHEDULED_TASK_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
+
 
 def _sharing_mode(state: Any) -> SharingMode:
     """Return the live sharing mode from ``app.state``; ``ON`` when hand-built without it."""
