@@ -9452,6 +9452,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity(co
                     "workspace": "/repo",
                     "git_branch": "feature/x",
                     "project_id": "proj_1",
+                    "total_cost_usd": 1.25,
+                    "usage_by_model": {"example-model": {"input_tokens": 12, "output_tokens": 4}},
                     "pending_elicitations": [{"id": "el_1"}, {"id": "el_2"}],
                 },
             )

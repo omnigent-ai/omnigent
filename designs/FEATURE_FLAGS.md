@@ -15,7 +15,8 @@ OMNIGENT_FEATURES=usage_page,harness_install
 Unset or empty uses the defaults below. A name enables a feature; `-name`
 disables it. Explicit disables win regardless of order, so appending
 `-claude_osc_status` is a kill switch even if `claude_osc_status` is also present.
-Unknown names, including unknown negative overrides, fail startup.
+Unknown names, including unknown negative overrides, fail startup. Retired names
+(`custom_agents_settings_ui`) are ignored with a startup warning, with or without `-`.
 The former `OMNIGENT_HARNESS_INSTALL_ENABLED` switch is rejected with a
 migration hint; use `OMNIGENT_FEATURES=harness_install` instead. The server resolves the set once at startup and publishes frontend-visible
 values in `GET /v1/info` under `features`. Users must reload the web app after a
@@ -35,9 +36,12 @@ lifecycle metadata.
 | `usage_page` | Off | Web | 0.11.0 | Exposes the web Usage route, sidebar navigation, timeline, and cost breakdown details. The existing `GET /v1/usage` CLI API remains available while off. |
 | `harness_install` | Off | Onboarding | 0.11.0 | Allows the web UI to install or configure supported harnesses on a connected host. |
 | `canvas` | Off | Web | 0.15.0 | Exposes the web Canvas route (`/canvas`) and its sidebar navigation: top-level sessions as draggable cards, one canvas per project. |
-| `custom_agents_settings_ui` | On | Web | 0.24.0 | Exposes Custom agents settings when the server also advertises `agent_install`. Append `-custom_agents_settings_ui` to restore the previous Settings layout, with Harnesses under General. |
 | `sidebar_grouping_ui` | On | Web | 0.23.0 | Adds Grouping, Ordering and Show options to the sidebar filter menu, moves that menu to the Projects header, splits Shared sessions into their own section, lets a Status or Updated grouping replace the Projects, Shared and Sessions sections, and expands the session tooltip with Repo, PR and Created by. Append `-sidebar_grouping_ui` to restore the previous sidebar until the flag is removed in 0.23.0. |
 | `sidebar_windowed_rows` | Off | Web | 0.24.0 | Mounts only the sidebar session rows near the viewport, plus any row that is focused, has an open menu, or is being dragged, so long session lists stay responsive. Off keeps every loaded row mounted. |
+| `session_overview` | Off | Web | 0.25.0 | On desktop, moves the session cost and per-model token usage from Agent info into a sidebar beside chat, toggled by a header cost chip. Wide windows with the workspace collapsed dock it open; narrower windows open it over chat. Mobile, and the flag off, keep cost in Agent info. |
+| `project_repository_creation` | On | Web | 0.25.0 | Adds **Run on** and a **Folder / Repository** choice to New project. On a connected host, Repository clones a URL and optional branch into a new folder before saving the project; on a sandbox provider, the project saves the repository for new sessions. Hosts without clone support are told to update. Append `-project_repository_creation` to keep the folder-only dialog. Servers that don't advertise the feature also keep it folder-only. |
+| `workspace_api_server_access` | Off | Server | 0.27.0 | Serves the workspace API (`omnigent.api.workspace.v1alpha1`) at `/v1/sessions/{id}/workspace/{service}/{method}` over Connect, gRPC-Web and gRPC, answered by the session's host over its tunnel. Same read access as the file routes; unconfined sessions only. Not exposed in `/v1/info`. |
+| `workspace_direct_access` | Off | Server | 0.27.0 | Lets a session's owner read its workspace straight from the host's local socket with a short-lived token the server issues (`POST /v1/sessions/{id}/workspace/direct-access`). Set it on the server and on the host; the host opens its socket only when enabled. Unconfined sessions only. Not exposed in `/v1/info`. |
 | `claude_osc_status` | On | Runner | 0.20.0 | Uses Claude OSC 7501 reports for working status, with legacy file/pane fallback. Set on the host/runner; applies to newly launched Claude-native terminals after restart. Not exposed in `/v1/info`. |
 
 At the review release, each flag must be removed by making the feature

@@ -1176,6 +1176,13 @@ async def _upload_codex_worker(auth_client, sub_agents=None, **config) -> str:
             ["--dangerously-bypass-approvals-and-sandbox"],
             id="spec-without-request",
         ),
+        pytest.param(
+            "child",
+            None,
+            {"permission_mode": "approve-for-me"},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="spec-permission-mode",
+        ),
     ],
 )
 async def test_created_session_launches_in_the_requested_permission_mode(

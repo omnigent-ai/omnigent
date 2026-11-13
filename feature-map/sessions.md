@@ -114,6 +114,14 @@ and [login and host authentication](login-and-host-auth.md).
   project folder from the row menu, the header menu, or the header's folder tag.
   Agents file sessions the same way with `sys_session_update` (see
   [session orchestration](session-orchestration.md)).
+- `project-create-run-on`: New project's **Run on** picks a connected host or a
+  sandbox provider (behind the `project_repository_creation` release feature, on by
+  default; append `-project_repository_creation` to keep the folder-only dialog).
+  On a host, **Folder** keeps the optional working directory; **Repository** clones
+  a URL and optional branch into **Clone into** (default `~/<repo>`) before the
+  project is saved, and the dialog stays locked until the clone and save finish.
+  On a sandbox, only the repository is offered and it is saved, not cloned, until a
+  session starts. Older servers keep the folder-only dialog.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
   Agents rename projects and set their emoji with `sys_project_update`, and
@@ -262,6 +270,15 @@ and [login and host authentication](login-and-host-auth.md).
   a third of its width, or after a quick flick, closes it; a shorter drag springs
   back. List scrolling, row taps, long-press reordering and horizontal scrollers
   keep their own touch handling.
+- `session-overview`: behind the `session_overview` release flag (off by
+  default), the desktop chat header shows the session cost as a `$x.xx` chip.
+  Clicking it shows or hides a **Session overview** card with the session cost
+  and per-model token usage, which then leave the desktop Agent info popover.
+  Windows at least 1280px wide with the workspace collapsed and chat in view
+  dock the card open beside chat; other layouts open it over chat. Mobile keeps
+  cost in Agent info.
+  When the session has sub-agents, a **Sub-agents** list names each direct one
+  with its cost, including its own sub-agents; an unpriced one shows no cost.
 
 ## How to get to it (user POV)
 

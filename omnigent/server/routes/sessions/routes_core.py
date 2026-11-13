@@ -1791,7 +1791,7 @@ def register_core_routes(
             created_by_labels=source.labels if source is not None else None,
         )
         assert isinstance(created, tuple)
-        resp, conv = created
+        resp, conv, resolved_body = created
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
         # Without this, the runner doesn't know this session exists
@@ -1891,15 +1891,15 @@ def register_core_routes(
         # synchronously.
         launch_host_id = body.host_id
         try:
-            if body.host_type == "managed" and resp.runner_id is None:
+            if resolved_body.host_type == "managed" and resp.runner_id is None:
                 await _schedule_managed_launch(
                     request,
                     session_id=resp.id,
                     agent_id=conv.agent_id if conv is not None else None,
                     user_id=user_id,
-                    sandbox_provider=body.sandbox_provider,
-                    workspaces=body.managed_repo_workspaces(),
-                    requested_host_id=body.requested_host_id,
+                    sandbox_provider=resolved_body.sandbox_provider,
+                    workspaces=resolved_body.managed_repo_workspaces(),
+                    requested_host_id=resolved_body.requested_host_id,
                 )
         finally:
             # Push the new session to this user's other open tabs (see the
@@ -2055,6 +2055,7 @@ def register_core_routes(
             parsed_metadata = parsed_metadata.model_copy(update={"labels": created_labels})
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
+            server_sandbox_providers,
         )
 
         if (
@@ -2067,6 +2068,7 @@ def register_core_routes(
             body=parsed_metadata,
             user_id=user_id,
             project_store=project_store,
+            launchable_sandbox_providers=server_sandbox_providers(request),
         )
         parsed_metadata = project_resolution.body
         await _check_initial_input(request, parsed_metadata.initial_input)
