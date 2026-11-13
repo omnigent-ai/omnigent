@@ -50,6 +50,7 @@ from omnigent.cli_config import (
     _credential_label,
     _isolated_databricks_cfg,
     _print_credentials_by_harness,
+    _repair_invalid_provider_entries,
     _run_configure_databricks,
     _run_configure_harnesses_interactive,
     _warn_missing_harness_dependencies,
@@ -5102,7 +5103,7 @@ def server(
 
     # Accounts mode: construct the AccountStore (sibling to PermissionStore)
     # here and pass it to create_app explicitly. Any deploy that doesn't run
-    # accounts (the internal hosted product) passes account_store=None and
+    # accounts (a hosted deployment) passes account_store=None and
     # the entire accounts surface stays inactive.
     account_store = None
     from omnigent.server.auth import UnifiedAuthProvider as _UAP
@@ -12276,9 +12277,8 @@ def setup(internal_beta: bool) -> None:
         ui.print_brandmark("setup")
 
     if internal_beta:
-        # The internal-beta workspace defaults are excluded from the public OSS
-        # build. Fail loud with a clear message instead of an ImportError deep
-        # in the onboarding flow when someone passes --internal-beta there.
+        # The --internal-beta defaults are not in every build. Fail loud with a
+        # clear message instead of an ImportError deep in the onboarding flow.
         try:
             import omnigent.onboarding.internal_beta  # type: ignore[import-not-found]  # noqa: F401
         except ImportError:
@@ -12338,8 +12338,8 @@ def setup(internal_beta: bool) -> None:
         return
 
     # --no-internal-beta: validate existing providers before entering the
-    # picker so malformed user config is reported as an actionable CLI error,
-    # not an application crash from the picker's ambient-adoption step.
+    # picker. Interactive runs can repair or remove malformed entries; other runs
+    # get an actionable CLI error, not a crash from the picker's ambient adoption.
     from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.onboarding.provider_config import load_providers
 
@@ -12348,8 +12348,11 @@ def setup(internal_beta: bool) -> None:
     except OmnigentError as exc:
         if exc.code != ErrorCode.INVALID_INPUT:
             raise
-        path = _display_config_path(_effective_global_config_path())
-        raise click.ClickException(f"Invalid provider configuration in {path}: {exc}") from None
+        if not (_stdin_is_tty() and _repair_invalid_provider_entries()):
+            path = _display_config_path(_effective_global_config_path())
+            raise click.ClickException(
+                f"Invalid provider configuration in {path}: {exc}"
+            ) from None
 
     # The picker warns about missing Node/tmux itself, configures
     # providers/defaults, and returns; the user then starts a session with
@@ -13168,7 +13171,7 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 def _with_default_scheme(server_url: str) -> str:
     """Prepend a scheme to a schemeless server URL, defaulting to https.
 
-    The internal user guide hands out workspace URLs without a scheme
+    The user guide hands out workspace URLs without a scheme
     (e.g. ``example.cloud.databricks.com/omnigent``), so a missing
     scheme defaults to ``https`` to let that URL be pasted verbatim.
     Loopback hosts (``localhost``, ``127.0.0.1``, ``::1``) default to
@@ -13251,7 +13254,7 @@ def _workspace_api_server_url(server: str) -> str:
     if parsed.query or parsed.fragment:
         server = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")).rstrip("/")
         parsed = urlsplit(server)
-    # The internal user guide hands out the workspace web-UI URL
+    # The user guide hands out the workspace web-UI URL
     # (``https://<ws>/omnigent``) for browser access; accept it for login
     # too by expanding its bare root to the API mount. A root that does
     # not answer as a Databricks workspace leaves the pasted URL
@@ -13422,7 +13425,7 @@ def _resolve_server_url(server: str) -> ServerUrl:
     normalization, so they all route through here: strip a trailing slash,
     default a schemeless URL to ``https`` (``http`` for loopback hosts),
     then expand a bare Databricks workspace URL — or the ``/omnigent``
-    web-UI URL the internal user guide hands out — to the
+    web-UI URL the user guide hands out — to the
     ``/api/2.0/omnigent`` mount.
 
     The ``?o=`` workspace selector is captured off the raw input (the

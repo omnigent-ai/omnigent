@@ -160,6 +160,28 @@ describe("server-page update bridge", () => {
       [true, false],
     );
   });
+
+  it("forwards modifier-clicked link requests and advertises support", async () => {
+    const h = loadPreload();
+    const received = [];
+    const unsubscribe = h.desktop.onBrowserOpenTab((request) => received.push(request));
+
+    h.emit("browser-open-tab", { conversationId: "browser-tab:s:t", url: "https://example.com/" });
+    assert.deepEqual(received, [
+      { conversationId: "browser-tab:s:t", url: "https://example.com/" },
+    ]);
+    unsubscribe();
+    assert.equal(h.hasListener("browser-open-tab"), false);
+
+    await h.desktop.browserSetOpenTabSupported(true);
+    await h.desktop.browserSetOpenTabSupported(false);
+    assert.deepEqual(
+      h.invokes
+        .filter(({ channel }) => channel === "omnigent:browser-set-open-tab-supported")
+        .map(({ args }) => args.supported),
+      [true, false],
+    );
+  });
 });
 
 describe("desktop command bridge", () => {

@@ -255,10 +255,10 @@ def test_build_app_wires_both_routing_backends(
     _build_app_from_config(
         monkeypatch,
         tmp_path,
-        "llm: {model: databricks-claude-haiku-4-5}\n"
+        "llm: {model: test-judge}\n"
         "routing:\n"
         "  provider: external\n"
-        "  base_url: https://host/ai-gateway/routing/v1\n"
+        "  base_url: https://router.example.test/ai-gateway/routing/v1\n"
         "  router_name: task_v1\n"
         "  model_prefix: [databricks-, system.ai.]\n",
     )
@@ -319,24 +319,35 @@ def test_resolve_execution_timeout(cfg: dict[str, int], expected_timeout: int) -
 # exactly as it does under `omnigent server`.
 
 
+@pytest.mark.parametrize("catalog_kind", ["public", "invalid", "missing_cipher"])
 def test_build_app_mounts_mcp_registry_from_env(
-    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, catalog_kind: str
 ) -> None:
     from deploy.docker.entrypoint import _resolve_config, build_app, run_migrations
+    from omnigent.server import mcp_registry
 
+    monkeypatch.setattr(mcp_registry, "build_secret_cipher", lambda: None)
+    auth = "bearer" if catalog_kind == "missing_cipher" else "none"
     registry_file = tmp_path / "mcp-registry.yaml"
     registry_file.write_text(
         "services:\n"
         "  - id: tracker\n"
         "    title: Tracker\n"
         "    url: https://mcp.example.test/mcp\n"
-        "    auth: none\n"
+        f"    auth: {auth}\n"
         "    tools: [read_ticket]\n"
     )
+    if catalog_kind == "invalid":
+        registry_file.write_text("unexpected: true\n")
     monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(registry_file))
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'entrypoint.db'}")
     resolved = _resolve_config()
     run_migrations(resolved.database_url)
+
+    if catalog_kind != "public":
+        with pytest.raises(ValueError):
+            build_app(resolved)
+        return
 
     app = build_app(resolved).app
 

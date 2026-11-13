@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +23,12 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("slow_observer_stderr", [False, True])
 async def test_forwarder_survives_unhandled_loop_exceptions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    slow_observer_stderr: bool,
 ) -> None:
     """
     A non-HTTP loop exception is logged and the next poll continues.
@@ -84,6 +87,22 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
     )
     caplog.set_level(logging.ERROR, logger="omnigent.harnesses.claude_native.forwarder")
 
+    observer_entered = asyncio.Event()
+    release_observer = threading.Event()
+    observer_finished = threading.Event()
+    original_stat = Path.stat
+    loop = asyncio.get_running_loop()
+
+    def slow_stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == bridge_dir / forwarder.OBSERVER_HOOK_STDERR_FILE:
+            if slow_observer_stderr and not observer_finished.is_set():
+                loop.call_soon_threadsafe(observer_entered.set)
+                release_observer.wait(timeout=5.0)
+                observer_finished.set()
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", slow_stat)
+
     server, thread, base_url = _start_recording_server()
     task = asyncio.create_task(
         forwarder.forward_claude_transcript_to_session(
@@ -97,8 +116,13 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
         )
     )
     try:
+        if slow_observer_stderr:
+            await asyncio.wait_for(observer_entered.wait(), timeout=10.0)
+            assert not observer_finished.is_set(), "observer file I/O blocked the event loop"
+            release_observer.set()
         request = await _get_recorded_item_request(server)
     finally:
+        release_observer.set()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

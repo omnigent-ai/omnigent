@@ -80,8 +80,8 @@ A Databricks workspace serves its own landing page at the root and mounts the
 Omnigent SPA at `/omnigent`, so the shell rewrites a **bare** workspace root to
 that mount (`Origins.databricksWorkspaceUiUrl`):
 
-- `https://dbc-a5d4177a-49dc.cloud.databricks.com` →
-  `https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent`
+- `https://dbc-12345678-abcd.cloud.databricks.com` →
+  `https://dbc-12345678-abcd.cloud.databricks.com/omnigent`
 - `?o=<org>` and any fragment are preserved; a URL that already carries a path
   (a deep link, or `/omnigent` itself) is left alone.
 

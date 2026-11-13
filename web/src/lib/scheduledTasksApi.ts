@@ -71,6 +71,12 @@ export interface ScheduledTask {
   executionTarget: ScheduledTaskExecutionTarget;
   /** Project every fired session is filed into, or `null` to leave them unfiled. */
   projectId: string | null;
+  /**
+   * The session every run copies: a session the server copied when
+   * the automation was created from a session. Each run starts a new session
+   * with this session's history. `null`/absent for ordinary automations.
+   */
+  sourceSessionId?: string | null;
   state: ScheduledTaskState;
   /** Epoch seconds of the last fire, or `null` if it has never fired. */
   lastRunAt: number | null;
@@ -106,6 +112,11 @@ export interface ScheduledTaskRun {
   finishedAt: number | null;
   /** Queryable failure classification, e.g. `no_online_host`; `null` on success. */
   errorCode: string | null;
+  /**
+   * The server's description of the failure, e.g. a sandbox provider's recovery
+   * steps, capped server-side; `null` when the run recorded none.
+   */
+  errorDetail: string | null;
   /** Epoch seconds of the conversation's last update; `null` for runs without a conversation. */
   conversationUpdatedAt: number | null;
   /**
@@ -168,6 +179,13 @@ export interface CreateScheduledTaskInput {
   executionTarget?: ScheduledTaskExecutionTarget;
   /** File every fired session into this existing project. */
   projectId?: string | null;
+  /**
+   * Create the automation from this session: the server copies it into the
+   * automation's project, and every run starts a new
+   * session from that copy. `prompt` then holds only additional instructions
+   * and may be empty. The created task's `sourceSessionId` is the copy's id.
+   */
+  sourceSessionId?: string;
 }
 
 /**
@@ -230,6 +248,7 @@ interface ScheduledTaskWire {
   execution_target: ScheduledTaskExecutionTarget;
   // Absent on servers that predate task projects.
   project_id?: string | null;
+  source_session_id?: string | null;
   state: ScheduledTaskState;
   last_run_at: number | null;
   last_run_status: ScheduledTaskRunStatus | null;
@@ -249,6 +268,7 @@ interface ScheduledTaskRunWire {
   fired_at: number | null;
   finished_at: number | null;
   error_code: string | null;
+  error_detail?: string | null;
   conversation_updated_at: number | null;
   conversation_status: string | null;
   viewer_last_seen: number | null;
@@ -316,6 +336,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     hostId: wire.host_id,
     executionTarget: wire.execution_target,
     projectId: wire.project_id ?? null,
+    sourceSessionId: wire.source_session_id ?? null,
     state: wire.state,
     lastRunAt: wire.last_run_at,
     lastRunStatus: wire.last_run_status,
@@ -336,6 +357,7 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
     firedAt: wire.fired_at,
     finishedAt: wire.finished_at,
     errorCode: wire.error_code,
+    errorDetail: wire.error_detail ?? null,
     conversationUpdatedAt: wire.conversation_updated_at ?? null,
     conversationStatus: wire.conversation_status ?? null,
     viewerLastSeen: wire.viewer_last_seen ?? null,
@@ -386,6 +408,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.projectId != null) body.project_id = input.projectId;
+  if (input.sourceSessionId != null) body.source_session_id = input.sourceSessionId;
   const templateId = input.templateId ?? "custom";
   const interaction = startTimedInteraction("create_scheduled_task", undefined, templateId);
   try {
