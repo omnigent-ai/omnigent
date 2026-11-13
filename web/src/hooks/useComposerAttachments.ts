@@ -1,5 +1,7 @@
-import { useCallback, useRef, useState } from "react";
-import { validateAttachments } from "@/lib/attachments";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { insertPastedText } from "@/lib/composerText";
 
 export interface UseComposerAttachmentsOptions {
   /**
@@ -20,6 +22,8 @@ export interface UseComposerAttachmentsOptions {
 export interface ComposerAttachmentsApi {
   files: File[];
   attachmentError: string | null;
+  /** The file picker's `accept` filter for the server's attachment policy. */
+  accept: string | undefined;
   /** Validate, append the accepted files, and surface the rejections. */
   addFiles: (incoming: File[]) => void;
   /** Drop one file by index and clear the rejection notice. */
@@ -36,8 +40,8 @@ export interface ComposerAttachmentsApi {
   restoreFiles: (files: File[]) => void;
   /**
    * Attach file-kind clipboard items instead of letting them insert as
-   * text. The event is claimed only when a usable file was present, so a
-   * plain-text paste keeps its native behavior.
+   * text. Without a usable file, plain text is inserted as typed input
+   * (see insertPastedText).
    */
   onPaste: (e: React.ClipboardEvent<HTMLTextAreaElement>) => void;
   clearError: () => void;
@@ -64,9 +68,29 @@ export function useComposerAttachments({
   onAcceptedRef.current = onAccepted;
   const onRemovedRef = useRef(onRemoved);
   onRemovedRef.current = onRemoved;
+  // The server's filesystem attachment policy, read through a ref for the same reason.
+  const info = useServerInfo();
+  const policy = info === "loading" ? null : (info.filesystem_attachments ?? null);
+  const policyRef = useRef(policy);
+  policyRef.current = policy;
+  const filesRef = useRef(files);
+  filesRef.current = files;
+
+  // Files added before /v1/info loaded were checked against the default policy,
+  // so recheck them against the server's once it arrives.
+  const checkedPolicyRef = useRef(policy);
+  useEffect(() => {
+    if (checkedPolicyRef.current === policy) return;
+    checkedPolicyRef.current = policy;
+    const { accepted, errors } = validateAttachments(filesRef.current, policy);
+    if (errors.length === 0) return;
+    setFiles(accepted);
+    setAttachmentError(errors.join("\n"));
+    onRemovedRef.current?.();
+  }, [policy]);
 
   const addFiles = useCallback((incoming: File[]) => {
-    const { accepted, errors } = validateAttachments(incoming);
+    const { accepted, errors } = validateAttachments(incoming, policyRef.current);
     if (accepted.length > 0) {
       setFiles((prev) => [...prev, ...accepted]);
       onAcceptedRef.current?.(accepted);
@@ -81,7 +105,7 @@ export function useComposerAttachments({
   }, []);
 
   const replaceFiles = useCallback((incoming: File[]) => {
-    const { accepted, errors } = validateAttachments(incoming);
+    const { accepted, errors } = validateAttachments(incoming, policyRef.current);
     setFiles(accepted);
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   }, []);
@@ -92,18 +116,13 @@ export function useComposerAttachments({
 
   const onPaste = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      const items = e.clipboardData?.items;
-      if (!items) return;
-      const pasted: File[] = [];
-      for (const item of items) {
-        if (item.kind !== "file") continue;
-        const file = item.getAsFile();
-        if (file !== null) pasted.push(file);
+      const pasted = clipboardFiles(e.clipboardData);
+      if (pasted.length === 0) {
+        insertPastedText(e);
+        return;
       }
-      if (pasted.length > 0) {
-        e.preventDefault();
-        addFiles(pasted);
-      }
+      e.preventDefault();
+      addFiles(pasted);
     },
     [addFiles],
   );
@@ -115,9 +134,12 @@ export function useComposerAttachments({
     setAttachmentError(null);
   }, []);
 
+  const accept = attachmentAccept(policy);
+
   return {
     files,
     attachmentError,
+    accept,
     addFiles,
     removeFile,
     replaceFiles,

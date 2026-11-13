@@ -2,6 +2,7 @@
 
 from typing import Protocol
 
+from omnigent.configuration_profile import ConfigurationSave, ConfigurationSnapshot
 from omnigent.preference_sync import (
     PREFERENCE_PAGE_SIZE,
     PreferenceMutation,
@@ -19,3 +20,9 @@ class PreferenceStore(Protocol):
     ) -> PreferencePage: ...
 
     def apply(self, operation: PreferenceMutation, *, user_id: str | None) -> PreferenceResult: ...
+
+    def read_configuration(self, *, user_id: str | None) -> ConfigurationSnapshot: ...
+
+    def save_configuration(
+        self, operation: ConfigurationSave, *, user_id: str | None
+    ) -> ConfigurationSnapshot: ...

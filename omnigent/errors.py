@@ -18,6 +18,8 @@ from collections.abc import Callable
 from enum import Enum
 from typing import Any, ParamSpec, TypeVar, cast
 
+from omnigent.util.uuid import normalize_uuid
+
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
@@ -188,9 +190,12 @@ class ErrorCode:
         one host can reach a replica that doesn't hold its tunnel — the key
         doesn't match where the tunnel lives. The request itself is valid
         (the same bytes succeed on the right replica), so the fix is to
-        re-address it: reissue WITHOUT the key and reach the host via the
-        default route. Distinct from ``RUNNER_UNAVAILABLE`` (no runner
-        bound anywhere), which no re-addressing can fix.
+        re-address it: a request not keyed to the host resends keyed to it,
+        and one already keyed to it resends WITHOUT the key to reach a tunnel
+        on the default route. :class:`WrongReplicaError` names that key; an
+        error without one (a binding that changed mid-request) retries
+        unchanged. Distinct from ``RUNNER_UNAVAILABLE`` (no runner bound
+        anywhere), which no re-addressing can fix.
     :cvar UNAUTHORIZED: No valid authentication credentials (HTTP 401).
     :cvar RUNNER_SCOPE_DENIED: A runner credential cannot authorize this request (HTTP 403).
     :cvar RUNNER_UPGRADE_REQUIRED: The runner credential protocol is unsupported (HTTP 426).
@@ -258,6 +263,7 @@ class ErrorCode:
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
     REFRESH_UNSUPPORTED = "refresh_unsupported"
+    LOGIN_UNSUPPORTED = "login_unsupported"
     WORKSPACE_MISSING = "workspace_missing"
     SESSION_AGENT_MISSING = "session_agent_missing"
     UPSTREAM_CANCELLED = "upstream_cancelled"
@@ -312,6 +318,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
     ErrorCode.REFRESH_UNSUPPORTED: 409,
+    ErrorCode.LOGIN_UNSUPPORTED: 409,
     ErrorCode.WORKSPACE_MISSING: 410,
     # 410 Gone, like WORKSPACE_MISSING: a valid request whose bound agent was
     # deleted; a retry cannot recreate it.
@@ -359,6 +366,7 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorCategory.CONFIG,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorCategory.CONFIG,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorCategory.CONFIG,
+    ErrorCode.LOGIN_UNSUPPORTED: ErrorCategory.CONFIG,
     # The human deleted their own workspace on the host.
     ErrorCode.WORKSPACE_MISSING: ErrorCategory.USER,
     # The session's agent was deleted or rebound; the caller must recreate the
@@ -418,6 +426,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.ALREADY_EXISTS: ErrorImpact.BENIGN,
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
+    ErrorCode.LOGIN_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
 }
 
@@ -453,6 +462,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorPhase.HARNESS_SETUP,
+    ErrorCode.LOGIN_UNSUPPORTED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.WORKSPACE_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.SESSION_AGENT_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorPhase.TURN,
@@ -572,6 +582,24 @@ class StaleCursorError(OmnigentError):
             code=ErrorCode.STALE_CURSOR,
         )
         self.cursor_id = cursor_id
+
+
+class WrongReplicaError(OmnigentError):
+    """A request reached a replica that does not hold its host's tunnel.
+
+    The HTTP error handler compares ``host_id`` with the request's slice key to
+    tell the client whether to resend keyed to the host or without the key.
+
+    :param message: What is not on this replica, e.g.
+        ``"host 'laptop' is on another replica"``.
+    :param host_id: The host whose tunnel serves the request, e.g.
+        ``"a1b2c3d4..."``. Stored in the bare-hex form the host dials with,
+        since ingress routes on the literal key.
+    """
+
+    def __init__(self, message: str, *, host_id: str) -> None:
+        super().__init__(message, code=ErrorCode.WRONG_REPLICA)
+        self.host_id = normalize_uuid(host_id)
 
 
 # Full-enumeration attempts before a persistently stale cursor propagates.

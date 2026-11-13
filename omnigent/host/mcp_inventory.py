@@ -2,21 +2,26 @@
 
 Only names and non-secret metadata leave the inventory response: ``env``, headers, stdio
 ``command``/``args`` and full URLs routinely carry tokens, so they are dropped.
+
+Per-server account state comes from ``mcp-auth-status.json`` (see
+``docs/MCP_AUTH_STATUS.md``); it can only mark known servers and name an http(s) page.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
 import time
+import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 from urllib.parse import urlsplit
 
-import tomllib
-
+from omnigent.host.frames import mcp_account_fields
 from omnigent.spec.skill_sources import (
     SkillSourceContext,
     _enabled_plugin_keys,
@@ -30,8 +35,20 @@ _logger = logging.getLogger(__name__)
 MCP_INVENTORY_CACHE_TTL_SECONDS = 60.0
 # Omnigent injects its own relay under this name; it is not user config.
 OMNIGENT_RELAY_SERVER = "omnigent"
+#: Where a host-side sign-in manager reports per-server account state (under ``$HOME``).
+MCP_AUTH_STATUS_RELPATH = Path(".omnigent") / "mcp-auth-status.json"
+#: Absolute path to use instead, for a deployment whose ``$HOME`` is read-only or
+#: sandboxed and whose sign-in manager must write somewhere else.
+MCP_AUTH_STATUS_ENV = "OMNIGENT_MCP_AUTH_STATUS_FILE"
+#: The report is a short list; a larger file is treated as unreadable rather than parsed
+#: on every poll.
+MCP_AUTH_STATUS_MAX_BYTES = 64 * 1024
+#: Signature of the file state already warned about, so a poll loop logs once per change.
+_warned_auth_status: tuple[int, int] | None = None
 
 McpServerSummary = dict[str, str]
+#: ``(harness, name)`` → the ``auth_status`` / ``sign_in_url`` keys to add to its summary.
+AuthStatusOverlay = dict[tuple[str, str], dict[str, str]]
 
 
 @dataclass
@@ -44,9 +61,17 @@ class ConfiguredMcpServer:
 
 
 def _summary(
-    name: object, config: object, harness: str, plugin: str | None = None
+    name: object,
+    config: object,
+    harness: str,
+    plugin: str | None = None,
+    managed: bool = False,
 ) -> McpServerSummary | None:
-    """Reduce one server entry to its name, transport, and at most a URL host."""
+    """Reduce one server entry to its name, transport, and at most a URL host.
+
+    ``scope`` stays ``user`` for older servers; enterprise config is flagged via
+    ``managed``.
+    """
     if not isinstance(name, str) or not name or name == OMNIGENT_RELAY_SERVER:
         return None
     if not isinstance(config, Mapping) or config.get("enabled") is False:
@@ -62,6 +87,8 @@ def _summary(
     else:
         return None
     summary = {"name": name, "harness": harness, "transport": transport, "scope": "user"}
+    if managed:
+        summary["managed"] = "true"
     if plugin is not None:
         summary["plugin"] = plugin
     if transport == "http" and isinstance(url, str):
@@ -88,12 +115,47 @@ def _read_config(path: Path, harness: str) -> Mapping[str, object] | None:
     return data
 
 
+def _managed_mcp_paths() -> tuple[Path, ...]:
+    """Claude Code's enterprise MCP config locations on this platform."""
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_paths
+
+    return claude_code_managed_mcp_paths()
+
+
+def managed_claude_mcp_config() -> tuple[bool, Mapping[str, object]]:
+    """Whether Claude Code's ``managed-mcp.json`` exists, and the servers it pins.
+
+    Like Claude Code, an unreadable file still counts as present but pins nothing.
+
+    :returns: ``(present, mcpServers table)``, e.g. ``(False, {})`` on an ordinary install.
+    """
+    paths = _managed_mcp_paths()
+    # The first readable, object-shaped file decides, as Claude Code (and
+    # ``claude_managed_gateway``) read this chain: a lower-precedence file is
+    # ignored even when the winning one pins no servers.
+    for path in paths:
+        data = _read_config(path, "claude managed")
+        if data is not None:
+            return True, _servers_in(data)
+    return any(os.path.exists(path) for path in paths), {}
+
+
 def _claude_servers(home: Path, env: Mapping[str, str]) -> list[ConfiguredMcpServer]:
-    """User-scope ``mcpServers`` plus servers bundled by enabled Claude plugins."""
+    """Claude Code's managed ``mcpServers``, or else its user-scope and enabled-plugin ones."""
+    managed_present, managed_table = managed_claude_mcp_config()
+    out = [
+        ConfiguredMcpServer(summary, config)
+        for name, config in managed_table.items()
+        if isinstance(config, Mapping)
+        and (summary := _summary(name, config, "claude", managed=True)) is not None
+    ]
+    if managed_present:
+        # The enterprise config keeps exclusive control: Claude Code loads no other server.
+        return out
     configured = env.get("CLAUDE_CONFIG_DIR")
     config_dir = Path(configured).expanduser() if configured else None
     data = _read_config((config_dir or home) / ".claude.json", "claude")
-    out = [
+    out += [
         ConfiguredMcpServer(summary, config)
         for name, config in _servers_in(data).items()
         if isinstance(config, Mapping)
@@ -159,8 +221,24 @@ def _cursor_servers(home: Path) -> list[ConfiguredMcpServer]:
     ]
 
 
+def _pi_servers(env: Mapping[str, str]) -> list[ConfiguredMcpServer]:
+    """``mcp.json`` in Pi's agent dir, which managed Pi sessions link into their own.
+
+    An entry with no ``command``, ``url`` or ``type`` only overrides a server Pi
+    defines elsewhere, so ``_summary`` leaves it out.
+    """
+    from omnigent.harnesses.pi_native.credentials import global_pi_agent_dir
+
+    data = _read_config(global_pi_agent_dir(env=env) / "mcp.json", "pi")
+    return [
+        ConfiguredMcpServer(summary, config)
+        for name, config in _servers_in(data).items()
+        if isinstance(config, Mapping) and (summary := _summary(name, config, "pi")) is not None
+    ]
+
+
 def configured_mcp_servers() -> list[ConfiguredMcpServer]:
-    """List user-level MCP servers across Claude, Codex, and Cursor on this host.
+    """List user-level MCP servers across Claude, Codex, Cursor, and Pi on this host.
 
     Each harness is read independently, so a missing or broken config for one
     never hides another's servers.
@@ -170,6 +248,7 @@ def configured_mcp_servers() -> list[ConfiguredMcpServer]:
         ("claude", lambda: _claude_servers(home, os.environ)),
         ("codex", _codex_servers),
         ("cursor", lambda: _cursor_servers(home)),
+        ("pi", lambda: _pi_servers(os.environ)),
     )
     out: list[ConfiguredMcpServer] = []
     for harness, read in readers:
@@ -180,8 +259,134 @@ def configured_mcp_servers() -> list[ConfiguredMcpServer]:
     return out
 
 
+def find_configured_server(
+    harness: str,
+    name: str,
+    plugin: str | None = None,
+    source_id: str | None = None,
+    *,
+    servers: list[ConfiguredMcpServer] | None = None,
+) -> ConfiguredMcpServer:
+    """Resolve one inventory identity, rejecting stale or ambiguous sources."""
+    matches = [
+        server
+        for server in (configured_mcp_servers() if servers is None else servers)
+        if server.summary["harness"] == harness
+        and server.summary["name"] == name
+        and server.summary.get("plugin") == plugin
+        and (source_id is None or server.summary.get("source_id") == source_id)
+    ]
+    if len(matches) != 1:
+        raise LookupError("MCP server unavailable or ambiguous")
+    return matches[0]
+
+
 def discover_mcp_servers() -> list[McpServerSummary]:
     return [server.summary for server in configured_mcp_servers()]
+
+
+def auth_status_path(home: Path) -> Path:
+    """Where the sign-in manager's report is read from, honouring the env override.
+
+    The override is used as given, so a relative path resolves against the host
+    process's working directory; deployments should set an absolute one.
+    """
+    override = os.environ.get(MCP_AUTH_STATUS_ENV)
+    return Path(override).expanduser() if override else home / MCP_AUTH_STATUS_RELPATH
+
+
+def _read_auth_status(path: Path) -> Mapping[str, object] | None:
+    """Read the status report, logging once per file change when it cannot be used."""
+    global _warned_auth_status
+    stat: os.stat_result | None = None
+    data: object = None
+    try:
+        # O_NONBLOCK so a FIFO opens instead of waiting for a writer; the panel polls
+        # this path every few seconds and a blocked worker thread would pile up.
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            stat = os.fstat(fd)
+            # Checked on the open descriptor, so nothing can be swapped in behind it.
+            if S_ISREG(stat.st_mode) and stat.st_size <= MCP_AUTH_STATUS_MAX_BYTES:
+                data = json.loads(os.read(fd, MCP_AUTH_STATUS_MAX_BYTES + 1))
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        _warned_auth_status = None
+        return None
+    except (OSError, ValueError, RecursionError):
+        # RecursionError is a RuntimeError, not a ValueError: deeply nested JSON
+        # under the size cap would otherwise escape and fail the whole inventory.
+        data = None
+    if isinstance(data, Mapping):
+        _warned_auth_status = None
+        return data
+    signature = (stat.st_mtime_ns, stat.st_size) if stat is not None else (0, 0)
+    if _warned_auth_status != signature:
+        _warned_auth_status = signature
+        _logger.warning("Skipping unusable MCP auth status at %s", path)
+    return None
+
+
+def read_auth_status_overlay(home: Path) -> AuthStatusOverlay:
+    """Read the sign-in manager's report; entries that fail validation are dropped."""
+    data = _read_auth_status(auth_status_path(home))
+    entries = data.get("servers") if data is not None else None
+    if not isinstance(entries, list):
+        return {}
+    overlay: AuthStatusOverlay = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        harness, name = entry.get("harness"), entry.get("name")
+        if not (isinstance(harness, str) and isinstance(name, str)):
+            continue
+        fields = mcp_account_fields(entry.get("status"), entry.get("sign_in_url"))
+        if fields:
+            overlay[(harness, name)] = fields
+    return overlay
+
+
+def _auth_status_overlay() -> AuthStatusOverlay:
+    """The reported state, or none: the configured servers matter more than it does."""
+    try:
+        return read_auth_status_overlay(Path.home())
+    except Exception:
+        _logger.exception("Reading MCP auth status failed; reporting servers without it")
+        return {}
+
+
+def apply_auth_status(
+    servers: list[McpServerSummary], overlay: AuthStatusOverlay
+) -> list[McpServerSummary]:
+    """Stamp each discovered server with its reported account state, if any."""
+    for server in servers:
+        fields = overlay.get((server["harness"], server["name"]))
+        if fields is not None:
+            server.update(fields)
+    return servers
+
+
+def apply_enabled_status(servers: list[McpServerSummary]) -> list[McpServerSummary]:
+    """Overlay saved preferences without altering the harness configuration."""
+    from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS, ServerKey, read_disabled_servers
+
+    disabled = read_disabled_servers()
+    managed_names = {
+        (server["harness"], server["name"])
+        for server in servers
+        if server.get("managed") == "true"
+    }
+    for server in servers:
+        harness = server["harness"]
+        if harness not in HARNESS_EXECUTORS:
+            continue
+        locked = (harness, server["name"]) in managed_names
+        server["locked"] = str(locked).lower()
+        server["enabled"] = str(
+            locked or ServerKey(harness, server["name"], server.get("plugin")) not in disabled
+        ).lower()
+    return servers
 
 
 class HostMcpInventory:
@@ -192,10 +397,12 @@ class HostMcpInventory:
         self._cached: tuple[float, list[McpServerSummary]] | None = None
 
     def discover(self) -> list[McpServerSummary]:
-        """Return the cached inventory, rescanning after the TTL."""
+        """Return the cached inventory, rescanning after the TTL; account state is always fresh."""
         with self._lock:
             if self._cached is not None and self._cached[0] > time.monotonic():
-                return [dict(server) for server in self._cached[1]]
-            result = discover_mcp_servers()
-            self._cached = (time.monotonic() + MCP_INVENTORY_CACHE_TTL_SECONDS, result)
-            return [dict(server) for server in result]
+                servers = [dict(server) for server in self._cached[1]]
+            else:
+                result = discover_mcp_servers()
+                self._cached = (time.monotonic() + MCP_INVENTORY_CACHE_TTL_SECONDS, result)
+                servers = [dict(server) for server in result]
+        return apply_enabled_status(apply_auth_status(servers, _auth_status_overlay()))

@@ -55,6 +55,12 @@ from omnigent.tools.builtins.scheduled_tasks import (
     SysScheduledTaskListTool,
     SysScheduledTaskUpdateTool,
 )
+from omnigent.tools.builtins.session_projects import (
+    SysProjectListTool,
+    SysProjectUpdateTool,
+    SysSessionLinkPrTool,
+    SysSessionUpdateTool,
+)
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     SysSessionCloseTool,
@@ -88,6 +94,8 @@ __all__ = [
     "SysCallAsyncTool",
     "SysCancelAsyncTool",
     "SysListModelsTool",
+    "SysProjectListTool",
+    "SysProjectUpdateTool",
     "SysReadInboxTool",
     "SysScheduledTaskCreateTool",
     "SysScheduledTaskDeleteTool",
@@ -97,10 +105,12 @@ __all__ = [
     "SysSessionCreateTool",
     "SysSessionGetHistoryTool",
     "SysSessionGetInfoTool",
+    "SysSessionLinkPrTool",
     "SysSessionListTool",
     "SysSessionRenameTool",
     "SysSessionSendTool",
     "SysSessionShareTool",
+    "SysSessionUpdateTool",
     "SysTimerCancelTool",
     "SysTimerSetTool",
     "UpdateCommentTool",
@@ -280,10 +290,10 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # name in the runner's tool dispatch — reserved here so user specs
     # cannot shadow it.
     "sys_advise_models": None,
-    # ``browser_*`` embedded-browser tools are framework-owned: always
+    # ``browser_*`` embedded-browser tools are framework-owned:
     # auto-registered by ``ToolManager._register_browser_tools`` (the
-    # single source of truth for registration), so any agent can drive
-    # the desktop app's browser without the spec opting in. Reserved
+    # single source of truth for registration) unless the spec sets
+    # ``tool_groups.browser: false``. Reserved
     # here with ``None`` — exactly like ``list_comments`` /
     # ``update_comment`` — so user specs cannot shadow the names and
     # ``get_builtin_tool`` returns ``None`` for them (they are not
@@ -294,6 +304,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "browser_click": None,
     "browser_type": None,
     "browser_screenshot": None,
+    "ui_open_file": None,
 }
 
 # Hindsight long-term memory (optional ``hindsight`` extra). Registered only

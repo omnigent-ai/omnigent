@@ -1,22 +1,22 @@
 import { useEffect } from "react";
 
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { type Chord, chordMatches } from "@/lib/shortcuts/chord";
+import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
 
-/** True for Cmd+Alt+, on Apple platforms or Ctrl+Alt+, elsewhere. */
+const SETTINGS_CHORD: Chord = { mod: true, alt: true, code: "Comma" };
+
+/**
+ * True for Cmd+Alt+, on Apple platforms or Ctrl+Alt+, elsewhere. Never in the
+ * desktop app, whose Settings menu item owns Cmd/Ctrl+, instead.
+ */
 export function isSettingsHotkey(
   event: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
+  desktopMenu = supportsDesktopCommands(),
 ): boolean {
-  if (
-    !hasCommandModifier(event, isMac) ||
-    !event.altKey ||
-    event.shiftKey ||
-    event.getModifierState("AltGraph")
-  ) {
-    return false;
-  }
-  return event.code === "Comma";
+  return !desktopMenu && chordMatches(SETTINGS_CHORD, event, isMac);
 }
 
 /** Navigate to Settings from anywhere in the app. */

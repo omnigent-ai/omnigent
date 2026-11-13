@@ -19,6 +19,7 @@ edit/read access to.
 
 from __future__ import annotations
 
+import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -100,6 +101,16 @@ def test_file_and_unfile_session_single_user(db_uri: str) -> None:
     # Listing by project NAME returns it (dual-read resolves the name → id).
     listed = client.get("/v1/sessions?project=Work")
     assert [s["id"] for s in listed.json()["data"]] == [conv.id]
+
+    # Archived folders resolve first-class membership and exclude live sessions.
+    archived = client.patch(f"/v1/sessions/{conv.id}", json={"archived": True})
+    assert archived.status_code == 200
+    archived_list = client.get("/v1/sessions?project=Work&visibility=archived")
+    assert archived_list.status_code == 200
+    assert [row["id"] for row in archived_list.json()["data"]] == [conv.id]
+    assert archived_list.json()["data"][0]["project_id"] == project["id"]
+    assert client.get("/v1/sessions?project=Work&visibility=mine").json()["data"] == []
+    assert client.patch(f"/v1/sessions/{conv.id}", json={"archived": False}).status_code == 200
 
     # Unfile it.
     resp = client.patch(f"/v1/sessions/{conv.id}", json={"project_id": ""})
@@ -191,7 +202,10 @@ def test_unfile_unknown_session_404(db_uri: str) -> None:
     assert resp.status_code == 404
 
 
-def test_fork_inherits_source_project(db_uri: str) -> None:
+@pytest.mark.parametrize("confined", [False, True])
+def test_fork_inherits_source_project(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, confined: bool
+) -> None:
     """A fork of a filed session lands in the same project as its source."""
     _ensure_agent(db_uri)
     conv = SqlAlchemyConversationStore(db_uri).create_conversation(title="s", agent_id=AGENT_ID)
@@ -199,7 +213,23 @@ def test_fork_inherits_source_project(db_uri: str) -> None:
     project = client.post("/v1/projects", json={"name": "Work"}).json()
     client.patch(f"/v1/sessions/{conv.id}", json={"project_id": project["id"]})
 
+    if confined:
+        from omnigent.server.auth import RunnerTokenConfinement
+
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions.routes_core.runner_token_confinement",
+            lambda _: RunnerTokenConfinement(
+                "runner", lambda _runner, session: session == conv.id
+            ),
+        )
+
     resp = client.post(f"/v1/sessions/{conv.id}/fork", json={})
+    if confined:
+        assert resp.status_code == 403
+        assert resp.json()["error"]["code"] == "runner_scope_denied"
+        listed = client.get("/v1/sessions?project=Work")
+        assert [session["id"] for session in listed.json()["data"]] == [conv.id]
+        return
     assert resp.status_code == 201
     fork = resp.json()
     assert fork["project_id"] == project["id"]

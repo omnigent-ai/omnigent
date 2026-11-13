@@ -118,7 +118,7 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
             SqlScheduledTask.user_id == user_id,
             SqlScheduledTask.state != encode_scheduled_task_state("deleted"),
         )
-        .values(state=encode_scheduled_task_state("deleted"), updated_at=now)
+        .values(state=encode_scheduled_task_state("deleted"), next_run_at=None, updated_at=now)
     )
     session.execute(
         update(SqlDeviceGrant)

@@ -42,6 +42,7 @@ import pytest
 from tests._helpers.live_server import isolated_process_env
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests
+from tests.e2e.omnigent._pexpect_harness import strip_ansi
 
 pexpect = pytest.importorskip("pexpect")
 
@@ -159,13 +160,32 @@ def _launch_pi(env: dict[str, str]) -> tuple[Any, str, str]:
         dimensions=(40, 140),
         timeout=_LAUNCH_TIMEOUT,
     )
-    child.logfile_read = (Path(env["HOME"]) / "terminal.txt").open("w")
+    # Under the logs dir so the E2E job uploads the transcript with the other logs.
+    transcript = Path(env["HOME"]) / ".omnigent" / "logs" / "pi-terminal.log"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    child.logfile_read = transcript.open("w")
     try:
-        child.expect(r"Web UI:\s*(\S+)", timeout=_LAUNCH_TIMEOUT)
+        child.expect(
+            r"(?:Web UI|Omnigent):[ \t]*(https?://[^\s\x1b]+/c/[0-9a-f]{32})",
+            timeout=_LAUNCH_TIMEOUT,
+        )
+        startup_output = strip_ansi(child.before or "")
         web_url = child.match.group(1)
         match = re.match(r"(https?://[^/]+)/c/(\S+)", web_url)
         assert match, f"could not parse Web UI url: {web_url!r}"
+        # The persistent footer can follow the first model render.
+        if _DEFAULT_MODEL not in startup_output:
+            child.expect(_DEFAULT_MODEL, timeout=_LAUNCH_TIMEOUT)
         return child, match.group(1), match.group(2)
+    except pexpect.TIMEOUT as exc:
+        child.logfile_read.flush()
+        output = child.before or ""
+        _teardown(child, env)
+        raise AssertionError(
+            f"omnigent pi did not publish its session link/model within {_LAUNCH_TIMEOUT}s "
+            f"('Web UI' in the raw output: {'Web UI' in output}); transcript: {transcript}\n"
+            f"{strip_ansi(output)[:2000]}\n...\n{strip_ansi(output)[-1000:]}"
+        ) from exc
     except BaseException:
         _teardown(child, env)
         raise
@@ -310,7 +330,6 @@ def test_pi_native_smart_routing_applies_pick(pi_home: Path, mock_llm: str, surf
     env = _env(pi_home)
     child, server, conv = _launch_pi(env)
     try:
-        child.expect(_DEFAULT_MODEL, timeout=_LAUNCH_TIMEOUT)
         _enable_smart_routing(server, conv)
         _configure_judge_from_options(mock_llm, server, conv)
         pane = _find_pi_pane(server, conv) if surface == "tui" else None
@@ -344,6 +363,15 @@ def test_pi_native_smart_routing_applies_pick(pi_home: Path, mock_llm: str, surf
 
         send("What did the command return?")
         items = _await_answer(child, server, conv, "ROUTED_FOLLOWUP_ANSWER")
+        for prompt in (_COMPLEX_PROMPT, "What did the command return?"):
+            assert (
+                sum(
+                    item.get("role") == "user"
+                    and any(part.get("text") == prompt for part in item.get("content", []))
+                    for item in items
+                )
+                == 1
+            ), items
         assert _served_pi_models(mock_llm) == [_TARGET_MODEL] * 3
         assert _judge_call_count(mock_llm) == judge_after
         requests = get_mock_requests(mock_llm, key=_TARGET_MODEL)

@@ -196,6 +196,7 @@ def test_failure_debug_row_preserves_background_count_before_cleanup(
         "origin": origin,
         "previous_status": "running",
         "response_id": "resp_bg",
+        "active_response_id_at_failure": "resp_bg",
     }
     if count == 2:
         expected["cached_background_task_count"] = "2"

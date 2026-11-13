@@ -50,18 +50,44 @@ of the agent YAML.
 | `async` | Optional | Whether async work tools are exposed. Defaults to `true`. |
 | `cancellable` | Optional | Whether the session can be cancelled. Defaults to `true`. |
 | `timers` | Optional | Whether timer tools are exposed. Defaults to `false`. |
+| `tool_groups` | Optional | Opt out of framework-owned tool groups the agent cannot use. Every group defaults to `true`. |
 
 ## Executor
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, devin-native, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # see the harness id list below
   model: databricks-claude-opus-4-7
   reasoning_effort: high     # optional spec default: low | medium | high | xhigh (harness-dependent)
   auth:
     type: databricks
     profile: oss             # Databricks profile for model routing
 ```
+
+Canonical `executor.harness` ids:
+
+| Family | Headless / SDK | Native TUI |
+|---|---|---|
+| Claude Code | `claude-sdk` | `claude-native` |
+| Codex | `codex` | `codex-native` |
+| Cursor | `cursor` | `cursor-native` |
+| OpenCode | — | `opencode-native` |
+| Goose | `goose` | `goose-native` |
+| Kiro | — | `kiro-native` |
+| Antigravity | `antigravity` | `antigravity-native` |
+| GitHub Copilot | `copilot` | — |
+| Devin | — | `devin-native` |
+| Qwen Code | `qwen` | `qwen-native` |
+| Kimi Code | `kimi` | `kimi-native` |
+| Hermes | `hermes` | `hermes-native` |
+| Pi | `pi` | `pi-native` |
+| Grok Build | `grok` | — |
+| Jcode | `jcode` | — |
+| OpenAI | `openai-agents`, `open-responses` | — |
+| Custom ACP agent | `acp:<slug>` | — |
+
+Aliases such as `claude`, `opencode`, `devin`, `agy`, `github-copilot`,
+`kimi-code`, `qwen-code`, `grok-build` and `native-goose` resolve to these ids.
 
 Set the Databricks profile under `executor.auth`. The older top-level
 `executor.profile` shorthand is legacy and should not be used in new specs.
@@ -112,10 +138,10 @@ executor:
 
 ### Pi context files
 
-With `harness: pi`, Pi automatically appends context files such as `AGENTS.md`
-and `CLAUDE.md` from the workspace, its ancestors, Pi's global agent directory,
-and the agent bundle's root. To disable this discovery for an agent, set
-`context_files: false`:
+With `harness: pi` or `pi-native`, Pi automatically appends context files such
+as `AGENTS.md` and `CLAUDE.md` from the workspace, its ancestors, and Pi's global
+agent directory. Regular `pi` also loads context from the agent bundle's root.
+To disable this discovery for an agent, set `context_files: false`:
 
 ```yaml
 name: focused-agent
@@ -143,8 +169,7 @@ The default is `true`; the value must be a YAML boolean. Explicit `prompt:` or
 `instructions:` content (including an explicitly referenced `AGENTS.md`) and
 Omnigent's runtime instructions are still sent to Pi. This option maps to Pi's
 `--no-context-files` flag. It does not disable skills, extensions, or Pi's
-separate `SYSTEM.md` discovery, and is only supported by `pi`, not `pi-native`
-or other harnesses.
+separate `SYSTEM.md` discovery. It supports `pi` and `pi-native` only.
 
 ### Pi bundle resources
 
@@ -175,15 +200,27 @@ exposed.
 
 ### Pi system prompt
 
-With `harness: pi`, `system_prompt_mode` controls how Omnigent sends its composed
-instructions to Pi:
+With `harness: pi` or `pi-native`, `system_prompt_mode` controls how Omnigent
+sends agent instructions to Pi:
 
-- `append` (default) keeps Pi's base prompt and appends Omnigent's instructions
+- `append` (default) keeps Pi's base prompt and appends agent instructions
   using `--append-system-prompt`. The base is Pi's built-in coding prompt or a
   discovered `SYSTEM.md`.
-- `replace` sends Omnigent's instructions as the base using `--system-prompt`.
+- `replace` sends agent instructions as the base using `--system-prompt`.
   Pi's built-in coding prompt and discovered `SYSTEM.md` are omitted. An explicit
   empty `--append-system-prompt` also prevents discovery of `APPEND_SYSTEM.md`.
+
+For native Pi in append mode, authored instructions are added after the normally
+selected `APPEND_SYSTEM.md`: the trusted workspace's `.pi/APPEND_SYSTEM.md`, or
+the active Pi agent directory's file as a fallback. `--no-approve` / `-na`
+exclude the project file. If the Pi version cannot be detected, project selection
+requires an explicit `--approve` / `-a`; stored or interactive trust is not inferred.
+Explicit native `--append-system-prompt` arguments
+select append inputs themselves and disable this automatic selection, matching
+Pi's CLI behavior. `context_files: false` does not disable `APPEND_SYSTEM.md`;
+use replacement mode or explicit append arguments to exclude it.
+Regular Pi SDK sessions use explicit composed instructions rather than
+automatically loading `APPEND_SYSTEM.md`.
 
 To replace the base prompt and disable workspace context discovery:
 
@@ -211,12 +248,16 @@ executor:
 instructions: AGENTS.md
 ```
 
-Both modes preserve explicit agent instructions, per-request instructions, and
-Omnigent's appended runtime instructions. Replacement removes Pi's default tool
-summaries and coding guidelines; tool schemas and execution still work.
+Regular `pi` delivers composed agent/request/runtime instructions. Native Pi
+loads the spec's resolved authored instructions at terminal launch; replacement
+requires non-empty authored instructions, checked at spec load. Per-turn runtime
+delivery is unchanged.
+Both modes preserve explicit agent instructions. Replacement removes Pi's default
+tool summaries and coding guidelines; tool schemas and execution still work.
 `context_files` is independent and still defaults to `true`. Skills, the working
 directory footer, and extension hooks remain active; extensions can modify the
-final prompt. This setting only supports `pi`, not `pi-native` or other harnesses.
+final prompt. This setting supports `pi` and `pi-native` only. Native settings
+apply on the next terminal launch; explicit native CLI arguments remain available.
 
 ### GitHub Copilot
 
@@ -274,6 +315,84 @@ executor values for a run. Databricks credentials come from the spec's
 `executor.auth` block or your `omnigent setup` provider config — there is
 no profile flag.
 
+### OpenCode
+
+`harness: opencode-native` runs the real OpenCode TUI against a private
+`opencode serve` per conversation, the same path `omnigent opencode` uses. It
+requires OpenCode 2.0.x (`npm i -g @opencode/cli@2.0.32`). Free models need no
+sign-in; run `opencode auth login` to add your own providers. Omnigent stores no
+OpenCode credential. See the [OpenCode harness guide](opencode-native.md).
+
+```yaml
+executor:
+  harness: opencode-native     # aliases: opencode, native-opencode
+  model: anthropic/<model-id>  # optional; OpenCode's provider/model form
+```
+
+### Goose
+
+`harness: goose` runs Block's [Goose](https://github.com/block/goose) headlessly
+over ACP (`goose acp`). Goose's mid-turn tool approvals surface as web
+elicitation cards. `harness: goose-native` is the terminal-first counterpart
+that `omnigent goose` launches; there, Goose's own TUI approval is the tool
+gate. Both require the `goose` CLI 1.38 or newer (`brew install block-goose-cli`)
+configured with a provider via `goose configure`; Omnigent stores no Goose
+credential.
+
+```yaml
+executor:
+  harness: goose               # native: goose-native (alias: native-goose)
+  model: <model-id>            # optional; forwarded as GOOSE_MODEL
+```
+
+The provider stays whatever `goose configure` selected unless
+`HARNESS_GOOSE_PROVIDER` overrides it.
+
+### Devin
+
+`harness: devin-native` wraps the Devin CLI TUI (Cognition), the same path
+`omnigent devin` uses. Install it with
+`curl -fsSL https://cli.devin.ai/install.sh | bash` and sign in with
+`devin auth login`; Omnigent stores no Devin credential. The removed
+`devin-acp` id still resolves here. See the
+[Devin harness guide](devin-native.md).
+
+```yaml
+executor:
+  harness: devin-native        # aliases: devin, devin-acp, native-devin
+```
+
+### Hermes
+
+`harness: hermes` runs the Hermes Agent CLI (Nous Research) via
+`hermes chat -q` per turn, resuming Hermes' own session store between turns. `harness: hermes-native` is the terminal-first path
+`omnigent hermes` uses. Install Hermes 0.17.0 or newer with
+`curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash` and pick a
+provider with `hermes model`; Omnigent stores no Hermes credential.
+
+```yaml
+executor:
+  harness: hermes              # native: hermes-native (alias: native-hermes)
+  model: <provider>/<model-id> # optional; omit for Hermes' configured default
+```
+
+### Grok Build and Jcode
+
+`harness: grok` (alias `grok-build`) and `harness: jcode` are builtin ACP CLI
+harnesses: Omnigent drives `grok agent stdio` or `jcode acp` through the same
+generic ACP wrap as `acp:<slug>`. By default each CLI owns its auth and model
+selection (`grok login --device-auth`, or a provider in `~/.jcode/config.toml`),
+so a `model` override is refused. When Omnigent's inference config binds
+`jcode` to an OpenAI-compatible Chat Completions provider, Omnigent writes a
+session-private Jcode config instead and forwards `model`. Jcode is not offered
+Omnigent's MCP tools. See the README's *Grok Build and Jcode* section for install
+steps.
+
+```yaml
+executor:
+  harness: grok                # or: jcode
+```
+
 ## Qwen Code
 
 `harness: qwen` runs the agent through [Qwen Code](https://github.com/QwenLM/qwen)
@@ -294,6 +413,12 @@ missing executor values.
 `harness: acp:<slug>` runs any configured Agent Client Protocol server command.
 Register commands in `~/.omnigent/config.yaml` under `acp.agents`; the slug is
 derived from the agent name.
+
+Every ACP `session/prompt`, including Goose and Qwen prompts, carries
+`params._meta["ai.omnigent/inputItemId"]`. Its value is the persisted user item
+ID, already readable via `GET /v1/sessions/{id}/items` when the prompt arrives.
+A `null` value means a synthetic or tool-recovery prompt without an initiating
+persisted user item. A missing key indicates an older Omnigent version.
 
 OpenClaw's Gateway ACP bridge is one such server. It rejects per-session
 `mcpServers`, so disable Omnigent's MCP relay for that entry and let OpenClaw
@@ -534,15 +659,163 @@ os_env:
     type: linux_bwrap
     egress_rules:
       - "* pypi.org/**"                              # your other egress needs
-      - "* dbc-adb7b1a3-9097.cloud.databricks.com/**"  # the proxied workspace
+      - "* dbc-87654321-dcba.cloud.databricks.com/**"  # the proxied workspace
     credential_proxy:
       - type: databricks_cli
-        profiles: [dbc-adb7b1a3-9097, oss]
-        default: dbc-adb7b1a3-9097   # optional; sets DATABRICKS_CONFIG_PROFILE
+        profiles: [dbc-87654321-dcba, oss]
+        default: dbc-87654321-dcba   # optional; sets DATABRICKS_CONFIG_PROFILE
 ```
 
-Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
+Inside the sandbox, `databricks --profile dbc-87654321-dcba current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
+
+A sandboxed `codex` executor can use an HTTPS gateway through the same proxy.
+Bind the gateway host with `https_bearer`, set `env` to
+`OMNIGENT_CODEX_GATEWAY_TOKEN`, and allow the gateway's exact Responses route.
+The runner replaces the provider's auth command with a fixed command that
+prints only the placeholder. The trusted parent reads the protected source and
+renews its token; Codex receives a private home without host auth or provider
+configuration. A locked profile requires an explicit `broker_gateway: true`;
+missing or mismatched bindings prevent launch. Other gateway profiles retain
+their existing authentication.
+
+```yaml
+executor:
+  model: gpt-daybreak-blue-latest
+  auth:
+    type: provider
+    name: locked-model
+  config:
+    harness: codex
+    broker_gateway: true
+    web_search: false
+    disable_native_tools: true
+os_env:
+  type: caller_process
+  sandbox:
+    type: darwin_seatbelt # or linux_bwrap
+    egress_rules:
+      - "POST model.example.com/cyber/v1/responses"
+    credential_proxy:
+      - type: https_bearer
+        target: model.example.com
+        env: OMNIGENT_CODEX_GATEWAY_TOKEN
+        source:
+          unix_socket: /private/model-token.sock
+          refresh_interval_seconds: 300
+```
+
+Configure this provider in the host's `~/.omnigent/config.yaml`:
+
+```yaml
+providers:
+  locked-model:
+    kind: gateway
+    openai:
+      base_url: https://model.example.com/cyber/v1
+      wire_api: responses
+      auth_command: "false" # required by the provider schema; locked mode replaces it
+      models:
+        default: gpt-daybreak-blue-latest
+```
+
+Before a release includes gateway broker support, the minimum runner build is
+[8ee1f8558f](https://github.com/omnigent-ai/omnigent/commit/8ee1f8558fc8f5e86244e8ac9bbcb1189eb6e375)
+or a later build containing that implementation. Upgrade every runner that can
+launch the profile before enabling it. Older runners
+ignore `broker_gateway` and retain legacy authentication behavior. Keep the
+provider's `auth_command: "false"` exactly as shown: an older runner then fails
+authentication instead of running a real token command. The setting alone
+does not protect an older runner. Verify a real turn and a resumed turn on
+the upgraded runner before rollout.
+
+The locked profile replaces `false` with the brokered placeholder command
+before Codex starts. Other uses of this provider run `false` and fail
+authentication.
+
+The reserved gateway binding requires a placeholder-bearing HTTPS request on
+port 443 in both the Codex relay and the Omnigent OS-tool proxy. A bare request
+or plaintext HTTP request receives no bearer.
+
+The socket path must be absolute and outside sandbox read/write grants. A
+separate trusted issuer must serve `GET /token` and refresh the bearer; Omnigent
+does not start that issuer. Keep its code, dependencies, configuration, and
+credential storage outside sandbox write grants. Locked Codex profiles must set
+`web_search: false` and `disable_native_tools: true` so their shell and file
+operations use Omnigent tools and policies. Missing or unsafe settings prevent
+launch.
+
+### Named TCP egress from a sandbox
+
+For runnable CLI checks on macOS and Linux, see the
+[local Python HTTP listener and public SSH examples](../examples/tcp-egress/README.md).
+
+`sandbox.tcp_egress` permits a sandbox to open an opaque TCP stream to one
+named, exact host and port without giving it general network access. The
+parent resolves DNS on each connection, checks **every** returned address
+against the route's policy, and dials a pinned address. The sandbox cannot
+choose the dialed IP or port. This setting supplies **no credentials** and
+does not verify the server's identity: configure TLS or host-key verification
+in the client.
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto # linux_bwrap or darwin_seatbelt
+    allow_network: false
+    tcp_egress:
+      - name: analytics_db
+        host: db.internal.example
+        port: 5432
+        allowed_cidrs: [10.42.0.0/16]
+      - name: git_host
+        host: github.com
+        port: 22
+terminals:
+  shell:
+    command: bash
+    os_env: inherit
+```
+
+Upgrade the server, host, and session runner to builds with TCP egress support
+before using this field. The server requires both connected runtimes to advertise
+the `tcp_egress` capability and rejects older builds before launch or initialization,
+including routes in sub-agents and terminal environments. Updating only the server
+is insufficient. Keep `allow_network: false` explicit so an older server and runner
+that ignore `tcp_egress` still deny direct networking.
+
+The parent resolves DNS on every connection. A public DNS name that resolves
+to a private address is **denied by default**; permit the smallest relevant
+private CIDR explicitly with `allowed_cidrs`. **Every** A/AAAA answer must
+match the CIDRs when specified; a mixed public/private answer is denied unless
+every address is explicitly allowed. The chosen IP is pinned for the dial,
+so a later DNS change cannot redirect an established connection.
+Loopback, link-local, metadata, cloud control addresses, and mixed
+allowed/blocked DNS answers remain denied. The broker permits up to eight
+concurrent streams per sandbox. Each stream has a 30-minute lifetime, a
+five-minute idle limit, and a 2 GiB total-transfer limit; the connector exits
+nonzero if the broker closes it early. A peer that stops reading for ten
+seconds also closes the stream, even if the idle limit has not elapsed.
+A sandbox cannot configure
+`tcp_egress` and HTTP `egress_rules` together: even a different DNS name
+could lead to the same HTTP endpoint and bypass method/path restrictions.
+Opaque routes on ports 80/443 are also rejected. Clients
+that support a stdin/stdout proxy can run
+`omnigent-egress-connect analytics_db` from `sys_os_shell` or an inherited
+sandboxed terminal. For example, OpenSSH can use
+`ssh -o 'ProxyCommand=omnigent-egress-connect git_host' git@github.com`
+with the `git_host` route above, a separately available SSH credential, and
+its own pinned host key. A
+plain `psql -h db.internal.example` cannot use this connector directly;
+PostgreSQL client wiring and secretless credentials require the separate
+PostgreSQL capability. Native Codex workers and sandbox backends other than
+`linux_bwrap` and `darwin_seatbelt` reject `tcp_egress` rather than silently
+discarding the route. Native launchers that have not started a TCP broker
+also fail at spawn rather than retaining direct network access. Git SSH
+bindings can coexist with named TCP routes;
+HTTP `egress_rules` cannot coexist until an explicit overlap policy exists.
 
 ### Git over SSH from a sandbox
 
@@ -854,6 +1127,40 @@ Use `os_env: inherit` to give the terminal the same sandbox as the agent, or
 alias a shared `sandbox:` block so `sys_os_*` and the terminal enforce the same
 policy. Keep `allow_sandbox_override: false` unless you intend to let the
 launcher weaken the sandbox at launch time.
+
+## Tool groups
+
+Several framework-owned tool groups register on every agent without any
+declaration. Each one has a `tool_groups` key so an agent can drop a group it
+cannot use — a headless sub-agent has no embedded browser to drive, and a
+byte-bounded provider counts every advertised tool against its limit.
+
+```yaml
+tool_groups:
+  browser: false          # browser_navigate / _snapshot / _click / _type / _screenshot
+  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete
+  comments: false         # list_comments / update_comment
+  policies: false         # sys_add_policy / sys_policy_registry
+  agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+  projects: false         # sys_project_* / sys_session_update
+```
+
+Every group defaults to `true`, so omitting the block changes nothing. Values
+must be booleans and group names must match exactly; a typo fails the load
+rather than silently leaving the group registered. Disabling `browser` also
+drops the embedded-browser guidance from the composed system prompt. The block
+is read the same way from a `config.yaml` bundle and a single-file agent YAML.
+
+`agent_discovery: false` is rejected while `spawn: true` or the
+`scheduled_tasks` group is on: `sys_session_create` and
+`sys_scheduled_task_create` take an `agent_id` the model looks up with
+`sys_agent_list` / `sys_agent_get`.
+
+The session read tools (`sys_session_list` / `sys_session_get_history` /
+`sys_session_get_info`), `sys_session_rename`, `ui_open_file`, and `sys_cancel_task`
+have no key: any agent in a multi-agent session needs the reads, and async work
+handles point at the cancel tool. [`ui_open_file`](agent-ui-api.md) asks current
+session viewers to open a workspace-relative file without switching sessions.
 
 ## Complete example
 

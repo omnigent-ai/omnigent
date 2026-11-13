@@ -21,10 +21,7 @@ policy attachment time (the ``config:`` block in the YAML spec).
 
 The callable must return a dict shaped::
 
-    {
-        "result": "ALLOW" | "DENY" | "ASK",
-        "reason": "human-readable string or null"
-    }
+    {"result": "ALLOW" | "DENY" | "ASK", "reason": "human-readable string or null"}
 
 Two YAML shapes parse into a :class:`FunctionRef`:
 
@@ -574,8 +571,13 @@ def _policy_result_from_dict(
 
     Accepts the flat shape::
 
-        {"result": "ALLOW"|"DENY"|"ASK", "reason": "...",
-         "data": ..., "state_updates": [...], "set_labels": {...}}
+        {
+            "result": "ALLOW" | "DENY" | "ASK",
+            "reason": "...",
+            "data": ...,
+            "state_updates": [...],
+            "set_labels": {...},
+        }
 
     :param raw: The callable's dict return.
     :param spec_name: Policy name for error messages.

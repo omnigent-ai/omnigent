@@ -36,10 +36,12 @@ from omnigent.runner.git_providers import (
     ProviderCapabilities,
     PullRequestAuth,
     PullRequestFacet,
+    ReviewerRef,
     ShellPrOp,
     ShellSegment,
     azure_devops_observer,
     local_git,
+    read_pinned_revision,
 )
 from omnigent.runner.session_prs import PullRequestRef
 
@@ -63,6 +65,7 @@ _CAPABILITIES = ProviderCapabilities(
 _AUTH_HINT = "Run az login on the host or set AZURE_DEVOPS_EXT_PAT."
 _INACCESSIBLE = "Cannot access this pull request with the Azure DevOps credentials on the host"
 _PR_LOAD_FAILED = "Azure DevOps could not load the selected PR's file content"
+_PR_CHANGED = "The pull request changed; refresh to see its latest revision."
 _UNEXPECTED_RESPONSE = "Azure DevOps returned an unexpected file response"
 _REVISION_LOAD_FAILED = "Azure DevOps could not load the selected file revision"
 _NO_CONTEXT = "Expanded context is unavailable for this file"
@@ -655,6 +658,11 @@ def _pr_payload(
         "head_ref": _short_ref(pr.get("sourceRefName")),
         "head_sha": _commit(pr, "lastMergeSourceCommit"),
         "base_sha": _commit(pr, "lastMergeTargetCommit"),
+        "head_repository_url": (
+            _text(_nested(pr, "forkSource", "repository", "webUrl"))
+            if pr.get("forkSource")
+            else url.rsplit("/pullrequest/", 1)[0]
+        ),
         "checks": checks,
         "body": description if isinstance(description, str) and description.strip() else None,
         "comments": comments[:_MAX_COMMENTS],
@@ -861,7 +869,16 @@ class AzureDevOpsPullRequests:
         When a page of changes cannot be read, such as when the request budget runs out,
         the files already read come back with ``has_more`` set.
         """
-        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
+        return self._changed_files(root, reference, time.monotonic() + _REQUEST_BUDGET_SECONDS)
+
+    def _changed_files(
+        self,
+        root: str,
+        reference: PullRequestRef | None,
+        deadline: float,
+        listed_heads: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """List the latest iteration's changes; ``listed_heads`` collects its source commit."""
         empty: dict[str, Any] = {"object": "list", "data": [], "has_more": False}
         repo = _target_repo(root, reference)
         token = _token() if repo is not None else None
@@ -886,6 +903,8 @@ class AzureDevOpsPullRequests:
                         "has_more": True,
                         "warning": "Azure DevOps file changes are not ready. Try again shortly.",
                     }
+                if listed_heads is not None and (source := _commit(latest, "sourceRefCommit")):
+                    listed_heads.append(source)
                 pages = client.iteration_change_pages(
                     repo.project, repo.repo, number, latest["id"], compare_to=0
                 )
@@ -899,9 +918,70 @@ class AzureDevOpsPullRequests:
             result["warning"] = "Azure DevOps could not load every changed file."
         return result
 
+    def pinned_changed_files(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """List the files at the pinned revisions; one budget covers the checks and the listing."""
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
+        listed_heads: list[str] = []
+        result = read_pinned_revision(
+            lambda: self._pr_revisions(reference, deadline),
+            lambda: self._changed_files(root, reference, deadline, listed_heads),
+            head_sha=head_sha,
+            base_sha=base_sha,
+            moved=_PR_CHANGED,
+        )
+        # The latest iteration must be the pinned head too; a list that names none is unverified.
+        if listed_heads and listed_heads[0] != head_sha:
+            raise ValueError(_PR_CHANGED)
+        if not listed_heads:
+            result.pop("head_sha", None)
+            result.pop("base_sha", None)
+        return result
+
+    def _pr_revisions(self, reference: PullRequestRef, deadline: float) -> tuple[str, str] | None:
+        """Return the PR's merge ``(head, base)``, or ``None`` when they cannot be read."""
+        repo = _reference_repo(reference)
+        token = _token() if repo is not None else None
+        if repo is None or token is None:
+            return None
+        try:
+            with self._client(repo.org, token, deadline=deadline) as client:
+                pr = _call(client.get_pull_request, repo.project, repo.repo, reference.number)
+        except _RestFailure:
+            return None
+        head, base = _commit(pr, "lastMergeSourceCommit"), _commit(pr, "lastMergeTargetCommit")
+        return (head, base) if head and base else None
+
     def pr_diff(self, root: str, reference: PullRequestRef | None) -> dict[str, Any]:
         """Diff the PR's head against its merge base in the workspace, fetching missing commits."""
+        return self._pr_patch(root, reference, time.monotonic() + _REQUEST_BUDGET_SECONDS)
+
+    def pinned_diff(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """Diff the pinned commits; one budget covers the checks and the patch."""
         deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
+        return read_pinned_revision(
+            lambda: self._pr_revisions(reference, deadline),
+            lambda: self._pr_patch(root, reference, deadline, pinned=(head_sha, base_sha)),
+            head_sha=head_sha,
+            base_sha=base_sha,
+            moved=_PR_CHANGED,
+        )
+
+    def _pr_patch(
+        self,
+        root: str,
+        reference: PullRequestRef | None,
+        deadline: float,
+        *,
+        pinned: tuple[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Return the PR's patch, fetching the commits it needs before ``deadline``.
+
+        With ``pinned`` ``(head, base)``, the patch is of those commits, not the PR's current ones.
+        """
         empty: dict[str, Any] = {"object": PR_DIFF_OBJECT, "patch": ""}
         remotes = _remotes(root)
         if reference is None:
@@ -930,8 +1010,10 @@ class AzureDevOpsPullRequests:
                 if failure.denied
                 else "Azure DevOps could not load the pull request diff. Try again shortly.",
             )
-        head = _commit(pr, "lastMergeSourceCommit")
-        base = _commit(pr, "lastMergeTargetCommit")
+        head, base = pinned or (
+            _commit(pr, "lastMergeSourceCommit"),
+            _commit(pr, "lastMergeTargetCommit"),
+        )
         if head is None or base is None:
             return _unavailable_diff(
                 "revisions_unavailable",
@@ -1138,6 +1220,101 @@ class AzureDevOpsPullRequests:
         :raises ValueError: Always.
         """
         raise ValueError("Editing Azure DevOps pull request labels is not supported yet.")
+
+    def merge_options(
+        self,
+        root: str,  # noqa: ARG002 - merging is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - merging is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: merging Azure DevOps pull requests is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Merging Azure DevOps pull requests from Omnigent is not supported yet.")
+
+    def merge(
+        self,
+        root: str,  # noqa: ARG002 - merging is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - merging is unsupported
+        *,
+        merge_method: str,  # noqa: ARG002 - merging is unsupported
+        expected_head: str,  # noqa: ARG002 - merging is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: merging Azure DevOps pull requests is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Merging Azure DevOps pull requests from Omnigent is not supported yet.")
+
+    def disable_auto_merge(
+        self,
+        root: str,  # noqa: ARG002 - merging is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - merging is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: merging Azure DevOps pull requests is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Merging Azure DevOps pull requests from Omnigent is not supported yet.")
+
+    def review_candidates(
+        self,
+        root: str,  # noqa: ARG002 - reviewer editing is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - reviewer editing is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: Azure DevOps reviewer editing is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Editing Azure DevOps pull request reviewers is not supported yet.")
+
+    def edit_reviewers(
+        self,
+        root: str,  # noqa: ARG002 - reviewer editing is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - reviewer editing is unsupported
+        *,
+        add: Sequence[ReviewerRef],  # noqa: ARG002 - reviewer editing is unsupported
+        remove: Sequence[ReviewerRef],  # noqa: ARG002 - reviewer editing is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: Azure DevOps reviewer editing is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Editing Azure DevOps pull request reviewers is not supported yet.")
+
+    def create_comment(self, root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+        """Reject comment posting for this provider."""
+        del root, reference, body
+        raise ValueError("Posting comments for this provider is not supported yet.")
+
+    def edit_details(
+        self,
+        root: str,  # noqa: ARG002 - details editing is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - details editing is unsupported
+        *,
+        title: str | None,  # noqa: ARG002 - details editing is unsupported
+        body: str | None,  # noqa: ARG002 - details editing is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: Azure DevOps title and description editing is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Editing Azure DevOps pull request descriptions is not supported yet.")
+
+    def upload_attachment(
+        self,
+        root: str,  # noqa: ARG002 - attachment uploads are unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - attachment uploads are unsupported
+        *,
+        name: str,  # noqa: ARG002 - attachment uploads are unsupported
+        content_type: str,  # noqa: ARG002 - attachment uploads are unsupported
+        content: bytes,  # noqa: ARG002 - attachment uploads are unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: Azure DevOps attachment uploads are not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Attaching files to Azure DevOps pull requests is not supported yet.")
 
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         """Return one op per ``az repos pr`` command, in order."""
