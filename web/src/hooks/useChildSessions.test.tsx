@@ -31,6 +31,28 @@ describe("useChildSessions", () => {
     expect(result.current.children).toEqual([]);
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });
+
+  it("follows every page of direct children", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const after = new URL(String(input), "http://test.local").searchParams.get("after");
+      const page =
+        after === null
+          ? { data: [{ id: "conv_new", busy: false }], last_id: "conv_new", has_more: true }
+          : { data: [{ id: "conv_old", busy: true }], has_more: false };
+      return new Response(JSON.stringify(page));
+    });
+    const { result } = renderHook(() => useChildSessions("conv_parent"), { wrapper });
+
+    await waitFor(() => expect(result.current.children.map((c) => c.id)).toHaveLength(2));
+    expect(result.current.children.map((c) => [c.id, c.busy])).toEqual([
+      ["conv_new", false],
+      ["conv_old", true],
+    ]);
+    expect(vi.mocked(authenticatedFetch).mock.calls.map(([input]) => input)).toEqual([
+      "/v1/sessions/conv_parent/child_sessions",
+      "/v1/sessions/conv_parent/child_sessions?limit=100&after=conv_new",
+    ]);
+  });
 });
 
 describe("useDescendantSession", () => {

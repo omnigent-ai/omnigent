@@ -142,20 +142,23 @@ async def test_agent_costs_report_subtree_totals(
     store = SqlAlchemyConversationStore(db_uri)
     codex = _seed_child(conv_store=store, parent_id=session["id"], title="codex:a")
     grandchild = _seed_child(conv_store=store, parent_id=codex.id, title="codex:b")
-    unpriced = _seed_child(conv_store=store, parent_id=session["id"], title="worker:c")
+    free = _seed_child(conv_store=store, parent_id=session["id"], title="worker:c")
+    unpriced = _seed_child(conv_store=store, parent_id=session["id"], title="worker:d")
     store.set_session_usage(session["id"], {"total_cost_usd": 1.0})
     store.set_session_usage(codex.id, {"total_cost_usd": 0.5})
-    store.set_session_usage(grandchild.id, {"total_cost_usd": 0.0})
+    store.set_session_usage(grandchild.id, {"total_cost_usd": 0.25})
+    store.set_session_usage(free.id, {"total_cost_usd": 0.0})
 
     resp = await client.get(f"/v1/sessions/{session['id']}/agent_costs")
 
     assert resp.status_code == 200
     assert {row["id"]: row["cost_usd"] for row in resp.json()["data"]} == {
         # Own and descendant spend, as each session's own total reports it.
-        session["id"]: 1.5,
-        codex.id: 0.5,
+        session["id"]: 1.75,
+        codex.id: 0.75,
+        grandchild.id: 0.25,
         # A known zero stays zero; nothing priced stays unknown.
-        grandchild.id: 0.0,
+        free.id: 0.0,
         unpriced.id: None,
     }
     child_resp = await client.get(f"/v1/sessions/{codex.id}/agent_costs")

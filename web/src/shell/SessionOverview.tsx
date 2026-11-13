@@ -1,5 +1,4 @@
-// WIP(session_overview): first cut with the session total, per-model usage and
-// direct sub-agents.
+// WIP(session_overview): session total, per-model usage and direct sub-agents.
 
 import { useSyncExternalStore } from "react";
 import { XIcon } from "lucide-react";

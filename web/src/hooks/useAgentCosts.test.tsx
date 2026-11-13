@@ -31,12 +31,18 @@ function costRequests(): URL[] {
     .filter((url) => url.pathname.endsWith("/agent_costs"));
 }
 
+// The busy child is on the second child-list page, as an older sibling.
 function routeCosts(costs: (url: URL) => Response, childBusy: boolean) {
   vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
     const url = new URL(String(input), "http://test.local");
-    return url.pathname.endsWith("/child_sessions")
-      ? new Response(JSON.stringify({ data: [{ id: "conv_child", busy: childBusy }] }))
-      : costs(url);
+    if (!url.pathname.endsWith("/child_sessions")) return costs(url);
+    return new Response(
+      JSON.stringify(
+        url.searchParams.get("after") === null
+          ? { data: [{ id: "conv_new", busy: false }], last_id: "conv_new", has_more: true }
+          : { data: [{ id: "conv_child", busy: childBusy }], has_more: false },
+      ),
+    );
   });
 }
 
@@ -106,6 +112,22 @@ describe("useAgentCosts", () => {
     ]);
   });
 
+  it("fails rather than walking a third time when the restarted cursor goes stale too", async () => {
+    routeCosts(
+      (url) =>
+        url.searchParams.get("after") === null
+          ? new Response(
+              JSON.stringify({ data: [{ id: "conv_root" }], last_id: "conv_root", has_more: true }),
+            )
+          : new Response('{"error":{"code":"stale_cursor"}}', { status: 400 }),
+      false,
+    );
+    const { result } = renderCosts(true);
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(costRequests()).toHaveLength(4);
+  });
+
   it.each([
     ["a route-missing body", '{"detail":"Not Found"}'],
     ["the Omnigent error envelope", '{"error":{"code":"not_found","message":"Not found"}}'],
@@ -130,7 +152,10 @@ describe("useAgentCosts", () => {
 
     await vi.advanceTimersByTimeAsync(15_000);
     await waitFor(() => expect(costRequests()).toHaveLength(2));
-    client.setQueryData(childSessionsQueryKey("conv_root"), [{ id: "conv_child", busy: false }]);
+    client.setQueryData(childSessionsQueryKey("conv_root"), [
+      { id: "conv_new", busy: false },
+      { id: "conv_child", busy: false },
+    ]);
     await vi.advanceTimersByTimeAsync(45_000);
     expect(costRequests()).toHaveLength(2);
   });

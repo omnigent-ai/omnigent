@@ -32,6 +32,7 @@ export function SessionOverviewSubagents() {
                 <span className="min-w-0 truncate text-muted-foreground">
                   {childPrimaryLabel(child)}
                 </span>
+                {/* An unknown cost, including after a failed read, shows nothing. */}
                 <span className="shrink-0 font-mono tabular-nums">
                   {typeof cost === "number" && formatSessionCostUsd(cost)}
                 </span>
