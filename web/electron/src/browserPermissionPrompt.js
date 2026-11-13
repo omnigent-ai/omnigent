@@ -5,8 +5,8 @@ const { pathToFileURL } = require("node:url");
 const PROMPT_WIDTH = 380;
 const PROMPT_HEIGHT = 250;
 const CHOICES = {
-  permission: new Set(["allow-once", "always-allow", "deny", "dismiss"]),
-  "security-key": new Set(["open-in-browser", "dismiss"]),
+  permission: new Set(["allow-once", "always-allow", "deny", "dismiss", "failed"]),
+  "security-key": new Set(["open-in-browser", "dismiss", "failed"]),
 };
 // A security-key notice the app closes is "suppressed" so it can return; only Dismiss or
 // Escape is final.
@@ -174,7 +174,7 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
     ipcMain.handle("omnigent:browser-permission-choose", (event, choice) => {
       const request = forSender(event);
       if (!CHOICES[request.kind].has(choice)) throw new Error("Invalid permission choice");
-      request.finish(choice);
+      request.finish(choice === "failed" && request.kind === "permission" ? "dismiss" : choice);
     });
   }
 

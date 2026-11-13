@@ -45,4 +45,4 @@ void bridge
       document.getElementById("close").focus();
     }
   })
-  .catch(() => choose("dismiss"));
+  .catch(() => choose("failed"));

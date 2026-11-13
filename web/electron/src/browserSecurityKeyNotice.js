@@ -86,7 +86,7 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
   contents.ipc.on(PENDING_CHANNEL, (event, value) => {
     // Only top-level requests are observed; iframe requests are outside this notice's scope.
     if (event.senderFrame !== contents.mainFrame) return;
-    if (!pending && value === true) promptFailures = 0;
+    if (value === true) promptFailures = 0;
     pending = value === true;
     if (!pending) hide();
     else if (!shown && !timer) timer = setTimeout(show, SHOW_DELAY_MS);

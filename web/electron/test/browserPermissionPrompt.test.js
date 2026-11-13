@@ -198,6 +198,16 @@ describe("browser permission popover", () => {
     assert.equal(await result, "open-in-browser");
   });
 
+  for (const kind of ["permission", "security-key"]) {
+    it(`handles failed page initialization for ${kind} prompts`, async () => {
+      const h = harness();
+      const result = h.show({ kind });
+      h.choose("failed");
+      assert.equal(await result, kind === "security-key" ? "failed" : "dismiss");
+      assert.equal(h.windows[0].destroyed, true);
+    });
+  }
+
   it("defers a security-key notice until a pending permission decision is made", async () => {
     const h = harness();
     const permission = h.show();
@@ -338,10 +348,9 @@ describe("browser permission popover", () => {
     await tick();
     assert.equal(h.windows.length, 3, "three failures exhaust this request");
     failedLoad.mock.restore();
-    h.pending(false);
     h.pending(true);
     await h.wait();
-    assert.equal(h.windows.length, 4, "a new request can recover after load succeeds");
+    assert.equal(h.windows.length, 4, "an overlapping new request resets the failure budget");
   });
 
   it("keeps a pending security-key notice on blur but respects explicit dismissal", async (t) => {
@@ -547,6 +556,10 @@ describe("permission popover page", () => {
       assert.equal(h.elements.get("heading").textContent, "Use your security key");
       assert.equal(h.elements.get("close").ariaLabel, "Dismiss security key notice");
       assert.match(h.elements.get("description").textContent, /touch it to continue/);
+      assert.match(
+        h.elements.get("description").textContent,
+        /Built-in biometrics and passkeys saved on this device can't be used here/,
+      );
       assert.equal(h.elements.get("origin").textContent, ORIGIN);
       assert.equal(h.elements.get("permission-choices").hidden, true);
       assert.equal(h.elements.get("security-key-choices").hidden, false);
@@ -554,5 +567,12 @@ describe("permission popover page", () => {
       assert.equal(h.elements.get("reload").hidden, true);
       assert.equal(h.elements.get("close").focused, true);
     }
+  });
+
+  it("reports failed initialization without claiming the user dismissed it", async () => {
+    const h = pageHarness(Promise.reject(new Error("prompt info unavailable")));
+    await tick();
+    assert.equal(h.elements.get("prompt").hidden, true);
+    assert.deepEqual(h.choices, ["failed"]);
   });
 });
