@@ -1768,6 +1768,15 @@ def register_core_routes(
             else:
                 body.sibling_source_id = sibling_source.id
                 body.project_id = sibling_source.project_id
+        # Header-derived placement must respect the runner's confinement too.
+        _require_runner_confined_placement(
+            request,
+            host_id=body.host_id,
+            host_type=body.host_type,
+            sandbox_provider=body.sandbox_provider,
+            project_id=body.project_id,
+            inherited_project_id=inherited_project_id,
+        )
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         created = await _create_session_from_existing_agent(
             conversation_store,

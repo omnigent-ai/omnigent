@@ -1130,6 +1130,68 @@ def _runner_for_session(owner_client, stores, owner, *, legacy=False):
     return runner, bound, runner_id
 
 
+def test_runner_token_cannot_inherit_orchestrated_host_placement(setup_app, monkeypatch):
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.host.frames import HostHelloFrame, HostLaunchRunnerFrame, decode_host_frame
+    from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
+    from omnigent.server.feature_flags import resolve_feature_flags
+    from omnigent.server.routes import _workspace_validation
+
+    _, alice, stores, _ = setup_app
+    runner, source_id, runner_id = _runner_for_session(alice, stores, "alice")
+    alice.app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "session_orchestration,-sibling_sessions"}
+    )
+    conversations = stores["conversation_store"]
+    source = conversations.get_conversation(source_id)
+    host = stores["host_store"].get_host(source.host_id)
+    registry = alice.app.state.host_registry
+    with account_authority_scope("alice", host.account_generation):
+        registry.register(
+            source.host_id,
+            object(),
+            HostHelloFrame(version="0.15.0", frame_protocol_version=1, name="review-host"),
+            "alice",
+        )
+    stats, launches = [], []
+
+    async def stat(**kwargs):
+        stats.append(kwargs["path"])
+        return {
+            "status": "ok",
+            "exists": True,
+            "type": "directory",
+            "canonical_path": kwargs["path"],
+        }
+
+    def launch(conn, payload):
+        frame = decode_host_frame(payload)
+        assert isinstance(frame, HostLaunchRunnerFrame)
+        launches.append(frame.session_id)
+        conn.pending_launches[frame.request_id].set_result({"status": "launched"})
+
+    monkeypatch.setattr(_workspace_validation, "_ask_host_stat", stat)
+    monkeypatch.setattr(registry, "send_text", launch)
+    headers = {
+        ORCHESTRATION_SOURCE_HEADER: source_id,
+        RUNNER_TUNNEL_TOKEN_HEADER: "confined-runner-binding",
+    }
+    body = {"agent_id": source.agent_id}
+    before = {session.id for session in conversations.list_conversations().data}
+    denied = runner.post("/v1/sessions", json=body, headers=headers)
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["error"]["code"] == "runner_scope_denied"
+    assert not stats and not launches
+    assert {session.id for session in conversations.list_conversations().data} == before
+
+    created = alice.post("/v1/sessions", json=body, headers=headers)
+    assert created.status_code == 201, created.text
+    worker = conversations.get_conversation(created.json()["id"])
+    assert worker.host_id == source.host_id and worker.workspace == source.workspace
+    assert worker.runner_id is not None and worker.runner_id != runner_id
+    assert stats == [source.workspace] and launches == [worker.id]
+
+
 def test_runner_native_clear_keeps_source_project_without_placement(setup_app):
     from omnigent.native._native_supersession import (
         clear_replacement_create_body,
