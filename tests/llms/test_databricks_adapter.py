@@ -159,6 +159,9 @@ def test_gateway_url_fallback_keeps_selected_profile(
         )
     )
     assert profiles == ["gateway-profile"]
+    assert str(databricks_requests[0].url) == (
+        "https://workspace.example.test/ai-gateway/mlflow/v1/chat/completions"
+    )
     assert databricks_requests[0].headers["Authorization"] == "Bearer fallback-token"
 
 
@@ -169,9 +172,11 @@ def test_gateway_url_fallback_keeps_selected_profile(
         "http://workspace.example.test/ai-gateway/mlflow/v1",
         "https://workspace.example.test:8443/ai-gateway/mlflow/v1",
         "https://workspace.example.test@other.example.test/v1",
+        "https://WORKSPACE.example.test/ai-gateway/mlflow/v1",
+        "https://workspace.example.test:443/ai-gateway/mlflow/v1",
     ],
 )
-def test_profile_token_is_not_sent_to_another_origin(
+def test_profile_token_requires_exact_workspace_authority(
     monkeypatch: pytest.MonkeyPatch,
     databricks_requests: list[httpx.Request],
     base_url: str,

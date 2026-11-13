@@ -139,7 +139,9 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
             ``Config`` (handles OAuth refresh), then falls back
             to :func:`~omnigent.runtime.credentials.databricks.resolve_databricks_workspace`.
             A URL override using resolved credentials must be HTTPS on the
-            resolved workspace host.
+            resolved workspace host. The shared credential guard compares
+            authorities exactly: retain the profile's host spelling and
+            explicit port, even for an equivalent HTTPS origin.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
         :returns: Response dict or async iterator of chunk dicts.
