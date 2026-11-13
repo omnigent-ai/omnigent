@@ -607,7 +607,10 @@ async def _start_codex_turn(
             for key in ("model", "effort")
             if isinstance(value := settings_overrides.get(key), str) and value
         }
-        failed = await asyncio.to_thread(mirror_applied_codex_settings, bridge_dir, switched)
+        try:
+            failed = await asyncio.to_thread(mirror_applied_codex_settings, bridge_dir, switched)
+        except OSError as exc:
+            raise _CodexNativeSettingsUpdateFailed(exc) from exc
         for key, value in failed.items():
             _logger.warning("Failed to mirror codex %s switch into config.toml: %s", key, value)
     response = await _native_delivery_request(

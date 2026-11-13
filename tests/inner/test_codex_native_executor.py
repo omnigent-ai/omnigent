@@ -3957,6 +3957,8 @@ def test_run_turn_error_after_submit_is_not_marked_undelivered(
         "settings-disconnected",
         "settings-timeout",
         "settings-replaced",
+        "settings-mirror-failed",
+        "settings-mirror-replaced",
     ],
 )
 async def test_transport_failure_keeps_native_work_running(
@@ -3977,6 +3979,19 @@ async def test_transport_failure_keeps_native_work_running(
     native_running = submission == "before-send"
     if settings_failure:
         monkeypatch.setattr(codex_native_executor, "_DELIVERY_RPC_TIMEOUT_SECONDS", 1.0)
+    if submission.startswith("settings-mirror-"):
+
+        def fail_mirror(bridge_dir: Path, applied: dict[str, str]) -> dict[str, str]:
+            if submission == "settings-mirror-replaced":
+                state = read_bridge_state(bridge_dir)
+                assert state is not None
+                write_bridge_state(
+                    bridge_dir,
+                    replace(state, session_id="conv_new", thread_id="thread_new"),
+                )
+            raise OSError(errno.ENOSPC, "settings mirror disk full")
+
+        monkeypatch.setattr(codex_native_executor, "mirror_applied_codex_settings", fail_mirror)
 
     async def handle(websocket: ServerConnection) -> None:
         nonlocal native_running
@@ -4000,6 +4015,9 @@ async def test_transport_failure_keeps_native_work_running(
                 if submission == "settings-timeout":
                     await websocket.wait_closed()
                     return
+                if submission.startswith("settings-mirror-"):
+                    await websocket.send(json.dumps({"id": request["id"], "result": {}}))
+                    continue
                 await websocket.send(
                     json.dumps(
                         {
@@ -4084,7 +4102,7 @@ async def test_transport_failure_keeps_native_work_running(
             elif settings_failure:
                 assert caught.value.undelivered is True
                 assert caught.value.code == "codex_settings_update_failed"
-                if submission != "settings-timeout" and submission != "settings-disconnected":
+                if submission in {"settings-rejected", "settings-replaced"}:
                     assert "requested model unavailable" in str(caught.value)
             else:
                 assert "may already be running" in str(caught.value)
