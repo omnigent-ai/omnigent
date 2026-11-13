@@ -232,9 +232,13 @@ describe("browser permission popover", () => {
   it("keeps only the newest security-key notice open and sends it only its own details", async () => {
     const h = harness();
     const replaced = h.show({ kind: "security-key" });
-    h.show({ kind: "security-key" });
+    h.show({ kind: "security-key", origin: "https://replacement.example", cookieImport: true });
     assert.equal(await replaced, "suppressed");
-    assert.deepEqual(h.info(), { kind: "security-key", origin: ORIGIN, cookieImport: false });
+    assert.deepEqual(h.info(), {
+      kind: "security-key",
+      origin: "https://replacement.example",
+      cookieImport: true,
+    });
     assert.deepEqual(
       h.windows.map((popup) => popup.destroyed),
       [true, false],

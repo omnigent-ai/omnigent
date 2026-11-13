@@ -149,8 +149,7 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
       for (const event of ["move", "resize"]) parent.on(event, position);
       parent.webContents.on("did-start-navigation", onNavigation);
       popup.on("closed", close);
-      // The security-key notice reports a request still in progress, so focus moving to
-      // another app, the page or another conversation leaves it open.
+      // Keep advisory notices open when focus leaves the popup.
       if (kind === "permission") popup.on("blur", close);
       popup.webContents.on("render-process-gone", failed);
       popup.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
