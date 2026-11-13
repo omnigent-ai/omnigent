@@ -207,7 +207,7 @@ def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
     cache_python.write_text("")
     cache_python.chmod(0o755)
     monkeypatch.setattr(service.sys, "executable", str(cache_python))
-    wrapper = tmp_path / "bin" / "wrapper"
+    wrapper = tmp_path / "tool bin" / "my wrapper"
     wrapper.parent.mkdir()
     wrapper.write_text("#!/bin/sh\n")
     wrapper.chmod(0o755)
@@ -220,7 +220,12 @@ def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
 
     installed = service.enable_user_host_service(
         "https://example.com",
-        environment={**environment, "OMNIGENT_WRAPPER_COMMAND": "wrapper omni"},
+        environment={
+            **environment,
+            "OMNIGENT_WRAPPER_COMMAND": shlex.join(
+                [str(wrapper), "omni", "--profile", 'team "quoted"\\config']
+            ),
+        },
     )
 
     command = _recorded_command(installed)
@@ -228,10 +233,18 @@ def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
     assert command == [
         str(wrapper),
         "omni",
+        "--profile",
+        'team "quoted"\\config',
         "host-service-entry",
         "--server",
         "https://example.com",
     ]
+    if system == "Linux":
+        assert (
+            f'ExecStart="{wrapper}" "omni" "--profile" '
+            '"team \\"quoted\\"\\\\config" "host-service-entry" '
+            '"--server" "https://example.com"'
+        ) in installed.path.read_text().splitlines()
     reloads = {
         "Darwin": [
             ["launchctl", "bootout", f"gui/501/{installed.label}"],
