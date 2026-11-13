@@ -970,6 +970,33 @@ describe("ComposerMicButton (server dictation)", () => {
     }
   });
 
+  it("keeps the server take when the recognizer fails synchronously inside start", async () => {
+    vi.useFakeTimers();
+    try {
+      startSpy.mockImplementation(() => handlers.error?.({ error: "service-not-allowed" }));
+      render(
+        <CapabilitiesContext.Provider value={DICTATION_INFO}>
+          <ComposerMicButton onTranscript={vi.fn()} />
+        </CapabilitiesContext.Provider>,
+      );
+      const button = screen.getByRole("button", { name: "Voice dictation" });
+
+      await act(async () => {
+        fireEvent.click(button);
+      });
+      expect(sessionStartMock).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+
+      expect(sessionStopMock).not.toHaveBeenCalled();
+      expect(stopSpy).not.toHaveBeenCalled();
+      expect(button).toHaveAttribute("aria-pressed", "true");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reports a busy server distinctly from a broken one", async () => {
     const { DictationBusyError } = await import("@/lib/dictation");
     sessionStartMock = vi.fn(async () => {

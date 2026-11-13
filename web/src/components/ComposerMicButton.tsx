@@ -578,7 +578,7 @@ export const ComposerMicButton = ({
           restarting: false,
           started: false,
         };
-        recognition.start();
+        // Armed before start() so a recognizer that answers synchronously clears it.
         startTimeoutRef.current = setTimeout(() => {
           webSpeechTakeRef.current = null;
           transitionRef.current = false;
@@ -590,10 +590,12 @@ export const ComposerMicButton = ({
           if (serverAvailableRef.current && !disabledRef.current) void toggleServerRef.current();
           else reportError("Voice input didn't start. Please try again.");
         }, WEB_SPEECH_START_TIMEOUT_MS);
+        recognition.start();
       }
     } catch {
       // InvalidStateError from a double-call — drop the guard so the
       // user can try again, and let the next event reconcile state.
+      clearTimeout(startTimeoutRef.current);
       transitionRef.current = false;
       if (!isListening) webSpeechTakeRef.current = null;
     }
