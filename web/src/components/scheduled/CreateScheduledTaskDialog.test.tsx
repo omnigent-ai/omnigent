@@ -6434,11 +6434,20 @@ describe("CreateScheduledTaskDialog MCP services", () => {
 
   beforeEach(() => {
     vi.mocked(registryRequest).mockResolvedValue({ data: [github, linear] });
+    vi.mocked(authorizeRegistryService).mockReset();
   });
 
-  /** Open the MCP chip's menu and return a service's switch. */
+  /** The MCP row lives under Advanced settings, so expand it first. */
+  async function mcpTrigger() {
+    if (!screen.queryByTestId("task-mcp-services-trigger")) {
+      fireEvent.click(screen.getByTestId("task-advanced-settings-trigger"));
+    }
+    return screen.findByTestId("task-mcp-services-trigger");
+  }
+
+  /** Open the MCP row's menu and return a service's switch. */
   async function mcpSwitch(name: string) {
-    fireEvent.click(screen.getByTestId("task-mcp-services-trigger"));
+    fireEvent.click(await mcpTrigger());
     return screen.findByRole("switch", { name });
   }
 
@@ -6546,24 +6555,29 @@ describe("CreateScheduledTaskDialog MCP services", () => {
     expect(screen.getByTestId("task-trigger-mcp-note")).toHaveTextContent("Uses Slack MCP");
     expect(screen.queryByTestId("task-trigger-tools-note")).not.toBeInTheDocument();
 
-    // Turning it off sticks, and the run is back to needing tools from elsewhere.
+    // Turning it off sticks, and offers the same way back as a signed-out service.
     fireEvent.click(await mcpSwitch("Slack"));
     await waitFor(() => expect(chip).toHaveTextContent("No MCPs"));
-    expect(screen.getByTestId("task-trigger-tools-note")).toHaveTextContent("MCP required");
+    fireEvent.click(screen.getByTestId("task-mcp-services-trigger"));
+    const add = screen.getByTestId("task-trigger-mcp-add");
+    expect(add).toHaveTextContent("Add Slack MCP");
+    fireEvent.click(add);
+    await waitFor(() => expect(chip).toHaveTextContent("MCPs · 1"));
+    expect(authorizeRegistryService).not.toHaveBeenCalled();
   });
 
-  it("offers sign-in for a trigger's MCP service without blocking the save", async () => {
+  it("signs in to a trigger's MCP service from the trigger without blocking the save", async () => {
     vi.mocked(authorizeRegistryService).mockResolvedValue(undefined);
     renderTrigger("slack", [github, { ...slack, connected: false }]);
-    const signIn = await screen.findByTestId("task-trigger-mcp-sign-in");
-    expect(signIn).toHaveTextContent("Sign in to use Slack MCP");
+    const add = await screen.findByTestId("task-trigger-mcp-add");
+    expect(add).toHaveTextContent("Add Slack MCP");
     // Nothing is picked for the owner, so nothing needs sign-in to save.
     expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
     expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
     expect(authorizeRegistryService).not.toHaveBeenCalled();
 
     vi.mocked(registryRequest).mockResolvedValue({ data: [github, slack] });
-    fireEvent.click(signIn);
+    fireEvent.click(add);
     await waitFor(() =>
       expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("MCPs · 1"),
     );
@@ -6571,11 +6585,40 @@ describe("CreateScheduledTaskDialog MCP services", () => {
     expect(screen.getByTestId("task-trigger-mcp-note")).toHaveTextContent("Uses Slack MCP");
   });
 
+  it("says why a trigger's MCP sign-in failed, and lets the owner retry", async () => {
+    vi.mocked(authorizeRegistryService).mockRejectedValueOnce(
+      new Error("Allow popups for this site to sign in."),
+    );
+    renderTrigger("slack", [github, { ...slack, connected: false }]);
+    fireEvent.click(await screen.findByTestId("task-trigger-mcp-add"));
+    expect(await screen.findByTestId("task-trigger-mcp-sign-in-error")).toHaveTextContent(
+      "Allow popups for this site to sign in.",
+    );
+    expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
+
+    vi.mocked(authorizeRegistryService).mockResolvedValueOnce(undefined);
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, slack] });
+    fireEvent.click(screen.getByTestId("task-trigger-mcp-add"));
+    await waitFor(() =>
+      expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("MCPs · 1"),
+    );
+    expect(screen.queryByTestId("task-trigger-mcp-sign-in-error")).not.toBeInTheDocument();
+  });
+
+  it("sends a pasted-token trigger service to settings rather than a sign-in popup", async () => {
+    renderTrigger("slack", [github, { ...slack, auth: "bearer", connected: false }]);
+    const add = await screen.findByTestId("task-trigger-mcp-add");
+    expect(add).toHaveTextContent("Add Slack MCP");
+    expect(add).toHaveAttribute("href", "/settings/mcp");
+    fireEvent.click(add);
+    expect(authorizeRegistryService).not.toHaveBeenCalled();
+  });
+
   it("keeps the tools warning for a trigger the server has no MCP service for", async () => {
     renderTrigger("jira", [github, slack]);
     await waitFor(() => expect(registryRequest).toHaveBeenCalled());
     expect(screen.getByTestId("task-trigger-tools-note")).toHaveTextContent("MCP required");
-    expect(screen.queryByTestId("task-trigger-mcp-sign-in")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-trigger-mcp-add")).not.toBeInTheDocument();
     expect(screen.getByTestId("task-mcp-services-trigger")).toHaveTextContent("No MCPs");
   });
 

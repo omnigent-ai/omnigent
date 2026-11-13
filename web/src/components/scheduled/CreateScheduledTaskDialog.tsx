@@ -100,6 +100,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { McpRegistryPicker } from "@/components/McpRegistry";
 import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
 import { readLastMcpServices } from "@/lib/mcpPreferences";
+import { withBasePath } from "@/lib/basePath";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
@@ -1261,7 +1262,12 @@ export function CreateScheduledTaskDialog({
     setMcpServices((current) =>
       next ? [...new Set([...current, id])] : current.filter((service) => service !== id),
     );
-  const { signIn: signInMcp, authorizing: mcpSigningIn } = useRegistrySignIn(mcpCatalog.refresh);
+  const {
+    signIn: signInMcp,
+    authorizing: mcpSigningIn,
+    error: mcpSignInError,
+    clearError: clearMcpSignInError,
+  } = useRegistrySignIn(mcpCatalog.refresh);
   // A trigger reads its source through that service's MCP, when the server offers one.
   const triggerMcp =
     mcpPickerShown && trigger !== null && !reusesExistingSession
@@ -1283,25 +1289,33 @@ export function CreateScheduledTaskDialog({
   const triggerMcpNote: TriggerMcpService | undefined =
     triggerMcp === undefined
       ? undefined
-      : !triggerMcp.connected
-        ? {
-            title: triggerMcp.title,
-            state: "needs-sign-in",
-            signingIn: mcpSigningIn === triggerMcp.id,
-            onSignIn: () => {
-              // A Databricks service first asks for its workspace, which the menu collects.
-              if (triggerMcp.auth === "databricks") {
-                setMcpMenuOpen(true);
-                return;
-              }
-              void signInMcp(triggerMcp).then(
-                (signedIn) => signedIn && toggleMcpService(triggerMcp.id, true),
-              );
-            },
-          }
-        : offeredMcpServices.includes(triggerMcp.id)
-          ? { title: triggerMcp.title, state: "selected", signingIn: false, onSignIn: () => {} }
-          : undefined;
+      : {
+          title: triggerMcp.title,
+          selected: triggerMcp.connected && offeredMcpServices.includes(triggerMcp.id),
+          signingIn: mcpSigningIn === triggerMcp.id,
+          error: mcpSignInError?.id === triggerMcp.id ? mcpSignInError.message : null,
+          // A pasted token has no sign-in popup, so it is connected in settings.
+          settingsHref:
+            !triggerMcp.connected && triggerMcp.auth === "bearer"
+              ? withBasePath("/settings/mcp")
+              : undefined,
+          onAdd: () => {
+            clearMcpSignInError();
+            if (triggerMcp.connected) {
+              toggleMcpService(triggerMcp.id, true);
+              return;
+            }
+            // A Databricks service first asks for its workspace, which the menu collects.
+            if (triggerMcp.auth === "databricks") {
+              setAdvancedOpen(true);
+              setMcpMenuOpen(true);
+              return;
+            }
+            void signInMcp(triggerMcp).then(
+              (signedIn) => signedIn && toggleMcpService(triggerMcp.id, true),
+            );
+          },
+        };
   const canSubmit =
     !curationPending &&
     name.trim() !== "" &&
@@ -1328,7 +1342,8 @@ export function CreateScheduledTaskDialog({
       workspaceWithoutHost ||
       Boolean(pollingBlockedReason) ||
       (workerSettings !== null && Boolean(workerHarnessSettings.blockedReason)) ||
-      (!isEdit && agents !== undefined && effectiveAgentId === null));
+      (!isEdit && agents !== undefined && effectiveAgentId === null) ||
+      (mcpBlockedReason !== null && !mcpCatalog.loading));
   useEffect(() => {
     if (open && advancedBlocksSubmit) setAdvancedOpen(true);
   }, [open, advancedBlocksSubmit]);
@@ -1969,78 +1984,6 @@ export function CreateScheduledTaskDialog({
                       </Select>
                     )}
 
-                    {mcpPickerShown && (
-                      <Popover
-                        open={mcpMenuOpen}
-                        onOpenChange={(next) => !mcpAuthorizing && setMcpMenuOpen(next)}
-                      >
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <span className="inline-flex w-full sm:col-span-2">
-                              <PopoverTrigger asChild>
-                                <ComposerHarnessTrigger
-                                  label="MCP services"
-                                  model={
-                                    reusesExistingSession
-                                      ? "Session's MCPs"
-                                      : offeredMcpServices.length === 0
-                                        ? "No MCPs"
-                                        : `MCPs · ${offeredMcpServices.length}`
-                                  }
-                                  icon={
-                                    <PlugIcon
-                                      className={`size-4 shrink-0${
-                                        mcpBlockedReason && !mcpCatalog.loading
-                                          ? " text-amber-600 dark:text-amber-500"
-                                          : ""
-                                      }`}
-                                    />
-                                  }
-                                  disabled={reusesExistingSession}
-                                  className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
-                                  data-testid="task-mcp-services-trigger"
-                                />
-                              </PopoverTrigger>
-                            </span>
-                          </TooltipTrigger>
-                          <TooltipContent>
-                            {reusesExistingSession
-                              ? "The continued session keeps its MCP services"
-                              : (mcpBlockedReason ?? "MCP services every run starts with")}
-                          </TooltipContent>
-                        </Tooltip>
-                        <PopoverContent
-                          align="end"
-                          collisionPadding={12}
-                          className="flex max-h-[var(--radix-popover-content-available-height)] w-72 max-w-[calc(100vw-2rem)] flex-col p-0"
-                          data-testid="task-mcp-services-menu"
-                        >
-                          <div className="shrink-0 border-b border-border px-3 py-2.5">
-                            <PickerSectionHeader>MCP services</PickerSectionHeader>
-                            <p className="mt-0.5 text-xs text-muted-foreground">
-                              Every run starts with these. Runs are unattended, so sign in to each
-                              one now.
-                            </p>
-                          </div>
-                          <McpRegistryPicker
-                            attached={mcpServices}
-                            onToggle={toggleMcpService}
-                            busy={mutationPending}
-                            onAuthorizingChange={setMcpAuthorizing}
-                            catalog={mcpCatalog}
-                          />
-                        </PopoverContent>
-                      </Popover>
-                    )}
-                    {mcpBlockedReason && !mcpCatalog.loading && (
-                      <p
-                        role="alert"
-                        data-testid="task-mcp-services-blocked"
-                        className="text-sm text-destructive sm:col-span-6"
-                      >
-                        {mcpBlockedReason}
-                      </p>
-                    )}
                     <Collapsible
                       open={advancedOpen}
                       onOpenChange={setAdvancedOpen}
@@ -2165,6 +2108,78 @@ export function CreateScheduledTaskDialog({
                                 </DropdownMenu>
                               </div>
                             )}
+                          {mcpPickerShown && (
+                            <div className="py-px" data-testid="task-mcp-services-field">
+                              <div className="flex min-h-9 items-center justify-between gap-4">
+                                <span className="text-ui text-muted-foreground">MCP services</span>
+                                <Popover
+                                  open={mcpMenuOpen}
+                                  onOpenChange={(next) => !mcpAuthorizing && setMcpMenuOpen(next)}
+                                >
+                                  <PopoverTrigger asChild>
+                                    <ComposerHarnessTrigger
+                                      label="MCP services"
+                                      model={
+                                        reusesExistingSession
+                                          ? "Session's MCPs"
+                                          : offeredMcpServices.length === 0
+                                            ? "No MCPs"
+                                            : `MCPs · ${offeredMcpServices.length}`
+                                      }
+                                      icon={
+                                        <PlugIcon
+                                          className={`size-4 shrink-0${
+                                            mcpBlockedReason && !mcpCatalog.loading
+                                              ? " text-amber-600 dark:text-amber-500"
+                                              : ""
+                                          }`}
+                                        />
+                                      }
+                                      disabled={reusesExistingSession}
+                                      title={
+                                        reusesExistingSession
+                                          ? "The continued session keeps its MCP services"
+                                          : undefined
+                                      }
+                                      className={AUTOMATION_ADVANCED_CONTROL_TRIGGER_CLASS_NAME}
+                                      data-testid="task-mcp-services-trigger"
+                                    />
+                                  </PopoverTrigger>
+                                  <PopoverContent
+                                    align="end"
+                                    collisionPadding={12}
+                                    onPointerDownOutside={keepParentPopoverOpenForNestedMenu}
+                                    className="flex max-h-[var(--radix-popover-content-available-height)] w-72 max-w-[calc(100vw-2rem)] flex-col p-0"
+                                    data-testid="task-mcp-services-menu"
+                                  >
+                                    <div className="shrink-0 border-b border-border px-3 py-2.5">
+                                      <PickerSectionHeader>MCP services</PickerSectionHeader>
+                                      <p className="mt-0.5 text-xs text-muted-foreground">
+                                        Every run starts with these. Runs are unattended, so sign in
+                                        to each one now.
+                                      </p>
+                                    </div>
+                                    <McpRegistryPicker
+                                      attached={mcpServices}
+                                      onToggle={toggleMcpService}
+                                      busy={mutationPending}
+                                      onAuthorizingChange={setMcpAuthorizing}
+                                      catalog={mcpCatalog}
+                                    />
+                                  </PopoverContent>
+                                </Popover>
+                              </div>
+                              {mcpBlockedReason && !mcpCatalog.loading && (
+                                <p
+                                  role="alert"
+                                  data-testid="task-mcp-services-blocked"
+                                  className="pb-2 text-sm text-destructive"
+                                >
+                                  {mcpBlockedReason}
+                                </p>
+                              )}
+                            </div>
+                          )}
 
                           {!usesTriggerSchedule && (isEdit || fromSession !== null) && (
                             <div className="flex min-h-9 items-center justify-between gap-4 py-px">

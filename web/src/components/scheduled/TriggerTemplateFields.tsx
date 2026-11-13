@@ -88,11 +88,19 @@ function WarningTag({
 /** The server's MCP service for a trigger's source, when it offers one. */
 export interface TriggerMcpService {
   title: string;
-  /** Selected for the task's runs, or still waiting for the owner to sign in. */
-  state: "selected" | "needs-sign-in";
+  /** Whether the task's runs use it. Off covers both turned off and not signed in. */
+  selected: boolean;
   signingIn: boolean;
-  onSignIn: () => void;
+  /** Why the last sign-in failed, so a blocked popup isn't silent. */
+  error: string | null;
+  /** Where to connect a service with no sign-in popup, such as a pasted token. */
+  settingsHref?: string;
+  /** Turn the service on, signing in first when needed. */
+  onAdd: () => void;
 }
+
+const TRIGGER_MCP_ADD_CLASS_NAME =
+  "h-5 gap-1 rounded-md border-amber-300 bg-amber-50 px-2 text-xs text-amber-800 hover:bg-amber-100 hover:text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300 dark:hover:bg-amber-500/20";
 
 export function TriggerTemplateFields({
   source,
@@ -140,6 +148,9 @@ export function TriggerTemplateFields({
       : fullTriggerDescription.slice(0, firstSentenceEnd + 1);
   const triggerDetails =
     firstSentenceEnd === -1 ? "" : fullTriggerDescription.slice(firstSentenceEnd + 2);
+  const addMcpHint = mcpService
+    ? `Runs only work if the agent can reach ${mcpService.title}. Add your ${mcpService.title} MCP service, or give the agent its tools another way.`
+    : "";
   const toolsWarning = `This only works if the agent has ${template.toolsExample} where this task runs. Without one, each run stops and says so in its reply.`;
   const sourceWarning = `Anyone who can ${authorAction} may direct the agent using your tools and permissions. Only use trusted sources.${fields.linkBack ? ` Links are posted with your ${triggerServiceName(source)} account.` : ""}`;
 
@@ -257,26 +268,45 @@ export function TriggerTemplateFields({
                   </TooltipProvider>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
-                  {mcpService?.state === "selected" ? (
+                  {mcpService?.selected ? (
                     <WarningTag
                       label={`Uses ${mcpService.title} MCP`}
                       message={`Every run, and each session it starts, uses your ${mcpService.title} MCP service.`}
                       testId="task-trigger-mcp-note"
                     />
-                  ) : mcpService?.state === "needs-sign-in" ? (
+                  ) : mcpService?.settingsHref ? (
+                    <Button
+                      asChild
+                      variant="outline"
+                      size="sm"
+                      className={TRIGGER_MCP_ADD_CLASS_NAME}
+                    >
+                      <a
+                        href={mcpService.settingsHref}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title={addMcpHint}
+                        data-testid="task-trigger-mcp-add"
+                      >
+                        <PlugIcon aria-hidden="true" className="size-3" />
+                        {`Add ${mcpService.title} MCP`}
+                      </a>
+                    </Button>
+                  ) : mcpService ? (
                     <Button
                       type="button"
                       variant="outline"
                       size="sm"
-                      className="h-5 gap-1 rounded-md px-2 text-xs"
+                      className={TRIGGER_MCP_ADD_CLASS_NAME}
                       disabled={mcpService.signingIn}
-                      onClick={mcpService.onSignIn}
-                      data-testid="task-trigger-mcp-sign-in"
+                      onClick={mcpService.onAdd}
+                      title={addMcpHint}
+                      data-testid="task-trigger-mcp-add"
                     >
                       <PlugIcon aria-hidden="true" className="size-3" />
                       {mcpService.signingIn
                         ? `Signing in to ${mcpService.title}…`
-                        : `Sign in to use ${mcpService.title} MCP`}
+                        : `Add ${mcpService.title} MCP`}
                     </Button>
                   ) : (
                     !toolsProvided && (
@@ -294,6 +324,15 @@ export function TriggerTemplateFields({
                     warning
                   />
                 </div>
+                {mcpService?.error && (
+                  <p
+                    role="alert"
+                    className="text-xs text-destructive"
+                    data-testid="task-trigger-mcp-sign-in-error"
+                  >
+                    {mcpService.error}
+                  </p>
+                )}
               </div>
             </div>
             <div
