@@ -7303,6 +7303,41 @@ def test_warn_missing_harness_dependencies_lists_all_gaps(
     assert "tmux not found" in err
 
 
+@pytest.mark.parametrize(
+    ("args", "servers", "exit_code"),
+    [
+        pytest.param(["--server", "https://example.com"], ["https://example.com"], 3, id="remote"),
+        pytest.param(["--local"], [""], 3, id="local"),
+        pytest.param([], [], 2, id="missing-mode"),
+        pytest.param(["--local", "--server", "https://example.com"], [], 2, id="both-modes"),
+    ],
+)
+def test_host_service_entry_runs_the_service_host(
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+    servers: list[str],
+    exit_code: int,
+) -> None:
+    """Verify the wrapper-launched service command reaches the service entry point."""
+    from omnigent import cli as cli_module
+
+    started: list[str] = []
+
+    def _run(server: str) -> int:
+        started.append(server)
+        return 3
+
+    monkeypatch.setattr("omnigent.host.service_entry.run", _run)
+
+    monkeypatch.setattr(sys, "argv", ["omnigent", "host-service-entry", *args])
+
+    with pytest.raises(SystemExit) as result:
+        cli_module.main()
+
+    assert result.value.code == exit_code
+    assert started == servers
+
+
 def test_click_subcommands_allowlist_covers_registered_commands() -> None:
     """Every command registered on the ``cli`` group is in ``_CLICK_SUBCOMMANDS``.
 
