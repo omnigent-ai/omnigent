@@ -9171,7 +9171,7 @@
                 "type": "null"
               }
             ],
-            "description": "Id for the new sandbox host, 32 lowercase hex characters, sent only when `GET /v1/info` reports `request_managed_sandbox_host_id`; `None` lets the server mint one.",
+            "description": "Id for the new sandbox host, 32 lowercase hex characters; `None` lets the server mint one.",
             "title": "Host Id"
           },
           "sandbox_provider": {
