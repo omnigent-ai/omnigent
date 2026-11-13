@@ -180,6 +180,44 @@ MCP independent creation.
   with `sys_session_create`. Covered by
   `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_polling_manager_task`.
 
+### Scripted review sessions
+
+With the server release flag `scripted_sessions` enabled (default off),
+`sys_session_create` also accepts `placement="host"`, an owned connected
+`host_id`, an absolute `workspace`, and optional
+`git: {branch_name, base_branch}`. The workspace is the source repository;
+the session starts in the new worktree. The caller can be hostless. Source
+privacy, host ownership, workspace validation and destination policy still
+apply. Omit the new fields to retain existing child, same-host or managed
+placement. Older servers refuse the tool's new options through the
+`/v1/info` capability check before creating a session. Dedicated orchestrated
+host-create and PR-link routes also reject requests that reach older replicas
+in a mixed-version deployment.
+
+Independent creates can use an existing owned `project_id` instead of
+`project_name`; never supply both. Project defaults do not replace the
+explicit agent, workspace or git selection. `sys_session_link_pr` takes
+`url`, optional `session_id` (defaults to this session), and `action` (`attach`
+or `remove`, default `attach`). It uses the target session's host and requires
+edit access there and an authorized private or read-only-shared source. The
+host or runner must be online and able to read the PR. An uncertain response
+requires checking the session before retrying.
+
+`sys_session_list(project="Reviews")` filters the global sessions view without
+creating a project; `project=""` lists unfiled sessions. Keep the same filter
+when continuing a cursor. The sub-agent view is unchanged.
+
+For a manual check, enable `scripted_sessions` on a test server and obtain an
+owned host ID from a session's `sys_session_get_info` response. Create a review
+session with `placement="host"`, that host ID, the repository path,
+`git={"branch_name":"review-example","base_branch":"main"}` and a project ID.
+Confirm the session starts in the new worktree and appears under that project.
+Link a PR with `sys_session_link_pr`, then remove it and confirm the PR panel
+updates. Coverage is in `tests/runner/test_session_orchestration.py`,
+`tests/runner/test_discovery_list_pagination.py`,
+`tests/server/integration/test_session_orchestration.py`, and
+`tests/server/integration/test_session_orchestration_projects.py`.
+
 ## Driving it with the repro environment
 
 Preconditions: use an isolated test server with default settings for nested
