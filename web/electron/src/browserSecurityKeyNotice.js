@@ -17,6 +17,7 @@ function pageOrigin(url) {
 /** Tell the user to use their security key while the pane's page waits on WebAuthn. */
 function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal, cookieImport }) {
   let pending = false;
+  let requestGeneration = 0;
   let promptFailures = 0;
   let timer = null;
   let shown = null;
@@ -67,12 +68,13 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
         if (!pending || contents.isDestroyed()) return;
         const url = contents.getURL();
         if (choice !== "open-in-browser" || pageOrigin(url) !== origin) return;
-        // The page is still waiting if the system browser fails to open, so offer the notice again.
+        const launchGeneration = requestGeneration;
+        // Retry only for the request that launched the system browser.
         return Promise.resolve()
           .then(() => openExternal(url))
           .catch((error) => {
             console.warn("[browser] could not open system browser:", error);
-            show();
+            if (launchGeneration === requestGeneration) show();
           });
       })
       .catch((error) => {
@@ -86,12 +88,14 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
   contents.ipc.on(PENDING_CHANNEL, (event, value) => {
     // Only top-level requests are observed; iframe requests are outside this notice's scope.
     if (event.senderFrame !== contents.mainFrame) return;
+    requestGeneration += 1;
     if (value === true) promptFailures = 0;
     pending = value === true;
     if (!pending) hide();
     else if (!shown && !timer) timer = setTimeout(show, SHOW_DELAY_MS);
   });
   const reset = () => {
+    requestGeneration += 1;
     pending = false;
     hide();
   };

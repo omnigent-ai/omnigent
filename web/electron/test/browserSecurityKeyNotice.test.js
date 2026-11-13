@@ -12,7 +12,7 @@ const {
 const PAGE = "https://login.example.com/signin/verify";
 const flush = () => new Promise(setImmediate);
 
-function harness({ url = PAGE, canPrompt = () => true, launch } = {}) {
+function harness({ url = PAGE, canPrompt = () => true, launch, beforeShow } = {}) {
   const contents = new EventEmitter();
   let currentUrl = url;
   Object.assign(contents, {
@@ -28,12 +28,14 @@ function harness({ url = PAGE, canPrompt = () => true, launch } = {}) {
       assert.equal(wc, contents);
       return canPrompt();
     },
-    showPrompt: (options) =>
-      new Promise((resolve) => {
+    showPrompt: (options) => {
+      beforeShow?.();
+      return new Promise((resolve) => {
         const prompt = { options, choose: resolve };
         options.signal.addEventListener("abort", () => resolve("dismiss"));
         prompts.push(prompt);
-      }),
+      });
+    },
     openExternal: (target) => {
       opened.push(target);
       return launch?.();
@@ -154,6 +156,48 @@ describe("security-key notice for embedded browser pages", () => {
     h.report(false);
     await h.wait();
     assert.equal(checks, 1, "request completion cancels the remaining poll");
+  });
+
+  it("ignores an old launch failure after a newer request's notice was dismissed", async () => {
+    mock.method(console, "warn", () => {});
+    let rejectLaunch;
+    const h = harness({
+      launch: () =>
+        new Promise((_resolve, reject) => {
+          rejectLaunch = reject;
+        }),
+    });
+    h.report(true);
+    await h.wait();
+    h.prompts[0].choose("open-in-browser");
+    await flush();
+    h.report(false);
+    h.report(true);
+    await h.wait();
+    h.prompts[1].choose("dismiss");
+    await flush();
+    rejectLaunch(new Error("old launch failed"));
+    await flush();
+    await h.wait();
+    assert.equal(h.prompts.length, 2, "a stale failure cannot undo the new dismissal");
+  });
+
+  it("retries after showPrompt throws and recovers on the next attempt", async () => {
+    const warning = mock.method(console, "warn", () => {});
+    let fail = true;
+    const h = harness({
+      beforeShow: () => {
+        if (fail) throw new Error("popup construction failed");
+      },
+    });
+    h.report(true);
+    await h.wait();
+    assert.equal(warning.mock.callCount(), 1);
+    assert.equal(h.prompts.length, 0);
+    fail = false;
+    await h.wait();
+    assert.equal(h.prompts.length, 1);
+    assert.equal(h.prompts[0].options.signal.aborted, false);
   });
 
   it("does not reopen after a browser launch fails when the view has closed", async () => {

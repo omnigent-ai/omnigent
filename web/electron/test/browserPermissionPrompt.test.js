@@ -312,22 +312,6 @@ describe("browser permission popover", () => {
     assert.equal(h.windows.length, 2, "the notice returns after navigation");
   });
 
-  it("recovers a pending security-key notice after popup construction fails", async (t) => {
-    const h = await securityKeyHarness(t);
-    const warning = t.mock.method(console, "warn", () => {});
-    const originalShow = h.controller.show;
-    const failedShow = t.mock.method(h.controller, "show", () => {
-      throw new Error("popup construction failed");
-    });
-    h.controller.dismiss(h.parent);
-    await h.wait();
-    assert.equal(warning.mock.callCount(), 1);
-    failedShow.mock.restore();
-    await h.wait();
-    assert.equal(h.controller.show, originalShow);
-    assert.equal(h.windows.at(-1).destroyed, false, "construction failure retries recover");
-  });
-
   it("backs off failed security-key popups and resets the budget for a new request", async (t) => {
     const h = await securityKeyHarness(t);
     t.mock.method(console, "warn", () => {});
