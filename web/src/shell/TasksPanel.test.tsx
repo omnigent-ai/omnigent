@@ -289,6 +289,18 @@ describe("TasksPanel", () => {
     );
     cleanup();
 
+    // A replan names no workflow, but it keeps the run's step, so the chip stays.
+    showJournal([
+      { ...journalPlan(0, ["explore"]), workflow_id: workflowId },
+      journalPlan(1, ["explore"], ["fix", ["explore"]]),
+    ]);
+    renderPanel();
+    expect(screen.getByTestId("tasks-plan-workflow")).toHaveAttribute(
+      "href",
+      `/workflows/${workflowId}`,
+    );
+    cleanup();
+
     showJournal([journalPlan(0, ["explore"])]);
     renderPanel();
     expect(screen.getByTestId("tasks-plan-name")).toHaveTextContent("The plan");

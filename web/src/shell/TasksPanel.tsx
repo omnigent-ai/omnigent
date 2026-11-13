@@ -40,6 +40,7 @@ import {
   linkedToPrevious,
   planName,
   planTally,
+  planWorkflowId,
   statusOf,
   stepStatusLabel,
   textOf,
@@ -770,6 +771,7 @@ function WorkflowChip({ workflowId }: { workflowId: string }) {
  */
 function TasksHeader({
   plan,
+  workflowId,
   progress,
   paused,
   stuck,
@@ -777,6 +779,8 @@ function TasksHeader({
   onSaveWorkflow,
 }: {
   plan: JournalEntry | null;
+  /** The saved workflow the plan came from, or null. */
+  workflowId: string | null;
   progress: readonly StepProgress[];
   paused: PausedLabel | null;
   stuck: boolean;
@@ -820,7 +824,7 @@ function TasksHeader({
                 >
                   {name}
                 </h3>
-                {plan?.workflow_id && <WorkflowChip workflowId={plan.workflow_id} />}
+                {workflowId && <WorkflowChip workflowId={workflowId} />}
               </div>
             )}
             <span className="ml-auto flex shrink-0 items-center gap-1">
@@ -1055,6 +1059,7 @@ export function TasksPanel({
           <>
             <TasksHeader
               plan={plan}
+              workflowId={planWorkflowId(entries)}
               progress={progress}
               paused={tasks.paused}
               stuck={stuck}

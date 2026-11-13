@@ -11,6 +11,7 @@ import {
   planName,
   planSteps,
   planTally,
+  planWorkflowId,
   sessionTaskList,
   stepProgress,
   stepsWithoutPlan,
@@ -61,6 +62,24 @@ describe("currentPlan", () => {
   it("is the newest plan among the entries", () => {
     expect(currentPlan([plan(0, ["a"]), journalEntry(1), plan(2, ["a"], ["b"])])?.position).toBe(2);
     expect(currentPlan([journalEntry(0)])).toBeNull();
+  });
+});
+
+describe("planWorkflowId", () => {
+  const WORKFLOW = "0123456789abcdef0123456789abcdef";
+  const start = { ...plan(0, ["explore"], ["review", ["explore"]]), workflow_id: WORKFLOW };
+
+  it("follows a run's plan through replans that keep one of its steps", () => {
+    expect(planWorkflowId([start])).toBe(WORKFLOW);
+    // The replan names no workflow, but keeps the exploration step.
+    const replan = plan(2, ["explore"], ["review-13730", ["explore"]]);
+    expect(planWorkflowId([start, journalEntry(1), replan])).toBe(WORKFLOW);
+  });
+
+  it("has none for a plan that shares no step with the run's, or without a run", () => {
+    expect(planWorkflowId([start, plan(1, ["triage"], ["fix", ["triage"]])])).toBeNull();
+    expect(planWorkflowId([plan(0, ["a"])])).toBeNull();
+    expect(planWorkflowId([journalEntry(0)])).toBeNull();
   });
 });
 
