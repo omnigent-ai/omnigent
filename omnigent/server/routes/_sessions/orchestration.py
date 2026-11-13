@@ -105,7 +105,7 @@ from omnigent.runner.mcp_execution_registry import (
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
@@ -387,6 +387,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
+    reconcile_orphaned_running_status,
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
@@ -9159,6 +9160,74 @@ async def _host_row_offline(
         and not host_is_live(host)
         and (updated_since is None or host.updated_at >= updated_since)
     )
+
+
+async def _settle_orphaned_running_rows(
+    convs: Sequence[Conversation],
+    *,
+    conversation_store: ConversationStore,
+    liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None,
+    host_store: HostStore | None,
+    may_settle: Callable[[Conversation], bool],
+) -> None:
+    """
+    Settle rows whose persisted ``running`` outlived their runner, before a read.
+
+    Shared by the session list and the child-session list so both report the
+    same status for an orphaned session. Only rows with no local cache entry
+    and a stale runner stamp are probed; a reconnecting runner within grace,
+    or a sleeping host that may resume it, keeps its status.
+
+    :param convs: Rows about to be serialized.
+    :param conversation_store: Store performing the conditional transition.
+    :param liveness_lookup: Bulk runner/host liveness lookup; ``None`` skips.
+    :param host_store: Host registrations, for the sleeping-host hold.
+    :param may_settle: Whether the caller may settle a row, e.g. owners only.
+    """
+    if liveness_lookup is None:
+        return
+    suspects = [
+        conv
+        for conv in convs
+        if conv.agent_id is not None
+        and conv.runner_id is not None
+        and conv.live_status in ("running", "waiting")
+        and _session_status_cache.get(conv.id) is None
+        and not runner_seen_is_fresh(conv.runner_last_seen)
+        and may_settle(conv)
+    ]
+    if not suspects:
+        return
+    liveness = await asyncio.to_thread(liveness_lookup, [conv.id for conv in suspects])
+    offline_hosts: dict[str, bool | None] = {}
+    now = int(time.time())
+    # Heartbeat expiry and reconnect grace can precede the hold.
+    hold_stale_before = now - HOST_OFFLINE_HOLD_S - 2 * RUNNER_LIVENESS_TTL_S
+    for conv in suspects:
+        result = liveness.get(conv.id)
+        # False means no replica has a tunnel and the heartbeat expired, so
+        # reconnecting runners within grace survive.
+        if result is None or result.runner_online:
+            continue
+        # A hostless sub-agent shares its parent's runner, so the hold is the tunnel host's.
+        host_id = conv.host_id or await asyncio.to_thread(
+            routing_host_id, conv, conversation_store
+        )
+        if host_id is not None and result.host_online is not True:
+            # A sleeping host can resume its runner; a read must not end that
+            # bounded wait on another replica.
+            if host_id not in offline_hosts:
+                offline_hosts[host_id] = await _host_row_offline(
+                    host_store, host_id, updated_since=hold_stale_before
+                )
+            if offline_hosts[host_id] is not False:
+                continue
+        await asyncio.to_thread(
+            reconcile_orphaned_running_status,
+            conv.id,
+            conversation_store,
+            now - RUNNER_LIVENESS_TTL_S,
+        )
 
 
 class _RelayTransportLost(Exception):
