@@ -5429,12 +5429,14 @@ def test_host_settings_survive_daemon_and_runner_hops(
         "GITLAB_HOST": "git.example.test:8443",
         "GLAB_HOST": "git.example.test:8443",
         "GH_CONFIG_DIR": str(tmp_path / "gh"),
+        "AZURE_CONFIG_DIR": str(tmp_path / "azure"),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "XDG_CONFIG_DIRS": str(tmp_path / "system-config"),
     }
+    tokens = ("GITLAB_TOKEN", "GLAB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "AZURE_DEVOPS_EXT_PAT")
     for name, value in selectors.items():
         monkeypatch.setenv(name, value)
-    for name in ("GITLAB_TOKEN", "GLAB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+    for name in tokens:
         monkeypatch.setenv(name, "must-not-forward")
     monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
     monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
@@ -5450,7 +5452,7 @@ def test_host_settings_survive_daemon_and_runner_hops(
     for env in (daemon_env, runner_env):
         for name, value in selectors.items():
             assert env[name] == value
-        for name in ("GITLAB_TOKEN", "GLAB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        for name in tokens:
             assert name not in env
 
 

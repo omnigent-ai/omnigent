@@ -1277,6 +1277,7 @@ export function PullRequestChangesTab({
   const threadContext: ReviewThreadContext = {
     conversationId,
     prUrl: data.selected_pr_url ?? pr.url,
+    providerLabel,
     account: data.auth.selected_account,
     canReply: !!(canEdit && data.capabilities.review_thread_replies),
     canCreate: !!(

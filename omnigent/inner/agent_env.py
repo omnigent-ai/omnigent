@@ -88,6 +88,7 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         "GLAB_CONFIG_DIR",
         "GITLAB_HOST",
         "GLAB_HOST",
+        "AZURE_CONFIG_DIR",
         OMNIGENT_SESSION_ENV_VAR,
         # Windows system / profile constants (SYSTEMROOT is mandatory for
         # Winsock init, USERPROFILE for Path.home(), etc.); no-ops on POSIX

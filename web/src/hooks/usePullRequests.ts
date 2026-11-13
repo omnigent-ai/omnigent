@@ -125,6 +125,8 @@ export interface PullRequestReviewer {
   login: string;
   kind: "user" | "team";
   state: PullRequestReviewerState;
+  /** The provider's name for the state, e.g. "Waiting for author"; null uses the default. */
+  state_label?: string | null;
 }
 
 /** A label on a PR or in its repository. */

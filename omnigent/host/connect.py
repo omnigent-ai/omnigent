@@ -661,6 +661,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "GITLAB_HOST",
         "GLAB_HOST",
         "GH_CONFIG_DIR",
+        "AZURE_CONFIG_DIR",
         "XDG_CONFIG_HOME",
         "XDG_CONFIG_DIRS",
         # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"

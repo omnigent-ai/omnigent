@@ -1238,8 +1238,9 @@ def test_resolve_sandbox_env_rejects_reserved_and_credential_and_missing(
     }
     with pytest.raises(click.ClickException, match="reserved"):
         KubernetesSandboxLauncher(env=["HOME"])._resolve_sandbox_env()
-    with pytest.raises(click.ClickException, match="credential"):
-        KubernetesSandboxLauncher(env=["MY_API_KEY"])._resolve_sandbox_env()
+    for credential in ("MY_API_KEY", "AZURE_DEVOPS_EXT_PAT"):
+        with pytest.raises(click.ClickException, match="credential"):
+            KubernetesSandboxLauncher(env=[credential])._resolve_sandbox_env()
     with pytest.raises(click.ClickException, match="not set"):
         KubernetesSandboxLauncher(env=["DEFINITELY_UNSET_VAR_XYZ"])._resolve_sandbox_env()
 

@@ -107,6 +107,7 @@ function renderSection(
         threadContext={{
           conversationId: "conv",
           prUrl: "pr",
+          providerLabel: "GitHub",
           account: null,
           canReply: false,
           loadComments: () => {},

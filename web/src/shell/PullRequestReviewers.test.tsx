@@ -272,6 +272,27 @@ it("shows reviewers read-only without editing or a selected PR", () => {
   expect(screen.queryByRole("button")).toBeNull();
 });
 
+it("shows the provider's name for a review state and tolerates an unknown state", () => {
+  stubFetch(candidates);
+  const reviewers = [
+    { login: "alice", kind: "user", state: "CHANGES_REQUESTED", state_label: "Waiting for author" },
+    { login: "bob", kind: "user", state: "ABSTAINED" },
+  ] as unknown as PullRequestReviewer[];
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <PullRequestReviewers
+        conversationId="conv_1"
+        prUrl={PR_URL}
+        reviewers={reviewers}
+        author={null}
+        editable={false}
+      />
+    </QueryClientProvider>,
+  );
+  expect(screen.getByRole("listitem", { name: "alice: Waiting for author" })).toBeInTheDocument();
+  expect(screen.getByRole("listitem", { name: "bob: ABSTAINED" })).toBeInTheDocument();
+});
+
 describe("typedReviewer", () => {
   it.each([
     ["octocat", { login: "octocat", kind: "user" }],

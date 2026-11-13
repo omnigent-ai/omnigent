@@ -507,10 +507,12 @@ export function PullRequestFileSection({
                   disabled={!threadContext.canCreate || composer.draft.pending}
                   onClick={() => composer.setDestination("github")}
                 >
-                  GitHub
+                  {threadContext.providerLabel}
                 </button>
               </TooltipTrigger>
-              <TooltipContent>Post a review comment on the GitHub pull request.</TooltipContent>
+              <TooltipContent>
+                Post a review comment on {threadContext.providerLabel}.
+              </TooltipContent>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
