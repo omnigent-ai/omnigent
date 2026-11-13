@@ -531,7 +531,7 @@ export const ComposerSendButton = forwardRef<
       ref={ref}
       type="submit"
       size="icon"
-      variant={interrupt ? "destructive" : "default"}
+      variant={interrupt ? "secondary" : "default"}
       className={cn(
         "size-8 mobile-touch-target shrink-0 rounded-lg transition-opacity md:size-7",
         !interrupt &&
