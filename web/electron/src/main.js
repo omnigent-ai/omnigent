@@ -131,6 +131,7 @@ const {
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
 const omnigentCli = require("./omnigent_cli");
+const { workspaceSocketRequest } = require("./workspaceSocket");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -5357,6 +5358,15 @@ function registerIpc() {
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
     };
+  });
+
+  // SPA → a workspace API call on a session host's local socket. The socket and
+  // call shape are checked in workspaceSocket.js; the host checks the token.
+  ipcMain.handle("omnigent:workspace-socket-request", (event, request) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("workspace-socket-request is only available to a connected server page");
+    }
+    return workspaceSocketRequest(request);
   });
 
   // SPA → connect a machine over SSH as a host. Requires the window's pinned origin

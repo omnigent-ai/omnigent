@@ -124,5 +124,11 @@
       }
     }
   ],
-  "ignorePatterns": ["dist", "node_modules", "src/components/ui", "src/components/ai-elements"]
+  "ignorePatterns": [
+    "dist",
+    "node_modules",
+    "src/components/ui",
+    "src/components/ai-elements",
+    "src/gen"
+  ]
 }
