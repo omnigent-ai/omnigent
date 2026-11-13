@@ -466,6 +466,8 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
 
         policy_env = "HARNESS_CLAUDE_SDK_OS_ENV"
         monkeypatch.delenv("OMNIGENT_CLAUDE_SDK_NO_SANDBOX", raising=False)
+        monkeypatch.setattr(claude_sdk_executor, "_claude_internal_write_roots", list)
+        monkeypatch.setattr(claude_sdk_executor, "_claude_internal_write_files", list)
         monkeypatch.setattr(
             claude_sdk_executor,
             "resolve_sandbox",

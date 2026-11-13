@@ -4507,7 +4507,7 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
 @_POSIX_ONLY
 @pytest.mark.asyncio
 async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A relay outlives no CLI: a turn cancelled mid-reconnect evicts its client and the
     next turn recovers on a fresh relay; one whose CLI fails, hangs past the connect
@@ -4515,7 +4515,9 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
     launcher or relay fails to start leaves nothing."""
     from omnigent.harnesses.claude_native import bridge
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ManagedMcpRelay
-    from omnigent.inner.sandbox import SandboxPolicy
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import HarnessSandboxPreparationError, SandboxPolicy
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
     _deploy_managed_mcp(tmp_path, monkeypatch, {"omnigent": bridge.managed_mcp_relay_entry()})
     status_file = tmp_path / "mcp-auth-status.json"
@@ -4625,7 +4627,8 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
         # A sandbox launcher that cannot be built stops the relay started for it.
         connect_outcome = "connects"
         executor._real_cli_path = "/usr/bin/claude"
-        executor._cli_sandbox = SandboxPolicy(
+        executor._os_env_spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+        requested_sandbox = SandboxPolicy(
             backend_type="linux_bwrap",
             active=True,
             read_roots=None,
@@ -4633,29 +4636,51 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
             write_files=[],
             allow_network=True,
         )
+        executor._cli_sandbox = requested_sandbox
         started: list[_ManagedMcpRelay] = []
         relay_init = _ManagedMcpRelay.__init__
+        launcher_error = OSError("profile too large: /private/host/toolchain/profile")
 
         def record_relay(relay: _ManagedMcpRelay, *args: object) -> None:
             relay_init(relay, *args)
             started.append(relay)
 
         def refuse_launcher(*_args: object, **_kwargs: object) -> str:
-            raise OSError("profile too large")
+            raise launcher_error
 
         monkeypatch.setattr(_ManagedMcpRelay, "__init__", record_relay)
         monkeypatch.setattr(
             "omnigent.inner.claude_sdk_executor.create_exec_launcher", refuse_launcher
         )
         clients_before = len(fake_sdk.created_clients)
-        with pytest.raises(OSError, match="profile too large"):
+        with pytest.raises(HarnessSandboxPreparationError) as failure:
             [event async for event in executor.run_turn(messages, tools, "")]
+        assert failure.value.__cause__ is launcher_error
+        detail = ExecutorAdapter(executor_factory=lambda: executor)._build_error_detail(
+            failure.value
+        )
+        assert detail.code == "HarnessSandboxPreparationError"
+        assert detail.message == HarnessSandboxPreparationError.client_message
+        assert str(launcher_error) not in detail.model_dump_json()
+        assert str(launcher_error) in caplog.text
         assert len(fake_sdk.created_clients) == clients_before
         assert "managed" not in executor._clients
         assert len(started) == 1
         socket_dir = started[0].socket_dir
         assert not started[0].bridge_dir.exists()
         assert socket_dir is None or not socket_dir.exists()
+
+        launcher = Mock(return_value="/test/confined-claude")
+        monkeypatch.setattr("omnigent.inner.claude_sdk_executor.create_exec_launcher", launcher)
+        [event async for event in executor.run_turn(messages, tools, "")]
+        launcher.assert_called_once()
+        assert launcher.call_args.args[1].active
+        assert launcher.call_args.args[1].backend_type == "linux_bwrap"
+        assert executor._cli_sandbox is requested_sandbox
+        recovered = executor._clients["managed"].client
+        assert recovered.options.cli_path == launcher.return_value
+        await executor.close_session("managed")
+        assert not relay_dir(recovered).exists()
         executor._cli_sandbox = None
 
         # A relay that cannot start leaves no bridge directory and starts no CLI.
@@ -4672,8 +4697,9 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
         monkeypatch.setattr(bridge, "prepare_acp_mcp_bridge_dir", record_allocation)
         monkeypatch.setattr(bridge, "start_tool_relay", refuse_to_start)
         clients_before = len(fake_sdk.created_clients)
-        with pytest.raises(OSError, match="no port for the relay"):
+        with pytest.raises(OSError, match="no port for the relay") as relay_failure:
             [event async for event in executor.run_turn(messages, tools, "")]
+        assert type(relay_failure.value) is OSError
         assert len(fake_sdk.created_clients) == clients_before
         assert "managed" not in executor._clients
         assert len(allocated) == 1

@@ -2592,8 +2592,14 @@ class ClaudeSDKExecutor(Executor):
                 ),
                 cwd=self._cli_sandbox_cwd,
             )
-        except BaseException:
+        except BaseException as exc:
             _release_client_cli(relay, None)
+            if (
+                self._os_env_spec is not None
+                and isinstance(exc, Exception)
+                and not isinstance(exc, HarnessSandboxValidationError)
+            ):
+                raise HarnessSandboxPreparationError(str(exc)) from exc
             raise
         options.cli_path = launcher
         return relay, launcher
