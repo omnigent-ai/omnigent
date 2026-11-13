@@ -28,7 +28,6 @@ from omnigent.inner.datamodel import (
     CredentialSourceSpec,
     OSEnvSandboxSpec,
     OSEnvSpec,
-    TcpEgressRoute,
 )
 from omnigent.inner.model_signer import SignerReadiness
 from omnigent.inner.sandbox import (

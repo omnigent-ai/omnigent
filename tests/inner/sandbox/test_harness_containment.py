@@ -20,7 +20,12 @@ from omnigent.inner import claude_sdk_executor, codex_worker, sandbox
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.codex_executor import CodexExecutor
 from omnigent.inner.codex_worker import prepare_codex_worker
-from omnigent.inner.datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import (
+    CredentialProxySpec,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+    TcpEgressRoute,
+)
 from omnigent.inner.executor import Executor
 from omnigent.inner.goose_executor import GooseExecutor
 from omnigent.inner.kimi_executor import KimiExecutor
@@ -318,11 +323,12 @@ def test_relative_policy_cwd_preserves_non_claude_workspace(
     [
         (harness, feature)
         for harness in _HARNESSES
-        for feature in ("cwd_conflict", "egress_rules", "credential_proxy")
-        if feature == "cwd_conflict" or harness != "codex"
+        for feature in ("cwd_conflict", "egress_rules", "credential_proxy", "tcp_egress")
+        if feature in {"cwd_conflict", "tcp_egress"} or harness != "codex"
         # Claude's successful-wrap scenario also exercises cwd conflicts.
         if (harness, feature) != ("claude-sdk", "cwd_conflict")
-    ],
+    ]
+    + [pytest.param("codex", "empty_tcp_egress", id="codex-empty-tcp-egress")],
 )
 def test_harness_rejects_policy_features_it_cannot_honor(
     harness: str, feature: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -332,14 +338,22 @@ def test_harness_rejects_policy_features_it_cannot_honor(
     executable.touch()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    routes = None
+    if feature == "tcp_egress":
+        routes = [TcpEgressRoute("db", "db.example.test", 5432)]
+    elif feature == "empty_tcp_egress":
+        routes = []
     spec = OSEnvSpec(
         cwd=str(workspace),
         sandbox=OSEnvSandboxSpec(
-            type="linux_bwrap",
+            type="darwin_seatbelt"
+            if harness == "codex" and feature == "tcp_egress"
+            else "linux_bwrap",
             egress_rules=["GET api.example.com/**"] if feature == "egress_rules" else None,
             credential_proxy=(
                 CredentialProxySpec(entries=[]) if feature == "credential_proxy" else None
             ),
+            tcp_egress=routes,
         ),
     )
     if feature == "cwd_conflict":
@@ -347,10 +361,21 @@ def test_harness_rejects_policy_features_it_cannot_honor(
     launcher = Mock(side_effect=AssertionError("Unsupported policy reached launcher creation"))
     monkeypatch.setattr(sandbox, "create_exec_launcher", launcher)
     monkeypatch.setattr(codex_worker, "create_exec_launcher", launcher)
-    message = "conflicts" if feature == "cwd_conflict" else feature
-    with pytest.raises(ValueError, match=message):
+    resolve = Mock(side_effect=AssertionError("Unsupported policy reached sandbox resolution"))
+    monkeypatch.setattr(sandbox, "resolve_sandbox", resolve)
+    monkeypatch.setattr(claude_sdk_executor, "resolve_sandbox", resolve)
+    monkeypatch.setattr(codex_worker, "resolve_sandbox", resolve)
+    message = {"cwd_conflict": "conflicts", "empty_tcp_egress": "tcp_egress"}.get(feature, feature)
+    with pytest.raises(sandbox.HarnessSandboxValidationError, match=message) as failure:
         with _prepared_launch(harness, executable, workspace, spec):
             pytest.fail(f"{harness} silently ignored {feature}")
+    if message == "tcp_egress":
+        assert failure.value.reason == "tcp_egress"
+        assert failure.value.client_message == (
+            "The selected harness does not support os_env.sandbox.tcp_egress. "
+            "Use sys_os_shell or a sandboxed terminal."
+        )
+    resolve.assert_not_called()
     launcher.assert_not_called()
 
 
