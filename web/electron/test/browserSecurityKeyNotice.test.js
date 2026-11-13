@@ -122,28 +122,32 @@ describe("security-key notice for embedded browser pages", () => {
       assert.deepEqual(h.opened, [PAGE]);
       assert.equal(h.prompts.length, 2);
       assert.equal(warning.mock.callCount(), 1);
-      let rejectLaunch;
-      const closing = harness({
-        launch: () =>
-          new Promise((_resolve, reject) => {
-            rejectLaunch = reject;
-          }),
-      });
-      closing.report(true);
-      await closing.wait();
-      closing.prompts[0].choose("open-in-browser");
-      await flush();
-      closing.contents.emit("destroyed");
-      const getURL = mock.method(closing.contents, "getURL", () => {
-        throw new Error("view destroyed");
-      });
-      rejectLaunch(new Error("late launch failure"));
-      await flush();
-      assert.equal(closing.prompts.length, 1);
-      assert.equal(warning.mock.callCount(), 2);
-      assert.equal(getURL.mock.callCount(), 0);
     });
   }
+
+  it("does not reopen after a browser launch fails when the view has closed", async () => {
+    const warning = mock.method(console, "warn", () => {});
+    let rejectLaunch;
+    const closing = harness({
+      launch: () =>
+        new Promise((_resolve, reject) => {
+          rejectLaunch = reject;
+        }),
+    });
+    closing.report(true);
+    await closing.wait();
+    closing.prompts[0].choose("open-in-browser");
+    await flush();
+    closing.contents.emit("destroyed");
+    const getURL = mock.method(closing.contents, "getURL", () => {
+      throw new Error("view destroyed");
+    });
+    rejectLaunch(new Error("late launch failure"));
+    await flush();
+    assert.equal(closing.prompts.length, 1);
+    assert.equal(warning.mock.callCount(), 1);
+    assert.equal(getURL.mock.callCount(), 0);
+  });
 
   it("does not hand a different site to the system browser", async () => {
     const h = harness();

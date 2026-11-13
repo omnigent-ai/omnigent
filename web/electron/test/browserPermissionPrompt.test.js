@@ -286,6 +286,22 @@ describe("browser permission popover", () => {
       h.parent.webContents.emit("did-stop-loading");
       await wait();
       assert.equal(h.windows.length, beforeNavigation + 1, "the notice returns after navigation");
+      const warning = mock.method(console, "warn", () => {});
+      const originalShow = h.controller.show;
+      const failedShow = mock.method(h.controller, "show", () => {
+        throw new Error("popup construction failed");
+      });
+      h.controller.dismiss(h.parent);
+      await wait();
+      assert.equal(warning.mock.callCount(), 1);
+      failedShow.mock.restore();
+      await wait();
+      assert.equal(h.controller.show, originalShow);
+      assert.equal(h.windows.at(-1).destroyed, false, "construction failure retries recover");
+      // A new request gets its own failure budget.
+      contents.ipc.emit(PENDING_CHANNEL, { senderFrame: contents.mainFrame }, false);
+      contents.ipc.emit(PENDING_CHANNEL, { senderFrame: contents.mainFrame }, true);
+      await wait();
       const beforeFailure = h.windows.length;
       const failedLoad = mock.method(Window.prototype, "loadFile", () =>
         Promise.reject(new Error("popup failed to load")),

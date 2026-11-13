@@ -29,6 +29,13 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
     controller?.abort();
   }
 
+  function retryFailure() {
+    promptFailures += 1;
+    if (promptFailures < MAX_PROMPT_FAILURES) {
+      timer = setTimeout(show, SHOW_DELAY_MS * 2 ** (promptFailures - 1));
+    }
+  }
+
   function show() {
     timer = null;
     if (!pending || shown || contents.isDestroyed()) return;
@@ -49,10 +56,7 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
         if (shown !== controller) return;
         shown = null;
         if (choice === "failed") {
-          promptFailures += 1;
-          if (promptFailures < MAX_PROMPT_FAILURES) {
-            timer = setTimeout(show, SHOW_DELAY_MS * 2 ** (promptFailures - 1));
-          }
+          retryFailure();
           return;
         }
         if (choice === "suppressed") {
@@ -70,8 +74,11 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
             show();
           });
       })
-      .catch(() => {
-        if (shown === controller) shown = null;
+      .catch((error) => {
+        if (shown !== controller) return;
+        shown = null;
+        console.warn("[browser] security-key notice failed:", error);
+        retryFailure();
       });
   }
 
