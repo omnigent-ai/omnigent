@@ -773,11 +773,14 @@ async def test_message_resent_when_its_wait_ran_out_gets_no_resend_notice(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A message delivered once the wait ran out isn't followed by "send your message again"."""
-    monkeypatch.setattr(runner_app, "_SIGN_IN_HOLD_MAX_S", 0.05)
-    monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.3)
+    monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
     sid = uuid.uuid4().hex
+    pane_reading = asyncio.Event()
+    pane_ready = asyncio.Event()
 
     async def read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        pane_reading.set()
+        await pane_ready.wait()
         return {"screen": _READY_SCREEN}
 
     app, harness, server = _build_app(
@@ -786,9 +789,13 @@ async def test_message_resent_when_its_wait_ran_out_gets_no_resend_notice(
     async with _runner_client(app) as client:
         await _create_session(client, sid)
         await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        await asyncio.wait_for(pane_reading.wait(), timeout=budget(5))
+        (watch,) = [t for t in asyncio.all_tasks() if t.get_name() == f"sign-in-watch-{sid}"]
+        app.state.sign_in_holds[sid].deadline = 0.0
         await _until(lambda: len(harness.posted_bodies) == 2 and sid not in app.state.active_turns)
-        # Past the watcher's next poll of the now-ready pane.
-        await asyncio.sleep(0.5)
+        pane_ready.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(watch, timeout=budget(5))
 
     assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first"]
     assert not server.notices("databricks_sign_in_completed")

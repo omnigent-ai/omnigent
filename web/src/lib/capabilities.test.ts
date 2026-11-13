@@ -291,6 +291,7 @@ describe.each([
   "scheduled_task_harness_settings",
   "scheduled_task_approval_skipping_modes",
   "scheduled_task_subhour",
+  "scheduled_task_trigger_headers",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
 ] as const)("resolveServerInfo %s", (capability) => {
@@ -393,17 +394,21 @@ describe("resolveServerInfo session_fork_workspaces", () => {
   });
 });
 
-describe("resolveServerInfo session_claude_sdk_clear", () => {
-  it.each([
-    [true, true],
-    [false, false],
-    [undefined, false],
-    ["true", false],
-  ])("parses %s strictly as %s", async (advertised, expected) => {
-    const parsed = await probe({ session_claude_sdk_clear: advertised });
-    expect(parsed.session_claude_sdk_clear).toBe(expected);
-  });
-});
+describe.each(["session_claude_sdk_clear", "session_rewind"] as const)(
+  "resolveServerInfo %s",
+  (capability) => {
+    it.each([
+      [true, true],
+      [false, false],
+      [undefined, false],
+      ["true", false],
+      [1, false],
+    ])("parses %s strictly as %s", async (advertised, expected) => {
+      const parsed = await probe({ [capability]: advertised });
+      expect(parsed[capability]).toBe(expected);
+    });
+  },
+);
 
 describe("resolveServerInfo session_event_types", () => {
   it.each([
@@ -543,10 +548,7 @@ describe("custom agents settings capability", () => {
   it.each([undefined, false, "true", true])(
     "requires a boolean install capability: %s",
     async (install) => {
-      const parsed = await probe({
-        features: { custom_agents_settings_ui: true },
-        agent_install: install,
-      });
+      const parsed = await probe({ agent_install: install });
       const { customAgentsSettingsEnabled } = await import("./capabilities");
       expect(customAgentsSettingsEnabled(parsed)).toBe(install === true);
     },

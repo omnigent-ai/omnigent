@@ -44,15 +44,17 @@ def setup_app(tmp_path, monkeypatch, request):
         kwargs["scheduled_task_store"] = SqlAlchemyScheduledTaskStore(
             str(kwargs["account_store"]._engine.url)
         )
-        if getattr(request, "param", False):
+        from omnigent.server.feature_flags import resolve_feature_flags
+
+        persistent = getattr(request, "param", False)
+        kwargs["feature_flags"] = resolve_feature_flags(
+            {"OMNIGENT_FEATURES": "automations_v2" if persistent else "-automations_v2"}
+        )
+        if persistent:
             from unittest.mock import AsyncMock
 
-            from omnigent.server.feature_flags import resolve_feature_flags
             from omnigent.server.scheduled.dispatch_scheduler import ScheduledTaskDispatchHooks
 
-            kwargs["feature_flags"] = resolve_feature_flags(
-                {"OMNIGENT_FEATURES": "automations_v2"}
-            )
             kwargs["scheduled_task_dispatch"] = ScheduledTaskDispatchHooks(
                 AsyncMock(), AsyncMock(return_value=None)
             )

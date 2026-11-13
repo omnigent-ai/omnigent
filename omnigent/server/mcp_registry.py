@@ -196,6 +196,17 @@ class McpRegistry:
             raise ConnectionError("MCP service is unavailable for this user")
         return service
 
+    def connected(self, service: McpService, user_id: str, app_state: Any) -> bool:
+        """Whether *user_id* has the account *service* needs; blocking store read."""
+        if service.auth in {"github", "databricks"}:
+            store = getattr(app_state, f"{service.auth}_store", None)
+            return store is not None and store.get(user_id) is not None
+        if service.auth in {"oauth", "bearer"}:
+            return (
+                self.store is not None and self.store.get(user_id, f"mcp:{service.id}") is not None
+            )
+        return service.auth == "none"
+
     async def token(self, service: McpService, user_id: str, app_state: Any) -> str | None:
         if service.auth == "none":
             return None
