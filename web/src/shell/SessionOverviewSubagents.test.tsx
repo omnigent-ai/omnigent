@@ -14,14 +14,12 @@ function child(id: string, title: string) {
   return { id, title, tool: title.split(":")[0], session_name: null, busy: false };
 }
 
-function route(children: Response | ((after: string | null) => Response), costs: unknown) {
-  vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
-    const url = new URL(String(input), "http://test.local");
-    if (!url.pathname.endsWith("/child_sessions")) {
-      return new Response(JSON.stringify({ data: costs, has_more: false }));
-    }
-    return typeof children === "function" ? children(url.searchParams.get("after")) : children;
-  });
+function route(children: Response, costs: unknown) {
+  vi.mocked(authenticatedFetch).mockImplementation(async (input) =>
+    String(input).includes("/child_sessions")
+      ? children
+      : new Response(JSON.stringify({ data: costs, has_more: false })),
+  );
 }
 
 function renderSection() {
@@ -47,16 +45,10 @@ afterEach(cleanup);
 
 describe("SessionOverviewSubagents", () => {
   it("lists each direct sub-agent with its cost, leaving an unknown cost empty", async () => {
-    // The older sub-agent is on the child list's second page.
     route(
-      (after) =>
-        new Response(
-          JSON.stringify(
-            after === null
-              ? { data: [child("conv_a", "codex:review")], last_id: "conv_a", has_more: true }
-              : { data: [child("conv_b", "worker:docs")], has_more: false },
-          ),
-        ),
+      new Response(
+        JSON.stringify({ data: [child("conv_a", "codex:review"), child("conv_b", "worker:docs")] }),
+      ),
       [
         { id: "conv_root", cost_usd: 2 },
         { id: "conv_a", cost_usd: 0.5 },

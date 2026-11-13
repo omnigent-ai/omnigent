@@ -3,7 +3,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
-import { useChildSessions } from "./useChildSessions";
+import { isStaleCursorResponse, useChildSessions } from "./useChildSessions";
 
 interface AgentCostPageWire {
   data: { id: string; cost_usd?: number | null }[];
@@ -31,9 +31,9 @@ async function fetchAgentCostPages(
     `/v1/sessions/${encodeURIComponent(sessionId)}/agent_costs?${params.toString()}`,
   );
   // Servers without the route answer with the same 404 envelope as a missing session.
-  if (res.status === 404) return null;
-  // The tree changed between pages (stale cursor): walk it again once.
-  if (res.status === 400 && after !== null && !restarted) {
+  if (res.status === 404 && after === null) return null;
+  // The tree changed between pages: walk it again once.
+  if (after !== null && !restarted && (await isStaleCursorResponse(res))) {
     return fetchAgentCostPages(sessionId, null, new Map(), true);
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -78,6 +78,7 @@ export function invalidateAgentCosts(queryClient: QueryClient): void {
 export function useAgentCosts(sessionId: string | null) {
   const enabled = isFeatureEnabled(useServerInfo(), "session_overview");
   const id = enabled && sessionId !== null && !isTempConvId(sessionId) ? sessionId : null;
+  // Cached child lists stay live: SessionUpdatesProvider watches each listed child.
   const { children } = useChildSessions(id);
   const working = children.some((child) => child.busy);
   return useQuery({

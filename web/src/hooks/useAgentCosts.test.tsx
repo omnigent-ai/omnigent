@@ -144,6 +144,22 @@ describe("useAgentCosts", () => {
     expect(costRequests()).toHaveLength(1);
   });
 
+  it("keeps a 404 after the first page an error, not a missing breakdown", async () => {
+    routeCosts(
+      (url) =>
+        url.searchParams.get("after") === null
+          ? new Response(
+              JSON.stringify({ data: [{ id: "conv_root" }], last_id: "conv_root", has_more: true }),
+            )
+          : new Response('{"error":{"code":"not_found"}}', { status: 404 }),
+      false,
+    );
+    const { result } = renderCosts(true);
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.data).toBeUndefined();
+  });
+
   it("polls while a child works and stops once it settles", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     routeCosts(() => new Response('{"data":[]}'), true);

@@ -93,6 +93,16 @@ interface ChildSessionsResponse {
 
 const CHILD_SESSIONS_PAGE_SIZE = "100";
 
+/** True for the server's 400 `stale_cursor`: the list changed under a page cursor. */
+export async function isStaleCursorResponse(res: Response): Promise<boolean> {
+  if (res.status !== 400) return false;
+  const body = (await res
+    .clone()
+    .json()
+    .catch(() => null)) as { error?: { code?: unknown } } | null;
+  return body?.error?.code === "stale_cursor";
+}
+
 async function fetchChildSessionRows(
   sessionId: string,
   after: string | null,
@@ -105,8 +115,8 @@ async function fetchChildSessionRows(
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions${query}`,
   );
-  // The list changed between pages (stale cursor): read it again once.
-  if (res.status === 400 && after !== null && !restarted) {
+  // The list changed between pages: read it again once.
+  if (after !== null && !restarted && (await isStaleCursorResponse(res))) {
     return fetchChildSessionRows(sessionId, null, [], true);
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
