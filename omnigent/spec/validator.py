@@ -335,6 +335,16 @@ def _validate_mcp_servers(spec: AgentSpec, result: ValidationResult) -> None:
                 result.add(f"{prefix}.args", "not allowed when transport is 'http'")
             if mcp.env:
                 result.add(f"{prefix}.env", "not allowed when transport is 'http'")
+        elif mcp.transport == "registry":
+            if (
+                mcp.url
+                or mcp.headers
+                or mcp.command
+                or mcp.args
+                or mcp.env
+                or mcp.databricks_profile
+            ):
+                result.add(prefix, "registry services cannot override server connection settings")
         elif mcp.transport == "stdio":
             if mcp.command is None:
                 result.add(f"{prefix}.command", "required when transport is 'stdio'")
@@ -541,6 +551,7 @@ def _validate_os_env(spec: AgentSpec, result: ValidationResult) -> None:
         list(getattr(sandbox, "egress_rules", None) or []) if sandbox is not None else []
     )
     git_ssh = list(getattr(sandbox, "git_ssh", None) or []) if sandbox is not None else []
+    tcp_egress = list(getattr(sandbox, "tcp_egress", None) or []) if sandbox is not None else []
 
     if start_in_scratch and fork:
         result.add(
@@ -573,6 +584,16 @@ def _validate_os_env(spec: AgentSpec, result: ValidationResult) -> None:
         result.add(
             "os_env.sandbox.git_ssh",
             "git_ssh requires linux_bwrap or darwin_seatbelt for hard network enforcement",
+        )
+    if tcp_egress and sandbox_type not in _EGRESS_CAPABLE_BACKENDS:
+        result.add(
+            "os_env.sandbox.tcp_egress",
+            "tcp_egress requires linux_bwrap or darwin_seatbelt for hard network enforcement",
+        )
+    if tcp_egress and egress_rules:
+        result.add(
+            "os_env.sandbox.tcp_egress",
+            "tcp_egress cannot coexist with HTTP egress_rules",
         )
 
 

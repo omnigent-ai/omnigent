@@ -18,6 +18,7 @@ function mockJsonResponse(body: unknown, init?: { ok?: boolean; status?: number 
 }
 
 const fetchMock = vi.fn();
+const CLIENT_KEY = expect.stringMatching(/^[0-9a-f]{32}$/);
 
 beforeEach(() => {
   fetchMock.mockReset();
@@ -33,6 +34,36 @@ afterEach(() => {
 });
 
 describe("resolveIdentity", () => {
+  it.each([
+    [true, true, false],
+    [false, true, false],
+    [true, false, true],
+    [false, false, false],
+    [true, undefined, true],
+    [false, undefined, false],
+    [true, "loading", false],
+    [false, "loading", false],
+  ])(
+    "preserves admin eligibility=%s with admin-view support=%s while off",
+    async (eligible, supported, expectedAdmin) => {
+      if (supported !== "loading") {
+        fetchMock.mockResolvedValueOnce(mockJsonResponse({ admin_view: supported }));
+        const { resolveServerInfo } = await import("./capabilities");
+        await resolveServerInfo();
+      }
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice", is_admin: eligible }));
+      const identity = await import("./identity");
+      await identity.resolveIdentity();
+      document.cookie = "omnigent_admin_view=off; Path=/";
+      try {
+        expect(identity.getCurrentIsAdmin()).toBe(expectedAdmin);
+        expect(identity.getCurrentAdminEligibility()).toBe(eligible);
+      } finally {
+        document.cookie = "omnigent_admin_view=; Max-Age=0; Path=/";
+      }
+    },
+  );
+
   it("calls GET /v1/me and caches the user id", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice@example.com" }));
     const { resolveIdentity, getCurrentUserId } = await import("./identity");
@@ -113,6 +144,140 @@ describe("resolveIdentity", () => {
     const { resolveIdentity } = await import("./identity");
 
     await expect(resolveIdentity()).resolves.toBeNull();
+  });
+});
+
+describe("resolveIdentity transient failures", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const failWithStatus = (status: number) => () =>
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status }));
+
+  it.each<[string, () => void]>([
+    ["a network error", () => fetchMock.mockRejectedValueOnce(new Error("network"))],
+    ["a gateway 503", failWithStatus(503)],
+    ["a 408", failWithStatus(408)],
+    ["a 429", failWithStatus(429)],
+    [
+      "a 200 whose body cannot be parsed",
+      () =>
+        fetchMock.mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => {
+            throw new SyntaxError("Unexpected end of JSON input");
+          },
+        } as unknown as Response),
+    ],
+  ])("probes again after %s instead of caching null", async (_label, failOnce) => {
+    failOnce();
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice@example.com" }));
+    const { resolveIdentity, getCurrentUserId } = await import("./identity");
+
+    expect(await resolveIdentity()).toBeNull();
+    expect(await resolveIdentity()).toBe("alice@example.com");
+    expect(await resolveIdentity()).toBe("alice@example.com");
+
+    expect(getCurrentUserId()).toBe("alice@example.com");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("caches a 4xx answer without probing again", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 403 }));
+    const { resolveIdentity } = await import("./identity");
+
+    expect(await resolveIdentity()).toBeNull();
+    expect(await resolveIdentity()).toBeNull();
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("caches a 401 answer even when its body is unreadable", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      json: async () => {
+        throw new SyntaxError("Unexpected token <");
+      },
+    } as unknown as Response);
+    const { resolveIdentity } = await import("./identity");
+
+    expect(await resolveIdentity()).toBeNull();
+    expect(await resolveIdentity()).toBeNull();
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("retries in the background while a listener is subscribed", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockRejectedValueOnce(new Error("network"));
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice@example.com" }));
+    const { resolveIdentity, getCurrentUserId, subscribeIdentity } = await import("./identity");
+    const listener = vi.fn();
+    subscribeIdentity(listener);
+
+    expect(await resolveIdentity()).toBeNull();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(getCurrentUserId()).toBe("alice@example.com");
+    expect(listener).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("backs off up to the cap and stops when the last listener leaves", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(mockJsonResponse({}, { ok: false, status: 502 }));
+    const { resolveIdentity, subscribeIdentity } = await import("./identity");
+    const unsubscribe = subscribeIdentity(() => {});
+
+    await resolveIdentity();
+    let calls = 1;
+    // Each retry's timer exists only after the previous probe settles, so the
+    // clock must advance one delay at a time.
+    /* oxlint-disable no-await-in-loop */
+    for (const delayMs of [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]) {
+      await vi.advanceTimersByTimeAsync(delayMs - 1);
+      expect(fetchMock).toHaveBeenCalledTimes(calls);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fetchMock).toHaveBeenCalledTimes(++calls);
+    }
+    /* oxlint-enable no-await-in-loop */
+
+    unsubscribe();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(calls);
+  });
+
+  it("keeps the retry delay when the listener leaves before the retry runs", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(mockJsonResponse({}, { ok: false, status: 502 }));
+    const { resolveIdentity, subscribeIdentity } = await import("./identity");
+    const unsubscribe = subscribeIdentity(() => {});
+    await resolveIdentity();
+
+    await vi.advanceTimersByTimeAsync(500);
+    unsubscribe();
+    const resubscribe = subscribeIdentity(() => {});
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    resubscribe();
+  });
+
+  it("does not retry without a listener", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockRejectedValue(new Error("network"));
+    const { resolveIdentity } = await import("./identity");
+
+    await resolveIdentity();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });
 
@@ -275,7 +440,7 @@ describe("authenticatedFetch", () => {
       },
       { query: "session_id=session-a", mode: "known", expected: "host_target" },
       { query: "session_id=session-a", mode: "resolve", expected: "host_target" },
-      { query: "session_id=session-a", mode: "unknown", expected: null },
+      { query: "session_id=session-a", mode: "unknown", expected: CLIENT_KEY },
     ])(
       "routes unified skill discovery to its own host ($mode)",
       async ({ query, mode, expected }) => {
@@ -298,7 +463,7 @@ describe("authenticatedFetch", () => {
         fetchMock.mockResolvedValueOnce(mockJsonResponse({ skills: [] }));
         await authenticatedFetch(`/api/2.0/omnigent/v1/skills?${query}`);
         const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
-        expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe(expected);
+        expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toEqual(expected);
         if (mode === "resolve" || mode === "unknown") {
           expect(resolve).toHaveBeenCalledExactlyOnceWith("session-a");
         } else {
@@ -307,12 +472,16 @@ describe("authenticatedFetch", () => {
       },
     );
 
-    it("stamps X-Databricks-Omnigent-Slice-Key on host-scoped URLs", async () => {
-      // Mock sessionHost module before importing identity
+    it.each([
+      [false, "host_123"],
+      [true, null],
+    ])("keys host-scoped URLs by their host (keyless %s)", async (keyless, key) => {
+      // A host proven keyless lives on the unkeyed default replica, so it must not
+      // receive the client key either.
       vi.doMock("./sessionHost", () => ({
         getSessionHost: vi.fn(() => "host_123"),
         setSessionHost: vi.fn(),
-        isHostKeyless: vi.fn(() => false),
+        isHostKeyless: vi.fn(() => keyless),
         markHostKeyless: vi.fn(),
         clearHostKeyless: vi.fn(),
         modalHostId: vi.fn(() => null),
@@ -331,9 +500,9 @@ describe("authenticatedFetch", () => {
 
       await authenticatedFetch("/v1/hosts/host_123/runners");
 
-      const init = fetchMock.mock.calls[0][1] as RequestInit;
-      const headers = new Headers(init.headers);
-      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_123");
+      const [, init, options] = fetchMock.mock.calls[0] as [string, RequestInit, unknown];
+      expect(new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")).toBe(key);
+      expect(options).toEqual({ unkeyed: keyless });
     });
 
     it("stamps the slice-key header in standalone dev against a workspace", async () => {
@@ -410,6 +579,7 @@ describe("authenticatedFetch", () => {
       expect(firstHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_789");
       // Second call (retry) should NOT have the slice key
       const secondInit = fetchMock.mock.calls[1][1] as RequestInit;
+      expect(fetchMock.mock.calls[1][2]).toEqual({ unkeyed: true });
       const secondHeaders = new Headers(secondInit.headers);
       expect(secondHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBeNull();
       expect(response.status).toBe(200);
@@ -468,13 +638,140 @@ describe("authenticatedFetch", () => {
       },
     );
 
-    it("keys /v1/imports/local by its body host_id, not the modal host", async () => {
-      // The import reads the CHOSEN host's transcripts over that host's tunnel,
-      // so it must route to the replica keyed by the body host_id — never the
-      // importing user's modal host (a different host, or null for a fresh user),
-      // which would land off-replica and 409 "host is not connected".
+    it.each([
+      "/v1/sessions?limit=50",
+      "/health?session_ids=a",
+      "/v1/sessions/projects",
+      "/v1/sessions/orchestrated",
+      "/v1/sessions/updates",
+    ])("keys host-less %s by the per-client key when there is no modal host", async (url) => {
+      // Without a key the request would route by workspace id, putting every
+      // host-less read from the workspace on one replica.
+      vi.doUnmock("./sessionHost");
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+        isHostRoutingEnabled: vi.fn(() => true),
+      }));
+      const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+      const resolve = vi.fn(async () => {});
+      setSessionHostResolver(resolve);
+      fetchMock.mockResolvedValue(mockJsonResponse({}));
+
+      await authenticatedFetch(url);
+      await authenticatedFetch(url);
+
+      const keys = fetchMock.mock.calls.map(([, init]) =>
+        new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
+      );
+      expect(keys[0]).toMatch(/^[0-9a-f]{32}$/);
+      expect(keys[1]).toBe(keys[0]);
+      expect(resolve).not.toHaveBeenCalled();
+    });
+
+    it("keys project reads and discovery-publishing writes by the modal host", async () => {
+      vi.doUnmock("./sessionHost");
+      const { resolveModalHost, setSessionHost } = await import("./sessionHost");
+      setSessionHost("session-a", "host_modal");
+      resolveModalHost(["host_modal"]);
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+        isHostRoutingEnabled: vi.fn(() => true),
+      }));
+      const { authenticatedFetch } = await import("./identity");
+      fetchMock.mockResolvedValue(mockJsonResponse({}));
+
+      // These writes publish projects_changed / session_added on their replica,
+      // which only the updates stream keyed by the same modal host receives.
+      await authenticatedFetch("/v1/sessions/projects");
+      await authenticatedFetch("/v1/projects/proj_1", { method: "PATCH", body: "{}" });
+      await authenticatedFetch("/v1/scheduled-tasks/task_1/run", { method: "POST" });
+      await authenticatedFetch("/v1/scheduled-tasks", { method: "POST", body: "{}" });
+      // A task edit or create naming a connected host is validated on that host's replica.
+      await authenticatedFetch("/v1/scheduled-tasks/task_1", {
+        method: "PATCH",
+        body: JSON.stringify({ name: "Renamed", host_id: "host_task", workspace: "/repo" }),
+      });
+
+      const keys = fetchMock.mock.calls.map(([, init]) =>
+        new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
+      );
+      expect(keys).toEqual(["host_modal", "host_modal", "host_modal", "host_modal", "host_task"]);
+    });
+
+    it("keys a session sub-path with an unknown host by the client key", async () => {
+      vi.doUnmock("./sessionHost");
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+        isHostRoutingEnabled: vi.fn(() => true),
+      }));
+      const { authenticatedFetch } = await import("./identity");
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+
+      await authenticatedFetch("/v1/sessions/sess_unknown/items");
+
+      const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toEqual(CLIENT_KEY);
+    });
+
+    it.each(["import", "bundle", "hostless_bundle"])(
+      "keys %s by its own destination",
+      async (kind) => {
+        // Requests route by their own host_id, never the modal host; hostless
+        // creates need no particular replica and carry the client key.
+        vi.doMock("./sessionHost", () => ({
+          getSessionHost: vi.fn(() => null),
+          setSessionHost: vi.fn(),
+          isHostKeyless: vi.fn(() => false),
+          markHostKeyless: vi.fn(),
+          clearHostKeyless: vi.fn(),
+          modalHostId: vi.fn(() => "host_modal"),
+          resolveModalHost: vi.fn(),
+          isModalHostResolved: vi.fn(() => true),
+        }));
+        vi.doMock("./host", () => ({
+          getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+          hostFetch: fetchMock,
+          isDatabricksWorkspace: vi.fn(() => true),
+          isHostRoutingEnabled: vi.fn(() => true),
+        }));
+
+        fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+        const { authenticatedFetch } = await import("./identity");
+
+        const metadata =
+          kind === "hostless_bundle" ? { host_type: "managed" } : { host_id: "host_target" };
+        const bundle = new FormData();
+        bundle.append("metadata", JSON.stringify(metadata));
+        await authenticatedFetch(kind === "import" ? "/v1/imports/local/stream" : "/v1/sessions", {
+          method: "POST",
+          body: kind === "import" ? JSON.stringify(metadata) : bundle,
+        });
+
+        const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+        expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toEqual(
+          kind === "hostless_bundle" ? CLIENT_KEY : "host_target",
+        );
+      },
+    );
+
+    it.each([
+      ["fork", { host_type: "managed", host_id: "host_fork" }, "host_fork"],
+      ["fork", { host_type: "managed" }, CLIENT_KEY],
+      ["fork", {}, "host_source"],
+      ["managed-host", { host_id: "host_sandbox" }, "host_sandbox"],
+      ["managed-host", {}, CLIENT_KEY],
+    ])("keys a managed %s only by the new host it names (%j)", async (route, body, key) => {
+      // A managed fork's or move's launch runs on the replica it lands on, so
+      // it must land where its own new host will connect (the client key without an
+      // id), never on the source's; any other fork keeps the source's key.
       vi.doMock("./sessionHost", () => ({
-        getSessionHost: vi.fn(() => null),
+        getSessionHost: vi.fn(() => "host_source"),
         setSessionHost: vi.fn(),
         isHostKeyless: vi.fn(() => false),
         markHostKeyless: vi.fn(),
@@ -493,14 +790,14 @@ describe("authenticatedFetch", () => {
       fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
       const { authenticatedFetch } = await import("./identity");
 
-      await authenticatedFetch("/v1/imports/local/stream", {
+      await authenticatedFetch(`/v1/sessions/conv_src/${route}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ host_id: "host_target", source: "all", limit: 5 }),
+        body: JSON.stringify(body),
       });
 
       const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
-      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_target");
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toEqual(key);
     });
   });
 });
@@ -706,5 +1003,45 @@ describe("login redirect", () => {
 
     expect(isLoginRedirectPending()).toBe(false);
     expect(hrefWrites).toEqual([]);
+  });
+});
+
+describe("isSignInExpired", () => {
+  const redirected = { ok: false, status: 0, type: "opaqueredirect", headers: new Headers() };
+  const maintenancePage = {
+    ok: true,
+    status: 200,
+    type: "basic",
+    headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+  };
+
+  it.each([
+    ["a redirect to a login page", redirected],
+    ["a 401", { ok: false, status: 401, type: "basic", headers: new Headers() }],
+    ["a 403", { ok: false, status: 403, type: "basic", headers: new Headers() }],
+  ])(
+    "reports an expired sign-in for %s, probing without following redirects",
+    async (_label, answer) => {
+      fetchMock.mockResolvedValueOnce(answer);
+      const { isSignInExpired } = await import("./identity");
+
+      await expect(isSignInExpired()).resolves.toBe(true);
+      expect(fetchMock.mock.calls[0]).toEqual([
+        "/v1/me",
+        expect.objectContaining({ redirect: "manual" }),
+      ]);
+    },
+  );
+
+  it.each([
+    ["a network failure", new TypeError("Failed to fetch")],
+    ["a JSON answer", mockJsonResponse({ user_id: "alice" })],
+    ["a 200 maintenance page", maintenancePage],
+  ])("reads %s as not expired, so the caller keeps retrying", async (_label, answer) => {
+    if (answer instanceof Error) fetchMock.mockRejectedValueOnce(answer);
+    else fetchMock.mockResolvedValueOnce(answer);
+    const { isSignInExpired } = await import("./identity");
+
+    await expect(isSignInExpired()).resolves.toBe(false);
   });
 });

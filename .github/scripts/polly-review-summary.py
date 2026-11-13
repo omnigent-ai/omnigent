@@ -10,6 +10,15 @@ from pathlib import Path, PurePosixPath
 
 TESTS = "Tests and test support"
 CATEGORIES = (TESTS, "Documentation", "Dependencies and lockfiles", "Implementation / other")
+TEST_FIELD_COUNT = 5
+LINKED_ISSUE_BODY_LIMIT = 4096
+LINKED_ISSUES_QUERY = """query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    closingIssuesReferences(first: 5) {
+      totalCount nodes { number title state body repository { nameWithOwner } }
+    }
+  } }
+}"""
 
 
 def category(filename: str) -> str:
@@ -101,6 +110,81 @@ def collapse_test_assessment(summary_body: str) -> str:
     )
 
 
+def _pipes(body: str, honor_code_spans: bool) -> list[tuple[int, bool]]:
+    """Return (index, inside_code_span) for each pipe not immediately preceded by a backslash."""
+    pipes = []
+    i = 0
+    while i < len(body):
+        char = body[i]
+        escaped = i > 0 and body[i - 1] == "\\"
+        if char == "`" and honor_code_spans and not escaped:
+            run = re.match(r"`+", body[i:])[0]
+            closing = re.compile(rf"(?<!`){run}(?!`)").search(body, i + len(run))
+            if closing is None:
+                i += len(run)
+                continue
+            # A pipe preceded by a backslash inside a code span is already escaped.
+            pipes.extend(
+                (j, True)
+                for j in range(i + len(run), closing.start())
+                if body[j] == "|" and body[j - 1] != "\\"
+            )
+            i = closing.end()
+            continue
+        if char == "|" and not escaped:
+            pipes.append((i, False))
+        i += 1
+    return pipes
+
+
+def _honors_code_spans(body: str) -> bool:
+    """Code spans are honored only when that yields the expected number of test fields."""
+    delimiters = [index for index, in_code in _pipes(body, True) if not in_code]
+    return len(delimiters) + 1 == TEST_FIELD_COUNT
+
+
+def split_table_row(body: str) -> list[str]:
+    honor = _honors_code_spans(body)
+    cells = []
+    start = 0
+    for index, in_code in _pipes(body, honor):
+        if not in_code:
+            cells.append(body[start:index])
+            start = index + 1
+    cells.append(body[start:])
+    return cells
+
+
+def _escape_code_span_pipes(body: str) -> str:
+    if not _honors_code_spans(body):
+        return body
+    pieces = []
+    last = 0
+    for index, in_code in _pipes(body, True):
+        if in_code:
+            pieces += [body[last:index], "\\|"]
+            last = index + 1
+    pieces.append(body[last:])
+    return "".join(pieces)
+
+
+def escape_tests_table(text: str) -> str:
+    """Escape pipes inside code spans in table rows, so GitHub renders them as cell text."""
+    lines = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            body = stripped.strip("|")
+            body_start = (len(line) - len(line.lstrip())) + (
+                len(stripped) - len(stripped.lstrip("|"))
+            )
+            line = (
+                line[:body_start] + _escape_code_span_pipes(body) + line[body_start + len(body) :]
+            )
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def compose_review(review: str, stats: dict) -> str:
     summaries = list(re.finditer(r"^## Summary\s*$", review, re.MULTILINE))
     if len(summaries) != 1:
@@ -108,6 +192,7 @@ def compose_review(review: str, stats: dict) -> str:
     summary = summaries[0]
     body = re.split(r"^## ", review[summary.end() :], maxsplit=1, flags=re.MULTILINE)[0]
     sections = {}
+    section_starts = {}
     for name in ("Changes", "Tests", "Scope"):
         matches = list(re.finditer(rf"^### {name}\s*$", body, re.MULTILINE))
         if len(matches) != 1:
@@ -116,6 +201,7 @@ def compose_review(review: str, stats: dict) -> str:
         if not text.strip():
             raise ValueError(f"Incomplete Polly review: empty '{name}' assessment.")
         sections[name] = text
+        section_starts[name] = summary.end() + matches[0].end()
     rows = []
     if stats["test_files"]:
         header = ["test / case", "behavior protected", "layer", "needed?", "action / rationale"]
@@ -123,13 +209,13 @@ def compose_review(review: str, stats: dict) -> str:
         for line in sections["Tests"].splitlines():
             if not line.strip().startswith("|"):
                 continue
-            cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+            cells = [cell.strip() for cell in split_table_row(line.strip().strip("|"))]
             if [cell.lower() for cell in cells] == header:
                 header_seen = True
                 continue
             if all(re.fullmatch(r":?-+:?", cell) for cell in cells):
                 continue
-            if len(cells) != 5 or not all(cells):
+            if len(cells) != TEST_FIELD_COUNT or not all(cells):
                 raise ValueError(
                     "Incomplete Polly review: test rows need all five assessment fields."
                 )
@@ -155,13 +241,20 @@ def compose_review(review: str, stats: dict) -> str:
         outside_parameters = re.sub(r"\[[^\]]*\]", "", identifier)
         return bool(outside_parameters.strip()) and "/" not in outside_parameters
 
-    case_only = all(is_case_only(row) for row in rows)
-    if len(stats["test_files"]) == 1 and rows and case_only and missing:
+    # Existing coverage from other files can appear beside the changed file's case-only rows.
+    has_case_only = any(is_case_only(row) for row in rows)
+    if len(stats["test_files"]) == 1 and has_case_only and missing:
         path = re.escape(missing[0])
         if re.search(rf"(?<![\w./~+-]){path}(?![\w/~+-]|\.[\w-])", sections["Tests"]):
             missing = []
     if missing:
         raise ValueError(f"Incomplete Polly review: unassessed test files: {', '.join(missing)}")
+    tests_start = section_starts["Tests"]
+    review = (
+        review[:tests_start]
+        + escape_tests_table(sections["Tests"])
+        + review[tests_start + len(sections["Tests"]) :]
+    )
     result = (
         review[: summary.end()].rstrip()
         + "\n\n"
@@ -176,10 +269,69 @@ def compose_review(review: str, stats: dict) -> str:
     return result
 
 
+def linked_issues(pull_request: str) -> dict | None:
+    """Return the issues a PR closes, or None when GitHub cannot be read."""
+    try:
+        repository, number = pull_request.rsplit("#", 1)
+        owner, name = repository.split("/", 1)
+        response = subprocess.run(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"owner={owner}",
+                "-f",
+                f"name={name}",
+                "-F",
+                f"number={number}",
+                "-f",
+                f"query={LINKED_ISSUES_QUERY}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        references = json.loads(response.stdout)["data"]["repository"]["pullRequest"][
+            "closingIssuesReferences"
+        ]
+        issues = []
+        for node in filter(None, references["nodes"]):
+            body = node.get("body") or ""
+            issues.append(
+                {
+                    "issue": f"{node['repository']['nameWithOwner']}#{node['number']}",
+                    "title": node["title"],
+                    "state": node["state"],
+                    "body": body[:LINKED_ISSUE_BODY_LIMIT],
+                    "body_truncated": len(body) > LINKED_ISSUE_BODY_LIMIT,
+                }
+            )
+        omitted = max(references["totalCount"] - len(issues), 0)
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+    ) as error:
+        detail = getattr(error, "stderr", None) or error
+        print(
+            "::warning::Could not read linked issues; scope is reviewed from the PR description. "
+            f"({type(error).__name__}: {' '.join(str(detail).split())[:500]})"
+        )
+        return None
+    return {"issues": issues, "omitted": omitted}
+
+
 def main() -> None:
     mode, source, destination = sys.argv[1:]
     if mode == "stats":
         Path(destination).write_text(json.dumps(diff_stats(Path(source))), encoding="utf-8")
+    elif mode == "linked-issues":
+        Path(destination).write_text(json.dumps(linked_issues(source)), encoding="utf-8")
     elif mode == "compose":
         stats = json.loads(Path(source).read_text(encoding="utf-8"))
         review = Path(destination)

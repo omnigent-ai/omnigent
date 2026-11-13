@@ -530,6 +530,7 @@ mod tests {
     /// Build an `App` over a throwaway pod and a channel whose receiver we keep
     /// so `cmds.send` never fails.
     fn app() -> (App, mpsc::UnboundedReceiver<Cmd>) {
+        let _guard = crate::paths::lock_test_env();
         let root = std::env::temp_dir().join(format!("omnidev-tui-{}", std::process::id()));
         let dir = root.join("pod");
         let pod = Arc::new(
@@ -616,6 +617,32 @@ mod tests {
         let rows = body(&app, 40, 12); // 4 header + 7 body + 1 footer
         assert_eq!(rows.last().unwrap(), "line099");
         assert!(rows.iter().any(|r| r == "line093"));
+    }
+
+    #[test]
+    fn ansi_log_colors_and_reset_survive_rendering() {
+        let (app, _rx) = app();
+        app.shared
+            .lock()
+            .unwrap()
+            .all
+            .push("\x1b[31mred\x1b[0m plain");
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| render::draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..9)
+            .map(|column| buffer.cell((column, 4)).unwrap().symbol())
+            .collect();
+        assert_eq!(text, "red plain");
+        for column in 0..9 {
+            let foreground = buffer.cell((column, 4)).unwrap().fg;
+            let expected = if column < 3 {
+                ratatui::style::Color::Red
+            } else {
+                ratatui::style::Color::Reset
+            };
+            assert_eq!(foreground, expected, "column {column}");
+        }
     }
 
     #[test]

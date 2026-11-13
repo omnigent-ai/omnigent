@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
@@ -8,7 +9,10 @@ import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
-vi.mock("@/lib/sessionsApi", () => ({ getSessionSignInLink: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  getSessionSignInLink: vi.fn(),
+}));
 
 afterEach(cleanup);
 
@@ -282,6 +286,14 @@ describe("ErrorBanner", () => {
     [
       "client_update_required",
       "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+    ],
+    [
+      "codex_provider_auth_failed",
+      "Codex couldn't get a token from the model provider's sign-in command on the host.",
+    ],
+    [
+      "harness_not_configured",
+      "The harness isn't set up on the host, so this session can't start.",
     ],
   ])("describes a %s failure in plain English", (code, sentence) => {
     render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
@@ -822,6 +834,112 @@ describe("ErrorBanner", () => {
   });
 });
 
+describe("Codex compaction on the previous model", () => {
+  beforeEach(() => useChatStore.setState({ conversationId: "conv_parent" }));
+  afterEach(() => useChatStore.setState({ conversationId: null }));
+
+  const cause =
+    "The AI gateway refused a compaction request on gpt-6-astra: its budget is exhausted.";
+  const gatewayError =
+    'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":"Budget \\"example-budget\\" has reached its limit of $100."}';
+
+  it("leads with the provider's error, then explains and forks without expanding", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ErrorBanner
+          message={gatewayError}
+          source="execution"
+          code="codex_compaction_model_failed"
+          title="gpt-6-astra is over its AI gateway budget"
+          cause={cause}
+        />
+      </ForkDialogContextProvider>,
+    );
+
+    const hint = screen.getByTestId("error-compaction-model-hint");
+    expect(hint.textContent?.startsWith(`${gatewayError}${cause}`)).toBe(true);
+    expect(hint).toHaveTextContent(/Fork session…$/);
+    fireEvent.click(screen.getByRole("button", { name: "Fork session…" }));
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({ sourceSessionId: "conv_parent" });
+  });
+
+  it("copies the provider's error from the hint", async () => {
+    render(
+      <ErrorBanner
+        message={gatewayError}
+        source="execution"
+        code="codex_compaction_model_failed"
+        title="gpt-6-astra is over its AI gateway budget"
+        cause={cause}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy error" }));
+
+    expect(copyText).toHaveBeenLastCalledWith(gatewayError);
+    expect(await screen.findByRole("button", { name: "Error copied" })).toBeInTheDocument();
+  });
+
+  it("does not repeat the hint in a Message section", () => {
+    render(
+      <ErrorBanner
+        message={gatewayError}
+        source="execution"
+        code="codex_compaction_model_failed"
+        title="gpt-6-astra is over its AI gateway budget"
+        cause={cause}
+        remediation="Fork this session to continue on gpt-6-1-sol."
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /over its AI gateway budget/i }));
+    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
+    expect(screen.queryByTestId("error-message-content")).toBeNull();
+    expect(screen.queryByText(/Try this:/)).toBeNull();
+    expect(screen.getAllByText(gatewayError)).toHaveLength(1);
+  });
+
+  it("offers the fork when the compaction failure is grouped under another error", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ErrorBanner
+          message="Runner disconnected."
+          source="execution"
+          code="runner_disconnected"
+          relatedErrors={[
+            {
+              itemId: "related-compaction",
+              message: gatewayError,
+              source: "execution",
+              code: "codex_compaction_model_failed",
+              cause,
+            },
+          ]}
+        />
+      </ForkDialogContextProvider>,
+    );
+
+    const hint = screen.getByTestId("error-compaction-model-hint");
+    expect(hint.textContent?.startsWith(`${gatewayError}${cause}`)).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Fork session…" }));
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({ sourceSessionId: "conv_parent" });
+  });
+
+  it.each([
+    { canFork: false, code: "codex_compaction_model_failed" },
+    { canFork: true, code: "budget_exhausted" },
+  ])("does not offer the fork for $code with canFork=$canFork", ({ canFork, code }) => {
+    render(
+      <ForkDialogContextProvider value={{ canFork, openForkDialog: vi.fn() }}>
+        <ErrorBanner message="Error details" source="execution" code={code} />
+      </ForkDialogContextProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Fork session…" })).not.toBeInTheDocument();
+  });
+});
+
 describe("missing workspace recovery", () => {
   beforeEach(() => useChatStore.setState({ conversationId: "conv_parent" }));
   afterEach(() => useChatStore.setState({ conversationId: null }));
@@ -1226,6 +1344,42 @@ describe("routing decision — harness / scope / raw pick", () => {
   });
 });
 
+describe("ErrorBanner — budget tone", () => {
+  it.each(["budget_exhausted", "codex_compaction_model_failed"])(
+    "renders %s in the neutral tone",
+    (code) => {
+      render(
+        <ErrorBanner message="Budget has reached its limit." source="execution" code={code} />,
+      );
+      const pill = screen.getByTestId("error-pill");
+      // Still a failed turn, only without the failure color.
+      expect(pill).toHaveAttribute("data-level", "error");
+      expect(pill.getAttribute("style")).toContain("--muted-foreground");
+      expect(screen.getByTestId("error-headline")).not.toHaveClass("text-destructive");
+    },
+  );
+
+  it("keeps the failure tone when another failure is grouped with it", () => {
+    render(
+      <ErrorBanner
+        message="Budget has reached its limit."
+        source="execution"
+        code="budget_exhausted"
+        relatedErrors={[
+          {
+            itemId: "related-disconnect",
+            message: "Runner disconnected.",
+            source: "execution",
+            code: "runner_disconnected",
+          },
+        ]}
+      />,
+    );
+    expect(screen.getByTestId("error-pill").getAttribute("style")).toContain("--destructive");
+    expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
+  });
+});
+
 describe("ErrorBanner — info level", () => {
   it("renders a neutral notice pill with the code's headline and an info icon", () => {
     render(
@@ -1252,5 +1406,28 @@ describe("ErrorBanner — info level", () => {
     render(<ErrorBanner message="boom" source="execution" code="runner_error" />);
     expect(screen.getByTestId("error-pill")).toHaveAttribute("data-level", "error");
     expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
+  });
+});
+
+describe("ErrorBanner sign-in notice", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("reloads the page from its Reload page action", () => {
+    const reload = vi.fn();
+    vi.stubGlobal("location", { reload });
+    render(
+      <ErrorBanner
+        message="Reload the page to sign in again."
+        source=""
+        code="sign_in_expired"
+        title="Your sign-in expired"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Reload page" }));
+
+    expect(reload).toHaveBeenCalledOnce();
   });
 });

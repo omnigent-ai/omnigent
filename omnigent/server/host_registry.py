@@ -21,13 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, TypedDict
 
 from cachetools import TTLCache
 
@@ -38,17 +39,24 @@ from omnigent.db.account_authority import (
     current_account_user,
 )
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
+from omnigent.harness_accounts import HarnessAccounts
+from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
     HostHelloFrame,
     HostMcpServersResultFrame,
     HostMcpToolsResultFrame,
     HostPluginsResultFrame,
+    HostProbeAccountsFrame,
+    HostSetMcpServerEnabledResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
+    HostWorkspaceReplyFrame,
+    encode_host_frame,
 )
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
+from omnigent.server.feature_flags import FeatureFlags, McpDisabledServersGate, active_harnesses
 
 _logger = logging.getLogger(__name__)
 
@@ -120,6 +128,27 @@ def _fail_pending_imports(conn: HostConnection) -> None:
         )
 
 
+def deliver_workspace_reply(conn: HostConnection, frame: HostWorkspaceReplyFrame) -> None:
+    """Hand a workspace call's reply to its waiting caller; a late reply is dropped."""
+    replies = conn.pending_workspace_calls.get(frame.request_id)
+    if replies is not None:
+        replies.put_nowait(frame)
+
+
+def _fail_pending_workspace_calls(conn: HostConnection) -> None:
+    """End every in-flight workspace call when its tunnel disconnects or is replaced."""
+    for request_id in list(conn.pending_workspace_calls):
+        deliver_workspace_reply(
+            conn,
+            HostWorkspaceReplyFrame(
+                request_id=request_id,
+                done=True,
+                error_code="unavailable",
+                error_message=f"host '{conn.host_id}' disconnected",
+            ),
+        )
+
+
 def _fail_pending_plugins(conn: HostConnection) -> None:
     """Fail plugin requests as soon as their tunnel disconnects or is replaced."""
     while conn.pending_plugins:
@@ -184,6 +213,40 @@ def _fail_pending_skills(conn: HostConnection) -> None:
 def _fail_pending_mcp_servers(conn: HostConnection) -> None:
     """Fail MCP inventory requests as soon as their host disappears."""
     _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
+    _fail_pending_inventory(conn.pending_mcp_server_enabled, conn.host_id)
+
+
+def _fail_pending_worktrees(conn: HostConnection) -> None:
+    """Fail worktree requests as soon as their host disappears."""
+    for pending in (
+        conn.pending_create_worktrees,
+        conn.pending_remove_worktrees,
+        conn.pending_list_worktrees,
+    ):
+        _fail_pending_inventory(pending, conn.host_id)
+
+
+def _fail_pending_clones(conn: HostConnection) -> None:
+    """Fail clone requests as soon as their host disappears."""
+    _fail_pending_inventory(conn.pending_clones, conn.host_id)
+
+
+def _fail_pending_harness_rpcs(conn: HostConnection) -> None:
+    """Wake account/login route waiters when their tunnel disappears."""
+    for pending in (
+        conn.pending_harness_account_probes,
+        conn.pending_harness_refreshes,
+        conn.pending_harness_login_starts,
+        conn.pending_harness_login_cancels,
+        conn.pending_harness_logouts,
+    ):
+        _fail_pending_inventory(pending, conn.host_id)
+
+
+def update_harness_accounts(conn: HostConnection, accounts: HarnessAccounts) -> None:
+    """Apply a successful account probe and record its per-connection age."""
+    conn.hello.harness_accounts = dict(accounts)
+    conn.harness_accounts_probed_at = time.monotonic()
 
 
 # How long a runner exit report stays answerable, and how many are kept.
@@ -213,6 +276,24 @@ class RunnerExitReport:
     error: str
     owner: str | None
     had_connected: bool | None = None
+
+
+HarnessLoginStatus = Literal["pending", "succeeded", "failed", "expired", "cancelled"]
+
+
+@dataclass
+class HarnessLoginState:
+    """Server-side state for one host-owned device login."""
+
+    harness: str
+    status: HarnessLoginStatus
+    expires_at: int
+    error: str | None = None
+    expired: bool = False
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    harness_accounts: HarnessAccounts | None = None
+    terminal_at: int | None = None
+    terminal_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
 
 class RunnerExitReports:
@@ -311,6 +392,22 @@ class WebSocketLike(Protocol):
         ...
 
 
+class HostLaunchResult(TypedDict, total=False):
+    """
+    Resolved fields of a ``host.launch_runner_result`` awaited by launch callers.
+
+    Mirrors :class:`omnigent.host.frames.HostLaunchRunnerResultFrame`; a
+    caller-synthesized failure (lost connection, timeout) carries only
+    ``status`` and ``error``.
+    """
+
+    status: str
+    runner_id: str | None
+    error: str | None
+    error_code: str | None
+    workspace_recreated: bool
+
+
 @dataclass
 class HostConnection:
     """Per-host state while the tunnel is open.
@@ -334,6 +431,8 @@ class HostConnection:
     :param connected_at: Unix epoch float of connect time.
     :param last_frame_at: Unix epoch float of the most recent
         frame from this host.
+    :param last_frame_monotonic: Monotonic timestamp of the last frame,
+        used for watchdog inactivity checks across wall-clock corrections.
     :param pending_launches: Per-``request_id`` futures for
         in-flight ``host.launch_runner`` requests. Resolved when
         the host sends ``host.launch_runner_result``.
@@ -373,11 +472,19 @@ class HostConnection:
         host sends ``host.create_dir_result``. Values carry the
         result fields (``status``, ``path``, ``error``). Same
         ``Any`` typing rationale as ``pending_stats``.
+    :param pending_clones: Per-``request_id`` futures for in-flight
+        ``host.clone_repository`` requests. Values carry ``status``,
+        ``path``, ``error``, and ``error_code``.
     :param pending_installs: Per-``request_id`` futures for in-flight
         ``host.install_harness`` requests. Resolved when the host sends
         ``host.install_harness_result``. Values carry the result fields
         (``status``, ``configured_harnesses``, ``gateway_inference``,
         ``error``). Same ``Any`` typing rationale as ``pending_stats``.
+    :param pending_harness_refreshes: Per-``request_id`` futures for forced
+        harness readiness probes. Values carry ``status``,
+        ``configured_harnesses``, ``gateway_inference``, and ``error``.
+    :param pending_harness_account_probes: Per-``request_id`` futures for
+        on-demand non-secret account probes.
     :param inflight_installs: Install tasks used to coalesce concurrent
         install requests for the same harness family (a double-click, or
         two spellings of one npm package) onto one in-flight install, so
@@ -401,6 +508,9 @@ class HostConnection:
         Resolved when the host sends ``host.fs_result``. Values
         carry ``status``, ``payload``, ``error_status``,
         ``error_code``, and ``error``.
+    :param pending_workspace_calls: Per-``request_id`` reply queues for
+        in-flight ``host.workspace_call`` workspace API calls. Each queue
+        receives the call's ``host.workspace_reply`` frames in order.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
     :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
@@ -417,6 +527,7 @@ class HostConnection:
     outbound_queue: asyncio.Queue[OutboundFrame | None]
     connected_at: float
     last_frame_at: float
+    last_frame_monotonic: float = field(default_factory=time.monotonic, kw_only=True)
     diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
     retirement_reason: str | None = None
     sender_end_reason: str | None = None
@@ -428,7 +539,7 @@ class HostConnection:
     # user machine reusing a managed host's id under ordinary login. Read by the
     # default-public policy so only genuine sandboxes count as managed.
     registered_with_managed_token: bool = False
-    pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
+    pending_launches: dict[str, asyncio.Future[HostLaunchResult]] = field(
         default_factory=dict,
     )
     pending_stops: dict[str, asyncio.Future[dict[str, str | None]]] = field(
@@ -455,9 +566,31 @@ class HostConnection:
     pending_create_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_clones: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
     pending_installs: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_harness_refreshes: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_harness_account_probes: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    harness_account_probe_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    harness_accounts_probed_at: float | None = None
+    pending_harness_login_starts: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_harness_login_cancels: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_harness_logouts: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    harness_logins: dict[str, HarnessLoginState] = field(default_factory=dict)
+    active_harness_logins: dict[str, str] = field(default_factory=dict)
     inflight_installs: dict[str, asyncio.Task[dict[str, Any]]] = field(
         default_factory=dict,
     )
@@ -469,6 +602,9 @@ class HostConnection:
     )
     credential_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_workspace_calls: dict[str, asyncio.Queue[HostWorkspaceReplyFrame]] = field(
         default_factory=dict,
     )
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
@@ -485,6 +621,9 @@ class HostConnection:
     )
     pending_skill_content: dict[str, asyncio.Future[HostSkillContentResultFrame]] = field(
         default_factory=dict
+    )
+    pending_mcp_server_enabled: dict[str, asyncio.Future[HostSetMcpServerEnabledResultFrame]] = (
+        field(default_factory=dict)
     )
     pending_mcp_tools: dict[str, asyncio.Future[HostMcpToolsResultFrame]] = field(
         default_factory=dict
@@ -518,8 +657,15 @@ class HostRegistry:
     don't race.
     """
 
-    def __init__(self) -> None:
-        """Initialize an empty host registry."""
+    def __init__(
+        self,
+        *,
+        mcp_disabled_servers: McpDisabledServersGate = False,
+        feature_flags: FeatureFlags | None = None,
+    ) -> None:
+        """Initialize an empty host registry with fail-closed launch activation."""
+        self._mcp_disabled_servers = mcp_disabled_servers
+        self._feature_flags = feature_flags or FeatureFlags()
         self._lock = threading.RLock()
         # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
         # one stable host_id can be live in more than one workspace.
@@ -535,6 +681,10 @@ class HostRegistry:
         self.launch_authorizer: (
             Callable[[str, str, str | None, str | None, bool, str | None], None] | None
         ) = None
+
+    def mcp_disabled_servers_active_harnesses(self) -> list[str] | None:
+        """Resolve launch activation; omit the wire field when no harness is active."""
+        return active_harnesses(self._mcp_disabled_servers, self._feature_flags) or None
 
     def register(
         self,
@@ -586,6 +736,7 @@ class HostRegistry:
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
+            last_frame_monotonic=time.monotonic(),
             registered_with_managed_token=registered_with_managed_token,
         )
         with self._lock:
@@ -602,10 +753,14 @@ class HostRegistry:
                 _fail_pending_imports(old)
                 _fail_pending_harness_startup(old)
                 _fail_pending_plugins(old)
+                _fail_pending_workspace_calls(old)
                 _fail_pending_skill_content(old)
                 _fail_pending_mcp_tools(old)
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
+                _fail_pending_worktrees(old)
+                _fail_pending_clones(old)
+                _fail_pending_harness_rpcs(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -651,10 +806,14 @@ class HostRegistry:
         _fail_pending_imports(removed)
         _fail_pending_harness_startup(removed)
         _fail_pending_plugins(removed)
+        _fail_pending_workspace_calls(removed)
         _fail_pending_skill_content(removed)
         _fail_pending_mcp_tools(removed)
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
+        _fail_pending_worktrees(removed)
+        _fail_pending_clones(removed)
+        _fail_pending_harness_rpcs(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:
@@ -668,6 +827,7 @@ class HostRegistry:
             if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
                 return False
             conn.last_frame_at = time.time()
+            conn.last_frame_monotonic = time.monotonic()
             return True
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:
@@ -741,10 +901,27 @@ class HostRegistry:
         :returns: ``False`` only for a connected host that did not advertise the
             codex side-chat capability.
         """
+        return self.host_may_support(host_id, CAP_CODEX_SIDE_CHAT, workspace_id)
+
+    def host_may_support(
+        self, host_id: str, capability: str, workspace_id: int | None = None
+    ) -> bool:
+        """Whether a host is not known to lack a capability token.
+
+        Fails OPEN (``True``) when the host is offline/unknown: we then can't
+        prove it's too old, and the launch surfaces any real failure itself.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param capability: Capability token, e.g. ``"codex_plan_at_launch"``.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: ``False`` only for a connected host that did not advertise
+            ``capability``.
+        """
         conn = self.get(host_id, workspace_id)
         if conn is None:
             return True
-        return CAP_CODEX_SIDE_CHAT in conn.hello.capabilities
+        return capability in conn.hello.capabilities
 
     def record_gateway_inference(
         self,
@@ -845,3 +1022,41 @@ class HostRegistry:
                 raise ConnectionError(f"host {conn.host_id!r} connection was replaced")
 
         conn.enqueue(data)
+
+    async def request_harness_accounts(
+        self,
+        conn: HostConnection,
+        *,
+        refresh_codex: bool,
+        timeout_s: float,
+        max_age_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Send one serialized account-probe RPC, optionally using a recent result."""
+        async with conn.harness_account_probe_lock:
+            if (
+                max_age_s is not None
+                and conn.harness_accounts_probed_at is not None
+                and time.monotonic() - conn.harness_accounts_probed_at < max_age_s
+                and conn.hello.harness_accounts is not None
+            ):
+                return {
+                    "status": "ok",
+                    "harness_accounts": conn.hello.harness_accounts,
+                    "cached": True,
+                }
+            request_id = secrets.token_hex(8)
+            future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+            conn.pending_harness_account_probes[request_id] = future
+            try:
+                self.send_text(
+                    conn,
+                    encode_host_frame(
+                        HostProbeAccountsFrame(
+                            request_id=request_id,
+                            refresh_codex=refresh_codex,
+                        )
+                    ),
+                )
+                return await asyncio.wait_for(future, timeout=timeout_s)
+            finally:
+                conn.pending_harness_account_probes.pop(request_id, None)

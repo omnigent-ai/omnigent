@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ErrorBlock } from "@/lib/blocks";
 import type { ErrorItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { latestActivityErrorState } from "@/lib/sessionError";
@@ -267,6 +268,43 @@ describe("useSessionErrors", () => {
     expect(fetchPage).toHaveBeenCalledTimes(1);
   });
 
+  it("reuses a rendered row's read for a marker that starts no reads of its own", async () => {
+    fetchPage.mockResolvedValue(errorPage);
+    const { wrapper } = harness();
+    const marker = renderHook(() => useSessionErrorStates([session], { startReads: false }), {
+      wrapper,
+    });
+    await act(async () => {});
+    expect(fetchPage).not.toHaveBeenCalled();
+    expect(marker.result.current).toEqual([null]);
+
+    renderHook(() => useSessionErrorStates([session]), { wrapper });
+    await waitFor(() => expect(marker.result.current).toEqual(["error"]));
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let a marker show a tail result that was invalidated", async () => {
+    fetchPage.mockResolvedValue(errorPage);
+    const { client, wrapper } = harness();
+    const reader = renderHook(() => useSessionErrorStates([session]), { wrapper });
+    await waitFor(() => expect(reader.result.current).toEqual(["error"]));
+    reader.unmount();
+    const marker = renderHook(() => useSessionErrorStates([session], { startReads: false }), {
+      wrapper,
+    });
+    expect(marker.result.current).toEqual(["error"]);
+    await act(async () => {
+      await client.invalidateQueries({
+        queryKey: ["session-latest-error", session.id],
+        refetchType: "none",
+      });
+    });
+    // Live-transcript disposal re-renders the hook alongside the invalidation.
+    marker.rerender();
+    expect(marker.result.current).toEqual([null]);
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+  });
+
   it("reads and subscribes to an already-loaded transcript without extra HTTP or streams", () => {
     const entry = conversationRegistry.acquire(session.id);
     entry.setState({
@@ -283,6 +321,30 @@ describe("useSessionErrors", () => {
     expect(hook.result.current).toEqual([true]);
     act(() => entry.setState({ status: "streaming" }));
     expect(hook.result.current).toEqual([false]);
+    expect(fetchPage).not.toHaveBeenCalled();
+  });
+
+  it("clears a live status-only failure once a resume moves the session off failed", () => {
+    const statusCard = {
+      type: "error",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
+      message: "Required terminal exited unexpectedly.",
+      source: "",
+      code: "required_terminal_exited",
+      fromSessionStatus: true,
+    } satisfies ErrorBlock;
+    const entry = conversationRegistry.acquire(session.id);
+    entry.setState({
+      blocks: [...itemsToBlocks(normalPage.items), statusCard],
+      sessionStatus: "failed",
+      loadingConversation: false,
+      abortController: new AbortController(),
+    });
+    const { wrapper } = harness();
+    const hook = renderHook(() => useSessionErrorStates([session]), { wrapper });
+    expect(hook.result.current).toEqual(["error"]);
+    act(() => entry.setState({ sessionStatus: "idle" }));
+    expect(hook.result.current).toEqual([null]);
     expect(fetchPage).not.toHaveBeenCalled();
   });
 

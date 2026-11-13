@@ -154,9 +154,16 @@ class PingFrame:
 
 @dataclass
 class PongFrame:
-    """Either direction: keepalive response — echoes the ping's ts."""
+    """Either direction: keepalive response — echoes the ping's ts.
+
+    :param ts: The ping's timestamp, echoed back.
+    :param keep_warm: Runner-to-server only. Whether the runner wants its managed
+        sandbox kept warm (it is working, or within its idle timeout of the last
+        work). ``None`` (omitted on the wire) means the runner does not report it.
+    """
 
     ts: int
+    keep_warm: bool | None = None
 
 
 @dataclass
@@ -205,6 +212,10 @@ class WSCloseFrame:
 # Additive extension of the runner tunnel, negotiated after hello. These are
 # not tunneled HTTP responses or terminal WebSocket channel frames.
 EVENT_INGEST_CAPABILITY = "session-event-ingest-v1"
+
+# Close reason (with code 1000) a runner sends when its idle watchdog found no
+# active work, so the server settles the runner's sessions instead of failing them.
+RUNNER_IDLE_SHUTDOWN_CLOSE_REASON = "runner idle shutdown"
 
 
 @dataclass
@@ -325,7 +336,10 @@ def encode_frame(frame: Frame) -> str:
     if isinstance(frame, PingFrame):
         return json.dumps({"kind": FrameKind.PING.value, "ts": frame.ts})
     if isinstance(frame, PongFrame):
-        return json.dumps({"kind": FrameKind.PONG.value, "ts": frame.ts})
+        pong: dict[str, object] = {"kind": FrameKind.PONG.value, "ts": frame.ts}
+        if frame.keep_warm is not None:
+            pong["keep_warm"] = frame.keep_warm
+        return json.dumps(pong)
     if isinstance(frame, WSOpenFrame):
         return json.dumps(
             {
@@ -449,7 +463,11 @@ def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
         case FrameKind.PING:
             return PingFrame(ts=_required_int(msg, "ts"))
         case FrameKind.PONG:
-            return PongFrame(ts=_required_int(msg, "ts"))
+            keep_warm = msg.get("keep_warm")
+            return PongFrame(
+                ts=_required_int(msg, "ts"),
+                keep_warm=keep_warm if isinstance(keep_warm, bool) else None,
+            )
         case FrameKind.WS_OPEN:
             return _decode_ws_open(msg)
         case FrameKind.WS_FRAME:

@@ -219,6 +219,7 @@ def test_codex_native_shell_runs_in_selected_workspace(
         ],
         key=marker,
         match=marker,
+        required_tools=["exec_command"],
     )
 
     _send(page, f"Run pwd in the shell and reply with only its exact output. {marker}")

@@ -21,6 +21,8 @@ from unittest.mock import MagicMock
 import pytest
 import yaml
 
+import omnigent.connections.databricks as connections
+import omnigent.stores.credential_store as credential_store
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from tests.deploy.test_databricks_app_lakebase_cold_start import (  # noqa: F401 — registers the fixture
     _APP_MODULE,
@@ -44,7 +46,9 @@ def _boot_with_config(
     """
     if config is None:
         monkeypatch.delenv("OMNIGENT_CONFIG", raising=False)
-        monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "no-config"))
+        monkeypatch.setenv(
+            "OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "no-config" / "admin-credentials")
+        )
     else:
         path = tmp_path / "config.yaml"
         path.write_text(yaml.safe_dump(config))
@@ -102,3 +106,164 @@ def test_invalid_sandbox_section_fails_startup(
 
     assert exit_codes == [1]
     sys.modules.pop(_APP_MODULE, None)
+
+
+def test_databricks_account_connection_reaches_create_app(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With OAuth client env and a cipher, owner-identity sandboxes get a token store."""
+    exit_codes = request.getfixturevalue("boot_exit_codes")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_CLIENT_ID", "client-id")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_REDIRECT_URI", "https://app.example.com/cb")
+
+    store = MagicMock()
+    monkeypatch.setattr(credential_store, "build_secret_cipher", lambda: MagicMock())
+    monkeypatch.setattr(connections, "DatabricksConnectionStore", lambda *_: store)
+    create_app = _boot_with_config(monkeypatch, tmp_path, None)
+
+    assert exit_codes == []
+    kwargs = create_app.call_args.kwargs
+    assert kwargs["databricks_config"].client_id == "client-id"
+    assert kwargs["databricks_store"] is store
+
+
+def test_databricks_account_connection_needs_a_cipher(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without a credential cipher the store stays off rather than holding plaintext."""
+    exit_codes = request.getfixturevalue("boot_exit_codes")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_CLIENT_ID", "client-id")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_CLIENT_SECRET", "client-secret")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_REDIRECT_URI", "https://app.example.com/cb")
+
+    monkeypatch.setattr(credential_store, "build_secret_cipher", lambda: None)
+    create_app = _boot_with_config(monkeypatch, tmp_path, None)
+
+    assert exit_codes == []
+    assert create_app.call_args.kwargs["databricks_store"] is None
+
+
+@pytest.mark.parametrize("routing_provider", ["external", "none", "default"])
+def test_runtime_and_module_configuration_reaches_databricks_boot(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    routing_provider: str,
+) -> None:
+    """The module boot honors the same configured routing pair and modules as the CLI."""
+    import omnigent.runtime as runtime
+    from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
+    from omnigent.spec import FunctionPolicySpec
+
+    exit_codes = request.getfixturevalue("boot_exit_codes")
+    monkeypatch.setattr(
+        "omnigent.runtime.policies.builder._resolve_server_llm_connection", lambda _llm: None
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.policies.builder._build_policy_llm_client", lambda *_args: MagicMock()
+    )
+    resolve_workspace = MagicMock(return_value=MagicMock(host="https://workspace.example.test"))
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", resolve_workspace
+    )
+    config: dict[str, object] = {
+        "llm": {"model": "test-judge"},
+        "routing": {
+            "provider": routing_provider,
+            "base_url": "https://router.example.test",
+            "router_name": "test-router",
+        },
+        "policies": {
+            "deployment_budget": {
+                "type": "function",
+                "handler": "omnigent.policies.builtins.cost.cost_budget",
+                "factory_params": {"max_cost_usd": 5.0},
+            }
+        },
+        "policy_modules": ["example.policies"],
+        "debug_router_modules": "example.debug",
+        "execution_timeout": 900,
+        "native_hook_allow_cache_seconds": 45,
+    }
+    if routing_provider == "default":
+        config.pop("routing")
+        config["providers"] = {"workspace": {"kind": "databricks", "profile": "deployment"}}
+    create_app = _boot_with_config(monkeypatch, tmp_path, config)
+
+    assert exit_codes == []
+    assert create_app.call_args.kwargs["policy_modules"] == ["example.policies"]
+    assert create_app.call_args.kwargs["debug_router_modules"] == ["example.debug"]
+    assert create_app.call_args.kwargs["server_config"] == config
+    caps = runtime.init.call_args.kwargs["caps"]
+    assert len(caps.default_policies) == 1
+    policy = caps.default_policies[0]
+    assert isinstance(policy, FunctionPolicySpec)
+    assert policy.name == "deployment_budget"
+    assert policy.function is not None
+    assert policy.function.path == "omnigent.policies.builtins.cost.cost_budget"
+    assert policy.function.arguments == {"max_cost_usd": 5.0}
+    assert caps.execution_timeout == 900
+    assert caps.native_hook_allow_cache_seconds() == 45
+    assert caps.llm.model == "test-judge"
+    if routing_provider != "none":
+        assert isinstance(caps.routing_backends.external, ExternalRoutingClient)
+        assert isinstance(caps.routing_backends.local, LLMRoutingClient)
+        assert caps.routing_client is caps.routing_backends.external
+        if routing_provider == "default":
+            resolve_workspace.assert_called_once_with("deployment")
+            assert caps.routing_backends.external._url == (
+                "https://workspace.example.test/ai-gateway/routing/v1/routes:select"
+            )
+            assert caps.routing_backends.external._databricks_profile == "deployment"
+    else:
+        assert caps.routing_backends.external is None
+        assert caps.routing_backends.local is None
+        assert caps.routing_client is None
+
+
+@pytest.mark.parametrize("catalog_kind", ["public", "invalid", "missing_cipher"])
+def test_registry_catalog_is_applied_during_databricks_boot(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    catalog_kind: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Configured catalogs mount, while invalid or unencryptable catalogs stop startup."""
+    from omnigent.server import mcp_registry
+
+    exit_codes = request.getfixturevalue("boot_exit_codes")
+    catalog = tmp_path / "mcp-registry.yaml"
+    catalog.write_text(
+        yaml.safe_dump(
+            {
+                "services": [
+                    {
+                        "id": "tracker",
+                        "title": "Tracker",
+                        "url": "https://mcp.example.test/mcp",
+                        "auth": "bearer" if catalog_kind == "missing_cipher" else "none",
+                        "tools": ["read_ticket"],
+                    }
+                ],
+                **({"unexpected": True} if catalog_kind == "invalid" else {}),
+            }
+        )
+    )
+    monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(catalog))
+    monkeypatch.setattr(mcp_registry, "build_secret_cipher", lambda: None)
+    if catalog_kind != "public":
+        with pytest.raises(SystemExit):
+            _boot_with_config(monkeypatch, tmp_path, None)
+        assert exit_codes == [1]
+        boot_error = capsys.readouterr().err
+        if catalog_kind == "invalid":
+            assert "unexpected" in boot_error
+            assert "extra_forbidden" in boot_error
+        else:
+            assert "MCP account connections require the existing KMS or Vault cipher" in boot_error
+    else:
+        create_app = _boot_with_config(monkeypatch, tmp_path, None)
+        assert exit_codes == []
+        assert list(create_app.call_args.kwargs["mcp_registry"].services) == ["tracker"]

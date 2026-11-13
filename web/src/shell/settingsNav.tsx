@@ -16,6 +16,7 @@ import {
   GitBranchIcon,
   KeyboardIcon,
   PaletteIcon,
+  PlugIcon,
   SettingsIcon,
   Share2Icon,
   ShieldCheckIcon,
@@ -40,9 +41,11 @@ export type SettingsSectionId =
   | "general"
   | "git"
   | "integrations"
+  | "mcp"
   | "shortcuts"
   | "import"
   | "account"
+  | "admin"
   | "members"
   | "policies"
   | "sharing"
@@ -57,9 +60,11 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "general",
   "git",
   "integrations",
+  "mcp",
   "shortcuts",
   "import",
   "account",
+  "admin",
   "members",
   "policies",
   "sharing",
@@ -88,7 +93,8 @@ interface SettingsNavGroup {
  * absent only in header single-user mode. The Admin group (Members / Policies)
  * appears for admins in ANY multi-user mode since both accounts and OIDC share
  * the `users.is_admin` flag and the server enforces admin on every route; the
- * Desktop group (Local CLI) appears only in the Electron shell.
+ * Desktop group (Local CLI) appears only in the Electron shell. Harnesses is
+ * left out when the deployment curated out every harness.
  */
 export function settingsNavGroups(
   hasAuthSession: boolean,
@@ -97,6 +103,9 @@ export function settingsNavGroups(
   isSingleUser = false,
   integrationsEnabled = false,
   customAgentsEnabled = false,
+  mcpEnabled = false,
+  nestedAgentsEnabled = false,
+  harnessesOffered = true,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
     id: "harnesses",
@@ -110,15 +119,17 @@ export function settingsNavGroups(
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
-  if (!customAgentsEnabled) general.splice(2, 0, harnesses);
-  // Sandbox Integrations appears once any connection provider is wired
-  // (enabled_connections non-empty). Slots right after Git.
+  if (!customAgentsEnabled && harnessesOffered) general.splice(2, 0, harnesses);
+  // Provider credentials and MCP accounts have separate settings pages.
   if (integrationsEnabled) {
     general.splice(2, 0, {
       id: "integrations",
       label: "Sandbox Integrations",
       icon: BlocksIcon,
     });
+  }
+  if (mcpEnabled) {
+    general.splice(2, 0, { id: "mcp", label: "MCP", icon: PlugIcon });
   }
   if (hasAuthSession) {
     // Account leads the group when present — it's the most-visited section
@@ -129,7 +140,10 @@ export function settingsNavGroups(
   if (customAgentsEnabled) {
     groups.push({
       title: "Customize",
-      items: [harnesses, { id: "custom-agents", label: "Custom agents", icon: BotIcon }],
+      items: [
+        ...(harnessesOffered ? [harnesses] : []),
+        { id: "custom-agents", label: "Custom agents", icon: BotIcon },
+      ],
     });
   }
   // Keep shell-specific settings directly after the cross-platform preferences.
@@ -142,24 +156,21 @@ export function settingsNavGroups(
       ],
     });
   }
-  // Admin: server-wide management, admin-only. Nested here as sub-categories
-  // (rather than links out of the Account section) so entering them stays
-  // inside /settings — the sidebar keeps the settings nav instead of snapping
-  // back to the conversation list. Gated on `isAdmin` alone (not
-  // `accountsEnabled`) so the surface also appears under OIDC/SSO, the one
-  // mode where there's otherwise no admin chrome at all. Members runs
-  // read-only under OIDC (no password actions); Policies is identical.
+  // Single-user servers permit destination settings without an admin identity.
+  const adminItems: SettingsNavItem[] = [];
+  if ((isAdmin || isSingleUser) && nestedAgentsEnabled) {
+    adminItems.push({ id: "admin", label: "General", icon: SettingsIcon });
+  }
   if (isAdmin) {
     // Members (manage other accounts) and Sharing (grant sessions to other
     // users) have no meaning in single-user mode — there are no other users —
     // so drop both from the nav there. Policies stays: global policies apply
     // to a solo user's own sessions too.
-    const adminItems: SettingsNavItem[] = [];
     if (!isSingleUser) adminItems.push({ id: "members", label: "Members", icon: UsersIcon });
     adminItems.push({ id: "policies", label: "Policies", icon: ShieldCheckIcon });
     if (!isSingleUser) adminItems.push({ id: "sharing", label: "Sharing", icon: Share2Icon });
-    groups.push({ title: "Admin", items: adminItems });
   }
+  if (adminItems.length > 0) groups.push({ title: "Admin", items: adminItems });
   groups.push({
     title: "Archived",
     items: [{ id: "archived", label: "Archived sessions", icon: ArchiveIcon }],
@@ -197,6 +208,7 @@ export function useSettingsRoute(): {
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
     !(singleUser && (next === "members" || next === "sharing")) &&
+    !(next === "admin" && (info === "loading" || info.sibling_sessions !== true)) &&
     !(next === "custom-agents" && !customAgentsSettingsEnabled(info));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
@@ -238,8 +250,11 @@ export function useTrackSettingsReturn(): void {
  */
 export function SettingsSidebarBody({
   onNavClick,
+  harnessesOffered = true,
 }: {
   onNavClick: (e: React.MouseEvent<HTMLAnchorElement>) => void;
+  /** False when the deployment curated out every harness, which drops Harnesses. */
+  harnessesOffered?: boolean;
 }) {
   const info = useServerInfo();
   // Account section shows whenever there's a login session (accounts OR OIDC).
@@ -248,7 +263,9 @@ export function SettingsSidebarBody({
   // `/v1/me` (mode-agnostic) so the group appears for admins under OIDC too,
   // not just accounts deploys. Non-admins never see it.
   const isAdmin = useIsAdmin();
-  const integrationsEnabled = info !== "loading" && (info.enabled_connections ?? []).length > 0;
+  const integrationsEnabled =
+    info !== "loading" && (info.enabled_connections ?? []).some((provider) => provider !== "mcp");
+  const mcpEnabled = info !== "loading" && (info.enabled_connections ?? []).includes("mcp");
   const { section } = useSettingsRoute();
   const groups = settingsNavGroups(
     hasAuthSession,
@@ -257,6 +274,9 @@ export function SettingsSidebarBody({
     isSingleUserMode(info),
     integrationsEnabled,
     customAgentsSettingsEnabled(info),
+    mcpEnabled,
+    info !== "loading" && info.sibling_sessions === true,
+    harnessesOffered,
   );
 
   return (

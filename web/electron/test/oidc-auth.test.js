@@ -162,6 +162,10 @@ describe("ensureSession", () => {
   });
 
   it("signs in through the browser on Connect and installs the session cookie", async () => {
+    const recorded = [];
+    mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+      recorded.push(args),
+    );
     const noGrant = Object.assign(new Error("none"), { code: "NO_STORED_TOKEN" });
     const h = harness({ refresh: async () => Promise.reject(noGrant) });
     let announced = 0;
@@ -179,6 +183,10 @@ describe("ensureSession", () => {
     assert.equal(details.secure, true);
     assert.equal(details.path, "/");
     assert.ok(details.expirationDate > Date.now() / 1000 + 28000);
+    assert.deepEqual(recorded, [
+      ["oidc_session", { origin: SERVER, outcome: "browser" }],
+      ["oidc_session", { origin: SERVER, outcome: "signed_in" }],
+    ]);
   });
 
   it("does not open the browser when the server is unreachable", async () => {

@@ -1,0 +1,14 @@
+public_url: http://localhost:18780
+services:
+  - id: tracker
+    title: Demo work tracker
+    description: Connect a fictional account and read tickets from any sandbox.
+    url: http://127.0.0.1:18782/mcp
+    auth: oauth
+    allow_http: true # Local demo only. Production defaults to HTTPS.
+    tools: [whoami, read_ticket]
+    oauth:
+      authorize_url: http://localhost:18782/authorize
+      token_url: http://127.0.0.1:18782/token
+      client_id: omnigent-local-demo
+      scopes: [tickets:read, offline_access]

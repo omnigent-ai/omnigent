@@ -171,7 +171,8 @@ try:
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider, warn_if_single_user_exposed
     from omnigent.server.managed_hosts import parse_sandbox_config
-    from omnigent.server.server_config import load_server_config
+    from omnigent.server.mcp_registry import build_mcp_registry_from_env
+    from omnigent.server.server_config import config_str_list, load_server_config
     from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     # OTel: the Databricks Apps platform auto-injects
@@ -244,9 +245,32 @@ try:
 
     agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=CACHE_DIR)
 
+    from omnigent.cli import (
+        _build_routing_backends,
+        _parse_native_hook_allow_cache_seconds,
+        parse_routing_settings,
+    )
+    from omnigent.spec import parse_default_policies, parse_server_llm
+
+    cfg = load_server_config()
+    server_llm = parse_server_llm(cfg.get("llm"))
+    routing_settings = parse_routing_settings(cfg.get("routing"))
+    routing_backends = _build_routing_backends(cfg, server_llm, routing_settings)
+    caps = RuntimeCaps(
+        execution_timeout=int(cfg.get("execution_timeout") or 7200),
+        default_policies=parse_default_policies(cfg.get("policies")),
+        llm=server_llm,
+        routing_client=routing_backends.any(),
+        routing_backends=routing_backends,
+        routing_settings=routing_settings,
+        native_hook_allow_cache_seconds=_parse_native_hook_allow_cache_seconds(
+            cfg.get("native_hook_allow_cache_seconds")
+        ),
+    )
+
     init_runtime(
         agent_cache=agent_cache,
-        caps=RuntimeCaps(),
+        caps=caps,
         agent_store=agent_store,
         file_store=file_store,
         conversation_store=conversation_store,
@@ -274,12 +298,33 @@ try:
     # config's ``sandbox:`` section like ``omnigent server`` does, so a typo
     # stops startup here instead of 502-ing the first managed session.
     try:
-        sandbox_config = parse_sandbox_config(load_server_config().get("sandbox"))
+        sandbox_config = parse_sandbox_config(cfg.get("sandbox"))
     except ValueError as exc:
         logger.error("Invalid 'sandbox' section in the server config: %s", exc)
         raise
     if sandbox_config is not None:
         logger.info("Managed sandbox hosts configured from the server config")
+
+    # Databricks account connection: per-user OAuth tokens, which the
+    # `databricks` sandbox provider needs to run each sandbox as its owner.
+    from omnigent.server.databricks_app import DatabricksConfig
+
+    databricks_config = DatabricksConfig.from_env()
+    databricks_store = None
+    if databricks_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        dbx_cipher = build_secret_cipher()
+        if dbx_cipher is None:
+            logger.error(
+                "Databricks account connection is configured but disabled: set the "
+                "credential store's key (OMNIGENT_CREDENTIAL_KMS_KEY_ID or "
+                "OMNIGENT_CREDENTIAL_VAULT_KEY) to enable it."
+            )
+        else:
+            from omnigent.connections.databricks import DatabricksConnectionStore
+
+            databricks_store = DatabricksConnectionStore(DB_URI, dbx_cipher)
 
     app = create_app(
         agent_store=agent_store,
@@ -294,15 +339,33 @@ try:
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
+        policy_modules=cfg.get("policy_modules"),
+        debug_router_modules=config_str_list(cfg.get("debug_router_modules")),
+        server_config=cfg,
         sandbox_config=sandbox_config,
+        databricks_config=databricks_config,
+        databricks_store=databricks_store,
+        mcp_registry=build_mcp_registry_from_env(DB_URI),
     )
 
     if __name__ == "__main__":
+        from omnigent.server.graceful_shutdown import SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S, serve
+
         logger.info("Starting omnigent on 0.0.0.0:%d", PORT)
-        # Tunnel frame cap + keepalive: without them uvicorn's 20 s default closes
-        # a busy-but-healthy runner or host tunnel with 1011 after a client-path
-        # stall, while both clients tolerate 90 s.
-        uvicorn.run(app, host="0.0.0.0", port=PORT, **uvicorn_tunnel_kwargs())
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=PORT,
+            # Tunnel frame cap + keepalive: without them uvicorn's 20 s default closes
+            # a busy-but-healthy runner or host tunnel with 1011 after a client-path
+            # stall, while both clients tolerate 90 s.
+            **uvicorn_tunnel_kwargs(),
+            # Bound the graceful wait and drain SSE streams so a held session
+            # stream can't keep the app alive until the platform SIGKILLs it.
+            # Matches `omnigent server`.
+            timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        )
+        serve(config)
 
 except Exception:  # noqa: BLE001 — startup catch-all; we want every failure logged
     logger.error("FATAL: omnigent failed to start:\n%s", traceback.format_exc())

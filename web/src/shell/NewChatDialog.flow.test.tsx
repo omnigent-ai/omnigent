@@ -15,10 +15,13 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
     error: null,
   })),
 }));
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => useTestConversations(),
+  useOptionalLoadedConversations: () => useTestConversations().data,
+}));
 
 vi.mock("@/hooks/useSkills", () => ({
   useSkills: ({ target, enabled }: { target: { agentId?: string } | null; enabled?: boolean }) => ({
@@ -35,19 +38,28 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { authorizeRegistryService, registryRequest } from "@/lib/mcpRegistry";
+import { readLastMcpServices, writeLastMcpServices } from "@/lib/mcpPreferences";
+
+vi.mock("@/lib/mcpRegistry", () => ({
+  authorizeRegistryService: vi.fn(),
+  registryRequest: vi.fn(),
+}));
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
+import { writeLastHostChoice } from "@/lib/hostPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -62,6 +74,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // handoff. The host list, agent catalog, conflict hooks, navigation and HTTP
 // layers are stubbed so the test isolates that wiring.
 const navigateMock = vi.fn();
+const replaceSearchParamsMock = vi.fn();
 const setPendingInitialPromptMock = vi.fn();
 const beginLocalConversationMock = vi.fn();
 const hasPendingLocalMessageMock = vi.fn();
@@ -83,6 +96,8 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 // (`@/lib/routing`), not react-router directly — mock that so the create
 // flow's navigate() lands on our spy regardless of router/provider setup.
 vi.mock("@/lib/routing", () => ({
+  useLocation: () => ({ hash: "", state: null }),
+  useReplaceSearchParams: () => replaceSearchParamsMock,
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));
@@ -149,7 +164,7 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 }));
 vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
   ...(await importOriginal<typeof HostWorktreesModule>()),
-  useHostWorktrees: (_hostId: string | null, path: string | null) => ({
+  useHostWorktrees: vi.fn((_hostId: string | null, path: string | null) => ({
     data:
       path === "/Users/corey/universe/src/foo"
         ? [
@@ -164,7 +179,7 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
           ? undefined
           : [],
     isPlaceholderData: false,
-  }),
+  })),
   hostWorktreesQueryOptions: (hostId: string, repoPath: string) => ({
     queryKey: ["host-worktrees", hostId, repoPath],
     queryFn: async () =>
@@ -257,7 +272,7 @@ function setAgents(agents: AvailableAgent[]): void {
 function renderLanding(
   cachedSessionIds: string[] = [],
   infoOverrides: Partial<ServerInfo> = {},
-): void {
+): QueryClient {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -307,6 +322,7 @@ function renderLanding(
     );
   }
   render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  return client;
 }
 
 /**
@@ -402,9 +418,12 @@ beforeEach(() => {
   pushMatchers.length = 0;
   announcePushedSession = null;
   vi.mocked(authenticatedFetch).mockReset();
+  vi.mocked(registryRequest).mockReset();
+  vi.mocked(authorizeRegistryService).mockReset();
   // Clear the module-level landing draft so a base branch (or other field)
   // left behind by an unmounting test doesn't seed the next one.
   resetLandingDraft();
+  vi.mocked(useHostWorktrees).mockReset();
   clearOptimisticTitles();
   clearSessionDrafts();
   localStorage.clear();
@@ -431,6 +450,158 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen create flow", () => {
+  it.each([
+    { provider: undefined, sourceBranch: "main", linked: false, action: "reuse" },
+    { provider: undefined, sourceBranch: "master", linked: false, action: "new" },
+    { provider: "test-sandbox", sourceBranch: "master", linked: false, action: "reuse" },
+    { provider: "test-sandbox", sourceBranch: "feature/source", linked: true, action: "reuse" },
+    { provider: "test-sandbox", sourceBranch: "master", linked: false, action: "new" },
+    { provider: "test-sandbox", sourceBranch: "feature/source", linked: true, action: "new" },
+    { provider: "test-sandbox", sourceBranch: "master", linked: false, action: "override" },
+    { provider: "test-sandbox", sourceBranch: "feature/source", linked: true, action: "existing" },
+    { provider: "test-sandbox", sourceBranch: "feature/source", linked: true, action: "switch" },
+  ])(
+    "inherits the nested checkout with provider=$provider, branch=$sourceBranch, action=$action",
+    async ({ provider, sourceBranch, linked, action }) => {
+      const sourceRoot = linked ? "/work/repo-worktrees/source" : "/work/repo";
+      const sourceDirectory = `${sourceRoot}/src`;
+      const otherWorktree = "/work/repo-worktrees/other";
+      const otherDirectory = "/work/other-repo";
+      const worktrees = [
+        { path: sourceRoot, branch: sourceBranch, is_main: !linked, detached: false },
+        { path: otherWorktree, branch: "feature/other", is_main: false, detached: false },
+        ...(linked
+          ? [{ path: "/work/repo", branch: "master", is_main: true, detached: false }]
+          : []),
+      ];
+      searchParams = new URLSearchParams("sibling=source");
+      localStorage.setItem("omnigent:always-use-worktree", "true");
+      writeDefaultBaseBranch("main");
+      setHosts([
+        host({ sandbox_provider: provider }),
+        host({ host_id: "other-host", name: "Other computer" }),
+      ]);
+      localStorage.setItem(
+        RECENT_KEY,
+        JSON.stringify({ host_1: [SEEDED_WORKSPACE], "other-host": [otherDirectory] }),
+      );
+      vi.mocked(useHostWorktrees).mockImplementation(
+        (hostId, path) =>
+          ({
+            data:
+              hostId === "other-host"
+                ? [{ path: otherDirectory, branch: "main", is_main: true, detached: false }]
+                : path?.startsWith("/work/")
+                  ? worktrees
+                  : undefined,
+            isPlaceholderData: false,
+          }) as ReturnType<typeof useHostWorktrees>,
+      );
+      vi.mocked(authenticatedFetch).mockImplementation(
+        async (url) =>
+          new Response(
+            JSON.stringify(
+              String(url).startsWith("/v1/sessions/source?")
+                ? {
+                    id: "source",
+                    title: "Source",
+                    host_id: "host_1",
+                    workspace: sourceDirectory,
+                    agent_id: "ag_hello",
+                    permission_level: 4,
+                    labels: {},
+                    items: [],
+                  }
+                : { id: "conv_new" },
+            ),
+          ),
+      );
+      renderLanding([], { sibling_sessions: true });
+      await screen.findByTestId("new-chat-landing-input");
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+        `Working directory: ${sourceDirectory}`,
+      );
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveAccessibleName(
+          expect.stringContaining(sourceBranch),
+        ),
+      );
+      openWorktree();
+      expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue("");
+      const selectedOption = linked
+        ? screen.getAllByTestId("new-chat-landing-worktree-option")[0]
+        : screen.getByTestId("new-chat-landing-no-worktree-option");
+      expect(within(selectedOption).getByRole("radio")).toBeChecked();
+      if (action === "existing") {
+        const options = screen.getAllByTestId("new-chat-landing-worktree-option");
+        fireEvent.click(within(options[options.length - 1]).getByRole("radio"));
+      } else {
+        if (action === "new" || action === "override") {
+          fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+            target: { value: "feature/nested" },
+          });
+          await waitFor(() =>
+            expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue(
+              sourceBranch,
+            ),
+          );
+          if (action === "override") {
+            fireEvent.change(screen.getByTestId("new-chat-landing-base-branch-input"), {
+              target: { value: "release/manual" },
+            });
+          }
+        }
+        fireEvent.keyDown(document, { key: "Escape" });
+      }
+      if (action === "switch") {
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-host-other-host"));
+        await waitFor(() =>
+          expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAccessibleName(
+            `Working directory: ${otherDirectory}`,
+          ),
+        );
+        openWorktree();
+        fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+          target: { value: "feature/unrelated" },
+        });
+        fireEvent.keyDown(document, { key: "Escape" });
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+        await waitFor(() =>
+          expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveAccessibleName(
+            `Existing worktree branch: ${sourceBranch}`,
+          ),
+        );
+      }
+      typeMessage("Research this change");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+      const create = vi
+        .mocked(authenticatedFetch)
+        .mock.calls.find(([url, init]) => url === "/v1/sessions" && init?.method === "POST")!;
+      const body = JSON.parse(create[1]!.body as string);
+      expect(body).toMatchObject({
+        sibling_source_id: "source",
+        host_id: "host_1",
+        workspace: action === "existing" ? otherWorktree : sourceDirectory,
+      });
+      const expectedGit =
+        action === "new" || action === "override"
+          ? {
+              branch_name: "feature/nested",
+              base_branch: action === "override" ? "release/manual" : sourceBranch,
+            }
+          : linked || action === "existing"
+            ? {
+                branch_name: action === "existing" ? "feature/other" : sourceBranch,
+                existing_worktree: true,
+              }
+            : undefined;
+      expect(body.git).toEqual(expectedGit);
+    },
+  );
+
   it.each([
     { query: "canvas=main", canvasId: "main", project: undefined },
     {
@@ -517,39 +688,316 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
   });
 
-  it("keeps the Canvas project and draft when a temporary create fails", async () => {
-    searchParams = new URLSearchParams("canvas=proj_alpha&project=Alpha");
-    projects = [{ id: "proj_alpha", name: "Alpha" }];
+  it.each([
+    { query: "canvas=proj_alpha&project=Alpha", sourceDeleted: false },
+    { query: "sibling=source", sourceDeleted: false },
+    { query: "sibling=source", sourceDeleted: true },
+  ])(
+    "keeps the composer draft after a temporary create fails: $query, sourceDeleted=$sourceDeleted",
+    async ({ query, sourceDeleted }) => {
+      searchParams = new URLSearchParams(query);
+      projects = [{ id: "proj_alpha", name: "Alpha" }];
+      const previousUrl = window.location.href;
+      navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
+        window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
+      });
+      beginLocalConversationMock.mockReturnValue({
+        tempConvId: "temp:1234567890abcdef1234567890abcdef",
+        pendingMsgTempId: "pend_scoped",
+        createToken: "1234567890abcdef1234567890abcdef",
+      });
+      removeLocalConversationMock.mockReturnValue(true);
+      let resolveCreate!: (response: Response) => void;
+      let sourceUnavailable = false;
+      let sourceTitle = "Source";
+      vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+        if (String(url).startsWith("/v1/sessions/source?")) {
+          if (sourceUnavailable) {
+            return new Response(JSON.stringify({ detail: "Not found" }), { status: 404 });
+          }
+          return new Response(
+            JSON.stringify({
+              id: "source",
+              title: sourceTitle,
+              host_id: "host_1",
+              workspace: SEEDED_WORKSPACE,
+              agent_id: "ag_hello",
+              permission_level: 4,
+              labels: {},
+              items: [],
+            }),
+          );
+        }
+        return new Promise<Response>((resolve) => {
+          resolveCreate = resolve;
+        });
+      });
+      const info = { features: { canvas: true }, sibling_sessions: true };
+      try {
+        const client = renderLanding([], info);
+        await waitForWorkspaceSeed();
+        typeMessage("Keep this scoped draft");
+        fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+          target: { files: [new File(["notes"], "notes.txt", { type: "text/plain" })] },
+        });
+        fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+        await waitFor(() => expect(resolveCreate).toBeDefined());
+        if (query.startsWith("sibling=")) {
+          sourceTitle = "Renamed source";
+          await act(async () => {
+            await client.invalidateQueries({ queryKey: ["sibling-source", "source"] });
+          });
+          expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+            expect.objectContaining({ creating: true, created: false }),
+          ]);
+        }
+        cleanup();
+        sourceUnavailable = sourceDeleted;
+        await act(async () => {
+          resolveCreate(
+            new Response(JSON.stringify({ detail: "Source unavailable" }), { status: 403 }),
+          );
+        });
+        if (query.startsWith("sibling=")) {
+          expect(client.getQueryData(["nested-session-drafts"])).toEqual([]);
+        }
+        await waitFor(() =>
+          expect(navigateMock).toHaveBeenLastCalledWith({ pathname: "/", search: `?${query}` }),
+        );
+        searchParams = new URLSearchParams(window.location.search);
+        const reopenedClient = renderLanding([], info);
+        if (sourceDeleted) {
+          expect(await screen.findByText("Source session is unavailable.")).toBeVisible();
+          fireEvent.click(screen.getByRole("button", { name: "Continue in a new session" }));
+          cleanup();
+          searchParams = new URLSearchParams(window.location.search);
+          expect(searchParams.has("sibling")).toBe(false);
+          renderLanding([], info);
+        }
+        await waitForWorkspaceSeed();
+        expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this scoped draft");
+        expect(screen.getByText("notes.txt")).toBeVisible();
+        expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
+        if (query.startsWith("sibling=") && !sourceDeleted) {
+          cleanup();
+          expect(reopenedClient.getQueryData(["nested-session-drafts"])).toEqual([]);
+        }
+      } finally {
+        window.history.replaceState({}, "", previousUrl);
+      }
+    },
+  );
+
+  it("keeps a created nested session and its prompt when local hydration fails", async () => {
     const previousUrl = window.location.href;
-    navigateMock.mockImplementation((to: string | { pathname: string; search: string }) => {
-      window.history.replaceState({}, "", typeof to === "string" ? to : to.pathname + to.search);
-    });
+    onTestFinished(() => window.history.replaceState({}, "", previousUrl));
+    navigateMock.mockImplementation((to: string) => window.history.replaceState({}, "", to));
+    searchParams = new URLSearchParams("sibling=source");
+    vi.mocked(authenticatedFetch).mockImplementation(
+      async (url) =>
+        new Response(
+          JSON.stringify(
+            String(url).startsWith("/v1/sessions/source?")
+              ? {
+                  id: "source",
+                  host_id: "host_1",
+                  workspace: SEEDED_WORKSPACE,
+                  agent_id: "ag_hello",
+                  permission_level: 4,
+                  labels: {},
+                  items: [],
+                }
+              : { id: "created" },
+          ),
+        ),
+    );
+    const tempConvId = "temp:1234567890abcdef1234567890abcdef";
     beginLocalConversationMock.mockReturnValue({
-      tempConvId: "temp:1234567890abcdef1234567890abcdef",
-      pendingMsgTempId: "pend_canvas",
+      tempConvId,
+      pendingMsgTempId: "pending",
       createToken: "1234567890abcdef1234567890abcdef",
     });
-    removeLocalConversationMock.mockReturnValue(true);
-    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ detail: "Host unavailable" }), { status: 503 }),
-    );
-    try {
-      renderLanding([], { features: { canvas: true } });
-      await waitForWorkspaceSeed();
-      typeMessage("Keep this Canvas draft");
-      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-      await waitFor(() =>
-        expect(navigateMock).toHaveBeenLastCalledWith({
-          pathname: "/",
-          search: "?canvas=proj_alpha&project=Alpha",
-        }),
-      );
-      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep this Canvas draft");
-      expect(hydrateLocalConversationMock).not.toHaveBeenCalled();
-    } finally {
-      window.history.replaceState({}, "", previousUrl);
-    }
+    hydrateLocalConversationMock.mockImplementationOnce(() => {
+      throw new Error("local setup failed");
+    });
+    const client = renderLanding([], { sibling_sessions: true });
+    await waitForWorkspaceSeed();
+    typeMessage("Keep this task");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(removeLocalConversationMock).toHaveBeenCalledWith(tempConvId));
+    expect(setPendingInitialPromptMock).toHaveBeenCalledWith("created", {
+      text: "Keep this task",
+      skill: null,
+      files: [],
+    });
+    expect(client.getQueryData(["nested-session-drafts"])).toEqual([
+      expect.objectContaining({ id: "created", created: true }),
+    ]);
+    expect(navigateMock).toHaveBeenLastCalledWith("/c/created");
   });
+
+  it("includes selected registry services in the sandbox creation request", async () => {
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [{ id: "tracker", title: "Tracker", auth: "none", connected: true }],
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_managed" }),
+    } as Response);
+    renderLanding([], { managed_sandboxes_enabled: true, enabled_connections: ["mcp"] });
+    fireEvent.click(screen.getByRole("button", { name: "MCP services: 0 selected" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Tracker" }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Tracker" })).toBeChecked());
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    typeMessage("use the tracker");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [url, init] = vi.mocked(authenticatedFetch).mock.calls[0];
+    expect(url).toBe("/v1/sessions");
+    expect(JSON.parse(init!.body as string)).toMatchObject({
+      host_type: "managed",
+      mcp_registry_services: ["tracker"],
+    });
+  });
+
+  it("waits for MCP OAuth before allowing launch and preserves the draft selection", async () => {
+    const service = { id: "tracker", title: "Tracker", auth: "oauth", connected: false };
+    vi.mocked(registryRequest).mockResolvedValue({ data: [service] });
+    let finish!: () => void;
+    vi.mocked(authorizeRegistryService).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    writeLastHostChoice("host_1");
+    renderLanding([], { managed_sandboxes_enabled: true, enabled_connections: ["mcp"] });
+    await waitForWorkspaceSeed();
+    typeMessage("use the tracker");
+    fireEvent.click(screen.getByRole("button", { name: "MCP services: 0 selected" }));
+    fireEvent.click(await screen.findByRole("switch", { name: "Tracker" }));
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    const signInSignal = vi.mocked(authorizeRegistryService).mock.calls[0][1];
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    expect(signInSignal.aborted).toBe(false);
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, connected: true }] });
+    await act(async () => finish());
+    await waitFor(() => expect(readLastMcpServices()).toEqual(["tracker"]));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByTestId("new-chat-landing-submit")).not.toBeDisabled();
+    cleanup();
+    writeLastMcpServices([]);
+    renderLanding([], { managed_sandboxes_enabled: true, enabled_connections: ["mcp"] });
+    expect(await screen.findByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("use the tracker");
+  });
+
+  it.each([false, true])(
+    "ignores remembered MCPs without the admin opt-in (hosted: %s)",
+    async (managed) => {
+      writeLastMcpServices(["system.ai.github"]);
+      vi.mocked(authenticatedFetch).mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderLanding([], { managed_sandboxes_enabled: managed });
+      if (!managed) await waitForWorkspaceSeed();
+      expect(screen.queryByTestId("new-chat-landing-mcp-registry-chip")).toBeNull();
+      expect(registryRequest).not.toHaveBeenCalled();
+      typeMessage("Start without managed registry");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+      expect(
+        JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
+      ).not.toHaveProperty("mcp_registry_services");
+      expect(readLastMcpServices()).toEqual(["system.ai.github"]);
+    },
+  );
+
+  it("restores remembered MCPs on a fresh draft and launches only available services without opening the picker", async () => {
+    writeLastMcpServices(["tracker", "removed"]);
+    let finish!: (value: unknown) => void;
+    vi.mocked(registryRequest).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    vi.mocked(authenticatedFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderLanding([], { enabled_connections: ["mcp"] });
+    await waitForWorkspaceSeed();
+    typeMessage("Use my remembered tools");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "MCP services: 2 selected" })).toBeVisible();
+    expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
+    await act(async () => finish({ data: [{ id: "tracker", title: "Tracker", connected: true }] }));
+    expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+    expect(
+      JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
+    ).toMatchObject({ mcp_registry_services: ["tracker"] });
+    expect(readLastMcpServices()).toEqual(["tracker", "removed"]);
+  });
+
+  it.each(["retry", "opt out"])(
+    "keeps preferences on a catalog failure and allows %s",
+    async (recovery) => {
+      writeLastMcpServices(["tracker"]);
+      vi.mocked(registryRequest).mockRejectedValue(new Error("Catalog unavailable"));
+      renderLanding([], { enabled_connections: ["mcp"] });
+      await waitForWorkspaceSeed();
+      typeMessage("Use my tools");
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.click(screen.getByTestId("new-chat-landing-mcp-registry-chip"));
+      expect(await screen.findByRole("alert")).toHaveTextContent("Catalog unavailable");
+      expect(readLastMcpServices()).toEqual(["tracker"]);
+      expect(screen.getByRole("button", { name: "MCP services: 1 selected" })).toBeVisible();
+      expect(screen.queryByText(/No longer available/)).toBeNull();
+      if (recovery === "opt out") {
+        fireEvent.click(screen.getByRole("switch", { name: "tracker" }));
+        expect(readLastMcpServices()).toEqual([]);
+        fireEvent.keyDown(document, { key: "Escape" });
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+        vi.mocked(authenticatedFetch).mockResolvedValue({
+          ok: true,
+          json: async () => ({ id: "conv_without_mcp" }),
+        } as Response);
+        fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+        await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledOnce());
+        expect(
+          JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0][1]!.body as string),
+        ).not.toHaveProperty("mcp_registry_services");
+        expect(authorizeRegistryService).not.toHaveBeenCalled();
+        return;
+      }
+      const service = { id: "tracker", title: "Tracker", auth: "oauth", connected: false };
+      vi.mocked(registryRequest).mockResolvedValue({ data: [service] });
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(await screen.findByRole("switch", { name: "Tracker" })).toBeChecked();
+      expect(
+        screen.getByRole("button", { name: "MCP services: 1 selected, 1 needs sign-in" }),
+      ).toBeVisible();
+      vi.mocked(authorizeRegistryService).mockResolvedValue();
+      vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...service, connected: true }] });
+      fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+      await screen.findByText("Connected");
+      expect(readLastMcpServices()).toEqual(["tracker"]);
+      fireEvent.click(screen.getByRole("switch", { name: "Tracker" }));
+      expect(readLastMcpServices()).toEqual([]);
+      cleanup();
+      resetLandingDraft();
+      renderLanding([], { enabled_connections: ["mcp"] });
+      fireEvent.click(screen.getByTestId("new-chat-landing-mcp-registry-chip"));
+      expect(await screen.findByRole("switch", { name: "Tracker" })).not.toBeChecked();
+    },
+  );
 
   it("keeps project placement on the provisional and rekeyed conversation", async () => {
     searchParams = new URLSearchParams("project=Alpha");
@@ -591,6 +1039,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         project,
+        false,
       ),
     );
   });
@@ -698,6 +1147,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
     expect(resolveCreate).toBeTypeOf("function");
@@ -744,6 +1194,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
   });
@@ -954,6 +1405,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
 
@@ -1935,12 +2387,8 @@ describe("NewChatLandingScreen create flow", () => {
       '[data-testid="new-chat-landing-agent-model-omnigent-openai/system.ai.gpt-5-6-sol"]',
     );
     expect(fullNameRow).not.toBeNull();
-    expect(fullNameRow).toHaveAttribute("title", "GPT 5.6 Sol");
-    fireEvent.change(screen.getByTestId("new-chat-landing-agent-model-search"), {
-      target: { value: "gpt sol" },
-    });
-    expect(screen.getByText("GPT 5.6 Sol")).toBeInTheDocument();
-    expect(screen.queryByText("Claude Sonnet 4.6")).toBeNull();
+    expect(fullNameRow).toHaveTextContent("GPT 5.6 Sol");
+    expect(fullNameRow).toHaveAttribute("title", "omnigent-openai/system.ai.gpt-5-6-sol");
     fireEvent.click(screen.getByText("GPT 5.6 Sol"));
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     typeMessage("go");

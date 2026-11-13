@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError, read_repository_branches
 
 
 def _git_env() -> dict[str, str]:
@@ -126,6 +126,41 @@ def test_read_missing_file_raises_not_found(tmp_path: Path) -> None:
     with pytest.raises(WorkspaceReaderError) as excinfo:
         reader.list_or_read("nope.txt")
     assert excinfo.value.status == 404
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX FIFOs")
+def test_read_fifo_raises_not_found_without_blocking(tmp_path: Path) -> None:
+    """A FIFO with no writer answers 404 instead of hanging the reader thread."""
+    os.mkfifo(tmp_path / "pipe")
+    reader = WorkspaceReader(tmp_path)
+    with pytest.raises(WorkspaceReaderError) as excinfo:
+        reader.read_file_bytes("pipe")
+    assert excinfo.value.status == 404
+
+
+def test_list_directory_skips_a_non_utf8_name_and_pages_past_it(tmp_path: Path) -> None:
+    """A name that isn't valid UTF-8 can't be sent; every other entry stays reachable."""
+    for name in ("a.txt", "z.txt"):
+        (tmp_path / name).write_text("x")
+    try:
+        with open(os.fsencode(tmp_path) + b"/m\xff.txt", "wb"):
+            pass
+    except OSError:
+        pytest.skip("this filesystem rejects non-UTF-8 names")
+    reader = WorkspaceReader(tmp_path)
+
+    names: list[str] = []
+    after: str | None = None
+    while True:
+        page = reader.list_directory("", limit=1, after=after)
+        names += [e["name"] for e in page.data]
+        if not page.has_more:
+            break
+        after = page.last_id
+
+    assert names == ["a.txt", "z.txt"]
+    listing = reader.list_or_read("", limit=10, order="asc")
+    assert [e["name"] for e in listing["data"]] == ["a.txt", "z.txt"]  # type: ignore[union-attr]
 
 
 def test_read_oversize_file_is_capped_and_flagged(tmp_path: Path, monkeypatch) -> None:
@@ -458,6 +493,94 @@ def _git_branch_repo(path: Path) -> None:
     subprocess.run(
         ["git", "commit", "-m", "feature"], cwd=path, check=True, capture_output=True, env=env
     )
+
+
+@pytest.mark.parametrize("state", ["pushed", "local", "deleted", "detached", "offline", "timeout"])
+def test_repository_branch_checks_original_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    """Remote existence, not tracking configuration, decides whether a fork can clone a branch."""
+    checkout = tmp_path / "repo"
+    checkout.mkdir()
+    _git_branch_repo(checkout)
+    remote = tmp_path / "remote.git"
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args], cwd=checkout, check=True, capture_output=True, env=_git_env()
+        )
+
+    git("init", "--bare", str(remote))
+    git("remote", "add", "origin", str(tmp_path / "different.git"))
+    git("push", str(remote), "main")
+    if state in {"pushed", "deleted", "detached"}:
+        git("push", str(remote), "feature")
+        if state == "deleted":
+            # Leave a stale remote-tracking ref; the remote no longer has this branch.
+            git("update-ref", "refs/remotes/origin/feature", "HEAD")
+            git("push", str(remote), "--delete", "feature")
+        elif state == "detached":
+            git("checkout", "--detach")
+    url = str(remote if state != "offline" else tmp_path / "missing.git")
+    original_config = (checkout / ".git/config").read_bytes()
+    original_index = (checkout / ".git/index").read_bytes()
+    if state == "timeout":
+        original_run = subprocess.run
+
+        def run(args, **kwargs):
+            if "ls-remote" in args:
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return original_run(args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", run)
+    result = read_repository_branches(tmp_path, [{"url": url, "path": "repo"}])
+    assert result == {
+        "repositories": [
+            {
+                "url": url,
+                "branch": None if state == "detached" else "feature",
+                "pushed": True
+                if state == "pushed"
+                else False
+                if state in {"local", "deleted"}
+                else None,
+            }
+        ]
+    }
+    assert read_repository_branches(tmp_path, [{"url": url, "path": "missing"}]) == {
+        "repositories": [{"url": url, "branch": None, "pushed": None}]
+    }
+    assert read_repository_branches(checkout, [{"url": url, "path": ""}]) == result
+    if state == "pushed":
+        second = tmp_path / "second"
+        second.mkdir()
+        _git_branch_repo(second)
+        second_remote = tmp_path / "second.git"
+        git("init", "--bare", str(second_remote))
+        assert read_repository_branches(
+            tmp_path,
+            [
+                {"url": url, "path": "repo"},
+                {"url": str(second_remote), "path": "second"},
+            ],
+        ) == {
+            "repositories": [
+                {"url": url, "branch": "feature", "pushed": True},
+                {"url": str(second_remote), "branch": "feature", "pushed": False},
+            ]
+        }
+    assert (checkout / ".git/config").read_bytes() == original_config
+    assert (checkout / ".git/index").read_bytes() == original_index
+
+
+@pytest.mark.parametrize("path", ["../outside", "escape", "/outside"])
+def test_repository_branches_confine_checkout_paths(tmp_path: Path, path: str) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "escape").symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(WorkspaceReaderError) as failure:
+        read_repository_branches(workspace, [{"url": "https://example.com/repo", "path": path}])
+    assert failure.value.status == 400
 
 
 def test_github_info_without_gh_reports_no_pr(tmp_path: Path, monkeypatch) -> None:

@@ -9,7 +9,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ChevronDownIcon, ChevronUpIcon, SearchIcon, XIcon } from "lucide-react";
 import type { Editor } from "@tiptap/react";
+import type { Transaction } from "@tiptap/pm/state";
 import type { ReactElement, RefObject } from "react";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
   findMatches,
   searchDecorationKey,
@@ -36,15 +38,18 @@ export function MarkdownSearchBar({
   const [query, setQuery] = useState("");
   const [currentIndex, setCurrentIndex] = useState(0);
 
-  // Recount matches whenever the query changes or the document is edited, so
-  // "n / m" and navigation stay accurate.
+  // Recount matches whenever the query changes or the document changes, so
+  // "n / m" and navigation stay accurate. Another writer's update arrives
+  // without an "update" event, so listen to every document-changing transaction.
   const [docVersion, setDocVersion] = useState(0);
   useEffect(() => {
     if (!editor) return;
-    const bump = () => setDocVersion((v) => v + 1);
-    editor.on("update", bump);
+    const bump = ({ transaction }: { transaction: Transaction }) => {
+      if (transaction.docChanged) setDocVersion((v) => v + 1);
+    };
+    editor.on("transaction", bump);
     return () => {
-      editor.off("update", bump);
+      editor.off("transaction", bump);
     };
   }, [editor]);
 
@@ -118,6 +123,8 @@ export function MarkdownSearchBar({
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={(e) => {
+          // IME composition keys (CJK input) confirm text, not find.
+          if (isImeCompositionKeyEvent(e)) return;
           if (e.key === "Enter") {
             e.preventDefault();
             if (e.shiftKey) goPrev();

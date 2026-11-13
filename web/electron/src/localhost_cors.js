@@ -6,7 +6,7 @@
 // CORS — they were written for same-origin or CLI use — so Chromium blocks
 // the response and the page sees an opaque "Failed to fetch". Chromium's
 // newer Local Network Access permission is NOT the blocker in Electron
-// (verified inert in Electron 42, even with LocalNetworkAccessChecks
+// (verified inert in Electron 45, even with LocalNetworkAccessChecks
 // force-enabled); ordinary CORS is.
 //
 // What: webRequest hooks on the shell session that inject CORS response

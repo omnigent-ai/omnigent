@@ -35,6 +35,7 @@ description: >-
 
 executor:
   type: omnigent
+  reasoning_effort: high
   config:
     harness: claude-sdk
 

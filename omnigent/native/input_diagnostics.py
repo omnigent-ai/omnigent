@@ -28,6 +28,7 @@ _DETAIL_IDS = frozenset(
         "native_rpc_attempt_id",
         "initial_thread_id",
         "initial_native_turn_id",
+        "lifecycle_response_id",
     }
 )
 _DETAIL_LABELS = frozenset(
@@ -40,6 +41,8 @@ _DETAIL_LABELS = frozenset(
         "cancellation_reason",
         "match_method",
         "harness",
+        "cause_class",
+        "reason_code",
     }
 )
 _DETAIL_ID_PATTERN = re.compile(r"[A-Za-z0-9_.:-]{1,256}")

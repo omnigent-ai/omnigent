@@ -33,15 +33,20 @@ search, and file content work identically in both modes.
 from __future__ import annotations
 
 import base64
+import bisect
 import mimetypes
 import os
 import re
+import stat
+import subprocess
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeAlias, cast
+from typing import TypeAlias, TypedDict, cast
 
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
-from omnigent.entities.pagination import paginate_in_memory
+from omnigent.entities.pagination import PagedList, paginate_in_memory
 from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.runner import pr_resource
 from omnigent.runner.environment_filesystem import (
@@ -60,8 +65,59 @@ from omnigent.runtime.filesystem_registry import (
 
 # Match the runner's caps so a host-served read is truncated identically.
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
+_REPOSITORY_BRANCH_TIMEOUT_S = 3.0
+_MAX_REPOSITORY_BRANCHES = 10
 
 _WorkspacePayload: TypeAlias = dict[str, object]
+
+
+class ListedEntry(TypedDict):
+    """One directory entry, in the runner's listing shape."""
+
+    id: str
+    object: str
+    name: str
+    path: str
+    type: str
+    bytes: int | None
+    modified_at: int
+
+
+def _repository_branch(url: str, checkout: Path) -> _WorkspacePayload:
+    """Inspect one checkout without fetching or trusting stale remote-tracking refs."""
+    result: _WorkspacePayload = {"url": url, "branch": None, "pushed": None}
+    if not (checkout / ".git").exists():
+        return result
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=checkout,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"},
+            capture_output=True,
+            text=True,
+            timeout=_REPOSITORY_BRANCH_TIMEOUT_S,
+            check=False,
+        )
+
+    try:
+        current = git("symbolic-ref", "--quiet", "HEAD")
+        current_ref = current.stdout.strip()
+        if current.returncode or not current_ref.startswith("refs/heads/"):
+            return result
+        branch = current_ref.removeprefix("refs/heads/")
+        result["branch"] = branch
+        remote = git("ls-remote", "--exit-code", "--heads", "--", url, f"refs/heads/{branch}")
+        if remote.returncode == 2:
+            result["pushed"] = False
+        elif remote.returncode == 0:
+            result["pushed"] = any(
+                line.partition("\t")[2] == f"refs/heads/{branch}"
+                for line in remote.stdout.splitlines()
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return result
 
 
 class WorkspaceReaderError(Exception):
@@ -81,6 +137,85 @@ class WorkspaceReaderError(Exception):
         self.status = status
         self.code = code
         self.message = message
+
+
+@dataclass(frozen=True)
+class FileBytes:
+    """A file's bytes, capped at the read limit, and how to present them.
+
+    :param data: The bytes to serve, at most ``_MAX_READ_BYTES``.
+    :param truncated: Whether the file was longer than the cap.
+    :param is_text: Whether ``data`` is valid UTF-8.
+    :param content_type: MIME type guessed from the name, e.g. ``"text/markdown"``.
+    """
+
+    data: bytes
+    truncated: bool
+    is_text: bool
+    content_type: str | None
+
+
+def _cap_file_bytes(rel: str, raw: bytes) -> FileBytes:
+    """Cap ``raw`` at the read limit and decide whether it is UTF-8 text."""
+    content_type, _ = mimetypes.guess_type(rel)
+    truncated = len(raw) > _MAX_READ_BYTES
+    capped = raw[:_MAX_READ_BYTES] if truncated else raw
+    try:
+        capped.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # The cap may split a trailing codepoint: drop that partial tail so oversize
+        # text stays text, as the runner does. Earlier invalid bytes mean binary.
+        if not (truncated and exc.start >= len(capped) - 3):
+            return FileBytes(capped, truncated, is_text=False, content_type=content_type)
+        capped = capped[: exc.start]
+    return FileBytes(capped, truncated, is_text=True, content_type=content_type)
+
+
+def is_utf8_encodable(text: str) -> bool:
+    """Return whether ``text`` has no surrogate-escaped bytes, so it encodes as UTF-8."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _resolve_workspace_path(root: Path, path: str) -> Path:
+    """Resolve a relative path, including symlinks, within the workspace root."""
+    try:
+        validated = _validate_path(path) if path else ""
+    except InvalidPath as exc:
+        raise WorkspaceReaderError(400, "invalid_path", str(exc)) from exc
+    if not validated:
+        return root
+    full = (root / validated).resolve()
+    try:
+        full.relative_to(root)
+    except ValueError as exc:
+        raise WorkspaceReaderError(
+            400, "invalid_path", f"Path {path!r} escapes the workspace root"
+        ) from exc
+    return full
+
+
+def read_repository_branches(root: Path, repositories: list[dict[str, str]]) -> _WorkspacePayload:
+    """Read current branches and their availability at the original clone URLs.
+
+    Targets come from server-owned launch metadata. Paths remain confined
+    to this workspace; failures and detached HEADs return unknown state.
+    """
+    if len(repositories) > _MAX_REPOSITORY_BRANCHES:
+        raise WorkspaceReaderError(400, "invalid_repositories", "Too many repositories")
+    root = root.resolve()
+    targets = [
+        (repository["url"], _resolve_workspace_path(root, repository["path"]))
+        for repository in repositories
+    ]
+    if not targets:
+        return {"repositories": []}
+    with ThreadPoolExecutor(max_workers=len(targets)) as executor:
+        branches = list(executor.map(lambda target: _repository_branch(*target), targets))
+    return {"repositories": branches}
 
 
 class WorkspaceReader:
@@ -108,20 +243,7 @@ class WorkspaceReader:
         :raises WorkspaceReaderError: 400 when the path escapes the root
             or is otherwise invalid.
         """
-        try:
-            validated = _validate_path(path) if path else ""
-        except InvalidPath as exc:
-            raise WorkspaceReaderError(400, "invalid_path", str(exc)) from exc
-        if not validated:
-            return self._root
-        full = (self._root / validated).resolve()
-        try:
-            full.relative_to(self._root)
-        except ValueError as exc:
-            raise WorkspaceReaderError(
-                400, "invalid_path", f"Path {path!r} escapes the workspace root"
-            ) from exc
-        return full
+        return _resolve_workspace_path(self._root, path)
 
     # ── Directory listing / file content ──────────────────────────
 
@@ -149,6 +271,39 @@ class WorkspaceReader:
             return self._list_dir(path, resolved, limit, after, before, order)
         return self._read_file(path, resolved)
 
+    def list_directory(
+        self, path: str, *, limit: int, after: str | None
+    ) -> PagedList[ListedEntry]:
+        """List a directory in ascending name order, like ``list_or_read``.
+
+        :param path: Relative directory path (``""`` for the workspace root).
+        :param limit: Max entries to return.
+        :param after: Return entries after this entry id. An id whose entry
+            was removed since still resumes at its place in name order.
+        :returns: The page of entries.
+        :raises WorkspaceReaderError: 404 when ``path`` is not a readable directory.
+        """
+        entries = self._list_entries(path, self._resolve(path))
+        # Ids sort like names (one shared parent), so the cursor needn't still exist.
+        start = bisect.bisect_right([e["id"] for e in entries], after) if after else 0
+        page = entries[start : start + limit]
+        return PagedList(
+            data=page,
+            first_id=page[0]["id"] if page else None,
+            last_id=page[-1]["id"] if page else None,
+            has_more=start + limit < len(entries),
+        )
+
+    def read_file_bytes(self, path: str) -> FileBytes:
+        """Read a file's capped bytes, exactly as ``list_or_read`` would serve them.
+
+        :param path: Relative file path.
+        :returns: The capped bytes and their presentation.
+        :raises WorkspaceReaderError: 400 on an invalid path, 404 when ``path``
+            is not a readable regular file.
+        """
+        return _cap_file_bytes(path, self._read_capped(path, self._resolve(path)))
+
     def _list_dir(
         self,
         rel: str,
@@ -158,14 +313,32 @@ class WorkspaceReader:
         before: str | None,
         order: str,
     ) -> _WorkspacePayload:
-        """Build the directory-listing payload for a resolved directory.
+        """Build the directory-listing payload for a resolved directory."""
+        page = paginate_in_memory(
+            self._list_entries(rel, resolved),
+            id_fn=lambda entry: entry["id"],
+            limit=limit,
+            after=after,
+            before=before,
+            order=order,
+        )
+        return {
+            "object": "list",
+            "data": page.data,
+            "first_id": page.first_id,
+            "last_id": page.last_id,
+            "has_more": page.has_more,
+        }
+
+    def _list_entries(self, rel: str, resolved: Path) -> list[ListedEntry]:
+        """List a resolved directory's entries in name order.
 
         Classifies entries by target type (follows symlinks) and skips
         per-entry ``OSError`` (e.g. a broken symlink) so one bad entry
         does not fail the listing — matching the runner's ``list_dir``.
         """
         validated = _validate_path(rel) if rel else ""
-        entries: list[_WorkspacePayload] = []
+        entries: list[ListedEntry] = []
         try:
             names = sorted(os.listdir(resolved))
         except OSError as exc:
@@ -173,6 +346,10 @@ class WorkspaceReader:
                 404, "not_found", f"Directory {rel!r} not found or not accessible"
             ) from exc
         for name in names:
+            if not is_utf8_encodable(name):
+                # A non-UTF-8 name comes back surrogate-escaped; no JSON or protobuf
+                # answer can carry it, so skip it rather than fail the listing.
+                continue
             full = resolved / name
             child_rel = os.path.join(validated, name) if validated else name
             try:
@@ -203,21 +380,7 @@ class WorkspaceReader:
                     "modified_at": mtime,
                 }
             )
-        page = paginate_in_memory(
-            entries,
-            id_fn=lambda entry: cast(str, entry["id"]),
-            limit=limit,
-            after=after,
-            before=before,
-            order=order,
-        )
-        return {
-            "object": "list",
-            "data": page.data,
-            "first_id": page.first_id,
-            "last_id": page.last_id,
-            "has_more": page.has_more,
-        }
+        return entries
 
     def _read_file(
         self,
@@ -234,15 +397,31 @@ class WorkspaceReader:
         Reads at most ``_MAX_READ_BYTES + 1`` from disk, bounding memory
         use before decoding oversized files.
         """
+        return self._file_content_payload(rel, self._read_capped(rel, resolved))
+
+    def _read_capped(self, rel: str, resolved: Path) -> bytes:
+        """Read up to the cap plus one byte of a regular file.
+
+        Opens without blocking and refuses anything but a regular file, so a
+        FIFO or device in the workspace answers "not found" instead of hanging.
+        """
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
         try:
-            with resolved.open("rb") as fh:
-                # One extra byte lets us detect (and flag) truncation
-                # without loading the rest of a large file into memory.
-                capped = fh.read(_MAX_READ_BYTES + 1)
+            fd = os.open(resolved, flags)
         except OSError as exc:
             raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found") from exc
-
-        return self._file_content_payload(rel, capped)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found")
+            with os.fdopen(fd, "rb", closefd=False) as fh:
+                # One extra byte lets us detect (and flag) truncation
+                # without loading the rest of a large file into memory.
+                return fh.read(_MAX_READ_BYTES + 1)
+        except OSError as exc:
+            raise WorkspaceReaderError(404, "not_found", f"Path {rel!r} not found") from exc
+        finally:
+            os.close(fd)
 
     def _file_content_payload(
         self,
@@ -250,46 +429,18 @@ class WorkspaceReader:
         raw: bytes,
     ) -> _WorkspacePayload:
         """Assemble the file-content dict from raw bytes."""
-        content_type_guess, _ = mimetypes.guess_type(rel)
-        truncated = False
-        capped = raw
-        if len(capped) > _MAX_READ_BYTES:
-            capped = capped[:_MAX_READ_BYTES]
-            truncated = True
-
-        text: str | None = None
-        try:
-            text = capped.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            # A byte-cap truncation can split a multi-byte codepoint at the very
-            # end, which would otherwise flip an oversize *text* file to base64.
-            # When the only invalid bytes are a partial trailing codepoint (the
-            # error starts within the last 3 bytes of the truncated buffer),
-            # drop them and retry — matching the runner's boundary-safe
-            # truncation so the same file serves as text from either side. A
-            # genuinely binary file has invalid bytes earlier in the buffer, so
-            # this guard doesn't rescue it and it falls through to base64.
-            if truncated and exc.start >= len(capped) - 3:
-                capped = capped[: exc.start]
-                text = capped.decode("utf-8")
-
-        payload: _WorkspacePayload = {
+        file = _cap_file_bytes(rel, raw)
+        return {
             "object": "session.environment.filesystem.file_content",
             "path": rel,
-            "content_type": content_type_guess,
+            "content_type": file.content_type,
+            "bytes": len(file.data),
+            "truncated": file.truncated,
+            "encoding": "utf-8" if file.is_text else "base64",
+            "content": file.data.decode("utf-8")
+            if file.is_text
+            else base64.b64encode(file.data).decode(),
         }
-        if text is not None:
-            data = text.encode("utf-8")
-            payload["bytes"] = len(data)
-            payload["truncated"] = truncated
-            payload["encoding"] = "utf-8"
-            payload["content"] = text
-        else:
-            payload["bytes"] = len(capped)
-            payload["truncated"] = truncated
-            payload["encoding"] = "base64"
-            payload["content"] = base64.b64encode(capped).decode()
-        return payload
 
     # ── Search ─────────────────────────────────────────────────────
 
@@ -576,8 +727,44 @@ class WorkspaceReader:
             ),
         )
 
+    def github_review_threads(
+        self, session_id: str, pr_url: str, after: str, head_sha: str, base_sha: str
+    ) -> _WorkspacePayload:
+        """Published review conversations, optionally paginated at a requested revision."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_review_threads(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                after=after,
+                head_sha=head_sha,
+                base_sha=base_sha,
+            ),
+        )
+
+    def github_review_thread_comments(
+        self, session_id: str, pr_url: str, thread_id: str, after: str
+    ) -> _WorkspacePayload:
+        """Additional replies in a selected-PR review conversation."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_review_thread_comments(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                thread_id=thread_id,
+                after=after,
+            ),
+        )
+
     def github_changes(
-        self, session_id: str | None = None, pr_url: str | None = None
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> _WorkspacePayload:
         """The selected PR's changed files."""
         return cast(
@@ -586,6 +773,8 @@ class WorkspaceReader:
                 str(self._root),
                 session_id=session_id,
                 pr_url=pr_url,
+                head_sha=head_sha,
+                base_sha=base_sha,
             ),
         )
 
@@ -615,12 +804,114 @@ class WorkspaceReader:
         )
 
     def github_pr_diff(
-        self, session_id: str | None = None, pr_url: str | None = None
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> _WorkspacePayload:
         """The selected PR's unified diff patch."""
         return cast(
             "_WorkspacePayload",
             pr_resource.pr_diff(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                head_sha=head_sha,
+                base_sha=base_sha,
+            ),
+        )
+
+    def github_commits(
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        head_sha: str | None = None,
+    ) -> _WorkspacePayload:
+        """The selected PR's commits at the displayed head."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_commits(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                head_sha=head_sha,
+            ),
+        )
+
+    def github_commit_diff(
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        commit_sha: str | None = None,
+    ) -> _WorkspacePayload:
+        """One commit's unified diff patch from the selected PR."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_commit_diff(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                commit_sha=commit_sha,
+            ),
+        )
+
+    def github_compare_diff(
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        head_sha: str | None = None,
+        from_sha: str | None = None,
+    ) -> _WorkspacePayload:
+        """The selected PR's changes after one of its commits."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_compare_diff(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                head_sha=head_sha,
+                from_sha=from_sha,
+            ),
+        )
+
+    def github_labels(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """The labels the selected PR's repository offers."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_labels(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
+        )
+
+    def github_merge_options(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """The merge methods the selected PR's repository allows."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_merge_options(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
+        )
+
+    def github_reviewers(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """The users and teams a review of the selected PR can be requested from."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_review_candidates(
                 str(self._root),
                 session_id=session_id,
                 pr_url=pr_url,

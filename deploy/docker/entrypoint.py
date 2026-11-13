@@ -266,49 +266,6 @@ def _select_artifact_store(resolved_config: _ResolvedConfig) -> ArtifactStore:
     return LocalArtifactStore(str(resolved_config.artifact_dir))
 
 
-def _build_local_llm_routing_client(
-    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
-) -> Any | None:  # type: ignore[explicit-any]  # LLMRoutingClient | None
-    if server_llm is None:
-        return None
-    from omnigent.runtime.policies.builder import (
-        _build_policy_llm_client,
-        _resolve_server_llm_connection,
-    )
-
-    conn = _resolve_server_llm_connection(server_llm)
-    policy_client = _build_policy_llm_client(server_llm, conn)
-    if policy_client is None:
-        return None
-    from omnigent.server.smart_routing import LLMRoutingClient
-
-    return LLMRoutingClient(policy_client)
-
-
-def _build_routing(
-    cfg: dict[str, Any],
-    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
-) -> tuple[Any, Any]:  # type: ignore[explicit-any]  # (RoutingClient | None, RoutingSettings)
-    """Build the routing client and settings from the ``routing:`` block.
-
-    Reuses the CLI's parser and builder so a Docker deployment honours the
-    same ``routing.*`` keys (router name, selection model, model prefixes) a
-    local server does.
-
-    :param cfg: The parsed server config mapping.
-    :param server_llm: The parsed server-level ``LLMConfig``, used for the
-        built-in judge when no external router is configured.
-    :returns: ``(routing_client, routing_settings)`` for ``RuntimeCaps``.
-    """
-    from omnigent.cli import _build_external_routing_client, parse_routing_settings
-
-    routing_cfg = cfg.get("routing")
-    settings = parse_routing_settings(routing_cfg)
-    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
-        return _build_external_routing_client(routing_cfg, settings), settings
-    return _build_local_llm_routing_client(server_llm), settings
-
-
 def _resolve_execution_timeout(cfg: dict[str, Any]) -> int:
     """Return the configured execution limit or the RuntimeCaps default."""
     return int(cfg.get("execution_timeout") or 7200)
@@ -410,14 +367,27 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    routing_client, routing_settings = _build_routing(cfg, server_llm)
+    # Same routing wiring as `omnigent server`: the external router and the
+    # built-in judge are built as a pair, not as alternatives.
+    from omnigent.cli import (
+        _build_routing_backends,
+        _parse_native_hook_allow_cache_seconds,
+        parse_routing_settings,
+    )
+
+    routing_settings = parse_routing_settings(cfg.get("routing"))
+    routing_backends = _build_routing_backends(cfg, server_llm, routing_settings)
 
     caps = RuntimeCaps(
         execution_timeout=_resolve_execution_timeout(cfg),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
-        routing_client=routing_client,
+        routing_client=routing_backends.any(),
+        routing_backends=routing_backends,
         routing_settings=routing_settings,
+        native_hook_allow_cache_seconds=_parse_native_hook_allow_cache_seconds(
+            cfg.get("native_hook_allow_cache_seconds")
+        ),
     )
 
     init_runtime(
@@ -487,6 +457,10 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
             databricks_store = DatabricksConnectionStore(database_url, dbx_cipher)
 
+    from omnigent.server.mcp_registry import build_mcp_registry_from_env
+
+    mcp_registry = build_mcp_registry_from_env(database_url)
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -501,6 +475,8 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         project_store=project_store,
         auth_provider=auth_provider,
         account_store=account_store,
+        policy_modules=cfg.get("policy_modules"),
+        debug_router_modules=config_str_list(cfg.get("debug_router_modules")),
         # Non-secret auth settings from the config file (admins are the
         # canonical, declarative roster; allowed_domains gates OIDC). Both
         # union with their runtime-editable files under <data_dir>.
@@ -510,6 +486,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         server_config=cfg,
         github_config=github_config,
         github_store=github_store,
+        mcp_registry=mcp_registry,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
     )
@@ -539,10 +516,11 @@ def main() -> None:
 
         import uvicorn
 
+        from omnigent.server.graceful_shutdown import SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S, serve
         from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
         logger.info("Starting omnigent server on %s:%d", resolved.host, resolved.port)
-        uvicorn.run(
+        config = uvicorn.Config(
             resolved.app,
             host=resolved.host,
             port=resolved.port,
@@ -550,7 +528,12 @@ def main() -> None:
             # tunnel: without the keepalive budget uvicorn's 20 s default closes
             # a busy-but-healthy one with 1011 after a client-path stall.
             **uvicorn_tunnel_kwargs(),
+            # Bound the graceful wait and drain SSE streams so a held session
+            # stream can't keep the container alive until the orchestrator
+            # SIGKILLs it. Matches `omnigent server`.
+            timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
         )
+        serve(config)
     except Exception:  # noqa: BLE001 — startup catch-all so failures land in logs
         logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())
         # Keep the process alive briefly so the container log capture has time

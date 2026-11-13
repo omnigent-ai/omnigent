@@ -4,7 +4,14 @@
 // paste is claimed) rather than internal state wiring.
 
 import { act, renderHook } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import {
+  FALLBACK_SERVER_INFO,
+  type FilesystemAttachmentsInfo,
+  type ServerInfo,
+} from "@/lib/capabilities";
 import { useComposerAttachments } from "./useComposerAttachments";
 
 function textFile(name = "notes.txt"): File {
@@ -43,14 +50,71 @@ function pasteEvent({
     // they must be skipped, not attached.
     items.push({ kind: "file", type: "image/png", getAsFile: () => null });
   }
-  const event = { clipboardData: { items }, preventDefault };
+  const getData = (type: string) => (type === "text/plain" ? (text ?? "") : "");
+  const target = document.createElement("textarea");
+  const event = { clipboardData: { items, getData }, currentTarget: target, preventDefault };
   return {
     event: event as unknown as React.ClipboardEvent<HTMLTextAreaElement>,
     preventDefault,
+    target,
+  };
+}
+
+/** Render under a server reporting *policy* from `/v1/info`. */
+function withPolicy(policy: FilesystemAttachmentsInfo) {
+  return function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, filesystem_attachments: policy }}>
+        {children}
+      </CapabilitiesProvider>
+    );
   };
 }
 
 describe("useComposerAttachments", () => {
+  it("validates added and pasted files against the server's policy", () => {
+    const { result } = renderHook(() => useComposerAttachments(), {
+      wrapper: withPolicy({ extensions: [".gz"], all_types: false }),
+    });
+    const gz = new File([new Uint8Array(4)], "trace.gz", { type: "application/gzip" });
+    // A default filesystem type the policy leaves out.
+    const zip = new File([new Uint8Array(4)], "bundle.zip", { type: "application/zip" });
+
+    act(() => result.current.addFiles([gz, zip]));
+    expect(result.current.files).toEqual([gz]);
+    expect(result.current.attachmentError).toContain("bundle.zip");
+    expect(result.current.accept?.split(",")).toContain(".gz");
+
+    const pasted = new File([new Uint8Array(4)], "more.gz", { type: "application/gzip" });
+    act(() => result.current.onPaste(pasteEvent({ files: [pasted] }).event));
+    expect(result.current.files).toEqual([gz, pasted]);
+  });
+
+  it("rechecks files added while the server's policy was loading", () => {
+    let info: ServerInfo | "loading" = "loading";
+    const onRemoved = vi.fn();
+    const { result, rerender } = renderHook(() => useComposerAttachments({ onRemoved }), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+      ),
+    });
+    const notes = textFile();
+    const zip = new File([new Uint8Array(4)], "bundle.zip", { type: "application/zip" });
+    // The defaults accept a .zip until the server says otherwise.
+    act(() => result.current.addFiles([notes, zip]));
+    expect(result.current.files).toEqual([notes, zip]);
+
+    info = {
+      ...FALLBACK_SERVER_INFO,
+      filesystem_attachments: { extensions: [], all_types: false },
+    };
+    rerender();
+
+    expect(result.current.files).toEqual([notes]);
+    expect(result.current.attachmentError).toContain("bundle.zip");
+    expect(onRemoved).toHaveBeenCalledOnce();
+  });
+
   it("starts empty by default and seeds from initialFiles", () => {
     const empty = renderHook(() => useComposerAttachments());
     expect(empty.result.current.files).toEqual([]);
@@ -135,35 +199,40 @@ describe("useComposerAttachments", () => {
     expect(result.current.files).toEqual([]);
   });
 
-  it("onPaste attaches clipboard files and claims the event", () => {
+  it("onPaste attaches clipboard files and claims the event without inserting text", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    const { event, preventDefault } = pasteEvent({ files: [pngFile(), textFile()] });
+    const { event, preventDefault, target } = pasteEvent({
+      text: "shot.png",
+      files: [pngFile(), textFile()],
+    });
 
     act(() => result.current.onPaste(event));
 
     expect(preventDefault).toHaveBeenCalledTimes(1);
     expect(result.current.files.map((f) => f.name)).toEqual(["shot.png", "notes.txt"]);
+    expect(target.value).toBe("");
   });
 
-  it("onPaste leaves a text-only paste to the browser", () => {
+  it("onPaste inserts a text-only paste as typed input", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    const { event, preventDefault } = pasteEvent({ text: "hello world" });
+    const { event, preventDefault, target } = pasteEvent({ text: "hello world" });
 
     act(() => result.current.onPaste(event));
 
-    expect(preventDefault).not.toHaveBeenCalled();
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+    expect(target.value).toBe("hello world");
     expect(result.current.files).toEqual([]);
   });
 
   it("onPaste ignores non-file kinds and null file payloads", () => {
     const { result } = renderHook(() => useComposerAttachments());
-    const { event, preventDefault } = pasteEvent({ text: "hi", nullFile: true });
+    const { event, target } = pasteEvent({ text: "hi", nullFile: true });
 
     act(() => result.current.onPaste(event));
 
-    // No usable file → nothing attached and the paste stays native.
-    expect(preventDefault).not.toHaveBeenCalled();
+    // No usable file → nothing attached; the text is inserted instead.
     expect(result.current.files).toEqual([]);
+    expect(target.value).toBe("hi");
   });
 
   it("replaceFiles swaps the list wholesale and revalidates the replacement", () => {

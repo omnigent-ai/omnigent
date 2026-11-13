@@ -10,15 +10,19 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
+from omnigent.install_ledger import atomic_write_json
 from omnigent.native import native_bridge_common
+from omnigent.process_logging import DATA_DIR_ENV_VAR
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
@@ -35,7 +39,8 @@ _STATE_FILE = "state.json"
 # the tmux/TUI section at the end of this module). Written by the runner after
 # the agy terminal launches; read by the executor's first-turn bootstrap.
 _TMUX_FILE = "tmux.json"
-_BRIDGE_ROOT = Path.home() / ".omnigent" / "antigravity-native"
+_BRIDGE_ROOT = native_bridge_common.native_bridge_data_dir() / "antigravity-native"
+_ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 # Prefix of the launcher-minted placeholder conversation id (see
 # ``antigravity_native._mint_agy_conversation_id``). agy mints its own real
@@ -183,9 +188,8 @@ class AntigravityNativeBridgeState:
         There is intentionally no durable read cursor. The retired transcript
         forwarder persisted a ``forwarded_steps`` set (+ a ``forwarded_step_index``
         mirror) so a tail (re)start did not re-mirror the whole JSONL. The RPC read
-        driver that superseded it (:mod:`omnigent.harnesses.antigravity_native.reader`) keeps
-        an *in-memory* seen-set only and is recreated per session by the runner, so
-        no on-disk cursor is needed. Legacy ``forwarded_step_index`` /
+        driver uses an in-memory seen-set within a run and stable item source ids
+        for server-side deduplication across restarts. Legacy ``forwarded_step_index`` /
         ``forwarded_steps`` keys in an on-disk ``state.json`` are tolerated and
         ignored on read.
 
@@ -262,16 +266,62 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
 
 def prune_orphaned_bridge_dirs() -> int:
     """
-    Remove antigravity-native bridge dirs whose owner process is provably dead.
+    Remove inactive antigravity-native bridge dirs whose owner is provably dead.
 
-    Delegates to the shared sweep against this harness's bridge root; the
-    global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
-    at startup to reclaim dirs leaked by a prior runner that died without
-    running the explicit delete path.
+    agy keeps the session's conversation store inside the bridge dir (see
+    :func:`agy_gemini_dir`), and a runner restart is a normal resume boundary,
+    so owner death alone cannot imply that the bridge is disposable. Keep the
+    whole bridge for 7 days after its latest bridge preparation or conversation
+    activity, then remove it intact.
+    Explicit session deletion remains immediate. Global maintenance calls this via
+    ``native_bridge_common.reap_orphaned_native_bridge_dirs`` at startup.
 
     :returns: The number of orphaned bridge dirs removed.
     """
-    return native_bridge_common.prune_orphaned_dirs(bridge_root())
+    return native_bridge_common.prune_orphaned_dirs(
+        bridge_root(),
+        should_prune=_agy_orphan_retention_expired,
+    )
+
+
+def _agy_orphan_retention_expired(bridge_dir: Path) -> bool:
+    """Return whether a dead-owner agy bridge has been inactive for 7 days."""
+    activity_cutoff = time.time() - _ORPHAN_RETENTION_SECONDS
+    owner_marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
+    try:
+        if owner_marker.stat().st_mtime > activity_cutoff:
+            return False
+    except OSError:
+        return False
+
+    conversations_dir = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations"
+    try:
+        conversations_mode = conversations_dir.stat().st_mode
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    # A non-directory at the store path holds no conversation history, so treat
+    # it like a missing store rather than leaking the bridge forever.
+    if not stat.S_ISDIR(conversations_mode):
+        return True
+
+    # Each conversation is ``<id>.db`` plus SQLite ``-wal``/``-shm`` sidecars; in
+    # WAL mode the sidecar, not the main file, carries the latest write.
+    try:
+        for filename in os.listdir(conversations_dir):
+            if not filename.endswith((".db", ".db-wal", ".db-shm")):
+                continue
+            try:
+                if (conversations_dir / filename).stat().st_mtime > activity_cutoff:
+                    return False
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+    except OSError:
+        return False
+    return True
 
 
 # ── Omnigent MCP relay wiring (sys_* tools) ──────────────────────────────────
@@ -295,7 +345,8 @@ def prune_orphaned_bridge_dirs() -> int:
 # ``HOME`` intact (needed for platform auth such as macOS keyring-backed tokens)
 # and launches agy with its hidden ``--gemini_dir=<bridge_dir>/agy-home/.gemini``
 # flag. That isolated Gemini dir is seeded with onboarding/migration markers and
-# a bridge-scoped ``config/mcp_config.json`` written by :func:`write_mcp_config`.
+# a bridge-scoped ``config/mcp_config.json`` written by :func:`write_mcp_config`
+# (the user's own ``~/.gemini`` MCP servers plus the Omnigent relay).
 # This (1) NEVER touches the user's real ``~/.gemini/config/mcp_config.json`` and
 # (2) gives each session its own config so concurrent sessions never clobber one
 # another. Known file-based OAuth markers are copied best-effort for platforms
@@ -338,12 +389,15 @@ _AGY_ENABLED_TOOLS = [
     "sys_os_shell",
     "sys_os_write",
     "sys_policy_registry",
+    "sys_project_list",
+    "sys_project_update",
     "sys_session_close",
     "sys_session_create",
     "sys_session_get_history",
     "sys_session_get_info",
     "sys_session_list",
     "sys_session_send",
+    "sys_session_update",
     "sys_terminal_close",
     "sys_terminal_launch",
     "sys_terminal_list",
@@ -426,6 +480,19 @@ def agy_gemini_dir(bridge_dir: Path) -> Path:
     return agy_home_dir(bridge_dir) / ".gemini"
 
 
+def agy_conversation_db(bridge_dir: Path, cascade_id: str) -> Path:
+    """Return the conversation db agy writes for *cascade_id* under this session's Gemini dir.
+
+    Its existence proves the cascade was created by this session's own agy; a
+    foreign agy writes into its own ``--gemini_dir``.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :param cascade_id: agy cascade/conversation id.
+    :returns: Path of that conversation's sqlite db (may not exist yet).
+    """
+    return agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations" / f"{cascade_id}.db"
+
+
 def build_mcp_config(
     bridge_dir: Path,
     *,
@@ -441,11 +508,12 @@ def build_mcp_config(
     ``<python> -I -m omnigent.harnesses.claude_native.bridge serve-mcp --bridge-dir <dir>``.
 
     **HOME pinning.** agy spawns this relay as a child. The relay validates its
-    ``--bridge-dir`` against ``bridge_root()`` (``$HOME/.omnigent/antigravity-native``),
-    which must resolve to the RUNNER's real home where the bridge dir actually
-    lives. Pinning ``HOME`` in the relay env keeps that invariant true even when a
-    future agy launch path customizes process environment. ``-I`` does not clear
-    ``HOME``; it only ignores ``PYTHON*`` vars and user site-packages.
+    ``--bridge-dir`` against ``bridge_root()`` (``<data dir>/antigravity-native``),
+    which must resolve to the RUNNER's data dir where the bridge dir actually
+    lives. Pinning ``HOME`` and ``OMNIGENT_DATA_DIR`` in the relay env keeps that
+    invariant true even when a future agy launch path customizes process
+    environment. ``-I`` does not clear either; it only ignores ``PYTHON*`` vars
+    and user site-packages.
 
     :param bridge_dir: Native Antigravity bridge directory whose relay this
         config points at.
@@ -469,9 +537,10 @@ def build_mcp_config(
                 "enabledTools": list(_AGY_ENABLED_TOOLS),
                 "env": {
                     "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
-                    # Pin the relay to the RUNNER's real home so its bridge-root
-                    # validation matches where the bridge dir lives. See docstring.
+                    # Pin the relay to the RUNNER's real home and data dir so its
+                    # bridge-root validation matches where the bridge dir lives. See docstring.
                     "HOME": str(Path.home()),
+                    DATA_DIR_ENV_VAR: str(native_bridge_common.native_bridge_data_dir()),
                 },
             }
         }
@@ -515,6 +584,10 @@ def write_mcp_config(
     config. Mirrors cursor #742's :func:`omnigent.harnesses.cursor_native.bridge.write_mcp_config`,
     adapted to agy's hidden ``--gemini_dir`` flag.
 
+    The user's real ``~/.gemini/config/mcp_config.json`` is re-read on every write
+    and merged beneath the relay, which wins a name collision. A missing or
+    malformed file seeds only the relay; the real file is never modified.
+
     :param bridge_dir: Native Antigravity bridge directory (holds ``bridge.json``
         and the isolated agy Gemini dir).
     :param python_executable: Python interpreter for the relay command;
@@ -525,11 +598,36 @@ def write_mcp_config(
     config_dir = agy_gemini_dir(bridge_dir) / _MCP_CONFIG_DIR
     config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = config_dir / _MCP_CONFIG_FILE
-    payload = build_mcp_config(bridge_dir, python_executable=python_executable)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    relay = build_mcp_config(bridge_dir, python_executable=python_executable)["mcpServers"]
+    servers = {**_load_user_mcp_servers(Path.home()), **cast("dict[str, object]", relay)}
+    # Inherited server env blocks can hold credentials; this writes owner-only.
+    atomic_write_json(path, {"mcpServers": servers})
     return path
+
+
+def _load_user_mcp_servers(real_home: Path) -> dict[str, object]:
+    """Return the user's real agy MCP servers; a missing or malformed file yields ``{}``."""
+    path = real_home / ".gemini" / _MCP_CONFIG_DIR / _MCP_CONFIG_FILE
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        _logger.warning(
+            "Could not read the user's agy MCP config at %s; seeding only the Omnigent relay",
+            path,
+            exc_info=True,
+        )
+        return {}
+    servers = loaded.get("mcpServers", {}) if isinstance(loaded, dict) else None
+    if not isinstance(servers, dict):
+        _logger.warning(
+            "agy MCP config at %s is not a JSON object with an mcpServers object; "
+            "seeding only the Omnigent relay",
+            path,
+        )
+        return {}
+    return servers
 
 
 def seed_isolated_agy_home(
@@ -546,10 +644,10 @@ def seed_isolated_agy_home(
     ``<bridge_dir>/agy-home/.gemini``.
     The runner keeps agy's real ``HOME`` intact and passes this directory through
     ``--gemini_dir``; on macOS that is required because agy uses keyring-backed
-    auth that is not portable to a relocated ``HOME``. The relay's
-    ``mcp_config.json`` is written separately by :func:`write_mcp_config` so it
-    lands in this same isolated tree rather than the user's real ``~/.gemini``
-    (the footgun this whole design avoids).
+    auth that is not portable to a relocated ``HOME``. The ``mcp_config.json``
+    (the user's servers plus the relay) is written separately by
+    :func:`write_mcp_config` so it lands in this same isolated tree rather than
+    the user's real ``~/.gemini`` (the footgun this whole design avoids).
 
     :param bridge_dir: Native Antigravity bridge directory.
     :param trusted_workspace: Optional workspace path to pre-trust inside the
@@ -766,7 +864,9 @@ _AGY_FEEDBACK_SURVEY_SETTING = "showFeedbackSurvey"
 _AGY_MODEL_PROVIDER_SETTING = "modelProvider"
 
 
-def ensure_agy_feedback_survey_disabled(home: Path) -> None:
+def ensure_agy_feedback_survey_disabled(
+    home: Path, *, launch_env: dict[str, str] | None = None
+) -> None:
     """
     Disable agy's feedback survey in the launch HOME's ``settings.json``.
 
@@ -788,6 +888,7 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
     :param home: The HOME agy launches under (the per-session isolated home, or
         the real home when the harness runs agy under it). Settings live at
         ``<home>/.gemini/antigravity-cli/settings.json``.
+    :param launch_env: Resolved child environment; None uses the current process.
     :returns: None.
     """
     # resolve() follows a symlinked settings.json (e.g. a dotfiles-managed file) to
@@ -838,7 +939,8 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
             return
         data = loaded
     desired: dict[str, object] = {_AGY_FEEDBACK_SURVEY_SETTING: False}
-    if (os.environ.get("GEMINI_API_KEY") or "").strip():
+    environment = os.environ if launch_env is None else launch_env
+    if (environment.get("GEMINI_API_KEY") or "").strip():
         desired[_AGY_MODEL_PROVIDER_SETTING] = "gemini"
     provider_removed = False
     current_provider = data.get(_AGY_MODEL_PROVIDER_SETTING)
@@ -899,6 +1001,12 @@ def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> Non
     os.replace(tmp, settings_path)
 
 
+# Serializes bridge-state writes in this process, so a guarded conversation-id update
+# (cold-start, reader recovery) is atomic against other writes and a terminal's
+# clear/reseed. Reentrant because update_conversation_id writes while holding it.
+_STATE_UPDATE_LOCK = threading.RLock()
+
+
 def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
     """
     Persist shared native Antigravity state atomically.
@@ -907,25 +1015,26 @@ def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) ->
     :param state: State payload to persist.
     :returns: None.
     """
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = bridge_dir / _STATE_FILE
-    fd, tmp_name = tempfile.mkstemp(prefix=f"{_STATE_FILE}.", dir=str(bridge_dir))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "session_id": state.session_id,
-                    "conversation_id": state.conversation_id,
-                    "active_turn_id": state.active_turn_id,
-                },
-                handle,
-                sort_keys=True,
-            )
-            handle.write("\n")
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+    with _STATE_UPDATE_LOCK:
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = bridge_dir / _STATE_FILE
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{_STATE_FILE}.", dir=str(bridge_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "session_id": state.session_id,
+                        "conversation_id": state.conversation_id,
+                        "active_turn_id": state.active_turn_id,
+                    },
+                    handle,
+                    sort_keys=True,
+                )
+                handle.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
 
 
 def clear_bridge_state(bridge_dir: Path) -> None:
@@ -945,9 +1054,10 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native Antigravity bridge directory.
     :returns: None.
     """
-    for runtime_file in (_STATE_FILE, _TMUX_FILE):
-        with contextlib.suppress(FileNotFoundError):
-            (bridge_dir / runtime_file).unlink()
+    with _STATE_UPDATE_LOCK:
+        for runtime_file in (_STATE_FILE, _TMUX_FILE):
+            with contextlib.suppress(FileNotFoundError):
+                (bridge_dir / runtime_file).unlink()
 
 
 def read_bridge_state(bridge_dir: Path) -> AntigravityNativeBridgeState | None:
@@ -996,6 +1106,9 @@ def update_conversation_id(
     bridge_dir: Path,
     conversation_id: str,
     active_turn_id: str | None = None,
+    *,
+    expect_placeholder: bool = False,
+    expected_state: AntigravityNativeBridgeState | None = None,
 ) -> bool:
     """
     Update the agy conversation id in bridge state.
@@ -1010,31 +1123,63 @@ def update_conversation_id(
     forever, surfaced only as a generic "conversation not ready". The caller
     decides how to react (it stays best-effort; this never raises).
 
+    The guards are checked under one process-wide lock, so racing writers cannot
+    clobber each other's binding.
+
     :param bridge_dir: Native Antigravity bridge directory.
     :param conversation_id: New agy conversation id, e.g.
         ``"agy_conv_abc123"``.
     :param active_turn_id: Active turn id for the new conversation, e.g.
         ``"turn_abc123"``, or ``None`` when no turn is running yet.
+    :param expect_placeholder: When ``True``, only replace an ``agy_conv_*``
+        placeholder; a real id already in state is kept and ``False`` returned.
+    :param expected_state: When set, only write if bridge state still names this
+        session and conversation, e.g. the placeholder a recovery scan started
+        from; a recreated terminal's new placeholder is kept and ``False`` returned.
     :returns: ``True`` when the new id was written, ``False`` when there was no
-        existing state to update (the id was dropped; a WARNING was logged).
+        existing state to update (the id was dropped; a WARNING was logged) or a
+        guard kept the current state.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        _logger.warning(
-            "Antigravity bridge: no existing state at %s to update; dropping "
-            "conversation_id=%s (the reader will stay on the placeholder id)",
+    with _STATE_UPDATE_LOCK:
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            _logger.warning(
+                "Antigravity bridge: no existing state at %s to update; dropping "
+                "conversation_id=%s (the reader will stay on the placeholder id)",
+                bridge_dir,
+                conversation_id,
+            )
+            return False
+        if expect_placeholder and not is_placeholder_conversation_id(state.conversation_id):
+            _logger.info(
+                "Antigravity bridge: state at %s already binds conversation %s; keeping it "
+                "instead of replacing it with %s",
+                bridge_dir,
+                state.conversation_id,
+                conversation_id,
+            )
+            return False
+        if expected_state is not None and (state.session_id, state.conversation_id) != (
+            expected_state.session_id,
+            expected_state.conversation_id,
+        ):
+            _logger.info(
+                "Antigravity bridge: state at %s changed from conversation %s to %s; "
+                "not replacing it with %s",
+                bridge_dir,
+                expected_state.conversation_id,
+                state.conversation_id,
+                conversation_id,
+            )
+            return False
+        write_bridge_state(
             bridge_dir,
-            conversation_id,
+            AntigravityNativeBridgeState(
+                session_id=state.session_id,
+                conversation_id=conversation_id,
+                active_turn_id=active_turn_id,
+            ),
         )
-        return False
-    write_bridge_state(
-        bridge_dir,
-        AntigravityNativeBridgeState(
-            session_id=state.session_id,
-            conversation_id=conversation_id,
-            active_turn_id=active_turn_id,
-        ),
-    )
     return True
 
 
@@ -1764,20 +1909,12 @@ def send_interaction_keys_via_tui(
     """
     Send raw key arguments to the agy TUI pane to answer its in-process prompt.
 
-    The companion to :func:`inject_user_message_via_tui` for the OTHER thing the
-    attended agy TUI maintains in parallel with the RPC step state: its
-    **in-process permission / question prompt**. When agy runs attended (the
-    web/mobile path types every turn into the TUI), an approval surfaces in the
-    Omnigent web UI AND as agy's own numbered TUI prompt ("Do you want to
-    proceed?", 1.Yes … 4.No). Delivering the verdict over
-    :func:`omnigent.harnesses.antigravity_native.rpc.handle_user_interaction` flips the
-    backend trajectory step to DONE and the command runs, but the **TUI prompt
-    for that interaction can stay open** — and the next typed turn then lands in
-    that stale prompt's filter/amend buffer instead of starting a fresh turn
-    (live-verified; see ``docs/claude/antigravity-rpc-spike-notes.md`` §"attended
-    TUI"). So the bridge ALSO types the selection into the pane to dismiss the
-    prompt, mirroring cursor-native's
-    :func:`omnigent.harnesses.cursor_native.bridge.send_cursor_pane_keys`.
+    RPC and terminal prompt state can diverge. Callers must confirm the same
+    interaction is still waiting before sending post-RPC dismissal keys: a
+    closed prompt would accept those keys as a new chat message. Clients whose
+    trajectory is already DONE while their terminal prompt remains open need
+    manual dismissal; the RPC state cannot safely distinguish that stale menu
+    from an active composer.
 
     Each argument is a tmux ``send-keys`` key argument — a bare ``"1"`` / ``"4"``
     selects a numbered option, ``"Enter"`` confirms, ``"Escape"`` cancels — sent

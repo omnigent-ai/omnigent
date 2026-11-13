@@ -41,8 +41,9 @@ from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import debug_event
 from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
-from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task, close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
+from omnigent.native.owner_claim import owner_is_gone, read_owner_claim, write_owner_claim
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
@@ -53,8 +54,32 @@ from omnigent.runtime.harnesses.paths import (
     HARNESS_TMP_PARENT_ENV_VAR,
     harness_tmp_parent,
 )
+from omnigent.util.json_serialization import json_dumps_transport_safe
 
 _logger = logging.getLogger(__name__)
+_UNCONDITIONAL_RELEASE = object()
+
+
+class _HarnessHttpClient(httpx.AsyncClient):
+    """Keep retained surrogate text encodable at the harness HTTP boundary."""
+
+    def build_request(self, method: str, url: httpx.URL | str, **kwargs: Any) -> httpx.Request:
+        try:
+            return super().build_request(method, url, **kwargs)
+        except UnicodeEncodeError:
+            payload = kwargs.get("json")
+            if payload is None or any(
+                kwargs.get(name) is not None for name in ("content", "data", "files")
+            ):
+                raise
+            headers = httpx.Headers(kwargs.get("headers"))
+            if "Content-Type" not in self.headers:
+                headers.setdefault("Content-Type", "application/json")
+            kwargs["json"] = None
+            kwargs["content"] = json_dumps_transport_safe(payload).encode("utf-8")
+            kwargs["headers"] = headers
+            return super().build_request(method, url, **kwargs)
+
 
 # Per-AP-instance directory holding all per-conversation Unix
 # sockets (POSIX) and the AP_PID sentinel file. Each Omnigent instance gets a
@@ -83,10 +108,9 @@ _TMP_PARENT_ENV_VAR = HARNESS_TMP_PARENT_ENV_VAR
 # depth.
 _HARNESS_AUTH_TOKEN_ENV = "OMNIGENT_HARNESS_AUTH_TOKEN"
 
-# Sentinel file the Omnigent instance writes into its subdir on boot. The
-# orphan sweep uses it to tell whether a sibling subdir belongs to
-# a still-running Omnigent (leave alone) or a crashed one (kill its
-# children, remove the dir).
+# Sentinel each instance writes into its subdir on boot; the orphan sweep uses it
+# to tell a still-running sibling from a crashed one (kill children, remove dir).
+# Holds an owner claim; older builds wrote a bare PID.
 _AP_PID_FILE = "AP_PID"
 
 # Mode bits applied to the per-AP subdir and the per-conversation
@@ -203,7 +227,9 @@ def _default_tmp_parent() -> Path:
     the host's real ``/tmp`` is unavailable or unsuitable. Relative
     values are intentionally preserved: Unix socket paths have tight
     length limits, and a short path such as ``.tmp/oa`` is useful
-    for local worktrees whose absolute path is long.
+    for local worktrees whose absolute path is long. Prefer storage
+    cleared at boot: the orphan sweep never reclaims a dir whose
+    owner ran under an earlier boot.
 
     :returns: Configured parent path, or the per-uid default
         ``/tmp/omnigent-<uid>`` on POSIX.
@@ -404,7 +430,10 @@ class _HarnessEndpoint:
         """The ``_runner`` CLI flags selecting this transport."""
         if self.socket_path is not None:
             return ["--socket", str(self.socket_path)]
-        return ["--bind", f"{self.host}:{self.port}"]
+        from omnigent.util.server_url import format_host_port
+
+        assert self.host is not None and self.port is not None
+        return ["--bind", format_host_port(self.host, self.port)]
 
     def make_transport(self) -> httpx.AsyncBaseTransport:
         """An httpx transport routed at this endpoint."""
@@ -417,7 +446,10 @@ class _HarnessEndpoint:
         """The httpx base URL. Under UDS the host is cosmetic; under TCP it routes."""
         if self.socket_path is not None:
             return "http://harness.local"
-        return f"http://{self.host}:{self.port}"
+        from omnigent.util.server_url import format_host_port
+
+        assert self.host is not None and self.port is not None
+        return f"http://{format_host_port(self.host, self.port)}"
 
     async def can_connect(self) -> bool:
         """Whether the runner is accepting connections at this endpoint yet."""
@@ -686,13 +718,7 @@ class HarnessProcessManager:
             # Sweep BEFORE creating our own dir, so a crashed prior instance
             # whose dir uuid happens to collide with ours gets cleaned first.
             await sweep_orphaned_harness_processes(tmp_parent=self._tmp_parent)
-        self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        # Write the AP_PID sentinel so other instances' sweeps can
-        # tell our dir is live. Strict ``"x"`` because the dir is
-        # exclusively ours; a pre-existing sentinel would mean the
-        # uuid collided with a still-running instance — fail loud.
-        sentinel = self._instance_dir / _AP_PID_FILE
-        sentinel.write_text(str(os.getpid()), encoding="utf-8")
+        self._ensure_instance_dir()
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -721,9 +747,10 @@ class HarnessProcessManager:
         switching support; changes to ACP startup options also require a restart.
 
         Crash detection: if the previously-spawned subprocess has
-        exited (``returncode is not None``), the entry is dropped
-        and a fresh subprocess is spawned with the ``env``
-        provided on the call that triggered the respawn.
+        exited (``returncode is not None``), or its Unix socket has
+        disappeared, the entry is dropped and a fresh subprocess is
+        spawned with the ``env`` provided on the call that triggered
+        the respawn.
         Per-conversation lock ensures concurrent callers during
         the lazy-init window don't race two subprocesses onto the
         same socket — see §Process management: Spawn lock for the
@@ -762,7 +789,7 @@ class HarnessProcessManager:
         # bumped generation and is allowed to respawn.
         async with self._registry_lock:
             start_generation = self._release_generations.get(conversation_id, 0)
-        # Non-None only for a model/harness-switch respawn of an in-flight entry
+        # Non-None only for a deliberate replacement of an in-flight entry
         # (not crash respawns — those are already covered by the orphan watchdog).
         respawn_reason: str | None = None
         # The replaced entry's in-flight response id, captured at the respawn
@@ -785,6 +812,39 @@ class HarnessProcessManager:
                     "while get_client waited"
                 )
             entry = self._entries.get(conversation_id)
+            # "any" control callers may hold an established connection past the
+            # unlink; don't kill the turn they're interrupting. Concrete-harness
+            # (new-turn) callers reconnect via the pathname and own recovery.
+            if (
+                not IS_WINDOWS
+                and entry is not None
+                and harness != "any"
+                and entry.process.returncode is None
+                and entry.endpoint is not None
+                and entry.endpoint.socket_path is not None
+                and entry.endpoint.socket_path.parent == self._instance_dir
+                and not entry.endpoint.socket_path.exists()
+            ):
+                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
+                _logger.warning(
+                    "harness %s for conversation %s lost its socket; respawning",
+                    entry.harness,
+                    conversation_id,
+                    extra={
+                        "session_id": conversation_id,
+                        "event_name": "harness_socket_missing",
+                        "attributes": {
+                            "harness": entry.harness,
+                            "pid": entry.process.pid,
+                            "socket_path": str(entry.endpoint.socket_path),
+                            "tracked_response_id": replaced_response_id,
+                        },
+                    },
+                )
+                await self._close_entry(entry)
+                self._in_flight_response_ids.pop(conversation_id, None)
+                entry = None
+                respawn_reason = "harness_respawn_socket_missing"
             if entry is not None and entry.process.returncode is not None:
                 # Prior subprocess died; drop the stale entry and
                 # respawn below. The dead client is closed on
@@ -1002,7 +1062,7 @@ class HarnessProcessManager:
                 entry.client.post(cancel_url, json={"type": "interrupt"}),
                 timeout=timeout_s,
             )
-        except (httpx.HTTPError, asyncio.TimeoutError):
+        except (TimeoutError, httpx.HTTPError):
             _logger.exception(
                 "harness cancel forward failed: conversation_id=%s harness_response_id=%s",
                 conversation_id,
@@ -1029,6 +1089,18 @@ class HarnessProcessManager:
         :returns: ``True`` if a subprocess entry exists.
         """
         return conversation_id in self._entries
+
+    def registered_client(self, conversation_id: str) -> httpx.AsyncClient | None:
+        """Snapshot the registered client without spawning or refreshing its lease.
+
+        Pass the result as ``release(expected_client=...)`` to retire only
+        this registration, even if another process replaces it while waiting.
+
+        :param conversation_id: Session whose current registration is needed.
+        :returns: The registered client, or ``None`` when no process is registered.
+        """
+        entry = self._entries.get(conversation_id)
+        return entry.client if entry is not None else None
 
     def has_active_turn(self, conversation_id: str) -> bool:
         """
@@ -1091,7 +1163,12 @@ class HarnessProcessManager:
         self._in_flight_response_ids.pop(conversation_id, None)
 
     async def release(
-        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+        self,
+        conversation_id: str,
+        *,
+        only_if_idle_cutoff: float | None = None,
+        expected_client: object = _UNCONDITIONAL_RELEASE,
+        can_release: Callable[[], bool] | None = None,
     ) -> None:
         """
         Terminate and unregister the subprocess for a conversation.
@@ -1133,10 +1210,21 @@ class HarnessProcessManager:
         spawn lock is acquired).
 
         :param conversation_id: AP-allocated conversation id.
+        :param expected_client: When supplied, release only the registration
+            captured by :meth:`registered_client`, checked under the spawn lock.
+        :param can_release: Optional synchronous, side-effect-free ownership
+            check, evaluated under the spawn lock immediately before unregistering.
         """
         spawn_lock = await self._get_spawn_lock(conversation_id)
         async with spawn_lock:
             async with self._registry_lock:
+                if can_release is not None and not can_release():
+                    return
+                if (
+                    expected_client is not _UNCONDITIONAL_RELEASE
+                    and self.registered_client(conversation_id) is not expected_client
+                ):
+                    return
                 if only_if_idle_cutoff is not None:
                     current = self._entries.get(conversation_id)
                     if (
@@ -1213,6 +1301,13 @@ class HarnessProcessManager:
                 self._spawn_locks[conversation_id] = lock
             return lock
 
+    def _ensure_instance_dir(self) -> None:
+        # Temporary-file cleanup may remove either directory after start().
+        # Recreated state needs the same private modes and live-owner claim.
+        self._tmp_parent.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+        self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+        write_owner_claim(self._instance_dir, filename=_AP_PID_FILE)
+
     async def _spawn_entry(
         self,
         conversation_id: str,
@@ -1239,6 +1334,15 @@ class HarnessProcessManager:
             ``_SPAWN_READY_TIMEOUT_S``.
         """
         module_path = _resolve_module_path(harness)
+        preparation = asyncio.create_task(asyncio.to_thread(self._ensure_instance_dir))
+        try:
+            await asyncio.shield(preparation)
+        except asyncio.CancelledError:
+            # Keep the spawn lock until disk writes finish so shutdown cannot
+            # remove the directory while the worker is still recreating it.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await await_cleanup_task(preparation)
+            raise
         endpoint = _HarnessEndpoint.create(self._instance_dir, conversation_id)
         # Defensive: a stale socket file from a previous spawn
         # (released but not cleaned up because of an OS quirk)
@@ -1321,7 +1425,7 @@ class HarnessProcessManager:
             # tool dispatch round-trips (action_required → AP
             # call_tool → PATCH → resume); use a generous fixed
             # timeout that still surfaces a genuinely-stuck harness.
-            client = httpx.AsyncClient(
+            client = _HarnessHttpClient(
                 transport=endpoint.make_transport(),
                 base_url=endpoint.base_url,
                 # S1 (security): present the per-spawn bearer token (Windows only)
@@ -1613,17 +1717,25 @@ async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) ->
                 exc,
             )
             continue
-        try:
-            pid = int(sentinel.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError) as exc:
-            _logger.warning(
-                "could not read AP_PID sentinel at %s: %s; skipping",
-                sentinel,
-                exc,
-            )
-            continue
-        if _pid_alive(pid):
-            continue
+        claim = read_owner_claim(child, filename=_AP_PID_FILE)
+        if claim is not None:
+            # Only a sweeper in the owner's boot and PID namespace can judge it.
+            if not owner_is_gone(claim, process_alive=_pid_alive):
+                continue
+            pid = claim.pid
+        else:
+            # A bare PID from a build that predates owner claims.
+            try:
+                pid = int(sentinel.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError) as exc:
+                _logger.warning(
+                    "could not read AP_PID sentinel at %s: %s; skipping",
+                    sentinel,
+                    exc,
+                )
+                continue
+            if _pid_alive(pid):
+                continue
         _logger.info(
             "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
             child,
