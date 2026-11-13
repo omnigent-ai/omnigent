@@ -302,6 +302,7 @@ def _poll_for_assistant_marker(
     session_id: str,
     marker: str,
     timeout: float,
+    after: str | None = None,
 ) -> str:
     """
     Poll session items until an assistant message contains *marker*.
@@ -315,6 +316,8 @@ def _poll_for_assistant_marker(
     :param marker: The literal string Claude was asked to echo, e.g.
         ``"AWAITUP_3F9C1A"``.
     :param timeout: Max seconds to wait for the response.
+    :param after: Only consider items newer than this item id, e.g. one
+        recorded before sending the message being answered.
     :returns: The matching assistant message text.
     :raises AssertionError: If no assistant message contains *marker*
         within *timeout* (the dropped-first-message regression), or as soon
@@ -323,7 +326,10 @@ def _poll_for_assistant_marker(
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        resp = client.get(f"/v1/sessions/{session_id}/items", params={"limit": 50, "order": "asc"})
+        params: dict[str, str | int] = {"limit": 50, "order": "asc"}
+        if after is not None:
+            params["after"] = after
+        resp = client.get(f"/v1/sessions/{session_id}/items", params=params)
         if resp.status_code == 200:
             for item in resp.json().get("data", []):
                 text = _assistant_text(item)

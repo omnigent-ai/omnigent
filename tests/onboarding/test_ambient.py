@@ -482,7 +482,7 @@ def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) ->
 
 # ── Codex config.toml custom provider (cli-config) detection ───────────────
 
-# The exact shape `isaac configure codex` writes (Unity Gateway mode): a custom
+# The shape a Codex setup writes (Unity Gateway mode): a custom
 # [model_providers.Databricks] table authenticated by a token-printing
 # command, selected via a top-level model_provider — and NO auth.json.
 _ISAAC_STYLE_CODEX_CONFIG = """
@@ -531,9 +531,9 @@ def _write_codex_config(home, body: str) -> None:
 def test_codex_config_custom_provider_detected(clean_env) -> None:
     """An isaac-style config.toml (custom provider + auth command) is detected.
 
-    This is the exact state ``isaac configure codex`` leaves behind — no
+    This is the state a Codex setup leaves behind — no
     auth.json at all — which the subscription detection cannot see. Failure
-    means internal users' gateway-configured codex shows as "not configured"
+    means managed users' gateway-configured codex shows as "not configured"
     in setup (the original bug).
     """
     _write_codex_config(clean_env, _ISAAC_STYLE_CODEX_CONFIG)
@@ -876,7 +876,7 @@ def test_prewarm_detect_providers_failure_falls_back_to_fresh_sweep(
     assert sweeps == ["sweep", "sweep"]
 
 
-# --- Claude Code managed-settings gateway (the `isaac configure claude` shape) ---
+# --- Claude Code managed-settings gateway (the shape a Claude setup writes) ---
 #
 # The credential lives in Claude Code's own enterprise settings, so omnigent
 # REFLECTS it (readiness + label) but surfaces it as the existing `subscription`

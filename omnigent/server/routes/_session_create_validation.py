@@ -10,15 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
 from pydantic import ValidationError
 
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, local_single_user_enabled
+from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.host_store import host_is_live
@@ -36,17 +37,30 @@ class ProjectCreateResolution:
     project_id: str | None = None
 
 
+def server_sandbox_providers(request: Any) -> tuple[str, ...]:
+    """The sandbox providers this server can launch, to check a saved provider against.
+
+    :param request: The create request, whose app carries ``sandbox_config``.
+    :returns: Launchable provider names; empty when managed sandboxes are off.
+    """
+    sandbox_config = getattr(request.app.state, "sandbox_config", None)
+    return sandbox_config.launchable_providers() if sandbox_config is not None else ()
+
+
 async def resolve_project_session_create(
     *,
     body: Any,
     user_id: str | None,
     project_store: ProjectStore | None,
+    launchable_sandbox_providers: Collection[str] = (),
 ) -> ProjectCreateResolution:
     """Apply opt-in project defaults before any create-side validation.
 
     Field presence, rather than value, controls defaulting.  Consequently an
     explicit JSON ``null`` remains explicit and is never replaced by a project
     hint.  Unknown and foreign projects deliberately share one 404 response.
+    A saved sandbox provider is inherited only when it is in
+    ``launchable_sandbox_providers``; an unconfigured one is ignored.
     """
     fields_set = set(body.model_fields_set)
     project_id = getattr(body, "project_id", None)
@@ -65,10 +79,28 @@ async def resolve_project_session_create(
 
     # Nested agents inherit filing, while the composer or MCP chooses their placement.
     config = {} if getattr(body, "sibling_source_id", None) else project.config
+    # A child runs on its parent's host, so the project's new-target defaults don't apply.
+    managed = (
+        getattr(body, "host_type", None) == "managed"
+        and getattr(body, "parent_session_id", None) is None
+    )
+    repository = _saved_managed_repository(config) if managed else None
     updates: dict[str, Any] = {}
     for field in ("agent_id", "workspace", "git"):
+        if repository is not None and field in ("workspace", "git"):
+            continue
         if field not in fields_set and field in config and field in body.__class__.model_fields:
             updates[field] = config[field]
+    if repository is not None and not {"workspace", "workspaces"} & fields_set:
+        updates["workspaces"] = [repository]
+    saved_provider = config.get("sandbox_provider")
+    if (
+        managed
+        and "sandbox_provider" not in fields_set
+        and isinstance(saved_provider, str)
+        and saved_provider in launchable_sandbox_providers
+    ):
+        updates["sandbox_provider"] = saved_provider
     resolved_data = body.model_dump()
     resolved_data.update(updates)
     # Re-validate project hints because config is intentionally stored as
@@ -92,6 +124,26 @@ async def resolve_project_session_create(
         )
 
     return ProjectCreateResolution(body=resolved, project_id=project_id)
+
+
+def _saved_managed_repository(config: dict[str, Any]) -> str | None:
+    """The project's saved repository as a managed workspace, or ``None``.
+
+    A malformed saved value is ignored rather than failing the create, since
+    config is opaque client JSON.
+
+    :param config: The project's opaque config object.
+    :returns: ``url`` or ``url#branch``, e.g. ``"https://git.example.com/team/app.git#main"``.
+    """
+    from omnigent.server.managed_hosts import parse_project_repository
+
+    if "repository" not in config:
+        return None
+    try:
+        parsed = parse_project_repository(config["repository"])
+    except ValueError:
+        return None
+    return parsed.url if parsed.branch is None else f"{parsed.url}#{parsed.branch}"
 
 
 def validate_session_model_metadata(
@@ -167,9 +219,9 @@ async def validate_session_agent(
         )
     require_user_agent_visible(agent, user_id)
 
-    # Session-scoped agents belong to a specific session. The caller must have
-    # at least READ access to that owning session — otherwise they can execute
-    # another user's private agent by guessing the raw agent id.
+    # Binding a session-scoped agent into a new session shares its mutable agent
+    # row, so the caller needs EDIT on the owning session. READ would let a
+    # read-only collaborator run, and then change, another user's private agent.
     if agent.session_id is not None:
         # Single-user servers persist the local owner as NULL (scheduled tasks
         # store user_id=None), but session grants are keyed by the "local"
@@ -186,7 +238,7 @@ async def validate_session_agent(
             await require_access(
                 access_user,
                 agent.session_id,
-                LEVEL_READ,
+                LEVEL_EDIT,
                 permission_store,
                 conversation_store,
             )
@@ -194,26 +246,26 @@ async def validate_session_agent(
             if denied.code not in (ErrorCode.FORBIDDEN, ErrorCode.NOT_FOUND):
                 raise
             # Forks of the owner's sessions share the row, so the lookup above
-            # picked one of several roots; READ on any of them is enough.
-            if not await _can_read_another_root(
+            # may pick one of several roots; EDIT on any of them is enough.
+            if not await _can_edit_another_root(
                 agent, access_user, permission_store, conversation_store
             ):
                 raise
     return agent
 
 
-# ponytail: checks the first 50 roots using the agent; a caller who can read only a
+# ponytail: checks the first 50 roots using the agent; a caller who can edit only a
 # later one is refused (forking that session still works).
 _SHARED_AGENT_ROOT_SCAN = 50
 
 
-async def _can_read_another_root(
+async def _can_edit_another_root(
     agent: Any,
     user_id: str | None,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore,
 ) -> bool:
-    """Whether *user_id* has READ on a session other than ``agent.session_id`` using it."""
+    """Whether *user_id* has EDIT on a session other than ``agent.session_id`` using it."""
     roots = await asyncio.to_thread(
         conversation_store.list_session_roots_for_agent, agent.id, _SHARED_AGENT_ROOT_SCAN
     )
@@ -221,7 +273,7 @@ async def _can_read_another_root(
         if root == agent.session_id:
             continue
         try:
-            await require_access(user_id, root, LEVEL_READ, permission_store, conversation_store)
+            await require_access(user_id, root, LEVEL_EDIT, permission_store, conversation_store)
         except OmnigentError:
             continue
         return True
@@ -274,8 +326,8 @@ async def _authorize_host_for_workspace(
         the ownership check (minimal test wirings).
     :param host_registry: Live host tunnels on this replica.
     :returns: The host's display name for error messages, or ``None``.
-    :raises OmnigentError: ``WRONG_REPLICA`` when the host is live but
-        its tunnel is on another replica.
+    :raises WrongReplicaError: When the host is live but its tunnel is on
+        another replica.
     """
     from omnigent.server.routes._host_launch import resolve_host_owner
 
@@ -292,15 +344,14 @@ async def _authorize_host_for_workspace(
     # → "host is offline" (invalid_input), which the client can't recover
     # from. If the host is live per the store but its tunnel isn't on this
     # replica, the create landed on the wrong replica — surface WRONG_REPLICA
-    # so the client re-addresses WITHOUT the key. A genuinely offline host
+    # naming the slice key that re-addresses it. A genuinely offline host
     # falls through to the invalid_input case. Both are 400; the distinct
     # code, not the status, is what tells the client to re-address rather
     # than give up. Safe to raise here: workspace validation runs BEFORE
     # create_conversation, so no orphan row is left.
     if host_registry is not None and host_registry.get(host_id) is None and host_is_live(host):
-        raise OmnigentError(
-            f"host {host.name or host_id!r} is on another replica; retry",
-            code=ErrorCode.WRONG_REPLICA,
+        raise WrongReplicaError(
+            f"host {host.name or host_id!r} is on another replica", host_id=host_id
         )
     return host.name
 

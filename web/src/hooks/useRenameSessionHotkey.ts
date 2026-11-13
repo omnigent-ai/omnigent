@@ -2,20 +2,18 @@ import { useEffect, useRef } from "react";
 
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { type Chord, chordMatches } from "@/lib/shortcuts/chord";
 
-/** Cmd/Ctrl+Alt+R; match the physical key because Option changes its character. */
+// The physical key, because Option changes the character it types.
+const RENAME_SESSION_CHORD: Chord = { mod: true, alt: true, code: "KeyR" };
+
+/** Cmd/Ctrl+Alt+R. */
 export function isRenameSessionHotkey(
   event: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
 ): boolean {
-  return (
-    hasCommandModifier(event, isMac) &&
-    event.altKey &&
-    !event.shiftKey &&
-    !event.getModifierState("AltGraph") &&
-    event.code === "KeyR"
-  );
+  return chordMatches(RENAME_SESSION_CHORD, event, isMac);
 }
 
 /** Bind alongside the owner-only title editor so unavailable sessions keep their keys. */

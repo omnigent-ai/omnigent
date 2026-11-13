@@ -131,6 +131,75 @@ async def test_child_sessions_404_for_nonexistent_session(
     assert resp.status_code == 404
 
 
+# ── Agent costs ──────────────────────────────────────────
+
+
+async def test_agent_costs_report_subtree_totals(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    session = await _create_parent_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    codex = _seed_child(conv_store=store, parent_id=session["id"], title="codex:a")
+    grandchild = _seed_child(conv_store=store, parent_id=codex.id, title="codex:b")
+    free = _seed_child(conv_store=store, parent_id=session["id"], title="worker:c")
+    unpriced = _seed_child(conv_store=store, parent_id=session["id"], title="worker:d")
+    store.set_session_usage(session["id"], {"total_cost_usd": 1.0})
+    store.set_session_usage(codex.id, {"total_cost_usd": 0.5})
+    store.set_session_usage(grandchild.id, {"total_cost_usd": 0.25})
+    store.set_session_usage(free.id, {"total_cost_usd": 0.0})
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/agent_costs")
+
+    assert resp.status_code == 200
+    assert {row["id"]: row["cost_usd"] for row in resp.json()["data"]} == {
+        # Own and descendant spend, as each session's own total reports it.
+        session["id"]: 1.75,
+        codex.id: 0.75,
+        grandchild.id: 0.25,
+        # A known zero stays zero; nothing priced stays unknown.
+        free.id: 0.0,
+        unpriced.id: None,
+    }
+    child_resp = await client.get(f"/v1/sessions/{codex.id}/agent_costs")
+    assert {row["id"] for row in child_resp.json()["data"]} == {codex.id, grandchild.id}
+    missing = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/agent_costs")
+    assert missing.status_code == 404
+
+
+async def test_agent_costs_paginate_and_bound_the_tree_read(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes.sessions import routes_items
+
+    session = await _create_parent_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    for name in ("a", "b"):
+        _seed_child(conv_store=store, parent_id=session["id"], title=f"worker:{name}")
+    url = f"/v1/sessions/{session['id']}/agent_costs"
+
+    pages: list[dict[str, Any]] = []
+    after: str | None = None
+    while not pages or pages[-1]["has_more"]:
+        params = {"limit": 2, **({"after": after} if after else {})}
+        pages.append((await client.get(url, params=params)).json())
+        after = pages[-1]["last_id"]
+    assert [len(page["data"]) for page in pages] == [2, 1]
+    assert len({row["id"] for page in pages for row in page["data"]}) == 3
+    stale = await client.get(url, params={"after": "ad563e906854634c49e1a6fd2fbb31d4"})
+    assert (stale.status_code, stale.json()["error"]["code"]) == (400, "stale_cursor")
+
+    # A tree past the read cap reports no costs rather than reading it all, and a
+    # continuation across that growth restarts instead of ending early.
+    monkeypatch.setattr(routes_items, "_SPAWN_TREE_READ_CAP", 1)
+    capped = (await client.get(url)).json()
+    assert (capped["data"], capped["has_more"]) == ([], False)
+    grown = await client.get(url, params={"after": pages[0]["last_id"]})
+    assert (grown.status_code, grown.json()["error"]["code"]) == (400, "stale_cursor")
+
+
 # ── Empty ────────────────────────────────────────────────
 
 
@@ -1418,6 +1487,18 @@ async def test_native_subagent_session_stamps_terminal_ui_labels(
             ["--dangerously-bypass-approvals-and-sandbox"],
         ),
         (
+            "codex-native",
+            {"permission_mode": "approve-for-me"},
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ],
+        ),
+        (
             "cursor-native",
             {"yolo": True},
             ["--yolo"],
@@ -1431,19 +1512,10 @@ async def test_native_subagent_yolo_args_derived_from_trusted_spec(
     expected_args: list[str],
 ) -> None:
     """
-    A YOLO-declaring native worker bundle gets bypass ``terminal_launch_args``.
+    Named workers persist the permission arguments declared by their own spec.
 
-    The worker sub-agent's own bundle declares its full-bypass intent
-    (``permission_mode: bypassPermissions`` for claude-native,
-    ``yolo: true`` for codex-native / cursor-native). On a sub-agent create,
-    the server derives the matching flag list from that trusted,
-    server-loaded spec and persists it as the child session's
-    ``terminal_launch_args`` — which the runner appends to the native CLI
-    argv so the headless worker can edit without stalling on an
-    ApprovalCard.
-
-    A failure here means the translation seam regressed and the worker
-    would launch in its default prompting mode (and hang headless).
+    Explicit Codex automatic review must survive named sub-agent resolution
+    instead of falling back to the headless bypass default.
     """
     parent = await _create_parent_with_subagents(
         client,
@@ -1460,8 +1532,6 @@ async def test_native_subagent_yolo_args_derived_from_trusted_spec(
         },
     )
     assert resp.status_code == 201, resp.text
-    # The persisted child session carries exactly the YOLO bypass flags;
-    # an empty / None value would mean the worker launches prompting.
     assert resp.json()["terminal_launch_args"] == expected_args
 
 
@@ -2062,6 +2132,54 @@ async def test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn(
     assert parent_after is not None
     assert parent_after.model_override == parent_before.model_override
     assert parent_after.reasoning_effort == parent_before.reasoning_effort
+
+
+async def test_fork_of_a_closed_codex_side_chat_accepts_messages(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forking a side chat whose tab was closed continues it as an open session."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
+    parent = await _create_parent_session(client, agent_name="side-fork")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(parent["id"], {"omnigent.wrapper": "codex-native-ui"})
+    store.set_runner_id(parent["id"], "runner_parent")
+    created = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread-side", "agent_nickname": "Side chat"},
+        },
+    )
+    assert created.status_code == 202, created.text
+    child_id = created.json()["child_session_id"]
+    # Closing the side chat's tab stops it, which seals the child.
+    stopped = await client.post(f"/v1/sessions/{child_id}/events", json={"type": "stop_session"})
+    assert stopped.status_code == 202, stopped.text
+    child = (await client.get(f"/v1/sessions/{child_id}")).json()
+    assert child["labels"][CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
+
+    forked = await client.post(f"/v1/sessions/{child_id}/fork", json={})
+
+    assert forked.status_code == 201, forked.text
+    fork = (await client.get(f"/v1/sessions/{forked.json()['id']}")).json()
+    assert fork["parent_session_id"] is None
+    assert CLOSED_LABEL_KEY not in fork["labels"]
+    sent = await client.post(
+        f"/v1/sessions/{fork['id']}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "Go on"}]},
+        },
+    )
+    # No runner is bound here, so the send gets as far as runner routing.
+    assert sent.status_code == 503, sent.text
+    assert sent.json()["error"]["code"] == "runner_unavailable"
+    child_after = (await client.get(f"/v1/sessions/{child_id}")).json()
+    assert child_after["labels"][CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
 
 
 async def test_subagent_idle_forward_recovers_via_parent_when_child_runner_stale(

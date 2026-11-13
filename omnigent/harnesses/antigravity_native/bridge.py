@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -388,12 +389,15 @@ _AGY_ENABLED_TOOLS = [
     "sys_os_shell",
     "sys_os_write",
     "sys_policy_registry",
+    "sys_project_list",
+    "sys_project_update",
     "sys_session_close",
     "sys_session_create",
     "sys_session_get_history",
     "sys_session_get_info",
     "sys_session_list",
     "sys_session_send",
+    "sys_session_update",
     "sys_terminal_close",
     "sys_terminal_launch",
     "sys_terminal_list",
@@ -474,6 +478,19 @@ def agy_gemini_dir(bridge_dir: Path) -> Path:
         config/state and the Omnigent MCP config.
     """
     return agy_home_dir(bridge_dir) / ".gemini"
+
+
+def agy_conversation_db(bridge_dir: Path, cascade_id: str) -> Path:
+    """Return the conversation db agy writes for *cascade_id* under this session's Gemini dir.
+
+    Its existence proves the cascade was created by this session's own agy; a
+    foreign agy writes into its own ``--gemini_dir``.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :param cascade_id: agy cascade/conversation id.
+    :returns: Path of that conversation's sqlite db (may not exist yet).
+    """
+    return agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations" / f"{cascade_id}.db"
 
 
 def build_mcp_config(
@@ -984,6 +1001,12 @@ def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> Non
     os.replace(tmp, settings_path)
 
 
+# Serializes bridge-state writes in this process, so a guarded conversation-id update
+# (cold-start, reader recovery) is atomic against other writes and a terminal's
+# clear/reseed. Reentrant because update_conversation_id writes while holding it.
+_STATE_UPDATE_LOCK = threading.RLock()
+
+
 def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
     """
     Persist shared native Antigravity state atomically.
@@ -992,25 +1015,26 @@ def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) ->
     :param state: State payload to persist.
     :returns: None.
     """
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = bridge_dir / _STATE_FILE
-    fd, tmp_name = tempfile.mkstemp(prefix=f"{_STATE_FILE}.", dir=str(bridge_dir))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "session_id": state.session_id,
-                    "conversation_id": state.conversation_id,
-                    "active_turn_id": state.active_turn_id,
-                },
-                handle,
-                sort_keys=True,
-            )
-            handle.write("\n")
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+    with _STATE_UPDATE_LOCK:
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = bridge_dir / _STATE_FILE
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{_STATE_FILE}.", dir=str(bridge_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "session_id": state.session_id,
+                        "conversation_id": state.conversation_id,
+                        "active_turn_id": state.active_turn_id,
+                    },
+                    handle,
+                    sort_keys=True,
+                )
+                handle.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
 
 
 def clear_bridge_state(bridge_dir: Path) -> None:
@@ -1030,9 +1054,10 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native Antigravity bridge directory.
     :returns: None.
     """
-    for runtime_file in (_STATE_FILE, _TMUX_FILE):
-        with contextlib.suppress(FileNotFoundError):
-            (bridge_dir / runtime_file).unlink()
+    with _STATE_UPDATE_LOCK:
+        for runtime_file in (_STATE_FILE, _TMUX_FILE):
+            with contextlib.suppress(FileNotFoundError):
+                (bridge_dir / runtime_file).unlink()
 
 
 def read_bridge_state(bridge_dir: Path) -> AntigravityNativeBridgeState | None:
@@ -1081,6 +1106,9 @@ def update_conversation_id(
     bridge_dir: Path,
     conversation_id: str,
     active_turn_id: str | None = None,
+    *,
+    expect_placeholder: bool = False,
+    expected_state: AntigravityNativeBridgeState | None = None,
 ) -> bool:
     """
     Update the agy conversation id in bridge state.
@@ -1095,31 +1123,63 @@ def update_conversation_id(
     forever, surfaced only as a generic "conversation not ready". The caller
     decides how to react (it stays best-effort; this never raises).
 
+    The guards are checked under one process-wide lock, so racing writers cannot
+    clobber each other's binding.
+
     :param bridge_dir: Native Antigravity bridge directory.
     :param conversation_id: New agy conversation id, e.g.
         ``"agy_conv_abc123"``.
     :param active_turn_id: Active turn id for the new conversation, e.g.
         ``"turn_abc123"``, or ``None`` when no turn is running yet.
+    :param expect_placeholder: When ``True``, only replace an ``agy_conv_*``
+        placeholder; a real id already in state is kept and ``False`` returned.
+    :param expected_state: When set, only write if bridge state still names this
+        session and conversation, e.g. the placeholder a recovery scan started
+        from; a recreated terminal's new placeholder is kept and ``False`` returned.
     :returns: ``True`` when the new id was written, ``False`` when there was no
-        existing state to update (the id was dropped; a WARNING was logged).
+        existing state to update (the id was dropped; a WARNING was logged) or a
+        guard kept the current state.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        _logger.warning(
-            "Antigravity bridge: no existing state at %s to update; dropping "
-            "conversation_id=%s (the reader will stay on the placeholder id)",
+    with _STATE_UPDATE_LOCK:
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            _logger.warning(
+                "Antigravity bridge: no existing state at %s to update; dropping "
+                "conversation_id=%s (the reader will stay on the placeholder id)",
+                bridge_dir,
+                conversation_id,
+            )
+            return False
+        if expect_placeholder and not is_placeholder_conversation_id(state.conversation_id):
+            _logger.info(
+                "Antigravity bridge: state at %s already binds conversation %s; keeping it "
+                "instead of replacing it with %s",
+                bridge_dir,
+                state.conversation_id,
+                conversation_id,
+            )
+            return False
+        if expected_state is not None and (state.session_id, state.conversation_id) != (
+            expected_state.session_id,
+            expected_state.conversation_id,
+        ):
+            _logger.info(
+                "Antigravity bridge: state at %s changed from conversation %s to %s; "
+                "not replacing it with %s",
+                bridge_dir,
+                expected_state.conversation_id,
+                state.conversation_id,
+                conversation_id,
+            )
+            return False
+        write_bridge_state(
             bridge_dir,
-            conversation_id,
+            AntigravityNativeBridgeState(
+                session_id=state.session_id,
+                conversation_id=conversation_id,
+                active_turn_id=active_turn_id,
+            ),
         )
-        return False
-    write_bridge_state(
-        bridge_dir,
-        AntigravityNativeBridgeState(
-            session_id=state.session_id,
-            conversation_id=conversation_id,
-            active_turn_id=active_turn_id,
-        ),
-    )
     return True
 
 
@@ -1849,20 +1909,12 @@ def send_interaction_keys_via_tui(
     """
     Send raw key arguments to the agy TUI pane to answer its in-process prompt.
 
-    The companion to :func:`inject_user_message_via_tui` for the OTHER thing the
-    attended agy TUI maintains in parallel with the RPC step state: its
-    **in-process permission / question prompt**. When agy runs attended (the
-    web/mobile path types every turn into the TUI), an approval surfaces in the
-    Omnigent web UI AND as agy's own numbered TUI prompt ("Do you want to
-    proceed?", 1.Yes … 4.No). Delivering the verdict over
-    :func:`omnigent.harnesses.antigravity_native.rpc.handle_user_interaction` flips the
-    backend trajectory step to DONE and the command runs, but the **TUI prompt
-    for that interaction can stay open** — and the next typed turn then lands in
-    that stale prompt's filter/amend buffer instead of starting a fresh turn
-    (live-verified; see ``docs/claude/antigravity-rpc-spike-notes.md`` §"attended
-    TUI"). So the bridge ALSO types the selection into the pane to dismiss the
-    prompt, mirroring cursor-native's
-    :func:`omnigent.harnesses.cursor_native.bridge.send_cursor_pane_keys`.
+    RPC and terminal prompt state can diverge. Callers must confirm the same
+    interaction is still waiting before sending post-RPC dismissal keys: a
+    closed prompt would accept those keys as a new chat message. Clients whose
+    trajectory is already DONE while their terminal prompt remains open need
+    manual dismissal; the RPC state cannot safely distinguish that stale menu
+    from an active composer.
 
     Each argument is a tmux ``send-keys`` key argument — a bare ``"1"`` / ``"4"``
     selects a numbered option, ``"Enter"`` confirms, ``"Escape"`` cancels — sent

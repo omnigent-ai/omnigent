@@ -1,3 +1,8 @@
+import {
+  addNestedSessionDraft,
+  updateNestedSessionDraft,
+  removeNestedSessionDraft,
+} from "@/lib/nestedSessionDrafts";
 import { useSiblingSessionDestinations } from "@/hooks/useSharing";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useComposerContext } from "@/hooks/useComposerContext";
@@ -19,7 +24,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
+import { useNavigate, useReplaceSearchParams, useSearchParams } from "@/lib/routing";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import { MobileHeaderControlPortal } from "./MobileHeaderControlsSlot";
@@ -57,7 +62,12 @@ import {
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
-import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
+import {
+  ComposerMirror,
+  MIRRORED_TEXTAREA_CLASS,
+  renderMentionTokens,
+  useComposerMirrorAlignment,
+} from "@/components/composer/MentionTokenOverlay";
 import {
   SandboxProfilePicker,
   useSandboxProfileCatalog,
@@ -117,6 +127,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
+import { managedSandboxHostId } from "@/lib/managedSandboxHost";
 import { randomUUID } from "@/lib/randomUUID";
 import { sessionRoutingHostId, setSessionHost } from "@/lib/sessionHost";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
@@ -177,6 +188,7 @@ import {
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import {
+  type PendingInitialPrompt,
   beginLocalConversation,
   hasPendingLocalMessage,
   hydrateLocalConversation,
@@ -202,6 +214,7 @@ import {
   initialPrefillState,
   prefillDone,
   projectPrefillStep,
+  projectRepository,
   withProjectLaunchDefaults,
   type ProjectPrefillConfig,
   type ProjectPrefillState,
@@ -235,6 +248,7 @@ import {
   readLastSandboxRepos,
   writeLastSandboxRepos,
 } from "@/lib/repoPreferences";
+import { readLastSandboxProfile, writeLastSandboxProfile } from "@/lib/sandboxProfilePreferences";
 import { readHarnessOptions, writeHarnessOption, type HarnessOptions } from "@/lib/modePreferences";
 import {
   getNewChatPickerCacheKey,
@@ -311,6 +325,8 @@ import {
   useSandboxModelOptions,
   useSandboxUnsupportedAgents,
 } from "@/hooks/useSandboxModelOptions";
+import { useSavedSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
+import { markSandboxLaunch } from "@/hooks/useSandboxLaunchSelectionCheck";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
 import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
@@ -343,6 +359,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import {
+  matchWorktree,
   useHostWorktrees,
   useVerifiedGitWorktrees,
   type HostWorktree,
@@ -371,8 +388,18 @@ import { CLIENT_CREATE_TOKEN_LABEL, newTempConversation } from "@/lib/tempConver
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import {
-  buildMentionPreamble,
+  MENTION_SEARCH_DEBOUNCE_MS,
+  useSessionMentionEntries,
+} from "@/hooks/useSessionMentionEntries";
+import {
+  composerInlineMentions,
+  expandMentionTokens,
+  findMentionTokens,
+  presentMentions,
+  type TaggedMentions,
+  withSessionMentionHint,
   detectMentionAt,
   type MentionState,
   parseMentionToken,
@@ -571,12 +598,11 @@ export function ConnectHostInstructions({
   /** After the desktop shell connects a machine over SSH, with its host id. */
   onSshConnected?: (hostId: string) => void;
 }) {
-  // Databricks/internal deployments add the "Databricks Lakebox" connect
-  // path; OSS deployments (where the lakebox launcher is excluded) show
-  // only the plain `omni host` command. Driven by /v1/info.
+  // Managed servers add the Lakebox connect path. Other builds show only the
+  // plain `omni host` command. Driven by /v1/info.
   const info = useServerInfo();
-  // "loading" before the boot probe resolves → treat as OSS (no Databricks
-  // hints) until known, so the clean UI shows first and lakebox never flashes.
+  // "loading" counts as no managed hints until the probe resolves, so the
+  // Lakebox option never flashes in.
   const databricksFeatures = info !== "loading" && info.databricks_features;
   const quotedServerUrl = quoteShellArgument(serverUrl);
   const sshConnectAvailable = useSshConnectAvailable();
@@ -686,15 +712,9 @@ export function composerWorktreeHeaderState({
   branchName,
   autoSeededBranch,
 }: ComposerWorktreeHeaderInput): ComposerWorktreeHeaderState {
-  const normalizedWorkspace = normalizeWorkspacePath(workspace);
   const currentWorktrees = worktreesResolved ? worktrees : [];
   const mainWorktree = currentWorktrees.find((worktree) => worktree.is_main) ?? null;
-  const selectedWorktree =
-    normalizedWorkspace === null
-      ? null
-      : (currentWorktrees.find(
-          (worktree) => normalizeWorkspacePath(worktree.path) === normalizedWorkspace,
-        ) ?? null);
+  const selectedWorktree = matchWorktree(currentWorktrees, workspace);
   const selectedDirectoryLabel =
     workspace.split("/").filter(Boolean).pop() ?? (workspace.trim() || "Working directory");
   const repositoryLabel =
@@ -923,6 +943,14 @@ function harnessWarningMessage(
       </>
     );
   }
+  if (reason === "cli-unresponsive") {
+    return (
+      <>
+        {agentName}&apos;s CLI on {hostName} did not respond to a version check — run it on that
+        machine and finish any setup prompt it shows.
+      </>
+    );
+  }
   return (
     <>
       {agentName} isn&apos;t configured on {hostName} — run <code>omni setup</code> on that machine.
@@ -937,7 +965,8 @@ function harnessWarningMessage(
  * Gated on the setup feature: when OFF, renders the original "run omnigent
  * setup" guidance so the flag-off UI is unchanged. When ON, offers a "Set up
  * <agent>" action that repairs native agents on user hosts in place, or opens
- * the setup checklist for other agents and managed hosts.
+ * the setup checklist for other agents and managed hosts. An unresponsive CLI
+ * keeps its timeout explanation, since setup would not change it.
  */
 function HarnessSetupNotice({
   agentName,
@@ -963,7 +992,7 @@ function HarnessSetupNotice({
       data-testid="new-chat-landing-harness-warning"
     >
       <TriangleAlertIcon className="size-3.5 shrink-0" />
-      {featureEnabled ? (
+      {featureEnabled && reason !== "cli-unresponsive" ? (
         <>
           <span>
             {agentName} isn&apos;t ready on {hostName}.
@@ -2096,6 +2125,8 @@ interface LandingDraft {
   project: string;
   message: string;
   files: File[];
+  /** Files and sessions tagged with "@" in ``message``. */
+  mentions?: TaggedMentions;
   pickedAgentId: string | null;
   selectedHostId: string | null;
   sandboxSelected: boolean;
@@ -2223,7 +2254,7 @@ function NewChatLandingContent({
   });
   const landingDraft = draftState.draft;
   const navigate = useNavigate();
-  const location = useLocation();
+  const replaceSearchParams = useReplaceSearchParams();
   const [searchParams] = useSearchParams();
   const linkedPrompt = searchParams.get("prompt");
   const handoffToken = searchParams.get(NEW_SESSION_HANDOFF_PARAM);
@@ -2329,6 +2360,8 @@ function NewChatLandingContent({
           useWorktree: c.use_worktree,
           model: c.model,
           effort: c.effort,
+          sandboxProvider: c.sandbox_provider,
+          repository: projectRepository(c.repository),
         }
       : {};
     return withProjectLaunchDefaults(stored, projectLaunch);
@@ -2461,31 +2494,28 @@ function NewChatLandingContent({
           autoSeededBranch: "",
         };
 
+  // A handoff or prompt link replaces the parked draft's text, and with it the
+  // tags that text's tokens pointed at.
+  const restoresDraftText = handoff === null && !linkedPrompt?.trim();
   const [message, setMessage] = useState<string>(() => {
     if (handoff !== null) return handoff.text;
     return linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? "");
   });
+  // Filled in once the mention browser below owns the tags.
+  const clearTaggedMentionsRef = useRef<() => void>(() => {});
   useEffect(() => {
     if (!searchParams.has("prompt") && handoffToken === null) return;
-    if (linkedPrompt?.trim()) setMessage(linkedPrompt);
+    if (linkedPrompt?.trim()) {
+      setMessage(linkedPrompt);
+      clearTaggedMentionsRef.current();
+    }
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
     remaining.delete("prompt");
     remaining.delete(NEW_SESSION_HANDOFF_PARAM);
     forgetNewSessionHandoff(handoffToken);
-    navigate(
-      { pathname: location.pathname, search: remaining.toString(), hash: location.hash },
-      { replace: true, state: location.state },
-    );
-  }, [
-    linkedPrompt,
-    handoffToken,
-    searchParams,
-    location.pathname,
-    location.hash,
-    location.state,
-    navigate,
-  ]);
+    replaceSearchParams(remaining);
+  }, [linkedPrompt, handoffToken, searchParams, replaceSearchParams]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -2659,8 +2689,8 @@ function NewChatLandingContent({
   // consumed in the menu's onOpenChange) — connecting while the menu is open
   // looks janky. A ref so the close handler sees it synchronously.
   const pendingConnectRef = useRef(false);
-  // Arca (Databricks-internal): the desktop shell reports the MDM flag; when
-  // set, the picker offers connecting the user's Arca dev instance as a host.
+  // The desktop shell reports whether Arca is enabled. When it is, the picker
+  // offers connecting the user's Arca instance as a host.
   const [arcaEnabled, setArcaEnabled] = useState(false);
   const [arcaPreviewRecovery, setArcaPreviewRecovery] = useState(false);
   const [connectingArca, setConnectingArca] = useState(false);
@@ -2684,8 +2714,20 @@ function NewChatLandingContent({
   // is what the launch will use.
   const effectiveSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  // The profile last picked on this provider seeds the picker, like the last provider.
+  // Reread after each pick, so a composer reset in place (another project) starts on it.
+  const [sandboxProfilePicks, setSandboxProfilePicks] = useState(0);
+  const rememberedSandboxProfileId = useMemo(
+    () => readLastSandboxProfile(effectiveSandboxProvider),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- a pick changes the stored value
+    [effectiveSandboxProvider, sandboxProfilePicks],
+  );
   const { launchError: sandboxProfileError, selection: selectedSandboxProfile } =
-    useSandboxProfileCatalog(sandboxSelected ? effectiveSandboxProvider : null, sandboxProfile);
+    useSandboxProfileCatalog(
+      sandboxSelected ? effectiveSandboxProvider : null,
+      sandboxProfile,
+      rememberedSandboxProfileId,
+    );
   const sandboxMultiRepo =
     info !== "loading" &&
     effectiveSandboxProvider !== null &&
@@ -2879,6 +2921,18 @@ function NewChatLandingContent({
   // `submittedRef` is flipped once the draft is sent to a create, so the
   // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
+  const [nestedProvisional, setNestedProvisional] = useState(newTempConversation);
+  const siblingSourceRef = useRef(siblingSource);
+  siblingSourceRef.current = siblingSource;
+  const siblingSourceKey = siblingSource?.id;
+  useEffect(() => {
+    const source = siblingSourceRef.current;
+    if (!source || submittedRef.current) return;
+    addNestedSessionDraft(queryClient, nestedProvisional.id, source);
+    return () => {
+      if (!submittedRef.current) removeNestedSessionDraft(queryClient, nestedProvisional.id);
+    };
+  }, [queryClient, nestedProvisional, siblingSourceKey]);
   const submittedDraftRevisionRef = useRef<number | null>(null);
   // Whether this composer is still on screen. The create POST can outlive
   // it — the user opens another session while the session bootstraps — and
@@ -2971,9 +3025,8 @@ function NewChatLandingContent({
     };
   }, []);
 
-  // Desktop feature gates (MDM-managed). Read once per mount — the shell
-  // re-reads macOS preferences on every call, so reopening the composer is
-  // enough to pick up a profile change.
+  // Desktop feature gates. Read once per mount, so reopening the composer
+  // picks up a change.
   useEffect(() => {
     if (!isElectronShell()) return;
     let cancelled = false;
@@ -3099,7 +3152,7 @@ function NewChatLandingContent({
         setSandboxProvider(defaultSandboxProvider());
         return;
       }
-      // Sandbox no longer offered (e.g. an OSS server) — fall through.
+      // Sandbox no longer offered (e.g. the server dropped it) — fall through.
     } else if (lastChoice) {
       // Restore offline hosts too; availability gates creation, not selection.
       // Wait for the list so a remembered host cannot lose to a default.
@@ -3184,6 +3237,7 @@ function NewChatLandingContent({
   // armed until the host is seeded (the once-per-host guard), and skipped for
   // sandboxes (no host worktrees).
   const forkFreshArmed =
+    !siblingSourceId &&
     prefillSettled &&
     selectedHostId !== null &&
     !sandboxSelected &&
@@ -3359,12 +3413,17 @@ function NewChatLandingContent({
   // effort, and permission knobs.
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
   // Probe only the selected, available harness. Older hosts without readiness
-  // metadata remain eligible, matching the picker's setup warnings.
+  // metadata remain eligible, matching the picker's setup warnings. A CLI that
+  // missed its version check still launches, so its catalog stays loadable.
+  const hostModelsBlocked = (harness: string) => {
+    const unavailableReason = harnessUnavailableReasonOnHost(harness, selectedHost);
+    return unavailableReason !== null && unavailableReason !== "cli-unresponsive";
+  };
   const canLoadHostModels = (harness: string) =>
     selectedNativeHarness === harness &&
     hostSelected &&
     selectedHost?.status === "online" &&
-    !harnessUnconfiguredOnHost(harness, selectedHost);
+    !hostModelsBlocked(harness);
   const {
     data: hostClaudeModelOptions,
     isLoading: hostClaudeModelsLoading,
@@ -3407,7 +3466,7 @@ function NewChatLandingContent({
     (selectedNativeHarness !== harness ||
     loading ||
     hostReadinessPending ||
-    harnessUnconfiguredOnHost(harness, selectedHost) ||
+    hostModelsBlocked(harness) ||
     selectedHostId === null
       ? cached
       : undefined);
@@ -3490,6 +3549,16 @@ function NewChatLandingContent({
   // A harness the default catalog cannot serve keeps its ordinary picker.
   const sandboxDefaultModelsEnabled =
     sandboxDefaultModelsOffered && sandboxModels.data?.status !== "unconfigured";
+  // The agent's last sandbox session catalog is more accurate than the gateway preview.
+  const savedSandboxCatalog = useSavedSandboxSessionCatalog(
+    sandboxDefaultModelsOffered ? previewSandboxProvider : null,
+    previewHarness,
+    effectiveAgentId,
+  );
+  const sandboxSessionCatalog =
+    sandboxDefaultModelsEnabled && sandboxModels.data?.status !== "unsupported"
+      ? savedSandboxCatalog
+      : undefined;
   const sandboxInferenceConfigured =
     sandboxPreviewEnabled && sandboxModels.data?.configured === true;
   const sandboxHasModelCatalog = sandboxInferenceConfigured || sandboxDefaultModelsEnabled;
@@ -3509,28 +3578,37 @@ function NewChatLandingContent({
           ? (sandboxModels.data.error ?? "No usable models are available for this harness.")
           : null))
       : null;
-  const sandboxDefaultCatalogError = sandboxDefaultModelsEnabled
-    ? (sandboxModels.error?.message ??
-      (sandboxModels.data !== undefined &&
-      ["unavailable", "empty"].includes(sandboxModels.data.status)
-        ? (sandboxModels.data.error ?? "Could not load AI Gateway models.")
-        : null))
-    : null;
+  const sandboxDefaultCatalogError =
+    sandboxDefaultModelsEnabled && sandboxSessionCatalog === undefined
+      ? (sandboxModels.error?.message ??
+        (sandboxModels.data !== undefined &&
+        ["unavailable", "empty"].includes(sandboxModels.data.status)
+          ? (sandboxModels.data.error ?? "Could not load AI Gateway models.")
+          : null))
+      : null;
   const sandboxCatalog = useMemo(
     () =>
       sandboxDefaultModelsEnabled
-        ? sandboxDefaultCatalogError
-          ? []
-          : (sandboxModels.data?.models ?? [])
+        ? (sandboxSessionCatalog ??
+          (sandboxDefaultCatalogError ? [] : (sandboxModels.data?.models ?? [])))
         : sandboxInferenceConfigured
           ? sandboxModels.data!.models
           : undefined,
     [
       sandboxDefaultModelsEnabled,
+      sandboxSessionCatalog,
       sandboxDefaultCatalogError,
       sandboxInferenceConfigured,
       sandboxModels.data,
     ],
+  );
+  // Saved session rows keep the harness's in-session effort ladder.
+  const sandboxEffortLevels = useCallback(
+    (models: readonly NativeModelOption[], model: string | null | undefined): readonly string[] =>
+      sandboxSessionCatalog !== undefined
+        ? (nativeEffortOptions(previewHarness, models, model) ?? []).map((option) => option.value)
+        : codexEffortLevelsForModel(models, model),
+    [sandboxSessionCatalog, previewHarness],
   );
   const claudeModelOptions = useMemo(
     () =>
@@ -3963,7 +4041,7 @@ function NewChatLandingContent({
   const visiblePermissionRow =
     pickerLoading && !interactiveWhileLoading ? cachedPermission?.row : permissionConfigRow;
   const pickerEffortOptions = sandboxDefaultModelsEnabled
-    ? codexEffortLevelsForModel(pickerModelOptions, pickedModel).map((value) => ({
+    ? sandboxEffortLevels(pickerModelOptions, pickedModel).map((value) => ({
         value,
         label: normalizeEffortLabel(value),
       }))
@@ -4021,9 +4099,10 @@ function NewChatLandingContent({
       : picked || codexModelOptions.find((option) => option.isDefault)?.id;
     const effort =
       (sandboxDefaultModelsEnabled || selectedNativeHarness === "codex-native") &&
-      !codexEffortLevelsForModel(
-        sandboxDefaultModelsEnabled ? pickerModelOptions : codexModelOptions,
-        effortModel,
+      !(
+        sandboxDefaultModelsEnabled
+          ? sandboxEffortLevels(pickerModelOptions, effortModel)
+          : codexEffortLevelsForModel(codexModelOptions, effortModel)
       ).includes(pickedEffort)
         ? ""
         : pickedEffort;
@@ -4589,7 +4668,7 @@ function NewChatLandingContent({
         : saved.model;
     const model = sandboxCatalog?.find((row) => row.id === candidate);
     setPickedModel(model?.id ?? "");
-    const effortLevels = codexEffortLevelsForModel(sandboxCatalog ?? [], model?.id);
+    const effortLevels = sandboxEffortLevels(sandboxCatalog ?? [], model?.id);
     const effortCandidate =
       !userPickedEffortRef.current &&
       projectDefaultEffort != null &&
@@ -4604,6 +4683,7 @@ function NewChatLandingContent({
     previewHarness,
     effectiveAgentId,
     sandboxCatalog,
+    sandboxEffortLevels,
     pickerEdits,
     projectDefaultModel,
     projectDefaultEffort,
@@ -4864,11 +4944,11 @@ function NewChatLandingContent({
   // The worktree the picked directory currently points at, if any. Set when
   // the user navigated the picker straight into a worktree folder, or clicked
   // one in the list below.
-  const activeWorktree = useMemo(() => {
-    const target = normalizeWorkspacePath(workspaceTrimmed);
-    if (target === null) return null;
-    return linkedWorktrees.find((w) => normalizeWorkspacePath(w.path) === target) ?? null;
-  }, [linkedWorktrees, workspaceTrimmed]);
+  const currentWorktree = useMemo(
+    () => matchWorktree(verifiedGitWorktrees, workspaceTrimmed),
+    [verifiedGitWorktrees, workspaceTrimmed],
+  );
+  const activeWorktree = currentWorktree?.is_main ? null : currentWorktree;
   // An empty New field means the selected workspace itself is authoritative.
   // A non-empty field is exclusively a request to create a new worktree.
   const startInExistingWorktree =
@@ -4919,9 +4999,8 @@ function NewChatLandingContent({
   // until the user touches the base field — then their choice (including a
   // cleared field) stands. Clearing the branch name (so the base field goes
   // away) re-arms the auto-fill, so naming a branch again starts fresh from the
-  // current default. The project's stored default (Project settings) wins over
-  // the user-global one (Settings › Git); an unset project default falls
-  // through to the global one, then to blank (fork from current branch).
+  // current default. Nested agents use the selected checkout's branch; other
+  // sessions use the project default, then the user-global preference.
   useEffect(() => {
     if (!shouldCreateWorktree) {
       if (worktreeVerificationPending && branchName.trim() !== "") return;
@@ -4931,7 +5010,11 @@ function NewChatLandingContent({
       return;
     }
     if (!baseBranchEdited) {
-      _setBaseBranch(projectBaseBranch ?? readDefaultBaseBranch() ?? "");
+      _setBaseBranch(
+        siblingSourceId
+          ? (currentWorktree?.branch ?? "")
+          : (projectBaseBranch ?? readDefaultBaseBranch() ?? ""),
+      );
     }
   }, [
     shouldCreateWorktree,
@@ -4939,6 +5022,8 @@ function NewChatLandingContent({
     branchName,
     baseBranchEdited,
     projectBaseBranch,
+    siblingSourceId,
+    currentWorktree?.branch,
   ]);
   // Existing worktrees stay visible while a new branch name is drafted. The
   // two actions are deliberately separate: radio selection binds an existing
@@ -4966,7 +5051,16 @@ function NewChatLandingContent({
     const { writes } = step;
     if (writes.selectSandbox) {
       setSandboxSelected(true);
-      setSandboxProvider(defaultSandboxProvider());
+      // A stored provider the server no longer offers falls back to the default.
+      const storedProvider = writes.sandboxProvider;
+      setSandboxProvider(
+        storedProvider !== undefined && sandboxProviderRows.includes(storedProvider)
+          ? storedProvider
+          : defaultSandboxProvider(),
+      );
+    }
+    if (writes.sandboxRepos !== undefined) {
+      setSandboxRepoSelections(writes.sandboxRepos);
     }
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
@@ -5008,14 +5102,18 @@ function NewChatLandingContent({
     prefillConfig,
     projectLaunch,
     defaultSandboxProvider,
+    sandboxProviderRows,
   ]);
 
+  // Nested agents reuse their source checkout unless a new worktree is explicitly chosen.
+  const defaultUseWorktree =
+    !siblingSourceId && (prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true;
   // Seed a fresh worktree branch once the workspace settles, from the effective
   // default (project `use_worktree` wins, else the user-global setting).
   // Ref-guarded to fire once per workspace and only into an empty branch.
   useEffect(() => {
     if (prefill.project !== projectParam || !prefillDone(prefill)) return;
-    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) !== true) return;
+    if (!defaultUseWorktree) return;
     if (sandboxSelected || selectedHostId === null || workspaceTrimmed === "") return;
     if (branchName !== "" || activeWorktree !== null) return;
     if (worktreeSeededForRef.current === workspaceTrimmed) return;
@@ -5026,7 +5124,7 @@ function NewChatLandingContent({
     worktreeSeededForRef.current = workspaceTrimmed;
     if (hostWorktrees.some((w) => w.is_main)) setAutoSeededBranch(generateBranchName());
   }, [
-    prefillConfig,
+    defaultUseWorktree,
     prefill,
     projectParam,
     sandboxSelected,
@@ -5045,12 +5143,12 @@ function NewChatLandingContent({
   // default off in Settings. Only clears while the field still holds OUR seed.
   useEffect(() => {
     if (autoSeededBranch === "" || branchName !== autoSeededBranch) return;
-    if ((prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true) return;
+    if (defaultUseWorktree) return;
     setBranchName("");
     setAutoSeededBranch("");
     // Re-arm the seed guard so flipping the default back on can seed again.
     worktreeSeededForRef.current = null;
-  }, [prefillConfig, branchName, autoSeededBranch]);
+  }, [defaultUseWorktree, branchName, autoSeededBranch]);
 
   // Keep provider changes and unfinished URL edits from silently dropping repositories.
   const sandboxRepoOverCap = sandboxRepoSelections.length > maxSandboxRepos;
@@ -5230,7 +5328,14 @@ function NewChatLandingContent({
     mentionFilter,
     workspaceRoot,
   ]);
-  const mentionOpen = mentionEntries.length > 0;
+  // Other sessions are taggable for every agent (no session exists yet, so
+  // there are no subagents to list).
+  const sessionEntries = useSessionMentionEntries({
+    mention,
+    debouncedQuery: useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS),
+    currentSessionId: null,
+  });
+  const mirrorRef = useRef<HTMLDivElement>(null);
   // Closed-but-loading window: don't let Enter send the half-typed "@dir/".
   // ``isPlaceholderData`` covers the drill-down window where react-query is
   // still serving the previous directory's rows (``isLoading`` stays false).
@@ -5243,20 +5348,37 @@ function NewChatLandingContent({
   // host-filesystem source + token state above are launcher-specific.
   const {
     mentionIndex,
+    mentionOpen,
+    sessionMenu,
     mentionedItems,
+    setMentionedItems,
     attachMention,
     openMentionDir,
-    removeMentionedItem,
+    mentionedSessions,
+    setMentionedSessions,
+    attachSession,
+    mentionTokens,
+    handleTokenBackspace,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
   } = useMentionBrowser({
     mention,
     setMention,
     mentionEntries,
+    sessionEntries,
     text: message,
     setText: setMessage,
     textareaRef,
+    initialMentions: restoresDraftText ? restoredDraft?.mentions : undefined,
   });
+  clearTaggedMentionsRef.current = () => {
+    setMentionedItems([]);
+    setMentionedSessions([]);
+  };
+  // The draft snapshot is built above the hook; add the tags it owns.
+  draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
+  const mentionTokensShown = findMentionTokens(message, mentionTokens).length > 0;
+  useComposerMirrorAlignment(mirrorRef, textareaRef, mentionTokensShown);
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
   const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
@@ -5289,10 +5411,7 @@ function NewChatLandingContent({
   // A drafted branch needs the discovery result unless the repository is
   // already verified; the always-use-worktree default needs it to seed one.
   const worktreeRequestPending =
-    worktreeDiscoveryPending &&
-    (branchName.trim() !== ""
-      ? !workspaceIsGit
-      : (prefillConfig?.useWorktree ?? readAlwaysUseWorktree()) === true);
+    worktreeDiscoveryPending && (branchName.trim() !== "" ? !workspaceIsGit : defaultUseWorktree);
   const worktreeHeader = composerWorktreeHeaderState({
     workspace: workspaceTrimmed,
     worktrees: hostWorktrees ?? [],
@@ -5645,9 +5764,9 @@ function NewChatLandingContent({
     if (hostId === selectedHostId) return;
     setSandboxSelected(false);
     setSelectedHostId(hostId);
-    // Workspace is host-specific — clear it and let the seeding effect run for
-    // the new host.
-    setWorkspace("");
+    // Returning to the source host restores its checkout, not an unrelated recent path.
+    setWorkspace(hostId === siblingSource?.hostId ? (siblingSource.workspace ?? "") : "");
+    if (siblingSourceId) setBranchName("");
     workspaceFromConfigRef.current = false;
     seededHostRef.current = null;
   }
@@ -5706,11 +5825,9 @@ function NewChatLandingContent({
     }
   }
 
-  // Connect the user's Arca dev instance (Databricks-internal sandbox) as a
-  // host, then select it. The bridge runs `arca ssh … isaac omni host
-  // --background` and resolves once the remote daemon started; the daemon then
-  // registers over its own tunnel moments later, so we poll the host list
-  // briefly to pick the host that newly came online.
+  // Connect the user's Arca instance as a host, then select it. The bridge
+  // resolves once the remote daemon starts. The daemon registers a moment
+  // later, so poll the host list briefly for the host that came online.
   async function connectArca() {
     if (connectingArca) return;
     setConnectingArca(true);
@@ -5756,7 +5873,7 @@ function NewChatLandingContent({
         });
         const fresh = hostList.find((h) => h.status === "online" && !onlineBefore.has(h.host_id));
         if (fresh) {
-          // Remember which host is the Arca box so the picker can tag it.
+          // Remember which host is the Arca instance so the picker can tag it.
           writeArcaHostId(fresh.host_id);
           selectHost(fresh.host_id);
           return;
@@ -5782,6 +5899,10 @@ function NewChatLandingContent({
   function returnDraftToUser(temporaryConversationId?: string) {
     submittedRef.current = false;
     submittedDraftRevisionRef.current = null;
+    removeNestedSessionDraft(queryClient, nestedProvisional.id);
+    if (siblingSource && onScreenRef.current) {
+      setNestedProvisional(newTempConversation());
+    }
     const originalDraft =
       temporaryConversationId && !hasPendingLocalMessage(temporaryConversationId)
         ? { ...draftRef.current, message: "", files: [] }
@@ -5792,6 +5913,11 @@ function NewChatLandingContent({
       // The draft's files were validated when the user attached them, so
       // they come back verbatim rather than through a re-validating replace.
       restoreFiles(returnedDraft.files);
+      // Merged tags, so recovered tokens still expand to their own targets.
+      if (returnedDraft.mentions) {
+        setMentionedItems(returnedDraft.mentions.files);
+        setMentionedSessions(returnedDraft.mentions.sessions);
+      }
     } else {
       writeLandingDraft(draftState, returnedDraft);
     }
@@ -5833,6 +5959,8 @@ function NewChatLandingContent({
       pendingMsgTempId: string;
       createToken: string;
     } | null = null;
+    let createdSessionId: string | undefined;
+    let undeliveredPrompt: PendingInitialPrompt | null = null;
     // Single teardown for EVERY create-failure exit (the `catch` and the
     // `"error" in created` early return): drop the client-only conversation and,
     // if the user is still on it, send them back to landing so the restored
@@ -5890,6 +6018,7 @@ function NewChatLandingContent({
       // Spend the draft only once provisioning starts, after the laptop credential check.
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
+      if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
         writeLastSandboxRepos(sandboxRepoSelections);
@@ -5985,9 +6114,14 @@ function NewChatLandingContent({
       // from the marker; no upload happens. Folders carry a trailing "/".
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
-      const initialPrompt =
-        buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null) +
-        sanitizeInitialPrompt(message);
+      const liveMentions = presentMentions(
+        composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
+        [message],
+      );
+      const initialPrompt = withSessionMentionHint(
+        expandMentionTokens(sanitizeInitialPrompt(message), liveMentions),
+        liveMentions.some((m) => m.marker.startsWith("[Session: ")),
+      );
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
       // selects which CLI bridge the runner launches — the values are the
@@ -6037,7 +6171,7 @@ function NewChatLandingContent({
       // "Sessions" section while the search-indexed session list catches up to
       // the move. A `project_id` create needs no label: the row is born with
       // first-class membership (and a label would go stale on project rename).
-      const createLabels =
+      const createLabels: Record<string, string> =
         selectedProject && createProjectId === null
           ? {
               ...(baseLabels ?? {}),
@@ -6046,11 +6180,13 @@ function NewChatLandingContent({
             }
           : { ...(baseLabels ?? {}), ...composerContextLabels };
 
+      if (siblingSource) createLabels[CLIENT_CREATE_TOKEN_LABEL] = nestedProvisional.token;
       const skill = isNativeTerminalAgent
         ? null
         : matchSkillInvocation(initialPrompt, availableSkills);
       const serverOwnsInitialInput =
         sandboxSelected && info !== "loading" && info.durable_initial_input === true;
+      if (!serverOwnsInitialInput) undeliveredPrompt = { text: initialPrompt, skill, files };
       const initialInput =
         skill !== null
           ? {
@@ -6081,7 +6217,7 @@ function NewChatLandingContent({
         const metadata: Parameters<typeof createBundledSession>[1] = { labels: createLabels };
         if (siblingSourceId) metadata.sibling_source_id = siblingSourceId;
         if (sandboxSelected) {
-          // Multipart creates allocate their host server-side; they cannot reserve a host ID.
+          // Bundle creates send no host id until the server's multipart host_id is deployed.
           metadata.host_type = "managed";
           metadata.workspaces = composeSandboxWorkspaces(sandboxRepoSelections);
           if (sandboxProvider !== null) metadata.sandbox_provider = sandboxProvider;
@@ -6130,6 +6266,7 @@ function NewChatLandingContent({
           serverOwnsInitialInput ? files : [],
         );
         data = { id: bundled.id };
+        createdSessionId = data.id;
         launchedAgentId = bundled.agentId ?? null;
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
@@ -6142,7 +6279,7 @@ function NewChatLandingContent({
         setPendingAgent(null);
       } else {
         // Normal path: bind to an existing registered agent.
-        const provisional = newTempConversation();
+        const provisional = siblingSource ? nestedProvisional : newTempConversation();
         try {
           localConv = beginLocalConversation(initialPrompt, files, provisional, localProject, {
             // Seed the temp session with the NORMALIZED create identity so the
@@ -6174,6 +6311,7 @@ function NewChatLandingContent({
         const matchOwnCreate = (item: SessionListWireItem) =>
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
+        const managedHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
         const createPayload = JSON.stringify({
           ...(siblingSourceId ? { sibling_source_id: siblingSourceId } : {}),
           ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
@@ -6206,9 +6344,7 @@ function NewChatLandingContent({
                   : {}),
                 // The new sandbox host's id, in the server's minted shape;
                 // keys the create and the session's requests until it binds.
-                ...(info !== "loading" && info.request_managed_sandbox_host_id
-                  ? { host_id: randomUUID().replace(/-/g, "") }
-                  : {}),
+                ...(managedHostId ? { host_id: managedHostId } : {}),
                 ...(sandboxPreviewEnabled && sandboxModels.data?.configuration_revision
                   ? {
                       inference_configuration_revision: sandboxModels.data.configuration_revision,
@@ -6351,10 +6487,19 @@ function NewChatLandingContent({
           return;
         }
         data = { id: created.id };
+        createdSessionId = data.id;
         // Register create_session (created → first AI activity), split by host.
         // New Chat is the only create path that can produce a managed sandbox;
         // interactionTelemetry completes/settles the span once the session runs.
         markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
+        if (sandboxSelected) {
+          const launchedRow = sandboxCatalog?.find((row) => row.id === normalizedModelOverride);
+          markSandboxLaunch(created.id, {
+            model: normalizedModelOverride ?? null,
+            effort: normalizedReasoningEffort ?? null,
+            modelLabel: launchedRow ? nativeModelLabel(launchedRow) : null,
+          });
+        }
       }
       // Persist the configuration that actually launched. Modal Save updates
       // storage eagerly so an immediate Send cannot observe stale state; this
@@ -6463,6 +6608,7 @@ function NewChatLandingContent({
         writeLandingDraft(draftState, null);
       }
 
+      if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id, data.id);
       // `localConv` is set only when a real agent id was resolved up front.
       if (localConv !== null && effectiveAgentId !== null) {
         const tempConvId = localConv.tempConvId;
@@ -6494,6 +6640,25 @@ function NewChatLandingContent({
         }
       }
     } catch {
+      if (siblingSource && createdSessionId) {
+        const stillViewing = localConv
+          ? stillViewingLocalSession(localConv.tempConvId)
+          : onScreenRef.current && window.location.href === createLocation;
+        if (
+          undeliveredPrompt &&
+          (localConv === null || hasPendingLocalMessage(localConv.tempConvId))
+        ) {
+          setPendingInitialPrompt(createdSessionId, undeliveredPrompt);
+        }
+        if (localConv) removeLocalConversation(localConv.tempConvId);
+        updateNestedSessionDraft(queryClient, nestedProvisional.id, createdSessionId);
+        void queryClient.refetchQueries({ queryKey: ["conversations"] });
+        showToast("Session created, but setup didn't finish. Open the session to continue.");
+        if (stillViewing) {
+          navigate(sessionLocation(createdSessionId));
+        }
+        return;
+      }
       const msg = "Couldn't reach the server. Check your connection and try again.";
       returnDraftToUser(localConv?.tempConvId);
       tearDownLocalConversation();
@@ -6730,7 +6895,15 @@ function NewChatLandingContent({
           <SandboxProfilePicker
             provider={effectiveSandboxProvider}
             value={sandboxProfile}
-            onChange={setSandboxProfile}
+            onChange={(profile) => {
+              setSandboxProfile(profile);
+              // Saved on pick, like the agent, harness and sandbox provider.
+              if (profile) {
+                writeLastSandboxProfile(profile.provider, profile.id);
+                setSandboxProfilePicks((picks) => picks + 1);
+              }
+            }}
+            rememberedProfileId={rememberedSandboxProfileId}
           />
         </ComposerWorkspaceBar>
       )}
@@ -7075,13 +7248,22 @@ function NewChatLandingContent({
           >
             <ChatComposer
               appearance={isMobileViewport ? "glass" : "default"}
-              hasContent={files.length > 0 || mentionedItems.length > 0 || attachmentError !== null}
+              hasContent={
+                files.length > 0 ||
+                mentionedItems.length > 0 ||
+                mentionedSessions.length > 0 ||
+                attachmentError !== null
+              }
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
               className={cn(isDragActive && "ring-2 ring-ring ring-inset")}
               data-testid="new-chat-landing-composer"
               input={{
                 ref: textareaRef,
                 value: message,
+                className: mentionTokensShown ? MIRRORED_TEXTAREA_CLASS : undefined,
+                onScroll: (e) => {
+                  if (mirrorRef.current) mirrorRef.current.scrollTop = e.currentTarget.scrollTop;
+                },
                 onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
                   slashCompletion.onSelectionChange(e.target);
@@ -7090,15 +7272,14 @@ function NewChatLandingContent({
                   // remove and nothing else would ever clear this. Left sticky it
                   // reads as a blocker on a composer the user can actually submit.
                   if (attachmentError !== null) clearError();
-                  // Recompute the active "@"-mention from the caret each keystroke
-                  // (native terminal agents with a workspace — ``mentionEnabled``).
+                  // Recompute the active "@"-mention from the caret each keystroke.
+                  // Sessions are taggable for every agent; files need ``mentionEnabled``.
                   setMention(
-                    mentionEnabled
-                      ? detectMentionAt(
-                          e.target.value,
-                          e.target.selectionStart ?? e.target.value.length,
-                        )
-                      : null,
+                    detectMentionAt(
+                      e.target.value,
+                      e.target.selectionStart ?? e.target.value.length,
+                      sessionEntries.map((session) => session.title),
+                    ),
                   );
                 },
                 onFocus: () => {
@@ -7117,6 +7298,7 @@ function NewChatLandingContent({
                   // mutually exclusive with the slash menu (a token can't be both)
                   // and takes priority over submission.
                   if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
+                  if (handleTokenBackspace(e)) return;
 
                   // Slash-completion menu keys (shared useSlashCompletion) —
                   // navigate, complete, or dismiss; takes priority over
@@ -7139,6 +7321,11 @@ function NewChatLandingContent({
                 "data-testid": "new-chat-landing-input",
               }}
               slots={{
+                inputBackdrop: mentionTokensShown && (
+                  <ComposerMirror ref={mirrorRef}>
+                    {renderMentionTokens(message, mentionTokens)}
+                  </ComposerMirror>
+                ),
                 beforeInput: (
                   <>
                     {/* Skill suggestions — floats above the composer box. */}
@@ -7160,11 +7347,15 @@ function NewChatLandingContent({
                     {(mentionOpen || mentionListingPending) && (
                       <FileMentionMenu
                         currentDir={mentionDir}
+                        query={mention?.query ?? ""}
+                        fileQuery={mentionFilter}
                         activeIndex={mentionIndex}
                         entries={mentionEntries}
                         loading={mentionListingPending}
                         onOpenDir={openMentionDir}
                         onAttach={attachMention}
+                        sessionMenu={sessionMenu}
+                        onAttachSession={attachSession}
                       />
                     )}
                   </>
@@ -7202,10 +7393,6 @@ function NewChatLandingContent({
                         }
                       }}
                     />
-                    {/* "@"-mention chips — one per tagged workspace file/folder. Each is
-                delivered as an "[Attached: <path>]" marker prepended to the
-                first message at create time. */}
-                    <ComposerMentionChips items={mentionedItems} onRemove={removeMentionedItem} />
                     {/* Pending attachments — image thumbnails (click to view) + file rows. */}
                     <ComposerAttachments files={files} onRemove={removeFile} />
                     {/* Rejected-attachment feedback: unsupported type or too large */}
@@ -7657,6 +7844,7 @@ function NewChatLandingContent({
                         voiceSnapshotRef.current = message;
                       }}
                       onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
+                      inputRef={textareaRef}
                       onTranscript={dictation.appendFinal}
                       onInterim={dictation.replaceInterim}
                     />
@@ -8018,7 +8206,7 @@ function NewChatLandingContent({
             ? async (bundle) => {
                 const installed = await installAgentBundle(bundle);
                 try {
-                  const mine = await queryClient.fetchQuery({
+                  const { agents: mine } = await queryClient.fetchQuery({
                     queryKey: USER_AGENTS_QUERY_KEY,
                     queryFn: fetchUserAgents,
                     staleTime: 0,

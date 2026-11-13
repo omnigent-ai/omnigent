@@ -34,7 +34,7 @@ from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.entities import Conversation
+from omnigent.entities import Conversation, MessageData, NewConversationItem
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
@@ -1167,6 +1167,79 @@ async def _offline_native_host_session(client: httpx.AsyncClient, app: FastAPI) 
     await comm.wait(timeout=budget(5.0))
     assert app.state.host_registry.get(_HOST_ID) is None
     return response.json()["id"]
+
+
+@pytest.mark.parametrize(
+    ("host_state", "expected_status"),
+    [
+        ("offline", "running"),
+        ("expired", "idle"),
+        ("unreadable", "running"),
+    ],
+)
+async def test_list_preserves_resumable_offline_host_turn(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    host_state: str,
+    expected_status: str,
+) -> None:
+    """A list read cannot end a bounded hold or turn unreachable Stop into success."""
+    from dataclasses import replace
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.orchestration import HOST_OFFLINE_HOLD_S
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+
+    session_id = await _offline_native_host_session(client, app)
+    hosts = app.state.host_store
+    get_host = hosts.get_host
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(session_id)
+    assert conv is not None and conv.runner_id is not None
+    store.clear_runner_liveness(conv.runner_id)
+    if host_state == "expired":
+        old_stamp = int(time.time() - HOST_OFFLINE_HOLD_S - 2 * RUNNER_LIVENESS_TTL_S - 120)
+        host = get_host(_HOST_ID)
+        assert host is not None
+        old_host = replace(host, created_at=old_stamp - 100, updated_at=old_stamp)
+        monkeypatch.setattr(hosts, "get_host", lambda _host_id: old_host)
+    await asyncio.wrap_future(
+        session_live_state.submit(
+            "test_offline_read_running", store.set_session_live_status, session_id, "running"
+        )
+    )
+    sessions_module._session_status_cache.pop(session_id, None)
+    if host_state == "unreadable":
+
+        def unreadable_host(_host_id: str) -> None:
+            raise OSError("host lookup unavailable")
+
+        monkeypatch.setattr(hosts, "get_host", unreadable_host)
+    completions: list[str] = []
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_scheduled_run_completion",
+        lambda _session_id, status, **_kwargs: completions.append(status),
+    )
+
+    response = await client.get("/v1/sessions")
+    assert response.status_code == 200, response.text
+    item = next(row for row in response.json()["data"] if row["id"] == session_id)
+    assert item["status"] == expected_status
+    assert store.get_conversation(session_id).live_status == expected_status  # type: ignore[union-attr]
+    assert completions == ([] if expected_status == "running" else ["failed"])
+    if expected_status == "running":
+        monkeypatch.setattr(hosts, "get_host", get_host)
+        stopped = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "stop_session", "data": {}}
+        )
+        assert stopped.status_code == 503, stopped.text
+        assert stopped.json()["error"]["code"] == "runner_unavailable"
+        assert store.get_conversation(session_id).live_status == "running"  # type: ignore[union-attr]
+        assert completions == []
 
 
 @pytest.mark.parametrize("has_runner_binding", [True, False])
@@ -4481,9 +4554,9 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
     real_replace = store.replace_runner_id
     bound_runner_ids: list[str] = []
 
-    def record_binding(session_id: str, runner_id: str) -> Conversation:
+    def record_binding(session_id: str, runner_id: str, **kwargs: Any) -> Conversation:
         bound_runner_ids.append(runner_id)
-        return real_replace(session_id, runner_id)
+        return real_replace(session_id, runner_id, **kwargs)
 
     async def replace_during_admission(conn: HostConnection, session_id: str) -> None:
         admissions.append(conn)
@@ -4769,19 +4842,61 @@ def _shared_runner_family(
 async def test_archiving_child_does_not_stop_parents_shared_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
     _shared_runner_family: dict[str, str],
 ) -> None:
-    """A child's archive must end only the child, not the runner its parent is on."""
+    """An idle child's archive releases its backend without stopping its parent."""
+    from omnigent.runner import create_runner_app
+    from omnigent.runner.native import orchestration as native
+    from omnigent.server.routes import sessions as sessions_module
+
     comm = await _connect_host(app)
     parent = await _inline_launch_session(client, comm)
     async with _HostFrameResponder(comm) as host:
         child = await _inline_child_session(client, parent["id"])
         _shared_runner_family.update(parent=parent["id"], child=child["id"])
+        transcript_content = [{"type": "input_text", "text": "Remember the completed worker."}]
+        (transcript_item,) = SqlAlchemyConversationStore(db_uri).append(
+            child["id"],
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_completed_worker",
+                    data=MessageData(role="user", content=transcript_content),
+                )
+            ],
+        )
+        sessions_module._session_status_cache[child["id"]] = "idle"
+        child_backend = Mock(close=AsyncMock())
+        parent_backend = Mock(close=AsyncMock())
+        monkeypatch.setitem(native._AUTO_CODEX_APP_SERVERS, child["id"], child_backend)
+        monkeypatch.setitem(native._AUTO_CODEX_APP_SERVERS, parent["id"], parent_backend)
+        runner_app = create_runner_app(server_client=client)
+        resources = runner_app.state.session_resource_registry
+        cleanup = AsyncMock(wraps=resources.cleanup_session)
+        monkeypatch.setattr(resources, "cleanup_session", cleanup)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=runner_app), base_url="http://runner"
+        ) as runner:
+            resolve = AsyncMock(return_value=runner)
+            monkeypatch.setattr(sessions_module, "_get_runner_client", resolve)
+            archive = await client.patch(f"/v1/sessions/{child['id']}", json={"archived": True})
+            assert archive.status_code == 200, archive.text
+            await _drain_detached_stops()
 
-        archive = await client.patch(f"/v1/sessions/{child['id']}", json={"archived": True})
-        assert archive.status_code == 200, archive.text
-        await _drain_detached_stops()
+        cleanup.assert_awaited_once_with(child["id"])
+        child_backend.close.assert_awaited_once()
+        parent_backend.close.assert_not_awaited()
+        assert child["id"] not in native._AUTO_CODEX_APP_SERVERS
+        assert resolve.await_args.kwargs["for_control"] is True
 
+    child_row = (await client.get(f"/v1/sessions/{child['id']}")).json()
+    assert child_row["archived"] is True
+    transcript = await client.get(f"/v1/sessions/{child['id']}/items")
+    assert transcript.status_code == 200, transcript.text
+    retained = next(item for item in transcript.json()["data"] if item["id"] == transcript_item.id)
+    assert retained["content"] == transcript_content
     parent_row = (await client.get(f"/v1/sessions/{parent['id']}")).json()
     assert parent_row["archived"] is False
     assert parent["runner_id"] not in host.stopped_runner_ids, (

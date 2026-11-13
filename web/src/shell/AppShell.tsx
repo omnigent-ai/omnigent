@@ -5,9 +5,8 @@ import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
   type ComponentProps,
   type CSSProperties,
-  lazy,
-  Suspense,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -16,6 +15,7 @@ import {
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { ShellCommandContext, ShellCommandDraftContext } from "./ShellCommandContext";
 import {
   Outlet,
   useLocation,
@@ -31,6 +31,8 @@ import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
 import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
+import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
+import type { Session, SessionStatus } from "@/lib/types";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
@@ -41,7 +43,6 @@ import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
-import { ArcaShutdownToast } from "@/components/ArcaShutdownToast";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -52,7 +53,6 @@ import {
   closeDesktopWindow,
   confirmDesktopQuit,
   isAndroidShell,
-  isElectronShell,
   isIOSShell,
   isMacElectronShell,
   onNativeSidebarDrag,
@@ -74,7 +74,6 @@ import {
   writeDefaultWorkspacePanelOpen,
 } from "@/lib/workspacePanelPreferences";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
-import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import {
   type DefaultWorkspaceTab,
   isDefaultWorkspaceTab,
@@ -109,6 +108,7 @@ import {
   type TerminalInfo,
 } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "./useWorkspaceResources";
+import { relativizeToWorkspace } from "@/hooks/useWorkspaceChangedFiles";
 import { useUiOpenFile } from "@/hooks/useUiOpenFile";
 import { citedFilePosition } from "./filePositionState";
 import { cn } from "@/lib/utils";
@@ -134,52 +134,38 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
-import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import {
   FileViewerContext,
   type FilePosition,
   type OpenFileOptions,
   type FileNavigationGuard,
 } from "./FileViewerContext";
-import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { revealFolderInFilesPanel } from "./FilesPanel";
+import { selectPullRequestInPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
-import { PullRequestPanel } from "./PullRequestPanel";
-import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { ContentSearchPanel } from "./ContentSearchPanel";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
-import { SubagentsPanel } from "./SubagentsPanel";
 import { isCachedAncestor, useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
 } from "./TerminalFirstContext";
-import { TerminalsPanel } from "./TerminalsPanel";
+import { AppShellWorkspacePanels } from "./AppShellWorkspacePanels";
 import { PermissionsModal } from "@/components/PermissionsModal";
-import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
-import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
-import { CommandPalette } from "./CommandPalette";
-import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
-import { Toaster } from "@/components/ui/sonner";
+import { AppShellOverlays } from "./AppShellOverlays";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { CloseWindowDialog } from "./CloseWindowDialog";
 import { QuitDialog } from "./QuitDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
-import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
+import { SessionCostButton, SessionOverview, useIsWideViewport } from "./SessionOverview";
 import type { RightRailTab } from "./railTabs";
-
-// Dev-only preview; lazy so the sample data never ships in production bundles.
-const ImportContextPreview = import.meta.env.DEV
-  ? lazy(() => import("@/components/onboarding/ImportContextPreview"))
-  : null;
 
 /**
  * Top-level layout. The sidebar and right panels are responsive:
@@ -264,11 +250,54 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
   return stored !== null && stored !== CHAT_VIEW_STORAGE_VALUE ? stored : agentKey;
 }
 
+/**
+ * Working fields for an off-window session's archive confirmation. The streamed
+ * open-session row decides, or the snapshot until it loads; a row fetched by id
+ * lacks the background flag until the stream settles it, so the snapshot's stands
+ * in. The live store only adds work, since a fresh bind starts idle.
+ */
+function offWindowArchiveState(
+  row: Conversation | null,
+  snapshot: Pick<Session, "status" | "pendingElicitations" | "backgroundTaskCount">,
+  boundStatus: SessionStatus | null,
+  boundBackgroundTaskCount: number,
+): Pick<Conversation, "status" | "pending_elicitations_count" | "background_work_running"> {
+  const snapshotBackground =
+    snapshot.status === "waiting" || (snapshot.backgroundTaskCount ?? 0) > 0;
+  const reportedStatus: string | undefined = row ? row.status : snapshot.status;
+  let status: Conversation["status"] = "idle";
+  if (boundStatus === "running" || reportedStatus === "running") status = "running";
+  else if (reportedStatus === "failed") status = "failed";
+  return {
+    status,
+    pending_elicitations_count: row
+      ? (row.pending_elicitations_count ?? 0)
+      : (snapshot.pendingElicitations?.length ?? 0),
+    // `waiting` is the loop parked on background work, which rows report separately.
+    background_work_running:
+      (row?.background_work_running ?? snapshotBackground) ||
+      reportedStatus === "waiting" ||
+      boundStatus === "waiting" ||
+      boundBackgroundTaskCount > 0,
+  };
+}
+
 export function AppShell() {
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const setDraft = useCallback((key: string, command: string | null) => {
+    setDrafts((current) => {
+      if (command !== null) return { ...current, [key]: command };
+      const { [key]: _discarded, ...remaining } = current;
+      return remaining;
+    });
+  }, []);
+  const draftContext = useMemo(() => ({ drafts, setDraft }), [drafts, setDraft]);
   return (
     <GridSessionsProvider>
       <MobileHeaderControlsProvider>
-        <AppShellImpl />
+        <ShellCommandDraftContext.Provider value={draftContext}>
+          <AppShellImpl />
+        </ShellCommandDraftContext.Provider>
       </MobileHeaderControlsProvider>
     </GridSessionsProvider>
   );
@@ -281,6 +310,7 @@ function GridSessionMain(props: ComponentProps<"main">) {
 }
 
 function AppShellImpl() {
+  const shellDrafts = useContext(ShellCommandDraftContext);
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
@@ -525,12 +555,9 @@ function AppShellImpl() {
   const [selectedTerminalKey, setSelectedTerminalKey] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedTerminalKey ?? null) : null,
   );
-  // The one shell key the user just opened by an explicit gesture (clicking a
-  // tab / creating a "+"→Shell). Its rail xterm may grab keyboard focus when it
-  // connects; a shell merely *restored* on a session switch may not — switching
-  // sessions keeps focus in the chat composer. Cleared once consumed and on
-  // every session switch.
-  const autoFocusTerminalKeyRef = useRef<string | null>(null);
+  // A shell opened by an explicit gesture may grab focus on connect; a restored
+  // one may not. Scoped per session: a switch restores the next shell first.
+  const autoFocusTerminalRef = useRef<{ conversationId: string; key: string } | null>(null);
   // Whether the workspace rail is maximized (covers the full content region,
   // hiding the chat column). Session-transient — a fresh visit starts docked.
   const [rightPanelMaximized, setRightPanelMaximized] = useState(false);
@@ -546,9 +573,6 @@ function AppShellImpl() {
   // to, so the persist effect targets the right session even before a switch's
   // restore has re-rendered. Set by the conversation-restore effect.
   const stateConvRef = useRef<string | null>(conversationId ?? null);
-  // Skips the first persist run so mount can't write default state over the
-  // values the restore effect is about to apply.
-  const workspacePersistHydrated = useRef(false);
   // Hidden (dot-prefixed) files are shown by default; the eye toggle hides them.
   const [filesPanelShowHidden, setFilesPanelShowHidden] = useState(true);
   // Lifted so the Changes list order and the FileViewer prev/next order
@@ -584,18 +608,9 @@ function AppShellImpl() {
   const workspaceTabListRef = useRef<HTMLDivElement>(null);
   const focusWorkspaceTabsOnOpenRef = useRef(false);
   const rightPanelOpenRef = useRef(rightPanelOpen);
+  const localFileUrlRef = useRef<URLSearchParams | null>(null);
   rightPanelOpenRef.current = rightPanelOpen;
   const [rightPanelVisibilityAnimating, setRightPanelVisibilityAnimating] = useState(false);
-  // Take the incoming session's rail open-state during render, so its first frame
-  // doesn't show the outgoing session's rail. The restore effect applies the rest.
-  const [railOpenConversationId, setRailOpenConversationId] = useState(conversationId);
-  if (railOpenConversationId !== conversationId) {
-    setRailOpenConversationId(conversationId);
-    setRightPanelOpen(
-      conversationId ? restoredRailOpen(conversationId, canvasMode, searchParams) : false,
-    );
-    setRightPanelVisibilityAnimating(false);
-  }
   const rightPanelMotionTimerRef = useRef<number | null>(null);
   const cancelRightPanelVisibilityMotion = useCallback(() => {
     if (rightPanelMotionTimerRef.current !== null) {
@@ -635,6 +650,7 @@ function AppShellImpl() {
     [],
   );
   const [shareOpen, setShareOpen] = useState(false);
+  const [sharedFilePath, setSharedFilePath] = useState<string | undefined>();
   const [forkOpen, setForkOpen] = useState(false);
   const [forkSourceSessionId, setForkSourceSessionId] = useState<string | null>(null);
   const [forkHostSessionId, setForkHostSessionId] = useState<string | null>(null);
@@ -834,6 +850,18 @@ function AppShellImpl() {
   const isKnownTopLevel =
     activeConv != null ||
     (activeSessionMatchesRoute && activeSession != null && activeSession.parentSessionId == null);
+  // The off-window archive confirmation's sources; see `offWindowArchiveState`.
+  const openSessionRow = useOpenSessionRow(
+    !conversationsLoading && !activeConv && isKnownTopLevel && isOwnerLevel(permissionLevel)
+      ? (serverConversationId ?? null)
+      : null,
+  );
+  const boundSessionStatus = useChatStore((s) =>
+    s.conversationId === serverConversationId ? s.sessionStatus : null,
+  );
+  const boundBackgroundTaskCount = useChatStore((s) =>
+    s.conversationId === serverConversationId ? s.backgroundTaskCount : 0,
+  );
   const actionConversation = useMemo<Conversation | null>(() => {
     if (!isKnownTopLevel || !isOwnerLevel(permissionLevel)) return null;
     if (activeConv) return activeConv;
@@ -857,8 +885,24 @@ function AppShellImpl() {
       agent_name: activeSession.agentName,
       family: activeSession.family,
       git_branch: activeSession.gitBranch ?? null,
+      // `useArchivePrompt` applies `isSessionWorking` to these.
+      ...offWindowArchiveState(
+        openSessionRow,
+        activeSession,
+        boundSessionStatus,
+        boundBackgroundTaskCount,
+      ),
     };
-  }, [activeConv, activeSession, activeSessionMatchesRoute, isKnownTopLevel, permissionLevel]);
+  }, [
+    activeConv,
+    activeSession,
+    activeSessionMatchesRoute,
+    boundBackgroundTaskCount,
+    boundSessionStatus,
+    isKnownTopLevel,
+    openSessionRow,
+    permissionLevel,
+  ]);
   // Header action gating, hoisted so the desktop buttons and the mobile
   // three-dot menu render the exact same set (they can't drift apart).
   // Stop session is not a header action — it lives in the sidebar row's
@@ -944,6 +988,8 @@ function AppShellImpl() {
     subagentsPanelOpen,
     shellsPanelOpen,
     rightPanelOpen,
+    rightPanelMaximized,
+    sidebarOpen,
   };
   const railSelectionRef = useRef(railSelection);
   railSelectionRef.current = railSelection;
@@ -975,6 +1021,9 @@ function AppShellImpl() {
           (prev) => {
             const params = new URLSearchParams(prev);
             params.set("file", filePath);
+            if (now.rightPanelMaximized) params.set("fullscreen", "1");
+            else params.delete("fullscreen");
+            localFileUrlRef.current = params;
             return params;
           },
           { replace: true },
@@ -1004,7 +1053,6 @@ function AppShellImpl() {
   // root's cached tree, we hold that root until the authoritative
   // resolution lands (a no-op transition once it does).
   const stickyRootRef = useRef<string | null>(null);
-  const previousRootSessionIdRef = useRef<string | null>(null);
   const queryClient = useQueryClient();
   // Derive the root from `serverConversationId` (undefined for a temp id) so the
   // fallback below never yields `temp:*` — otherwise `useChildSessions` would
@@ -1255,12 +1303,23 @@ function AppShellImpl() {
     [conversationId, setSearchParams, terminalFirst],
   );
 
-  // Restore the per-session workspace state when switching conversations:
-  // rail open-state, selected tab, and the open file tabs. The Chat/TUI toggle
-  // is restored from sessionStorage; with no per-tab choice, terminal-first
-  // sessions use the Appearance default. The Files scope and the active file
-  // also honor URL search params so shared links open to the right view.
-  useEffect(() => {
+  // Restore saved and URL workspace state during render (on mount and on every
+  // switch) so the session's first frame is correct.
+  const [restoredWorkspace, setRestoredWorkspace] = useState<{
+    conversationId: string | undefined;
+    canvasMode: boolean;
+    exitedMaximized: boolean;
+  } | null>(null);
+  // The root as of the previous render, so restoration can tell whether the
+  // switch stays inside the visible Agents tree.
+  const [previousRootSessionId, setPreviousRootSessionId] = useState<string | null>(null);
+  if (
+    restoredWorkspace === null ||
+    restoredWorkspace.conversationId !== conversationId ||
+    restoredWorkspace.canvasMode !== canvasMode
+  ) {
+    setShareOpen(false);
+    setSharedFilePath(undefined);
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
@@ -1269,130 +1328,247 @@ function AppShellImpl() {
     setContentSearchPanelOpen(false);
     setSideChatsPanelOpen(false);
     setFilesPanelShowHidden(true);
-    // Drop shell interaction state carried from the outgoing session: a
-    // still-armed create ref would otherwise auto-focus an unrelated shell in
-    // the new session, and an open "Close shell?" dialog would target a
-    // terminal absent from the new session's list.
-    pendingShellCreateRef.current = null;
+    // An open "Close shell?" dialog would target a terminal absent from the
+    // new session's list.
     setTerminalPendingClose(null);
     setFileNavigation(undefined);
+    setRightPanelVisibilityAnimating(false);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
       // effects stay quiet on non-session routes.
-      setRightPanelOpenImmediately(false);
+      setRestoredWorkspace({ conversationId, canvasMode, exitedMaximized: false });
+      setRightPanelOpen(false);
       setRightRailTab(null);
       setOpenPanels([]);
       setSelectedFilePath(null);
       setOpenFiles([]);
-      autoFocusTerminalKeyRef.current = null;
       setSelectedTerminalKey(null);
       setPanelInitialKeyState(null);
-      stateConvRef.current = null;
+    } else {
+      const persisted = readSessionWorkspaceState(conversationId);
+      const showAgents = searchParams.get("panel") === "agents";
+
+      const storageKey = `omnigent.web.panel-key:${conversationId}`;
+      const stored = sessionStorage.getItem(storageKey);
+      const requestedView = terminalFirst ? searchParams.get("view") : null;
+      const terminalKey =
+        agentTerminal === null ? PANEL_NO_TERMINAL_KEY : terminalTabKey(agentTerminal);
+      const defaultToTerminal = terminalFirst && readTranscriptViewDefault() === "terminal";
+      setPanelInitialKeyState(
+        showAgents || requestedView === "chat"
+          ? null
+          : requestedView === "terminal"
+            ? resolveTerminalViewKey(stored, terminalKey)
+            : stored === CHAT_VIEW_STORAGE_VALUE
+              ? null
+              : (stored ?? (defaultToTerminal ? terminalKey : null)),
+      );
+
+      // A remembered per-session tab wins; otherwise use the Appearance default.
+      // Navigating within the visible Agents tree is one continuous rail action,
+      // so keep that tab while moving between its root and descendants.
+      const keepAgentsAcrossTreeNavigation =
+        rightRailTab === "subagents" &&
+        rootSessionId !== null &&
+        previousRootSessionId === rootSessionId;
+      let nextTab: RightRailTab | null =
+        persisted.rightRailTab ??
+        (keepAgentsAcrossTreeNavigation ? "subagents" : readInitialWorkspaceTab());
+      // Browser is a dynamic soft-tab mode, not a permanent nav destination.
+      // A stale pre-soft-tab selection (or a closed last tab) restores to the
+      // configured static default instead of showing an unselected rail.
+      const persistedBrowsers = persisted.openBrowsers ?? [];
+      if (
+        nextTab === "browser" &&
+        (persisted.selectedBrowserId === null ||
+          persisted.selectedBrowserId === undefined ||
+          !persistedBrowsers.includes(persisted.selectedBrowserId))
+      ) {
+        nextTab = readInitialWorkspaceTab();
+      }
+
+      // Restore the open file tabs from the per-session store, then merge the
+      // URL ?file= param: a deep-link selects (and, if absent, opens) that file
+      // without discarding the other remembered tabs.
+      const fileParam = searchParams.get("file");
+      const urlFile = fileParam === null || fileParam === "" ? null : fileParam;
+      const persistedFiles = persisted.openFiles ?? [];
+      const nextOpenFiles =
+        urlFile && !persistedFiles.includes(urlFile)
+          ? [...persistedFiles, urlFile]
+          : persistedFiles;
+      const nextSelected = showAgents ? null : (urlFile ?? persisted.selectedFilePath ?? null);
+      setOpenFiles(nextOpenFiles);
+      setSelectedFilePath(nextSelected);
+      // The tab strip derives from the live terminal list, so there's nothing to
+      // restore for the tabs themselves — only which shell was focused. The prune
+      // effect clears that selection if its terminal no longer exists once this
+      // session's list loads. A restored shell selection must not coexist with a
+      // file selection (one content slot).
+      setSelectedTerminalKey(nextSelected ? null : (persisted.selectedTerminalKey ?? null));
+      // A maximized rail is transient too — the incoming session starts docked.
+      // The effect below restores the sidebar collapsed on entry.
+      setRightPanelMaximized(false);
+      setRestoredWorkspace({ conversationId, canvasMode, exitedMaximized: rightPanelMaximized });
+      // A selected file must be visible in the rail. The Files and Changes tabs
+      // both surface the inline viewer; the Agents/Browser tabs don't, so
+      // pull the rail to Files unless it's already on a files scope.
+      if (nextSelected && nextTab !== "files" && nextTab !== "changes") {
+        nextTab = "files";
+      }
+      if (showAgents) {
+        nextTab = "subagents";
+        setSelectedTerminalKey(null);
+        setSubagentsPanelOpen(isMobileViewport());
+      }
+      setRightRailTab(nextTab);
+      const restoredPanels = persisted.openPanels ?? [];
+      setOpenPanels(
+        isDefaultWorkspaceTab(nextTab) &&
+          !readPinnedWorkspaceTabs().includes(nextTab) &&
+          !nextSelected &&
+          !restoredPanels.includes(nextTab)
+          ? [...restoredPanels, nextTab]
+          : restoredPanels,
+      );
+
+      // ?file= / ?comment= deep links reveal the rail even if this session left
+      // it closed, so the linked target isn't rendered into a collapsed panel.
+      setRightPanelOpen(restoredRailOpen(conversationId, canvasMode, searchParams));
+    }
+  }
+  if (previousRootSessionId !== rootSessionId) setPreviousRootSessionId(rootSessionId);
+
+  // The parts of a session switch that can't run during render: ref writes and
+  // the sidebar, which belongs to another hook. A still-armed shell-create ref
+  // would otherwise auto-focus an unrelated shell in the new session.
+  useEffect(() => {
+    pendingShellCreateRef.current = null;
+    autoFocusTerminalRef.current = null;
+    stateConvRef.current = conversationId ?? null;
+    cancelRightPanelVisibilityMotion();
+    if (restoredWorkspace?.exitedMaximized) restoreSidebarAfterMaximize();
+  }, [restoredWorkspace]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
+  const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
+    fileNavigationGuardsRef.current.add(guard);
+    return () => {
+      fileNavigationGuardsRef.current.delete(guard);
+    };
+  }, []);
+  const guardFileNavigation = useCallback(
+    (path: string | null, options: OpenFileOptions | undefined, commit: () => void) => {
+      const guards = [...fileNavigationGuardsRef.current];
+      const navigate = (index: number) => {
+        const guard = guards[index];
+        if (guard) guard(path, options, () => navigate(index + 1));
+        else commit();
+      };
+      navigate(0);
+    },
+    [],
+  );
+  const urlFilePath = searchParams.get("file") || null;
+  const urlFileFullscreen = searchParams.get("fullscreen") === "1";
+  const fullscreenRestoreRef = useRef<typeof restoredWorkspace>(null);
+  const visibleFileUrlRef = useRef(searchParams);
+  const fileLinkLocationRef = useRef(location);
+  fileLinkLocationRef.current = location;
+  const guardedFileLinkRef = useRef<{
+    locationKey: string;
+    restoredParams: URLSearchParams | null;
+  } | null>(null);
+  useEffect(
+    () => () => {
+      guardedFileLinkRef.current = null;
+    },
+    [],
+  );
+  if (urlFilePath === selectedFilePath && urlFileFullscreen === rightPanelMaximized) {
+    visibleFileUrlRef.current = searchParams;
+  }
+  // Honor incoming links even when the current session is already open.
+  useEffect(() => {
+    const sessionJustRestored = fullscreenRestoreRef.current !== restoredWorkspace;
+    fullscreenRestoreRef.current = restoredWorkspace;
+    const localFileUrl = localFileUrlRef.current;
+    localFileUrlRef.current = null;
+    // Local actions already established the rail selection and visibility motion.
+    if (
+      !sessionJustRestored &&
+      localFileUrl &&
+      (localFileUrl.get("file") || null) === urlFilePath &&
+      (localFileUrl.get("fullscreen") === "1") === urlFileFullscreen
+    ) {
+      if (guardedFileLinkRef.current?.restoredParams === localFileUrl) {
+        guardedFileLinkRef.current.locationKey = location.key;
+      } else {
+        guardedFileLinkRef.current = null;
+      }
       return;
     }
-    const persisted = readSessionWorkspaceState(conversationId);
-    const showAgents = searchParams.get("panel") === "agents";
-
-    const storageKey = `omnigent.web.panel-key:${conversationId}`;
-    const stored = sessionStorage.getItem(storageKey);
-    const requestedView = terminalFirst ? searchParams.get("view") : null;
-    const terminalKey =
-      agentTerminal === null ? PANEL_NO_TERMINAL_KEY : terminalTabKey(agentTerminal);
-    const defaultToTerminal = terminalFirst && readTranscriptViewDefault() === "terminal";
-    setPanelInitialKeyState(
-      showAgents || requestedView === "chat"
-        ? null
-        : requestedView === "terminal"
-          ? resolveTerminalViewKey(stored, terminalKey)
-          : stored === CHAT_VIEW_STORAGE_VALUE
-            ? null
-            : (stored ?? (defaultToTerminal ? terminalKey : null)),
-    );
-
-    // A remembered per-session tab wins; otherwise use the Appearance default.
-    // Navigating within the visible Agents tree is one continuous rail action,
-    // so keep that tab while moving between its root and descendants.
-    const keepAgentsAcrossTreeNavigation =
-      rightRailTab === "subagents" &&
-      rootSessionId !== null &&
-      previousRootSessionIdRef.current === rootSessionId;
-    let nextTab: RightRailTab | null =
-      persisted.rightRailTab ??
-      (keepAgentsAcrossTreeNavigation ? "subagents" : readInitialWorkspaceTab());
-    // Browser is a dynamic soft-tab mode, not a permanent nav destination.
-    // A stale pre-soft-tab selection (or a closed last tab) restores to the
-    // configured static default instead of showing an unselected rail.
-    const persistedBrowsers = persisted.openBrowsers ?? [];
-    if (
-      nextTab === "browser" &&
-      (persisted.selectedBrowserId === null ||
-        persisted.selectedBrowserId === undefined ||
-        !persistedBrowsers.includes(persisted.selectedBrowserId))
-    ) {
-      nextTab = readInitialWorkspaceTab();
+    guardedFileLinkRef.current = null;
+    const applyIncomingLink = () => {
+      if (conversationId && urlFilePath) {
+        setSelectedFilePath(urlFilePath);
+        setSelectedTerminalKey(null);
+        setOpenFiles((prev) => (prev.includes(urlFilePath) ? prev : [...prev, urlFilePath]));
+        setRightRailTab((prev) => (prev === "files" || prev === "changes" ? prev : "files"));
+        setRightPanelOpenImmediately(true);
+        setFilesPanelOpen(false);
+        setSubagentsPanelOpen(false);
+        setShellsPanelOpen(false);
+        setSideChatsPanelOpen(false);
+        setContentSearchPanelOpen(false);
+        setExecutionLogsKey(null);
+        if (!terminalFirst) setPanelInitialKeyState(null);
+      }
+      const maximized = !!conversationId && !!urlFilePath && urlFileFullscreen;
+      const currentLayout = railSelectionRef.current;
+      if (maximized && !currentLayout.rightPanelMaximized) {
+        if (!sessionJustRestored || !restoredWorkspace?.exitedMaximized) {
+          sidebarOpenBeforeMaximizeRef.current = currentLayout.sidebarOpen;
+        }
+        setSidebarOpen(false);
+      } else if (!maximized && currentLayout.rightPanelMaximized) {
+        restoreSidebarAfterMaximize();
+      }
+      setRightPanelMaximized(maximized);
+    };
+    if (!sessionJustRestored && conversationId && urlFilePath && urlFilePath !== selectedFilePath) {
+      const request = { locationKey: location.key, restoredParams: null as URLSearchParams | null };
+      guardedFileLinkRef.current = request;
+      let committed = false;
+      guardFileNavigation(urlFilePath, undefined, () => {
+        if (
+          guardedFileLinkRef.current !== request ||
+          fileLinkLocationRef.current.key !== request.locationKey
+        )
+          return;
+        committed = true;
+        guardedFileLinkRef.current = null;
+        if (request.restoredParams) {
+          localFileUrlRef.current = searchParams;
+          setSearchParams(searchParams, { replace: true });
+        }
+        applyIncomingLink();
+      });
+      if (!committed) {
+        const currentParams = new URLSearchParams(visibleFileUrlRef.current);
+        if (selectedFilePath) currentParams.set("file", selectedFilePath);
+        else currentParams.delete("file");
+        if (selectedFilePath && rightPanelMaximized) currentParams.set("fullscreen", "1");
+        else currentParams.delete("fullscreen");
+        request.restoredParams = currentParams;
+        localFileUrlRef.current = currentParams;
+        setSearchParams(currentParams, { replace: true });
+      }
+    } else {
+      applyIncomingLink();
     }
-
-    // Restore the open file tabs from the per-session store, then merge the
-    // URL ?file= param: a deep-link selects (and, if absent, opens) that file
-    // without discarding the other remembered tabs.
-    const fileParam = searchParams.get("file");
-    const urlFile = fileParam === null || fileParam === "" ? null : fileParam;
-    const persistedFiles = persisted.openFiles ?? [];
-    const nextOpenFiles =
-      urlFile && !persistedFiles.includes(urlFile) ? [...persistedFiles, urlFile] : persistedFiles;
-    const nextSelected = showAgents ? null : (urlFile ?? persisted.selectedFilePath ?? null);
-    setOpenFiles(nextOpenFiles);
-    setSelectedFilePath(nextSelected);
-    // The tab strip derives from the live terminal list, so there's nothing to
-    // restore for the tabs themselves — only which shell was focused. The prune
-    // effect clears that selection if its terminal no longer exists once this
-    // session's list loads. A restored shell selection must not coexist with a
-    // file selection (one content slot).
-    autoFocusTerminalKeyRef.current = null;
-    setSelectedTerminalKey(nextSelected ? null : (persisted.selectedTerminalKey ?? null));
-    // A maximized rail is transient too — the incoming session starts docked.
-    // If we were maximized, restore the sidebar we collapsed on entry (the
-    // toggle handler won't run on a session switch).
-    setRightPanelMaximized((wasMaximized) => {
-      if (wasMaximized) restoreSidebarAfterMaximize();
-      return false;
-    });
-    // A selected file must be visible in the rail. The Files and Changes tabs
-    // both surface the inline viewer; the Agents/Browser tabs don't, so
-    // pull the rail to Files unless it's already on a files scope.
-    if (nextSelected && nextTab !== "files" && nextTab !== "changes") {
-      nextTab = "files";
-    }
-    if (showAgents) {
-      nextTab = "subagents";
-      setSelectedTerminalKey(null);
-      setSubagentsPanelOpen(isMobileViewport());
-    }
-    setRightRailTab(nextTab);
-    const restoredPanels = persisted.openPanels ?? [];
-    setOpenPanels(
-      isDefaultWorkspaceTab(nextTab) &&
-        !readPinnedWorkspaceTabs().includes(nextTab) &&
-        !nextSelected &&
-        !restoredPanels.includes(nextTab)
-        ? [...restoredPanels, nextTab]
-        : restoredPanels,
-    );
-
-    // Restore the rail open-state for this session. A deep link / reload that
-    // carries a workspace signal — a file to open (?file=) or a comment to
-    // surface (?comment=) — reveals the rail even when this session was last
-    // left closed; otherwise the linked file/comment would render into a
-    // collapsed, invisible panel.
-    setRightPanelOpenImmediately(restoredRailOpen(conversationId, canvasMode, searchParams));
-
-    stateConvRef.current = conversationId;
-  }, [conversationId, canvasMode]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Record the incoming root after restoration compares it with the outgoing tree.
-  useEffect(() => {
-    previousRootSessionIdRef.current = rootSessionId;
-  }, [rootSessionId]);
+    // Sidebar and maximize state are captured only when the URL request changes.
+  }, [conversationId, urlFilePath, urlFileFullscreen, restoredWorkspace]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Session metadata can arrive after the restore effect above. Once the
   // terminal-first label is known, apply URL state first, then the per-tab
@@ -1472,17 +1648,9 @@ function AppShellImpl() {
     setSubagentsPanelOpen(isMobileViewport());
   }, [conversationId, agentsPanelRequested, setRightPanelOpenImmediately, selectRightRailTab]);
 
-  // Persist the per-session rail tab + open file tabs whenever they change.
-  // Keyed on the state (not conversationId) and targeted at the conversation
-  // the current state belongs to (stateConvRef, set by the restore effect) so
-  // a conversation switch can't write the outgoing session's state into the
-  // incoming one. The first run (mount) is skipped so it can't clobber the
-  // store with defaults before the restore effect's values are applied.
+  // Persist the per-session rail tab + open file tabs whenever they change, to
+  // the session the state belongs to (stateConvRef, set after each restore).
   useEffect(() => {
-    if (!workspacePersistHydrated.current) {
-      workspacePersistHydrated.current = true;
-      return;
-    }
     const id = stateConvRef.current;
     if (!id) return;
     writeSessionWorkspaceState(id, {
@@ -1546,6 +1714,8 @@ function AppShellImpl() {
         (prev) => {
           const next = new URLSearchParams(prev);
           next.set("file", path);
+          if (rightPanelMaximized) next.set("fullscreen", "1");
+          else next.delete("fullscreen");
           next.delete("comment"); // stale comment belongs to the previous file
           // A citation's cited line rides along so the viewer can land on it;
           // a plain open clears any previous citation's line.
@@ -1555,33 +1725,22 @@ function AppShellImpl() {
           else next.delete("column");
           if (position?.endLine != null) next.set("endLine", String(position.endLine));
           else next.delete("endLine");
+          localFileUrlRef.current = next;
           return next;
         },
         { replace: true },
       );
     },
-    [setPanelInitialKey, terminalFirst, setSearchParams, conversationId, setRightPanelOpenAnimated],
+    [
+      setPanelInitialKey,
+      terminalFirst,
+      setSearchParams,
+      conversationId,
+      setRightPanelOpenAnimated,
+      rightPanelMaximized,
+    ],
   );
 
-  const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
-  const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
-    fileNavigationGuardsRef.current.add(guard);
-    return () => {
-      fileNavigationGuardsRef.current.delete(guard);
-    };
-  }, []);
-  const guardFileNavigation = useCallback(
-    (path: string | null, options: OpenFileOptions | undefined, commit: () => void) => {
-      const guards = [...fileNavigationGuardsRef.current];
-      const navigate = (index: number) => {
-        const guard = guards[index];
-        if (guard) guard(path, options, () => navigate(index + 1));
-        else commit();
-      };
-      navigate(0);
-    },
-    [],
-  );
   // Mobile Back returns to Content search only for the conversation and file
   // its result committed; any other file navigation clears it.
   const contentSearchFileRef = useRef<string | null>(null);
@@ -1618,6 +1777,8 @@ function AppShellImpl() {
         next.delete("line");
         next.delete("column");
         next.delete("endLine");
+        next.delete("fullscreen");
+        localFileUrlRef.current = next;
         return next;
       },
       { replace: true },
@@ -1629,11 +1790,14 @@ function AppShellImpl() {
       (prev) => {
         const params = new URLSearchParams(prev);
         params.set("file", selectedFilePath);
+        if (rightPanelMaximized) params.set("fullscreen", "1");
+        else params.delete("fullscreen");
+        localFileUrlRef.current = params;
         return params;
       },
       { replace: true },
     );
-  }, [selectedFilePath, setSearchParams]);
+  }, [selectedFilePath, rightPanelMaximized, setSearchParams]);
 
   // Toggle the right (Workspace) sidebar — shared by the header's collapse
   // button and the ⌘⌥]/Ctrl+Alt+] hotkey so they can't drift. Beyond flipping the
@@ -1851,7 +2015,27 @@ function AppShellImpl() {
       restoreSidebarAfterMaximize();
     }
     setRightPanelMaximized((prev) => !prev);
-  }, [rightPanelMaximized, sidebarOpen, restoreSidebarAfterMaximize, setSidebarOpen]);
+    if (selectedFilePath) {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.set("file", selectedFilePath);
+          if (rightPanelMaximized) next.delete("fullscreen");
+          else next.set("fullscreen", "1");
+          localFileUrlRef.current = next;
+          return next;
+        },
+        { replace: true },
+      );
+    }
+  }, [
+    rightPanelMaximized,
+    sidebarOpen,
+    restoreSidebarAfterMaximize,
+    setSidebarOpen,
+    selectedFilePath,
+    setSearchParams,
+  ]);
 
   // ⌘B / ⇧⌘B in the desktop app (⌘⌥[ / ⌘⌥] in a browser) toggle the left and
   // right sidebars. Bound here where both panels' open-state lives. A grid route
@@ -1914,6 +2098,10 @@ function AppShellImpl() {
     setSelectedFilePath(null);
     setFileViewerCommentsOpen(false);
     clearFileViewerUrl();
+    if (rightPanelMaximized) {
+      setRightPanelMaximized(false);
+      restoreSidebarAfterMaximize();
+    }
     if (contentSearchFileRef.current === `${conversationId}\n${selectedFilePath}`) {
       setContentSearchPanelOpen(true);
     } else {
@@ -1942,6 +2130,13 @@ function AppShellImpl() {
       return null;
     });
   }, [clearFileViewerUrl]);
+  const closeFileViewerToScope = useCallback(() => {
+    showScopeView();
+    if (rightPanelMaximized) {
+      setRightPanelMaximized(false);
+      restoreSidebarAfterMaximize();
+    }
+  }, [showScopeView, rightPanelMaximized, restoreSidebarAfterMaximize]);
 
   // Close a single file tab. If the closed tab was the active one, activate
   // its neighbor (prefer the previous tab, else the next); when no tabs
@@ -1958,6 +2153,10 @@ function AppShellImpl() {
           if (next.length === 0) {
             setFileViewerCommentsOpen(false);
             clearFileViewerUrl();
+            if (rightPanelMaximized) {
+              setRightPanelMaximized(false);
+              restoreSidebarAfterMaximize();
+            }
             return null;
           }
           const neighbor = next[idx - 1] ?? next[idx] ?? next[0];
@@ -1969,6 +2168,7 @@ function AppShellImpl() {
               params.delete("line"); // stale citation belongs to the closed file
               params.delete("column");
               params.delete("endLine");
+              localFileUrlRef.current = params;
               return params;
             },
             { replace: true },
@@ -1978,7 +2178,7 @@ function AppShellImpl() {
         return next;
       });
     },
-    [clearFileViewerUrl, setSearchParams],
+    [clearFileViewerUrl, setSearchParams, rightPanelMaximized, restoreSidebarAfterMaximize],
   );
 
   // Switch the workspace rail's tab. The side effect (closing any open
@@ -2117,15 +2317,18 @@ function AppShellImpl() {
   // phone's drawer even where this viewer or harness can't start side chats.
   const [hasSideChatTabs, setHasSideChatTabs] = useState(false);
 
-  function openTerminalsPanel(key: string) {
-    setSelectedFilePath(null); // close file viewer
-    clearFileViewerUrl();
-    setExecutionLogsKey(null); // close execution-logs panel
-    setFilesPanelOpen(false); // close files drawer
-    setSubagentsPanelOpen(false); // close mobile agents drawer
-    setShellsPanelOpen(false); // close mobile shells drawer
-    setPanelInitialKey(key);
-  }
+  const openTerminalsPanel = useCallback(
+    (key: string) => {
+      setSelectedFilePath(null); // close file viewer
+      clearFileViewerUrl();
+      setExecutionLogsKey(null); // close execution-logs panel
+      setFilesPanelOpen(false); // close files drawer
+      setSubagentsPanelOpen(false); // close mobile agents drawer
+      setShellsPanelOpen(false); // close mobile shells drawer
+      setPanelInitialKey(key);
+    },
+    [clearFileViewerUrl, setPanelInitialKey],
+  );
 
   // Open a shell as a tab in the desktop workspace rail (the mobile path
   // still uses ``openTerminalsPanel`` → full-screen drawer). Adds the key to
@@ -2139,7 +2342,7 @@ function AppShellImpl() {
       // pruned off the list), so a fresh create that's still landing stays
       // selected and its xterm surfaces the instant the terminal appears.
       // `focus: false` shows the shell but leaves keyboard focus where it is.
-      autoFocusTerminalKeyRef.current = focus ? key : null;
+      autoFocusTerminalRef.current = focus && conversationId ? { conversationId, key } : null;
       setSelectedTerminalKey(key);
       setSelectedFilePath(null);
       setFileViewerCommentsOpen(false);
@@ -2192,6 +2395,48 @@ function AppShellImpl() {
   );
   useNewShellHotkey(launchShellFromShortcut, shellLaunchable);
   useDesktopCommand("new-terminal", shellLaunchable ? launchShellFromShortcut : null);
+
+  const shellCommandAction = useMemo(() => {
+    const commandShells = (boundAgent?.terminals ?? []).filter((name) =>
+      ["bash", "sh", "zsh", "fish", "shell"].includes(name),
+    );
+    if (!isOwnerLevel(permissionLevel) || gridRoute || commandShells.length === 0) return null;
+    return {
+      disabled: !shellLaunchable,
+      open: (command: string, language: string) => {
+        if (!shellLaunchable || !conversationId || !command.trim()) return;
+        const shell = commandShells.includes(language)
+          ? language
+          : resolveDefaultShell(commandShells);
+        if (!shell) return;
+        void createTerminal.mutateAsync(shell).then(
+          (info) => {
+            shellDrafts?.setDraft(`${conversationId}:${info.id}`, command);
+            if (railSelectionRef.current.conversationId !== conversationId) return;
+            guardFileNavigation(null, undefined, () => {
+              if (railSelectionRef.current.conversationId !== conversationId) return;
+              const key = terminalTabKey(info);
+              if (isMobileViewport()) openTerminalsPanel(key);
+              else openTerminalTab(key);
+            });
+          },
+          (error: unknown) =>
+            toast.error(error instanceof Error ? error.message : "Couldn't open the shell."),
+        );
+      },
+    };
+  }, [
+    boundAgent?.terminals,
+    permissionLevel,
+    gridRoute,
+    shellLaunchable,
+    conversationId,
+    createTerminal,
+    shellDrafts,
+    guardFileNavigation,
+    openTerminalsPanel,
+    openTerminalTab,
+  ]);
 
   // Desktop Close (⌘W / Ctrl+W), once the workspace rail has passed on it:
   // leave the open session or page for the new-session page; from the
@@ -2363,28 +2608,33 @@ function AppShellImpl() {
 
   // Composer links open the mobile drawer or reveal the desktop Pull Requests tab.
   // Deselect files/shells so the chosen panel owns its content slot.
-  const openGithubTab = useCallback(() => {
-    if (isMobileViewport()) {
-      openGithubPanel();
-      return;
-    }
-    setSelectedFilePath(null);
-    setSelectedTerminalKey(null);
-    if (!terminalFirst) setPanelInitialKey(null);
-    setExecutionLogsKey(null);
-    setFilesPanelOpen(false);
-    setSubagentsPanelOpen(false);
-    selectRightRailTab("github");
-    setRightPanelOpenAnimated(true);
-    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
-  }, [
-    conversationId,
-    terminalFirst,
-    setPanelInitialKey,
-    openGithubPanel,
-    selectRightRailTab,
-    setRightPanelOpenAnimated,
-  ]);
+  const openGithubTab = useCallback(
+    (prUrl?: string) => {
+      if (prUrl && conversationId) selectPullRequestInPanel(queryClient, conversationId, prUrl);
+      if (isMobileViewport()) {
+        openGithubPanel();
+        return;
+      }
+      setSelectedFilePath(null);
+      setSelectedTerminalKey(null);
+      if (!terminalFirst) setPanelInitialKey(null);
+      setExecutionLogsKey(null);
+      setFilesPanelOpen(false);
+      setSubagentsPanelOpen(false);
+      selectRightRailTab("github");
+      setRightPanelOpenAnimated(true);
+      if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+    },
+    [
+      conversationId,
+      queryClient,
+      terminalFirst,
+      setPanelInitialKey,
+      openGithubPanel,
+      selectRightRailTab,
+      setRightPanelOpenAnimated,
+    ],
+  );
 
   function openMainExecutionLog() {
     // Mobile FAB → "Execution logs" jumps straight to the main thread.
@@ -2429,6 +2679,23 @@ function AppShellImpl() {
   // Sourced from the same environment query that gates the files panel.
   const workspaceRoot = environmentQuery.data?.root ?? null;
   const workspaceHome = environmentQuery.data?.home ?? null;
+  const relativeFilePath = relativizeToWorkspace(selectedFilePath, workspaceRoot);
+  const shareableFilePath =
+    relativeFilePath &&
+    !/^(?:[/\\~]|[a-z]:)/i.test(relativeFilePath) &&
+    !relativeFilePath.split(/[/\\]/).includes("..")
+      ? relativeFilePath
+      : null;
+  const shareFile = useMemo(
+    () =>
+      canShare && shareableFilePath
+        ? () => {
+            setSharedFilePath(shareableFilePath);
+            setShareOpen(true);
+          }
+        : undefined,
+    [canShare, shareableFilePath],
+  );
   const fileViewerContextValue = useMemo(
     () => ({
       openFile: openFileViewer,
@@ -2649,6 +2916,29 @@ function AppShellImpl() {
     !executionLogsOpen &&
     !filesPanelOpen,
   );
+  // WIP(session_overview): docks beside chat when a wide window leaves the right side
+  // free; otherwise the header cost opens it over chat.
+  const sessionOverviewEnabled =
+    serverConversationId !== undefined && isFeatureEnabled(serverInfo, "session_overview");
+  const wideViewport = useIsWideViewport();
+  const sessionOverviewDocked =
+    wideViewport &&
+    !workspacePanelVisible &&
+    !panelOpen &&
+    !executionLogsOpen &&
+    !filesPanelOpen &&
+    !canvasMode;
+  const [sessionOverviewDockedOpen, setSessionOverviewDockedOpen] = useState(true);
+  const [sessionOverviewOverlayOpen, setSessionOverviewOverlayOpen] = useState(false);
+  const sessionOverviewOpen =
+    sessionOverviewEnabled &&
+    (sessionOverviewDocked ? sessionOverviewDockedOpen : sessionOverviewOverlayOpen);
+  const toggleSessionOverview = useCallback(() => {
+    const setOpen = sessionOverviewDocked
+      ? setSessionOverviewDockedOpen
+      : setSessionOverviewOverlayOpen;
+    setOpen((open) => !open);
+  }, [sessionOverviewDocked]);
   useEffect(() => {
     if (!workspacePanelVisible || !focusWorkspaceTabsOnOpenRef.current) return;
     focusWorkspaceTabsOnOpenRef.current = false;
@@ -2687,10 +2977,8 @@ function AppShellImpl() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
-            {/* Settings and the sidebar toggle live HERE on the macOS shell so
-          they hold one fixed position beside the traffic lights no matter what
-          the sidebar does. Search sits with the wordmark while the sidebar is
-          open, then moves beside the expand button when it collapses. */}
+            {/* macOS shell: the toggle and Back/Forward stay fixed beside the traffic
+          lights. Search joins them when collapsed; Settings is in the profile footer. */}
             {/* Hidden on /settings: the settings nav replaces the session list
           INSIDE the sidebar, and its "Back" row is the only way out. Leaving a
           collapse toggle up here would let the user hide the one exit and strand
@@ -2721,6 +3009,7 @@ function AppShellImpl() {
                     }
                     setSidebarPeek(false);
                   }}
+                  showSettings={false}
                   // Dwell-to-peek moves here with the button: on mac this cluster
                   // replaces ChatHeader's collapsed-state toggle, which is where
                   // peek was armed, so without this the affordance would vanish.
@@ -2781,6 +3070,14 @@ function AppShellImpl() {
               >
                 {!extensionOwnsHeader && (
                   <ChatHeader
+                    sessionOverviewControl={
+                      sessionOverviewEnabled && (
+                        <SessionCostButton
+                          expanded={sessionOverviewOpen}
+                          onToggle={toggleSessionOverview}
+                        />
+                      )
+                    }
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
                     // is a transient card floating over the collapsed layout (the
                     // docked sidebar stays w-0), so the header must keep its
@@ -2810,7 +3107,10 @@ function AppShellImpl() {
                     forkDisabledReason={forkDisabledReason}
                     shareDisabled={shareDisabled}
                     shareDisabledReason={shareDisabledReason}
-                    onShare={() => setShareOpen(true)}
+                    onShare={() => {
+                      setSharedFilePath(undefined);
+                      setShareOpen(true);
+                    }}
                     onFork={() => forkDialogContextValue.openForkDialog()}
                     hasAgentInfo={hasAgentInfo}
                     onAgentInfo={() => setAgentInfoOpen(true)}
@@ -2863,10 +3163,29 @@ function AppShellImpl() {
                 >
                   <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
                     <RenderErrorBoundary name="this page" resetKey={location.pathname}>
-                      <Outlet />
+                      <ShellCommandContext.Provider value={shellCommandAction}>
+                        <Outlet />
+                      </ShellCommandContext.Provider>
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
+                  {sessionOverviewOpen && !sessionOverviewDocked && (
+                    <aside
+                      aria-label="Session overview"
+                      className="absolute right-2 top-12 z-20 w-64 max-md:hidden"
+                    >
+                      <SessionOverview onClose={toggleSessionOverview} />
+                    </aside>
+                  )}
                 </GridSessionMain>
+
+                {sessionOverviewOpen && sessionOverviewDocked && (
+                  <aside
+                    aria-label="Session overview"
+                    className="flex w-64 shrink-0 flex-col overflow-y-auto px-2 pb-3 pt-12"
+                  >
+                    <SessionOverview onClose={toggleSessionOverview} />
+                  </aside>
+                )}
 
                 {/* Debug-mode execution-logs rail — desktop only, hidden when a
               push panel is open (the panel itself becomes the focus). Only
@@ -2924,14 +3243,17 @@ function AppShellImpl() {
                     openFiles={openFiles}
                     openFileViewer={openFileViewer}
                     onCloseFile={closeFile}
-                    onShowScopeView={showScopeView}
+                    onShowScopeView={closeFileViewerToScope}
                     onCommentsOpenChange={setFileViewerCommentsOpen}
+                    onShareFile={shareFile}
+                    shareDisabledReason={shareDisabledReason}
                     openTerminalTab={openTerminalTab}
                     openTerminals={openTerminals}
                     selectedTerminalKey={selectedTerminalKey}
                     autoFocusSelectedTerminal={
-                      autoFocusTerminalKeyRef.current !== null &&
-                      autoFocusTerminalKeyRef.current === selectedTerminalKey
+                      autoFocusTerminalRef.current !== null &&
+                      autoFocusTerminalRef.current.conversationId === conversationId &&
+                      autoFocusTerminalRef.current.key === selectedTerminalKey
                     }
                     closingTerminalKey={closingTerminalKey}
                     onCloseTerminal={requestCloseTerminal}
@@ -2953,105 +3275,47 @@ function AppShellImpl() {
                 )}
               </div>
 
-              {/* Push panels — flex siblings to main, animate width. Only one is open at a time.
-          Terminal-first sessions render the terminal inline inside main
-          (via MainTerminalView in ChatPage) and never mount the drawer. */}
-              {conversationId && !terminalFirst && (
-                <TerminalsPanel
-                  open={panelOpen}
-                  conversationId={conversationId}
-                  initialTerminalKey={panelInitialKey}
-                  // No neighbor to resize against (chat is hidden, FilesPanel
-                  // owns its own width) — grow via flex-1.
-                  fluid={panelOpen}
-                  // Non-owners attach read-only: a shared PTY can't attribute
-                  // input per-user, so only the owner may type (server-enforced).
-                  readOnly={!isOwnerLevel(permissionLevel)}
-                  onClose={() => setPanelInitialKey(null)}
-                />
-              )}
-              {conversationId && (
-                <ExecutionLogsPanel
-                  open={executionLogsOpen}
-                  conversationId={conversationId}
-                  initialKey={executionLogsKey}
-                  onClose={() => setExecutionLogsKey(null)}
-                />
-              )}
-              {conversationId && showFilesPanel && (
-                <FilesPanelDrawer
-                  open={filesPanelOpen}
-                  onClose={() => setFilesPanelOpen(false)}
-                  onFileSelect={openFileViewer}
-                  flatView={filesDrawerFlatView}
-                  showHidden={filesPanelShowHidden}
-                  onShowHiddenChange={setFilesPanelShowHidden}
-                  sort={filesPanelSort}
-                  onSortChange={handleFilesSortChange}
-                />
-              )}
-              {/* Mobile-only full-screen drawers for the rail tabs that have no
-          desktop push panel of their own. `MobilePanelDrawer` is `md:hidden`,
-          so these never collide with the desktop rail; they're opened from
-          the session-menu FAB above. */}
-              {conversationId && rootSessionId && (
-                <MobilePanelDrawer
-                  open={subagentsPanelOpen}
-                  title="Agents"
-                  onClose={() => setSubagentsPanelOpen(false)}
-                  testId="subagents-panel-drawer"
-                >
-                  <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-                </MobilePanelDrawer>
-              )}
-              {conversationId && (
-                <MobilePanelDrawer
-                  open={shellsPanelOpen}
-                  title="Shells"
-                  onClose={() => setShellsPanelOpen(false)}
-                  testId="shells-panel-drawer"
-                >
-                  <InlineTerminalsSection
-                    conversationId={conversationId}
-                    onExpand={openTerminalsPanel}
-                    // Mobile has no tab strip "+" menu, so the drawer carries
-                    // the "+ New shell" create row.
-                    showNewShell
-                  />
-                </MobilePanelDrawer>
-              )}
-              {conversationId && showFilesPanel && (
-                <MobilePanelDrawer
-                  open={githubPanelOpen}
-                  title="Pull Requests"
-                  onClose={() => setGithubPanelOpen(false)}
-                  testId="github-panel-drawer"
-                >
-                  <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
-                    <PullRequestPanel conversationId={conversationId} />
-                  </RenderErrorBoundary>
-                </MobilePanelDrawer>
-              )}
-              {conversationId && mobileViewport && railTabsAvailable["content-search"] && (
-                <MobilePanelDrawer
-                  open={contentSearchPanelOpen}
-                  title="Content search"
-                  onClose={() => setContentSearchPanelOpen(false)}
-                  testId="content-search-panel-drawer"
-                >
-                  <ContentSearchPanel
-                    key={conversationId}
-                    conversationId={conversationId}
-                    onFileSelect={openContentSearchResult}
-                  />
-                </MobilePanelDrawer>
-              )}
-              <div ref={setMobileFileTarget} className="md:hidden" />
+              <AppShellWorkspacePanels
+                conversationId={conversationId}
+                terminalFirst={terminalFirst}
+                panelOpen={panelOpen}
+                panelInitialKey={panelInitialKey}
+                setPanelInitialKey={setPanelInitialKey}
+                permissionLevel={permissionLevel}
+                executionLogsOpen={executionLogsOpen}
+                executionLogsKey={executionLogsKey}
+                setExecutionLogsKey={setExecutionLogsKey}
+                showFilesPanel={showFilesPanel}
+                filesPanelOpen={filesPanelOpen}
+                setFilesPanelOpen={setFilesPanelOpen}
+                openFileViewer={openFileViewer}
+                filesDrawerFlatView={filesDrawerFlatView}
+                filesPanelShowHidden={filesPanelShowHidden}
+                setFilesPanelShowHidden={setFilesPanelShowHidden}
+                filesPanelSort={filesPanelSort}
+                handleFilesSortChange={handleFilesSortChange}
+                rootSessionId={rootSessionId}
+                subagentsPanelOpen={subagentsPanelOpen}
+                setSubagentsPanelOpen={setSubagentsPanelOpen}
+                shellsPanelOpen={shellsPanelOpen}
+                setShellsPanelOpen={setShellsPanelOpen}
+                openTerminalsPanel={openTerminalsPanel}
+                githubPanelOpen={githubPanelOpen}
+                setGithubPanelOpen={setGithubPanelOpen}
+                mobileViewport={mobileViewport}
+                railTabsAvailable={railTabsAvailable}
+                contentSearchPanelOpen={contentSearchPanelOpen}
+                setContentSearchPanelOpen={setContentSearchPanelOpen}
+                openContentSearchResult={openContentSearchResult}
+                setMobileFileTarget={setMobileFileTarget}
+              />
             </GridWorkspace>
           </div>
           {conversationId && (
             <PermissionsModal
+              key={`${conversationId}:${sharedFilePath ?? ""}`}
               sessionId={conversationId}
+              filePath={sharedFilePath}
               workspace={activeSession?.workspace ?? activeConv?.workspace}
               open={shareOpen}
               onOpenChange={setShareOpen}
@@ -3122,7 +3386,7 @@ function AppShellImpl() {
         AgentInfoButton popover, opened from the header's three-dot menu. */}
           {hasAgentInfo && (
             <Dialog open={agentInfoOpen} onOpenChange={setAgentInfoOpen}>
-              <DialogContent>
+              <DialogContent className="max-h-[85vh] overflow-y-auto">
                 <DialogHeader>
                   <DialogTitle>Agent</DialogTitle>
                   <DialogDescription className="sr-only">
@@ -3137,52 +3401,18 @@ function AppShellImpl() {
               </DialogContent>
             </Dialog>
           )}
-          {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
-              ⌘/Ctrl+/ opener); ungated so it works on every route. */}
-          <KeyboardShortcutsDialog />
-          {/* Opens the import modal once per newly connected host. */}
-          {!isEmbedded && <ImportReviewGate />}
-          {/* Keep this after Outlet so a visible chat banner wins before the toast effect runs. */}
-          {isFeatureEnabled(serverInfo, "arca_shutdown_warnings") && <ArcaShutdownToast />}
-          {/* Dev-only `?import-preview` for the post-setup import modal. */}
-          {ImportContextPreview && (
-            <Suspense fallback={null}>
-              <ImportContextPreview />
-            </Suspense>
-          )}
-          {/* Global command palette (⌘K). Ungated so it works on every route
-              and in embedded mode — the sidebar's "Search" button opens it
-              there even though the ⌘K hotkey is disabled (it belongs to the
-              host page). */}
-          <CommandPalette
-            key={sessionSearch ? "sessions" : "commands"}
-            sessionsOnly={sessionSearch}
-            open={commandPaletteOpen}
-            onOpenChange={setCommandPaletteOpen}
-            onToggleLeftSidebar={toggleLeftSidebar}
-            onToggleRightSidebar={toggleRightPanel}
-            rightSidebarShortcutEnabled={!gridRoute}
-          />
-          <RecentSessionsSwitcher
-            conversations={allConversations}
-            activeSessionId={serverConversationId ?? null}
-            enabled={isElectronShell()}
-          />
-          {/* Transient toasts (e.g. "session archived"). Mounted once here so
-              any surface can fire one via showToast(). */}
-          {/* Match the previous toast system's effectively unbounded stack so
-              security prompts cannot be hidden behind ordinary notifications. */}
-          <Toaster
-            position="top-center"
-            visibleToasts={100}
-            offset={{
-              right: "1rem",
-              bottom: updateOverlayToastOffset(updateOverlayHeight),
-            }}
-            mobileOffset={{
-              right: "1rem",
-              bottom: updateOverlayToastOffset(updateOverlayHeight),
-            }}
+          <AppShellOverlays
+            isEmbedded={isEmbedded}
+            serverInfo={serverInfo}
+            sessionSearch={sessionSearch}
+            commandPaletteOpen={commandPaletteOpen}
+            setCommandPaletteOpen={setCommandPaletteOpen}
+            toggleLeftSidebar={toggleLeftSidebar}
+            toggleRightPanel={toggleRightPanel}
+            gridRoute={gridRoute}
+            allConversations={allConversations}
+            serverConversationId={serverConversationId}
+            updateOverlayHeight={updateOverlayHeight}
           />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>

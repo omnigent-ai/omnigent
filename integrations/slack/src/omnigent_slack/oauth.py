@@ -12,8 +12,10 @@ from the server itself (see :func:`probe_auth_mode`, mirroring the
   scoped, rotating delegated token.
 - **oidc** → the server's CLI-login ticket flow (``/auth/cli-login`` +
   ``/auth/cli-poll``). The user completes the real OIDC flow at the IdP;
-  the bot receives the server's session JWT (no refresh — re-login on
-  expiry), exactly as the ``omnigent`` CLI does.
+  the bot receives the server's session JWT, exactly as the ``omnigent``
+  CLI does. When the server has a grant store (a database), the poll also
+  returns a login grant's refresh token, which the bot renews through
+  ``/oauth/token``; without one, the user re-logs-in on expiry.
 
 Header/proxy mode is unsupported: identity is asserted by a trusted
 upstream proxy, so the server mints no token and mounts no login
@@ -34,9 +36,11 @@ import enum
 import hashlib
 import secrets
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
+
+from omnigent_slack.user_agent import USER_AGENT_HEADERS
 
 _DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 
@@ -93,19 +97,23 @@ class DeviceGrantUnavailableError(OAuthError):
 class TokenResult:
     """A token obtained from a completed login.
 
-    ``refresh_token`` is empty for OIDC session JWTs (the cli-ticket flow
-    issues no refresh token — the bot re-logs-in on expiry).
+    ``refresh_token`` is empty when an OIDC server's cli-ticket login
+    issues no login grant (no grant store wired) — the session JWT then
+    stands alone and the bot re-logs-in on expiry.
     """
 
-    access_token: str
-    refresh_token: str
+    access_token: str = field(repr=False)
+    refresh_token: str = field(repr=False)
     expires_in: int
 
 
 def _token_from_response(
-    resp: httpx.Response, *, access_key: str, has_refresh: bool, default_expires: int
+    resp: httpx.Response, *, access_key: str, refresh_required: bool, default_expires: int
 ) -> TokenResult:
     """Parse a 200 token body, mapping a malformed one to ``OAuthError``.
+
+    ``refresh_required`` makes a missing ``refresh_token`` malformed; when
+    false the field is optional and an absent one yields ``""``.
 
     A 200 whose body is non-JSON, missing the token field, or carries a
     non-numeric ``expires_in`` would otherwise raise
@@ -117,7 +125,10 @@ def _token_from_response(
     try:
         data = resp.json()
         access_token = str(data[access_key])
-        refresh_token = str(data["refresh_token"]) if has_refresh else ""
+        if refresh_required:
+            refresh_token = str(data["refresh_token"])
+        else:
+            refresh_token = str(data.get("refresh_token") or "")
         expires_in = int(data.get("expires_in", default_expires))
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise OAuthError(f"Malformed token response: {exc}") from exc
@@ -161,7 +172,9 @@ async def probe_auth_mode(server_url: str, http_timeout: float = 10.0) -> AuthMo
     :returns: The detected :class:`AuthMode`.
     """
     async with httpx.AsyncClient(
-        base_url=server_url.rstrip("/"), timeout=httpx.Timeout(http_timeout)
+        base_url=server_url.rstrip("/"),
+        timeout=httpx.Timeout(http_timeout),
+        headers=USER_AGENT_HEADERS,
     ) as client:
         try:
             resp = await client.get("/v1/me")
@@ -229,7 +242,7 @@ async def _start_device_login(
     client = httpx.AsyncClient(
         base_url=server_url.rstrip("/"),
         timeout=httpx.Timeout(30.0),
-        headers=_secret_headers(client_secret),
+        headers={**USER_AGENT_HEADERS, **_secret_headers(client_secret)},
     )
     try:
         resp = await client.post("/oauth/device/authorize", json={"client_id": client_id})
@@ -289,7 +302,7 @@ async def _poll_device(
             continue  # transient — keep polling until the deadline (mirrors the ticket flow)
         if resp.status_code == 200:
             return _token_from_response(
-                resp, access_key="access_token", has_refresh=True, default_expires=3600
+                resp, access_key="access_token", refresh_required=True, default_expires=3600
             )
         error = _error_code(resp)
         if error == "slow_down":
@@ -309,7 +322,9 @@ async def _poll_device(
 
 async def _start_cli_ticket_login(server_url: str) -> PendingLogin:
     base = server_url.rstrip("/")
-    client = httpx.AsyncClient(base_url=base, timeout=httpx.Timeout(30.0))
+    client = httpx.AsyncClient(
+        base_url=base, timeout=httpx.Timeout(30.0), headers=USER_AGENT_HEADERS
+    )
     code_verifier = secrets.token_urlsafe(48)
     code_challenge = (
         base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
@@ -371,10 +386,10 @@ async def _poll_cli_ticket(
         if resp.status_code == 202:
             continue  # pending: browser flow not finished
         if resp.status_code == 200:
-            # No refresh token in the ticket flow — the session JWT stands
-            # alone until it expires, then the user re-logs-in.
+            # Keep optional login grants; servers without grant storage
+            # return only the session JWT.
             return _token_from_response(
-                resp, access_key="token", has_refresh=False, default_expires=8 * 3600
+                resp, access_key="token", refresh_required=False, default_expires=8 * 3600
             )
         if resp.status_code in (400, 403, 410):
             raise AuthorizationExpiredError(
@@ -386,8 +401,9 @@ async def _poll_cli_ticket(
 class DeviceFlowClient:
     """Talks to a single Omnigent server's ``/oauth/*`` endpoints.
 
-    Used for token refresh and revocation of device-grant tokens (the
-    login start/poll now lives in :func:`start_login`). Sends the optional
+    Used for token refresh and revocation of device-grant and OIDC
+    login-grant tokens (the login start/poll now lives in
+    :func:`start_login`). Sends the optional
     device-grant client secret (when configured) on every call, since the
     ``/oauth/token`` and ``/oauth/revoke`` endpoints may be secret-gated.
     """
@@ -398,7 +414,7 @@ class DeviceFlowClient:
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=httpx.Timeout(timeout),
-            headers=_secret_headers(client_secret),
+            headers={**USER_AGENT_HEADERS, **_secret_headers(client_secret)},
         )
 
     async def aclose(self) -> None:
@@ -413,7 +429,7 @@ class DeviceFlowClient:
         if response.status_code != 200:
             raise OAuthError(f"Refresh failed: {_error_code(response) or response.status_code}")
         return _token_from_response(
-            response, access_key="access_token", has_refresh=True, default_expires=3600
+            response, access_key="access_token", refresh_required=True, default_expires=3600
         )
 
     async def revoke(self, refresh_token: str) -> None:

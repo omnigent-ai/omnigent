@@ -145,6 +145,40 @@ describe("resolveServerInfo sandbox_providers", () => {
     });
   });
 
+  it("keeps each provider's automation notice", async () => {
+    const result = await probe({
+      sandbox_provider_automation_notices: { agent_sandbox: "Keep your laptop signed in." },
+    });
+    expect(result.sandbox_provider_automation_notices).toEqual({
+      agent_sandbox: "Keep your laptop signed in.",
+    });
+  });
+
+  it.each([undefined, null, "invalid", ["note"]])(
+    "reads a missing or malformed notice map as no notices (%j)",
+    async (value) => {
+      expect(
+        (await probe({ sandbox_provider_automation_notices: value }))
+          .sandbox_provider_automation_notices,
+      ).toEqual({});
+    },
+  );
+
+  it("drops notices that aren't non-blank text", async () => {
+    const result = await probe({
+      sandbox_provider_automation_notices: {
+        kept: "Keep your laptop signed in.",
+        empty: "",
+        blank: "   ",
+        number: 42,
+        missing: null,
+      },
+    });
+    expect(result.sandbox_provider_automation_notices).toEqual({
+      kept: "Keep your laptop signed in.",
+    });
+  });
+
   it.each([undefined, false, "true", true])(
     "requires an explicit durable-input capability (%s)",
     async (value) => {
@@ -255,7 +289,9 @@ describe("resolveServerInfo session_search_scope", () => {
 describe.each([
   "scheduled_task_projects",
   "scheduled_task_harness_settings",
+  "scheduled_task_approval_skipping_modes",
   "scheduled_task_subhour",
+  "scheduled_task_trigger_headers",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
 ] as const)("resolveServerInfo %s", (capability) => {
@@ -358,17 +394,21 @@ describe("resolveServerInfo session_fork_workspaces", () => {
   });
 });
 
-describe("resolveServerInfo session_claude_sdk_clear", () => {
-  it.each([
-    [true, true],
-    [false, false],
-    [undefined, false],
-    ["true", false],
-  ])("parses %s strictly as %s", async (advertised, expected) => {
-    const parsed = await probe({ session_claude_sdk_clear: advertised });
-    expect(parsed.session_claude_sdk_clear).toBe(expected);
-  });
-});
+describe.each(["session_claude_sdk_clear", "session_rewind"] as const)(
+  "resolveServerInfo %s",
+  (capability) => {
+    it.each([
+      [true, true],
+      [false, false],
+      [undefined, false],
+      ["true", false],
+      [1, false],
+    ])("parses %s strictly as %s", async (advertised, expected) => {
+      const parsed = await probe({ [capability]: advertised });
+      expect(parsed[capability]).toBe(expected);
+    });
+  },
+);
 
 describe("resolveServerInfo session_event_types", () => {
   it.each([
@@ -382,6 +422,17 @@ describe("resolveServerInfo session_event_types", () => {
     expect((await probe({ session_event_types: advertised })).session_event_types).toEqual(
       expected,
     );
+  });
+});
+
+describe("resolveServerInfo move_to_managed_sandbox", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ move_to_managed_sandbox: advertised });
+    expect(parsed.move_to_managed_sandbox).toBe(expected);
   });
 });
 
@@ -478,12 +529,26 @@ describe("custom agents settings capability", () => {
   );
 
   it.each([undefined, false, "true", true])(
+    "parses session_title_instructions strictly: %s",
+    async (stored) => {
+      const parsed = await probe({ session_title_instructions: stored });
+      expect(parsed.session_title_instructions).toBe(stored === true);
+    },
+  );
+
+  it.each([undefined, false, "true", true])(
+    "requires explicit support for PR comment anchors: %s",
+    async (supported) => {
+      expect((await probe({ comment_anchor_metadata: supported })).comment_anchor_metadata).toBe(
+        supported === true,
+      );
+    },
+  );
+
+  it.each([undefined, false, "true", true])(
     "requires a boolean install capability: %s",
     async (install) => {
-      const parsed = await probe({
-        features: { custom_agents_settings_ui: true },
-        agent_install: install,
-      });
+      const parsed = await probe({ agent_install: install });
       const { customAgentsSettingsEnabled } = await import("./capabilities");
       expect(customAgentsSettingsEnabled(parsed)).toBe(install === true);
     },

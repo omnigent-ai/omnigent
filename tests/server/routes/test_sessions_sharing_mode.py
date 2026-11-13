@@ -22,6 +22,7 @@ lifespan) since none of these paths need the runtime.
 from __future__ import annotations
 
 import errno
+import uuid
 from pathlib import Path
 
 import httpx
@@ -538,6 +539,66 @@ async def test_revoke_is_unaffected_by_read_only(db_uri: str, tmp_path: Path) ->
         )
         revoke = await c.delete(f"/v1/sessions/{sid}/permissions/{_GRANTEE}")
         assert revoke.status_code == 204, revoke.text
+
+
+# ── Gate order: the sharing mode is checked before the public checks ──
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode,public_sharing,level,expected_message",
+    [
+        # Read-only cap (403) wins over the public ceiling (400) for an edit grant.
+        (
+            SharingMode.READ_ONLY,
+            True,
+            LEVEL_EDIT,
+            "Sharing is limited to read-only access on this Omnigent server.",
+        ),
+        # The OFF refusal (403) wins over the public kill switch (403).
+        (
+            SharingMode.OFF,
+            False,
+            LEVEL_READ,
+            "Sharing has been disabled for this Omnigent server.",
+        ),
+    ],
+)
+async def test_sharing_mode_refusal_precedes_public_checks(
+    db_uri: str,
+    tmp_path: Path,
+    mode: SharingMode,
+    public_sharing: bool,
+    level: int,
+    expected_message: str,
+) -> None:
+    """A public grant refused by the sharing mode reports the mode's message and status."""
+    app, sid = _seed_owned_session(
+        db_uri,
+        tmp_path,
+        sharing_mode=mode,
+        public_sharing=public_sharing,
+        public_sharing_max_level="read",
+    )
+    async with _client(app, _OWNER) as c:
+        resp = await c.put(
+            f"/v1/sessions/{sid}/permissions",
+            json={"user_id": RESERVED_USER_PUBLIC, "level": level},
+        )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["message"] == expected_message
+
+
+async def test_access_check_precedes_sharing_gate(db_uri: str, tmp_path: Path) -> None:
+    """A caller with no access to a missing session gets 404 even when sharing is OFF."""
+    app, _ = _seed_owned_session(db_uri, tmp_path, sharing_mode=SharingMode.OFF)
+    async with _client(app, _GRANTEE) as c:
+        resp = await c.put(
+            f"/v1/sessions/{uuid.uuid4().hex}/permissions",
+            json={"user_id": "carol@sharing.test", "level": LEVEL_READ},
+        )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["message"] == "Conversation not found"
 
 
 # ── workspace_sharing_blocked — the home/root cwd predicate ──────────

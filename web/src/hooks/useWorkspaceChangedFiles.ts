@@ -566,6 +566,13 @@ export interface WorkspaceFileSearchResult {
    * definitive "no match".
    */
   truncated: boolean;
+  /** True when the server returned its full result limit, so more matches may exist. */
+  hasMore: boolean;
+  /**
+   * True when the workspace couldn't be searched (no OS environment, or the runner
+   * is unavailable). `files` is then empty, which doesn't mean nothing matched.
+   */
+  unavailable: boolean;
 }
 
 async function fetchWorkspaceFileSearch(
@@ -574,6 +581,7 @@ async function fetchWorkspaceFileSearch(
   include: string,
   exclude: string,
   location: string,
+  signal?: AbortSignal,
 ): Promise<WorkspaceFileSearchResult> {
   const params = new URLSearchParams({ limit: "500" });
   if (query) params.set("q", query);
@@ -584,15 +592,22 @@ async function fetchWorkspaceFileSearch(
   if (base) params.set("base", base);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/search${segment ? `/${segment}` : ""}?${params}`,
+    { signal },
   );
   // 404 means the runner has no OS environment for this session (cloud-only
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
   // results rather than surfacing an error.
-  if (res.status === 404) return { files: [], truncated: false };
-  if (await isRunnerUnavailable503(res)) return { files: [], truncated: false };
+  const unavailable = { files: [], truncated: false, hasMore: false, unavailable: true };
+  if (res.status === 404) return unavailable;
+  if (await isRunnerUnavailable503(res)) return unavailable;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as FilesystemListResponse;
-  return { files: mapFilesystemEntries(json, location), truncated: !!json.truncated };
+  return {
+    files: mapFilesystemEntries(json, location),
+    truncated: !!json.truncated,
+    hasMore: !!json.has_more,
+    unavailable: false,
+  };
 }
 
 /**
@@ -632,8 +647,16 @@ export function useWorkspaceFileSearch(
       trimmedExclude,
       location,
     ],
-    queryFn: () =>
-      fetchWorkspaceFileSearch(conversationId!, trimmed, trimmedInclude, trimmedExclude, location),
+    // React Query aborts the signal when a newer query replaces this one.
+    queryFn: ({ signal }) =>
+      fetchWorkspaceFileSearch(
+        conversationId!,
+        trimmed,
+        trimmedInclude,
+        trimmedExclude,
+        location,
+        signal,
+      ),
     enabled:
       (options.enabled ?? true) && !!conversationId && trimmed.length > 0 && serveable !== false,
     staleTime: 5_000,

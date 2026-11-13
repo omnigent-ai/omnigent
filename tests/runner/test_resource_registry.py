@@ -21,6 +21,7 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
@@ -559,6 +560,34 @@ def test_list_resources_filters_by_type(tmp_path: Path) -> None:
     assert all(r.type == "terminal" for r in term_page.data)
 
 
+def test_wake_session_terminal_watchers_targets_only_status_terminals(tmp_path: Path) -> None:
+    """A turn edge wakes native agent terminals' watchers, not generic ones."""
+    tr = TerminalRegistry()
+    _seed_terminal(tr, "conv_1", "claude", "main", tmp_path)
+    _seed_terminal(tr, "conv_1", "bash", "s1", tmp_path)
+    reg = SessionResourceRegistry(terminal_registry=tr)
+    reg._terminal_roles[("conv_1", terminal_resource_id("claude", "main"))] = (
+        CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+
+    woke: list[tuple[str, bool]] = []
+    for entry in tr.list_for_conversation("conv_1"):
+        entry.instance.wake_idle_watcher = (  # type: ignore[method-assign]
+            lambda name=entry.terminal_name, *, expect_output=False: woke.append(
+                (name, expect_output)
+            )
+        )
+
+    reg.wake_session_terminal_watchers("conv_1")
+
+    assert woke == [("claude", True)]
+
+
+def test_wake_session_terminal_watchers_without_registry_is_noop() -> None:
+    """With no terminal registry the wake hook is a safe no-op."""
+    SessionResourceRegistry().wake_session_terminal_watchers("conv_x")
+
+
 @pytest.mark.asyncio
 async def test_terminal_resource_role_is_private_and_cleared_on_close(
     tmp_path: Path,
@@ -770,9 +799,11 @@ async def test_auxiliary_terminal_exit_publishes_resource_exit_only(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s
+        del on_idle, on_activity, on_tick, idle_threshold_s
+        del poll_interval_s, idle_poll_backoff_allowed
         callbacks["on_exit"] = on_exit
         callbacks["replace"] = replace
 
@@ -843,9 +874,11 @@ async def test_auxiliary_codex_exit_persists_redacted_final_screen(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s
+        del poll_interval_s, idle_poll_backoff_allowed, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
@@ -896,9 +929,10 @@ async def _observe_native_agent_terminal_and_capture(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del idle_threshold_s, poll_interval_s, replace
+        del idle_threshold_s, poll_interval_s, idle_poll_backoff_allowed, replace
         callbacks["on_idle"] = on_idle
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit
@@ -937,6 +971,7 @@ class _FakeStatusPoller:
         self._on_failure = on_failure
         self.on_background = on_background
         self.active = False
+        self.reports_idle = False
         self.blocked_on: str | None = None
         self.ticks = 0
         self.retired = False
@@ -1019,6 +1054,7 @@ async def _observe_native_with_fake_poller(
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
         del idle_threshold_s, poll_interval_s, replace
@@ -1026,6 +1062,7 @@ async def _observe_native_with_fake_poller(
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit
         callbacks["on_tick"] = on_tick
+        callbacks["idle_poll_backoff_allowed"] = idle_poll_backoff_allowed
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
     await registry.observe_required_terminal(
@@ -1048,6 +1085,7 @@ async def _observe_native_with_real_poller(
 ) -> tuple[Callable[[], None], list[str], SessionResourceRegistry, Path]:
     """Observe a Claude terminal with a real poller and caller-written status file.
 
+    :param program_status_path: A PTY relay's OSC status report for the terminal, if any.
     :param instance: Terminal to observe; a fresh test terminal when ``None``.
     :param published: Collects each published ``(status, blocked_on)`` edge.
     :param inferred_edges: Collects the edges among them published as pane-inferred.
@@ -1055,7 +1093,7 @@ async def _observe_native_with_real_poller(
     """
     config_dir = tmp_path / "claude"
     status_file = config_dir / "sessions" / "123.json"
-    status_file.parent.mkdir(parents=True)
+    status_file.parent.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
@@ -1190,6 +1228,69 @@ async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
     on_tick()
     on_tick()
     assert pollers[0].ticks == 2
+
+
+@pytest.mark.asyncio
+async def test_claude_native_backoff_predicate_tracks_file_idle(tmp_path: Path) -> None:
+    """Native idle-poll backoff is gated on the status file's idle reading.
+
+    While the file owns the session's status the predicate holds the base
+    cadence until Claude itself reads idle, so a quiet-but-working pane never
+    delays the file-driven turn edge. Without the file, pane quiescence alone
+    governs backoff.
+    """
+    callbacks, _statuses, pollers, _registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_backoff"
+    )
+    allowed = callbacks["idle_poll_backoff_allowed"]
+    assert callable(allowed)
+    poller = pollers[0]
+
+    # File unresolved: pane quiescence governs, so backoff is allowed.
+    poller.active = False
+    poller.reports_idle = False
+    assert allowed()
+
+    # File owns status while Claude runs (or is unknown): hold the base cadence.
+    poller.active = True
+    poller.reports_idle = False
+    assert not allowed()
+
+    # File owns status and Claude reads idle: allow backoff.
+    poller.reports_idle = True
+    assert allowed()
+
+
+@pytest.mark.asyncio
+async def test_non_claude_native_terminal_has_no_idle_poll_backoff_gate(
+    tmp_path: Path,
+) -> None:
+    """Only claude-native wires the status-file backoff gate.
+
+    Other native roles have no status file to arbitrate their turn edge, so
+    the watcher receives no backoff predicate and pane quiescence alone
+    governs their polling.
+    """
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    registry.set_session_status_publisher(lambda *_args: None)
+    registry.set_terminal_exit_publisher(lambda *_args: None)
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault("conv_codex_gate", {})[("codex", "main")] = (
+        instance
+    )
+    captured: dict[str, object] = {"backoff": "unset"}
+
+    def _capture_watcher(
+        *_args: object, idle_poll_backoff_allowed: object | None = None, **_kwargs: object
+    ) -> None:
+        captured["backoff"] = idle_poll_backoff_allowed
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    await registry.observe_required_terminal(
+        "conv_codex_gate", "codex", "main", instance, resource_role=CODEX_NATIVE_TERMINAL_ROLE
+    )
+    assert captured["backoff"] is None
 
 
 @pytest.mark.asyncio
@@ -1710,6 +1811,126 @@ async def _hidden_input_box_session(
     return _HiddenInputBoxSession(
         on_tick, instance, registry, status_file, published, inferred_edges, clock
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "poll_before_idle_edge", [False, True], ids=["edge-then-poll", "poll-then-edge"]
+)
+@pytest.mark.parametrize("status_source", ["status_file", "osc"])
+async def test_stop_leaving_a_background_agent_settles_a_busy_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    poll_before_idle_edge: bool,
+    status_source: str,
+) -> None:
+    """A Stop that leaves a background agent running settles the turn as waiting.
+
+    Claude keeps its status file busy and its OSC report working for the agent's
+    lifetime, so the idle edge's resync must republish waiting rather than running
+    or leave the forwarded idle standing, and so must a restarted runner; a
+    blocking Stop hook's continuation or the next prompt's turn reports running.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        bridge_dir_for_conversation_id,
+        record_hook_event,
+    )
+
+    session_id = "conv_background_agent"
+    claude_session_id = "claude-background-agent"
+    report: Path | None = None
+    if status_source == "osc":
+        report = tmp_path / "program-status.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "relay_pid": os.getpid(),
+                    "pid": 123,
+                    "status": {"state": "working", "app": "claude-code"},
+                }
+            )
+        )
+    on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id, program_status_path=report
+    )
+    bridge_dir = bridge_dir_for_conversation_id(session_id)
+
+    def hook(event_name: str, **fields: object) -> None:
+        record_hook_event(
+            bridge_dir, {"hook_event_name": event_name, "session_id": claude_session_id, **fields}
+        )
+
+    async def tick() -> None:
+        on_tick()
+        await asyncio.sleep(0)
+
+    async def stop_leaving_the_agent_running() -> None:
+        hook(
+            "Stop",
+            transcript_path=str(transcript),
+            background_tasks=[
+                {"id": "a1", "type": "subagent", "status": "running", "description": "Audit"},
+                {"id": "s1", "type": "shell", "status": "running", "command": "sleep 9"},
+            ],
+        )
+        if poll_before_idle_edge:
+            await tick()
+        registry.note_external_session_status(session_id, "idle")
+        await tick()
+        await tick()
+        assert not registry.session_turn_is_active(session_id)
+        assert registry.session_has_background_agents(session_id)
+        assert registry.session_background_agents(session_id) == [
+            {"id": "a1", "type": "subagent", "status": "running", "description": "Audit"}
+        ]
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        '{"type": "user", "message": {"content": "go"}}\n'
+        '{"type": "assistant", "message": {"content": []}}\n',
+        encoding="utf-8",
+    )
+    record = {"pid": 123, "sessionId": claude_session_id, "kind": "interactive", "status": "busy"}
+    status_file.write_text(json.dumps(record), encoding="utf-8")
+    hook("UserPromptSubmit")
+    await tick()
+    assert statuses == ["running"]
+
+    await stop_leaving_the_agent_running()
+    # The forwarded idle overwrites a waiting edge already sent, so it is resent.
+    settled = (
+        ["running", "waiting", "waiting"] if poll_before_idle_edge else ["running", "waiting"]
+    )
+    assert statuses == settled
+
+    restarted_tick, restarted_statuses, restarted, _ = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id, program_status_path=report
+    )
+    restarted_tick()
+    await asyncio.sleep(0)
+    assert restarted_statuses == ["waiting"]
+    assert restarted.session_has_background_agents(session_id)
+
+    feedback = {
+        "type": "user",
+        "isMeta": True,
+        "message": {"content": "Stop hook feedback:\nwait"},
+    }
+    with transcript.open("a", encoding="utf-8") as transcript_file:
+        transcript_file.write(json.dumps(feedback) + "\n")
+    await tick()
+    assert statuses == [*settled, "running"]
+    assert registry.session_turn_is_active(session_id)
+    assert not registry.session_has_background_agents(session_id)
+    assert registry.session_background_agents(session_id) == []
+
+    with transcript.open("a", encoding="utf-8") as transcript_file:
+        transcript_file.write('{"type": "assistant", "message": {"content": []}}\n')
+    await stop_leaving_the_agent_running()
+    hook("UserPromptSubmit")
+    await tick()
+    assert registry.session_turn_is_active(session_id)
+    assert not registry.session_has_background_agents(session_id)
 
 
 @pytest.mark.asyncio
@@ -2294,8 +2515,22 @@ async def test_pty_edges_drive_status_when_poller_inactive(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hold_edges", "status_before_exit", "was_waiting"),
+    [
+        ((), "idle", False),
+        (("waiting",), "waiting", True),
+        (("waiting", "idle"), "idle", False),
+        (("waiting", "failed"), "failed", False),
+    ],
+    ids=["idle", "background_agent_hold", "hold_ended", "hold_failed"],
+)
 async def test_required_terminal_exit_while_idle_is_clean_shutdown(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    hold_edges: tuple[str, ...],
+    status_before_exit: str,
+    was_waiting: bool,
 ) -> None:
     """A required terminal that exits after going idle is not a failure.
 
@@ -2303,9 +2538,16 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     finishes. A pane exit observed while idle means the work was already
     delivered and the process simply shut down, so the exit event must carry
     ``session_was_idle=True`` — the runner uses that to avoid flipping the chat
-    to ``failed`` (the spurious-"failed"-session bug).
+    to ``failed`` (the spurious-"failed"-session bug). A finished turn that
+    published a background-agent ``waiting`` instead is just as finished, and
+    the exit also says the server still holds that wait, so the runner can end
+    it; once a later edge replaced the wait, it doesn't.
 
     :param tmp_path: Temporary directory for fake terminal paths.
+    :param hold_edges: Status edges published after the turn, instead of the
+        pane's own idle edge; empty for a plain idle turn.
+    :param status_before_exit: The status the exit should report.
+    :param was_waiting: Whether the exit should report the server's wait.
     """
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
@@ -2330,7 +2572,12 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     on_idle = callbacks["on_idle"]
     assert callable(on_activity) and callable(on_idle)
     on_activity()
-    on_idle()
+    if hold_edges:
+        # The status poller's edges for a turn that left a background agent running.
+        for status in hold_edges:
+            assert registry._claim_status_edge("conv_idle", status, None)
+    else:
+        on_idle()
     # Then the pane disappeared (e.g. Claude Code exited cleanly).
     on_exit = callbacks["on_exit"]
     assert callable(on_exit)
@@ -2339,7 +2586,8 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
 
     assert len(exits) == 1
     assert exits[0].lifecycle == TerminalLifecycle.REQUIRED
-    assert exits[0].session_was_idle is True
+    assert exits[0].session_was_idle is (status_before_exit != "failed")
+    assert exits[0].session_was_waiting is was_waiting
     assert registry.session_activity_epoch("conv_idle") == initial_activity
     record = next(
         record
@@ -2348,7 +2596,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     )
     assert record.session_id == "conv_idle"
     assert record.attributes["terminal_lifecycle"] == "required"
-    assert record.attributes["session_status_before_exit"] == "idle"
+    assert record.attributes["session_status_before_exit"] == status_before_exit
 
 
 @pytest.mark.asyncio
@@ -2651,9 +2899,11 @@ async def test_required_terminal_exit_without_observed_status_is_failure(tmp_pat
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        del on_idle, on_activity, on_tick, idle_threshold_s
+        del poll_interval_s, idle_poll_backoff_allowed, replace
         callbacks["on_exit"] = on_exit
 
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
@@ -3344,9 +3594,10 @@ async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
         on_tick: object | None = None,
         idle_threshold_s: float | None = None,
         poll_interval_s: float | None = None,
+        idle_poll_backoff_allowed: object | None = None,
         replace: bool = False,
     ) -> None:
-        del idle_threshold_s, poll_interval_s, replace
+        del idle_threshold_s, poll_interval_s, idle_poll_backoff_allowed, replace
         callbacks["on_idle"] = on_idle
         callbacks["on_activity"] = on_activity
         callbacks["on_exit"] = on_exit
