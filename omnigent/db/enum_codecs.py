@@ -5,10 +5,9 @@ Several low-cardinality closed-set columns (``conversations.kind``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
 ``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
 ``scheduled_tasks.execution_target``,
-``scheduled_task_runs.status``) are stored as
-integer codes rather
-than their string names — smaller rows and a tighter ``CHECK`` than a
-free ``VARCHAR``. The string names remain the
+``scheduled_task_runs.status``, ``inbox_items.status``)
+are stored as integer codes rather than their string names — smaller rows
+and a tighter ``CHECK`` than a free ``VARCHAR``. The string names remain the
 contract for entities, the HTTP API, the web client, and the SDKs; the
 integer form never leaves the store row↔entity boundary. These codecs are
 the single place that translates between the two.
@@ -132,6 +131,14 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "failed": 4,
     "skipped": 5,
     "starting": 6,
+}
+
+# Proactive-agent Inbox items (``inbox_items``).
+INBOX_ITEM_STATUS: dict[str, int] = {
+    "unread": 1,
+    "read": 2,
+    "done": 3,
+    "dismissed": 4,
 }
 
 

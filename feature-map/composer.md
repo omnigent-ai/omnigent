@@ -76,7 +76,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `project-session-defaults`: Project settings store a default agent and, for
   Claude Code, Codex, and Pi, a default model and reasoning effort; the
   new-session composer opened in that project (`/?project=<name>`) starts with
-  them. The Fork dialog and CLI, API, and scheduled creates don't apply model
+  them. A project created with a repository seeds its sandbox provider and
+  repository into a sandbox pick, and a managed create without those fields takes
+  them from the project. A malformed saved repository (for example a legacy bare
+  string) is ignored. The Fork dialog and CLI, API, and scheduled creates don't apply model
   or effort. States: no default, a Codex
   effort the pinned model lacks (or, with no project model, the remembered
   model lacks), an explicit composer pick, remembered Smart Routing, another
@@ -135,14 +138,38 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   The main composer lists its full built-in set and the session's skills; a live
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through
-  `slash_command` so it runs on an in-process harness. A native terminal side
-  chat shows no menu and sends slash text to the vendor TUI. Claude Code and
-  Codex native sessions offer `/clear` only when `/v1/info` lists `clear` in
-  `session_event_types`; claude-sdk sessions only when it reports
-  `session_claude_sdk_clear`. Otherwise a typed `/clear` goes to the harness
-  as text. A claude-sdk `/clear` continues in a new, empty session on the same
-  machine and the view follows it. States: loading, error/retry,
+  `slash_command` so it runs on an in-process harness. A built-in the session
+  doesn't offer (e.g. `/compact` or `/model` where gated off) is not handled
+  locally: a skill of the same name runs, otherwise the text is sent. `/side`
+  is the exception: outside Codex native it always opens a side chat. A native
+  terminal side chat shows no menu and sends slash text to the vendor TUI.
+  Claude Code and Codex native sessions offer `/clear` only when `/v1/info`
+  lists `clear` in `session_event_types`; claude-sdk sessions only when it
+  reports `session_claude_sdk_clear`. Otherwise a typed `/clear` goes to the
+  harness as text. A claude-sdk `/clear` continues in a new, empty session on
+  the same machine and the view follows it. States: loading, error/retry,
   unavailable while disconnected, and an incomplete catalog.
+- `goal-command`: in sessions with a Goal control, bare `/goal` or its slash-menu
+  row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
+  existing message path. Sessions without the control keep sending the text
+  or invoking a same-named skill. States: no goal, existing goal, read-only.
+- `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
+  a searchable list of the session's prompts, newest first. Choosing one
+  continues the conversation in a new session holding only the history before
+  that prompt, on the same host, workspace and runner, with the prompt back in
+  the composer to edit, attachments included; the original session keeps
+  everything and links to the new one. Workspace files are not rolled back.
+  The picker reads the newest prompts first and offers **Load older prompts**,
+  which stays while searching. Offered only when `/v1/info` reports
+  `session_rewind`; otherwise a typed `/rewind` is sent as text, or runs a
+  custom command of that name (likewise `/clear`). States: loading prompts,
+  prompts failed to load, no prompts, older prompts loading or failed, refused
+  while a turn runs or with neither a usable runner nor a saved host binding
+  (error under the composer), prompt arriving after the new session opened
+  (filled unless the user has typed, cleared or sent a draft there), an
+  attachment that could not be restored (a warning asks the user to attach it
+  again, including missing files and failed server lookups; failed downloads
+  name the affected files).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -207,6 +234,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   arriving (the highlighted row stays put), a file and a session with the same
   name (the later one gets a suffix such as `@README.md (file)`), Attach to
   agent from the file viewer (adds a token at the end).
+- `review-context`: submitting an Agent comment in PR Changes attaches a chip
+  to the session composer. Hover previews the comment, click reveals it in
+  Changes, and X deletes the saved comment. Failed deletion retains the chip.
+  See [local review](pull-request-conversations.md) for all four entry points.
 - `dictation`: the microphone button beside the message box dictates speech
   into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
   terminal or code editor. While a browser or server take is listening, Enter
@@ -297,6 +328,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## How to get to it (user POV)
 
+- In a Codex native chat or a Polly session with a Goal control, send `/goal`,
+  choose `/goal` from the slash menu, or open **+ → Goal**.
+
 **In-session composer** (open any session):
 
 - Hover the model/effort pill to see the tooltip; click it to open configuration.
@@ -359,6 +393,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   as "Waiting for host" until the host reconnects.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
   page in the same project. Selecting **/new** in Commands also opens it.
+- In a claude-sdk session, type `/cl` and click **/clear**, or type the whole
+  `/clear` and press Enter; either opens a new, empty chat on the same machine.
+- In a claude-sdk or Claude Code native session with a few prompts sent,
+  type `/rew` and click **/rewind**, or type `/rewind` and press Enter, then
+  pick a prompt (search, or **Load older prompts** in a long session). The new
+  chat opens with that prompt, and its attachments, in the composer.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
@@ -578,6 +618,16 @@ Other connection providers alone do not enable the managed MCP picker.
   reply once, with no model-change error. Requires Claude Code and tmux. Use
   a clean container when machine-managed Claude settings override the mock
   endpoint; this does not establish live gateway compatibility.
+- **`model-picker`, paused Pi after server restart (own environment):**
+  Start a Pi session on a host with a configured local catalog, pause the
+  session, restart only the server, and reload the session. Open the model
+  picker through the gear, model pill, and Ctrl+Shift+M; the host models must
+  appear while the runner remains offline. Repeat for a sub-agent that inherits
+  its host from an ancestor. The component scenario
+  `tests/server/routes/test_sessions_snapshot.py::test_session_snapshot_fills_cold_pi_catalog_from_host`
+  covers direct and inherited hosts, concurrent reads and refresh publication.
+  Direct-host browser evidence is in the PR Demo; inherited-host browser and
+  live-provider resume checks remain manual gaps.
 - **`model-picker`, row hover (both composers):** no browser-level coverage;
   `web/src/lib/composerModelLabel.test.ts`. Manually: hover a row labeled with
   a family name and expect its full model ID; the Fusion row shows none.
@@ -701,6 +751,27 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_slash_menu.py::test_new_command_deleted_project_opens_unfiled`
   covers deleted projects with dangling session membership.
   No running agent is needed.
+- **`slash-menu` (claude-sdk `/clear`) and `slash-rewind`:** the browser
+  scenarios select the command from the menu against a real Claude CLI on the
+  mock LLM:
+  `tests/e2e_ui/chat/test_claude_sdk_clear.py::test_claude_sdk_clear_follows_a_new_empty_session`
+  and
+  `tests/e2e_ui/chat/test_claude_sdk_rewind.py::test_claude_sdk_rewind_follows_the_truncated_session`.
+  At the process boundary, with a real Claude login, Claude Code native
+  `/rewind` is covered by
+  `tests/e2e/test_host_claude_native_fork_e2e.py::test_rewind_claude_native_resumes_only_the_earlier_history`
+  (opt in with `OMNIGENT_E2E_CLAUDE_NATIVE=1`) and claude-sdk `/rewind` by
+  `tests/e2e/test_host_claude_sdk_e2e.py::test_rewind_claude_sdk_keeps_only_the_earlier_turns`
+  (opt in with `OMNIGENT_E2E_CLAUDE_SDK=1`). The typed
+  full command, the fallback to text or a custom command, and a prompt that
+  arrives after the redirect are component-covered in
+  `web/src/pages/ChatPage.composer.test.tsx`; the picker's older-prompt
+  loading, retry and stale replies in `web/src/components/RewindPicker.test.tsx`.
+  Manually, repeat both entry routes (menu click; whole command plus Enter)
+  for SDK `/clear`, SDK `/rewind` and native `/rewind`, and rewind to a prompt
+  with an attachment. Each `/clear` moves the view to an empty chat on the
+  same machine, and the original chat ends with a notice linking to it. The
+  capability gate is also in `web/src/pages/ChatPage.composer.test.tsx`.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_full_skill_description`,
@@ -710,13 +781,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
   `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
-  claude-sdk `/clear` from the menu, with a real Claude CLI on the mock model:
-  `tests/e2e_ui/chat/test_claude_sdk_clear.py::test_claude_sdk_clear_follows_a_new_empty_session`.
-  Manually, in a claude-sdk session with one finished turn, type `/cle` and
-  pick **/clear**, then repeat in a new session by typing `/clear` and pressing
-  Enter. Each time the view moves to an empty chat on the same machine, and the
-  original chat ends with a notice linking to it. Menu and typed entry, and the
-  capability gate, are in `web/src/pages/ChatPage.composer.test.tsx`.
+  claude-sdk `/clear` is in the `/clear` and `slash-rewind` recipe above.
+- **`goal-command`:**
+  `tests/e2e_ui/chat/test_codex_goal_mode.py::test_codex_goal_mode_processes_first_message_with_untrusted_hooks`
+  drives a real Codex native session through **+ → Goal**, bare `/goal`, and
+  the slash-menu row. Component coverage in `web/src/pages/ChatPage.composer.test.tsx`
+  also checks Polly's command-backed dialog, full objective forwarding, and
+  same-named skills when Goal is unavailable. New-session and side-chat
+  composers do not expose this session Goal dialog.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under

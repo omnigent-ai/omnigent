@@ -72,6 +72,8 @@ interface CommentProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   /** In-progress comment body; clicking away won't clear an active draft. */
   pendingBodyRef?: React.RefObject<string>;
+  /** Whether the session's agent opens an attached workspace path */
+  attachToAgent?: boolean;
 }
 
 interface MonacoCodeEditorProps extends CommentProps {
@@ -139,6 +141,7 @@ export function MonacoCodeEditor({
   activeSelection,
   onSetActiveSelection,
   pendingBodyRef,
+  attachToAgent,
 }: MonacoCodeEditorProps) {
   // A truncated buffer must never be editable, regardless of permission.
   const canEdit = useCanEdit(conversationId) && !truncated;
@@ -185,6 +188,7 @@ export function MonacoCodeEditor({
       activeSelection={activeSelection}
       onSetActiveSelection={onSetActiveSelection}
       pendingBodyRef={pendingBodyRef}
+      attachToAgent={attachToAgent}
     />
   );
 }
@@ -245,6 +249,7 @@ function MonacoCodeEditorInner({
   activeSelection,
   onSetActiveSelection,
   pendingBodyRef,
+  attachToAgent,
 }: InnerProps) {
   const lang = detectLang(path);
   const monacoTheme = resolvedThemeToMonaco(useResolvedThemeMode());
@@ -479,6 +484,7 @@ function MonacoCodeEditorInner({
     canComment: canEdit && !isDirty,
     pendingBodyRef,
     path,
+    attachToAgent,
   });
 
   const options = useMemo<EditorOptions>(() => {

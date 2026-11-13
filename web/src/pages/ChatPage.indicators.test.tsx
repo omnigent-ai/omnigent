@@ -356,12 +356,15 @@ describe("WorkingIndicator", () => {
       );
     });
 
-    it("still points at the terminal when the only pending card is a sub-agent's", () => {
+    it.each([
+      ["a sub-agent's", { targetSessionId: "conv_sub_agent" }],
+      ["a question the agent keeps working past", { isBlocking: false as const }],
+    ])("still points at the terminal when the only pending card is %s", (_case, cardFields) => {
       useChatStore.setState({
         conversationId: "conv_root",
         sessionStatus: "running",
         blockedOn: "permission prompt",
-        blocks: [{ ...pendingApproval, targetSessionId: "conv_sub_agent" }],
+        blocks: [{ ...pendingApproval, ...cardFields }],
       });
       renderInTerminalFirstSession();
 
