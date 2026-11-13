@@ -1169,6 +1169,79 @@ async def _offline_native_host_session(client: httpx.AsyncClient, app: FastAPI) 
     return response.json()["id"]
 
 
+@pytest.mark.parametrize(
+    ("host_state", "expected_status"),
+    [
+        ("offline", "running"),
+        ("expired", "idle"),
+        ("unreadable", "running"),
+    ],
+)
+async def test_list_preserves_resumable_offline_host_turn(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    host_state: str,
+    expected_status: str,
+) -> None:
+    """A list read cannot end a bounded hold or turn unreachable Stop into success."""
+    from dataclasses import replace
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.orchestration import HOST_OFFLINE_HOLD_S
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+
+    session_id = await _offline_native_host_session(client, app)
+    hosts = app.state.host_store
+    get_host = hosts.get_host
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(session_id)
+    assert conv is not None and conv.runner_id is not None
+    store.clear_runner_liveness(conv.runner_id)
+    if host_state == "expired":
+        old_stamp = int(time.time() - HOST_OFFLINE_HOLD_S - 2 * RUNNER_LIVENESS_TTL_S - 120)
+        host = get_host(_HOST_ID)
+        assert host is not None
+        old_host = replace(host, created_at=old_stamp - 100, updated_at=old_stamp)
+        monkeypatch.setattr(hosts, "get_host", lambda _host_id: old_host)
+    await asyncio.wrap_future(
+        session_live_state.submit(
+            "test_offline_read_running", store.set_session_live_status, session_id, "running"
+        )
+    )
+    sessions_module._session_status_cache.pop(session_id, None)
+    if host_state == "unreadable":
+
+        def unreadable_host(_host_id: str) -> None:
+            raise OSError("host lookup unavailable")
+
+        monkeypatch.setattr(hosts, "get_host", unreadable_host)
+    completions: list[str] = []
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_scheduled_run_completion",
+        lambda _session_id, status, **_kwargs: completions.append(status),
+    )
+
+    response = await client.get("/v1/sessions")
+    assert response.status_code == 200, response.text
+    item = next(row for row in response.json()["data"] if row["id"] == session_id)
+    assert item["status"] == expected_status
+    assert store.get_conversation(session_id).live_status == expected_status  # type: ignore[union-attr]
+    assert completions == ([] if expected_status == "running" else ["failed"])
+    if expected_status == "running":
+        monkeypatch.setattr(hosts, "get_host", get_host)
+        stopped = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "stop_session", "data": {}}
+        )
+        assert stopped.status_code == 503, stopped.text
+        assert stopped.json()["error"]["code"] == "runner_unavailable"
+        assert store.get_conversation(session_id).live_status == "running"  # type: ignore[union-attr]
+        assert completions == []
+
+
 @pytest.mark.parametrize("has_runner_binding", [True, False])
 async def test_offline_host_skips_runner_grace_before_refusing_native_send(
     client: httpx.AsyncClient,
@@ -4481,9 +4554,9 @@ async def test_relaunch_recovers_only_a_rejected_enqueue(
     real_replace = store.replace_runner_id
     bound_runner_ids: list[str] = []
 
-    def record_binding(session_id: str, runner_id: str) -> Conversation:
+    def record_binding(session_id: str, runner_id: str, **kwargs: Any) -> Conversation:
         bound_runner_ids.append(runner_id)
-        return real_replace(session_id, runner_id)
+        return real_replace(session_id, runner_id, **kwargs)
 
     async def replace_during_admission(conn: HostConnection, session_id: str) -> None:
         admissions.append(conn)

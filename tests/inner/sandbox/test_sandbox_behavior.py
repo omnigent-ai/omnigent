@@ -39,7 +39,12 @@ import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
-from omnigent.inner.sandbox import create_exec_launcher, resolve_sandbox
+from omnigent.inner.sandbox import (
+    SandboxBackend,
+    create_exec_launcher,
+    get_backend,
+    resolve_sandbox,
+)
 from tests.inner.sandbox.conftest import run_async
 
 # ---------------------------------------------------------------------------
@@ -569,14 +574,24 @@ def test_sandbox_hides_user_dotfiles_in_cwd(
     assert venv_read["stdout"] == "venv-allowed"
 
 
+@pytest.mark.parametrize("declares_stability", [False, True])
 def test_sandbox_helper_survives_sequential_requests(
     tmp_path: Path,
     active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
     sandbox_pythonpath_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    declares_stability: bool,
 ) -> None:
     """Requests run on short-lived threads; the helper must outlive the one that spawned it."""
+    sandbox_spec = active_sandbox_spec_factory()
+    if not declares_stability:
+        monkeypatch.setattr(
+            type(get_backend(sandbox_spec.type)),
+            "launch_fingerprint",
+            SandboxBackend.launch_fingerprint,
+        )
     os_env = create_os_environment(
-        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=active_sandbox_spec_factory()),
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=sandbox_spec),
         relaunch_when_stale=True,
     )
     # Each launch gets a fresh private scratch dir; PIDs are namespace-local under bwrap.
@@ -587,7 +602,7 @@ def test_sandbox_helper_survives_sequential_requests(
     finally:
         os_env.close()
 
-    assert len(scratch_dirs) == 1
+    assert len(scratch_dirs) == (1 if declares_stability else 5)
 
 
 def test_sandbox_hides_dotfiles_created_after_helper_start(

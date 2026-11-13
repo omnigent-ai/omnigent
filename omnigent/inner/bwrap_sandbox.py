@@ -189,7 +189,7 @@ _ALLOWED_SOCKET_FAMILIES = (
 # Vetted outer sandboxes; see _should_bind_host_proc for isolation requirements.
 _PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"lakebox", "phoenix-kubernetes"})
 
-# Marker directory the Databricks Lakebox runtime seeds inside every
+# Marker directory the Lakebox runtime seeds inside every
 # microVM. Used to autodetect lakebox when the launcher hasn't declared the
 # backend via :data:`HOST_SANDBOX_BACKEND_ENV`.
 _LAKEBOX_MARKER = Path("/run/lakebox")
@@ -373,6 +373,7 @@ class BwrapSandboxBackend(SandboxBackend):
             ),
             credential_proxy=sandbox_spec.credential_proxy,
             git_ssh=sandbox_spec.git_ssh,
+            tcp_egress=sandbox_spec.tcp_egress,
         )
 
     def launch_fingerprint(
@@ -396,6 +397,7 @@ class BwrapSandboxBackend(SandboxBackend):
             policy,
             argv=argv,
         )
+        masks += _socket_mask_args(policy)
         skip = set(policy.mask_scan_skip_roots or [])
         granted = [
             cwd_resolved,
@@ -460,6 +462,8 @@ class BwrapSandboxBackend(SandboxBackend):
         :func:`omnigent.inner.sandbox.run_launcher`.
         """
         policy = self.prepare_launcher_policy(policy)
+        if policy.tcp_egress and policy.tcp_egress_socket_path is None:
+            raise ValueError("tcp_egress requires its parent broker before sandbox launch")
         cwd_resolved = cwd.resolve(strict=False)
         chdir_target = chdir.resolve(strict=False) if chdir is not None else cwd_resolved
         bwrap_args: list[str] = ["bwrap"]
@@ -620,8 +624,7 @@ class BwrapSandboxBackend(SandboxBackend):
         # mask only exists inside the helper's mount namespace. Emitted
         # AFTER the write-root binds so it is the last mount and wins
         # (same deny-wins ordering as the dotfile mask above).
-        for sock in policy.deny_unix_socket_paths or []:
-            bwrap_args += ["--bind-try", "/dev/null", str(sock)]
+        bwrap_args.extend(_socket_mask_args(policy))
 
         # Set $TMPDIR (and friends) to the first write_root that lives
         # under the system temp dir — the parent's
@@ -640,6 +643,7 @@ class BwrapSandboxBackend(SandboxBackend):
             not policy.allow_network
             or policy.egress_relay_port is not None
             or policy.git_ssh_socket_path is not None
+            or policy.tcp_egress_socket_path is not None
         ):
             bwrap_args.append("--unshare-net")
 
@@ -1040,6 +1044,15 @@ def _interpreter_chain_binds(argv: Sequence[str], covered_prefixes: list[Path]) 
 _BIND_FLAGS = frozenset(
     {"--bind", "--bind-try", "--ro-bind", "--ro-bind-try", "--dev-bind", "--dev-bind-try"}
 )
+
+
+def _socket_mask_args(policy: SandboxPolicy) -> list[str]:
+    """Return explicit socket masks shared by launch and fingerprint calculation."""
+    return [
+        arg
+        for path in policy.deny_unix_socket_paths or []
+        for arg in ("--bind-try", "/dev/null", str(path))
+    ]
 
 
 def _mount_target_identities(argv: Sequence[str]) -> list[tuple[int, int] | None]:

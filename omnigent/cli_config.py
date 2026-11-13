@@ -45,9 +45,8 @@ if TYPE_CHECKING:
     from omnigent.onboarding.openclaw_config import OpenClawDiscovery, SourceKind
     from omnigent.onboarding.provider_config import ProviderEntry
 
-# _INTERNAL_BETA_DEFAULT_SERVER (internal Databricks Apps host) moved to
-# omnigent.onboarding.internal_beta (excluded from the OSS build); the
-# internal-beta setup branch and the sandbox CLI import it from there.
+# _INTERNAL_BETA_DEFAULT_SERVER lives in omnigent.onboarding.internal_beta;
+# the --internal-beta setup branch and the sandbox CLI import it from there.
 # Brand shown for an auto-configured CLI login in the credentials callout —
 # the product the login authenticates, not the CLI name (the codex CLI logs in
 # a ChatGPT subscription). Keyed by the ambient detection name; these are the
@@ -185,7 +184,7 @@ def _tmux_dependency_problem() -> str | None:
 def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
     """Run Databricks setup against a temp config containing only our three profiles.
 
-    The temp file starts with just the canonical internal-beta profile
+    The temp file starts with just the canonical profile
     sections (see ``DEFAULT_PROFILES``) seeded from the original when they
     exist, so there is exactly one section per workspace host and
     ``databricks auth token --host X`` never hits the "multiple profiles
@@ -225,7 +224,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
             else:
                 os.environ[var] = prev
 
-    # Temp file contains only the canonical internal-beta profile sections
+    # Temp file contains only the canonical profile sections
     # (see DEFAULT_PROFILES), seeded from the original when they already
     # exist. Everything else is excluded so there is exactly one
     # section per workspace host and `databricks auth token --host X`
@@ -641,7 +640,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     # harness, the menu is scoped to that harness's surface.
     options = add_menu_options_for_family(family) if family is not None else add_menu_options()
     # A custom provider defined by the user's own ~/.codex/config.toml
-    # (e.g. isaac's Databricks Unity Gateway) that is not currently configured
+    # (e.g. a Databricks Unity Gateway) that is not currently configured
     # gets its own add option. This is the only way back after Remove —
     # removal dismisses the detection so it stops auto-adopting, and there
     # is nothing to type/paste here (the credential lives in that file).
@@ -867,6 +866,8 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             if isinstance(block, dict):
                 remaining = {k: v for k, v in block.items() if k not in existing_subs}
                 _save_global_config({"providers": remaining})
+        # Signing in again re-enables a login dismissed when setup removed an invalid entry.
+        _clear_detection_dismissal(cli_name)
         # Subscription name is derived from the CLI — no prompt.
         name = f"{cli_name}-subscription"
         entry = build_subscription_provider_entry(cli_name)
@@ -3664,6 +3665,97 @@ def _manage_opencode_harness() -> None:
         elif action == "help":
             _print_opencode_auth_help()
             status = None
+
+
+def _repair_removal_dismissals(removed: dict[str, object], kept: dict[str, object]) -> set[str]:
+    """Return live ambient detections that would re-adopt the *removed* entries.
+
+    A detection matches a removed entry's name or a removed subscription's CLI. Unlike
+    :func:`_remove_credential`, setup's repair does not sign out, so a login is dismissed
+    too unless a *kept* subscription still covers that CLI.
+    """
+    from omnigent.onboarding.ambient import SUBSCRIPTION_KIND, detect_providers
+
+    def subscription_clis(block: dict[str, object]) -> set[str]:
+        return {
+            entry["cli"]
+            for entry in block.values()
+            if isinstance(entry, dict)
+            and entry.get("kind") == SUBSCRIPTION_KIND
+            and isinstance(entry.get("cli"), str)
+        }
+
+    removed_names = set(removed) | subscription_clis(removed)
+    covered_clis = subscription_clis(kept)
+    return {
+        detection.name
+        for detection in detect_providers()
+        if detection.name in removed_names
+        and not (detection.kind == SUBSCRIPTION_KIND and detection.name in covered_clis)
+    }
+
+
+def _repair_invalid_provider_entries() -> bool:
+    """Offer to repair or remove provider entries that fail to load; allow cancellation.
+
+    Removing an entry dismisses the live ambient detection that would re-adopt it.
+
+    :returns: ``False`` when the user leaves an invalid entry unchanged; the
+        config is then not written. ``True`` otherwise.
+    """
+    from rich.markup import escape
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.onboarding.detected import DISMISSED_DETECTIONS_KEY, dismissed_detection_names
+    from omnigent.onboarding.interactive import select
+    from omnigent.onboarding.provider_config import drop_unserved_default_scopes, load_providers
+
+    config = _load_global_config()
+    block = config.get("providers")
+    if not isinstance(block, dict):
+        return True
+    repaired: dict[str, object] = {}
+    removed: dict[str, object] = {}
+    for name, entry in block.items():
+        try:
+            load_providers({"providers": {name: entry}})
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.INVALID_INPUT:
+                raise
+            error = exc
+        else:
+            repaired[name] = entry
+            continue
+        fixed = drop_unserved_default_scopes(str(name), entry) if isinstance(entry, dict) else None
+        options = ["Remove this provider", "Leave unchanged and exit"]
+        descriptions = [
+            "Deletes this entry from the config. Keys stored outside the config stay in place.",
+            "Exits setup without changing the config.",
+        ]
+        if fixed is not None:
+            options.insert(0, "Keep it without the invalid default")
+            descriptions.insert(0, "Removes only the default scopes this provider does not serve.")
+        choice = select(
+            f"Invalid provider configuration: {escape(str(error))}",
+            options,
+            descriptions=descriptions,
+            default=0 if fixed is not None else len(options) - 1,
+        )
+        if choice < 0 or choice == len(options) - 1:
+            return False
+        if fixed is not None and choice == 0:
+            repaired[name] = fixed
+        else:
+            removed[str(name)] = entry
+    if repaired != block:
+        settings: dict[str, object] = {"providers": repaired}
+        dismissed = _repair_removal_dismissals(removed, repaired) if removed else set()
+        if dismissed:
+            settings[DISMISSED_DETECTIONS_KEY] = sorted(
+                dismissed_detection_names(config) | dismissed
+            )
+        _save_global_config(settings)
+    return True
 
 
 def _repair_conflicting_provider_defaults() -> bool:

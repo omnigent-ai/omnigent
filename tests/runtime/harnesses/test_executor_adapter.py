@@ -567,6 +567,103 @@ async def test_turn_cancelled_terminates_with_response_cancelled(
 # ── Error-code classification ──────────────────────────────────
 
 
+@pytest.mark.parametrize("watchdog_enabled", [False, True])
+def test_executor_wait_does_not_report_progress_or_delivery(watchdog_enabled: bool) -> None:
+    import asyncio
+    from unittest.mock import Mock
+
+    from omnigent.inner.executor import ExecutorWait
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = TurnContext(
+        response_id="resp_wait", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    hold_idle = Mock()
+    progress = Mock()
+    ctx._hold_idle_watchdog = hold_idle if watchdog_enabled else None
+    ctx._reset_idle_watchdog = progress
+
+    adapter._translate_event(ExecutorWait(), ctx)
+
+    assert hold_idle.call_count == int(watchdog_enabled)
+    progress.assert_not_called()
+    assert ctx._has_progress is False
+    assert ctx._event_queue.empty()
+
+
+@pytest.mark.parametrize("outcome", ["recovered", "absolute", "cancelled", "stalled_probe"])
+async def test_claude_disk_hold_keeps_only_the_idle_watchdog_alive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
+) -> None:
+    """A checked capacity wait survives idle expiry without disabling other limits."""
+    import asyncio
+    from unittest.mock import Mock
+
+    from omnigent.inner import claude_native_executor
+    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(claude_native_executor, "_HOST_DISK_POLL_S", 0.05)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    checked: list[float] = []
+    ctx = TurnContext(
+        response_id="resp_disk_wait", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    def disk_full(bridge_dir: Path) -> bool:
+        del bridge_dir
+        elapsed = loop.time() - started
+        checked.append(elapsed)
+        if outcome == "cancelled" and elapsed >= 0.8:
+            loop.call_soon_threadsafe(ctx.cancelled.set)
+        return outcome != "recovered" or elapsed < 0.8
+
+    monkeypatch.setattr(claude_native_executor, "_transcript_disk_full", disk_full)
+    injected = Mock()
+    reaped = Mock()
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
+    monkeypatch.setattr(claude_native_executor, "kill_session", reaped)
+    executor = claude_native_executor.ClaudeNativeExecutor(tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    if outcome == "stalled_probe":
+        # No further capacity check completes within the idle window.
+        monkeypatch.setattr(claude_native_executor, "_HOST_DISK_POLL_S", 10.0)
+    request = CreateResponseRequest(model="test-agent", input="held original")
+    try:
+        if outcome in {"absolute", "stalled_probe"}:
+            expected = "absolute watchdog" if outcome == "absolute" else "idle watchdog"
+            with pytest.raises(RuntimeError, match=expected):
+                await adapter._guarded_run_turn(request, ctx)
+        else:
+            await adapter._guarded_run_turn(request, ctx)
+            assert checked[-1] >= 0.8
+        if outcome == "recovered":
+            injected.assert_called_once()
+            assert injected.call_args.kwargs["content"] == "held original"
+            reaped.assert_not_called()
+            assert adapter._executor is executor
+        else:
+            injected.assert_not_called()
+        if outcome == "cancelled":
+            assert ctx.cancelled.is_set()
+        deltas = []
+        while not ctx._event_queue.empty():
+            event = ctx._event_queue.get_nowait()
+            if event is not None:
+                deltas.append(event)
+        assert len(deltas) == 1
+        assert deltas[0].delta == claude_native_executor._HOST_DISK_WAIT_MESSAGE
+    finally:
+        await adapter.on_shutdown()
+
+
 def test_build_error_detail_keeps_inner_executor_error_fields() -> None:
     """
     An executor that names its failure (``ExecutorError.code``) is raised as
@@ -3704,3 +3801,137 @@ async def test_ask_user_question_roundtrip_real_executor_hook_through_adapter_br
     payload = getattr(params, "ask_user_question", None)
     assert payload is not None
     assert payload["questions"][0]["question"] == "Env?"
+
+
+class _LiveMcpExecutor(Executor):
+    """Executor whose MCP connections a test scripts, failing a reconnect on request."""
+
+    def __init__(self, reconnect_failure: BaseException | None = None) -> None:
+        from omnigent.inner.executor import LiveMcpServerStatus
+
+        self.statuses = [LiveMcpServerStatus(name="docs", status="failed", error="HTTP 401")]
+        self.reconnect_failure = reconnect_failure
+        self.status_failure: BaseException | None = None
+        self.reconnected: list[tuple[str, str]] = []
+
+    def supports_live_mcp_control(self) -> bool:
+        return True
+
+    async def live_mcp_statuses(self, session_key: str) -> list[Any] | None:
+        if self.status_failure is not None:
+            raise self.status_failure
+        return self.statuses
+
+    async def reconnect_live_mcp_server(self, session_key: str, name: str) -> None:
+        from omnigent.inner.executor import LiveMcpServerStatus
+
+        self.reconnected.append((session_key, name))
+        if self.reconnect_failure is not None:
+            raise self.reconnect_failure
+        self.statuses = [LiveMcpServerStatus(name=name, status="connected")]
+
+
+@contextlib.asynccontextmanager
+async def _live_mcp_client(adapter: Any) -> AsyncIterator[httpx.AsyncClient]:
+    app = adapter.build()
+    app.state.conversation_id = "conv_live_mcp"
+    app.state.harness_auth_token = "spawn-token"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer spawn-token"},
+    ) as client:
+        yield client
+
+
+async def test_live_mcp_routes_reach_only_an_executor_that_reports_them() -> None:
+    from omnigent.inner.executor import (
+        LiveMcpHarnessNotRunning,
+        LiveMcpReconnectRefused,
+        LiveMcpServerUnknown,
+    )
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    status_path = "/v1/sessions/conv_live_mcp/mcp-status"
+    reconnect_path = "/v1/sessions/conv_live_mcp/mcp-reconnect"
+
+    # Before the first turn builds the executor, nothing is connected yet.
+    adapter = ExecutorAdapter(executor_factory=_LiveMcpExecutor, session_key="conv_live_mcp")
+    async with _live_mcp_client(adapter) as client:
+        assert (await client.get(status_path)).json() == {"running": False, "servers": []}
+        resp = await client.post(reconnect_path, json={"name": "docs"})
+        assert (resp.status_code, resp.json()["error"]) == (409, "harness_not_running")
+
+        executor = adapter._ensure_executor()
+        resp = await client.get(status_path)
+        assert resp.json() == {
+            "running": True,
+            "servers": [{"name": "docs", "status": "failed", "error": "HTTP 401"}],
+        }
+        resp = await client.post(reconnect_path, json={"name": "docs"})
+        assert resp.json() == {
+            "running": True,
+            "servers": [{"name": "docs", "status": "connected"}],
+        }
+        assert executor.reconnected == [("conv_live_mcp", "docs")]
+
+        for body in ({}, {"name": " "}, ["docs"]):
+            assert (await client.post(reconnect_path, json=body)).status_code == 400
+        assert (await client.get("/v1/sessions/conv_other/mcp-status")).status_code == 404
+        unauthenticated = await client.get(status_path, headers={"Authorization": "Bearer wrong"})
+        assert unauthenticated.status_code == 401
+
+    # The harness's refusal comes back with the connections as they stand; other
+    # failures keep their text out of the answer.
+    for failure, expected_status, expected_body in (
+        (
+            LiveMcpReconnectRefused("still unauthorized"),
+            200,
+            {"reconnect_error": "still unauthorized"},
+        ),
+        (RuntimeError("internal detail"), 502, {"error": "mcp_reconnect_failed"}),
+        (LiveMcpServerUnknown("docs"), 404, {"error": "mcp_server_unknown"}),
+        (LiveMcpHarnessNotRunning("conv_live_mcp"), 409, {"error": "harness_not_running"}),
+        (TimeoutError(), 504, {"error": "mcp_reconnect_timeout"}),
+    ):
+        adapter = ExecutorAdapter(
+            executor_factory=lambda failure=failure: _LiveMcpExecutor(failure),
+            session_key="conv_live_mcp",
+        )
+        adapter._ensure_executor()
+        async with _live_mcp_client(adapter) as client:
+            resp = await client.post(reconnect_path, json={"name": "docs"})
+        assert resp.status_code == expected_status
+        assert expected_body.items() <= resp.json().items()
+        assert "internal detail" not in resp.text
+
+    # A failed status read reports the harness as running, without the exception's text.
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: _LiveMcpExecutor(LiveMcpReconnectRefused("still unauthorized")),
+        session_key="conv_live_mcp",
+    )
+    executor = adapter._ensure_executor()
+    executor.status_failure = RuntimeError("internal detail")
+    async with _live_mcp_client(adapter) as client:
+        resp = await client.get(status_path)
+        assert (resp.status_code, resp.json()) == (502, {"error": "mcp_status_failed"})
+        resp = await client.post(reconnect_path, json={"name": "docs"})
+    assert (resp.status_code, resp.json()) == (
+        200,
+        {
+            "running": True,
+            "servers": [],
+            "status_unavailable": True,
+            "reconnect_error": "still unauthorized",
+        },
+    )
+
+    # A harness that can't report MCP status says so instead of answering empty.
+    adapter = ExecutorAdapter(executor_factory=_StubExecutor, session_key="conv_live_mcp")
+    adapter._ensure_executor()
+    async with _live_mcp_client(adapter) as client:
+        for resp in (
+            await client.get(status_path),
+            await client.post(reconnect_path, json={"name": "docs"}),
+        ):
+            assert (resp.status_code, resp.json()["error"]) == (404, "unsupported")

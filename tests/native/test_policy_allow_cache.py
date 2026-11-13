@@ -273,6 +273,14 @@ _CODEX_TOOL_CALL = {
             "open",
             True,
         ),
+        (
+            _compact(
+                {**_CLAUDE_TOOL_CALL, "hook_event_name": "PostToolUseFailure", "error": "Exit 1"}
+            ),
+            "open",
+            True,
+        ),
+        (_compact({"hook_event_name": "PostToolUseFailure", "error": "Exit 1"}), "open", False),
         (_compact(_CODEX_TOOL_CALL), "open", True),
         (
             _compact(
@@ -351,6 +359,11 @@ _CODEX_TOOL_CALL = {
         ),
         (_compact({"tool_input": {"text": "x" * 2_000_000}}), "open", False),
         (_compact({"hook_event_name": "PreToolUse", "tool_name": "Bash"}), "expired", False),
+        (
+            _compact({"hook_event_name": "PostToolUseFailure", "tool_name": "Bash"}),
+            "expired",
+            False,
+        ),
         (_compact({"hook_event_name": "PreToolUse", "tool_name": "Bash"}), "unreadable", False),
         (_compact({"hook_event_name": "PreToolUse", "tool_name": "Bash"}), "absent", False),
         (_compact({"hook_event_name": "PreToolUse", "tool_name": "Bash"}), "revoked", False),
@@ -371,6 +384,8 @@ _CODEX_TOOL_CALL = {
         "other_event_with_tool_name",
         "claude_tool_call_after_effort",
         "claude_tool_result_after_effort",
+        "claude_tool_failure_after_effort",
+        "tool_failure_missing_tool_name",
         "codex_tool_call",
         "nested_metadata_before_keys",
         "event_name_nested_after_metadata",
@@ -383,6 +398,7 @@ _CODEX_TOOL_CALL = {
         "large_tool_result",
         "large_payload_without_keys",
         "expired",
+        "tool_failure_expired",
         "unreadable",
         "absent",
         "revoked",
