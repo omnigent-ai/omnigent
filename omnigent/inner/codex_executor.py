@@ -134,6 +134,11 @@ from .model_signer import (
     SignerStartError,
     SubprocessModelSigner,
 )
+from .sandbox import (
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
+    harness_sandbox_preparation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3252,6 +3257,8 @@ class _CodexAppServerSession:
             if skip_reason is not None:
                 logger.warning("%s", skip_reason)
                 router_bridge_dir = None
+        with harness_sandbox_preparation():
+            process_cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
         # Off the loop: this copies/symlinks a home AND (on the routing path)
         # shells out to ``codex debug models`` with a 10s timeout. Run inline it
         # stalled every other session sharing this event loop for that long.
@@ -3269,7 +3276,7 @@ class _CodexAppServerSession:
             required_brokered_probe=(
                 (
                     self._codex_path,
-                    Path(self._cwd or os.getcwd()).resolve(strict=False),
+                    process_cwd,
                     self._os_env_spec,
                 )
                 if (self._signer is not None or brokered_gateway) and self._os_env_spec is not None
@@ -3311,7 +3318,6 @@ class _CodexAppServerSession:
             for name in ("TMPDIR", "TMP", "TEMP"):
                 proc_env[name] = str(self._codex_home_dir)
         try:
-            process_cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             # Active egress rules start a parent-side proxy and wait for its
             # thread readiness. Keep that bounded synchronous setup off the
             # shared executor loop, just like CODEX_HOME population above.
@@ -5505,7 +5511,12 @@ class CodexExecutor(Executor):
                 reasoning_effort=reasoning_effort,
             ):
                 yield event
-        except (HarnessTransportClosedError, ProviderAuthRequired):
+        except (
+            HarnessTransportClosedError,
+            ProviderAuthRequired,
+            HarnessSandboxPreparationError,
+            HarnessSandboxValidationError,
+        ):
             raise
         except Exception as exc:  # noqa: BLE001 — executor boundary converts any error into an ExecutorError event
             yield ExecutorError(message=f"Codex executor error: {exc}")

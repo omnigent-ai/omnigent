@@ -123,13 +123,12 @@ from .executor import (
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
-    HarnessSandboxPreparationError,
-    HarnessSandboxValidationError,
     SandboxPolicy,
     cleanup_private_tmpdir,
     create_exec_launcher,
     create_private_tmpdir,
     get_backend,
+    harness_sandbox_preparation,
     resolve_sandbox,
     validate_harness_sandbox,
     with_additional_read_roots,
@@ -2104,29 +2103,29 @@ def prepare_claude_cli_path(
 
     if spec is None:
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
-    resolved_cwd = _resolve_sandbox_cwd(cwd if cwd is not None else spec.cwd)
-    # Named relative roots use the runner base; "." follows the selected session cwd.
-    if (
-        spec.cwd
-        and pathlib.Path(spec.cwd) != pathlib.Path(".")
-        and not pathlib.Path(spec.cwd).is_absolute()
-        and resolved_cwd == _resolve_sandbox_cwd(None)
-    ):
-        resolved_cwd = _resolve_sandbox_cwd(spec.cwd)
-    validate_harness_sandbox(
-        spec, "Claude SDK", cwd=resolved_cwd if cwd is not None else None,
-        supports_egress_rules=worker_env is not None,
-        supports_credential_proxy=worker_env is not None,
-    )
-    sandbox_spec = spec.sandbox or OSEnvSandboxSpec()
-    if sandbox_spec.type == "none":
-        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
-    if real_cli_path is None:
-        raise OSError("Claude SDK requires a CLI path to apply the requested sandbox")
-    if _sandbox_disabled_by_env():
-        raise OSError("OMNIGENT_CLAUDE_SDK_NO_SANDBOX conflicts with the requested sandbox")
+    with harness_sandbox_preparation():
+        resolved_cwd = _resolve_sandbox_cwd(cwd if cwd is not None else spec.cwd)
+        # Named relative roots use the runner base; "." follows the selected session cwd.
+        if (
+            spec.cwd
+            and pathlib.Path(spec.cwd) != pathlib.Path(".")
+            and not pathlib.Path(spec.cwd).is_absolute()
+            and resolved_cwd == _resolve_sandbox_cwd(None)
+        ):
+            resolved_cwd = _resolve_sandbox_cwd(spec.cwd)
+        validate_harness_sandbox(
+            spec, "Claude SDK", cwd=resolved_cwd if cwd is not None else None,
+            supports_egress_rules=worker_env is not None,
+            supports_credential_proxy=worker_env is not None,
+        )
+        sandbox_spec = spec.sandbox or OSEnvSandboxSpec()
+        if sandbox_spec.type == "none":
+            return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
+        if real_cli_path is None:
+            raise OSError("Claude SDK requires a CLI path to apply the requested sandbox")
+        if _sandbox_disabled_by_env():
+            raise OSError("OMNIGENT_CLAUDE_SDK_NO_SANDBOX conflicts with the requested sandbox")
 
-    try:
         if model_access is not None and worker_env is None:
             raise ValueError("Brokered Claude model access requires an owned worker environment")
 
@@ -2306,10 +2305,6 @@ def prepare_claude_cli_path(
             finally:
                 cleanup_private_tmpdir(runtime_tmpdir)
             raise
-    except HarnessSandboxValidationError:
-        raise
-    except Exception as exc:
-        raise HarnessSandboxPreparationError(str(exc)) from exc
 
 
 def prepare_tight_cli_process(
@@ -3102,8 +3097,9 @@ class ClaudeSDKExecutor(Executor):
             asyncio.to_thread(self._build_managed_cli_launcher, options, relay)
         )
         try:
-            launcher = await asyncio.shield(build_task)
-        except BaseException as exc:
+            with harness_sandbox_preparation():
+                launcher = await asyncio.shield(build_task)
+        except BaseException:
             try:
                 await await_cleanup_task(build_task)
             except BaseException:  # noqa: BLE001 - cleanup must finish after cancellation
@@ -3114,12 +3110,6 @@ class ClaudeSDKExecutor(Executor):
                 asyncio.to_thread(_release_client_cli, relay, launcher)
             )
             await await_cleanup_task(cleanup_task)
-            if (
-                self._os_env_spec is not None
-                and isinstance(exc, Exception)
-                and not isinstance(exc, HarnessSandboxValidationError)
-            ):
-                raise HarnessSandboxPreparationError(str(exc)) from exc
             raise
         options.cli_path = launcher
         return relay, launcher

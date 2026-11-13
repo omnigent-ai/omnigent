@@ -62,7 +62,12 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 
-from .sandbox import validate_harness_sandbox
+from .sandbox import (
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
+    harness_sandbox_preparation,
+    validate_harness_sandbox,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -362,38 +367,39 @@ class GooseExecutor(Executor):
         os_env = self._os_env
         if os_env is None:
             return self._goose_path
-        cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
-        validate_harness_sandbox(os_env, "Goose", cwd=cwd)
-        sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
-        if sandbox_spec.type == "none":
-            return self._goose_path
-        from .sandbox import (
-            create_exec_launcher,
-            resolve_sandbox,
-            with_additional_read_roots,
-            with_additional_write_roots,
-            with_spawn_env_allowlist,
-        )
+        with harness_sandbox_preparation():
+            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+            validate_harness_sandbox(os_env, "Goose", cwd=cwd)
+            sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
+            if sandbox_spec.type == "none":
+                return self._goose_path
+            from .sandbox import (
+                create_exec_launcher,
+                resolve_sandbox,
+                with_additional_read_roots,
+                with_additional_write_roots,
+                with_spawn_env_allowlist,
+            )
 
-        sandbox = resolve_sandbox(os_env, cwd)
-        if not sandbox.active:
-            raise OSError("Goose requires an active sandbox for the requested policy")
-        # goose must read its own install tree and write its config/state
-        # dirs (~/.config/goose, ~/.local/share/goose), or it can't
-        # start inside the jail.
-        goose_bin = Path(self._goose_path)
-        if goose_bin.parent != Path("."):
-            sandbox = with_additional_read_roots(sandbox, [goose_bin.resolve().parent])
-        sandbox = with_additional_write_roots(
-            sandbox,
-            [
-                Path.home() / ".config" / "goose",
-                Path.home() / ".local" / "share" / "goose",
-            ],
-        )
-        sandbox = with_additional_read_roots(sandbox, [Path.home() / ".config" / "goose"])
-        sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-        return create_exec_launcher(self._goose_path, sandbox, cwd=str(cwd))
+            sandbox = resolve_sandbox(os_env, cwd)
+            if not sandbox.active:
+                raise OSError("Goose requires an active sandbox for the requested policy")
+            # goose must read its own install tree and write its config/state
+            # dirs (~/.config/goose, ~/.local/share/goose), or it can't
+            # start inside the jail.
+            goose_bin = Path(self._goose_path)
+            if goose_bin.parent != Path("."):
+                sandbox = with_additional_read_roots(sandbox, [goose_bin.resolve().parent])
+            sandbox = with_additional_write_roots(
+                sandbox,
+                [
+                    Path.home() / ".config" / "goose",
+                    Path.home() / ".local" / "share" / "goose",
+                ],
+            )
+            sandbox = with_additional_read_roots(sandbox, [Path.home() / ".config" / "goose"])
+            sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
+            return create_exec_launcher(self._goose_path, sandbox, cwd=str(cwd))
 
     async def _read_stderr(self) -> None:
         """Continuously drain goose stderr, logging each line at debug.
@@ -1108,6 +1114,8 @@ class GooseExecutor(Executor):
                 await self._start_process()
             await self._ensure_initialized()
             session_id = await self._ensure_session()
+        except (HarnessSandboxPreparationError, HarnessSandboxValidationError):
+            raise
         except Exception as exc:  # noqa: BLE001
             yield ExecutorError(message=describe_exception(exc), retryable=False)
             return

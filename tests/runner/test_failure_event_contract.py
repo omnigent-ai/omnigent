@@ -101,23 +101,7 @@ async def test_spec_resolution_error_has_a_valid_queued_failure(has_mcp_servers:
     async def fail_resolution(agent_id: str, session_id: str | None = None) -> AgentSpec:
         raise RuntimeError("synthetic spec resolution failure")
 
-    harness = _ScriptedHarnessClient(
-        [
-            _sse({"type": "response.created", "response": {"id": "resp_test"}}),
-            _sse(
-                {
-                    "type": "response.output_item.done",
-                    "item": {
-                        "type": "function_call",
-                        "status": "action_required",
-                        "name": "sys_os_read",
-                        "call_id": "call_test",
-                        "arguments": "{}",
-                    },
-                }
-            ),
-        ]
-    )
+    harness = _ScriptedHarnessClient([])
     manager = _FakeProcessManager(harness)
     app = create_runner_app(
         process_manager=manager,  # type: ignore[arg-type]

@@ -119,7 +119,7 @@ from .executor import (
     pending_interruption_marker,
 )
 from .model_credential import _authoritative_expiry
-from .sandbox import validate_harness_sandbox
+from .sandbox import harness_sandbox_preparation, validate_harness_sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -1800,35 +1800,36 @@ def _try_sandbox_pi(
     """
     if os_env is None:
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
-    resolved_cwd = pathlib.Path(cwd or os.getcwd()).resolve(strict=False)
-    validate_harness_sandbox(os_env, "Pi", cwd=resolved_cwd)
-    sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
-    if sandbox_spec.type == "none":
-        return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
-    from .sandbox import (
-        create_exec_launcher,
-        resolve_sandbox,
-        with_additional_read_roots,
-        with_additional_write_roots,
-        with_spawn_env_allowlist,
-    )
+    with harness_sandbox_preparation():
+        resolved_cwd = pathlib.Path(cwd or os.getcwd()).resolve(strict=False)
+        validate_harness_sandbox(os_env, "Pi", cwd=resolved_cwd)
+        sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
+        if sandbox_spec.type == "none":
+            return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
+        from .sandbox import (
+            create_exec_launcher,
+            resolve_sandbox,
+            with_additional_read_roots,
+            with_additional_write_roots,
+            with_spawn_env_allowlist,
+        )
 
-    sandbox = resolve_sandbox(os_env, resolved_cwd)
-    if not sandbox.active:
-        raise OSError("Pi requires an active sandbox for the requested policy")
-    # Bundled and legacy CLIs both need their sibling npm dependencies.
-    executable = pathlib.Path(pi_path).resolve()
-    pi_dir = next(
-        (parent for parent in executable.parents if parent.name == "node_modules"),
-        executable.parent,
-    )
-    sandbox = with_additional_read_roots(sandbox, [pi_dir, *(extra_read_roots or ())])
-    home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
-    sandbox = with_additional_write_roots(sandbox, [home_pi])
-    sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-    # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
-    launcher = create_exec_launcher(str(executable), sandbox, cwd=str(resolved_cwd))
-    return SandboxedPiCli(launch_path=launcher, sandboxed=True)
+        sandbox = resolve_sandbox(os_env, resolved_cwd)
+        if not sandbox.active:
+            raise OSError("Pi requires an active sandbox for the requested policy")
+        # Bundled and legacy CLIs both need their sibling npm dependencies.
+        executable = pathlib.Path(pi_path).resolve()
+        pi_dir = next(
+            (parent for parent in executable.parents if parent.name == "node_modules"),
+            executable.parent,
+        )
+        sandbox = with_additional_read_roots(sandbox, [pi_dir, *(extra_read_roots or ())])
+        home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
+        sandbox = with_additional_write_roots(sandbox, [home_pi])
+        sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
+        # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
+        launcher = create_exec_launcher(str(executable), sandbox, cwd=str(resolved_cwd))
+        return SandboxedPiCli(launch_path=launcher, sandboxed=True)
 
 
 def _resolve_pi_skill_args(

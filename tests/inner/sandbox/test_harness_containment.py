@@ -9,17 +9,19 @@ import shlex
 import socket
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import psutil
 import pytest
 
 from omnigent.inner import claude_sdk_executor, codex_worker, sandbox
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+from omnigent.inner.codex_executor import CodexExecutor
 from omnigent.inner.codex_worker import prepare_codex_worker
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.executor import Executor
 from omnigent.inner.goose_executor import GooseExecutor
 from omnigent.inner.kimi_executor import KimiExecutor
 from omnigent.inner.pi_executor import PiExecutor, _try_sandbox_pi
@@ -89,7 +91,7 @@ def _prepared_launch(
     ("harness", "fault"),
     [
         pytest.param(harness, fault, id=f"{fault}-{harness}")
-        for fault in ("resolve", "unsupported", "backend", "launcher", "inactive")
+        for fault in ("cwd", "resolve", "unsupported", "backend", "launcher", "inactive")
         for harness in _HARNESSES
         if fault != "backend" or harness in ("claude-sdk", "codex")
     ]
@@ -146,19 +148,93 @@ def test_requested_sandbox_never_falls_back_to_bare_worker(
     monkeypatch.setattr(claude_sdk_executor, "get_backend", backend)
     monkeypatch.setattr(codex_worker, "get_backend", backend)
     spec = OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
-    expected_error = NotImplementedError if fault in ("unsupported", "backend") else OSError
-    if harness == "claude-sdk":
-        expected_error = sandbox.HarnessSandboxPreparationError
-    with pytest.raises(expected_error):
-        with _prepared_launch(harness, executable, workspace, spec):
-            pytest.fail(f"{harness} accepted an unavailable requested sandbox")
-    if fault == "launcher":
+    private_diagnostic = "/private/host/sandbox-cwd-sentinel"
+    cwd_resolution = Mock(side_effect=OSError(f"cwd resolution failed: {private_diagnostic}"))
+    with pytest.raises(sandbox.HarnessSandboxPreparationError) as failure:
+        with monkeypatch.context() as launch_patch:
+            if fault == "cwd":
+                launch_patch.setattr(Path, "resolve", cwd_resolution)
+            with _prepared_launch(harness, executable, workspace, spec):
+                pytest.fail(f"{harness} accepted an unavailable requested sandbox")
+    cause = failure.value.__cause__
+    if fault == "inactive":
+        assert isinstance(cause, OSError)
+        assert "requires an active sandbox" in str(cause)
+    else:
+        if fault == "cwd":
+            failed_operation = cwd_resolution
+        elif fault == "launcher":
+            failed_operation = launcher
+        elif fault in ("backend", "backend-oserror"):
+            failed_operation = backend
+        else:
+            failed_operation = resolve
+        assert cause is failed_operation.side_effect
+    assert str(failure.value) == str(cause)
+    if fault == "cwd":
+        cwd_resolution.assert_called_once()
+        resolve.assert_not_called()
+        backend.assert_not_called()
+        launcher.assert_not_called()
+        assert private_diagnostic not in failure.value.client_message
+    elif fault == "launcher":
         launcher.assert_called_once()
     elif fault in ("backend", "backend-oserror"):
         backend.assert_called_once()
     else:
         launcher.assert_not_called()
         resolve.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["acp", "goose", "qwen", "codex"])
+@pytest.mark.parametrize(
+    "failure_type",
+    [sandbox.HarnessSandboxPreparationError, sandbox.HarnessSandboxValidationError],
+    ids=["preparation", "validation"],
+)
+async def test_run_turn_preserves_typed_sandbox_failure(
+    harness: str,
+    failure_type: type[Exception],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = failure_type("private sandbox diagnostic")
+    executor: Executor
+    if harness == "codex":
+
+        class FailingAppSession:
+            async def run_turn(self, **_kwargs: object) -> AsyncIterator[None]:
+                raise failure
+                yield  # pragma: no cover
+
+            async def close(self) -> None:
+                pass
+
+        executor = CodexExecutor(
+            cwd=str(tmp_path),
+            codex_path="/test/codex",
+            model="test-model",
+            app_session_factory=Mock(return_value=FailingAppSession()),
+        )
+    else:
+        if harness == "acp":
+            executor = AcpExecutor(AcpAgentConfig(command="/test/agent"), cwd=str(tmp_path))
+        elif harness == "goose":
+            executor = GooseExecutor(goose_path="/test/goose", cwd=str(tmp_path))
+        else:
+            executor = QwenExecutor(qwen_path="/test/qwen", cwd=str(tmp_path))
+        monkeypatch.setattr(executor, "_start_process", AsyncMock(side_effect=failure))
+
+    try:
+        with pytest.raises(failure_type) as raised:
+            async for _event in executor.run_turn(
+                [{"role": "user", "content": "hello", "session_id": "sandbox-failure"}], [], ""
+            ):
+                pytest.fail(f"{harness} converted a typed sandbox failure into an event")
+        assert raised.value is failure
+    finally:
+        await executor.close()
 
 
 # Goose/Kimi/Qwen's executor scenarios cover absent and explicit-none policies.
@@ -240,8 +316,8 @@ def test_relative_policy_cwd_preserves_non_claude_workspace(
     [
         (harness, feature)
         for harness in _HARNESSES
-        for feature in ("cwd_conflict", "egress_rules")
-        if feature != "egress_rules" or harness != "codex"
+        for feature in ("cwd_conflict", "egress_rules", "credential_proxy")
+        if feature == "cwd_conflict" or harness != "codex"
     ],
 )
 def test_harness_rejects_policy_features_it_cannot_honor(
@@ -257,6 +333,9 @@ def test_harness_rejects_policy_features_it_cannot_honor(
         sandbox=OSEnvSandboxSpec(
             type="linux_bwrap",
             egress_rules=["GET api.example.com/**"] if feature == "egress_rules" else None,
+            credential_proxy=(
+                CredentialProxySpec(entries=[]) if feature == "credential_proxy" else None
+            ),
         ),
     )
     if feature == "cwd_conflict":
@@ -264,7 +343,7 @@ def test_harness_rejects_policy_features_it_cannot_honor(
     launcher = Mock(side_effect=AssertionError("Unsupported policy reached launcher creation"))
     monkeypatch.setattr(sandbox, "create_exec_launcher", launcher)
     monkeypatch.setattr(codex_worker, "create_exec_launcher", launcher)
-    message = "egress_rules" if feature == "egress_rules" else "conflicts"
+    message = "conflicts" if feature == "cwd_conflict" else feature
     with pytest.raises(ValueError, match=message):
         with _prepared_launch(harness, executable, workspace, spec):
             pytest.fail(f"{harness} silently ignored {feature}")

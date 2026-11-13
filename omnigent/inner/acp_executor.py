@@ -88,7 +88,12 @@ from omnigent.inner.executor import (
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.process_logging import current_process_log_path, display_log_path
 
-from .sandbox import validate_harness_sandbox
+from .sandbox import (
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
+    harness_sandbox_preparation,
+    validate_harness_sandbox,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -473,7 +478,8 @@ class AcpExecutor(Executor):
         """
         self._config = config
         self._extension = extension
-        self._cwd = _resolve_cwd(cwd)
+        with harness_sandbox_preparation() if os_env is not None else contextlib.nullcontext():
+            self._cwd = _resolve_cwd(cwd)
         self._os_env = os_env
         # Advertise ``clientCapabilities.fs`` so the agent delegates file
         # reads/writes back to us (executed through the Omnigent OSEnvironment,
@@ -575,11 +581,14 @@ class AcpExecutor(Executor):
         # Re-validate cwd before every spawn and respawn: the workspace may have
         # been deleted after __init__, and this error flows through
         # _startup_error_message so the UI also shows the harness-log path.
-        _resolve_cwd(self._cwd, session_id=self._session_id)
-        # If the cwd is relative the spawn resolves it against the process cwd;
-        # fail early with a clear message if that directory was also deleted.
-        if not os.path.isabs(self._cwd):
-            _resolve_cwd(None, session_id=self._session_id)
+        with (
+            harness_sandbox_preparation() if self._os_env is not None else contextlib.nullcontext()
+        ):
+            _resolve_cwd(self._cwd, session_id=self._session_id)
+            # If the cwd is relative the spawn resolves it against the process cwd;
+            # fail early with a clear message if that directory was also deleted.
+            if not os.path.isabs(self._cwd):
+                _resolve_cwd(None, session_id=self._session_id)
         # Reset handshake state: this may be a restart after the previous
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
@@ -623,26 +632,27 @@ class AcpExecutor(Executor):
         os_env = self._os_env
         if os_env is None:
             return binary, rest
-        cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
-        validate_harness_sandbox(os_env, "ACP", cwd=cwd)
-        sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
-        if sandbox_spec.type == "none":
-            return binary, rest
-        from .sandbox import (
-            create_exec_launcher,
-            resolve_sandbox,
-            with_additional_read_roots,
-            with_spawn_env_allowlist,
-        )
+        with harness_sandbox_preparation():
+            cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
+            validate_harness_sandbox(os_env, "ACP", cwd=cwd)
+            sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
+            if sandbox_spec.type == "none":
+                return binary, rest
+            from .sandbox import (
+                create_exec_launcher,
+                resolve_sandbox,
+                with_additional_read_roots,
+                with_spawn_env_allowlist,
+            )
 
-        sandbox = resolve_sandbox(os_env, cwd)
-        if not sandbox.active:
-            raise OSError("ACP requires an active sandbox for the requested policy")
-        resolved_bin = Path(binary)
-        if resolved_bin.parent != Path(".") and resolved_bin.exists():
-            sandbox = with_additional_read_roots(sandbox, [resolved_bin.resolve().parent])
-        sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-        return create_exec_launcher(binary, sandbox, cwd=str(cwd)), rest
+            sandbox = resolve_sandbox(os_env, cwd)
+            if not sandbox.active:
+                raise OSError("ACP requires an active sandbox for the requested policy")
+            resolved_bin = Path(binary)
+            if resolved_bin.parent != Path(".") and resolved_bin.exists():
+                sandbox = with_additional_read_roots(sandbox, [resolved_bin.resolve().parent])
+            sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
+            return create_exec_launcher(binary, sandbox, cwd=str(cwd)), rest
 
     def _startup_error_message(self, exc: BaseException) -> str:
         """Describe a handshake failure, quoting the agent's own stderr.
@@ -1876,6 +1886,8 @@ class AcpExecutor(Executor):
                 await self._start_process()
             await self._ensure_initialized()
             session_id = await self._ensure_session()
+        except (HarnessSandboxPreparationError, HarnessSandboxValidationError):
+            raise
         except Exception as exc:  # noqa: BLE001
             yield ExecutorError(message=self._startup_error_message(exc), retryable=False)
             return
