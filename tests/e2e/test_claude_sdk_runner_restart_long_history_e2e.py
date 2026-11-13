@@ -3,7 +3,8 @@
 While the runner is up, the live Claude CLI compacts its own context, so a
 session whose server-side history is larger than the model's context window
 keeps working. A runner restart loses that CLI; the next turn must still fit
-the window instead of failing with ``Prompt is too long``.
+the window instead of failing with ``Prompt is too long``, including a window
+smaller than the one the spec declares.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import yaml
 
 from tests._helpers.live_server import terminate_process
 from tests._helpers.polling import poll_until
-from tests._helpers.server_runner import server_runner
+from tests._helpers.server_runner import ServerRunner, server_runner
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
@@ -54,6 +55,47 @@ def _runner_online(client: httpx.Client, runner_id: str) -> bool:
     return bool(client.get(f"/v1/runners/{runner_id}/status").json().get("online"))
 
 
+def _start_session(
+    client: httpx.Client, stack: ServerRunner, mock_url: str, declared_window: int
+) -> str:
+    """Create a claude-sdk session whose spec declares *declared_window* tokens."""
+    spec = {
+        "spec_version": 1,
+        "name": "long-claude-sdk-session",
+        "instructions": "You are a terse assistant.",
+        "executor": {
+            "type": "omnigent",
+            "model": _MODEL,
+            "context_window": declared_window,
+            "config": {"harness": "claude-sdk"},
+            "auth": {"type": "api_key", "api_key": "mock-key", "base_url": mock_url},
+        },
+    }
+    created = post_session_bundle(
+        client.post, "/v1/sessions", bundle_files({"config.yaml": yaml.safe_dump(spec).encode()})
+    )
+    created.raise_for_status()
+    session_id = created.json()["session_id"]
+    bind_session_runner(client.patch, "", session_id, stack.runner_id)
+    return session_id
+
+
+def _restart_runner(client: httpx.Client, stack: ServerRunner, runner_env: dict[str, str]) -> None:
+    terminate_process(stack.runner)
+    poll_until(lambda: not _runner_online(client, stack.runner_id), timeout_s=60)
+    stack.runner = None
+    stack.start_runner(env=runner_env)
+
+
+def _client(stack: ServerRunner) -> httpx.Client:
+    return httpx.Client(
+        base_url=stack.base_url,
+        trust_env=False,
+        timeout=60,
+        headers={"x-omnigent-background-session-titles": "off"},
+    )
+
+
 def test_long_claude_sdk_session_answers_after_runner_restart(
     tmp_path: Path, isolated_mock_llm_server_url: str
 ) -> None:
@@ -67,35 +109,10 @@ def test_long_claude_sdk_session_answers_after_runner_restart(
         match=_COMPACTION_PROMPT,
     )
     runner_env = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(_CONTEXT_WINDOW_TOKENS)}
-    spec = {
-        "name": "long-claude-sdk-session",
-        "prompt": "You are a terse assistant.",
-        "executor": {
-            "harness": "claude-sdk",
-            "model": _MODEL,
-            "context_window": _CONTEXT_WINDOW_TOKENS,
-            "auth": {"type": "api_key", "api_key": "mock-key", "base_url": mock_url},
-        },
-    }
     uid = uuid.uuid4().hex[:6]
-    with (
-        server_runner(tmp_path / "stack") as stack,
-        httpx.Client(
-            base_url=stack.base_url,
-            trust_env=False,
-            timeout=60,
-            headers={"x-omnigent-background-session-titles": "off"},
-        ) as client,
-    ):
+    with server_runner(tmp_path / "stack") as stack, _client(stack) as client:
         stack.start_runner(env=runner_env)
-        created = post_session_bundle(
-            client.post,
-            "/v1/sessions",
-            bundle_files({"long-claude-sdk-session.yaml": yaml.safe_dump(spec).encode()}),
-        )
-        created.raise_for_status()
-        session_id = created.json()["session_id"]
-        bind_session_runner(client.patch, "", session_id, stack.runner_id)
+        session_id = _start_session(client, stack, mock_url, _CONTEXT_WINDOW_TOKENS)
 
         for turn in range(1, _WARM_TURNS + 1):
             warm = _ask(client, mock_url, session_id, f"warm-{turn:02d}-{uid}", _filler(turn))
@@ -108,13 +125,46 @@ def test_long_claude_sdk_session_answers_after_runner_restart(
         history = client.get(f"/v1/sessions/{session_id}").json()["items"]
         assert len(json.dumps(history)) > 4 * _CONTEXT_WINDOW_TOKENS
 
-        previous_runner = stack.runner
-        terminate_process(previous_runner)
-        poll_until(lambda: not _runner_online(client, stack.runner_id), timeout_s=60)
-        stack.runner = None
-        stack.start_runner(env=runner_env)
+        _restart_runner(client, stack, runner_env)
 
         # Equal-length tokens let the mock route each turn by its newest token.
+        after = _ask(client, mock_url, session_id, f"restart-1-{uid}", "Still here.")
+        assert after["status"] == "completed", (
+            f"the first turn after the runner restart failed: {after['error']}"
+        )
+        assert "Still here." in json.dumps(after["output"])
+        follow_up = _ask(client, mock_url, session_id, f"restart-2-{uid}", "Still here too.")
+        assert follow_up["status"] == "completed", (
+            f"the follow-up turn after the runner restart failed: {follow_up['error']}"
+        )
+        assert "Still here too." in json.dumps(follow_up["output"])
+
+
+def test_claude_sdk_session_answers_after_restarting_into_a_smaller_window(
+    tmp_path: Path, isolated_mock_llm_server_url: str
+) -> None:
+    mock_url = isolated_mock_llm_server_url
+    uid = uuid.uuid4().hex[:6]
+    with server_runner(tmp_path / "stack") as stack, _client(stack) as client:
+        stack.start_runner()
+        # The spec declares a larger window than the gateway serves after the restart.
+        session_id = _start_session(client, stack, mock_url, 1_000_000)
+        for turn in range(1, _WARM_TURNS + 1):
+            warm = _ask(client, mock_url, session_id, f"warm-{turn:02d}-{uid}", _filler(turn))
+            assert warm["status"] == "completed", (
+                f"warm turn {turn} failed before any restart: {warm['error']}\n{stack.log_tail()}"
+            )
+        assert not any(_COMPACTION_PROMPT in json.dumps(r) for r in get_mock_requests(mock_url))
+        history = client.get(f"/v1/sessions/{session_id}").json()["items"]
+        assert len(json.dumps(history)) > 4 * _CONTEXT_WINDOW_TOKENS
+
+        httpx.post(
+            f"{mock_url}/mock/context_window", json={"max_input_tokens": _CONTEXT_WINDOW_TOKENS}
+        ).raise_for_status()
+        _restart_runner(
+            client, stack, {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(_CONTEXT_WINDOW_TOKENS)}
+        )
+
         after = _ask(client, mock_url, session_id, f"restart-1-{uid}", "Still here.")
         assert after["status"] == "completed", (
             f"the first turn after the runner restart failed: {after['error']}"
