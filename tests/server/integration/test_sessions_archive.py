@@ -254,9 +254,11 @@ async def test_archive_idle_parent_stops_running_child(
         _sessions_common._session_status_cache.pop(child.id, None)
 
 
+@pytest.mark.parametrize("cleanup_status", [200, 503])
 async def test_archive_tears_down_host_spawned_runner(
     client: httpx.AsyncClient,
     db_uri: str,
+    cleanup_status: int,
 ) -> None:
     """
     Archiving a host-spawned session tears down its dedicated runner.
@@ -278,6 +280,10 @@ async def test_archive_tears_down_host_spawned_runner(
     conv_store.set_runner_id(session_id, "b1b2c3d4e5f61234567890abcdef0123")
 
     mock_teardown = AsyncMock(return_value=True)
+    runner_client = AsyncMock(spec=httpx.AsyncClient)
+    runner_client.delete.return_value = httpx.Response(
+        cleanup_status, request=httpx.Request("DELETE", f"http://runner/v1/sessions/{session_id}")
+    )
     _sessions_common._session_status_cache[session_id] = "running"
     try:
         with (
@@ -285,6 +291,9 @@ async def test_archive_tears_down_host_spawned_runner(
                 _sessions_orchestration, "_stop_session_via_runner", AsyncMock(return_value=True)
             ),
             patch.object(_sessions_facade, "_stop_session_host_runner", mock_teardown),
+            patch.object(
+                _sessions_facade, "_get_runner_client", AsyncMock(return_value=runner_client)
+            ),
         ):
             resp = await client.patch(
                 f"/v1/sessions/{session_id}",
@@ -293,6 +302,7 @@ async def test_archive_tears_down_host_spawned_runner(
             await _drain_detached_stops()
         assert resp.status_code == 200
         assert resp.json()["archived"] is True
+        runner_client.delete.assert_awaited_once_with(f"/v1/sessions/{session_id}", timeout=30.0)
         mock_teardown.assert_awaited_once()
         assert mock_teardown.await_args is not None
         assert mock_teardown.await_args.args[:3] == (
@@ -517,11 +527,13 @@ async def test_undo_within_grace_keeps_runner_alive(
     session_id = session["id"]
 
     mock_stop = AsyncMock(return_value=True)
+    resolve_runner = AsyncMock()
     _sessions_common._session_status_cache[session_id] = "running"
     try:
         with (
             patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 30.0),
             patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop),
+            patch.object(_sessions_facade, "_get_runner_client", resolve_runner),
         ):
             await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
             assert session_id in _sessions_orchestration._pending_archive_stops
@@ -531,6 +543,7 @@ async def test_undo_within_grace_keeps_runner_alive(
             assert session_id not in _sessions_orchestration._pending_archive_stops
             await _drain_detached_stops()
         mock_stop.assert_not_awaited()
+        resolve_runner.assert_not_awaited()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
 

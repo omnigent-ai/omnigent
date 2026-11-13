@@ -4842,19 +4842,45 @@ def _shared_runner_family(
 async def test_archiving_child_does_not_stop_parents_shared_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
     _shared_runner_family: dict[str, str],
 ) -> None:
-    """A child's archive must end only the child, not the runner its parent is on."""
+    """An idle child's archive releases its backend without stopping its parent."""
+    from omnigent.runner import create_runner_app
+    from omnigent.runner.native import orchestration as native
+    from omnigent.server.routes import sessions as sessions_module
+
     comm = await _connect_host(app)
     parent = await _inline_launch_session(client, comm)
     async with _HostFrameResponder(comm) as host:
         child = await _inline_child_session(client, parent["id"])
         _shared_runner_family.update(parent=parent["id"], child=child["id"])
+        sessions_module._session_status_cache[child["id"]] = "idle"
+        child_backend = Mock(close=AsyncMock())
+        parent_backend = Mock(close=AsyncMock())
+        monkeypatch.setitem(native._AUTO_CODEX_APP_SERVERS, child["id"], child_backend)
+        monkeypatch.setitem(native._AUTO_CODEX_APP_SERVERS, parent["id"], parent_backend)
+        runner_app = create_runner_app(server_client=client)
+        resources = runner_app.state.session_resource_registry
+        cleanup = AsyncMock(wraps=resources.cleanup_session)
+        monkeypatch.setattr(resources, "cleanup_session", cleanup)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=runner_app), base_url="http://runner"
+        ) as runner:
+            resolve = AsyncMock(return_value=runner)
+            monkeypatch.setattr(sessions_module, "_get_runner_client", resolve)
+            archive = await client.patch(f"/v1/sessions/{child['id']}", json={"archived": True})
+            assert archive.status_code == 200, archive.text
+            await _drain_detached_stops()
 
-        archive = await client.patch(f"/v1/sessions/{child['id']}", json={"archived": True})
-        assert archive.status_code == 200, archive.text
-        await _drain_detached_stops()
+        cleanup.assert_awaited_once_with(child["id"])
+        child_backend.close.assert_awaited_once()
+        parent_backend.close.assert_not_awaited()
+        assert child["id"] not in native._AUTO_CODEX_APP_SERVERS
+        assert resolve.await_args.kwargs["for_control"] is True
 
+    child_row = (await client.get(f"/v1/sessions/{child['id']}")).json()
+    assert child_row["archived"] is True
     parent_row = (await client.get(f"/v1/sessions/{parent['id']}")).json()
     assert parent_row["archived"] is False
     assert parent["runner_id"] not in host.stopped_runner_ids, (
