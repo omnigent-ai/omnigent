@@ -280,13 +280,6 @@ describe("embedded prompt link", () => {
     expect(composer()).toHaveValue("hello_world");
   });
 
-  it("drops the kept prompt once the user edits the composer", () => {
-    renderLanding();
-    fireEvent.change(composer(), { target: { value: "" } });
-    reloadPage();
-    expect(composer()).toHaveValue("");
-  });
-
   it.each([
     [59_999, "hello_world"],
     [60_000, ""],
@@ -344,15 +337,32 @@ describe("embedded prompt link", () => {
   });
 
   it.each([
-    ["clearing the composer", ""],
-    ["editing the composer", "Edited"],
-  ])("keeps the parked snapshot in step after %s", (_case, text) => {
-    const { rerender } = renderLanding();
-    fireEvent.change(composer(), { target: { value: text } });
-    rerender(<Landing visit={2} />);
-    expect(composer()).toHaveValue(text);
-    reloadPage();
-    expect(composer()).toHaveValue("");
+    ["clearing the composer", [""]],
+    ["editing the composer", ["Edited"]],
+    ["editing then clearing", ["Edited", ""]],
+    ["editing repeatedly", ["Edited", "Edited again"]],
+  ])("keeps the parked snapshot in step after %s", (_case, edits) => {
+    const stores = ["stored", "no server identity", "failed write"] as const;
+    for (const store of stores) {
+      cleanup();
+      resetLandingDraft();
+      window.sessionStorage.clear();
+      serverIdentity = store === "no server identity" ? null : "workspace:1";
+      searchParams = new URLSearchParams("o=123&prompt=hello_world");
+      const quota =
+        store === "failed write"
+          ? vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+              throw new DOMException("full", "QuotaExceededError");
+            })
+          : null;
+      const { rerender } = renderLanding();
+      quota?.mockRestore();
+      for (const text of edits) fireEvent.change(composer(), { target: { value: text } });
+      rerender(<Landing visit={2} />);
+      expect(composer()).toHaveValue(edits.at(-1));
+      reloadPage();
+      expect(composer()).toHaveValue("");
+    }
   });
 
   it("drops the kept prompt when dictation changes the text", () => {

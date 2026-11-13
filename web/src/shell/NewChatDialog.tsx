@@ -2116,6 +2116,8 @@ export function AgentHarnessPicker({
 // Drafts survive navigation within this page load, with one slot per source.
 // Successful creation clears only its slot; a page refresh starts clean.
 interface LandingDraft {
+  /** Parked at prompt-link consumption: the composer keeps it in step with edits. */
+  fromLink?: boolean;
   mcpRegistryServices: string[];
   // `?project=` context the draft was composed under ("" = plain visit).
   // A draft restored under a DIFFERENT project only brings back its text and
@@ -2612,6 +2614,7 @@ function NewChatLandingContent({
     ownsKeptLinkedPrompt ? keptLinkedPrompt : null,
   );
   const submittedLinkedPromptRef = useRef<KeptLinkedPrompt | null>(null);
+  const syncsParkedDraftRef = useRef(landingDraft?.fromLink === true);
   useEffect(() => {
     if (keptLinkedPrompt !== null && !ownsKeptLinkedPrompt) {
       forgetKeptLinkedPrompt(siblingSourceId, keptLinkedPrompt);
@@ -2638,7 +2641,9 @@ function NewChatLandingContent({
         ...draftRef.current,
         message: linkedPrompt,
         mentions: undefined,
+        fromLink: true,
       });
+      syncsParkedDraftRef.current = true;
       keptLinkedRef.current = keepLinkedPrompt(siblingSourceId, linkedPrompt);
     } else if (handoff !== null) {
       // The handoff replaced the draft, so a prompt kept for this composer is stale.
@@ -2668,10 +2673,13 @@ function NewChatLandingContent({
     if (kept === null || message === kept.text) return;
     keptLinkedRef.current = null;
     forgetKeptLinkedPrompt(siblingSourceId, kept);
-    // Keep the snapshot parked at consume time in step with the edit; a submitted
-    // draft stays spent.
-    if (!submittedRef.current) writeLandingDraft(draftState, draftRef.current);
-  }, [message, siblingSourceId, draftState]);
+  }, [message, siblingSourceId]);
+  // A draft parked at link consumption is the only copy a same-commit remount can
+  // read, so it follows every edit; a submitted draft stays spent.
+  useEffect(() => {
+    if (!syncsParkedDraftRef.current || submittedRef.current) return;
+    writeLandingDraft(draftState, { ...draftRef.current, fromLink: true });
+  }, [message, draftState]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
