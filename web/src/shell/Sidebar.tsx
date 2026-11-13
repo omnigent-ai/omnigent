@@ -27,12 +27,7 @@ import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
 import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
-import {
-  useRegisterRenderedSidebarRows,
-  useSidebarData,
-  useSidebarView,
-  type SidebarListQuery,
-} from "@/hooks/useSidebarData";
+import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
 import { useArchivedSessions } from "@/hooks/useScopeCache";
 import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/InfiniteScrollSentinel";
 import {
@@ -4516,7 +4511,6 @@ function ConversationSection({
     return representative !== undefined && representative.id !== row.id;
   };
   const visibleFamilyRows = orderSessionFamilies(rows, collapsedFamilies);
-  useRegisterRenderedSidebarRows(visibleFamilyRows);
   const reorderRows = visibleFamilyRows.filter((row) => !isNestedFamilyRow(row));
 
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");

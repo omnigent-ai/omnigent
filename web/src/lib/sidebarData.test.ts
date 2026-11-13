@@ -6,7 +6,6 @@ import {
   refreshScopeWindow,
   appendScopePage,
   sessionRowsPage,
-  sidebarWatchedIds,
 } from "./sidebarData";
 
 const row = (id: string, updated_at: number): Conversation => ({
@@ -294,53 +293,4 @@ it("uses creation time for scope boundaries, appended pages, and capped refreshe
   );
   expect(refreshed.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
   expect(refreshed.pages[0].last_id).toBe("old");
-});
-
-describe("sidebarWatchedIds", () => {
-  const idle = row("idle", 1);
-  const running = { ...row("running", 1), status: "running" as const };
-  const awaiting = { ...row("awaiting", 1), pending_elicitations_count: 1 };
-  const shown = row("shown", 1);
-  const refreshed = new Set(["idle", "running", "awaiting", "shown"]);
-
-  it("watches every loaded row until a section reports what it renders", () => {
-    expect(sidebarWatchedIds([idle, running, shown], new Map(), refreshed)).toEqual([
-      "idle",
-      "running",
-      "shown",
-    ]);
-  });
-
-  it("drops hidden idle rows the refresh covers but keeps rows that can still notify", () => {
-    const rendered = new Map([
-      ["sessions", ["shown"]],
-      ["collapsed-folder", []],
-    ]);
-    expect(sidebarWatchedIds([idle, running, awaiting, shown], rendered, refreshed)).toEqual([
-      "shown",
-      "running",
-      "awaiting",
-    ]);
-  });
-
-  it("keeps watching hidden rows the periodic refresh does not re-read", () => {
-    const rendered = new Map([["sessions", ["shown"]]]);
-    expect(sidebarWatchedIds([idle, shown], rendered, new Set(["shown"]))).toEqual([
-      "shown",
-      "idle",
-    ]);
-  });
-
-  it("ignores rendered rows the sidebar caches do not hold, such as archived ones", () => {
-    const rendered = new Map([["archived", ["archived-row", "shown"]]]);
-    expect(sidebarWatchedIds([shown], rendered, refreshed)).toEqual(["shown"]);
-  });
-
-  it("lists a row rendered by two sections once", () => {
-    const rendered = new Map([
-      ["pinned", ["shown"]],
-      ["sessions", ["shown", "idle"]],
-    ]);
-    expect(sidebarWatchedIds([idle, shown], rendered, refreshed)).toEqual(["shown", "idle"]);
-  });
 });
