@@ -49,6 +49,8 @@ from omnigent.host.frames import (
     SERVER_CAP_TMUX_READINESS,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -5776,6 +5778,40 @@ def test_handle_list_dir_pagination_last_page_has_more_false(
     assert result.status == "ok"
     assert len(result.entries) == 2
     assert result.has_more is False
+
+
+async def test_dispatch_clone_repository_keeps_orphan_reaper_paused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The clone worker owns its git exit status until it finishes."""
+    host = _make_host_process()
+    started = threading.Event()
+    release = threading.Event()
+    destination = str(tmp_path / "app")
+
+    def _clone(frame: HostCloneRepositoryFrame) -> HostCloneRepositoryResultFrame:
+        started.set()
+        if not release.wait(timeout=1.0):
+            raise AssertionError("test did not release the clone worker")
+        return HostCloneRepositoryResultFrame(
+            request_id=frame.request_id, status="ok", path=frame.path
+        )
+
+    monkeypatch.setattr("omnigent.host.connect.clone_repository", _clone)
+    tunnel = _FakeTunnel()
+    request = HostCloneRepositoryFrame(
+        request_id="clone-1", url="https://git.example.com/team/app.git", path=destination
+    )
+    dispatch = asyncio.create_task(host._dispatch_host_frame(tunnel, request))  # type: ignore[arg-type]
+    assert await asyncio.to_thread(started.wait, 1.0)
+    assert host._owned_subprocess_ops == 1
+
+    release.set()
+    await dispatch
+    assert host._owned_subprocess_ops == 0
+    assert decode_host_frame(tunnel.sent[0]) == HostCloneRepositoryResultFrame(
+        request_id="clone-1", status="ok", path=destination
+    )
 
 
 # ── host.create_dir handler ─────────────────────────────

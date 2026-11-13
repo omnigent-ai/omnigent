@@ -69,6 +69,7 @@ export type FeatureKey =
   | "automations_v2"
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
+  | "project_repository_creation"
   | "session_orchestration";
 
 /** Deployment-wide release-feature values advertised by the server. */
