@@ -2523,9 +2523,11 @@ def test_session_id_from_request_parses_session_path() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["http", "websocket", "closed", "peer-disconnected"])
 async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
     app: FastAPI,
     caplog: pytest.LogCaptureFixture,
+    transport: str,
 ) -> None:
     """
     ``RUNNER_UNAVAILABLE`` logs a stateful WARN; other 5xx keep ERROR.
@@ -2538,33 +2540,70 @@ async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
     :param caplog: Pytest log capture fixture.
     :returns: None.
     """
+    from fastapi import WebSocket
+
+    from omnigent.debug_logging import current_request_audit_attrs, reset_request_audit_attrs
     from omnigent.errors import ErrorCode, OmnigentError
 
     handler = app.exception_handlers[OmnigentError]
-    request = Request(
-        {
-            "type": "http",
-            "method": "GET",
+    messages = []
+
+    async def send(message):
+        messages.append(message)
+
+    async def handle(exc: OmnigentError):
+        incoming = iter(
+            [
+                {"type": "websocket.connect"},
+                {"type": "websocket.disconnect", "code": 1000},
+            ]
+        )
+
+        async def receive():
+            return next(incoming)
+
+        scope = {
+            "type": "http" if transport == "http" else "websocket",
             "path": "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
-            "raw_path": b"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
             "query_string": b"",
             "headers": [],
         }
-    )
+        if transport == "http":
+            scope["method"] = "GET"
+            request = Request(scope)
+        else:
+            request = WebSocket(scope, receive=receive, send=send)
+            await request.accept()
+            if transport == "closed":
+                await request.close()
+            elif transport == "peer-disconnected":
+                await request.receive()
+            messages.clear()
+        reset_request_audit_attrs()
+        result = await handler(request, exc)
+        attrs = current_request_audit_attrs()
+        assert attrs["code"] == str(exc.code)
+        assert attrs["http_status"] == str(exc.http_status)
+        assert attrs["error_category"] == exc.category.value
+        if transport == "http":
+            assert result.status_code == exc.http_status
+        else:
+            assert result is None
+            expected = (
+                [{"type": "websocket.close", "code": 1011, "reason": str(exc.code)}]
+                if transport == "websocket"
+                else []
+            )
+            assert messages == expected
 
     with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
-        offline = await handler(
-            request,
+        await handle(
             OmnigentError(
                 "runner 'runner_token_x' is offline",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
-            ),
+            )
         )
-        fault = await handler(request, OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR))
-
-    # The wire contract is untouched: only the log level moves.
-    assert offline.status_code == 503
-    assert fault.status_code == 500
+        await handle(OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR))
 
     records = [r for r in caplog.records if r.name == "omnigent.server.app"]
     assert len(records) == 2, f"expected one record per error, got {records}"

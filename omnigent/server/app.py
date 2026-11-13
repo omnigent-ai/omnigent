@@ -28,9 +28,11 @@ from pydantic import BaseModel
 from sqlalchemy.exc import StatementError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
+from starlette.requests import HTTPConnection
 from starlette.responses import Response
 from starlette.routing import Match, Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
@@ -696,7 +698,7 @@ _NO_RESPONSE_RETURNED = "No response returned."
 _HTTP_CLIENT_CLOSED_REQUEST = 499
 
 
-def _session_id_from_request(request: Request) -> str | None:
+def _session_id_from_request(request: HTTPConnection) -> str | None:
     """Best-effort session id parsed from a ``/v1/sessions/<id>/…`` request path.
 
     Threaded into exception-handler logs so a 500 on a session route carries its
@@ -711,7 +713,7 @@ def _session_id_from_request(request: Request) -> str | None:
 
 
 def _error_audit_extra(
-    request: Request,
+    request: HTTPConnection,
     *,
     phase: str = "error",
     **attributes: str,
@@ -726,7 +728,7 @@ def _error_audit_extra(
     """
     route = request.scope.get("route")
     operation = getattr(route, "name", None) or "unmatched"
-    attributes.setdefault("method", request.method)
+    attributes.setdefault("method", request.scope.get("method", "WEBSOCKET"))
     attributes.setdefault("route", getattr(route, "path", None) or "<unmatched>")
     request_id = getattr(request.state, "audit_request_id", None)
     if isinstance(request_id, str):
@@ -3039,22 +3041,20 @@ def create_app(
     ) -> JSONResponse | None:
         """Close rejected WebSockets; render HTTP failures as structured JSON."""
         if isinstance(request, WebSocket):
-            await request.close(code=1008 if exc.http_status < 500 else 1011, reason=str(exc.code))
+            _record_omnigent_error(request, exc)
+            if (
+                request.application_state != WebSocketState.DISCONNECTED
+                and request.client_state != WebSocketState.DISCONNECTED
+            ):
+                with suppress(WebSocketDisconnect):
+                    await request.close(
+                        code=1008 if exc.http_status < 500 else 1011, reason=str(exc.code)
+                    )
             return None
         return await _handle_omnigent_error(request, exc)
 
-    async def _handle_omnigent_error(
-        request: Request,
-        exc: OmnigentError,
-    ) -> JSONResponse:
-        """
-        Convert application errors to structured JSON responses.
-
-        :param request: The incoming request; its path supplies the session id
-            threaded into the error log.
-        :param exc: The application error.
-        :returns: A JSON response with the error code and message.
-        """
+    def _record_omnigent_error(request: HTTPConnection, exc: OmnigentError) -> None:
+        """Retain audit attribution and error logs across HTTP and WebSocket failures."""
         # Stamp attribution onto the per-request audit-envelope row (table-only,
         # one per request) for EVERY code, so the 4xx we deliberately don't log
         # to the ERROR stream are still queryable by owner/impact/phase. The
@@ -3115,6 +3115,20 @@ def create_app(
                     error_phase=exc.phase.value,
                 ),
             )
+
+    async def _handle_omnigent_error(
+        request: Request,
+        exc: OmnigentError,
+    ) -> JSONResponse:
+        """
+        Convert application errors to structured JSON responses.
+
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
+        :param exc: The application error.
+        :returns: A JSON response with the error code and message.
+        """
+        _record_omnigent_error(request, exc)
         from omnigent.errors import ERROR_CODE_HEADER
 
         error = (
