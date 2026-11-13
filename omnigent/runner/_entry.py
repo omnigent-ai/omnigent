@@ -403,7 +403,9 @@ class _RunnerDatabricksAuth(ThreadedAuth):
             )
         if self._factory is not None:
             token, declined = _call_factory_with_declined(self._factory)
-            self._last_bearer = token
+            # A transient refresh failure does not change the established scope.
+            if token or declined:
+                self._last_bearer = token
             if not token:
                 if declined:
                     # The mint declined (400/404 no-auth, intermediary 5xx, or a
@@ -1073,10 +1075,11 @@ class _ManagedMintTokenFactory:
                 raise httpx.HTTPStatusError(
                     message, request=exc.request, response=response
                 ) from exc
+            login_redirect = response.is_redirect and _is_login_redirect_or_unauthorized(response)
             if (
                 response.status_code in (400, 404)
                 or response.is_server_error
-                or (response.is_redirect and _is_login_redirect_or_unauthorized(response))
+                or (login_redirect and not self.uses_scoped_credentials)
             ):
                 # Only treat as a definitive refusal if we have never
                 # successfully minted. A 400/404 mid-session (e.g. during an
@@ -1090,7 +1093,7 @@ class _ManagedMintTokenFactory:
                     self.declined_by_server_error = response.is_server_error
                     return None
                 return self._still_valid_cached_token(now)
-            if response.status_code in (401, 403):
+            if response.status_code in (401, 403) or login_redirect:
                 if self._proxy_bearer is None and not self.uses_scoped_credentials:
                     # A successful mint would have promoted a bearer, so
                     # nothing expired: the server will not mint for us yet.

@@ -1655,7 +1655,7 @@ def test_mint_managed_owner_token_includes_proxy_bearer_when_provided(
 
 
 @pytest.mark.parametrize("recovery", ["success", "unavailable", "rejected", "upgrade required"])
-@pytest.mark.parametrize("rejection_status", [401, 403])
+@pytest.mark.parametrize("rejection_status", [401, 403, 302])
 def test_delegated_factory_recovers_proxy_admission_without_changing_callback_scope(
     monkeypatch: pytest.MonkeyPatch, recovery: str, rejection_status: int
 ) -> None:
@@ -1692,7 +1692,12 @@ def test_delegated_factory_recovers_proxy_admission_without_changing_callback_sc
                 200, json={"token": "minted-jwt", "expires_at": time.time() + 1800}
             )
         if bearer != "Bearer owner-admission-token" or recovery == "rejected":
-            return httpx.Response(rejection_status)
+            return httpx.Response(
+                rejection_status,
+                headers={"Location": "/oidc/oauth2/v2.0/authorize"}
+                if rejection_status == 302
+                else {},
+            )
         if recovery == "upgrade required":
             return httpx.Response(426)
         return httpx.Response(

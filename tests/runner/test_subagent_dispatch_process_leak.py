@@ -198,16 +198,26 @@ async def test_tombstone_close_reaps_cluster() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("created_child", [False, True])
 async def test_confined_failed_send_retains_work_without_cleanup(created_child: bool) -> None:
+    from omnigent.runner._entry import _RunnerDatabricksAuth
     from omnigent.runner.tool_dispatch import _teardown_failed_child
+    from omnigent.server.oidc import mint_session_token
 
     requests = []
 
     def handle(request):
         requests.append(request)
-        return httpx.Response(500)
+        return httpx.Response(200)
 
-    auth = httpx.Auth()
-    auth.runner_confined = True
+    tokens: list[str | None] = [
+        mint_session_token(
+            "alice",
+            b"test-only-secret" * 3,
+            1800,
+            "accounts",
+            extra_claims={"scope": "runner", "runner_id": "runner_test"},
+        )
+    ]
+    auth = _RunnerDatabricksAuth(lambda: tokens[0])
     entry = subagent_work.register_subagent_work(
         parent_session_id=PARENT_ID,
         child_session_id=CHILD_ID,
@@ -218,6 +228,13 @@ async def test_confined_failed_send_retains_work_without_cleanup(created_child: 
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(handle), base_url="http://server", auth=auth
         ) as client:
+            await client.get(f"/v1/sessions/{PARENT_ID}")
+            assert auth.runner_confined
+            requests.clear()
+            tokens[0] = None
+            with pytest.raises(httpx.RequestError, match="refresh returned no token"):
+                await client.post(f"/v1/sessions/{CHILD_ID}/events", json={"type": "message"})
+            assert auth.runner_confined
             warning = await _teardown_failed_child(client, CHILD_ID, created_child=created_child)
         assert warning is not None and CHILD_ID in warning and "retained" in warning
         assert subagent_work.get_subagent_work(CHILD_ID) is entry
