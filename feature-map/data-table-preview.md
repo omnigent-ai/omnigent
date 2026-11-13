@@ -10,7 +10,7 @@ CSV and TSV files open as a read-only table in the file viewer instead of as hig
 - `table-sort`: clicking a column header sorts ascending, then descending, then back to file order. Numbers and dates sort by value, text naturally; empty cells stay last.
 - `table-filter`: each column has a filter that keeps rows whose cell contains the text, case-insensitively; the summary shows how many rows match.
 - `table-copy`: clicking a cell selects it and offers Copy cell and Copy row (tab-separated).
-- `table-bounds`: only the first 1,000 rows (within a text budget) are kept. A note says "Showing the first N of M rows". When the server sent only the start of a large file, the count reads "At least N rows" and the note says the file is larger than the preview.
+- `table-bounds`: only the first 1,000 rows, the first 500 columns and 200,000 cells (within a text budget) are kept, so a wide file keeps fewer rows. A note says "Showing the first N of M rows" and, for a wide file, "the first 500 of M columns". When the server sent only the start of a large file, the count reads "At least N rows" and the shared banner says the file is truncated.
 - `table-encoding`: files the server sends as base64 (not valid UTF-8) are decoded in the browser: UTF-16 by its byte-order mark, else UTF-8, else Windows-1252.
 
 ## How to get to it (user POV)
@@ -18,6 +18,9 @@ CSV and TSV files open as a read-only table in the file viewer instead of as hig
 - Files: open the Files panel, choose Explore or Changes, and select a `.csv` or `.tsv` file.
 - Chat file link: click a link to a workspace `.csv` or `.tsv` file in an agent's reply.
 - Deep link: open a conversation URL with `?file=results.csv`.
+- Content search: a match inside a CSV opens the file in Source at the matching line; View preview switches to the table.
+- Find: with the table open, press Cmd/Ctrl+F; matches refresh after sorting, filtering or a file change, and the table scrolls sideways to a match in a hidden column.
+- Keyboard: Tab reaches the table as one stop; arrow keys and Home/End move between cells, and focusing a cell selects it for Copy cell and Copy row. A column's resize handle takes Left and Right.
 - Mobile web: the same entry points at a narrow viewport; the table scrolls horizontally.
 
 ## Driving it with the repro environment

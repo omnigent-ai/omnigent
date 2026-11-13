@@ -239,12 +239,22 @@ function DataTableView({
     table.totalRows === 1 ? "row" : "rows"
   }`;
   const filtered = visibleRows.length !== shown;
+  const columnsCut = table.header.length < table.totalColumns;
+  const notes = [
+    shown < table.totalRows &&
+      (truncated
+        ? `the first ${shown.toLocaleString()} rows`
+        : `the first ${shown.toLocaleString()} of ${table.totalRows.toLocaleString()} rows`),
+    columnsCut &&
+      `the first ${table.header.length.toLocaleString()} of ${table.totalColumns.toLocaleString()} columns`,
+  ].filter((note): note is string => typeof note === "string");
 
   return (
     <div className="flex h-full flex-col">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2 text-sm text-muted-foreground">
         <span data-testid="data-table-summary">
-          {rowCount} · {table.header.length} {table.header.length === 1 ? "column" : "columns"} ·{" "}
+          {rowCount} · {table.totalColumns.toLocaleString()}{" "}
+          {table.totalColumns === 1 ? "column" : "columns"} ·{" "}
           {DELIMITER_LABELS[table.delimiter] ?? "delimited"}
           {table.encoding !== "utf-8" ? ` · ${table.encoding}` : ""}
         </span>
@@ -268,12 +278,11 @@ function DataTableView({
           </span>
         )}
       </div>
-      {shown < table.totalRows && (
+      {notes.length > 0 && (
         // A truncated file also gets the viewer's shared truncation banner.
         <div role="note" className="border-b bg-muted/40 px-4 py-1.5 text-sm text-muted-foreground">
-          {truncated
-            ? `Showing the first ${shown.toLocaleString()} rows.`
-            : `Showing the first ${shown.toLocaleString()} of ${table.totalRows.toLocaleString()} rows. Download the file to see every row.`}
+          {`Showing ${notes.join(" and ")}.`}
+          {truncated ? "" : ` Download the file to see ${columnsCut ? "all of it" : "every row"}.`}
         </div>
       )}
       {/* Only the table scrolls, so the summary and its copy buttons stay in view. */}

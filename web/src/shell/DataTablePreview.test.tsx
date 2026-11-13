@@ -1,15 +1,24 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DataTablePreview } from "./DataTablePreview";
-import { DATA_TABLE_MAX_ROWS } from "./dataTable";
+import { DATA_TABLE_MAX_COLUMNS, DATA_TABLE_MAX_ROWS } from "./dataTable";
 
 const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn() }));
 vi.mock("sonner", () => ({ toast }));
 
+const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
+  else Reflect.deleteProperty(navigator, "clipboard");
 });
+
+/** Replace the clipboard for one test; ``afterEach`` puts the original back. */
+function stubClipboard(writeText: (text: string) => Promise<void>) {
+  Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+}
 
 const SALES = "region,units,closed\nWest,10,2026-03-01\nEast,2,2026-01-15\nNorth,,2026-02-10\n";
 
@@ -78,7 +87,7 @@ describe("DataTablePreview", () => {
 
   it("copies the selected cell or its row", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.assign(navigator, { clipboard: { writeText } });
+    stubClipboard(writeText);
     renderTable(SALES);
     expect(screen.queryByRole("button", { name: /Copy cell/ })).toBeNull();
 
@@ -90,6 +99,25 @@ describe("DataTablePreview", () => {
     expect(writeText).toHaveBeenNthCalledWith(1, "East");
     expect(writeText).toHaveBeenNthCalledWith(2, "East\t2\t2026-01-15");
     expect(toast.success).toHaveBeenCalledWith("Copied row");
+  });
+
+  it("says so when the clipboard refuses a copy", async () => {
+    stubClipboard(vi.fn().mockRejectedValue(new Error("denied")));
+    renderTable(SALES);
+    fireEvent.click(screen.getByRole("cell", { name: "East" }));
+    fireEvent.click(screen.getByRole("button", { name: /Copy cell/ }));
+    await vi.waitFor(() => expect(toast.error).toHaveBeenCalledWith("Couldn't copy the cell"));
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("says how many columns it shows when the file has more", () => {
+    const header = Array.from({ length: DATA_TABLE_MAX_COLUMNS + 100 }, (_, i) => `c${i}`);
+    renderTable(`${header.join(",")}\n1\n`);
+    expect(screen.getByTestId("data-table-summary")).toHaveTextContent("1 row · 600 columns");
+    expect(screen.getAllByRole("columnheader")).toHaveLength(DATA_TABLE_MAX_COLUMNS);
+    expect(screen.getByRole("note")).toHaveTextContent(
+      "Showing the first 500 of 600 columns. Download the file to see all of it.",
+    );
   });
 
   it("says how many rows it shows when the file has more", () => {
@@ -130,7 +158,7 @@ describe("DataTablePreview", () => {
 
   it("selects a cell from the keyboard and copies its row as quoted tab-separated text", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.assign(navigator, { clipboard: { writeText } });
+    stubClipboard(writeText);
     renderTable('name,note\nLee,"tab\there and\na ""quote"""\n');
 
     fireEvent.focus(screen.getByRole("cell", { name: "Lee" }));

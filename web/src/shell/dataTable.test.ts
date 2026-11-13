@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  DATA_TABLE_MAX_CELLS,
   DATA_TABLE_MAX_CHARS,
+  DATA_TABLE_MAX_COLUMNS,
   DATA_TABLE_MAX_ROWS,
   compareCells,
   decodeDataFile,
@@ -48,6 +50,25 @@ describe("parseDataTable", () => {
     ]);
   });
 
+  it("bounds a sparse, wide file by columns and cells, still counting both", () => {
+    // One row of delimiters would otherwise widen every row: 1,000 rows × 2,000 columns.
+    const text = `h\n${"x\n".repeat(999)}${",".repeat(1999)}\n`;
+    const table = parseDataTable(text, "sparse.csv");
+    expect(table?.header).toHaveLength(DATA_TABLE_MAX_COLUMNS);
+    expect(table?.totalColumns).toBe(2000);
+    expect(table?.totalRows).toBe(1000);
+    const cells = ((table?.rows.length ?? 0) + 1) * (table?.header.length ?? 0);
+    expect(cells).toBeLessThanOrEqual(DATA_TABLE_MAX_CELLS);
+    expect(table?.rows.every((row) => row.length === DATA_TABLE_MAX_COLUMNS)).toBe(true);
+  });
+
+  it("caps an oversized header's columns", () => {
+    const table = parseDataTable(`${"c,".repeat(3000)}c\n1\n`, "wide.csv");
+    expect(table?.header).toHaveLength(DATA_TABLE_MAX_COLUMNS);
+    expect(table?.totalColumns).toBe(3001);
+    expect(table?.rows).toHaveLength(1);
+  });
+
   it("returns null for an empty file", () => {
     expect(parseDataTable("", "empty.csv")).toBeNull();
     expect(parseDataTable("\n\n", "empty.csv")).toBeNull();
@@ -70,11 +91,20 @@ describe("parseDataTable", () => {
     expect(table?.totalRows).toBe(3);
   });
 
-  it("keeps an oversized header as the header", () => {
+  it("keeps an oversized header as the header, its text cut at the budget", () => {
     const wideHeader = "h".repeat(DATA_TABLE_MAX_CHARS + 1);
     const table = parseDataTable(`${wideHeader},b\n1,2\n`, "wide.csv");
-    expect(table?.header).toEqual([wideHeader, "b"]);
+    expect(table?.header.map((name) => name.length)).toEqual([DATA_TABLE_MAX_CHARS, 0]);
+    // The header spent the budget, so no row is kept, though every row is counted.
+    expect(table?.rows).toEqual([]);
     expect(table?.totalRows).toBe(1);
+  });
+
+  it("keeps the rows before one cell bigger than the whole budget", () => {
+    const huge = "x".repeat(DATA_TABLE_MAX_CHARS * 2);
+    const table = parseDataTable(`col\nsmall\n${huge}\nafter\n`, "huge.tsv");
+    expect(table?.rows).toEqual([["small"]]);
+    expect(table?.totalRows).toBe(3);
   });
 
   it("infers each column's type", () => {
@@ -109,6 +139,11 @@ describe("detectDelimiter", () => {
     expect(detectDelimiter(`${head}\n${tail}`, "x.csv")).toBe(";");
   });
 
+  it("detects the delimiter of a file whose first line is a huge row of commas", () => {
+    // A row this wide is read under the column cap.
+    expect(detectDelimiter(`${",".repeat(1_000_000)}\n`, "x.csv")).toBe(",");
+  });
+
   it("ignores a delimiter inside quotes", () => {
     // Semicolons split every row; the commas sit inside quoted fields only.
     expect(detectDelimiter('a;b\n"1,5";"2,5"\n"3,1";"4,0"\n', "eu.csv")).toBe(";");
@@ -129,12 +164,11 @@ describe("decodeDataFile", () => {
     });
   });
 
-  it("decodes UTF-16 marked by its byte-order mark", () => {
-    const bytes = [0xff, 0xfe, 0x61, 0x00, 0x2c, 0x00, 0x62, 0x00];
-    expect(decodeDataFile(base64Of(bytes), "base64")).toEqual({
-      text: "a,b",
-      encoding: "utf-16le",
-    });
+  it.each([
+    ["little-endian", [0xff, 0xfe, 0x61, 0x00, 0x2c, 0x00, 0x62, 0x00], "utf-16le"],
+    ["big-endian", [0xfe, 0xff, 0x00, 0x61, 0x00, 0x2c, 0x00, 0x62], "utf-16be"],
+  ])("decodes %s UTF-16 marked by its byte-order mark", (_, bytes, encoding) => {
+    expect(decodeDataFile(base64Of(bytes), "base64")).toEqual({ text: "a,b", encoding });
   });
 
   it("prefers UTF-8 for base64 bytes that are valid UTF-8", () => {
@@ -167,5 +201,10 @@ describe("inferColumnType and compareCells", () => {
       "item2",
       "item10",
     ]);
+    expect(
+      ["2026-03-01", "", "2025-12-31T23:00:00Z", "2026-01-15"].sort((a, b) =>
+        compareCells(a, b, "date"),
+      ),
+    ).toEqual(["2025-12-31T23:00:00Z", "2026-01-15", "2026-03-01", ""]);
   });
 });
