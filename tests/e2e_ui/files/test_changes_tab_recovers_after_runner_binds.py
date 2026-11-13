@@ -45,6 +45,8 @@ def _git_workspace(root: Path) -> Path:
     git = ["git", "-C", str(workspace), "-c", "user.name=t", "-c", "user.email=t@example.com"]
     subprocess.run([*git, "add", "README.md"], check=True)
     subprocess.run([*git, "commit", "-q", "-m", "init"], check=True)
+    # Skip the startup cache probe; its temporary directory can appear in Changes.
+    subprocess.run([*git, "config", "core.untrackedCache", "true"], check=True)
     return workspace
 
 
