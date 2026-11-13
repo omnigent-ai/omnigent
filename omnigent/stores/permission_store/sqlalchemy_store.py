@@ -152,13 +152,34 @@ def _upsert_grant(
     level: int,
     *,
     ensure_minimum: bool = False,
+    keep_existing: bool = False,
 ) -> Insert:
     """Build a grant upsert, replacing the level unless stronger access is preserved.
 
     :param key: The row's primary key columns other than ``workspace_id``.
     :param ensure_minimum: Atomically retain the higher existing or requested level.
+    :param keep_existing: Leave an existing row exactly as it is.
     """
     key_columns = ["workspace_id", *key]
+    if keep_existing:
+        if dialect == "sqlite":
+            return (
+                sqlite_insert(model)
+                .values(**key, level=level)
+                .on_conflict_do_nothing(index_elements=key_columns)
+            )
+        if dialect == "mysql":
+            # ``level = level`` keeps the stored value.
+            return (
+                mysql_insert(model)
+                .values(**key, level=level)
+                .on_duplicate_key_update(level=model.level)
+            )
+        return (
+            pg_insert(model)
+            .values(**key, level=level)
+            .on_conflict_do_nothing(index_elements=key_columns)
+        )
     next_level = case((model.level < level, level), else_=model.level) if ensure_minimum else level
     if dialect == "sqlite":
         return (
@@ -518,12 +539,12 @@ class SqlAlchemyPermissionStore(PermissionStore):
     def grant_if_absent(self, user_id: str, conversation_id: str, level: int) -> bool:
         """Insert a grant unless the grantee holds one. See base class for contract.
 
-        The insert keeps the higher of the stored and requested levels, so a stored
-        grant is never lowered. An insert's row count isn't reliable on every
-        backend, so a locking read decides the result. On MySQL its gap lock and on
-        SQLite the write lock hold off a concurrent insert. On PostgreSQL and
-        CockroachDB, a grant committed between the read and the insert is kept, though
-        the call still returns ``True``.
+        The insert leaves an existing row unchanged, so a stored grant never changes.
+        An insert's row count isn't reliable on every backend, so a locking read
+        decides the result. On MySQL its gap lock and on SQLite the write lock hold
+        off a concurrent insert. On PostgreSQL and CockroachDB, a grant committed
+        between the read and the insert is kept, though the call still returns
+        ``True``.
         """
 
         def write(session: Session) -> bool:
@@ -545,7 +566,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     SqlSessionPermission,
                     {"user_id": user_id, "conversation_id": conversation_id},
                     level,
-                    ensure_minimum=True,
+                    keep_existing=True,
                 )
             )
             return True
