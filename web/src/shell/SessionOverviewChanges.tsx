@@ -1,5 +1,5 @@
-// WIP(session_overview): workspace change rows. Lines count tracked files only
-// for now; untracked files count as files but carry no line counts yet.
+// WIP(session_overview): workspace change rows. Lines include untracked files
+// when the runner counts them, and tracked files only otherwise.
 
 import { useSession } from "@/hooks/useSession";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
@@ -22,8 +22,14 @@ export function SessionOverviewChanges({ sessionId }: { sessionId: string }) {
   const files = useWorkspaceChangedFiles(sessionId).data?.data ?? [];
   const isGit = worktrees.data?.status === "ok" && worktrees.data.worktrees.length > 0;
   if (!isGit || files.length === 0) return null;
-  const counted = files.filter((file) => file.lines_added !== null || file.lines_removed !== null);
-  const added = counted.reduce((sum, file) => sum + (file.lines_added ?? 0), 0);
+  const counted = files.filter(
+    (file) =>
+      file.lines_added !== null || file.lines_removed !== null || file.untracked_lines != null,
+  );
+  const added = counted.reduce(
+    (sum, file) => sum + (file.lines_added ?? file.untracked_lines ?? 0),
+    0,
+  );
   const removed = counted.reduce((sum, file) => sum + (file.lines_removed ?? 0), 0);
   return (
     <>
