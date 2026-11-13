@@ -608,6 +608,16 @@ Other connection providers alone do not enable the managed MCP picker.
   reply once, with no model-change error. Requires Claude Code and tmux. Use
   a clean container when machine-managed Claude settings override the mock
   endpoint; this does not establish live gateway compatibility.
+- **`model-picker`, paused Pi after server restart (own environment):**
+  Start a Pi session on a host with a configured local catalog, pause the
+  session, restart only the server, and reload the session. Open the model
+  picker through the gear, model pill, and Ctrl+Shift+M; the host models must
+  appear while the runner remains offline. Repeat for a sub-agent that inherits
+  its host from an ancestor. The component scenario
+  `tests/server/routes/test_sessions_snapshot.py::test_session_snapshot_fills_cold_pi_catalog_from_host`
+  covers direct and inherited hosts, concurrent reads and refresh publication.
+  Direct-host browser evidence is in the PR Demo; inherited-host browser and
+  live-provider resume checks remain manual gaps.
 - **`model-picker`, row hover (both composers):** no browser-level coverage;
   `web/src/lib/composerModelLabel.test.ts`. Manually: hover a row labeled with
   a family name and expect its full model ID; the Fusion row shows none.
