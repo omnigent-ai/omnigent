@@ -7,7 +7,7 @@ import hashlib
 import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import (
     BigInteger,
@@ -31,10 +31,18 @@ from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from omnigent.db.bounded_binary import BoundedBinary
 from omnigent.db.compression import CompressedText
+from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
 from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
+
+if TYPE_CHECKING:
+    from sqlalchemy import Connection, Dialect, Table
+    from sqlalchemy.sql.compiler import DDLCompiler
+    from sqlalchemy.sql.ddl import BaseDDLElement
+    from sqlalchemy.sql.schema import SchemaItem
 
 # 32-byte sha256 digest column. LargeBinary → BYTEA (Postgres) / BLOB (SQLite),
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
@@ -622,6 +630,30 @@ class SqlSessionPermission(OmnigentBase):
 _MYSQL_BLOB_TEXT = CompressedText().with_variant(CompressedText(max_stored_bytes=65_535), "mysql")
 
 
+def _on_sqlite_family(
+    ddl: BaseDDLElement,
+    target: SchemaItem | str,
+    bind: Connection | None,
+    tables: list[Table] | None = None,
+    state: Any | None = None,
+    *,
+    dialect: Dialect,
+    compiler: DDLCompiler | None = None,
+    checkfirst: bool = False,
+) -> bool:
+    """
+    Whether DDL runs on SQLite or Cloudflare D1, which serves SQLite.
+
+    Neither enforces declared column types, so a size or type bound needs a
+    CHECK there.
+
+    :param dialect: The dialect running the DDL, e.g. ``"sqlite"``.
+    :returns: ``True`` for those two dialects.
+    """
+    del ddl, target, bind, tables, state, compiler, checkfirst
+    return dialect.name in ("sqlite", "cloudflare_d1")
+
+
 class SqlConversationMetadata(OmnigentBase):
     """
     SQLAlchemy model for the ``omnigent_conversation_metadata`` table.
@@ -671,14 +703,27 @@ class SqlConversationMetadata(OmnigentBase):
     live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     # Outstanding elicitation (approval-prompt) count; NULL = never written.
     pending_elicitation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Whether the agent's work outlives its ended turn, e.g. a background shell;
+    # NULL = never written.
+    background_work_running: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # When the bound runner decided that value, in its own epoch nanoseconds;
+    # NULL = never written.
+    background_work_reported_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Why a running session's agent is parked on a terminal prompt; NULL = not parked.
+    blocked_on: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # First-class project membership. Relates to projects.id; no DB FK
     # (Rule R032). NULL = unfiled. Coexists with the implicit ``omni_project``
     # label via the store's dual-read until labels are consolidated.
     project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Independent peers share a stable ID; NULL means a standalone session.
+    family_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     # JSON document of the session's linked pull requests and pending unlinks,
     # kept under 16,384 stored bytes by SessionPullRequestStore; NULL = none
     # reported. Deferred so whole-row reads (e.g. the session list) skip it.
     pull_requests: Mapped[str | None] = mapped_column(CompressedText, nullable=True, deferred=True)
+    # The session whose Workspace rail lists this side chat; NULL = not a side chat.
+    # No DB FK (Rule R032).
+    side_chat_parent_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),
@@ -686,11 +731,35 @@ class SqlConversationMetadata(OmnigentBase):
             "host_id IS NULL OR workspace IS NOT NULL",
             name="ck_conversation_metadata_workspace_required_for_host",
         ),
+        # SQLite ignores VARCHAR lengths: 128 characters at up to four bytes each.
+        CheckConstraint(
+            "blocked_on IS NULL OR length(CAST(blocked_on AS BLOB)) <= 512",
+            name="ck_conversation_metadata_blocked_on_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # SQLite stores any value in a BOOLEAN column, so it could hold a long string.
+        CheckConstraint(
+            "background_work_running IS NULL OR background_work_running IN (0, 1)",
+            name="ck_conversation_metadata_running_boolean",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # SQLite stores any value in a BIGINT column, so it could hold a long string.
+        CheckConstraint(
+            "background_work_reported_at IS NULL "
+            "OR typeof(background_work_reported_at) = 'integer'",
+            name="ck_conversation_metadata_reported_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
         # Supports list_conversations_by_runner_id and get_runner_ids.
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
         Index("ix_conversation_metadata_host_id", "workspace_id", "host_id", "id"),
         # "list sessions in project X" + per-project counts (GROUP BY project_id).
         Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
+        # Lists a session's side chats on any device, in id order.
+        Index(
+            "ix_conversation_metadata_side_chat_parent_id",
+            "workspace_id",
+            "side_chat_parent_id",
+            "id",
+        ),
+        Index("ix_conversation_metadata_family_id", "workspace_id", "family_id", "id"),
     )
 
 
@@ -1085,6 +1154,8 @@ class SqlComment(OmnigentBase):
     :param created_by: Email of the user who created this comment,
         e.g. ``"alice@example.com"``. ``NULL`` for legacy comments or
         comments created in single-user mode.
+    :param anchor_metadata: Bounded provider-specific coordinates for comments
+        that are not anchored by workspace-file character offsets.
     """
 
     __tablename__ = "comments"
@@ -1118,6 +1189,10 @@ class SqlComment(OmnigentBase):
     updated_at: Mapped[int] = mapped_column(BigInteger)
     anchor_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    anchor_metadata: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=COMMENT_ANCHOR_MAX_STORED_BYTES), nullable=True
+    )
 
     __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
 
@@ -1534,6 +1609,8 @@ class SqlScheduledTask(OmnigentBase):
     # (Claude Code). The fire path converts it to the runner's
     # ``--permission-mode`` launch arg. NULL = use the agent default.
     permission_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # JSON list of MCP service names every fired session starts with. NULL = none.
+    mcp_services: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     # Per-firing cost budget in USD. When set, the fire path attaches a
     # cost_budget policy to each spawned session. NULL = no per-firing cap.
     max_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -1569,6 +1646,9 @@ class SqlScheduledTask(OmnigentBase):
     session_mode: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     # Relates to conversations.id. No DB foreign key (Rule R032).
     session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # The session each run's new session starts as a copy of. Relates to
+    # conversations.id. No DB foreign key (Rule R032).
+    source_session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
@@ -1585,6 +1665,8 @@ class SqlScheduledTask(OmnigentBase):
             "created_at",
             "id",
         ),
+        # Pages one agent's tasks across owners, e.g. every proactive-agent task.
+        Index("ix_scheduled_tasks_agent", "workspace_id", "agent_id", "id"),
     )
 
 
@@ -1701,5 +1783,180 @@ class SqlScheduledTaskRun(OmnigentBase):
             "conversation_id",
             "status",
             "id",
+        ),
+    )
+
+
+# Largest stored (compressed) value for a new column, per the database guide.
+_INBOX_MAX_STORED_BYTES = 16_383
+
+
+class SqlInboxItem(OmnigentBase):
+    """Agent-posted Inbox suggestions, scoped to a workspace and owner.
+
+    Agent and session relationships are maintained by application code (no DB
+    foreign key, Rule R032). What the agent wrote and how the owner answered are
+    two storage envelopes; the other columns route, order, and deduplicate.
+    """
+
+    __tablename__ = "inbox_items"
+
+    # Tenant partition key: workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # The reserved "local" user in single-user mode, so the unique index applies there too.
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # The session whose agent posted the item, and that agent.
+    source_session_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    agent_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    # Versioned duplicate key: a hash of the kind, primary link, and topic.
+    dedupe_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    # INBOX_ITEM_STATUS code: unread, read, done, or dismissed.
+    status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    # What the agent posted, which a deployment may encrypt, as one storage
+    # envelope: {"kind", "title", "body_md", "links", "actions", "topic",
+    # "primary_link", "media"}. Always read and written together.
+    content: Mapped[bytes] = mapped_column(BoundedBinary(_INBOX_MAX_STORED_BYTES), nullable=False)
+    # How the owner answered, in its own envelope since it is written alone:
+    # {"reason", "action", "text"}. NULL until the owner answers.
+    resolution: Mapped[bytes | None] = mapped_column(
+        BoundedBinary(_INBOX_MAX_STORED_BYTES), nullable=True
+    )
+    # Unix epoch seconds.
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    resolved_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    expires_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN (1, 2, 3, 4)", name="ck_inbox_items_status"),
+        # SQLite enforces neither declared lengths nor types; these bound what it stores.
+        CheckConstraint(
+            "user_id IS NULL OR length(CAST(user_id AS BLOB)) <= 512",
+            name="ck_inbox_items_user_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "dedupe_key IS NULL OR length(CAST(dedupe_key AS BLOB)) <= 512",
+            name="ck_inbox_items_dedupe_key_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "content IS NULL OR length(CAST(content AS BLOB)) <= 16383",
+            name="ck_inbox_items_content_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "resolution IS NULL OR length(CAST(resolution AS BLOB)) <= 16383",
+            name="ck_inbox_items_resolution_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "workspace_id IS NULL OR typeof(workspace_id) = 'integer'",
+            name="ck_inbox_items_workspace_id_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "created_at IS NULL OR typeof(created_at) = 'integer'",
+            name="ck_inbox_items_created_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "resolved_at IS NULL OR typeof(resolved_at) = 'integer'",
+            name="ck_inbox_items_resolved_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "expires_at IS NULL OR typeof(expires_at) = 'integer'",
+            name="ck_inbox_items_expires_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "length(CAST(id AS BLOB)) = 16",
+            name="ck_inbox_items_id_uuid",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "length(CAST(source_session_id AS BLOB)) = 16",
+            name="ck_inbox_items_source_session_id_uuid",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "length(CAST(agent_id AS BLOB)) = 16",
+            name="ck_inbox_items_agent_id_uuid",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # Newest-first list of all of an owner's items.
+        Index("ix_inbox_items_user_created", "workspace_id", "user_id", "created_at", "id"),
+        # Newest-first list and bounded count of an owner's items in one status.
+        Index(
+            "ix_inbox_items_user_status_created",
+            "workspace_id",
+            "user_id",
+            "status",
+            "created_at",
+            "id",
+        ),
+        # Bounded count of the items one session posted, for the per-session cap.
+        Index("ix_inbox_items_session", "workspace_id", "user_id", "source_session_id", "id"),
+        Index(
+            "uq_inbox_items_user_dedupe_key",
+            "workspace_id",
+            "user_id",
+            "dedupe_key",
+            unique=True,
+        ),
+    )
+
+
+class SqlScheduledTaskShare(OmnigentBase):
+    """
+    SQLAlchemy model for the ``scheduled_task_shares`` table.
+
+    One row per user or group an automation is shared with. Each run grants its
+    session to these recipients, and they may also view the automation itself
+    (read-only). These rows are not session grants; those stay in
+    ``session_permissions``. Public shares (``__public__``) are never stored; the
+    application enforces that.
+
+    :param scheduled_task_id: The automation this share belongs to (relates to
+        ``scheduled_tasks.id``). Rows are deleted with their task by the
+        application; there is no DB foreign key (schema Rule R032).
+    :param user_id: The grantee, a user or group ID, e.g. ``"alice@example.com"``.
+        String(128) matches ``session_permissions.user_id``.
+    :param level: The permission level granted on each run's session. No CHECK
+        constraint: the permission store owns the set of valid levels.
+    """
+
+    __tablename__ = "scheduled_task_shares"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    # No database default; the ORM always supplies it.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        default=current_workspace_id,
+    )
+    scheduled_task_id: Mapped[str] = mapped_column(Uuid16, primary_key=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True, nullable=False)
+    # Permission level code, stored as a small integer like scheduled_task_runs.status.
+    level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+
+    __table_args__ = (
+        # SQLite and D1 ignore VARCHAR lengths: 128 characters at up to four bytes each.
+        CheckConstraint(
+            "length(CAST(user_id AS BLOB)) <= 512",
+            name="ck_scheduled_task_shares_user_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # SQLite and D1 store any value in an integer column.
+        CheckConstraint(
+            "typeof(workspace_id) = 'integer'",
+            name="ck_scheduled_task_shares_workspace_id_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(level) = 'integer'",
+            name="ck_scheduled_task_shares_level_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # Looks up the automations shared with one user; the primary key already
+        # covers the remaining columns.
+        Index(
+            "ix_scheduled_task_shares_user_id",
+            "workspace_id",
+            "user_id",
+            "scheduled_task_id",
         ),
     )

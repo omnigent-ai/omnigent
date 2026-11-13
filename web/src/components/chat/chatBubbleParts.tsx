@@ -8,26 +8,30 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useLayoutEffect,
   useRef,
   useState,
+  type MouseEvent as ReactMouseEvent,
 } from "react";
 import {
   ArrowUpIcon,
   CheckIcon,
-  ClockIcon,
+  ChevronRightIcon,
+  ChevronUpIcon,
   CopyIcon,
+  CornerDownRightIcon,
   FileTextIcon,
-  FolderIcon,
-  ImageIcon,
   Link2Icon,
   Loader2Icon,
+  PencilIcon,
   SplitIcon,
   XIcon,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { askUserQuestionPayloadOf } from "@/lib/askUserQuestion";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import {
   Message,
@@ -37,6 +41,9 @@ import {
   type MessageResponseProps,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
+import { renderLocalReviewComment } from "./LocalReviewCommentPreview";
+import { omitIncompleteLocalReviewComment } from "@/lib/localReviewComments";
+import { SessionMentionPill } from "@/components/blocks/ChatMarkdown";
 import {
   BlockRenderer,
   FilePathAwareMessageResponse,
@@ -50,25 +57,35 @@ import {
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
-import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import {
+  isSystemUserContent,
+  parseSystemMessage,
+  stripAutomationContext,
+} from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
+import { RunningDot } from "@/components/RunningDot";
 import { cn } from "@/lib/utils";
-import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
+import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
+import { mentionPillMarkdown } from "@/lib/mentionPills";
+import { splitSessionMessageOrigin, type SessionMessageOrigin } from "@/lib/sessionMessageOrigin";
+import { useSessionLabel } from "@/hooks/useSessionLabel";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
   hasPendingOwnElicitation,
   imagePreview,
+  isPendingBlockingElicitation,
   isTextBlock,
   keyedAttachments,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { getCurrentAuthorId, getCurrentUserId } from "@/lib/identity";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
-import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
+import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
@@ -81,23 +98,22 @@ import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
-import { InlineImage, SessionImage } from "@/components/SessionImage";
+import { ImageAttachmentPlaceholder, InlineImage, SessionImage } from "@/components/SessionImage";
+import { UndeliveredMessageNotice } from "@/components/chat/UndeliveredMessageNotice";
+import { EditSentMessageContext } from "@/components/chat/editSentMessage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
+import { codexAsyncQuestionReplyText } from "@/lib/codexAsyncQuestionReply";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
-import type { SessionStatus } from "@/lib/types";
+import { usePeerSessionMessageDisplay } from "@/lib/peerSessionMessagePreferences";
+import type { BackgroundTaskInfo, PendingInput, SessionStatus } from "@/lib/types";
 import {
   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
   type TranscriptScrollbarDragDetail,
 } from "@/pages/TranscriptScrollbar";
-
-// Matches both wordings the native executors emit: "[Attached: <path>]"
-// (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
-// is the path. Global so all markers in a message are found / stripped.
-const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\][ \t]*(?:\r?\n)*/g;
 
 const COLLAPSE_THRESHOLD = 12000;
 
@@ -110,55 +126,106 @@ function sliceByCodePoint(str: string, limit: number): string {
 // value and UserBubble reads it, so the gate lives in one place.
 export const SessionSharedContext = createContext(false);
 
+/** A user message's raw text, minus runtime context and any sender prefix. */
+function userMessageBody(content: MessageContentBlock[]): string {
+  const text = stripAutomationContext(joinTextBlocks(content));
+  return codexAsyncQuestionReplyText(splitSessionMessageOrigin(text)?.body ?? text);
+}
+
+/** The sending session of a user message another session sent, or null. */
+export function userMessageOrigin(content: MessageContentBlock[]): SessionMessageOrigin | null {
+  return splitSessionMessageOrigin(stripAutomationContext(joinTextBlocks(content)));
+}
+
+/** A user message's text for reading and copying: mention markers become ``@name``. */
 export function extractUserText(content: MessageContentBlock[]): string {
+  return readableSentText(userMessageBody(content)).trimEnd();
+}
+
+/** A user message's text for rendering: mention markers become inline pills. */
+function userMarkdownText(content: MessageContentBlock[]): string {
+  return replaceSentMentions(userMessageBody(content), mentionPillMarkdown).trimEnd();
+}
+
+/** "From @<sender>" above a message another session sent with ``sys_session_message``. */
+function SessionMessageOriginLine({
+  sourceId,
+  currentSessionId,
+  className,
+}: {
+  sourceId: string;
+  currentSessionId: string | null;
+  className?: string;
+}) {
+  const label = useSessionLabel(sourceId, currentSessionId);
+  return (
+    <div
+      data-testid="message-origin"
+      className={cn("flex shrink-0 items-center gap-1 text-xs text-muted-foreground", className)}
+    >
+      <CornerDownRightIcon className="size-3 shrink-0" />
+      <span>From</span>
+      {label ? (
+        <SessionMentionPill id={sourceId} isSubagent={label.isSubagent}>
+          @{label.title}
+        </SessionMentionPill>
+      ) : (
+        <span>another session</span>
+      )}
+    </div>
+  );
+}
+
+/** A collapsed message from another session: its sender and first line, expandable. */
+function CollapsedSessionMessage({
+  bubble,
+  origin,
+  text,
+  currentSessionId,
+  onExpand,
+}: {
+  bubble: Extract<Bubble, { kind: "user" }>;
+  origin: SessionMessageOrigin;
+  text: string;
+  currentSessionId: string | null;
+  onExpand: () => void;
+}) {
+  const preview = text.split("\n").find((line) => line.trim().length > 0) ?? "";
+  return (
+    <Message
+      from="user"
+      data-testid="message-bubble"
+      data-role="user"
+      data-user-message-id={bubble.itemId}
+      data-message-id={bubble.itemId}
+      className="max-w-[640px]"
+    >
+      <div
+        data-testid="collapsed-session-message"
+        className="ml-auto flex w-fit max-w-full items-center gap-2 rounded-lg bg-muted px-3 py-1.5"
+      >
+        <SessionMessageOriginLine sourceId={origin.sourceId} currentSessionId={currentSessionId} />
+        <button
+          type="button"
+          onClick={onExpand}
+          aria-expanded={false}
+          aria-label="Show message"
+          data-testid="expand-session-message"
+          className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <span className="min-w-0 truncate">{preview}</span>
+          <ChevronRightIcon className="size-3 shrink-0" />
+        </button>
+      </div>
+    </Message>
+  );
+}
+
+function joinTextBlocks(content: MessageContentBlock[]): string {
   return content
     .filter(isTextBlock)
     .map((c) => c.text)
-    .join("")
-    .replace(ATTACHED_RE, "")
-    .trimEnd();
-}
-
-// An absolute filesystem path in any form a native executor might materialize
-// an upload to: POSIX ("/…"), Windows drive ("C:\…" or "C:/…"), or UNC
-// ("\\host\share"). Workspace "@"-mention paths are always relative, so this
-// reliably tells a materialized upload apart from a tagged workspace file
-// regardless of the host OS the runner happens to be on.
-function isAbsolutePath(p: string): boolean {
-  return /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
-}
-
-/**
- * Pull the paths out of the "[Attached: …]" markers an "@"-mention adds to a
- * user message, so the bubble can show what was attached (the marker text
- * itself is stripped from the rendered text by {@link extractUserText}). A
- * trailing "/" marks a folder. Returns [] for ordinary messages.
- */
-function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
-  const text = content
-    .filter(isTextBlock)
-    .map((c) => c.text)
     .join("");
-  const out: MentionItem[] = [];
-  for (const m of text.matchAll(ATTACHED_RE)) {
-    const raw = m[1].trim();
-    if (!raw) continue;
-    // Absolute path → a materialized upload, already shown via its file block.
-    if (isAbsolutePath(raw)) continue;
-    // Split a trailing ":start-end" line span back out so the chip can show
-    // it without truncation (it's the whole point of a partial-file attach).
-    const range = /^(.*):(\d+)-(\d+)$/.exec(raw);
-    if (range) {
-      out.push({
-        path: range[1],
-        isDir: false,
-        lineRange: { start: Number(range[2]), end: Number(range[3]) },
-      });
-    } else {
-      out.push({ path: raw.replace(/\/$/, ""), isDir: raw.endsWith("/") });
-    }
-  }
-  return out;
 }
 
 /** Joins all `kind: "text"` items into a single markdown string for copying. */
@@ -223,6 +290,8 @@ export function buildPendingBubbles(
       itemId: p.tempId,
       pending: true,
       ...(p.sentMidTurn ? { awaitingAgent: true } : {}),
+      ...(p.stillSending && p.posted !== true ? { stillSending: true } : {}),
+      ...(p.posted === true ? { accepted: true } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -230,6 +299,72 @@ export function buildPendingBubbles(
       ...(p.createdAtS !== undefined ? { createdAtS: p.createdAtS } : {}),
     };
   });
+}
+
+/**
+ * Build "Not delivered" user bubbles from a session's undelivered startup inputs.
+ *
+ * @param failedInputs - The snapshot's `failedInputs`, in submission order.
+ * @param selfAuthor - The viewer's attribution id, or null.
+ */
+export function buildUndeliveredBubbles(
+  failedInputs: PendingInput[],
+  selfAuthor: string | null,
+): Bubble[] {
+  return failedInputs.map((input) => {
+    const author = input.createdBy ?? selfAuthor;
+    return {
+      kind: "user",
+      itemId: input.pendingId,
+      // No transcript item exists, so there is nothing to link to.
+      pending: true,
+      undelivered: true,
+      content: input.content,
+      ...(author !== null ? { createdBy: author } : {}),
+    };
+  });
+}
+
+function isStartupFailureBubble(bubble: Bubble): boolean {
+  return (
+    bubble.kind === "assistant" &&
+    bubble.items.some((item) => item.kind === "error" && item.code === "startup_input_failed")
+  );
+}
+
+/**
+ * Place undelivered messages above the startup failure notice that explains
+ * them, or at the end of the transcript when that notice isn't loaded.
+ */
+export function placeUndeliveredBubbles(committed: Bubble[], undelivered: Bubble[]): Bubble[] {
+  if (undelivered.length === 0) return committed;
+  const notice = committed.findIndex(isStartupFailureBubble);
+  if (notice === -1) return [...committed, ...undelivered];
+  return [...committed.slice(0, notice), ...undelivered, ...committed.slice(notice)];
+}
+
+/**
+ * Add a conversation's uncommitted user messages to its committed bubbles: the
+ * undelivered startup messages, and the optimistic sends they don't replace.
+ *
+ * @param committed - Bubbles built from the transcript.
+ * @param pendingUserMessages - The conversation's optimistic sends.
+ * @param failedInputs - The snapshot's undelivered startup messages.
+ * @param selfAuthor - The viewer's attribution id, or null.
+ */
+export function withUncommittedUserBubbles(
+  committed: Bubble[],
+  pendingUserMessages: PendingUserMessage[],
+  failedInputs: PendingInput[],
+  selfAuthor: string | null,
+): Bubble[] {
+  const withUndelivered = placeUndeliveredBubbles(
+    committed,
+    buildUndeliveredBubbles(failedInputs, selfAuthor),
+  );
+  const pending = withoutFailedInputs(pendingUserMessages, failedInputs);
+  if (pending.length === 0) return withUndelivered;
+  return mergePendingBubbles(withUndelivered, buildPendingBubbles(pending, selfAuthor));
 }
 
 // A committed bubble that exists ONLY to render one or more
@@ -305,6 +440,18 @@ export function collectPendingElicitations(bubbles: Bubble[]): ElicitationItem[]
     }
   }
   return pending;
+}
+
+// Keyboard input drives the newest pending AskUserQuestion. A newer one still
+// awaiting delivery holds the keys, so older questions stay inert.
+export function keyboardActiveQuestionId(pending: ElicitationItem[]): string | null {
+  for (let index = pending.length - 1; index >= 0; index -= 1) {
+    const item = pending[index]!;
+    if (askUserQuestionPayloadOf(item) === null) continue;
+    const awaitingDelivery = item.nativeDelivery && item.nativeDelivery.state !== "ready";
+    return awaitingDelivery ? null : item.elicitationId;
+  }
+  return null;
 }
 
 // Drop the pending elicitation cards from the transcript bubbles so they
@@ -402,6 +549,30 @@ export function isBackgroundTasksOnly(
 }
 
 /**
+ * Waiting only on background agents a FINISHED claude-native turn left running.
+ * The turn is over, so this replaces the shimmer; a dialog or a new local send
+ * wins.
+ */
+export function isBackgroundAgentsOnly(
+  sessionStatus: SessionStatus,
+  agents: readonly BackgroundTaskInfo[],
+  blockedOn: string | null,
+  localSending: boolean,
+): boolean {
+  return sessionStatus === "waiting" && agents.length > 0 && !blockedOn && !localSending;
+}
+
+/**
+ * What the session still waits on, e.g. "Background agent running: Audit the
+ * auth flow", or "2 background agents running" when there are several.
+ */
+export function backgroundAgentsLabel(agents: readonly BackgroundTaskInfo[]): string {
+  if (agents.length !== 1) return `${agents.length} background agents running`;
+  const description = agents[0]?.description?.trim();
+  return description ? `Background agent running: ${description}` : "Background agent running";
+}
+
+/**
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
  * a local send in flight.
  */
@@ -415,9 +586,9 @@ function useAgentTurnActive(): boolean {
   return computeIsTurnActive(sessionStatus, localSending);
 }
 
-/** Whether any elicitation card is still awaiting the user's answer. */
+/** Whether any elicitation card still parks the turn on the user's answer. */
 function hasPendingElicitationBlock(blocks: readonly AnyBlock[]): boolean {
-  return blocks.some((b) => b.type === "elicitation" && b.status === "pending");
+  return blocks.some(isPendingBlockingElicitation);
 }
 
 /**
@@ -439,6 +610,11 @@ export function workingIndicatorLabel(
     if (blockedOn === "dialog open") {
       return "Waiting on a dialog in the terminal. Open the terminal tab to respond.";
     }
+    if (blockedOn === TERMINAL_PROMPT_BLOCKED_ON) {
+      // Inferred from the terminal's screen, so the hint stays tentative.
+      const hint = "Something in the agent's terminal may need your input.";
+      return terminalView ? `${hint} Open the Terminal view to check.` : hint;
+    }
     if (answerableInChat) return `Blocked on: ${blockedOn}`;
     const waiting =
       blockedOn === "permission prompt"
@@ -453,6 +629,9 @@ export function WorkingIndicator() {
   const scopedConversationId = useContext(ConversationScopeContext);
   const scopedState = useConversationEntryState(scopedConversationId);
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
+  const rootBackgroundAgents = useChatStore((s) => s.backgroundAgents);
+  const rootSessionStatus = useChatStore((s) => s.sessionStatus);
+  const rootLocalSending = useChatStore((s) => s.status === "streaming");
   const rootBlockedOn = useChatStore((s) => s.blockedOn);
   const rootHasOwnPendingElicitation = useChatStore((s) =>
     hasPendingOwnElicitation(s.blocks, s.conversationId),
@@ -468,10 +647,58 @@ export function WorkingIndicator() {
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
   const tick = useWorkingLabelTick();
-  // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
-  // the state and the shimmer stays off (it would misread as the agent still
-  // thinking). While the turn is active the shimmer shows, with the pill beside it.
-  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
+  const backgroundAgents = scopedConversationId
+    ? scopedState.backgroundAgents
+    : rootBackgroundAgents;
+  const waitsOnBackgroundAgents = isBackgroundAgentsOnly(
+    scopedConversationId ? scopedState.sessionStatus : rootSessionStatus,
+    backgroundAgents,
+    blockedOn,
+    scopedConversationId ? scopedState.status === "streaming" : rootLocalSending,
+  );
+  if (waitsOnBackgroundAgents) {
+    // The turn ended and the composer is free, but the session isn't idle:
+    // name the agent it still waits on rather than shimmering "Working…".
+    const label = backgroundAgentsLabel(backgroundAgents);
+    return (
+      <>
+        <span role="status" aria-live="polite" className="sr-only">
+          {label}
+        </span>
+        <Message from="assistant" data-testid="background-agents-indicator" aria-hidden="true">
+          <MessageContent>
+            <div className="flex min-w-0 items-center gap-1.5 py-0.5 text-muted-foreground">
+              <RunningDot className="size-3.5 shrink-0" />
+              <span className="truncate text-sm font-mono">{label}</span>
+            </div>
+          </MessageContent>
+        </Message>
+      </>
+    );
+  }
+  // Background shells outliving a finished turn keep the session in progress,
+  // but the agent isn't thinking: show a plain spinner instead of the shimmer.
+  // The main composer's pill announces the count; side chats have no pill.
+  if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) {
+    const label = `${bgCount} background task${bgCount === 1 ? "" : "s"} running`;
+    return (
+      <>
+        {scopedConversationId && (
+          <span role="status" aria-live="polite" className="sr-only">
+            {label}
+          </span>
+        )}
+        <Message from="assistant" data-testid="background-tasks-indicator" aria-hidden="true">
+          <MessageContent>
+            <div className="flex items-center gap-1.5 py-0.5 text-muted-foreground">
+              <RunningDot className="size-3.5" />
+              <span className="text-sm font-mono">{label}</span>
+            </div>
+          </MessageContent>
+        </Message>
+      </>
+    );
+  }
   const label = workingIndicatorLabel(tick, blockedOn, {
     answerableInChat: hasOwnPendingElicitation,
     // The toggle switches to the root session's terminal, not a side chat's.
@@ -488,13 +715,62 @@ export function WorkingIndicator() {
         <MessageContent>
           <div className="flex items-center gap-1.5 py-0.5">
             <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
-            <Shimmer className="text-sm font-mono" duration={1.5}>
+            <Shimmer className="text-sm" duration={1.5}>
               {label}
             </Shimmer>
           </div>
         </MessageContent>
       </Message>
     </>
+  );
+}
+
+// Timed like the sidebar's "Show more" and the file tree's rows.
+const WORKING_ROW_CLOSE: KeyframeAnimationOptions = {
+  duration: 180,
+  easing: "cubic-bezier(0.4, 0, 0.2, 1)",
+  fill: "forwards",
+};
+
+/**
+ * The Working row, kept while it eases closed after the turn ends, so a
+ * transcript scrolled to its end doesn't drop by the row's height in one frame.
+ */
+export function WorkingIndicatorRow({ show }: { show: boolean }) {
+  const rowRef = useRef<HTMLDivElement>(null);
+  const [shown, setShown] = useState(show);
+  const [closing, setClosing] = useState(false);
+  if (shown !== show) {
+    setShown(show);
+    setClosing(!show);
+  }
+  useLayoutEffect(() => {
+    const row = rowRef.current;
+    if (!closing || !row) return;
+    if (
+      typeof row.animate !== "function" ||
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    ) {
+      setClosing(false);
+      return;
+    }
+    // Close the column's gap above the row along with the row itself.
+    const gap = Number.parseFloat(getComputedStyle(row.parentElement ?? row).rowGap) || 0;
+    const animation = row.animate(
+      [
+        { height: `${row.offsetHeight}px`, marginTop: "0px", opacity: 1, overflow: "hidden" },
+        { height: "0px", marginTop: `${-gap}px`, opacity: 0, overflow: "hidden" },
+      ],
+      WORKING_ROW_CLOSE,
+    );
+    animation.onfinish = () => setClosing(false);
+    return () => animation.cancel();
+  }, [closing]);
+  if (!shown && !closing) return null;
+  return (
+    <div ref={rowRef} aria-hidden={closing || undefined}>
+      <WorkingIndicator />
+    </div>
   );
 }
 
@@ -542,7 +818,7 @@ function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
   return (
     <Message from="assistant" data-testid="compacting-indicator">
       <MessageContent>
-        <div className="flex items-center gap-2 text-sm font-mono">
+        <div className="flex items-center gap-2 text-sm">
           <Shimmer as="span" duration={1.5}>
             Compacting conversation…
           </Shimmer>
@@ -738,12 +1014,51 @@ function useCopyMessageLink(messageId: string | null): {
   return { isLinkCopied, handleCopyLink };
 }
 
+function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesktop = false) {
+  const isMobile = useIsMobileViewport();
+  const actionsId = useId();
+  const [actionsRevealed, setActionsRevealed] = useState<boolean | null>(null);
+  const actionsVisible = isMobile ? (actionsRevealed ?? persistentOnMobile) : persistentOnDesktop;
+  const toggleVisibility = () => setActionsRevealed((visible) => !(visible ?? persistentOnMobile));
+
+  return {
+    actionsId,
+    visibilityToggle: isMobile ? (
+      <button
+        type="button"
+        aria-controls={actionsId}
+        aria-expanded={actionsVisible}
+        onClick={toggleVisibility}
+        className="sr-only focus:not-sr-only focus:rounded focus:p-1 focus:outline-2 focus:outline-ring"
+      >
+        {actionsVisible ? "Hide message actions" : "Show message actions"}
+      </button>
+    ) : null,
+    toggleActions: isMobile
+      ? (event: ReactMouseEvent<HTMLDivElement>) => {
+          if (
+            event.target instanceof Element &&
+            event.target.closest("a, button, input, textarea, select, [role=button]")
+          )
+            return;
+          toggleVisibility();
+        }
+      : undefined,
+    visibilityClassName: actionsVisible
+      ? "opacity-100"
+      : isMobile
+        ? "invisible opacity-0"
+        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
+  };
+}
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
   // the main conversation the root store projects.
   const sessionId = useScopedConversationId();
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
+  const editSentMessage = useContext(EditSentMessageContext);
   // - input_image: `imagePreview` picks the variant — an uploaded file, an
   //   imported inline data URI, an in-flight upload chip, or a placeholder
   //   for a block carrying neither.
@@ -751,34 +1066,61 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   //   previewed inline).
   const isShellCommand = bubble.shellCommand !== undefined;
   const text = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
+  const origin = isShellCommand ? null : userMessageOrigin(bubble.content);
+  const collapsesOrigin = usePeerSessionMessageDisplay() === "collapse" && origin !== null;
+  const [originExpanded, setOriginExpanded] = useState(false);
   const images = bubble.content.filter((c): c is ImageContentBlock => c.type === "input_image");
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
   );
-  // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
-  // markers (no input_file block), so surface them as chips.
-  const mentionedChips = isShellCommand ? [] : extractAttachedPaths(bubble.content);
+  // "@"-tagged files and sessions ride in as text markers; render them as
+  // inline pills where they sit in the sentence.
+  const renderedText = isShellCommand ? text : userMarkdownText(bubble.content);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
   const ts = formatBubbleTimestamp(bubble.createdAtS);
+  const awaitingAgent = Boolean(bubble.pending && bubble.awaitingAgent);
+  const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
+    useMessageActionVisibility(awaitingAgent, awaitingAgent && !text);
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
     bubble.pending ? null : bubble.itemId,
   );
   // Collapse long prompts by default to avoid expensive Markdown parsing and
   // a large DOM for text the user hasn't asked to read yet.
-  const isLong = text.length > COLLAPSE_THRESHOLD;
+  const isLong = renderedText.length > COLLAPSE_THRESHOLD;
   const [isCollapsed, setIsCollapsed] = useState(isLong);
-  const visibleText = isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text;
+  const visibleText = isCollapsed
+    ? omitIncompleteLocalReviewComment(sliceByCodePoint(renderedText, COLLAPSE_THRESHOLD))
+    : renderedText;
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
-  if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
+  // Another session's message is never one: it keeps its sender attribution.
+  if (!origin && images.length === 0 && fileChips.length === 0) {
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
+  }
+  if (origin && collapsesOrigin && !originExpanded) {
+    return (
+      <CollapsedSessionMessage
+        bubble={bubble}
+        origin={origin}
+        text={text}
+        currentSessionId={sessionId ?? null}
+        onExpand={() => setOriginExpanded(true)}
+      />
+    );
   }
   // Badge OTHER contributors' messages only (never your own).
   const author = bubble.createdBy;
   const showAuthorBadge = shouldShowAuthorBadge(author, getCurrentAuthorId(), isSessionShared);
+  // Edit copies the text of a message you sent, shared session or not; single-user
+  // messages carry no author. A pending message counts once the server has it.
+  const canEdit =
+    editSentMessage !== null &&
+    (!bubble.pending || bubble.accepted === true) &&
+    (author === undefined || author === getCurrentUserId()) &&
+    text.trim().length > 0;
 
   return (
     <Message
@@ -788,11 +1130,11 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-user-message-id={bubble.itemId}
       data-message-id={bubble.itemId}
       className={cn("max-w-[640px]", bubble.pending && "animate-user-message-enter")}
+      onClick={toggleActions}
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
-        {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
-            immediately left of the right-aligned bubble. */}
-        <div className="flex w-fit max-w-full items-center gap-1.5">
+        {/* Keep the avatar beside the attachments and text as one aligned message. */}
+        <div className="flex w-fit max-w-full items-end gap-1.5">
           {showAuthorBadge && author && (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -813,20 +1155,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               <TooltipContent>{author}</TooltipContent>
             </Tooltip>
           )}
-          <MessageContent
-            className={flashing ? "animate-message-highlight" : undefined}
-            // Another contributor's bubble takes their avatar color at low
-            // alpha instead of the default bg-muted.
-            style={
-              showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
-            }
-          >
-            {/* Inline image previews. Wrap rather than scroll horizontally:
-                a landscape image fills the bubble width, so a second one in a
-                non-wrapping strip would sit off-screen in the overflow and
-                look like it never rendered. */}
+          <div className="flex min-w-0 max-w-full flex-col items-end gap-1.5">
             {images.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap items-start gap-2">
+              <div
+                data-testid="user-image-attachments"
+                className={cn(
+                  "flex max-w-full flex-wrap justify-end gap-1.5",
+                  flashing && "animate-message-highlight rounded-lg",
+                )}
+              >
                 {keyedAttachments(
                   images,
                   (img) => img.file_id ?? img.image_url ?? img.filename,
@@ -842,7 +1179,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                             : undefined
                         }
                         alt={preview.alt}
-                        className="rounded-md object-contain"
+                        variant="userAttachment"
                       />
                     );
                   }
@@ -852,127 +1189,178 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                         key={key}
                         src={preview.src}
                         alt={preview.alt}
-                        className="rounded-md object-contain"
+                        variant="userAttachment"
                       />
                     );
                   }
-                  // In-flight upload, or a block with nothing renderable on it.
-                  return <AttachmentChip key={key} icon={ImageIcon} label={preview.label} />;
+                  return (
+                    <ImageAttachmentPlaceholder
+                      key={key}
+                      label={preview.label}
+                      pending={preview.kind === "pending"}
+                    />
+                  );
                 })}
               </div>
             )}
-            {/* Non-image file chips */}
-            {fileChips.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap gap-1.5">
-                {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
-                  ({ key, item: att }) => (
-                    <AttachmentChip key={key} icon={FileTextIcon} label={attachmentLabel(att)} />
-                  ),
+            {(text || fileChips.length > 0) && (
+              <MessageContent
+                data-testid="user-message-content"
+                className={flashing ? "animate-message-highlight" : undefined}
+                // Another contributor's bubble takes their avatar color at low
+                // alpha instead of the default bg-muted.
+                style={
+                  showAuthorBadge && author ? { backgroundColor: userColorTint(author) } : undefined
+                }
+              >
+                {origin && (
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <SessionMessageOriginLine
+                      sourceId={origin.sourceId}
+                      currentSessionId={sessionId ?? null}
+                    />
+                    {collapsesOrigin && (
+                      <button
+                        type="button"
+                        onClick={() => setOriginExpanded(false)}
+                        aria-expanded
+                        aria-label="Collapse message"
+                        data-testid="collapse-session-message"
+                        className="text-muted-foreground transition-colors hover:text-foreground"
+                      >
+                        <ChevronUpIcon className="size-3" />
+                      </button>
+                    )}
+                  </div>
                 )}
-              </div>
-            )}
-            {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
-            {mentionedChips.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap gap-1.5">
-                {mentionedChips.map((item) => (
-                  <span
-                    key={mentionItemPath(item)}
-                    className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                  >
-                    {item.isDir ? (
-                      <FolderIcon className="size-3 shrink-0" />
-                    ) : (
-                      <FileTextIcon className="size-3 shrink-0" />
+                {/* Non-image file chips */}
+                {fileChips.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {keyedAttachments(fileChips, (att) => att.file_id ?? att.filename).map(
+                      ({ key, item: att }) => (
+                        <AttachmentChip
+                          key={key}
+                          icon={FileTextIcon}
+                          label={attachmentLabel(att)}
+                        />
+                      ),
                     )}
-                    <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
-                      @{item.path}
-                      {item.isDir ? "/" : ""}
-                    </span>
-                    {item.lineRange && (
-                      <span className="shrink-0">
-                        :{item.lineRange.start}-{item.lineRange.end}
-                      </span>
-                    )}
-                  </span>
-                ))}
-              </div>
-            )}
-            {/* Render user text as markdown, matching the assistant bubble.
+                  </div>
+                )}
+                {/* Render user text as markdown, matching the assistant bubble.
               `breaks` keeps single newlines as line breaks. Empty text renders
               nothing rather than an empty markdown block.
               For long prompts, only the visible slice is passed to the renderer
               so the Markdown parser never processes hidden text. */}
-            {text && (
-              <>
-                <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
-                  {isShellCommand ? (
-                    <pre className="whitespace-pre-wrap break-words font-mono text-sm">
-                      <code>{visibleText}</code>
-                    </pre>
-                  ) : (
-                    <FilePathAwareMessageResponse
-                      breaks
-                      mode="static"
-                      remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-                    >
-                      {visibleText}
-                    </FilePathAwareMessageResponse>
-                  )}
-                  {/* Gradient fade at the bottom of collapsed prompts to signal
+                {text && (
+                  <>
+                    <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
+                      {isShellCommand ? (
+                        <pre className="whitespace-pre-wrap break-words font-mono text-sm">
+                          <code>{visibleText}</code>
+                        </pre>
+                      ) : (
+                        <FilePathAwareMessageResponse
+                          className="text-message"
+                          breaks
+                          mode="static"
+                          remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                          renderLocalReviewComment={renderLocalReviewComment}
+                        >
+                          {visibleText}
+                        </FilePathAwareMessageResponse>
+                      )}
+                      {/* Gradient fade at the bottom of collapsed prompts to signal
                       there is more content below. */}
-                  {isCollapsed && isLong && (
-                    <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-muted to-transparent" />
-                  )}
-                </div>
-                {isLong && (
-                  <button
-                    type="button"
-                    onClick={() => setIsCollapsed((c) => !c)}
-                    className="mt-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    {isCollapsed
-                      ? `Show full prompt (${text.length.toLocaleString()} chars)`
-                      : "Collapse prompt"}
-                  </button>
+                      {isCollapsed && isLong && (
+                        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-muted to-transparent" />
+                      )}
+                    </div>
+                    {isLong && (
+                      <button
+                        type="button"
+                        onClick={() => setIsCollapsed((c) => !c)}
+                        className="mt-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                      >
+                        {isCollapsed
+                          ? `Show full prompt (${text.length.toLocaleString()} chars)`
+                          : "Collapse prompt"}
+                      </button>
+                    )}
+                  </>
                 )}
-              </>
+              </MessageContent>
             )}
-          </MessageContent>
+          </div>
         </div>
-        {/* Always visible: a mid-turn message can wait minutes behind a long tool call. */}
-        {bubble.pending && bubble.awaitingAgent && (
+        {bubble.undelivered && (
+          <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
+        )}
+        {bubble.pending && bubble.stillSending && (
           <div
             className="flex items-center gap-1 pt-1 text-[11px] leading-4 text-muted-foreground"
-            data-testid="message-awaiting-agent"
+            data-testid="message-still-sending"
           >
-            <ClockIcon size={12} aria-hidden />
-            The agent will read this after its current step
+            <Loader2Icon size={12} className="animate-spin" aria-hidden />
+            Still sending…
           </div>
         )}
-        {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
-        <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+        {visibilityToggle}
+        <div
+          id={actionsId}
+          className={cn(
+            "flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0",
+            visibilityClassName,
+          )}
+        >
+          {awaitingAgent && (
+            <span
+              className="min-w-0 truncate text-sm leading-4 text-muted-foreground"
+              data-testid="message-awaiting-agent"
+              title="The agent will read this after its current step"
+            >
+              The agent will read this after its current step
+            </span>
+          )}
           {ts && (
             <span
-              className="select-none text-[11px] leading-4 text-foreground/56"
+              className="shrink-0 select-none whitespace-nowrap text-sm leading-4 text-foreground/56"
               data-testid="message-timestamp"
             >
               {ts}
             </span>
           )}
-          <MessageActions>
+          <MessageActions className="shrink-0">
             {text && (
               <MessageAction
                 tooltip="Copy"
                 size="icon-xxs"
+                className="[@media(pointer:coarse)]:size-8"
                 onClick={handleCopy}
                 componentId="chat.message.copy_user"
               >
                 {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
               </MessageAction>
             )}
+            {canEdit && (
+              <MessageAction
+                tooltip="Edit and resend"
+                size="icon-xxs"
+                className="[@media(pointer:coarse)]:size-8"
+                onClick={() =>
+                  editSentMessage({
+                    text: isShellCommand ? text : userMessageBody(bubble.content),
+                  })
+                }
+                componentId="chat.message.edit_user"
+              >
+                <PencilIcon size={14} />
+              </MessageAction>
+            )}
             <MessageAction
               tooltip={isLinkCopied ? "Copied!" : "Copy link"}
               size="icon-xxs"
+              className="[@media(pointer:coarse)]:size-8"
               data-testid="copy-message-link"
               disabled={bubble.pending}
               onClick={handleCopyLink}
@@ -999,6 +1387,8 @@ function AssistantBubble({
   actionsPersistent?: boolean;
   recoveryDisabled?: boolean;
 }) {
+  const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
+    useMessageActionVisibility(isLastAssistant, actionsPersistent);
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
   // is rendered at the page level, not inside this component.
@@ -1014,7 +1404,7 @@ function AssistantBubble({
   const rootSessionStatus = useChatStore((s) => s.sessionStatus);
   const rootHasPendingElicitation = useChatStore((s) => hasPendingElicitationBlock(s.blocks));
   const sessionStatus = scopedConversationId ? scopedState.sessionStatus : rootSessionStatus;
-  // A pending elicitation means the turn is parked awaiting the user — still in
+  // A pending blocking elicitation means the turn is parked awaiting the user — still in
   // flight even when its lifecycle or the session status reads settled.
   const hasPendingElicitation = scopedConversationId
     ? hasPendingElicitationBlock(scopedState.blocks)
@@ -1052,7 +1442,7 @@ function AssistantBubble({
           current.sessionStatus === "running" ||
           current.sessionStatus === "waiting" ||
           current.pendingUserMessages.length > 0 ||
-          current.blocks.some((block) => block.type === "elicitation" && block.status === "pending")
+          current.blocks.some(isPendingBlockingElicitation)
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
@@ -1114,6 +1504,21 @@ function AssistantBubble({
   const hasSubagentNotice = bubble.items.some((it) => it.kind === "subagent_activity");
   // Shrink-wrapped to a short reply, tool rows would cut their titles off mid-column.
   const hasToolRows = bubble.items.some((it) => it.kind === "tool" || it.kind === "native_tool");
+  // Keep a simple trailing notice after the footer so it ends the visible row.
+  const detachTrailingNotices =
+    !foldOnly &&
+    bubble.lifecycle !== "cancelled" &&
+    !!markdownText &&
+    bubble.items.at(-1)?.kind === "subagent_activity" &&
+    bubble.items.every((item) => item.kind === "text" || item.kind === "subagent_activity");
+  const trailingNoticeStart = detachTrailingNotices
+    ? bubble.items.findLastIndex((item) => item.kind === "text") + 1
+    : bubble.items.length;
+  const mainItems =
+    trailingNoticeStart === bubble.items.length
+      ? bubble.items
+      : bubble.items.slice(0, trailingNoticeStart);
+  const trailingNotices = bubble.items.slice(trailingNoticeStart);
 
   return (
     <>
@@ -1123,17 +1528,23 @@ function AssistantBubble({
         data-role={errorNotice ? "error" : "assistant"}
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
-        className={spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]"}
+        onClick={toggleActions}
+        className={cn(
+          "mobile-app:gap-0",
+          spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]",
+        )}
       >
         {/* Fold-only rows and notices fill the prose width so their hairlines stay visible. */}
         <MessageContent
           className={cn(
+            // The final code card has its own margin inside the custom pre wrapper.
+            "mobile-app:[&_.message-markdown>.chat-code-block:last-child>[data-streamdown=code-block]]:mb-0",
             (spansFullColumn || foldOnly || hasSubagentNotice || hasToolRows) && "w-full",
             flashing && "animate-message-highlight rounded-lg",
           )}
         >
           <BlockRenderer
-            items={bubble.items}
+            items={mainItems}
             sessionStatus={sessionStatus}
             turnLifecycle={bubble.lifecycle}
             workedForS={bubble.workedForS}
@@ -1158,66 +1569,77 @@ function AssistantBubble({
         )}
         {/* Skip fold-only and error-only bubbles. Order: actions, then timestamp. */}
         {!foldOnly && !errorOnly && (
-          <div
-            className={cn(
-              "flex items-center gap-3 py-1",
-              actionsPersistent
-                ? "opacity-100"
-                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
-            )}
-          >
-            <MessageActions>
-              {markdownText && (
-                <MessageAction
-                  tooltip="Copy"
-                  size="icon-xxs"
-                  onClick={handleCopy}
-                  componentId="chat.message.copy_assistant"
-                >
-                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-                </MessageAction>
+          <>
+            {visibilityToggle}
+            <div
+              id={actionsId}
+              className={cn(
+                "flex mobile-app:flex-wrap items-center gap-3 mobile-app:py-0",
+                visibilityClassName,
               )}
-              {/* Fork from this response: clone the session with history
+            >
+              <MessageActions>
+                {markdownText && (
+                  <MessageAction
+                    tooltip="Copy"
+                    size="icon-xxs"
+                    className="[@media(pointer:coarse)]:size-8"
+                    onClick={handleCopy}
+                    componentId="chat.message.copy_assistant"
+                  >
+                    {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+                  </MessageAction>
+                )}
+                {/* Fork from this response: clone the session with history
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
-              {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-                <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
-                  <MessageAction
-                    tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}
-                    label="Fork from here"
-                    disabled={!!forkDialog.disabledReason}
-                    size="icon-xxs"
-                    data-testid="fork-from-response"
-                    onClick={() =>
-                      forkDialog.openForkDialog({
-                        sourceSessionId: scopedConversationId ?? undefined,
-                        upToResponseId: bubble.responseId,
-                      })
-                    }
-                    componentId="chat.message.fork"
-                  >
-                    <SplitIcon size={14} />
-                  </MessageAction>
-                </DisabledActionTooltip>
+                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                  <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
+                    <MessageAction
+                      tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}
+                      label="Fork from here"
+                      disabled={!!forkDialog.disabledReason}
+                      size="icon-xxs"
+                      data-testid="fork-from-response"
+                      onClick={() =>
+                        forkDialog.openForkDialog({
+                          sourceSessionId: scopedConversationId ?? undefined,
+                          upToResponseId: bubble.responseId,
+                        })
+                      }
+                      componentId="chat.message.fork"
+                    >
+                      <SplitIcon size={14} />
+                    </MessageAction>
+                  </DisabledActionTooltip>
+                )}
+                <MessageAction
+                  tooltip={isLinkCopied ? "Copied!" : "Copy link"}
+                  size="icon-xxs"
+                  data-testid="copy-message-link"
+                  onClick={handleCopyLink}
+                >
+                  {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
+                </MessageAction>
+              </MessageActions>
+              {ts && (
+                <span
+                  className="select-none text-sm leading-4 text-foreground/56"
+                  data-testid="message-timestamp"
+                >
+                  {ts}
+                </span>
               )}
-              <MessageAction
-                tooltip={isLinkCopied ? "Copied!" : "Copy link"}
-                size="icon-xxs"
-                data-testid="copy-message-link"
-                onClick={handleCopyLink}
-              >
-                {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
-              </MessageAction>
-            </MessageActions>
-            {ts && (
-              <span
-                className="select-none text-[11px] leading-4 text-foreground/56"
-                data-testid="message-timestamp"
-              >
-                {ts}
-              </span>
-            )}
-          </div>
+            </div>
+          </>
+        )}
+        {trailingNotices.map((notice, index) =>
+          notice.kind === "subagent_activity" ? (
+            <SubagentActivityMessage
+              key={notice.itemId ?? `subagent-activity-${index}`}
+              data={notice.data}
+            />
+          ) : null,
         )}
       </Message>
 
@@ -1250,35 +1672,62 @@ export function ScrollToBottomOnSend({ nonce }: { nonce: number }) {
   return null;
 }
 
-/** Keep bottom-locked readers pinned when the composer changes viewport height. */
-export function KeepBottomOnViewportResize() {
+const POINTER_STATE_EVENTS = ["pointerdown", "pointerup", "pointercancel"] as const;
+
+/** Keep bottom-locked readers pinned when the viewport or the transcript changes height. */
+export function KeepBottomOnResize() {
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef?: React.RefObject<HTMLElement>;
   };
   const scrollRef = ctx.scrollRef;
+  const contentRef = ctx.contentRef;
   const state = ctx.state;
   const scrollToBottom = ctx.scrollToBottom;
 
   useEffect(() => {
     const el = scrollRef?.current;
     if (!el || typeof ResizeObserver === "undefined") return;
-    const isPhysicallyAtBottom = () => el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
-    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isPhysicallyAtBottom();
     let clientHeight = el.clientHeight;
+    let scrollHeight = el.scrollHeight;
+    // At the end of the last observed layout or the current one: a pin's own scroll
+    // event can arrive after the next line grew the transcript, and a shrink's
+    // clamp before its resize callback.
+    const isAtEnd = () => {
+      const end = Math.min(scrollHeight - clientHeight, el.scrollHeight - el.clientHeight);
+      return end - el.scrollTop <= 1;
+    };
+    let wasBottomLocked = state.isAtBottom && !state.escapedFromLock && isAtEnd();
+    let pointerDown = false;
     let frame: number | null = null;
     const onScroll = () => {
-      wasBottomLocked = isPhysicallyAtBottom();
+      wasBottomLocked = isAtEnd();
+    };
+    const onPointer = (event: Event) => {
+      pointerDown = event.type === "pointerdown";
+    };
+    // Like the library, hold still while the reader drags a selection in the transcript.
+    const isSelecting = () => {
+      const selection = document.getSelection();
+      if (!pointerDown || !selection || selection.isCollapsed) return false;
+      const common = selection.getRangeAt(0).commonAncestorContainer;
+      return common.contains(el) || el.contains(common);
     };
     const observer = new ResizeObserver(() => {
-      const nextHeight = el.clientHeight;
-      if (nextHeight === clientHeight) return;
-      clientHeight = nextHeight;
-      if (!wasBottomLocked) return;
+      const viewportResized = el.clientHeight !== clientHeight;
+      const contentGrew = el.scrollHeight > scrollHeight;
+      clientHeight = el.clientHeight;
+      scrollHeight = el.scrollHeight;
+      // Rechecked by the follow-up frame: the reader may scroll away or start selecting first.
+      const shouldPin = () =>
+        wasBottomLocked &&
+        !isSelecting() &&
+        (viewportResized || (contentGrew && state.isAtBottom && !state.escapedFromLock));
+      if (!shouldPin()) return;
       // Gecko delivers this callback before the frame paints, but the
       // library's scrollToBottom always lands a frame later (it defers
-      // through a rAF promise), so the shrink paints with the transcript
-      // shoved up before the follow-up pin snaps it back — a visible
-      // bounce on every wrapped composer line. Pin synchronously here
+      // through a rAF promise), so the resize paints with the transcript
+      // off its end before the follow-up pin snaps it back — a visible
+      // bounce on every wrapped composer or streamed line. Pin synchronously here
       // first; the async pins below stay as a safety net for engines that
       // deliver the callback after paint. Target the library's park
       // position (one pixel short) so the settle is identical whether our
@@ -1288,18 +1737,22 @@ export function KeepBottomOnViewportResize() {
       if (frame !== null) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         frame = null;
+        if (!shouldPin()) return;
         el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - 1);
         scrollToBottom("instant");
       });
     });
     el.addEventListener("scroll", onScroll, { passive: true });
+    for (const type of POINTER_STATE_EVENTS) document.addEventListener(type, onPointer, true);
     observer.observe(el);
+    if (contentRef.current) observer.observe(contentRef.current);
     return () => {
       el.removeEventListener("scroll", onScroll);
+      for (const type of POINTER_STATE_EVENTS) document.removeEventListener(type, onPointer, true);
       observer.disconnect();
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [scrollRef, scrollToBottom, state]);
+  }, [scrollRef, contentRef, scrollToBottom, state]);
 
   return null;
 }
@@ -1951,8 +2404,10 @@ export function ConversationScrollRefBridge({
     state: ConversationScroller["state"];
     stopScroll: () => void;
   };
-  useEffect(() => {
-    // Runs after commit, when StickToBottom has populated scrollRef.current.
+  // Before paint: the virtualized transcript renders no rows until it has the
+  // scroll element, so handing it over later paints a newly opened session blank.
+  // Render this after StickToBottom.Content so its scrollRef is attached by now.
+  useLayoutEffect(() => {
     const el = ctx.scrollRef?.current ?? null;
     onScroller(el ? { el, state: ctx.state, stopScroll: ctx.stopScroll } : null);
     return () => onScroller(null);

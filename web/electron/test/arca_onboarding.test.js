@@ -25,7 +25,7 @@ function setup(child, options = {}) {
 }
 
 describe("Arca onboarding setup", () => {
-  it("uses a remote TTY and Companion browser without changing ordinary connection arguments", () => {
+  it("uses a remote TTY and the sign-in browser without changing ordinary connection arguments", () => {
     const url = "https://account.databricks.com/omnigent?o=123";
     const args = buildSetupArgs(url);
     assert.equal(args[0], "ssh");
@@ -106,6 +106,25 @@ describe("Arca onboarding setup", () => {
     });
   }
 
+  it("separates the safe browser sign-in recovery from the legacy error", async () => {
+    const child = fakeChild();
+    const run = setup(child);
+    child.stderr.emit("data", "OMNIGENT_AUTH_REQUIRED");
+    child.emit("exit", 1);
+    child.emit("close", 1);
+
+    const result = await run.promise;
+    assert.equal(
+      result.error,
+      "Arca setup didn't complete. Check Arca Companion, finish browser sign-in, and try again.",
+    );
+    assert.equal(result.errorMessage, "Arca setup didn't complete.");
+    assert.equal(
+      result.errorAction,
+      "Check Arca Companion, finish browser sign-in, and try again.",
+    );
+  });
+
   it("cancels immediately and still kills descendants after the parent closes", async () => {
     const child = fakeChild();
     const run = setup(child);
@@ -139,6 +158,11 @@ describe("Arca onboarding setup", () => {
     const run = setup(child, { timeoutMs: 5 });
     const result = await run.promise;
     assert.equal(result.errorKind, "timeout");
+    assert.equal(result.errorMessage, "Arca sign-in timed out.");
+    assert.equal(
+      result.errorAction,
+      "Check Arca Companion, finish browser sign-in, and try again.",
+    );
     assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
     child.emit("close", 0);
     assert.equal((await run.promise).ok, false);

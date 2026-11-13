@@ -16,6 +16,7 @@ import re
 import shlex
 import ssl
 import subprocess
+import sys
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -41,11 +42,14 @@ from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.native import native_terminal
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
+from omnigent.runtime import workflow
+from omnigent.runtime.prompt import WORKSPACE_IMAGE_INSTRUCTION
 from omnigent.spec import load_omnigent_yaml
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
+from tests._helpers.managed_mcp import expand_entry_value
 from tests._image_fixtures import (
     _TINY_CMYK_JPEG_BASE64,
     _TINY_GIF_BASE64,
@@ -62,7 +66,10 @@ from tests.budgets import budget
 
 
 @pytest.fixture(autouse=True)
-def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_provider_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep provider defaults independent of ambient CI context and catalog access."""
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     monkeypatch.setattr(
         "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
@@ -112,6 +119,7 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     Channels flag is not snuck in.
     """
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("API_TIMEOUT_MS", raising=False)
     bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
     body = claude_native._claude_terminal_request(
         ("--resume", "claude-session", "-p", "hi"),
@@ -127,10 +135,12 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     spec = body["spec"]
     assert spec["command"] == "claude"
     assert spec["env"] == {
+        "CLAUDE_AGENT_SDK_CLIENT_APP": "omnigent",
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_ENV_FILE": claude_native.claude_tool_env_file(),
+        "API_TIMEOUT_MS": "120000",
     }
     assert spec["os_env_type"] == "caller_process"
     # Claude Code emits long interactive transcripts; this value is
@@ -181,6 +191,8 @@ def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
 
     monkeypatch.chdir(tmp_path)
     _install_managed_mcp_config(tmp_path, monkeypatch)
+    socket_root = tmp_path / "harness-sockets"
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(socket_root))
     bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
     captured_warnings: list[str] = []
     monkeypatch.setattr(
@@ -200,6 +212,105 @@ def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
     # The runner recovers the bridge from the settings path, and hooks still load.
     assert Path(args[args.index("--settings") + 1]).parent == bridge_dir
     assert "SessionStart" in _load_invocation_settings(args)["hooks"]
+    # A static relay entry in the managed file reaches this bridge through the env.
+    relay_env = body["spec"]["env"]
+    assert relay_env[claude_native_bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV] == str(bridge_dir)
+    assert relay_env[claude_native_bridge.MANAGED_MCP_RELAY_PYTHON_ENV] == sys.executable
+    # serve-mcp keeps the operator's harness socket root once Claude expands the entry.
+    entry_env = claude_native_bridge.managed_mcp_relay_entry()["env"]
+    assert expand_entry_value(entry_env["OMNIGENT_HARNESS_TMP_PARENT"], relay_env) == str(
+        socket_root
+    )
+
+    managed_file = tmp_path / "etc-claude-code" / "managed-mcp.json"
+    managed_file.write_text(
+        json.dumps({"mcpServers": {"omnigent": claude_native_bridge.managed_mcp_relay_entry()}}),
+        encoding="utf-8",
+    )
+    captured_warnings.clear()
+    body = claude_native._claude_terminal_request((), command="claude", bridge_dir=bridge_dir)
+    assert "--mcp-config" not in body["spec"]["args"]
+    assert captured_warnings == []
+
+
+_RELAY_ARGS = [
+    "-I",
+    "-m",
+    "omnigent.harnesses.claude_native.bridge",
+    "serve-mcp",
+    "--bridge-dir",
+    "${OMNIGENT_MCP_RELAY_BRIDGE_DIR}",
+]
+
+
+@pytest.mark.parametrize(
+    ("entry", "configured"),
+    [
+        pytest.param(
+            {"command": "${OMNIGENT_MCP_RELAY_PYTHON}", "args": _RELAY_ARGS}, True, id="documented"
+        ),
+        pytest.param(
+            {
+                "command": "/usr/bin/corp-run",
+                "args": ["${OMNIGENT_MCP_RELAY_PYTHON}", *_RELAY_ARGS],
+            },
+            True,
+            id="wrapper",
+        ),
+        pytest.param(
+            {
+                "command": "/bin/sh",
+                "args": [
+                    "-c",
+                    "exec python -m x serve-mcp --bridge-dir=${OMNIGENT_MCP_RELAY_BRIDGE_DIR}",
+                ],
+            },
+            True,
+            id="shell-wrapper",
+        ),
+        pytest.param(
+            {"command": "/bin/false", "env": {"NOTE": "${OMNIGENT_MCP_RELAY_BRIDGE_DIR}"}},
+            False,
+            id="prefix-only-in-env",
+        ),
+        pytest.param(
+            {"command": "/usr/bin/other", "args": ["--dir", "${OMNIGENT_MCP_RELAY_BRIDGE_DIR}"]},
+            False,
+            id="not-the-relay",
+        ),
+        pytest.param(
+            {"url": "https://relay.example/${OMNIGENT_MCP_RELAY_BRIDGE_DIR}/serve-mcp"},
+            False,
+            id="http",
+        ),
+        pytest.param(
+            {"command": "${OMNIGENT_MCP_RELAY_PYTHON}", "args": "serve-mcp"}, False, id="bad-args"
+        ),
+    ],
+)
+def test_managed_relay_entry_must_launch_serve_mcp_for_the_session_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: dict[str, object], configured: bool
+) -> None:
+    """Only an entry whose launch reaches serve-mcp with the session's bridge dir counts,
+    so the warning and the tools prompt never rest on an entry that cannot connect."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+
+    _install_managed_mcp_config(tmp_path, monkeypatch)
+    managed_file = tmp_path / "etc-claude-code" / "managed-mcp.json"
+    managed_file.write_text(json.dumps({"mcpServers": {"omnigent": entry}}), encoding="utf-8")
+
+    assert claude_native_bridge.managed_mcp_relay_configured() is configured
+
+
+def test_documented_managed_relay_entry_matches_the_one_omnigent_reads() -> None:
+    """Operators copy the entry from the docs, so it must be the shape the relay expands."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+
+    doc = (Path(__file__).parents[3] / "docs" / "CLAUDE_MANAGED_MCP.md").read_text()
+    documented = json.loads(doc.split("```json\n", 1)[1].split("```", 1)[0])
+    assert documented == {
+        "mcpServers": {"omnigent": claude_native_bridge.managed_mcp_relay_entry()}
+    }
 
 
 def test_claude_terminal_request_loads_workspace_agents_skills(tmp_path, monkeypatch) -> None:
@@ -258,15 +369,25 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "isaac")
     monkeypatch.chdir(tmp_path)
     body = claude_native._claude_terminal_request(
-        ("--resume", "s"),
+        ("--resume", "s", "--append-system-prompt", "Review like a staff engineer."),
         command="claude",
         bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        append_system_prompt="Claude Code is running in the session terminal.",
     )
     spec = body["spec"]
     assert spec["command"] == "isaac"
     # Claude's argv is now passed through isaac after the ``--`` separator.
     assert spec["args"][0] == "--"
     assert spec["args"][1:3] == ["--resume", "s"]
+    # Omnigent's prompt joins the caller's flag, so the launch carries the caller's prompt once.
+    prompt_values = [
+        spec["args"][index + 1]
+        for index, arg in enumerate(spec["args"])
+        if arg == "--append-system-prompt"
+    ]
+    assert prompt_values == [
+        "Claude Code is running in the session terminal.\n\nReview like a staff engineer."
+    ]
     # The bridge MCP + hook injection still rides along.
     assert "--mcp-config" in spec["args"]
     assert "--settings" in spec["args"]
@@ -291,6 +412,7 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         model="databricks-claude-opus-test",
     )
 
+    monkeypatch.delenv("API_TIMEOUT_MS", raising=False)
     body = claude_native._claude_terminal_request(
         ("--print", "hi"),
         command="claude",
@@ -301,6 +423,7 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
     spec = body["spec"]
     assert spec["command"] == "env"
     assert spec["env"] == {
+        "CLAUDE_AGENT_SDK_CLIENT_APP": "omnigent",
         "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
@@ -308,6 +431,7 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_ENV_FILE": claude_native.claude_tool_env_file(),
+        "API_TIMEOUT_MS": "120000",
         "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
     }
     args = spec["args"]
@@ -457,8 +581,10 @@ def test_claude_terminal_request_preserves_user_model_arg(tmp_path, monkeypatch)
     assert args.count("--model") == 1
 
 
+@pytest.mark.parametrize("gateway", [True, False])
 def test_ucode_config_for_profile_reads_allowlisted_claude_state(
     monkeypatch: pytest.MonkeyPatch,
+    gateway: bool,
 ) -> None:
     """
     Profile-backed native Claude config reads only required ucode fields.
@@ -469,24 +595,29 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
     """
     from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
 
+    workspace_url = "https://example.cloud.databricks.com"
+    path = "/ai-gateway/anthropic" if gateway else "/serving-endpoints/anthropic"
+    base_url = workspace_url + path
     workspace_state = UcodeWorkspaceState(
-        workspace_url="https://example.databricks.com",
+        workspace_url=workspace_url,
         agents={
             "claude": UcodeAgentState(
                 model="databricks-claude-opus-test",
-                base_url="https://example.databricks.com/ai-gateway/anthropic",
+                base_url=base_url,
                 auth_command="printf token",
                 auth_refresh_interval_ms=123456,
                 env={
-                    "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+                    "ANTHROPIC_BASE_URL": base_url,
                     "ANTHROPIC_AUTH_TOKEN": "must-not-leak",
+                    "ANTHROPIC_CUSTOM_HEADERS": "User-Agent: ucode/test claude/test",
+                    "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "0",
                 },
             )
         },
     )
     monkeypatch.setattr(
         "omnigent.onboarding.databricks_config.get_workspace_url_for_profile",
-        lambda profile: "https://example.databricks.com",
+        lambda profile: workspace_url,
     )
     monkeypatch.setattr(
         "omnigent.onboarding.ucode_state.read_ucode_state",
@@ -497,13 +628,18 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
 
     assert config == claude_native.ClaudeNativeUcodeConfig(
         env={
-            "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+            "ANTHROPIC_BASE_URL": base_url,
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "123456",
             "CLAUDE_CODE_USE_GATEWAY": "1",
+            "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "1",
             "ANTHROPIC_CUSTOM_HEADERS": (
-                "x-databricks-use-coding-agent-mode: true\n"
-                "Databricks-Custom-Coding-Agent: claude-code\n"
-                "Databricks-Custom-Client-Surfaces: omnigent, ug"
+                "x-databricks-use-coding-agent-mode: true\nUser-Agent: ucode/test claude/test"
+            )
+            + (
+                "\nDatabricks-Custom-Coding-Agent: claude-code"
+                "\nDatabricks-Custom-Client-Surfaces: omnigent, ug"
+                if gateway
+                else ""
             ),
             # No CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: this path launches in
             # gateway mode (CLAUDE_CODE_USE_GATEWAY=1), where Claude Code
@@ -905,9 +1041,11 @@ def test_claude_native_static_model_options_list_nothing(
     assert claude_native.claude_native_model_options(None) == []
 
 
+@pytest.mark.parametrize("subscription_auth", [False, True])
 def test_claude_native_model_options_follow_managed_claude_catalog(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    subscription_auth: bool,
 ) -> None:
     """Managed Claude model overrides replace the generic fallback rows."""
     managed_settings = tmp_path / "managed-settings.json"
@@ -929,7 +1067,12 @@ def test_claude_native_model_options_follow_managed_claude_catalog(
         (managed_settings,),
     )
 
-    assert claude_native.claude_native_model_options(None) == [
+    config = (
+        claude_native.ClaudeNativeUcodeConfig(env={}, subscription_auth=True)
+        if subscription_auth
+        else None
+    )
+    assert claude_native.claude_native_model_options(config) == [
         {
             "id": "opus",
             "model": "system.ai.claude-opus-4-8[1m]",
@@ -6732,7 +6875,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     assert prepared.reattached is False
 
 
-def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_resolves_prompt(tmp_path: Path) -> None:
     """The ``omnigent claude`` wrapper's own materialized spec is resolvable.
 
     Its ``prompt`` field is real ``AgentSpec.instructions`` content (the
@@ -6741,16 +6884,19 @@ def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
     instructions.
     """
     spec_path = claude_native._materialize_claude_agent_spec(tmp_path)
-    result = claude_native._wrapper_spec_raw_instructions(spec_path)
+    result = claude_native._wrapper_spec_startup_instructions(spec_path)
     assert result is not None
     assert "Claude Code is running in the session terminal" in result
+    assert result.endswith(WORKSPACE_IMAGE_INSTRUCTION)
 
 
-def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
+def test_wrapper_spec_startup_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
     """A malformed wrapper spec must not block the terminal launch."""
     bad_spec = tmp_path / "bad.yaml"
     bad_spec.write_text("not: [valid, agent, spec")
-    assert claude_native._wrapper_spec_raw_instructions(bad_spec) is None
+    assert (
+        claude_native._wrapper_spec_startup_instructions(bad_spec) == WORKSPACE_IMAGE_INSTRUCTION
+    )
 
 
 @pytest.mark.asyncio
@@ -9194,11 +9340,16 @@ def test_provider_config_for_native_claude_keeps_betas_under_use_gateway(
     assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in cfg.env
 
 
+@pytest.mark.parametrize("ci", [False, True])
 def test_provider_config_for_native_claude_attributes_a_unity_gateway(
     monkeypatch: pytest.MonkeyPatch,
+    ci: bool,
 ) -> None:
     """A provider on the Unity Gateway adds attribution after the user's own headers."""
     from omnigent.onboarding.provider_config import load_providers
+
+    if ci:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"polly-review","run_id":"123"}')
 
     monkeypatch.setenv("CLAUDE_CODE_USE_GATEWAY", "1")
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Team: search")
@@ -9217,14 +9368,28 @@ def test_provider_config_for_native_claude_attributes_a_unity_gateway(
     cfg = claude_native._provider_config_for_native_claude(entry)
 
     assert cfg is not None
+    preserved_headers = ["X-Team: search"]
+    if ci:
+        preserved_headers.append(
+            'Databricks-Ai-Gateway-Request-Tags: {"pipeline":"polly-review","run_id":"123"}'
+        )
     assert cfg.env == {
         "ANTHROPIC_BASE_URL": base_url,
-        "ANTHROPIC_CUSTOM_HEADERS": (
-            "X-Team: search\n"
-            "Databricks-Custom-Coding-Agent: claude-code\n"
-            "Databricks-Custom-Client-Surfaces: omnigent"
+        "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "1",
+        "ANTHROPIC_CUSTOM_HEADERS": "\n".join(
+            [
+                *preserved_headers,
+                "Databricks-Custom-Coding-Agent: claude-code",
+                "Databricks-Custom-Client-Surfaces: omnigent",
+            ]
         ),
     }
+    terminal_env = claude_native.build_native_claude_terminal_env(cfg, client_surface="desktop")
+    assert terminal_env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+        *preserved_headers,
+        "Databricks-Custom-Coding-Agent: claude-code",
+        "Databricks-Custom-Client-Surfaces: omnigent-desktop",
+    ]
 
 
 def test_bedrock_config_for_native_claude_static_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -9303,7 +9468,7 @@ def test_bedrock_config_for_native_claude_keeps_betas_under_use_gateway(
 ) -> None:
     """A bedrock-style gateway with CLAUDE_CODE_USE_GATEWAY=1 keeps betas on.
 
-    Bedrock-compatible corporate gateways can run in gateway-aware mode; when
+    Bedrock-compatible enterprise gateways can run in gateway-aware mode; when
     CLAUDE_CODE_USE_GATEWAY=1 the beta-disable flag is skipped so MCP tool
     search stays enabled, matching the generic gateway provider path.
     """
@@ -9391,23 +9556,91 @@ def test_resolve_native_claude_config_spec_provider_default(
     assert cfg.api_key_helper == "printf %s sk-ant-default"
 
 
+@pytest.mark.parametrize("selection", ["cli-default", "spec-default", "spec-provider"])
 def test_resolve_native_claude_config_subscription_uses_cli_login(
     _isolated_provider_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selection: str,
 ) -> None:
-    """A claude subscription default → None (use the CLI's own enterprise login).
+    """A subscription launch cannot use an inherited API key instead of its login."""
+    from omnigent.spec.types import ProviderAuth
 
-    A subscription means "use whatever ~/.claude is logged into" (e.g. a
-    Claude Enterprise seat), NOT a gateway. The resolver must return None so
-    the native launch leaves Claude's own login alone — and must NOT fall
-    back to ucode.
-    """
     _seed_config(
         _isolated_provider_config,
         {"claude-subscription": {"kind": "subscription", "cli": "claude", "default": True}},
     )
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.setenv(name, "inherited-test-credential")
+    for name in ("ANTHROPIC_BASE_URL", *claude_native._CLAUDE_TRANSPORT_FLAGS):
+        monkeypatch.delenv(name, raising=False)
+    spec = None if selection == "cli-default" else _no_auth_claude_spec()
+    if selection == "spec-provider":
+        spec.executor.auth = ProviderAuth(name="claude-subscription")
+    config = claude_native.resolve_native_claude_config(spec=spec)
+    script = _isolated_provider_config / "credentials.py"
+    script.write_text(
+        "import json, os\n"
+        "print(json.dumps(sorted(name for name in "
+        "('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN') "
+        "if name in os.environ)))\n"
+    )
+    body = claude_native._claude_terminal_request(
+        (str(script),),
+        command=sys.executable,
+        bridge_dir=_test_bridge_dir(_isolated_provider_config, monkeypatch),
+        claude_config=config,
+    )
+    terminal = body["spec"]
+    result = subprocess.run(
+        [terminal["command"], *terminal["args"]],
+        env={**os.environ, **terminal["env"]},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
 
-    cfg = claude_native.resolve_native_claude_config(spec=_no_auth_claude_spec())
-    assert cfg is None
+    assert json.loads(result.stdout) == ["CLAUDE_CODE_OAUTH_TOKEN"]
+
+
+@pytest.mark.parametrize(
+    ("source", "settings"),
+    [
+        ("managed", {"apiKeyHelper": "print-token"}),
+        ("user", {"apiKeyHelper": "print-token"}),
+        ("managed", {"env": {"CLAUDE_CODE_USE_GATEWAY": "1"}}),
+        ("user", {"env": {"CLAUDE_CODE_USE_GATEWAY": "1"}}),
+        ("environment", {"CLAUDE_CODE_USE_GATEWAY": "1"}),
+        ("environment", {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}),
+        ("environment", {"CLAUDE_CODE_USE_VERTEX": "1"}),
+    ],
+)
+def test_subscription_provider_preserves_claude_configured_auth(
+    _isolated_provider_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    settings: dict[str, Any],
+) -> None:
+    """CLI-owned gateway and cloud credentials keep their existing launch behavior."""
+    _seed_config(
+        _isolated_provider_config,
+        {"claude": {"kind": "subscription", "cli": "claude", "default": True}},
+    )
+    if source == "environment":
+        for name, value in settings.items():
+            monkeypatch.setenv(name, value)
+    else:
+        settings_dir = _isolated_provider_config / ".claude"
+        settings_dir.mkdir()
+        settings_path = settings_dir / "settings.json"
+        settings_path.write_text(json.dumps(settings))
+        if source == "managed":
+            monkeypatch.setattr(
+                claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings_path,)
+            )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "inherited-test-credential")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "inherited-test-credential")
+
+    assert claude_native.resolve_native_claude_config(spec=None) is None
 
 
 def test_resolve_native_claude_config_global_databricks_auth_matches_session(
@@ -12437,6 +12670,14 @@ def test_managed_gateway_endpoint_takes_precedence(
             True,
             id="process-foundry-on",
         ),
+        pytest.param(
+            {},
+            {},
+            {"CLAUDE_CODE_USE_GATEWAY": "1"},
+            {"CLAUDE_CODE_USE_GATEWAY": "1"},
+            True,
+            id="process-gateway-on",
+        ),
     ],
 )
 def test_ambient_transport_takes_managed_then_user_then_process_values(
@@ -12449,12 +12690,7 @@ def test_ambient_transport_takes_managed_then_user_then_process_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Each transport setting comes from managed settings, else user settings, else the env."""
-    for name in (
-        "ANTHROPIC_BASE_URL",
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CODE_USE_FOUNDRY",
-    ):
+    for name in ("ANTHROPIC_BASE_URL", *claude_native._CLAUDE_TRANSPORT_FLAGS):
         monkeypatch.delenv(name, raising=False)
     managed_settings = tmp_path / "managed-settings.json"
     managed_settings.write_text(json.dumps({"env": managed}))
@@ -12622,10 +12858,37 @@ def _isolate_to_connect_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         lambda *a, **k: None,
     )
-    monkeypatch.setattr("omnigent.runtime.workflow._load_global_auth", lambda: None)
+    monkeypatch.setattr(workflow, "_load_global_auth", lambda: None)
     monkeypatch.setattr(
         "omnigent.onboarding.detected.effective_config_with_detected", lambda cfg: cfg
     )
+
+
+def test_connect_fallback_isolation_does_not_leak_provider_stub() -> None:
+    """A fresh interpreter must restore provider aliases imported during isolation."""
+    program = """
+import pytest
+from omnigent.onboarding import provider_config
+
+original = provider_config.default_provider_for_harness
+from tests.harnesses.claude_native.test_claude_native import _isolate_to_connect_fallback
+
+with pytest.MonkeyPatch.context() as monkeypatch:
+    _isolate_to_connect_fallback(monkeypatch)
+
+from omnigent.runtime import workflow
+assert provider_config.default_provider_for_harness is original
+assert workflow.default_provider_for_harness is original
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_resolve_native_claude_config_connect_broker_fallback(
@@ -12639,14 +12902,16 @@ def test_resolve_native_claude_config_connect_broker_fallback(
     cfg = tmp_path / ".databrickscfg"
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    dc._write_profile(cfg, "https://ws.example")
-    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+    workspace_url = "https://ws.cloud.databricks.com"
+    dc._write_profile(cfg, workspace_url)
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", workspace_url)
 
     config = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
 
     assert config is not None
-    assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/ai-gateway/anthropic"
+    assert config.env["ANTHROPIC_BASE_URL"] == workspace_url + "/ai-gateway/anthropic"
     assert config.env["CLAUDE_CODE_USE_GATEWAY"] == "1"
+    assert config.env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
     assert config.env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
         "x-databricks-use-coding-agent-mode: true",
         "Databricks-Custom-Coding-Agent: claude-code",
@@ -12658,8 +12923,9 @@ def test_resolve_native_claude_config_connect_broker_fallback(
     assert config.model == "catalog-databricks-claude-default"
 
 
+@pytest.mark.parametrize("gateway", [False, True])
 def test_connect_fallback_prefers_ucode_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: bool
 ) -> None:
     """When ucode has populated ~/.ucode/state.json for the connected workspace,
     the managed-connect config uses ucode's base URL and discovered served model,
@@ -12671,17 +12937,21 @@ def test_connect_fallback_prefers_ucode_state(
     cfg = tmp_path / ".databrickscfg"
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    dc._write_profile(cfg, "https://ws.example")
-    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+    workspace_url = "https://ws.cloud.databricks.com"
+    path = "/ai-gateway/anthropic" if gateway else "/serving-endpoints/anthropic"
+    base_url = workspace_url + path
+    dc._write_profile(cfg, workspace_url)
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", workspace_url)
 
     state = UcodeWorkspaceState(
-        workspace_url="https://ws.example",
+        workspace_url=workspace_url,
         agents={
             "claude": UcodeAgentState(
                 model="system.ai.claude-sonnet-4-6",
                 env={
-                    "ANTHROPIC_BASE_URL": "https://ws.example/serving-endpoints/anthropic",
+                    "ANTHROPIC_BASE_URL": base_url,
                     "ANTHROPIC_CUSTOM_HEADERS": "User-Agent: ucode/0.1.0 claude/2.1.0",
+                    "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "0",
                 },
             )
         },
@@ -12692,13 +12962,20 @@ def test_connect_fallback_prefers_ucode_state(
 
     assert config is not None
     # ucode's base URL + discovered model win over the hand-built defaults.
-    assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/serving-endpoints/anthropic"
+    assert config.env["ANTHROPIC_BASE_URL"] == base_url
     assert config.model == "system.ai.claude-sonnet-4-6"
-    # ug's own header lines survive, and the route is attributed to it.
+    assert config.env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
+    # Preserve ug's headers; add attribution only on its Unity Gateway route.
     assert config.env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
         "User-Agent: ucode/0.1.0 claude/2.1.0",
-        "Databricks-Custom-Coding-Agent: claude-code",
-        "Databricks-Custom-Client-Surfaces: omnigent, ug",
+        *(
+            [
+                "Databricks-Custom-Coding-Agent: claude-code",
+                "Databricks-Custom-Client-Surfaces: omnigent, ug",
+            ]
+            if gateway
+            else []
+        ),
     ]
     # But the bearer is still our own broker command, not ucode's.
     assert config.api_key_helper is not None

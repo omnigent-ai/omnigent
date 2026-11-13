@@ -9,8 +9,9 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.runtime import _globals
+from omnigent.runtime import _globals, get_caps
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.app import create_app
 from omnigent.server.routes import sessions as sessions_routes
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -132,6 +133,47 @@ async def test_descendant_checks_inherited_budget_independently(
     assert "$55.00" in denied["reason"]
     assert "$50.00" in denied["reason"]
     assert interrupted_sessions == []
+
+
+async def test_descendant_without_inherited_policies_gets_allow_window(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sub-agent whose root has no session policies gets the no-policy window.
+
+    Once the root attaches a policy, the child's gate evaluates it and grants
+    no window, so its native hooks ask the server again.
+    """
+    caps = RuntimeCaps(
+        execution_timeout=get_caps().execution_timeout,
+        native_hook_allow_cache_seconds=lambda: 60.0,
+    )
+    monkeypatch.setattr("omnigent.server.routes.sessions.get_caps", lambda: caps)
+    agent = await create_test_agent(client)
+    response = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert response.status_code == 201, response.text
+    root_id = response.json()["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    child = store.create_conversation(agent_id=agent["id"], parent_conversation_id=root_id)
+
+    allowed = await _evaluate(client, child.id, "PHASE_TOOL_CALL")
+    assert allowed["result"] == "POLICY_ACTION_ALLOW", allowed
+    assert 0 < allowed["allow_cache_seconds"] <= 60.0
+
+    attached = await client.post(
+        f"/v1/sessions/{root_id}/policies",
+        json={
+            "name": "session_cost_budget",
+            "type": "python",
+            "handler": "omnigent.policies.builtins.cost.cost_budget",
+            "factory_params": {"max_cost_usd": 50.0},
+        },
+    )
+    assert attached.status_code < 300, attached.text
+    evaluated = await _evaluate(client, child.id, "PHASE_TOOL_CALL")
+    assert evaluated["result"] == "POLICY_ACTION_ALLOW", evaluated
+    assert "allow_cache_seconds" not in evaluated
 
 
 @pytest.mark.parametrize("phase", ["PHASE_REQUEST", "PHASE_TOOL_CALL"])

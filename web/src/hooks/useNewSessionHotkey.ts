@@ -2,20 +2,22 @@ import { useEffect } from "react";
 
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
+import { type Chord, chordMatches } from "@/lib/shortcuts/chord";
 import { isNativeShell } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
 
-/** Browser Cmd/Ctrl+Shift+O; preserve the native Cmd/Ctrl+Alt+N chord. */
+const BROWSER_NEW_SESSION_CHORD: Chord = { mod: true, shift: true, key: "o" };
+// The key that types N, on any layout.
+const NATIVE_NEW_SESSION_CHORD: Chord = { mod: true, key: "n" };
+
+/** Browser Cmd/Ctrl+Shift+O; native shells Cmd/Ctrl+N. */
 export function isNewSessionHotkey(
   e: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
   native = isNativeShell(),
 ): boolean {
-  if (!hasCommandModifier(e, isMac) || e.getModifierState("AltGraph")) return false;
-  return native
-    ? e.altKey && !e.shiftKey && e.code === "KeyN"
-    : !e.altKey && e.shiftKey && e.key.toLowerCase() === "o";
+  return chordMatches(native ? NATIVE_NEW_SESSION_CHORD : BROWSER_NEW_SESSION_CHORD, e, isMac);
 }
 
 /** Navigate to the same new-session route used by the command palette. */

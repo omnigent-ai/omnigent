@@ -10,9 +10,10 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.server.feature_flags import Feature
 from omnigent.server.schemas import SessionStartupInput
+from omnigent.server.sharing_settings import peer_session_messaging_enabled
 from omnigent.stores.conversation_store import (
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -20,6 +21,17 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.session_lifecycle import is_session_closed
+
+
+def _shared_with_editors(session_id: str, user_id: str, permissions: PermissionStore) -> bool:
+    """Whether anyone besides the owner holds a stored grant that can add input."""
+    cursor: str | None = None
+    while True:
+        grants, cursor = permissions.list_for_session(session_id, after_user_id=cursor)
+        if any(g.user_id != user_id and g.level >= LEVEL_EDIT for g in grants):
+            return True
+        if cursor is None:
+            return False
 
 
 def require_owned_session(
@@ -47,11 +59,12 @@ def require_owned_session(
         if grant is None or grant.level != LEVEL_OWNER:
             break
         if private:
-            # Child access comes from the root, including public/read-only grants.
-            grants, cursor = permissions.list_for_session(current.id, limit=2)
-            if cursor is not None or any(g.user_id != user_id for g in grants):
+            # Child access comes from the root. Read-only viewers, including the
+            # public grant, cannot add input, so they cannot steer other sessions.
+            if _shared_with_editors(current.id, user_id, permissions):
                 raise OmnigentError(
-                    "Shared sessions cannot send messages or launch independent sessions",
+                    "Sessions shared with edit access cannot send messages, launch "
+                    "independent sessions or organize other sessions and projects",
                     code=ErrorCode.FORBIDDEN,
                 )
             if current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
@@ -62,6 +75,89 @@ def require_owned_session(
         assert session is not None
         return session
     raise OmnigentError("Session is not owned or available", code=ErrorCode.FORBIDDEN)
+
+
+def require_private_bound_source(
+    request: Request,
+    user_id: str,
+    conversations: ConversationStore,
+    permissions: PermissionStore,
+) -> Conversation:
+    """Resolve the header's source as a private owned session on the caller's runner."""
+    source = require_owned_session(
+        request.headers.get(ORCHESTRATION_SOURCE_HEADER, ""),
+        user_id,
+        conversations,
+        permissions,
+        private=True,
+    )
+    token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+    if not token or not source.runner_id or token_bound_runner_id(token) != source.runner_id:
+        raise OmnigentError(
+            "Session orchestration requires the sender's bound runner", code=ErrorCode.FORBIDDEN
+        )
+    return source
+
+
+# How many sessions the archive guard walks up from the caller before refusing.
+_MAX_ARCHIVE_LINEAGE_DEPTH = 32
+
+
+def require_archive_outside_source_lineage(
+    request: Request, session_id: str, conversations: ConversationStore
+) -> None:
+    """
+    Refuse an agent-tool archive of any session the calling session runs under.
+
+    Archiving stops the target's running sub-agents, so archiving an ancestor
+    would stop the caller mid-turn. The caller may archive itself: the route
+    defers that teardown until its turn ends. Cyclic or over-depth lineages are
+    refused. Requests without the orchestration-source header bypass this
+    agent-only guard.
+    """
+    raw_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+    if not raw_source:
+        return
+    target = normalize_uuid(session_id)
+    source_id = normalize_uuid(raw_source)
+    current = conversations.get_conversation(source_id) if source_id else None
+    seen: set[str] = set()
+    while current is not None:
+        if current.id == target and current.id != source_id:
+            raise OmnigentError(
+                "An agent cannot archive a session it runs under",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if current.id in seen or len(seen) >= _MAX_ARCHIVE_LINEAGE_DEPTH:
+            raise OmnigentError(
+                "An agent cannot archive another session while its own session's "
+                "lineage cannot be checked",
+                code=ErrorCode.FORBIDDEN,
+            )
+        seen.add(current.id)
+        next_id = current.parent_conversation_id
+        if next_id is None and current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+            next_id = current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+        current = conversations.get_conversation(next_id) if next_id else None
+
+
+def require_named_source_private(
+    request: Request,
+    user_id: str | None,
+    conversations: ConversationStore,
+    permissions: PermissionStore | None,
+) -> None:
+    """
+    Refuse an agent-tool write whose named calling session is shared with edit access.
+
+    Requests without the orchestration-source header, and servers without
+    per-user sharing (no auth or the local user), are left alone.
+    """
+    if ORCHESTRATION_SOURCE_HEADER not in request.headers:
+        return
+    if user_id is None or user_id == RESERVED_USER_LOCAL or permissions is None:
+        return
+    require_private_bound_source(request, user_id, conversations, permissions)
 
 
 def require_orchestration_source(
@@ -75,20 +171,13 @@ def require_orchestration_source(
     """Check the bound runner, private sender and optional same-owner destination."""
     if not request.app.state.feature_flags.enabled(Feature.SESSION_ORCHESTRATION):
         raise OmnigentError("Session orchestration is disabled", code=ErrorCode.FORBIDDEN)
+    if target_id is not None and not peer_session_messaging_enabled(
+        request.app.state.feature_flags
+    ):
+        raise OmnigentError("Messaging other sessions is disabled", code=ErrorCode.FORBIDDEN)
     if not user_id or permissions is None:
         raise OmnigentError("Session orchestration requires ownership", code=ErrorCode.FORBIDDEN)
-    source = require_owned_session(
-        request.headers.get(ORCHESTRATION_SOURCE_HEADER, ""),
-        user_id,
-        conversations,
-        permissions,
-        private=True,
-    )
-    token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
-    if not token or not source.runner_id or token_bound_runner_id(token) != source.runner_id:
-        raise OmnigentError(
-            "Session orchestration requires the sender's bound runner", code=ErrorCode.FORBIDDEN
-        )
+    source = require_private_bound_source(request, user_id, conversations, permissions)
     if target_id is not None:
         target = require_owned_session(target_id, user_id, conversations, permissions)
         if source.id == target.id:

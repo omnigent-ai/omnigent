@@ -68,6 +68,7 @@ function makeWrapper() {
 }
 
 const RUN: api.ScheduledTaskRun = {
+  sessionCostUsd: null,
   id: "run_1",
   scheduledTaskId: "st_1",
   status: "running",
@@ -76,6 +77,7 @@ const RUN: api.ScheduledTaskRun = {
   firedAt: 1_700_000_000,
   finishedAt: null,
   errorCode: null,
+  errorDetail: null,
   conversationUpdatedAt: 1_700_000_500,
   conversationStatus: "running",
   viewerLastSeen: null,
@@ -88,7 +90,7 @@ beforeEach(() => {
   vi.mocked(api.createScheduledTask).mockResolvedValue(TASK);
   vi.mocked(api.updateScheduledTask).mockResolvedValue({ ...TASK, state: "paused" });
   vi.mocked(api.deleteScheduledTask).mockResolvedValue(undefined);
-  vi.mocked(api.runScheduledTaskNow).mockResolvedValue(undefined);
+  vi.mocked(api.runScheduledTaskNow).mockResolvedValue("run_1");
 });
 
 afterEach(() => {
@@ -132,6 +134,19 @@ describe("mutations invalidate the list", () => {
     const { result } = renderHook(() => useDeleteScheduledTask(), { wrapper });
     await result.current.mutateAsync("st_1");
     expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });
+    expect(spy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
+  });
+
+  it("deleting an automation that runs from a session refreshes the cached sessions", async () => {
+    const { queryClient, wrapper } = makeWrapper();
+    queryClient.setQueryData(SCHEDULED_TASKS_KEY, [{ ...TASK, sourceSessionId: "conv_copy" }]);
+    const spy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useDeleteScheduledTask(), { wrapper });
+    await result.current.mutateAsync(TASK.id);
+    // The server cleared the copy's automation label; the sidebar must refetch it.
+    for (const queryKey of [["conversations"], ["project-sessions"], ["session", "conv_copy"]]) {
+      expect(spy).toHaveBeenCalledWith({ queryKey });
+    }
   });
 
   it("a deleted task's detail page refetches instead of rendering from cache", async () => {
@@ -155,9 +170,15 @@ describe("mutations invalidate the list", () => {
 
   it("run-now calls the API and immediately invalidates the list, detail + runs", async () => {
     const { queryClient, wrapper } = makeWrapper();
+    queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [RUN]);
+    const runs = renderHook(() => useScheduledTaskRuns("st_1"), { wrapper });
+    expect(runs.result.current.isFetchedAfterMount).toBe(false);
+    expect(api.listScheduledTaskRuns).not.toHaveBeenCalled();
     const spy = vi.spyOn(queryClient, "invalidateQueries");
     const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
-    await result.current.mutateAsync("st_1");
+    expect(await result.current.mutateAsync("st_1")).toBe("run_1");
+    await waitFor(() => expect(runs.result.current.isFetchedAfterMount).toBe(true));
+    expect(api.listScheduledTaskRuns).toHaveBeenCalledTimes(1);
     expect(api.runScheduledTaskNow).toHaveBeenCalledWith("st_1");
     // Refreshes the list (so the completion badge updates)…
     expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SessionStateBadge } from "./SessionStateBadge";
 import type { SessionState } from "@/hooks/useSessionState";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 
 function renderBadge(state: SessionState) {
   return render(
@@ -25,6 +26,23 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(badge).toHaveTextContent("Needs response");
   });
 
+  it("names the terminal prompt when no web card exists", () => {
+    renderBadge({ kind: "awaiting", count: 0, terminalReason: "permission prompt" });
+    const badge = screen.getByTestId("session-state-badge");
+    expect(badge).toHaveTextContent("Needs response");
+    expect(badge).toHaveAttribute(
+      "aria-label",
+      "Waiting for you in the agent's terminal (permission prompt)",
+    );
+  });
+
+  it("hedges a terminal prompt the runner inferred from the screen", () => {
+    renderBadge({ kind: "awaiting", count: 0, terminalReason: TERMINAL_PROMPT_BLOCKED_ON });
+    const badge = screen.getByTestId("session-state-badge");
+    expect(badge).toHaveTextContent("May need input");
+    expect(badge).toHaveAttribute("aria-label", "May need your input in the agent's terminal");
+  });
+
   it("uses singular wording when only one prompt is pending", () => {
     renderBadge({ kind: "awaiting", count: 1 });
     expect(screen.getByTestId("session-state-badge")).toHaveAttribute(
@@ -45,6 +63,14 @@ describe("SessionStateBadge — per-state rendering", () => {
     expect(spinner?.getAttribute("class")).toContain("text-muted-foreground");
     expect(spinner?.getAttribute("class")).toContain("size-3");
     expect(container.querySelector(".bg-success")).toBeNull();
+  });
+
+  it("renders background work with the running spinner and its own label", () => {
+    const { container } = renderBadge({ kind: "running", background: true });
+    const badge = screen.getByTestId("session-state-badge");
+    expect(badge).toHaveAttribute("data-state", "running");
+    expect(badge).toHaveAttribute("aria-label", "Working in the background");
+    expect(container.querySelector('[data-testid="running-dot"]')).not.toBeNull();
   });
 
   it("renders starting with the same spinner as running and its own label", () => {

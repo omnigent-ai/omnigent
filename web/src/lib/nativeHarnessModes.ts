@@ -6,7 +6,10 @@
 // native CLI; a mode whose `args` are empty sends no flags (the CLI keeps its
 // own configured default). Keep in sync with each CLI's `--help`.
 
-import { CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE } from "@/lib/claudePermissionMode";
+import {
+  CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+  CLAUDE_NATIVE_PERMISSION_MODES,
+} from "@/lib/claudePermissionMode";
 
 /** One selectable mode: value + label + blurb + the CLI flags it maps to. */
 export interface NativeHarnessMode {
@@ -29,7 +32,9 @@ const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConc
     bypassPermissions: "full-access",
   },
   "codex-native": {
-    default: "automatic",
+    default: "manual",
+    "ask-for-approval": "manual",
+    "approve-for-me": "automatic",
     "full-access": "full-access",
     "read-only": "read-only",
     bypass: "full-access",
@@ -88,13 +93,13 @@ export const AGY_NATIVE_DEFAULT_SKIP_MODE = "default";
 export const AGY_NATIVE_SKIP_VALUE = "skip";
 export const AGY_NATIVE_SKIP_MODES: NativeHarnessMode[] = [
   {
-    value: AGY_NATIVE_DEFAULT_SKIP_MODE,
+    value: "default",
     label: "Ask every time",
     description: "Prompts before each tool runs",
     args: [],
   },
   {
-    value: AGY_NATIVE_SKIP_VALUE,
+    value: "skip",
     label: "Skip permissions",
     description: "Runs everything; no prompts or safety checks",
     args: ["--dangerously-skip-permissions"],
@@ -181,31 +186,55 @@ export const DEVIN_NATIVE_PERMISSION_MODES: NativeHarnessMode[] = [
   },
 ];
 
-// Codex approval presets matching the `/permissions` TUI popup.
-// Each preset bundles a sandbox profile + approval policy, mirroring
-// codex-rs/utils/approval-presets/src/lib.rs. "default" is the auto
-// preset (workspace-write + on-request) and sends no flags so the
-// runner uses Codex's built-in default.
-// Keep in sync with `codex --help` and
-// https://developers.openai.com/codex/agent-approvals-security
+// Create-time Codex approval presets. "default" sends no flags, so Codex uses
+// its built-in default or the user's Codex config. The others use the labels of
+// Codex's `/permissions` popup (omnigent/codex_approval_modes.py), so the
+// running-session picker shows the same name the session was created with.
+// Keep in sync with https://developers.openai.com/codex/agent-approvals-security
 export const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "default";
 export const CODEX_NATIVE_APPROVAL_MODES: NativeHarnessMode[] = [
   {
     value: "default",
     label: "Default",
-    description: "Read/edit/run in workspace; approval for external edits or network",
+    description: "Codex's default permissions, or your Codex config",
     args: [],
   },
   {
+    value: "ask-for-approval",
+    label: "Ask for approval",
+    description: "Read/edit/run in the workspace; approval for the internet or external edits",
+    args: [
+      "--sandbox",
+      "workspace-write",
+      "--ask-for-approval",
+      "on-request",
+      "-c",
+      'approvals_reviewer="user"',
+    ],
+  },
+  {
+    value: "approve-for-me",
+    label: "Approve for me",
+    description: "Only asks for actions detected as potentially unsafe",
+    args: [
+      "--sandbox",
+      "workspace-write",
+      "--ask-for-approval",
+      "on-request",
+      "-c",
+      'approvals_reviewer="auto_review"',
+    ],
+  },
+  {
     value: "full-access",
-    label: "Full access",
+    label: "Full Access",
     description: "Edit any file and access the internet without approval",
     args: ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
   },
   {
     value: "read-only",
-    label: "Read only",
-    description: "Read files only; approval required for edits, commands, or network",
+    label: "Read Only",
+    description: "Read files only; approval required to edit files or access the internet",
     args: ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
   },
 ];
@@ -225,8 +254,67 @@ export const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypa
 // terminal_launch_args, so its `args` are empty and it's handled specially.
 export const CODEX_NATIVE_BYPASS_APPROVAL_VALUE = "bypass";
 export const CODEX_NATIVE_BYPASS_APPROVAL_OPTION: NativeHarnessMode = {
-  value: CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+  value: "bypass",
   label: "Bypass approvals & sandbox",
   description: "Runs Codex with no approval prompts and no command sandbox",
   args: [],
 };
+
+/**
+ * Modes that skip the approval prompt. Automations offer them only on servers that
+ * advertise scheduled_task_approval_skipping_modes. Mirrors omnigent/native/permission_modes.py.
+ */
+export const APPROVAL_SKIPPING_PERMISSION_MODES: ReadonlySet<string> = new Set([
+  "bypassPermissions",
+  "dontAsk",
+  "full-access",
+  "bypass",
+  "yolo",
+  "skip",
+  "dangerous",
+]);
+
+/**
+ * Mode a new automation starts with. Nobody watches an automation's turns, so a
+ * mode that asks would stall them; the user can still pick another one.
+ */
+export const NEW_AUTOMATION_PERMISSION_MODES: Readonly<Record<string, string>> = {
+  "claude-native": "auto",
+  "codex-native": "approve-for-me",
+};
+
+/** Create-time permission choices shared by New Chat and automations. */
+export function nativePermissionOptions(harness: string | null | undefined) {
+  switch (harness) {
+    case "claude-native":
+      return CLAUDE_NATIVE_PERMISSION_MODES;
+    case "codex-native":
+      return [...CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_BYPASS_APPROVAL_OPTION];
+    case "cursor-native":
+      return CURSOR_NATIVE_EXEC_MODES;
+    case "antigravity-native":
+      return AGY_NATIVE_SKIP_MODES;
+    case "devin-native":
+      return DEVIN_NATIVE_PERMISSION_MODES;
+    default:
+      return [];
+  }
+}
+
+/** The named mode each harness starts in by default, e.g. Codex's "default". */
+export function nativeDefaultPermissionMode(harness: string | null | undefined): string | null {
+  switch (harness) {
+    case "claude-native":
+      return CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE;
+    case "codex-native":
+      return CODEX_NATIVE_DEFAULT_APPROVAL_MODE;
+    case "cursor-native":
+      return CURSOR_NATIVE_DEFAULT_EXEC_MODE;
+    case "antigravity-native":
+      return AGY_NATIVE_DEFAULT_SKIP_MODE;
+    case "devin-native":
+      return DEVIN_NATIVE_DEFAULT_PERMISSION_MODE;
+    default:
+      return null;
+  }
+}
