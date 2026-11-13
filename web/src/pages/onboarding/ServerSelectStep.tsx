@@ -133,6 +133,7 @@ export function ServerSelectStep({
   managedServers,
   managedServerNames,
   serverNames,
+  installed,
   onBack,
   onConnect,
   connection = null,
@@ -150,6 +151,8 @@ export function ServerSelectStep({
   managedServerNames?: Record<string, string>;
   /** Names servers gave themselves, origin → name. */
   serverNames?: Record<string, string>;
+  /** CLI status for local setup; remote servers always offer "Open Omnigent". */
+  installed?: boolean;
   /** Reports whether the URL-input ("add") view is showing, so the parent can
    *  swap the panel band (hero icons) for it. */
   onAddModeChange?: (addMode: boolean) => void;
@@ -277,6 +280,7 @@ export function ServerSelectStep({
   // Joining the local install while it's down boots it → "Start", not "Open".
   const startsLocal =
     selected !== null && isLocalInstall(selected) && checks[selected] === "unreachable";
+  const actionInstalled = installed || (selected !== null && !isLocalInstall(selected));
 
   const managedName = (url: string): string | null =>
     managedServers.includes(url) && managedServerNames && Object.hasOwn(managedServerNames, url)
@@ -510,9 +514,8 @@ export function ServerSelectStep({
               onClick={join}
               size="lg"
             >
-              {/* Picking a server never installs the CLI. */}
-              <InstallActionIcon installed startsLocal={startsLocal} />
-              {installActionLabel(true, startsLocal)}
+              <InstallActionIcon installed={actionInstalled} startsLocal={startsLocal} />
+              {installActionLabel(actionInstalled, startsLocal)}
             </Button>
           </>
         )}

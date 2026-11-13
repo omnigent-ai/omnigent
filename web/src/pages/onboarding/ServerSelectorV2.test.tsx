@@ -190,37 +190,23 @@ describe("ServerSelectorV2", () => {
     expect(onStartLocal).not.toHaveBeenCalled();
   });
 
-  it("never installs the CLI from a picked local installation, even a stopped one", async () => {
+  it("still installs the CLI when explicitly opening a local installation", async () => {
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
-    const onConnect = vi.fn().mockResolvedValue({});
-    const onStartLocal = vi
-      .fn()
-      .mockResolvedValue({ ok: false, error: "The omnigent CLI was not found." });
+    const onStartLocal = vi.fn().mockResolvedValue({ ok: true });
     render(
       <ServerSelectorV2
         setup={makeSetup({
           installed: false,
           recentServers: ["http://localhost:6767/"],
           onInstallCli,
-          onConnect,
           onStartLocal,
           onCheckServer: vi.fn().mockResolvedValue({ status: "unreachable" }),
         })}
       />,
     );
-    fireEvent.click(await screen.findByRole("button", { name: "Start Omnigent" }));
-    expect(await screen.findByText("The omnigent CLI was not found.")).toBeInTheDocument();
-    expect(onStartLocal).toHaveBeenCalledOnce();
-    expect(onInstallCli).not.toHaveBeenCalled();
-    for (const name of ["Retry", "Continue anyway", "Back"]) {
-      expect(screen.getByRole("button", { name })).toBeInTheDocument();
-    }
-    fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
-    await waitFor(() =>
-      expect(onConnect).toHaveBeenCalledWith("http://localhost:6767/", expect.any(Function)),
-    );
-    expect(onStartLocal).toHaveBeenCalledOnce();
-    expect(onInstallCli).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await waitFor(() => expect(onStartLocal).toHaveBeenCalledOnce());
+    expect(onInstallCli).toHaveBeenCalledOnce();
   });
 
   it("re-checks on click: a local install that stopped since the list loaded is booted", async () => {
@@ -307,6 +293,29 @@ describe("ServerSelectorV2", () => {
     expect(getRunnerOptions).toHaveBeenCalledWith("https://typed.example.com/");
     expect(screen.queryByRole("heading", { name: /where do you work today/i })).toBeNull();
     expect(onInstallCli).not.toHaveBeenCalled();
+  });
+
+  it("a new MDM user's typed local install keeps the runner step", async () => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions: vi.fn().mockResolvedValue({ remote: false, bundledCli: false }),
+          onConnect,
+        })}
+      />,
+    );
+    openPresetDropdown();
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "http://localhost:6767" },
+    });
+    fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(localhost:6767\)/i }));
+    expect(
+      await screen.findByRole("heading", { name: /where do you work today/i }),
+    ).toBeInTheDocument();
+    expect(onConnect).not.toHaveBeenCalled();
   });
 
   it("picking a preset offers only this laptop when the shell reports no remote environment", async () => {
@@ -939,20 +948,24 @@ describe("onboarding parity", () => {
     [{}, "Server ready"],
     [{ error: "Server unavailable" }, "Server unavailable"],
     [{ cancelled: true }, "Connection cancelled."],
-  ])("opens a running local server without installing the CLI (%j)", async (result, message) => {
-    const setup = makeSetup({
-      installed: false,
-      recentServers: ["http://localhost:6767/"],
-      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
-      onConnect: vi.fn().mockResolvedValue(result),
-    });
-    render(<ServerSelectorV2 setup={setup} />);
-    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
-    await screen.findByText(message);
-    expect(setup.onConnect).toHaveBeenCalledWith("http://localhost:6767/", expect.any(Function));
-    expect(setup.onInstallCli).not.toHaveBeenCalled();
-    expect(setup.onStartLocal).not.toHaveBeenCalled();
-  });
+  ])(
+    "opens a selected local server without retrying failed installation (%j)",
+    async (result, message) => {
+      const setup = makeSetup({
+        installed: false,
+        recentServers: ["http://localhost:6767/"],
+        onInstallCli: vi.fn().mockResolvedValue({ ok: false, error: "Installer failed" }),
+        onConnect: vi.fn().mockResolvedValue(result),
+      });
+      render(<ServerSelectorV2 setup={setup} />);
+      fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Continue anyway" }));
+      await screen.findByText(message);
+      expect(setup.onConnect).toHaveBeenCalledWith("http://localhost:6767/", expect.any(Function));
+      expect(setup.onInstallCli).toHaveBeenCalledOnce();
+      expect(setup.onStartLocal).not.toHaveBeenCalled();
+    },
+  );
 
   it("does not offer Continue anyway when new local setup has no server destination", async () => {
     const setup = makeSetup({
@@ -1015,15 +1028,16 @@ describe("onboarding parity", () => {
     },
   );
 
-  it("opens a running local server without manual installation instructions", async () => {
+  it("can open an existing local server from manual installation instructions", async () => {
     const setup = makeSetup({
       installed: false,
       installSupported: false,
       recentServers: ["http://localhost:6767/"],
     });
     render(<ServerSelectorV2 setup={setup} />);
-    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
-    expect(screen.queryByRole("link", { name: "Installation instructions" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    expect(screen.getByRole("link", { name: "Installation instructions" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
     await waitFor(() => expect(setup.onConnect).toHaveBeenCalledOnce());
     expect(setup.onStartLocal).not.toHaveBeenCalled();
   });
