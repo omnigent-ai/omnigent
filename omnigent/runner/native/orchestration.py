@@ -27,6 +27,10 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapp
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from omnigent.util.claude_launch_args import (
+    claude_legacy_launch_prompt,
+    without_claude_session_id_arg,
+)
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -8104,9 +8108,7 @@ def _claude_legacy_launch_prompt(terminal_launch_args: list[str] | None) -> str 
         ``["hello", "--permission-mode", "auto"]``.
     :returns: The leading positional, e.g. ``"hello"``, or ``None``.
     """
-    if not terminal_launch_args or terminal_launch_args[0].startswith("-"):
-        return None
-    return terminal_launch_args[0]
+    return claude_legacy_launch_prompt(terminal_launch_args)
 
 
 async def _claude_prompt_in_history(
@@ -8187,19 +8189,7 @@ def _without_claude_session_id_arg(args: list[str]) -> list[str]:
     """
     if "--fork-session" in args:
         return args
-    kept: list[str] = []
-    skip_value = False
-    for arg in args:
-        if skip_value:
-            skip_value = False
-            continue
-        if arg == "--session-id":
-            skip_value = True
-            continue
-        if arg.startswith("--session-id="):
-            continue
-        kept.append(arg)
-    return kept
+    return without_claude_session_id_arg(args)
 
 
 def _build_claude_native_base_args(
