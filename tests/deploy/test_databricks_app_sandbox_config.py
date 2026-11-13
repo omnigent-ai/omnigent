@@ -152,6 +152,7 @@ def test_runtime_and_module_configuration_reaches_databricks_boot(
     """The module boot honors the same configured routing pair and modules as the CLI."""
     import omnigent.runtime as runtime
     from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
+    from omnigent.spec import FunctionPolicySpec
 
     exit_codes = request.getfixturevalue("boot_exit_codes")
     monkeypatch.setattr(
@@ -167,6 +168,13 @@ def test_runtime_and_module_configuration_reaches_databricks_boot(
             "base_url": "https://router.example.test",
             "router_name": "test-router",
         },
+        "policies": {
+            "deployment_budget": {
+                "type": "function",
+                "handler": "omnigent.policies.builtins.cost.cost_budget",
+                "factory_params": {"max_cost_usd": 5.0},
+            }
+        },
         "policy_modules": ["example.policies"],
         "debug_router_modules": "example.debug",
         "execution_timeout": 900,
@@ -179,6 +187,13 @@ def test_runtime_and_module_configuration_reaches_databricks_boot(
     assert create_app.call_args.kwargs["debug_router_modules"] == ["example.debug"]
     assert create_app.call_args.kwargs["server_config"] == config
     caps = runtime.init.call_args.kwargs["caps"]
+    assert len(caps.default_policies) == 1
+    policy = caps.default_policies[0]
+    assert isinstance(policy, FunctionPolicySpec)
+    assert policy.name == "deployment_budget"
+    assert policy.function is not None
+    assert policy.function.path == "omnigent.policies.builtins.cost.cost_budget"
+    assert policy.function.arguments == {"max_cost_usd": 5.0}
     assert caps.execution_timeout == 900
     assert caps.native_hook_allow_cache_seconds() == 45
     assert caps.llm.model == "test-judge"

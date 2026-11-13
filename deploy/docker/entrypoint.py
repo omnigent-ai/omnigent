@@ -352,17 +352,6 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     policy_store = SqlAlchemyPolicyStore(database_url)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(database_url)
     project_store = SqlAlchemyProjectStore(database_url)
-    # Shared preferences mount only for a configured authority, as under `omnigent server`.
-    from omnigent.cli import _parse_shared_preferences_authority_id
-
-    authority_id = _parse_shared_preferences_authority_id(
-        cfg.get("shared_preferences_authority_id")
-    )
-    preference_store = None
-    if authority_id is not None:
-        from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
-
-        preference_store = SqlAlchemyPreferenceStore(database_url, authority_id=authority_id)
     # Fail startup loud on a malformed `sandbox:` section (an operator
     # typo should not surface as a runtime 502 on the first managed
     # session); the startup catch-all below logs it.
@@ -498,7 +487,6 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         github_config=github_config,
         github_store=github_store,
         mcp_registry=mcp_registry,
-        preference_store=preference_store,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
     )

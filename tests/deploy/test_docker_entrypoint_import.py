@@ -272,33 +272,23 @@ def test_build_app_wires_both_routing_backends(
 
 
 @pytest.mark.parametrize(
-    ("config_yaml", "expected_cache_seconds", "expect_preferences"),
-    [
-        (
-            "native_hook_allow_cache_seconds: 45\nshared_preferences_authority_id: docker-test\n",
-            45.0,
-            True,
-        ),
-        ("{}\n", None, False),
-    ],
+    ("config_yaml", "expected_cache_seconds"),
+    [("native_hook_allow_cache_seconds: 45\n", 45.0), ("{}\n", None)],
     ids=["configured", "absent"],
 )
-def test_build_app_honours_hook_cache_and_shared_preferences(
+def test_build_app_honours_hook_cache(
     _entrypoint_env: None,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     config_yaml: str,
     expected_cache_seconds: float | None,
-    expect_preferences: bool,
 ) -> None:
     from omnigent.runtime import get_caps
 
-    app = _build_app_from_config(monkeypatch, tmp_path, config_yaml)
+    _build_app_from_config(monkeypatch, tmp_path, config_yaml)
 
     resolver = get_caps().native_hook_allow_cache_seconds
     assert (resolver() if resolver is not None else None) == expected_cache_seconds
-    routes = {route.path for route in app.routes}
-    assert ("/v1/preferences/shared" in routes) is expect_preferences
 
 
 @pytest.mark.parametrize(
@@ -323,7 +313,6 @@ def test_resolve_execution_timeout(cfg: dict[str, int], expected_timeout: int) -
 def test_build_app_mounts_mcp_registry_from_env(
     _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, catalog_kind: str
 ) -> None:
-    from deploy.docker.entrypoint import _resolve_config, build_app, run_migrations
     from omnigent.server import mcp_registry
 
     monkeypatch.setattr(mcp_registry, "build_secret_cipher", lambda: None)
@@ -340,16 +329,13 @@ def test_build_app_mounts_mcp_registry_from_env(
     if catalog_kind == "invalid":
         registry_file.write_text("unexpected: true\n")
     monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(registry_file))
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'entrypoint.db'}")
-    resolved = _resolve_config()
-    run_migrations(resolved.database_url)
 
     if catalog_kind != "public":
         with pytest.raises(ValueError):
-            build_app(resolved)
+            _build_app_from_config(monkeypatch, tmp_path, "{}\n")
         return
 
-    app = build_app(resolved).app
+    app = _build_app_from_config(monkeypatch, tmp_path, "{}\n")
 
     assert list(app.state.mcp_registry.services) == ["tracker"]
     assert "/v1/mcp-registry/services" in {route.path for route in app.routes}
