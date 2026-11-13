@@ -10017,8 +10017,7 @@ async def _auto_create_claude_terminal(
             env_start = env_wrapper_args_start(
                 launch_command, launch_args, _claude_terminal_pre_wrapper_env(env_spec)
             )
-            if env_start is not None:
-                claude_args_start = env_start
+            claude_args_start = env_start if env_start is not None else len(configured_prefix)
         settings_generation = record_claude_settings_boundary(
             bridge_dir, launch_args, claude_args_start=claude_args_start
         )

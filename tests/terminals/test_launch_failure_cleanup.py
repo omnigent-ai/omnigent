@@ -377,7 +377,8 @@ async def test_preparation_uses_new_instance_once_before_spawn(
 
     async def prepare(instance):
         assert instance is created[0]
-        assert instance.os_env is created[0].os_env
+        assert instance.os_env is not None
+        assert instance.os_env.cwd == tmp_path
         assert not instance.running
         calls.append(instance)
         if outcome == "error":

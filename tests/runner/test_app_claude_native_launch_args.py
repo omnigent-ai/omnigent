@@ -1407,6 +1407,8 @@ async def _auto_create_claude_terminal_for_test(
         ("env", ["-C", "sub", "claude", "--settings", "caller.json"]),
         ("env", ["-C", "sub", "--", "claude", "--settings", "caller.json"]),
         ("env", ["-S", "-C sub claude", "--settings", "caller.json"]),
+        ("env", ["-v", "-C", "sub", "claude", "--settings", "caller.json"]),
+        ("env", ["env", "claude", "--settings", '{"disableAllHooks":true}']),
     ],
     ids=[
         "configured-wrapper",
@@ -1420,6 +1422,8 @@ async def _auto_create_claude_terminal_for_test(
         "configured-env-chdir-settings",
         "configured-env-delimiter-settings",
         "configured-env-split-settings",
+        "opaque-env-verbose-settings",
+        "opaque-nested-env-settings",
     ],
 )
 async def test_auto_create_claude_settings_preserve_configured_argument_boundary(
@@ -1468,6 +1472,7 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
             settings = json.loads(Path(created.instance.args[settings_index]).read_text())
             assert settings["env"]["ORDER"] == "caller"
             assert settings["hooks"]["UserPromptSubmit"]
+            opaque_env = command == "env" and prefix[0] in {"-v", "env"}
             if command == "claude-wrapper":
                 boundary = prefix.index("--") + 1 if "--" in prefix else len(prefix)
                 assert created.instance.args[:boundary] == prefix[:boundary]
@@ -1476,9 +1481,10 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
             if command == "sh":
                 assert created.instance.args[: len(prefix)] == prefix
             if command == "env":
-                boundary = prefix.index("--settings")
+                boundary = len(prefix) if opaque_env else prefix.index("--settings")
                 assert created.instance.args[:boundary] == prefix[:boundary]
-            wrapper_settings = command == "claude-wrapper" and "--" not in prefix
+                assert "disableAllHooks" not in settings
+            wrapper_settings = (command == "claude-wrapper" and "--" not in prefix) or opaque_env
             if "--settings" in prefix and not wrapper_settings:
                 assert settings["env"]["CONFIG_ONLY"] == "yes"
             assert created.instance.args.count("--settings") == (2 if wrapper_settings else 1)
