@@ -2722,30 +2722,42 @@ class HostProcess:
         :param frame: The status query frame.
         :returns: Liveness, or ``sign_in_pending`` for an exact bounded startup wait.
         """
-        while pending := self._pending_runner_launches.get(frame.runner_id):
-            # Shield shared completions from a status request's cancellation.
-            await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
-        handle = self._runners.get(frame.runner_id)
-        if handle is None:
-            status = "unknown"
-        else:
+        while True:
+            while pending := self._pending_runner_launches.get(frame.runner_id):
+                # Shield shared completions from a status request's cancellation.
+                await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
+            handle = self._runners.get(frame.runner_id)
+            if handle is None:
+                status = "unknown"
+                break
             # poll() is a lock-free waitpid for a direct-Popen runner, but a
             # blocking control-socket round-trip (bounded only by the 30s
             # control timeout, and contended against a booting zygote) for a
             # zygote-forked one — so run it off the loop, matching
             # _watch_runner / _handle_stop, lest a slow zygote stall the daemon.
             status = "alive" if await asyncio.to_thread(handle.proc.poll) is None else "dead"
+            # A stop or relaunch can supersede either probe while its thread runs.
+            if (
+                self._pending_runner_launches.get(frame.runner_id)
+                or self._runners.get(frame.runner_id) is not handle
+            ):
+                continue
             if (
                 status == "alive"
                 and not handle.stop_requested
                 and handle.connect_marker is not None
-                and await asyncio.to_thread(
+            ):
+                sign_in_pending = await asyncio.to_thread(
                     runner_sign_in_is_pending, handle.connect_marker, frame.runner_id
                 )
-                and self._runners.get(frame.runner_id) is handle
-                and not handle.stop_requested
-            ):
-                status = "sign_in_pending"
+                if (
+                    self._pending_runner_launches.get(frame.runner_id)
+                    or self._runners.get(frame.runner_id) is not handle
+                ):
+                    continue
+                if sign_in_pending and not handle.stop_requested:
+                    status = "sign_in_pending"
+            break
         return HostRunnerStatusResultFrame(
             request_id=frame.request_id,
             status=status,
