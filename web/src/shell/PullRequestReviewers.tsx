@@ -135,12 +135,14 @@ function PullRequestReviewerRow({
       {reviewer.kind === "team" && <span className="shrink-0 text-muted-foreground">(team)</span>}
       <span
         className={cn(
-          "inline-flex shrink-0 items-center gap-1",
+          "inline-flex min-w-0 items-center gap-1",
           edit ? "text-muted-foreground" : state.className,
         )}
       >
-        <StateIcon aria-hidden className={cn("size-3", edit && "animate-spin")} />
-        <span>{stateLabel}</span>
+        <StateIcon aria-hidden className={cn("size-3 shrink-0", edit && "animate-spin")} />
+        <span className="truncate" title={stateLabel}>
+          {stateLabel}
+        </span>
       </span>
       {onToggle && !edit && (
         <PullRequestChipAction
