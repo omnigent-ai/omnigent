@@ -221,15 +221,18 @@ describe("ComposerPrLink", () => {
     ];
     const onOpen = vi.fn();
     render(
-      <ComposerPrLink
-        state="ready"
-        prCount={3}
-        prNumber={42}
-        prStatus="conflict"
-        prs={prs}
-        onOpen={onOpen}
-        conversationId="conv_1"
-      />,
+      <>
+        <ComposerPrLink
+          state="ready"
+          prCount={3}
+          prNumber={42}
+          prStatus="conflict"
+          prs={prs}
+          onOpen={onOpen}
+          conversationId="conv_1"
+        />
+        <button type="button">Next composer control</button>
+      </>,
     );
     const trigger = screen.getByTestId("composer-pr-link");
     fireEvent.focus(trigger);

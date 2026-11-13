@@ -123,6 +123,7 @@ afterEach(() => {
 });
 
 beforeEach(() => {
+  vi.mocked(selectPullRequestInPanel).mockClear();
   pullRequestFault.error = null;
   window.addEventListener("error", suppressPullRequestFault);
   // The rail persists per-session state (selected tab, width) in

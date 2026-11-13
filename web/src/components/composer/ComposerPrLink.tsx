@@ -150,6 +150,15 @@ export function ComposerPrLink({
       data-testid="composer-pr-link"
       data-pr-status={status}
       onClick={() => onOpen()}
+      onKeyDown={(event) => {
+        if (event.key === "Tab" && !event.shiftKey && previewOpen) {
+          const firstRow = previewRef.current?.querySelector("button");
+          if (firstRow) {
+            event.preventDefault();
+            firstRow.focus();
+          }
+        }
+      }}
       onBlur={(event) => {
         if (previewRef.current?.contains(event.relatedTarget)) event.preventDefault();
       }}
