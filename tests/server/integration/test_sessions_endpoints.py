@@ -5944,7 +5944,8 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     if child_lookup_fails:
         from sqlalchemy.exc import OperationalError
 
-        async def fail_child_restore(*_args: Any) -> None:
+        async def fail_child_restore(*_args: Any, confinement: Any = None) -> None:
+            assert confinement is None
             assert sessions_module._session_status_cache.get(sid) == "idle"
             assert relay_bindings == [(sid, "runner_recovered")]
             raise OperationalError("child lookup", {}, RuntimeError("database unavailable"))
