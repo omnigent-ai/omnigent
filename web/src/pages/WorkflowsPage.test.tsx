@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { showToast } from "@/components/ui/toast";
@@ -13,6 +13,9 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type * as RoutingModule from "@/lib/routing";
 
 import { WorkflowsPage } from "./WorkflowsPage";
+import { useCreateWorkflowDraft } from "@/hooks/useWorkflow";
+
+vi.mock("@/hooks/useWorkflow", () => ({ useCreateWorkflowDraft: vi.fn() }));
 
 vi.mock("@/hooks/useSavedWorkflows", () => ({
   useSavedWorkflows: vi.fn(),
@@ -71,6 +74,7 @@ function mockWorkflows(state: Partial<ReturnType<typeof useSavedWorkflows>>) {
 }
 
 const deleteWorkflow = vi.fn();
+const createDraft = vi.fn();
 const rows = () => screen.queryAllByTestId("workflow-row");
 const openMenu = (row: HTMLElement) =>
   fireEvent.pointerDown(within(row).getByTestId("workflow-row-menu"), { button: 0 });
@@ -80,6 +84,10 @@ describe("WorkflowsPage", () => {
     vi.mocked(showToast).mockClear();
     navigate.mockClear();
     deleteWorkflow.mockClear();
+    createDraft.mockReset().mockResolvedValue({ id: "draft-id" });
+    vi.mocked(useCreateWorkflowDraft).mockReturnValue({
+      mutateAsync: createDraft,
+    } as unknown as ReturnType<typeof useCreateWorkflowDraft>);
     vi.mocked(useDeleteWorkflow).mockReturnValue({
       mutate: deleteWorkflow,
     } as unknown as ReturnType<typeof useDeleteWorkflow>);
@@ -187,7 +195,7 @@ describe("WorkflowsPage", () => {
     expect(refresh).toHaveBeenCalledOnce();
   });
 
-  it("asks where the new workflow's drafting session runs, after its name", () => {
+  it("saves a draft and opens its workflow page after its name", async () => {
     mockWorkflows({ workflows: WORKFLOWS });
     render(<WorkflowsPage />);
 
@@ -209,11 +217,25 @@ describe("WorkflowsPage", () => {
     expect(screen.queryByTestId("workflow-session-dialog")).toBeNull();
     fireEvent.click(within(dialog).getByTestId("new-workflow-next"));
 
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith("/workflows/draft-id"));
     expect(screen.queryByRole("dialog", { name: "New workflow" })).toBeNull();
-    expect(JSON.parse(screen.getByTestId("workflow-session-dialog").textContent!)).toEqual({
-      kind: "create",
+    expect(screen.queryByTestId("workflow-session-dialog")).toBeNull();
+    expect(createDraft).toHaveBeenCalledWith({
       name: "Upgrade a dependency",
       description: "Bump one package and fix what breaks",
     });
+  });
+
+  it("lists drafts but disables their execution actions", () => {
+    mockWorkflows({ workflows: [{ ...WORKFLOWS[0]!, is_draft: true }] });
+    render(<WorkflowsPage />);
+    expect(useSavedWorkflows).toHaveBeenCalledWith({ includeDrafts: true });
+    expect(screen.getByText("Draft · No saved plan")).toBeInTheDocument();
+    openMenu(rows()[0]!);
+    expect(screen.getByTestId("workflow-run")).toHaveAttribute("aria-disabled", "true");
+    expect(screen.getByTestId("workflow-create-automation")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
   });
 });

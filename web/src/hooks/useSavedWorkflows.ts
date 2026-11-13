@@ -12,6 +12,8 @@ export interface SavedWorkflow {
   name: string;
   /** What it does and what a run needs, e.g. `"…Give it: the test suite."`. */
   description: string;
+  /** A draft has no saved plan and cannot run yet. */
+  is_draft?: boolean;
 }
 
 // The menu lists the user's workflows by name; more than this many need a search page.
@@ -28,7 +30,10 @@ const SAVED_WORKFLOWS_KEY = ["saved-workflows"];
  *   it failed; and `refresh`, which reloads them, e.g. as the "+" menu opens after the
  *   agent saved one.
  */
-export function useSavedWorkflows({ enabled = true }: { enabled?: boolean } = {}): {
+export function useSavedWorkflows({
+  enabled = true,
+  includeDrafts = false,
+}: { enabled?: boolean; includeDrafts?: boolean } = {}): {
   workflows: readonly SavedWorkflow[];
   isLoading: boolean;
   isError: boolean;
@@ -37,14 +42,22 @@ export function useSavedWorkflows({ enabled = true }: { enabled?: boolean } = {}
   const serverInfo = useServerInfo();
   const supported = serverInfo !== "loading" && serverInfo.workflows === true;
   const query = useQuery<SavedWorkflow[]>({
-    queryKey: SAVED_WORKFLOWS_KEY,
+    queryKey: [...SAVED_WORKFLOWS_KEY, includeDrafts],
     queryFn: async ({ signal }) => {
-      const res = await authenticatedFetch(`/v1/workflows?limit=${SAVED_WORKFLOWS_PAGE}`, {
-        signal,
-      });
+      const res = await authenticatedFetch(
+        `/v1/workflows?limit=${SAVED_WORKFLOWS_PAGE}${includeDrafts ? "&include_drafts=true" : ""}`,
+        {
+          signal,
+        },
+      );
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       const body = (await res.json()) as { data?: SavedWorkflow[] };
-      return (body.data ?? []).map(({ id, name, description }) => ({ id, name, description }));
+      return (body.data ?? []).map(({ id, name, description, is_draft }) => ({
+        id,
+        name,
+        description,
+        is_draft,
+      }));
     },
     staleTime: 30_000,
     enabled: enabled && supported,

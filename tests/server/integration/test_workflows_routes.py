@@ -17,6 +17,7 @@ from tests.server.integration.test_scheduled_tasks_routes import (
     _make_user,
     _serve,
 )
+from tests.server.integration.test_session_journal_routes import _runner, _session, _write
 
 pytestmark = pytest.mark.asyncio
 
@@ -91,3 +92,72 @@ async def test_writes_report_conflicts_bad_input_and_missing_workflows(
     deleted = await client.delete(path, headers=_headers(ALICE))
     assert deleted.json() == {"id": created["id"], "object": "workflow.deleted", "deleted": True}
     assert (await client.get(path, headers=_headers(ALICE))).status_code == 404
+
+
+async def test_draft_planning_is_persistent_private_and_separate_from_runs(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    created = await client.post(
+        "/v1/workflows",
+        json={"name": "release", "description": "Plan the next release."},
+        headers=_headers(ALICE),
+    )
+    assert created.status_code == 200, created.text
+    draft = created.json()
+    assert draft["is_draft"] and draft["steps"] == []
+    path = f"/v1/workflows/{draft['id']}"
+    assert (await client.get("/v1/workflows", headers=_headers(ALICE))).json()["data"] == []
+    drafts = await client.get("/v1/workflows?include_drafts=true", headers=_headers(ALICE))
+    assert drafts.json()["data"][0]["id"] == draft["id"]
+
+    planner = _session(db_uri)
+    foreign = _session(db_uri, owner=BOB)
+    link = path + "/planning-session"
+    refused = await client.put(link, json={"session_id": foreign}, headers=_headers(ALICE))
+    assert refused.status_code == 403
+    missing = await client.put(link, json={"session_id": foreign}, headers=_headers(BOB))
+    assert missing.status_code == 404
+    linked = await client.put(link, json={"session_id": planner}, headers=_headers(ALICE))
+    assert linked.status_code == 200, linked.text
+    assert (await client.get(path, headers=_headers(ALICE))).json()[
+        "planning_session_id"
+    ] == planner
+    # A retried attachment is harmless; another tab cannot silently replace it.
+    assert (
+        await client.put(link, json={"session_id": planner}, headers=_headers(ALICE))
+    ).status_code == 200
+    replacement = _session(db_uri)
+    raced = await client.put(link, json={"session_id": replacement}, headers=_headers(ALICE))
+    assert raced.status_code == 409
+
+    journal = f"/v1/sessions/{planner}/journal"
+    empty = await client.post(
+        journal, json=_write("plan", {"steps": []}, "empty"), headers=_runner(planner)
+    )
+    assert empty.status_code == 400
+    plan = {"name": draft["name"], "steps": STEPS}
+    premature = await client.post(
+        journal,
+        json=_write("plan", plan, "run", workflow_id=draft["id"]),
+        headers=_runner(planner),
+    )
+    assert premature.status_code == 400 and "workflow_is_draft" in premature.text
+    proposal = await client.post(
+        journal, json=_write("plan", plan, "proposal"), headers=_runner(planner)
+    )
+    assert proposal.status_code == 200, proposal.text
+    saved = await client.patch(
+        path, json={"steps": proposal.json()["payload"]["steps"]}, headers=_headers(ALICE)
+    )
+    assert saved.status_code == 200 and saved.json()["is_draft"] is False
+    assert saved.json()["planning_session_id"] == planner
+    assert (await client.get(path + "/runs", headers=_headers(ALICE))).json()["data"] == []
+    assert (await client.get("/v1/workflows", headers=_headers(ALICE))).json()["data"][0][
+        "id"
+    ] == draft["id"]
+    replaced = await client.put(
+        link,
+        json={"session_id": replacement, "expected_session_id": planner},
+        headers=_headers(ALICE),
+    )
+    assert replaced.status_code == 200 and replaced.json()["planning_session_id"] == replacement

@@ -2,8 +2,7 @@
  * Workflows page (`/workflows`): the user's saved workflows, a search, and a
  * "New workflow" button. Laid out like the Automations page.
  *
- * New workflow asks for a name and what it should do, then where the session
- * that drafts it runs; Run asks where a saved one's session runs. Create
+ * New workflow saves a draft and opens its plan editor; Run asks where a saved one's session runs. Create
  * automation opens New automation with the workflow chosen and locked. Delete
  * removes one.
  */
@@ -30,9 +29,11 @@ import {
 import { automationPagePath } from "@/lib/automationFromSession";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useNavigate } from "@/lib/routing";
+import { useCreateWorkflowDraft } from "@/hooks/useWorkflow";
 
 export function WorkflowsPage() {
-  const { workflows, isLoading, isError, refresh } = useSavedWorkflows();
+  const { workflows, isLoading, isError, refresh } = useSavedWorkflows({ includeDrafts: true });
+  const createDraft = useCreateWorkflowDraft();
   const deleteWorkflow = useDeleteWorkflow();
   const navigate = useNavigate();
   const info = useServerInfo();
@@ -137,7 +138,10 @@ export function WorkflowsPage() {
       <NewWorkflowDialog
         open={creating}
         onOpenChange={setCreating}
-        onCreate={({ name, description }) => startSession({ kind: "create", name, description })}
+        onCreate={async (draft) => {
+          const workflow = await createDraft.mutateAsync(draft);
+          navigate(`/workflows/${workflow.id}`);
+        }}
         takenNames={takenNames}
       />
       <WorkflowSessionDialog

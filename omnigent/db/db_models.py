@@ -1978,6 +1978,10 @@ class SqlWorkflow(OmnigentBase):
     )
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    is_draft: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    planning_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         # An owner's workflows by name: the list, `/workflow <name>` and the

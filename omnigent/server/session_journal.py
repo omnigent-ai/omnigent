@@ -337,6 +337,11 @@ def create_session_journal_router(
                 f"workflow_not_found: no saved workflow {workflow_id!r}",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if workflow.is_draft:
+            raise OmnigentError(
+                "workflow_is_draft: save a plan before running this workflow",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
     @router.post(
         "/sessions/{session_id}/journal/input-requests",

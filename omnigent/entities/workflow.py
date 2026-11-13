@@ -41,6 +41,8 @@ class Workflow:
     :param updated_at: Unix epoch seconds of the last write.
     :param steps: The steps in the journal plan's format, or ``None`` when read
         without them, as a list page reads it.
+    :param is_draft: Whether no plan has been saved yet.
+    :param planning_session_id: The owner's conversation for iterating on the plan.
     """
 
     id: str
@@ -50,6 +52,8 @@ class Workflow:
     created_at: int
     updated_at: int
     steps: list[dict[str, Any]] | None = None
+    is_draft: bool = False
+    planning_session_id: str | None = None
 
 
 def normalize_workflow(
@@ -61,14 +65,18 @@ def normalize_workflow(
         characters; whitespace is collapsed.
     :param description: Non-empty text of at most
         :data:`WORKFLOW_DESCRIPTION_MAX_CHARS` characters; it may span lines.
-    :param steps: The graph, checked as the journal checks a plan's: unique
+    :param steps: Empty for a draft; otherwise checked as the journal checks a plan's: unique
         step IDs, dependencies inside the graph, no cycles, at most 100 steps.
     :returns: ``(name, description, steps)``.
     :raises InvalidWorkflowError: If a field is invalid.
     """
     try:
         workflow_name = _line("name", name, WORKFLOW_NAME_MAX_CHARS)
-        workflow_steps = normalize_plan(steps, name=workflow_name, source="workflow")["steps"]
+        workflow_steps = (
+            []
+            if steps == []
+            else normalize_plan(steps, name=workflow_name, source="workflow")["steps"]
+        )
     except InvalidJournalEntryError as exc:
         raise InvalidWorkflowError(str(exc)) from exc
     if not isinstance(description, str) or not description.strip():

@@ -14,6 +14,9 @@ import {
   WorkflowNotFoundError,
 } from "@/hooks/useWorkflow";
 import type * as WorkflowHooks from "@/hooks/useWorkflow";
+import { useSessionJournal } from "@/hooks/useSessionJournal";
+import { authenticatedFetch } from "@/lib/identity";
+import type * as IdentityModule from "@/lib/identity";
 import type * as RoutingModule from "@/lib/routing";
 import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
 import { sendUserMessage } from "@/lib/sessionsApi";
@@ -29,6 +32,27 @@ vi.mock("@/hooks/useWorkflow", async (importOriginal) => {
   const actual = await importOriginal<typeof WorkflowHooks>();
   return { ...actual, useWorkflow: vi.fn(), useWorkflowRuns: vi.fn() };
 });
+vi.mock("@/hooks/useSessionJournal", () => ({ useSessionJournal: vi.fn() }));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  authenticatedFetch: vi.fn(),
+}));
+// The real chat has its own stream/composer tests; this page owns its placement and session link.
+vi.mock("@/components/workflows/WorkflowPlanningChat", () => ({
+  WorkflowPlanningChat: ({
+    workflow,
+    onClose,
+  }: {
+    workflow: WorkflowDetail;
+    onClose: () => void;
+  }) => (
+    <div data-testid="planning-chat" data-session={workflow.planning_session_id}>
+      <button type="button" onClick={onClose}>
+        Close planning chat
+      </button>
+    </div>
+  ),
+}));
 vi.mock("@/hooks/useSavedWorkflows", () => ({
   useDeleteWorkflow: vi.fn(),
   useSavedWorkflows: vi.fn(),
@@ -171,12 +195,91 @@ describe("WorkflowDetailPage", () => {
     deleteWorkflow.mockClear();
     vi.mocked(openTasksTab).mockClear();
     vi.mocked(showToast).mockClear();
+    vi.mocked(useSessionJournal).mockReturnValue({
+      entries: [],
+      isLoading: false,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+    });
     vi.mocked(useDeleteWorkflow).mockReturnValue({
       mutate: deleteWorkflow,
       isPending: false,
     } as unknown as ReturnType<typeof useDeleteWorkflow>);
   });
   afterEach(cleanup);
+
+  it("keeps a draft unrunnable until its proposed plan saves, then reopens the same chat", async () => {
+    const actual = await vi.importActual<typeof WorkflowHooks>("@/hooks/useWorkflow");
+    vi.mocked(useWorkflow).mockImplementation(actual.useWorkflow);
+    mockRuns([]);
+    const planner = "a".repeat(32);
+    let stored: WorkflowDetail = {
+      ...WORKFLOW,
+      steps: [],
+      is_draft: true,
+      planning_session_id: planner,
+    };
+    let rejectSave = true;
+    vi.mocked(authenticatedFetch).mockImplementation(async (_path, options) => {
+      if (options?.method === "PATCH") {
+        if (rejectSave)
+          return new Response(
+            JSON.stringify({ error: { message: "Try again", type: "server_error" } }),
+            { status: 500 },
+          );
+        const body = JSON.parse(String(options.body));
+        stored = { ...stored, steps: body.steps, is_draft: false };
+      }
+      return new Response(JSON.stringify(stored));
+    });
+    const proposal: JournalEntry = {
+      id: "proposal",
+      position: 1,
+      created_at: 1,
+      scheduled_task_run_id: null,
+      step: null,
+      author: { type: "agent" },
+      kind: "plan",
+      payload: { steps: WORKFLOW.steps },
+    };
+    vi.mocked(useSessionJournal).mockReturnValue({
+      entries: [proposal],
+      isLoading: false,
+      error: null,
+      hasOlder: false,
+      loadingOlder: false,
+      loadOlder: vi.fn(),
+    });
+    renderPage();
+
+    expect(await screen.findByText("Draft")).toBeInTheDocument();
+    expect(screen.getByTestId("workflow-steps-graph")).toHaveTextContent(
+      "Explore the failures, Fix the test",
+    );
+    expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
+    expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
+    expect(screen.getByTestId("workflow-detail-create-automation")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t save the plan");
+    expect(screen.getByTestId("workflow-detail-run")).toBeDisabled();
+
+    rejectSave = false;
+    fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
+    await waitFor(() => expect(screen.getByTestId("workflow-detail-run")).toBeEnabled());
+    expect(stored.steps).toEqual(WORKFLOW.steps);
+    expect(screen.getByTestId("planning-chat")).toBeInTheDocument();
+    expect(screen.queryByText("Draft")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
+
+    cleanup();
+    renderPage();
+    await screen.findByTestId("workflow-detail-title");
+    fireEvent.click(screen.getByRole("button", { name: "Plan with agent" }));
+    expect(screen.getByTestId("planning-chat")).toHaveAttribute("data-session", planner);
+    expect(screen.getByTestId("workflow-detail-run")).toBeEnabled();
+  });
 
   it("shows the workflow, its steps, and the sessions that ran it", () => {
     mockWorkflow({});

@@ -29,8 +29,8 @@ export interface NewWorkflowRequest {
 export interface NewWorkflowDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Moves on to choosing where the drafting session runs; the dialog closes after. */
-  onCreate: (request: NewWorkflowRequest) => void;
+  /** Saves the draft; the dialog closes only after it succeeds. */
+  onCreate: (request: NewWorkflowRequest) => void | Promise<void>;
   /** Names of the user's workflows; reusing one blocks Create. */
   takenNames?: readonly string[];
 }
@@ -44,6 +44,8 @@ export function NewWorkflowDialog({
 }: NewWorkflowDialogProps) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const nameId = useId();
   const nameTakenId = useId();
   const descriptionId = useId();
@@ -53,33 +55,46 @@ export function NewWorkflowDialog({
     if (!open) return;
     setName("");
     setDescription("");
+    setError(null);
   }, [open]);
 
   const trimmedName = name.trim();
   const nameTaken = trimmedName !== "" && takenNames.includes(trimmedName);
-  const canCreate = trimmedName !== "" && description.trim() !== "" && !nameTaken;
-  const submit = (event: FormEvent) => {
+  const canCreate = trimmedName !== "" && description.trim() !== "" && !nameTaken && !submitting;
+  const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!canCreate) return;
-    onCreate({ name: trimmedName, description: description.trim() });
-    onOpenChange(false);
+    setSubmitting(true);
+    setError(null);
+    try {
+      await onCreate({ name: trimmedName, description: description.trim() });
+      onOpenChange(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Couldn’t create the draft. Try again.");
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(value) => {
+        if (!submitting) onOpenChange(value);
+      }}
+    >
       <DialogContent
         className="sm:max-w-lg max-h-[85dvh] grid-rows-[auto_1fr_auto]"
         data-testid="new-workflow-dialog"
       >
-        <form className="contents" onSubmit={submit}>
+        <form className="contents" onSubmit={(event) => void submit(event)}>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <WorkflowIcon className="size-4" />
               <span>New workflow</span>
             </DialogTitle>
             <DialogDescription>
-              The agent drafts the steps in a new session. You review them in chat before the
-              workflow is saved.
+              Create a draft, then shape its plan with an agent beside the workflow.
             </DialogDescription>
           </DialogHeader>
 
@@ -113,9 +128,9 @@ export function NewWorkflowDialog({
                 value={description}
                 onChange={(event) => setDescription(event.currentTarget.value)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) submit(event);
+                  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void submit(event);
                 }}
-                maxLength={4000}
+                maxLength={2000}
                 rows={5}
                 className="min-h-32 resize-y rounded-xl p-4 text-ui focus-visible:ring-0"
                 placeholder="Run the test suite a few times, file an issue for each flaky test, and fix the clear ones"
@@ -125,10 +140,16 @@ export function NewWorkflowDialog({
             </div>
           </div>
 
+          {error && (
+            <p role="alert" className="text-sm text-destructive">
+              {error}
+            </p>
+          )}
           <DialogFooter>
             <Button
               type="button"
               variant="outline"
+              disabled={submitting}
               onClick={() => onOpenChange(false)}
               componentId="workflows.new.cancel"
             >
@@ -137,10 +158,11 @@ export function NewWorkflowDialog({
             <Button
               type="submit"
               disabled={!canCreate}
+              loading={submitting}
               data-testid="new-workflow-next"
               componentId="workflows.new.next"
             >
-              Next
+              Create draft
             </Button>
           </DialogFooter>
         </form>

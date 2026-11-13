@@ -6,6 +6,7 @@ Routes, under ``/v1``, each scoped to the caller:
 * ``POST /workflows`` saves one.
 * ``GET /workflows/{workflow_id}`` returns one, with its steps.
 * ``PATCH /workflows/{workflow_id}`` changes its name, description or steps.
+* ``PUT /workflows/{workflow_id}/planning-session`` attaches a private owned chat.
 * ``DELETE /workflows/{workflow_id}`` deletes it.
 * ``GET /workflows/{workflow_id}/runs`` lists the sessions that ran it, newest
   first, with where each run's steps stand.
@@ -29,12 +30,13 @@ from omnigent.entities import Conversation
 from omnigent.entities.session_journal import JournalEntry
 from omnigent.entities.workflow import InvalidWorkflowError, Workflow
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_READ, AuthProvider
+from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._sessions.helpers import _session_status_from_cache
 from omnigent.server.schemas import (
     CreateWorkflowRequest,
+    SetWorkflowPlanningSessionRequest,
     UpdateWorkflowRequest,
     WorkflowDeleted,
     WorkflowList,
@@ -45,15 +47,20 @@ from omnigent.server.schemas import (
     WorkflowStep,
     WorkflowSummary,
 )
-from omnigent.server.session_orchestration import require_named_source_private
+from omnigent.server.session_orchestration import (
+    require_named_source_private,
+    require_owned_session,
+)
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_journal_store import SessionJournalStore
 from omnigent.stores.workflow_store import (
     WORKFLOW_PAGE_MAX,
     WorkflowNameTakenError,
+    WorkflowPlanningSessionConflictError,
     WorkflowStore,
 )
+from omnigent.util.uuid import normalize_uuid
 
 _logger = logging.getLogger(__name__)
 
@@ -95,6 +102,7 @@ def _summary(workflow: Workflow) -> WorkflowSummary:
         description=workflow.description,
         created_at=workflow.created_at,
         updated_at=workflow.updated_at,
+        is_draft=workflow.is_draft,
     )
 
 
@@ -102,6 +110,7 @@ def _object(workflow: Workflow) -> WorkflowObject:
     return WorkflowObject(
         **_summary(workflow).model_dump(),
         steps=[WorkflowStep(**step) for step in workflow.steps or []],
+        planning_session_id=workflow.planning_session_id,
     )
 
 
@@ -168,12 +177,14 @@ def create_workflows_router(
         limit: int = Query(default=_DEFAULT_PAGE, ge=1, le=WORKFLOW_PAGE_MAX),
         after: str | None = None,
         name: str | None = None,
+        include_drafts: bool = False,
     ) -> WorkflowList:
         """List the caller's workflows by name, without their steps.
 
         :param limit: Page size, e.g. ``50``.
         :param after: The previous page's ``last_id``.
         :param name: Only the workflow with this exact name, for ``/workflow <name>``.
+        :param include_drafts: Include workflows with no saved plan in the editor list.
         :raises OmnigentError: 401 if unauthenticated in multi-user mode, 400 for
             an ``after`` that isn't one of the caller's workflows.
         """
@@ -186,6 +197,7 @@ def create_workflows_router(
                 limit=limit,
                 after=after,
                 name=name,
+                include_drafts=include_drafts,
             )
         except InvalidWorkflowError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
@@ -257,6 +269,51 @@ def create_workflows_router(
         except InvalidWorkflowError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         except WorkflowNameTakenError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.ALREADY_EXISTS) from exc
+        if workflow is None:
+            raise _not_found()
+        return _object(workflow)
+
+    @router.put("/workflows/{workflow_id}/planning-session", response_model=WorkflowObject)
+    async def set_planning_session(
+        request: Request, workflow_id: str, body: SetWorkflowPlanningSessionRequest
+    ) -> WorkflowObject:
+        """Keep planning conversations separate from execution runs."""
+        user_id = await _writer(request)
+        store = _store()
+        if await asyncio.to_thread(store.get, workflow_id, user_id=user_id) is None:
+            raise _not_found()
+        session_id = normalize_uuid(body.session_id)
+        if session_id is None:
+            raise OmnigentError("Invalid planning session ID", code=ErrorCode.INVALID_INPUT)
+        if user_id not in (None, RESERVED_USER_LOCAL) and permission_store is not None:
+            assert user_id is not None
+            await asyncio.to_thread(
+                require_owned_session,
+                session_id,
+                user_id,
+                conversation_store,
+                permission_store,
+                private=True,
+            )
+        else:
+            session = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if session is None or session.archived:
+                raise OmnigentError("Planning session not found", code=ErrorCode.NOT_FOUND)
+        expected_session_id = body.expected_session_id
+        if expected_session_id is not None:
+            expected_session_id = normalize_uuid(expected_session_id)
+            if expected_session_id is None:
+                raise OmnigentError("Invalid previous session ID", code=ErrorCode.INVALID_INPUT)
+        try:
+            workflow = await asyncio.to_thread(
+                store.set_planning_session,
+                workflow_id,
+                user_id=user_id,
+                session_id=session_id,
+                expected_session_id=expected_session_id,
+            )
+        except WorkflowPlanningSessionConflictError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.ALREADY_EXISTS) from exc
         if workflow is None:
             raise _not_found()

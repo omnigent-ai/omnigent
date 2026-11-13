@@ -135,3 +135,19 @@ def test_a_workflow_deletes_once_and_only_for_its_owner(store: WorkflowStore) ->
     assert store.delete(saved.id, user_id=ALICE) is True
     assert store.delete(saved.id, user_id=ALICE) is False
     assert store.get(saved.id, user_id=ALICE) is None
+
+
+def test_a_draft_becomes_runnable_when_its_plan_is_saved(store: WorkflowStore) -> None:
+    draft = store.create(user_id=ALICE, name="draft", description="Plan a release.", steps=[])
+    assert draft.is_draft and draft.steps == []
+    assert store.get(draft.id, user_id=ALICE) == draft
+    assert store.list_page(user_id=ALICE, limit=10) == ([], False)
+    page, _ = store.list_page(user_id=ALICE, limit=10, include_drafts=True)
+    assert len(page) == 1 and page[0].is_draft and page[0].steps is None
+
+    renamed = store.update(draft.id, user_id=ALICE, name="release")
+    assert renamed is not None and renamed.is_draft
+    saved = store.update(draft.id, user_id=ALICE, steps=STEPS)
+    assert saved is not None and not saved.is_draft and saved.steps
+    assert store.get(draft.id, user_id=ALICE) == saved
+    assert store.list_page(user_id=ALICE, limit=10)[0][0].id == draft.id

@@ -3411,6 +3411,7 @@ class WorkflowSummary(BaseModel):
     :param description: What the workflow is for.
     :param created_at: Unix epoch seconds when it was saved.
     :param updated_at: Unix epoch seconds of the last write.
+    :param is_draft: Whether a plan must be saved before the workflow can run.
     """
 
     id: str
@@ -3419,6 +3420,7 @@ class WorkflowSummary(BaseModel):
     description: str
     created_at: int
     updated_at: int
+    is_draft: bool = False
 
 
 class WorkflowObject(WorkflowSummary):
@@ -3426,9 +3428,11 @@ class WorkflowObject(WorkflowSummary):
     A saved workflow with its steps, the plan a run copies into a journal.
 
     :param steps: The workflow's graph.
+    :param planning_session_id: The conversation for proposing revisions, separate from runs.
     """
 
     steps: list[WorkflowStep]
+    planning_session_id: str | None = None
 
 
 class WorkflowList(BaseModel):
@@ -3520,15 +3524,24 @@ class CreateWorkflowRequest(BaseModel):
     :param name: One line of at most 80 characters, unique among the caller's
         workflows.
     :param description: What the workflow is for, at most 2,000 characters.
-    :param steps: The graph: unique step IDs, dependencies inside it, no
-        cycles, at most 100 steps.
+    :param steps: Empty or omitted to create a draft. Otherwise a graph with unique
+        step IDs, dependencies inside it, no cycles, and at most 100 steps.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
     description: str
-    steps: list[WorkflowStep]
+    steps: list[WorkflowStep] = Field(default_factory=list)
+
+
+class SetWorkflowPlanningSessionRequest(BaseModel):
+    """Attach a real planning session; name the previous session when replacing it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    expected_session_id: str | None = None
 
 
 class UpdateWorkflowRequest(BaseModel):

@@ -51,6 +51,11 @@ export function WorkflowRow({ workflow, onRun, onCreateAutomation, onDelete }: W
             className="flex min-w-0 flex-1 cursor-pointer flex-col gap-0.5 text-left after:absolute after:inset-0 after:content-['']"
           >
             <span className="truncate text-[15px] font-semibold">{workflow.name}</span>
+            {workflow.is_draft && (
+              <span className="text-xs font-medium text-muted-foreground">
+                Draft · No saved plan
+              </span>
+            )}
             <span className="line-clamp-2 text-ui text-muted-foreground/80">
               {workflow.description}
             </span>
@@ -91,6 +96,7 @@ interface MenuItemProps {
   children?: ReactNode;
   variant?: "default" | "destructive";
   onSelect?: (event: Event) => void;
+  disabled?: boolean;
   "data-testid"?: string;
 }
 
@@ -112,6 +118,7 @@ function WorkflowMenuItems({
   return (
     <>
       <Item
+        disabled={workflow.is_draft}
         onSelect={() => {
           trackClick("workflows.row.run", "button");
           onRun(workflow);
@@ -122,6 +129,7 @@ function WorkflowMenuItems({
         Run
       </Item>
       <Item
+        disabled={workflow.is_draft}
         onSelect={() => {
           trackClick("workflows.row.create_automation", "button");
           onCreateAutomation(workflow);
