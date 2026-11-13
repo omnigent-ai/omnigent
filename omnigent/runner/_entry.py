@@ -1646,32 +1646,40 @@ def create_app(
     if auth_token_factory is None and not auth_resolved:
         auth_token_factory = _make_auth_token_factory()
     binding_token = _runner_tunnel_binding_token_from_env()
-    server_client = open_server_client(
-        server_url,
-        auth=_RunnerDatabricksAuth(auth_token_factory),
-        # Announce the runner as a first-party non-browser client via the
-        # sentinel Origin. The server's require_trusted_origin CSRF guard on
-        # the multipart routes (POST /v1/sessions bundle create, file upload
-        # — both reached from tool_dispatch over this client) requires a
-        # trusted Origin; the runner sends none otherwise, so the sentinel is
-        # what lets sys_session_create / sys_upload_file through. The factory
-        # folds the routing/slice-key headers in on top; we pass only the
-        # runner's tunnel-binding token (when present) alongside the Origin.
-        headers={
-            "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
-            **({RUNNER_TUNNEL_TOKEN_HEADER: binding_token} if binding_token is not None else {}),
-        },
-        timeout=httpx.Timeout(5.0, read=None),
-        # NOTE: ``follow_redirects`` deliberately stays False.
-        # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the
-        # Databricks Apps OAuth login redirect (302 →
-        # ``/oidc/...authorize``) to know it should re-mint the bearer
-        # and retry the original POST. With ``follow_redirects=True``,
-        # httpx walks the redirect chain inside the auth loop and
-        # hands the auth flow only the terminal HTML login page,
-        # defeating the retry. See ``_is_login_redirect_or_unauthorized``.
-        follow_redirects=False,
-    )
+
+    def _server_client_factory() -> httpx.AsyncClient:
+        return open_server_client(
+            server_url,
+            auth=_RunnerDatabricksAuth(auth_token_factory),
+            # Announce the runner as a first-party non-browser client via the
+            # sentinel Origin. The server's require_trusted_origin CSRF guard on
+            # the multipart routes (POST /v1/sessions bundle create, file upload
+            # — both reached from tool_dispatch over this client) requires a
+            # trusted Origin; the runner sends none otherwise, so the sentinel is
+            # what lets sys_session_create / sys_upload_file through. The factory
+            # folds the routing/slice-key headers in on top; we pass only the
+            # runner's tunnel-binding token (when present) alongside the Origin.
+            headers={
+                "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+                **(
+                    {RUNNER_TUNNEL_TOKEN_HEADER: binding_token}
+                    if binding_token is not None
+                    else {}
+                ),
+            },
+            timeout=httpx.Timeout(5.0, read=None),
+            # NOTE: ``follow_redirects`` deliberately stays False.
+            # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the
+            # Databricks Apps OAuth login redirect (302 →
+            # ``/oidc/...authorize``) to know it should re-mint the bearer
+            # and retry the original POST. With ``follow_redirects=True``,
+            # httpx walks the redirect chain inside the auth loop and
+            # hands the auth flow only the terminal HTML login page,
+            # defeating the retry. See ``_is_login_redirect_or_unauthorized``.
+            follow_redirects=False,
+        )
+
+    server_client = _server_client_factory()
 
     mcp_manager = RunnerMcpManager(
         stdio_cwd=runner_workspace,
@@ -1757,6 +1765,7 @@ def create_app(
         process_manager=pm,
         spec_resolver=spec_resolver,
         server_client=server_client,
+        mcp_reattach_client_factory=_server_client_factory,
         terminal_registry=_terminal_registry,
         runner_workspace=runner_workspace,
         per_session_workspace=isolate_session,
@@ -2449,6 +2458,9 @@ def main() -> None:
     # hangup cannot kill the runner while they run.
     _ignore_finish_work_signal_until_handled()
     from omnigent.process_logging import configure_process_logging
+    from omnigent.telemetry.request_headers import set_client_component
+
+    set_client_component("runner")
 
     configure_process_logging("runner", force=True)
     _install_crash_logging()

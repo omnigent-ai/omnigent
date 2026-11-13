@@ -123,6 +123,7 @@ from omnigent.server.performance_metrics import (
     set_request_user_agent_for_access_log,
 )
 from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
+from omnigent.server.routes._host_launch import routed_slice_key
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -763,10 +764,7 @@ def _wrong_replica_error_body(request: Request, exc: WrongReplicaError) -> dict[
         ``slice_key_header``, and ``slice_key`` to resend with (``None`` to
         resend without the header).
     """
-    request_slice_key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER) or (
-        request.query_params.get("omnigent_slice_key")
-    )
-    if request_slice_key == exc.host_id:
+    if routed_slice_key(request) == exc.host_id:
         resend_slice_key = None
         remedy = (
             f"resend without the {OMNIGENT_SLICE_KEY_HEADER} header "

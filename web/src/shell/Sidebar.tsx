@@ -3449,6 +3449,7 @@ function ConversationList({
                           <>
                             <ProjectHeaderActions
                               hostId={defaultProjectHostId}
+                              hosts={hosts}
                               hostsLoading={hostsLoading}
                               onOrderChange={(manual) => {
                                 const ranks = new Map(
@@ -4237,6 +4238,7 @@ function SessionFilterMenu({
 
 function ProjectHeaderActions({
   hostId,
+  hosts,
   hostsLoading,
   onOrderChange,
   manualOrder,
@@ -4251,6 +4253,7 @@ function ProjectHeaderActions({
   onEnterSelectionMode,
 }: {
   hostId: string | null;
+  hosts: Host[];
   hostsLoading: boolean;
   onOrderChange: (manual: boolean) => void;
   manualOrder: boolean;
@@ -4275,7 +4278,12 @@ function ProjectHeaderActions({
 
   return (
     <div className="flex items-center gap-0.5">
-      <NewProjectButton onCreated={onProjectCreated} hostId={hostId} hostsLoading={hostsLoading} />
+      <NewProjectButton
+        onCreated={onProjectCreated}
+        hostId={hostId}
+        hosts={hosts}
+        hostsLoading={hostsLoading}
+      />
       {showMenu && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
