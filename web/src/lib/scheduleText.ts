@@ -370,7 +370,6 @@ export function describeSchedule(rrule: string, timezone?: string): string {
       const zone = !timezone ? "" : timezone === "UTC" ? " UTC" : ` (${timezone})`;
       return `Once on ${monthName} ${monthDays[0]}${timeSuffix}${zone}`;
     }
-    // Remove COUNT before describing the underlying recurrence.
     const recurring = rrule
       .replace(/^RRULE:/i, "")
       .split(";")
