@@ -3,6 +3,7 @@
 
 import {
   closestCenter,
+  type CollisionDetection,
   DndContext,
   type DragEndEvent,
   MouseSensor,
@@ -205,6 +206,17 @@ export function SideChatRailTab({
 // users reorder from, so Space and Enter still activate the tab.
 const MOUSE_SENSOR_OPTIONS = { activationConstraint: { distance: 5 } };
 
+/** Closest tab in the dragged tab's own pinned or unpinned group, so the other group never shifts. */
+export const closestInSameGroup: CollisionDetection = (args) => {
+  const group = args.active.data.current?.sortable?.containerId;
+  return closestCenter({
+    ...args,
+    droppableContainers: args.droppableContainers.filter(
+      (container) => container.data.current?.sortable?.containerId === group,
+    ),
+  });
+};
+
 /** Drag context for the strip's side-chat tabs; `onMove` gets the dragged and target ids. */
 export function SideChatTabsDragArea({
   onMove,
@@ -220,7 +232,7 @@ export function SideChatTabsDragArea({
   return (
     <DndContext
       sensors={sensors}
-      collisionDetection={closestCenter}
+      collisionDetection={closestInSameGroup}
       onDragEnd={onDragEnd}
       // Keep dnd-kit's screen-reader live region out of the one-row tab strip.
       accessibility={{ container: document.body }}

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  MAX_OPEN_TABS,
   type SessionWorkspaceState,
   readSessionWorkspaceState,
   resetSessionWorkspaceTabSelections,
@@ -258,14 +259,14 @@ describe("sessionWorkspaceState", () => {
   });
 
   it("drops unpinned side chats before pinned ones past the tab cap", () => {
-    const unpinned = Array.from({ length: 21 }, (_, index) => `conv_${index}`);
+    const unpinned = Array.from({ length: MAX_OPEN_TABS + 1 }, (_, index) => `conv_${index}`);
     saveSessionWorkspaceState("conv_a", {
       openSideChats: ["conv_pinned", ...unpinned],
       pinnedSideChats: ["conv_pinned"],
     });
     expect(readSessionWorkspaceState("conv_a").openSideChats).toEqual([
       "conv_pinned",
-      ...unpinned.slice(2),
+      ...unpinned.slice(-(MAX_OPEN_TABS - 1)),
     ]);
   });
 });
