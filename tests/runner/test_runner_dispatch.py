@@ -2610,7 +2610,7 @@ async def test_runner_failed_status_carries_setup_error_message(
     caplog: pytest.LogCaptureFixture,
     pinned_runner_log: Path,
 ) -> None:
-    """A setup failure forwards safe diagnostics on the ``failed`` event.
+    """A setup failure forwards safe diagnostics and allows a corrected retry.
 
     Regression for the silent-REPL failure mode: ending the turn on a
     pre-stream error stopped the spinner but rendered no text, because the
@@ -2629,6 +2629,7 @@ async def test_runner_failed_status_carries_setup_error_message(
     conv = "conv_failed_status_carries_error"
     stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
     raised_message = "No model resolved for the 'claude-sdk' harness on a generic provider."
+    setup_valid = False
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """
@@ -2649,15 +2650,17 @@ async def test_runner_failed_status_carries_setup_error_message(
         spec: object, *, cwd: object = None, workdir: object = None
     ) -> dict[str, str]:
         """
-        Fail the spawn-env build the way the no-model provider path does.
+        Script a setup failure until the configuration is corrected.
 
         :param spec: The agent spec (unused).
         :param workdir: Bundle workdir (unused).
-        :returns: Never returns.
-        :raises OmnigentError: Always.
+        :returns: Empty spawn environment after correction.
+        :raises OmnigentError: While setup is invalid.
         """
         del spec, workdir
-        raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT)
+        if not setup_valid:
+            raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT)
+        return {}
 
     monkeypatch.setattr(
         "omnigent.runtime.workflow._build_claude_sdk_spawn_env",
@@ -2667,7 +2670,9 @@ async def test_runner_failed_status_carries_setup_error_message(
     app = create_runner_app(
         process_manager=cast(
             HarnessProcessManager,
-            _FakeProcessManager(_FakeHarnessClient([])),
+            _FakeProcessManager(
+                _FakeHarnessClient([_SSE_RESPONSE_CREATED, _SSE_RESPONSE_COMPLETED])
+            ),
         ),
         spec_resolver=_spec_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -2696,6 +2701,42 @@ async def test_runner_failed_status_carries_setup_error_message(
             until_status="failed",
             timeout=2.0,
         )
+        assert conv not in app.state.active_turns
+        assert conv not in app.state.live_response_id
+        assert not app.state.session_message_buffers.get(conv)
+
+        setup_valid = True
+        retry_id = "b" * 32
+        retry = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "retry"}],
+                "stable_id": retry_id,
+                "input_stable_id": retry_id,
+            },
+        )
+        assert retry.status_code == 202
+        assert retry.json()["status"] == "accepted"
+        await _await_bg_turn_task(conv)
+        retry_events = await _drain_turn_events(
+            app.state.session_event_queues, conv, until_status="idle", timeout=2.0
+        )
+        [completed] = [
+            event for event in retry_events if event.get("type") == "response.completed"
+        ]
+        assert completed["input_stable_id"] == retry_id
+        assert completed["response"]["status"] == "completed"
+        assert [
+            event["status"] for event in retry_events if event.get("type") == "session.status"
+        ] == ["running", "idle"]
+        assert not any(event.get("type") == "response.failed" for event in retry_events)
+        assert conv not in app.state.active_turns
+        assert conv not in app.state.live_response_id
+        assert not app.state.session_message_buffers.get(conv)
 
     failed_event = next(
         event

@@ -6278,6 +6278,8 @@ def create_runner_app(
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name or (dispatch is None and spec_resolver is not None):
+            from omnigent.runner.policy import AgentStartPolicyError
+
             _agent_id = _ds_agent_id
             _sub_agent_name = await _recover_sub_agent_name(conv_id)
             try:
@@ -6297,6 +6299,14 @@ def create_runner_app(
                     sub_agent_name=_sub_agent_name,
                     cwd=await _session_runtime_cwd(conv_id),
                     effective_spec_entry=_session_spec_cache.get(conv_id),
+                )
+            except AgentStartPolicyError as exc:
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "agent_start_policy_unevaluable",
+                        "detail": _client_safe_error_detail(exc, context="agent start policy"),
+                    },
                 )
             except SessionAgentMissingError:
                 return JSONResponse(
