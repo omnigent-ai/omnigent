@@ -63,7 +63,6 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { activeUiFeatureOverrides } from "@/lib/uiFeatureOverrides";
 import { openFeatureFlagsPicker } from "@/store/featureFlagsPicker";
 import { cn } from "@/lib/utils";
-import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
@@ -816,10 +815,10 @@ export function ChatHeader({
               </DropdownMenuTrigger>
               <DropdownMenuContent
                 align="end"
+                mobileSurface="solid"
                 collisionPadding={isMobile ? 16 : undefined}
                 className={cn(
                   "min-w-44 max-w-[min(20rem,calc(100vw-1rem))]",
-                  MOBILE_GLASS_SURFACE,
                   isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
                 )}
               >
