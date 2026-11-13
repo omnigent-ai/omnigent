@@ -6,6 +6,7 @@ All durably checkpointed for crash recovery.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -395,9 +396,9 @@ def _configure_brokered_codex_with_ucode(
         else:
             # In place, so the session's OS tools share the worker's sandbox.
             spec.os_env.sandbox = sandbox
-    if sandbox.egress_rules:
+    if sandbox.egress_rules or sandbox.tcp_egress:
         raise OmnigentError(
-            "signer-backed Codex does not support os_env.sandbox.egress_rules; "
+            "signer-backed Codex does not support os_env.sandbox.egress_rules or tcp_egress; "
             "brokered sessions are model-only",
             code=ErrorCode.INVALID_INPUT,
         )
@@ -3219,7 +3220,7 @@ async def compact_conversation_now(
         task_id=task_id,
         llm_client=_get_llm_client(),
         connection=compaction_state.connection,
-        runner_client=_get_runner_client_for_compaction(conversation_id),
+        runner_client=await asyncio.to_thread(_get_runner_client_for_compaction, conversation_id),
         force=True,
         fail_on_summary_error=True,
         conversation_id=conversation_id,

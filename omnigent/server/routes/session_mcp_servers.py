@@ -442,7 +442,7 @@ def create_session_mcp_servers_router(
 
     async def _require_registry_runtime(request: Request, session_id: str, service: str) -> None:
         from omnigent.runner.routing import routing_host_id
-        from omnigent.server.mcp_compatibility import require_registry_mcp_runtime
+        from omnigent.server.runtime_compatibility import require_runtime_support
 
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
@@ -452,7 +452,7 @@ def create_session_mcp_servers_router(
                 "Named sub-agents use their authored MCP services",
                 code=ErrorCode.INVALID_INPUT,
             )
-        require_registry_mcp_runtime(
+        require_runtime_support(
             [service],
             host_id=await asyncio.to_thread(routing_host_id, conv, conversation_store),
             runner_id=conv.runner_id,
@@ -607,7 +607,7 @@ async def _reset_runner_session_agent_cache(
     if runner_router is None:
         return
     try:
-        routed = runner_router.client_for_session_resources(session_id)
+        routed = await asyncio.to_thread(runner_router.client_for_session_control, session_id)
     except (LookupError, httpx.HTTPError, OmnigentError):
         # The session may not be runner-bound yet. Persisting the bundle is
         # still correct; the next runner bind resolves the updated spec.

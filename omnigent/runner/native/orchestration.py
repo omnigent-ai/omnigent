@@ -27,6 +27,10 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapp
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from omnigent.util.claude_launch_args import (
+    claude_legacy_launch_prompt,
+    without_claude_session_id_arg,
+)
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -2018,8 +2022,10 @@ async def _auto_create_opencode_terminal(
         extra_providers=extra_providers,
     )
     # The per-session XDG_CONFIG_HOME hides the user's global config; carry over
-    # their providers, default model, plugins and MCP servers (v1 or v2 spelling).
-    config = maybe_merge_user_provider_config(config)
+    # providers, the default model, and plugins, but never ambient user MCP
+    # servers. The agent spec plus the Omnigent relay above are the complete
+    # task-scoped tool allowlist for this bridge-owned session.
+    config = maybe_merge_user_provider_config(config, include_user_mcp_servers=False)
     write_opencode_provider_config(
         xdg_config_home,
         config,
@@ -8102,9 +8108,7 @@ def _claude_legacy_launch_prompt(terminal_launch_args: list[str] | None) -> str 
         ``["hello", "--permission-mode", "auto"]``.
     :returns: The leading positional, e.g. ``"hello"``, or ``None``.
     """
-    if not terminal_launch_args or terminal_launch_args[0].startswith("-"):
-        return None
-    return terminal_launch_args[0]
+    return claude_legacy_launch_prompt(terminal_launch_args)
 
 
 async def _claude_prompt_in_history(
@@ -8185,19 +8189,7 @@ def _without_claude_session_id_arg(args: list[str]) -> list[str]:
     """
     if "--fork-session" in args:
         return args
-    kept: list[str] = []
-    skip_value = False
-    for arg in args:
-        if skip_value:
-            skip_value = False
-            continue
-        if arg == "--session-id":
-            skip_value = True
-            continue
-        if arg.startswith("--session-id="):
-            continue
-        kept.append(arg)
-    return kept
+    return without_claude_session_id_arg(args)
 
 
 def _build_claude_native_base_args(
