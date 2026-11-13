@@ -218,7 +218,7 @@ import {
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
-import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
+import { getCliServerUrl, getOmnigentHostConfig, getOmnigentServerIdentity } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import {
@@ -2172,6 +2172,71 @@ export function resetLandingDraft(): void {
   landingDrafts.clear();
 }
 
+// An embedding host can remount the composer or reload the page right after
+// the composer strips `?prompt=` from the URL. A remount renders the new
+// composer before the old one's unmount cleanup parks its draft, and a reload
+// drops the module-scoped draft, so the consumed prompt is parked immediately
+// and kept briefly in sessionStorage.
+const LINKED_PROMPT_TTL_MS = 60_000;
+
+// One origin can front many workspaces, and sessionStorage outlives reloads and
+// sign-in changes, so the kept prompt is scoped to the server and nothing is
+// kept without a server identity. It is also dropped when the viewer differs,
+// but only when both viewers are known: the embed resolves identity after
+// first render, so a prompt kept or read before then is not tied to a viewer.
+function linkedPromptStorageKey(): string | null {
+  const server = getOmnigentServerIdentity();
+  return server === null ? null : `omnigent:linked-prompt:${JSON.stringify([server])}`;
+}
+
+function keepLinkedPrompt(text: string): void {
+  const key = linkedPromptStorageKey();
+  if (key === null) return;
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ text, at: Date.now(), user: getCurrentUserId() }));
+  } catch {
+    // Without storage only the reload case is lost.
+  }
+}
+
+function readKeptLinkedPrompt(): string | null {
+  const key = linkedPromptStorageKey();
+  if (key === null) return null;
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (raw === null) return null;
+    const kept: unknown = JSON.parse(raw);
+    const viewer = getCurrentUserId();
+    if (
+      typeof kept === "object" &&
+      kept !== null &&
+      "text" in kept &&
+      "at" in kept &&
+      typeof kept.text === "string" &&
+      typeof kept.at === "number" &&
+      kept.text.trim() !== "" &&
+      Date.now() - kept.at < LINKED_PROMPT_TTL_MS &&
+      !(viewer !== null && "user" in kept && typeof kept.user === "string" && kept.user !== viewer)
+    ) {
+      return kept.text;
+    }
+    sessionStorage.removeItem(key);
+  } catch {
+    // Unreadable storage means there is nothing to restore.
+  }
+  return null;
+}
+
+function forgetKeptLinkedPrompt(): void {
+  const key = linkedPromptStorageKey();
+  if (key === null) return;
+  try {
+    sessionStorage.removeItem(key);
+  } catch {
+    // Nothing was kept.
+  }
+}
+
 function NewChatWorkspaceControls({
   children,
   disabled,
@@ -2491,12 +2556,21 @@ function NewChatLandingContent({
           autoSeededBranch: "",
         };
 
+  // A fresh page has no parked draft, so a prompt consumed just before a reload
+  // comes back from sessionStorage.
+  const [keptLinkedPrompt] = useState(() =>
+    handoff === null && !linkedPrompt?.trim() && landingDraft === null
+      ? readKeptLinkedPrompt()
+      : null,
+  );
+  const keptLinkedTextRef = useRef<string | null>(keptLinkedPrompt);
   // A handoff or prompt link replaces the parked draft's text, and with it the
   // tags that text's tokens pointed at.
-  const restoresDraftText = handoff === null && !linkedPrompt?.trim();
+  const restoresDraftText = handoff === null && !linkedPrompt?.trim() && keptLinkedPrompt === null;
   const [message, setMessage] = useState<string>(() => {
     if (handoff !== null) return handoff.text;
-    return linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? "");
+    if (linkedPrompt?.trim()) return linkedPrompt;
+    return keptLinkedPrompt ?? restoredDraft?.message ?? "";
   });
   // Filled in once the mention browser below owns the tags.
   const clearTaggedMentionsRef = useRef<() => void>(() => {});
@@ -2505,6 +2579,9 @@ function NewChatLandingContent({
     if (linkedPrompt?.trim()) {
       setMessage(linkedPrompt);
       clearTaggedMentionsRef.current();
+      writeLandingDraft(draftState, { ...draftRef.current, message: linkedPrompt });
+      keepLinkedPrompt(linkedPrompt);
+      keptLinkedTextRef.current = linkedPrompt;
     }
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
@@ -2512,7 +2589,21 @@ function NewChatLandingContent({
     remaining.delete(NEW_SESSION_HANDOFF_PARAM);
     forgetNewSessionHandoff(handoffToken);
     replaceSearchParams(remaining);
-  }, [linkedPrompt, handoffToken, searchParams, replaceSearchParams]);
+  }, [linkedPrompt, handoffToken, searchParams, replaceSearchParams, draftState]);
+  // Once the user acts on the prompt, a reload must not bring the link's text
+  // back over their work. Any change to the text counts (typing, dictation,
+  // slash completion, clearing).
+  function releaseKeptLinkedPrompt(): void {
+    if (keptLinkedTextRef.current === null) return;
+    keptLinkedTextRef.current = null;
+    forgetKeptLinkedPrompt();
+  }
+  useEffect(() => {
+    const kept = keptLinkedTextRef.current;
+    if (kept === null || message === kept) return;
+    keptLinkedTextRef.current = null;
+    forgetKeptLinkedPrompt();
+  }, [message]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -5911,6 +6002,7 @@ function NewChatLandingContent({
   }
 
   async function handleCreate() {
+    releaseKeptLinkedPrompt();
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
