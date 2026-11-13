@@ -111,6 +111,9 @@ describe(
       const { window, electronApp } = desktop;
       // Wall-clock step times let a recording's captions match its footage.
       const mark = (step) => t.diagnostic(`${step} at ${Date.now()}`);
+      // Pauses keep a readable clip only when the capture is retained.
+      const holdForRecording = (ms) =>
+        process.env.OMNIGENT_DESKTOP_RECORD_DIR ? window.waitForTimeout(ms) : Promise.resolve();
       const capture = startDisplayCapture(recordDir, process.env.DISPLAY);
       if (capture) stopCapture = capture.stop;
 
@@ -138,14 +141,22 @@ describe(
       await page.locator("#load", { hasText: "Load #1" }).waitFor({ timeout: 20_000 });
       await spinning.waitFor({ state: "detached", timeout: 10_000 });
       mark("first load shown");
-      await window.waitForTimeout(2_000);
+      await holdForRecording(2_000);
 
+      const clickedAt = Date.now();
       await reload.click();
       await spinning.waitFor({ timeout: 2_000 });
       mark("reload clicked, spinning");
-      assert.equal(fixture.state.pending, 1, "the reload request is still being answered");
+      await eventually(
+        () => fixture.state.requests === 2 && fixture.state.pending === 1,
+        "reload request reached the slow server",
+      );
       assert.equal(await reload.getAttribute("aria-busy"), "true");
-      await window.waitForTimeout(1_500);
+      // Check again a second before the held response is due.
+      await window.waitForTimeout(
+        Math.max(0, RESPONSE_DELAY_MS - 1_000 - (Date.now() - clickedAt)),
+      );
+      assert.equal(fixture.state.pending, 1, "the reload response is still held");
       assert.equal(await spinning.count(), 1, "the icon keeps spinning while the page loads");
 
       await page.locator("#load", { hasText: "Load #2" }).waitFor({ timeout: 20_000 });
@@ -153,7 +164,7 @@ describe(
       mark("reloaded, stopped");
       assert.equal(fixture.state.pending, 0);
       assert.equal(await reload.getAttribute("aria-busy"), "false");
-      await window.waitForTimeout(2_500);
+      await holdForRecording(2_500);
     });
   },
 );
