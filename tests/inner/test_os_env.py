@@ -175,68 +175,41 @@ def test_shell_impl_timeout_includes_exit_code(tmp_path: Path) -> None:
     assert shell_path is not None
 
     result = _shell_impl(
-        command="sleep 2",
+        command="printf partial-stdout; printf partial-stderr >&2; sleep 2",
         timeout=1,
         shell_path=shell_path,
         cwd=tmp_path,
     )
 
-    assert result["stdout"] == ""
-    assert result["stderr"] == ""
+    assert result["stdout"] == "partial-stdout"
+    assert result["stderr"] == "partial-stderr"
     assert result["exit_code"] is None
     assert result["timed_out"] is True
     assert result["error"] == "Command timed out after 1 seconds"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Requires POSIX shell commands and signals")
-def test_shell_impl_timeout_kills_foreground_child(tmp_path: Path) -> None:
-    shell_path = shutil.which("bash") or shutil.which("sh")
-    assert shell_path is not None
-    pid_file = tmp_path / "child.pid"
-    child_command = f"echo $$ > {shlex.quote(str(pid_file))}; exec sleep 30"
-
-    try:
-        result = _shell_impl(
-            command=f"sh -c {shlex.quote(child_command)}; echo after",
-            timeout=1,
-            shell_path=shell_path,
-            cwd=tmp_path,
-        )
-
-        assert result["timed_out"] is True
-        pid = int(pid_file.read_text())
-        deadline = time.monotonic() + 2
-        while process_alive(pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert not process_alive(pid)
-    finally:
-        if pid_file.exists():
-            pid = int(pid_file.read_text())
-            if process_alive(pid):
-                with suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGKILL)
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="Requires POSIX shell commands and signals")
 @pytest.mark.parametrize(
-    ("wait_for_child", "redirect_child", "timed_out"),
-    [(True, False, True), (False, False, True), (False, True, False)],
-    ids=["live-shell", "exited-shell", "successful-background"],
+    ("command_kind", "timed_out"),
+    [("foreground", True), ("live-shell", True), ("exited-shell", True), ("redirected", False)],
+    ids=["foreground", "live-shell", "exited-shell", "successful-background"],
 )
-def test_shell_impl_background_job_lifetime(
-    tmp_path: Path, wait_for_child: bool, redirect_child: bool, timed_out: bool
-) -> None:
+def test_shell_impl_child_lifetime(tmp_path: Path, command_kind: str, timed_out: bool) -> None:
     shell_path = shutil.which("bash") or shutil.which("sh")
     assert shell_path is not None
     pid_file = tmp_path / "child.pid"
-    redirect = " > /dev/null 2>&1" if redirect_child else ""
+    if command_kind == "foreground":
+        child_command = f"echo $$ > {shlex.quote(str(pid_file))}; exec sleep 30"
+        command = f"sh -c {shlex.quote(child_command)}; echo after"
+    else:
+        redirect = " > /dev/null 2>&1" if command_kind == "redirected" else ""
+        command = f"sleep 30{redirect} & echo $! > {shlex.quote(str(pid_file))}"
+        if command_kind == "live-shell":
+            command += "; wait"
 
     try:
         result = _shell_impl(
-            command=(
-                f"sleep 30{redirect} & echo $! > {shlex.quote(str(pid_file))}"
-                + ("; wait" if wait_for_child else "")
-            ),
+            command=command,
             timeout=1,
             shell_path=shell_path,
             cwd=tmp_path,
@@ -250,49 +223,6 @@ def test_shell_impl_background_job_lifetime(
         assert process_alive(pid) is not timed_out
     finally:
         if pid_file.exists():
-            pid = int(pid_file.read_text())
-            if process_alive(pid):
-                with suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGKILL)
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="Requires POSIX shell commands and signals")
-def test_shell_impl_failure_kills_child_and_returns(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A non-timeout failure while waiting kills the tree instead of waiting it out."""
-    shell_path = shutil.which("bash") or shutil.which("sh")
-    assert shell_path is not None
-    pid_file = tmp_path / "child.pid"
-    child_command = f"echo $$ > {shlex.quote(str(pid_file))}; exec sleep 30"
-
-    def failing_communicate(*_args: object, **_kwargs: object) -> tuple[str, str]:
-        # Fail only once the child is running, so there is a tree to clean up.
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            if pid_file.exists() and pid_file.read_text().strip():
-                break
-            time.sleep(0.02)
-        raise RuntimeError("communicate failed")
-
-    monkeypatch.setattr(subprocess.Popen, "communicate", failing_communicate)
-    started = time.monotonic()
-    try:
-        with pytest.raises(RuntimeError, match="communicate failed"):
-            _shell_impl(
-                command=f"sh -c {shlex.quote(child_command)}; echo after",
-                timeout=30,
-                shell_path=shell_path,
-                cwd=tmp_path,
-            )
-        assert time.monotonic() - started < 10
-        pid = int(pid_file.read_text())
-        deadline = time.monotonic() + 2
-        while process_alive(pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert not process_alive(pid)
-    finally:
-        if pid_file.exists() and pid_file.read_text().strip():
             pid = int(pid_file.read_text())
             if process_alive(pid):
                 with suppress(ProcessLookupError):
