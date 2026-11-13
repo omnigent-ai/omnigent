@@ -32,6 +32,8 @@ const ws = vi.hoisted(() => ({
   dirLoading: false,
   searchFiles: [] as unknown[],
 }));
+// Harness ids the server declares ``workspace_file_mentions`` for.
+const declaredMentions = vi.hoisted(() => ({ harnesses: new Set<string>() }));
 const ROOT_ENTRIES: WorkspaceFile[] = [
   { path: "src", name: "src", type: "directory", bytes: null, modified_at: null },
   { path: "readme.md", name: "readme.md", type: "file", bytes: 10, modified_at: null },
@@ -154,6 +156,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     antigravity: "Antigravity",
     copilot: "Copilot",
   }),
+  useFileMentionHarnesses: () => declaredMentions.harnesses,
 }));
 
 import { Composer, detectMentionAt, mentionMarkerFor } from "./ChatPage";
@@ -294,6 +297,7 @@ describe("Composer @-file-mention browser (native sessions)", () => {
   let convSeq = 0;
   beforeEach(() => {
     resetWorkspaceMock();
+    declaredMentions.harnesses = new Set();
     localStorage.clear();
     useChatStore.setState({
       conversationId: `conv_test_${++convSeq}`,
@@ -415,11 +419,24 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     );
   });
 
-  it("does NOT show the mention menu on non-native (in-process SDK) harnesses", () => {
+  it("does NOT show the mention menu on a non-native harness the server doesn't declare", () => {
     useChatStore.setState({ sessionHarness: "claude-sdk" });
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@src");
     expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
+  });
+
+  it("delivers mentions on a non-native harness the server declares", () => {
+    declaredMentions.harnesses = new Set(["claude-sdk"]);
+    useChatStore.setState({ sessionHarness: "claude-sdk" });
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("check @src");
+    fireEvent.click(screen.getByTitle("Open src"));
+    fireEvent.click(screen.getByTitle("Attach server.ts"));
+    append("now");
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith("check [Attached: src/server.ts] now", undefined);
   });
 
   it("opens the menu on an aliased native harness (native-pi → pi-native)", () => {
