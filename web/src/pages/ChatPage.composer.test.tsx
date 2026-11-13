@@ -322,11 +322,11 @@ function renderMobileInShell(ui: ReactElement) {
 /** Swiping down inside an open composer menu keeps focus, draft, and menu,
  * while the same swipe elsewhere in the shell still dismisses. */
 function expectSwipeKeepsMenu(menuTestId: string, draft: string) {
-  swipeDown(screen.getByTestId(menuTestId));
+  act(() => swipeDown(screen.getByTestId(menuTestId)));
   expect(textarea()).toHaveFocus();
   expect(textarea()).toHaveValue(draft);
   expect(screen.getByTestId(menuTestId)).toBeVisible();
-  swipeDown(document.querySelector(".app-shell")!);
+  act(() => swipeDown(document.querySelector(".app-shell")!));
   expect(textarea()).not.toHaveFocus();
 }
 
@@ -1152,7 +1152,7 @@ describe("Composer slash-command menu", () => {
 
   it("keeps the keyboard up while the mobile command menu scrolls", () => {
     renderMobileInShell(<Composer {...composerProps()} />);
-    textarea().focus();
+    act(() => textarea().focus());
     fireEvent.change(textarea(), { target: { value: "/" } });
     expectSwipeKeepsMenu("slash-command-menu", "/");
   });
@@ -4143,7 +4143,7 @@ describe("Composer MCP status command", () => {
         })}
       />,
     );
-    textarea().focus();
+    act(() => textarea().focus());
     fireEvent.change(textarea(), { target: { value: "/" } });
     fireEvent.click(screen.getByTestId("slash-menu-item-mcp"));
     expectSwipeKeepsMenu("mcp-server-menu", "/mcp");

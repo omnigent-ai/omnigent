@@ -502,13 +502,13 @@ describe("Composer @-file-mention browser (native sessions)", () => {
         <Composer {...composerProps()} />
       </div>,
     );
-    textarea().focus();
+    act(() => textarea().focus());
     type("@");
-    swipeDown(screen.getByTestId("file-mention-menu"));
+    act(() => swipeDown(screen.getByTestId("file-mention-menu")));
     expect(textarea()).toHaveFocus();
     expect(textarea()).toHaveValue("@");
     expect(screen.getByTitle("Open src")).toBeVisible();
-    swipeDown(document.querySelector(".app-shell")!);
+    act(() => swipeDown(document.querySelector(".app-shell")!));
     expect(textarea()).not.toHaveFocus();
   });
 
