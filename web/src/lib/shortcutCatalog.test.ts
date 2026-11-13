@@ -50,8 +50,22 @@ describe("shortcutGroupsFor", () => {
     const touch = labelsIn({ ...BROWSER_TAB, preventsKeyboardSubmit: true }, "In chats");
     expect(touch).not.toContain("Send message");
     expect(touch).not.toContain("Pick a question option by number");
+    expect(touch).not.toContain("Reply to selected chat text");
     expect(touch).toContain("Stop response");
     expect(labelsIn(BROWSER_TAB, "In chats").slice(0, 1)).toEqual(["Send message"]);
+  });
+
+  it("documents the transcript selection shortcuts separately from composer shortcuts", () => {
+    const items = shortcutGroupsFor(BROWSER_TAB).find((group) => group.title === "In chats")!.items;
+    expect(items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ label: "Reply to selected chat text", keys: ["↵"] }),
+        expect.objectContaining({
+          label: "Ask about selected chat text in side chat (when available)",
+          keys: ["Alt", "↵"],
+        }),
+      ]),
+    );
   });
 
   it("widens the workspace tab digits when content search adds a tab", () => {

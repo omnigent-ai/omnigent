@@ -90,6 +90,12 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Cycle reasoning effort", keys: [CTRL_KEY, ALT_KEY, "E"] },
       { label: "Cycle permission mode (in session)", keys: [SHIFT_KEY, "Tab"] },
       { label: "Focus chat input", keys: [CTRL_KEY, SHIFT_KEY, "L"] },
+      { label: "Reply to selected chat text", keys: [ENTER_KEY], desktopOnly: true },
+      {
+        label: "Ask about selected chat text in side chat (when available)",
+        keys: [ALT_KEY, ENTER_KEY],
+        desktopOnly: true,
+      },
       { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
       { label: "Stop response", keys: [ESC_KEY] },
     ],
