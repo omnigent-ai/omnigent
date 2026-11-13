@@ -215,6 +215,33 @@ def test_list_pages_newest_first_and_filters(store: SqlAlchemyInboxItemStore) ->
     assert store.list_for_user("alice", created_after=items[0].created_at + 3600) == ([], None)
 
 
+def test_list_keeps_an_item_once_when_its_status_moves_between_the_reads(
+    store: SqlAlchemyInboxItemStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each status is a separate read; a status change in between must not duplicate."""
+    items = [store.create(_new(dedupe_key=f"v1:{n}")) for n in range(3)]
+    newest, moving, oldest = sorted(items, key=lambda i: (i.created_at, i.id), reverse=True)
+    store.update(moving.id, "alice", status="read", now=10)
+    page = store._page
+
+    def reread_after_the_status_moves(session: object, user_id: str, **kwargs: object) -> list:
+        rows = page(session, user_id, **kwargs)  # type: ignore[arg-type]
+        if kwargs["status"] == "read":
+            # Another writer reopens the item after the ``read`` page was taken.
+            SqlAlchemyInboxItemStore(
+                store._engine.url.render_as_string(hide_password=False)
+            ).update(moving.id, "alice", status="unread", now=20)
+        return rows
+
+    monkeypatch.setattr(store, "_page", reread_after_the_status_moves)
+
+    listed, end = store.list_for_user("alice", statuses=frozenset({"unread", "read"}), limit=3)
+    assert [item.id for item in listed] == [newest.id, moving.id, oldest.id]
+    assert end is None
+    reopened = store.get(moving.id, "alice")
+    assert reopened is not None and reopened.status == "unread"
+
+
 def test_unread_count_is_bounded(store: SqlAlchemyInboxItemStore) -> None:
     for n in range(3):
         store.create(_new(dedupe_key=f"v1:{n}"))
