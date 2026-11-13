@@ -15,6 +15,20 @@ _CLEAR_ONE_ROW_COMPOSER = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
 _AGENTS = ("main", "general-purpose", "general-purpose")
 _RULE = "─" * 60
 _PANEL_KEYS = ("Down", "Up", "Enter")
+_BILLING_NOTICE = "\n".join(
+    [
+        "● I started 2 general-purpose agents in the background.",
+        _RULE,
+        "We're changing auto mode to no longer charge for classifier requests in Claude Code.",
+        "However, this session isn't eligible because your requests go through",
+        "gateway.example.com, which isn't compatible with this update.",
+        "Nothing breaks: auto mode keeps working,",
+        "and its classifier requests are billed as before.",
+        "To fix it and access the new version of auto mode, ask your gateway to implement:",
+        "https://code.claude.com/docs/en/auto-mode-classifier-billing",
+        "Enter to continue · Esc to cancel",
+    ]
+)
 
 
 class _Clock:
@@ -324,18 +338,33 @@ def test_a_message_reaches_main_while_the_terminal_shows_a_subagent(
 
 
 @pytest.mark.parametrize(
-    "panel_less_captures", [0, 2], ids=["whole-frames-after", "input-box-without-panel-after"]
+    ("billing_notices", "panel_less_captures"),
+    [(0, 0), (0, 2), (3, 2)],
+    ids=[
+        "whole-frames-after",
+        "input-box-without-panel-after",
+        "billing-notice-then-input-box-without-panel",
+    ],
 )
 def test_an_empty_first_capture_does_not_skip_the_switch_to_main(
-    panel_less_captures: int, bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+    billing_notices: int,
+    panel_less_captures: int,
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     The readiness gate finds the subagent's view the torn first capture hid, and
-    frames that then drop the agent panel are not taken for main.
+    frames that then drop the agent panel are not taken for main, even after a
+    billing notice is acknowledged.
     """
     tui = _FakeClaudeFooter(viewed=1)
     panel_less = "\n".join(tui.pane().splitlines()[:5])
-    tui.queued_captures = ["", tui.pane(), *[panel_less] * panel_less_captures]
+    tui.queued_captures = [
+        "",
+        tui.pane(),
+        *[_BILLING_NOTICE] * billing_notices,
+        *[panel_less] * panel_less_captures,
+    ]
     _drive(monkeypatch, tui)
 
     inject_user_message(bridge_dir, content="what did the explorer find?")
@@ -404,6 +433,24 @@ def test_a_subagent_view_that_will_not_close_is_refused_before_typing(
         inject_user_message(bridge_dir, content="what did the explorer find?")
 
     assert tui.subagent_inbox == []
+    assert tui.draft == ""
+
+
+def test_a_billing_notice_that_keeps_returning_over_a_subagent_view_is_refused(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each acknowledged notice hides the agent panel again, so main is never confirmed."""
+    clock = _Clock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    tui = _FakeClaudeFooter(viewed=1)
+    _drive(monkeypatch, tui)
+    monkeypatch.setattr(tui, "capture", lambda: _BILLING_NOTICE if tui.keys else tui.pane())
+
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied, match="a subagent's view"):
+        inject_user_message(bridge_dir, content="what did the explorer find?")
+
+    assert tui.subagent_inbox == []
+    assert tui.submitted == []
     assert tui.draft == ""
 
 

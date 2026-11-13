@@ -7163,7 +7163,13 @@ def _restore_occupied_input(
         )
         if auto_mode_billing_notice_visible(pane):
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
-            return None
+            if not subagent_view_seen:
+                return None
+            # The notice hid the agent panel, so main still needs two frames in a row.
+            main_frame_seen = False
+            if time.monotonic() >= deadline:
+                return _SUBAGENT_VIEW_SURFACE
+            continue
         surface = _occupying_surface(pane)
         if transcript_toggled and not pane.strip():
             # A torn capture cannot confirm that the toggled view closed.
