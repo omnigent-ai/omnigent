@@ -36,6 +36,8 @@ from tests.runner.conftest import (
 )
 from tests.runner.helpers import NullServerClient
 
+pytestmark = pytest.mark.usefixtures("_isolate_claude_default_model_guard")
+
 
 def _native_spec() -> AgentSpec:
     """Return a claude-native agent spec for session create."""

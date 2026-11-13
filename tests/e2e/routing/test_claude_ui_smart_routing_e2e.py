@@ -73,7 +73,7 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
 ) -> None:
     require_tmux()
     routing_arms("claude-native")  # type: ignore[operator]
-    settings_before = claude_settings_apart_from_the_model()
+    settings_before = claude_settings_apart_from_the_model(include_model=True)
     workspace = trusted_workspace(tmp_path, "claude_ui_ws")
 
     # ── 1. The routed create ────────────────────────────────────────────────
@@ -167,8 +167,13 @@ def test_claude_session_create_routes_the_model_and_then_the_spawn(
         "the spawn's task text never reached the router"
     )
 
-    # ── 4. Isolation: only Claude Code's own `model` key may have moved ──────
-    assert claude_settings_apart_from_the_model() == settings_before, (
-        "~/.claude/settings.json changed beyond its `model` key — routing must "
-        "confine its hook wiring to the session's bridge dir"
+    # The guard restores the saved default after Claude's session-local switch.
+    wait_for(
+        lambda: (
+            True
+            if claude_settings_apart_from_the_model(include_model=True) == settings_before
+            else None
+        ),
+        timeout=10,
+        what="Claude settings, including the saved default, to match their initial state",
     )

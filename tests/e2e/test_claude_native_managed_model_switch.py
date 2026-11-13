@@ -21,6 +21,7 @@ from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.models import model_catalog_store
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.polling import poll_until_async
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
 
@@ -34,8 +35,10 @@ pytestmark = [
     pytest.mark.timeout(180),
 ]
 
-_INITIAL_MODEL = "system.ai.claude-opus-4-8[1m]"
-_TARGET_MODEL = "system.ai.glm-5-3"
+_INITIAL_MODEL = os.environ.get(
+    "OMNIGENT_E2E_CLAUDE_INITIAL_MODEL", "system.ai.claude-opus-4-8[1m]"
+)
+_TARGET_MODEL = os.environ.get("OMNIGENT_E2E_CLAUDE_TARGET_MODEL", "system.ai.glm-5-3")
 
 
 def _capture_pane(socket_path: Path) -> str:
@@ -58,10 +61,16 @@ async def _wait_for_picker(socket_path: Path) -> str:
     pytest.fail(f"Claude did not open its model picker:\n{_capture_pane(socket_path)[-3000:]}")
 
 
+def _status_model_matches(bridge_dir: Path, expected: str) -> bool:
+    # Recent Claude builds omit the context-window suffix in statusLine model IDs.
+    actual = bridge.read_claude_status_model(bridge_dir)
+    return actual is not None and actual.removesuffix("[1m]") == expected.removesuffix("[1m]")
+
+
 async def _wait_for_model(bridge_dir: Path, expected: str, socket_path: Path) -> None:
     deadline = asyncio.get_running_loop().time() + 30
     while asyncio.get_running_loop().time() < deadline:
-        if bridge.read_claude_status_model(bridge_dir) == expected:
+        if _status_model_matches(bridge_dir, expected):
             return
         await asyncio.sleep(0.1)
     pane = _capture_pane(socket_path)
@@ -118,7 +127,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                     "replaceBuiltInOptions": True,
                     "options": [
                         {"model": _INITIAL_MODEL, "label": "Opus"},
-                        {"model": _TARGET_MODEL, "label": "GLM 5.3"},
+                        {"model": _TARGET_MODEL, "label": "Managed target"},
                     ],
                 },
                 "statusLine": {
@@ -138,7 +147,8 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
     )
     rows = await claude_native.claude_model_catalog(None)
     assert rows is not None
-    assert {_INITIAL_MODEL, _TARGET_MODEL} <= {row["id"] for row in rows}
+    available_models = {row["id"] for row in rows}
+    assert {_INITIAL_MODEL, _TARGET_MODEL} <= available_models, sorted(available_models)
     model_catalog_store.write_catalog(
         "claude-native", claude_native.claude_catalog_fingerprint(None), rows
     )
@@ -202,6 +212,10 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
     )
     try:
         await _wait_for_model(bridge_dir, _INITIAL_MODEL, socket_path)
+        (tmp_path / "before-switch.txt").write_text(_capture_pane(socket_path))
+        (tmp_path / "saved-default-before.json").write_text(
+            json.dumps({"model": json.loads(settings_path.read_text())["model"]})
+        )
         app = create_runner_app(
             process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
             spec_resolver=resolve_spec,
@@ -229,6 +243,10 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                 )
                 assert response.status_code == 204, response.text
                 await _wait_for_model(bridge_dir, model, socket_path)
+                await poll_until_async(
+                    lambda: json.loads(settings_path.read_text()).get("model") == _INITIAL_MODEL
+                )
+                assert _status_model_matches(bridge_dir, model)
             await asyncio.to_thread(bridge.inject_slash_command, bridge_dir, command="/model")
             (tmp_path / "open-model-picker.txt").write_text(await _wait_for_picker(socket_path))
             recovered = await client.post(
@@ -237,6 +255,59 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
             )
             assert recovered.status_code == 204, recovered.text
             await _wait_for_model(bridge_dir, _TARGET_MODEL, socket_path)
+            await poll_until_async(
+                lambda: json.loads(settings_path.read_text()).get("model") == _INITIAL_MODEL
+            )
+            assert _status_model_matches(bridge_dir, _TARGET_MODEL)
+            (tmp_path / "after-switch.txt").write_text(_capture_pane(socket_path))
+            (tmp_path / "live-model.json").write_text(
+                json.dumps({"model": bridge.read_claude_status_model(bridge_dir)})
+            )
+            (tmp_path / "saved-default.json").write_text(
+                json.dumps({"model": json.loads(settings_path.read_text())["model"]})
+            )
+
+        # A new standalone pane has no session model override.
+        standalone = [command[0], *command[3:]]
+        subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "new-window",
+                "-d",
+                "-t",
+                "model-switch",
+                "-n",
+                "fresh-default",
+                "-c",
+                str(workspace),
+                shlex.join(standalone),
+            ],
+            check=True,
+            timeout=10,
+        )
+        await _wait_for_model(bridge_dir, _INITIAL_MODEL, socket_path)
+        fresh_pane = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket_path),
+                "capture-pane",
+                "-p",
+                "-t",
+                "model-switch:fresh-default",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        ).stdout
+        (tmp_path / "fresh-session.txt").write_text(fresh_pane)
+        (tmp_path / "fresh-model.json").write_text(
+            json.dumps({"model": bridge.read_claude_status_model(bridge_dir)})
+        )
+        assert json.loads(settings_path.read_text())["model"] == _INITIAL_MODEL
     finally:
         subprocess.run(
             ["tmux", "-S", str(socket_path), "kill-server"], capture_output=True, timeout=10

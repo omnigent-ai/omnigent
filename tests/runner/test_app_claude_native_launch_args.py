@@ -1516,14 +1516,16 @@ async def test_auto_create_claude_terminal_logs_stage_timings(
     "subagent_started,turn_started",
     [(True, True), (True, False), (False, True), (False, False)],
 )
+@pytest.mark.parametrize("failure_stage", ["trust", "settings-metadata"])
 async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fails(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     subagent_started: bool,
     turn_started: bool,
+    failure_stage: str,
 ) -> None:
     """
-    A trust-seeding failure releases only the routers this launch started.
+    A trust or settings-metadata failure releases only this launch's routers.
 
     Seeding runs after the subagent and turn routers start but before the
     forwarder that normally shuts them down exists, so a malformed config must
@@ -1533,6 +1535,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
 
     :param subagent_started: Whether this launch started a subagent router.
     :param turn_started: Whether this launch started a turn router.
+    :param failure_stage: Which pre-launch settings operation fails.
     """
     from unittest.mock import Mock
 
@@ -1549,7 +1552,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
     async def record_turn_shutdown(_session_id: str, router: object) -> None:
         shutdowns.append(("turn", router))
 
-    def failing_seed(_workspace: Path, env: dict[str, str] | None = None) -> None:
+    def failing_settings_operation(*_args: object, **_kwargs: object) -> None:
         raise ValueError("config is not a JSON object")
 
     monkeypatch.setattr(
@@ -1563,8 +1566,14 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
     monkeypatch.setattr(orchestration, "_shutdown_session_router_async", record_subagent_shutdown)
     monkeypatch.setattr(orchestration, "_shutdown_session_turn_router_async", record_turn_shutdown)
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", failing_seed
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
+        failing_settings_operation if failure_stage == "trust" else lambda *_a, **_k: None,
     )
+    if failure_stage == "settings-metadata":
+        monkeypatch.setattr(
+            "omnigent.harnesses.claude_native.bridge.write_user_settings_path",
+            failing_settings_operation,
+        )
     registry = Mock(spec=SessionResourceRegistry)
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 

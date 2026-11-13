@@ -37,6 +37,8 @@ from tests.runner.conftest import (
 from tests.runner.helpers import NullServerClient
 from tests.runner.native_helpers import _harness_spec
 
+pytestmark = pytest.mark.usefixtures("_isolate_claude_default_model_guard")
+
 
 @pytest.fixture(autouse=True)
 def _isolate_anthropic_default_model_env(monkeypatch: pytest.MonkeyPatch) -> None:

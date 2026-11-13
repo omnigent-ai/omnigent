@@ -416,7 +416,7 @@ def _isolate_claude_native_state(
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(state_dir))
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _isolate_claude_default_model_guard(
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,
