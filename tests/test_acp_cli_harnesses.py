@@ -128,12 +128,17 @@ def test_jcode_connect_injects_gateway_env_and_passthrough(
             "JCODE_RUNTIME_DIR": "/tmp/jc-home/run",
         },
     )
+    monkeypatch.setitem(
+        ACP_CLI_HARNESSES,
+        "jcode",
+        dataclasses.replace(ACP_CLI_HARNESSES["jcode"], env_passthrough=("TEST_ROW_AUTH",)),
+    )
     env = _build_acp_cli_spawn_env(_spec("jcode"), harness="jcode", session_id="sess-1")
     assert env["JCODE_DBX_TOKEN"] == "fresh-bearer"
     assert env["JCODE_HOME"] == "/tmp/jc-home"
     assert env["JCODE_RUNTIME_DIR"] == "/tmp/jc-home/run"
     names = set(env["HARNESS_ACP_ENV_PASSTHROUGH"].split(","))
-    assert {"JCODE_DBX_TOKEN", "JCODE_HOME", "JCODE_RUNTIME_DIR"} <= names
+    assert {"TEST_ROW_AUTH", "JCODE_DBX_TOKEN", "JCODE_HOME", "JCODE_RUNTIME_DIR"} <= names
 
 
 def test_jcode_no_connect_is_a_noop(monkeypatch: pytest.MonkeyPatch) -> None:
