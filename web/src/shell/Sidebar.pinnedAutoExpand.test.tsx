@@ -4,15 +4,14 @@ import { type ReactNode, Suspense } from "react";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
-// Navigating to a session never opens its project folder. A collapsed folder lists
-// only the open session (its held row), so folders open and close only on request.
+// Navigating to a session never opens its project folder. Collapsed folders hide
+// every child row, so folders open and close only on request.
 
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { sessionNumberAriaShortcut } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { sidebarConfig } from "@/lib/sidebarConfig";
@@ -141,18 +140,18 @@ describe("navigating to a session in a collapsed project", () => {
     expect(expandedProjects()).toEqual([]);
   });
 
-  it("keeps the folder collapsed and lists only the open session", () => {
+  it("keeps the folder collapsed and hides the open session", () => {
     collapsedProject();
 
     renderAt("/c/sibling_b");
 
     expect(header()).toHaveAttribute("aria-expanded", "false");
-    expect(screen.getAllByRole("link", { name: /sibling_b/ })).toHaveLength(1);
+    expect(screen.queryByRole("link", { name: /sibling_b/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: /sibling_c/ })).not.toBeInTheDocument();
     expect(expandedProjects()).toEqual([]);
   });
 
-  it("holds the open session under the collapsed folder once it's unpinned", () => {
+  it("keeps the open session hidden under the collapsed folder once it's unpinned", () => {
     pinnedRef.current = [conv("pinned_a", "Repro 2506")];
     collapsedProject();
     const { rerenderSidebar } = renderAt("/c/pinned_a");
@@ -161,7 +160,7 @@ describe("navigating to a session in a collapsed project", () => {
     act(() => rerenderSidebar());
 
     expect(header()).toHaveAttribute("aria-expanded", "false");
-    expect(screen.getAllByRole("link", { name: /pinned_a/ })).toHaveLength(1);
+    expect(screen.queryByRole("link", { name: /pinned_a/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("link", { name: /sibling_b/ })).not.toBeInTheDocument();
     expect(expandedProjects()).toEqual([]);
   });
@@ -221,7 +220,7 @@ describe("collapsing the project that holds the open session", () => {
     expect(expandedProjects()).toEqual([]);
   });
 
-  it("keeps the open session's row under the collapsed header until navigating away", () => {
+  it("hides the open session's row when its project collapses", () => {
     openFiledSession();
     renderAt("/c/sibling_b");
 
@@ -231,17 +230,10 @@ describe("collapsing the project that holds the open session", () => {
       "aria-expanded",
       "false",
     );
-    expect(screen.getAllByRole("link", { name: /sibling_b/ })).toHaveLength(1);
-    // The held row keeps its numbered hotkey, after the pinned row's.
-    expect(screen.getByRole("link", { name: /sibling_b/ })).toHaveAttribute(
-      "aria-keyshortcuts",
-      sessionNumberAriaShortcut("2"),
-    );
-    fireEvent.click(screen.getByRole("link", { name: /pinned_x/ }));
     expect(screen.queryByRole("link", { name: /sibling_b/ })).not.toBeInTheDocument();
   });
 
-  it("badges the collapsed header only for the rows it hides", () => {
+  it("badges the collapsed header for the hidden open session", () => {
     const awaiting = (id: string) =>
       ({ ...conv(id, "Repro 2506"), pending_elicitations_count: 1 }) as Conversation;
     openFiledSession();
@@ -251,13 +243,13 @@ describe("collapsing the project that holds the open session", () => {
 
     const header = () => screen.getByRole("button", { name: /^Repro 2506/ });
     expect(header()).toHaveAttribute("aria-expanded", "false");
-    expect(within(header()).queryByText("Needs response")).toBeNull();
+    expect(within(header()).getByText("Needs response")).toBeInTheDocument();
     expect(screen.getAllByText("Needs response")).toHaveLength(1);
 
     mockConversations([conv("pinned_x"), awaiting("sibling_b"), awaiting("sibling_c")]);
     act(() => rerenderSidebar());
     expect(within(header()).getByText("Needs response")).toBeInTheDocument();
-    expect(screen.getAllByText("Needs response")).toHaveLength(2);
+    expect(screen.getAllByText("Needs response")).toHaveLength(1);
   });
 
   // The chat page suspends until released, holding the route commit as a loading chat does.
@@ -333,7 +325,7 @@ describe("collapsing the project that holds the open session", () => {
       "false",
     );
     expect(expandedProjects()).toEqual([]);
-    expect(screen.getAllByRole("link", { name: /sibling_b/ })).toHaveLength(1);
+    expect(screen.queryByRole("link", { name: /sibling_b/ })).not.toBeInTheDocument();
   });
 
   it("stays collapsed when an open child session resolves to its parent", async () => {
@@ -361,8 +353,7 @@ describe("collapsing the project that holds the open session", () => {
       await parentGate;
     });
 
-    // The collapsed folder now holds the resolved parent's row.
-    expect(await screen.findByRole("link", { name: /sibling_b/ })).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /sibling_b/ })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Repro 2506" })).toHaveAttribute(
       "aria-expanded",
       "false",

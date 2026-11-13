@@ -209,7 +209,7 @@ describe("Sidebar open session reveal", () => {
     { route: "its own route", childId: undefined },
     { route: "a child route", childId: "conv_child" },
   ])(
-    "holds an older session filed only by project id under its folder, on $route",
+    "reveals an older session filed only by project id after expanding its folder, on $route",
     async ({ childId }) => {
       mocks.projects = [{ id: "proj_1", name: "Customer X" }];
       const older = conversation("conv_older", {
@@ -219,12 +219,11 @@ describe("Sidebar open session reveal", () => {
       });
       renderOpenSession("conv_older", LOADED, older, { childId });
 
-      // The folder stays collapsed and lists the open session as its held row.
+      const projectHeader = screen.getByRole("button", { name: /^Customer X/ });
+      expect(projectHeader).toHaveAttribute("aria-expanded", "false");
+      expect(screen.queryByRole("link", { name: /Older filed work/ })).toBeNull();
+      fireEvent.click(projectHeader);
       const row = await findOpenRow(/Older filed work/);
-      expect(screen.getByRole("button", { name: /^Customer X/ })).toHaveAttribute(
-        "aria-expanded",
-        "false",
-      );
       expect(screen.getByText("Customer X").closest("section")).toContainElement(row);
     },
   );

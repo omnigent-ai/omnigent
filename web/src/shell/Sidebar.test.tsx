@@ -2828,7 +2828,7 @@ describe("Sidebar project sections", () => {
     expect(screen.queryByText("conv_filed")).toBeNull();
   });
 
-  it("holds the selected session under its collapsed project folder", () => {
+  it("hides the selected session under its collapsed project folder", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -2851,11 +2851,11 @@ describe("Sidebar project sections", () => {
       </QueryClientProvider>,
     );
 
-    // Selecting the session doesn't open the folder; its row stays listed under it.
+    // Selecting the session doesn't open the folder or keep its child row visible.
     const header = screen.getByRole("button", { name: /^Customer X/ });
     expect(header).toHaveAttribute("aria-expanded", "false");
     const projectSection = screen.getByText("Customer X").closest("section")!;
-    expect(within(projectSection).getByText("conv_filed")).toBeInTheDocument();
+    expect(within(projectSection).queryByText("conv_filed")).not.toBeInTheDocument();
   });
 
   it("moves a pinned project session out into the global Pinned section", () => {

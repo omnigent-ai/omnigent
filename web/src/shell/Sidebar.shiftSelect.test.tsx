@@ -380,7 +380,7 @@ describe("Sidebar shift-click selection", () => {
     },
   );
 
-  it("includes a collapsed folder's held open session in a projects-scope range", async () => {
+  it("excludes a collapsed folder's open session from a projects-scope range", async () => {
     projectsMock.push("Alpha", "Beta", "Gamma");
     mockConversations([
       conv("a0", { labels: { omni_project: "Alpha" }, updated_at: 5 }),
@@ -405,13 +405,13 @@ describe("Sidebar shift-click selection", () => {
     fireEvent.click(await screen.findByRole("link", { name: "a0" }));
     fireEvent.click(screen.getByRole("link", { name: "g0" }), { shiftKey: true });
     await waitFor(() => {
-      expect(screen.getByText("3 selected")).toBeInTheDocument();
+      expect(screen.getByText("2 selected")).toBeInTheDocument();
     });
     fireEvent.click(screen.getByTestId("bulk-archive"));
     await waitFor(() => {
       expect(bulkArchiveMock.mutate).toHaveBeenCalledTimes(1);
     });
-    expect([...bulkArchiveMock.mutate.mock.calls[0][0].ids].sort()).toEqual(["a0", "b1", "g0"]);
+    expect([...bulkArchiveMock.mutate.mock.calls[0][0].ids].sort()).toEqual(["a0", "g0"]);
   });
 
   it("keeps a selected folder session in bulk actions once it moves behind Show more", async () => {

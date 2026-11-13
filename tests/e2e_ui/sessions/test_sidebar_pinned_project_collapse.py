@@ -155,8 +155,7 @@ def test_collapsing_project_of_open_session_stays_collapsed(
 ) -> None:
     """Collapsing the open session's project sticks through pinned-session activity.
 
-    The open session stays visible as a single held row under the collapsed
-    header until the user navigates to another session.
+    Collapsing hides every child row, including the open session.
     """
     base_url, pinned_id = seeded_session
     _, member_id, outside_id = seeded_session_pair
@@ -173,10 +172,10 @@ def test_collapsing_project_of_open_session_stays_collapsed(
 
     page: Page = request.getfixturevalue("page")
     page.goto(f"{base_url}/c/{member_id}")
-    # Arriving doesn't open the folder: it stays collapsed and holds the open session.
+    # Arriving doesn't open the folder, and no child rows remain visible.
     folder_header = page.get_by_role("button", name=project, exact=True)
     expect(folder_header).to_have_attribute("aria-expanded", "false")
-    expect(_section(page, project).locator(f'a[href="/c/{member_id}"]')).to_have_count(1)
+    expect(_section(page, project).locator(f'a[href="/c/{member_id}"]')).to_have_count(0)
     pinned_row = _row(page, pinned_id)
     expect(pinned_row).to_be_visible()
     pinned_row.hover()
@@ -205,7 +204,7 @@ def test_collapsing_project_of_open_session_stays_collapsed(
     assert project not in json.loads(
         page.evaluate("localStorage.getItem('omnigent:expanded-project-sections') ?? '[]'")
     )
-    expect(_section(page, project).locator(f'a[href="/c/{member_id}"]')).to_have_count(1)
+    expect(_section(page, project).locator(f'a[href="/c/{member_id}"]')).to_have_count(0)
 
     page.locator(f'a[href="/c/{outside_id}"]').first.click()
     expect(page).to_have_url(re.compile(rf"/c/{outside_id}$"))
