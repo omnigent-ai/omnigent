@@ -424,6 +424,8 @@ print(json.dumps({{'contained': True}}))
     assert not target.exists()
     assert not home_output.exists()
     assert protected_home_file.read_text() == "unchanged host content"
+    assert outside.is_dir()
+    assert secret.read_text() == "private canary"
     if writable_grant:
         assert (writable / "allowed.txt").read_text() == "allowed write"
     assert not (writable / "denied.txt").exists()
