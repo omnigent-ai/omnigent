@@ -321,7 +321,7 @@ jobs:
             -n 4 \
             --dist=loadfile \
             --timeout=300 \
-            --junitxml=artifacts/pytest-stores-crdb.xml
+            --junitxml=artifacts/pytest-stores-crdb-${{ matrix.crdb_version }}.xml
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
