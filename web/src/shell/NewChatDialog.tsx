@@ -6071,6 +6071,9 @@ function NewChatLandingContent({
   }
 
   async function handleCreate() {
+    // Captured before any await: a newer prompt link can replace the kept record
+    // while an earlier submit is still waiting on a pre-create check.
+    const submittedLinkedPrompt = keptLinkedRef.current;
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
@@ -6165,8 +6168,6 @@ function NewChatLandingContent({
       // Spend the draft only once provisioning starts, after the laptop credential check.
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
-      // A newer prompt link may replace the kept prompt while this create runs.
-      const submittedLinkedPrompt = keptLinkedRef.current;
       submittedLinkedPromptRef.current = submittedLinkedPrompt;
       if (submittedLinkedPrompt !== null) submittedKeptPromptIds.add(submittedLinkedPrompt.id);
       if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
