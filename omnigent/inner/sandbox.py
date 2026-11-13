@@ -565,6 +565,15 @@ class HarnessSandboxValidationError(ValueError):
         return self._GUIDANCE.get(self.reason, "The requested sandbox policy cannot be enforced.")
 
 
+class HarnessSandboxPreparationError(OSError):
+    """Containment setup failed; keep its diagnostic separate from client guidance."""
+
+    client_message = (
+        "The requested sandbox could not be prepared. "
+        "Check the host sandbox configuration and retry."
+    )
+
+
 def validate_harness_sandbox(
     spec: OSEnvSpec,
     harness: str,

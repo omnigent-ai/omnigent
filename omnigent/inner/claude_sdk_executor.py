@@ -110,6 +110,8 @@ from .executor import (
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
     SandboxPolicy,
     create_exec_launcher,
     get_backend,
@@ -1910,27 +1912,32 @@ def prepare_claude_cli_path(
     if _sandbox_disabled_by_env():
         raise OSError("OMNIGENT_CLAUDE_SDK_NO_SANDBOX conflicts with the requested sandbox")
 
-    sandbox = resolve_sandbox(spec, resolved_cwd)
-    if not sandbox.active:
-        raise OSError("Claude SDK requires an active sandbox for the requested policy")
+    try:
+        sandbox = resolve_sandbox(spec, resolved_cwd)
+        if not sandbox.active:
+            raise OSError("Claude SDK requires an active sandbox for the requested policy")
 
-    sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
-    sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
-    sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-    probe = [sys.executable, "-c", "pass"]
-    if (
-        get_backend(sandbox.backend_type).wrap_launcher_argv(
-            probe, sandbox, resolved_cwd, target=real_cli_path
+        sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
+        sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
+        sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
+        probe = [sys.executable, "-c", "pass"]
+        if (
+            get_backend(sandbox.backend_type).wrap_launcher_argv(
+                probe, sandbox, resolved_cwd, target=real_cli_path
+            )
+            == probe
+        ):
+            raise OSError("Sandbox backend cannot contain the Claude CLI at spawn")
+        return PreparedClaudeCli(
+            cli_path=create_exec_launcher(real_cli_path, sandbox, cwd=str(resolved_cwd)),
+            enable_native_tools=True,
+            sandbox=sandbox,
+            cwd=str(resolved_cwd),
         )
-        == probe
-    ):
-        raise OSError("Sandbox backend cannot contain the Claude CLI at spawn")
-    return PreparedClaudeCli(
-        cli_path=create_exec_launcher(real_cli_path, sandbox, cwd=str(resolved_cwd)),
-        enable_native_tools=True,
-        sandbox=sandbox,
-        cwd=str(resolved_cwd),
-    )
+    except HarnessSandboxValidationError:
+        raise
+    except Exception as exc:
+        raise HarnessSandboxPreparationError(str(exc)) from exc
 
 
 def prepare_tight_cli_process(

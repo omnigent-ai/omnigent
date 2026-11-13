@@ -424,14 +424,23 @@ async def test_executor_error_terminates_with_response_failed(
         ),
         (
             '{"sandbox": {"type": "linux_bwrap"}}',
-            "Antigravity cannot enforce",
+            "The selected harness cannot enforce os_env.sandbox",
             "UnsupportedHarnessSandboxError",
         ),
+        (
+            '{"sandbox": {"type": "linux_bwrap"}}',
+            "The requested sandbox could not be prepared.",
+            "HarnessSandboxPreparationError",
+        ),
     ],
-    ids=["invalid-policy", "unsupported-policy"],
+    ids=["invalid-policy", "unsupported-policy", "backend-error"],
 )
 async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry(
-    monkeypatch: pytest.MonkeyPatch, policy: str, message: str, error_code: str
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    policy: str,
+    message: str,
+    error_code: str,
 ) -> None:
     """Child-side policy rejection terminates the turn and permits a same-session retry."""
     import asyncio
@@ -447,8 +456,46 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
     )
     constructor = Mock(return_value=executor)
     monkeypatch.setattr(antigravity_harness, "AntigravityExecutor", constructor)
-    monkeypatch.setenv("HARNESS_ANTIGRAVITY_OS_ENV", policy)
-    factory = Mock(wraps=antigravity_harness._build_antigravity_executor)
+    policy_env = "HARNESS_ANTIGRAVITY_OS_ENV"
+    builder = antigravity_harness._build_antigravity_executor
+    private_diagnostic = "/private/host/toolchain/unfinished-scan-directory"
+    if error_code == "HarnessSandboxPreparationError":
+        from omnigent.inner import claude_sdk_executor
+        from omnigent.inner.os_env_serialization import resolve_harness_os_env
+        from omnigent.inner.sandbox import SandboxPolicy
+
+        policy_env = "HARNESS_CLAUDE_SDK_OS_ENV"
+        monkeypatch.delenv("OMNIGENT_CLAUDE_SDK_NO_SANDBOX", raising=False)
+        monkeypatch.setattr(
+            claude_sdk_executor,
+            "resolve_sandbox",
+            Mock(
+                return_value=SandboxPolicy(
+                    backend_type="linux_bwrap",
+                    active=True,
+                    read_roots=[],
+                    write_roots=[],
+                    write_files=[],
+                    allow_network=True,
+                )
+            ),
+        )
+        backend = Mock()
+        backend.wrap_launcher_argv.side_effect = OSError(
+            f"Containment scan failed: {private_diagnostic}"
+        )
+        monkeypatch.setattr(claude_sdk_executor, "get_backend", Mock(return_value=backend))
+
+        def build_claude_with_mock_executor() -> Executor:
+            claude_sdk_executor.prepare_claude_cli_path(
+                "/test/claude", resolve_harness_os_env(policy_env)
+            )
+            return constructor()
+
+        builder = build_claude_with_mock_executor
+
+    monkeypatch.setenv(policy_env, policy)
+    factory = Mock(wraps=builder)
     session_id = "conv_factory_policy_retry"
     adapter = ExecutorAdapter(executor_factory=factory, session_key=session_id)
     app = adapter.build()
@@ -477,6 +524,9 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
             assert failed["status"] == "failed"
             assert failed["error"]["code"] == error_code
             assert message in failed["error"]["message"]
+            assert private_diagnostic not in json.dumps([event.data for event in failed_events])
+            if error_code == "HarnessSandboxPreparationError":
+                assert private_diagnostic in caplog.text
             factory.assert_called_once_with()
             constructor.assert_not_called()
             assert adapter._executor is None
@@ -485,7 +535,7 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
             assert adapter._active_turn_ctx is None
             assert adapter._in_flight == {}
 
-            monkeypatch.setenv("HARNESS_ANTIGRAVITY_OS_ENV", '{"sandbox": {"type": "none"}}')
+            monkeypatch.setenv(policy_env, '{"sandbox": {"type": "none"}}')
             async with client.stream(
                 "POST", f"/v1/sessions/{session_id}/events", json=_start_turn_body()
             ) as response:
