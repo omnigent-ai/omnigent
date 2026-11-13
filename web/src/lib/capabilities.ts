@@ -265,6 +265,8 @@ export interface ServerInfo {
    * Session control there. Fails to ``false``.
    */
   scheduled_task_session_modes?: boolean;
+  /** Scheduled tasks accept `mcp_services`; older servers reject it. */
+  scheduled_task_mcp_services?: boolean;
   /**
    * True when a session create (and so ``sys_session_create``) accepts
    * ``permission_mode``. Older servers ignore the field, so trigger templates
@@ -485,6 +487,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   session_search_scope: false,
   scheduled_task_session_modes: false,
   session_create_permission_modes: false,
+  scheduled_task_mcp_services: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
   scheduled_task_trigger_headers: false,
@@ -665,6 +668,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           session_create_permission_modes: data.session_create_permission_modes === true,
+          scheduled_task_mcp_services: data.scheduled_task_mcp_services === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,

@@ -12,6 +12,7 @@ import {
   FolderIcon,
   FolderOpenIcon,
   MonitorIcon,
+  PlugIcon,
   RefreshCwIcon,
   ShieldCheckIcon,
   TriangleAlertIcon,
@@ -93,6 +94,9 @@ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAge
 import { useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { McpRegistryPicker } from "@/components/McpRegistry";
+import { useMcpRegistryCatalog } from "@/hooks/useMcpRegistry";
+import { readLastMcpServices } from "@/lib/mcpPreferences";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
@@ -246,6 +250,11 @@ export function CreateScheduledTaskDialog({
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   // Older servers reject a task's project fields, so the picker needs the flag.
   const projectsSupported = info !== "loading" && info.scheduled_task_projects === true;
+  // Older servers reject a task's mcp_services, and without a registry there is nothing to pick.
+  const mcpRegistryEnabled =
+    info !== "loading" &&
+    info.scheduled_task_mcp_services === true &&
+    !!info.enabled_connections?.includes("mcp");
   const sandboxRepoCatalog =
     info !== "loading" && info.scheduled_task_sandbox_workspaces === true && info.sandbox_provider
       ? (info.sandbox_provider_capabilities?.[info.sandbox_provider]?.repo_catalog ?? [])
@@ -450,6 +459,7 @@ export function CreateScheduledTaskDialog({
     setAgentMenuOpen(false);
     setScheduleMenuOpen(false);
     setEndingMenuOpen(false);
+    setMcpMenuOpen(false);
     selectOpenCountRef.current = 0;
     nestedMenuOpenCountRef.current = 0;
     nestedMenuClosedAtRef.current = 0;
@@ -519,6 +529,9 @@ export function CreateScheduledTaskDialog({
   const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
   const [sessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
   const [startNewSession, setStartNewSession] = useState(false);
+  const [mcpServices, setMcpServices] = useState<string[]>([]);
+  const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
+  const [mcpMenuOpen, setMcpMenuOpen] = useState(false);
   const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
     ? "managed_sandbox"
     : "connected_host";
@@ -632,6 +645,7 @@ export function CreateScheduledTaskDialog({
         setPickedProjectId(null);
         setSessionMode(editingTask.sessionMode);
         setStartNewSession(false);
+        setMcpServices(editingTask.mcpServices);
         if (editingTriggerConfig !== null) {
           const {
             source,
@@ -672,6 +686,8 @@ export function CreateScheduledTaskDialog({
         setSandboxMode(false);
         setProjectChoice(null);
         setPickedProjectId(null);
+        // Start from the services the owner last picked for a new chat.
+        setMcpServices(readLastMcpServices());
       }
       setError(null);
     }
@@ -1243,6 +1259,35 @@ export function CreateScheduledTaskDialog({
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
+  // A trigger's saved worker settings hide the session controls, so its services stay as saved.
+  const mcpPickerShown = mcpRegistryEnabled && !editingWorkerSettings;
+  const mcpCatalog = useMcpRegistryCatalog(open && mcpPickerShown);
+  // A saved or remembered service the catalog no longer offers is not saved again.
+  const offeredMcpServices = mcpServices.filter((id) =>
+    mcpCatalog.services.some((service) => service.id === id),
+  );
+  const mcpNeedsSignIn = mcpCatalog.services.filter(
+    (service) => offeredMcpServices.includes(service.id) && !service.connected,
+  ).length;
+  // Runs start unattended, so every selected service must already be signed in.
+  const mcpBlockedReason =
+    !mcpPickerShown || reusesExistingSession || mcpServices.length === 0
+      ? null
+      : mcpCatalog.loading
+        ? "Loading MCP services…"
+        : mcpCatalog.error
+          ? "Could not load MCP services. Retry, or turn them off."
+          : mcpNeedsSignIn > 0
+            ? "Sign in to each selected MCP service, or turn it off."
+            : null;
+  const mcpServicesChanged =
+    editingTask === null
+      ? offeredMcpServices.length > 0
+      : !sameServices(offeredMcpServices, editingTask.mcpServices);
+  const toggleMcpService = (id: string, next: boolean) =>
+    setMcpServices((current) =>
+      next ? [...new Set([...current, id])] : current.filter((service) => service !== id),
+    );
   const canSubmit =
     !curationPending &&
     name.trim() !== "" &&
@@ -1255,6 +1300,8 @@ export function CreateScheduledTaskDialog({
     !scheduleInvalid &&
     !pollingBlockedReason &&
     !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
+    mcpBlockedReason === null &&
+    !mcpAuthorizing &&
     !mutationPending;
   // Problems that disable Save but whose explanation or fix lives under Advanced settings.
   const advancedBlocksSubmit =
@@ -1380,6 +1427,7 @@ export function CreateScheduledTaskDialog({
     setTrigger(null);
     setTriggerFields(emptyTriggerFields("jira"));
     setTriggerTaskSessionMode("new");
+    setMcpServices([]);
     setError(null);
     setScheduleUnsupported(false);
   }
@@ -1446,6 +1494,7 @@ export function CreateScheduledTaskDialog({
                   }
                 : {}),
               ...(supportsPermission ? { permissionMode: effectivePermission || null } : {}),
+              ...(mcpPickerShown && mcpServicesChanged ? { mcpServices: offeredMcpServices } : {}),
             };
         await updateMutation.mutateAsync({
           id: editingTask.id,
@@ -1481,6 +1530,7 @@ export function CreateScheduledTaskDialog({
           ...(supportsPermission && effectivePermission !== ""
             ? { permissionMode: effectivePermission }
             : {}),
+          ...(mcpPickerShown && mcpServicesChanged ? { mcpServices: offeredMcpServices } : {}),
         });
         onCreated?.(created);
       }
@@ -1935,6 +1985,79 @@ export function CreateScheduledTaskDialog({
                           ))}
                         </SelectContent>
                       </Select>
+                    )}
+
+                    {mcpPickerShown && (
+                      <Popover
+                        open={mcpMenuOpen}
+                        onOpenChange={(next) => !mcpAuthorizing && setMcpMenuOpen(next)}
+                      >
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="inline-flex w-full sm:col-span-2">
+                              <PopoverTrigger asChild>
+                                <ComposerHarnessTrigger
+                                  label="MCP services"
+                                  model={
+                                    reusesExistingSession
+                                      ? "Session's MCPs"
+                                      : offeredMcpServices.length === 0
+                                        ? "No MCPs"
+                                        : `MCPs · ${offeredMcpServices.length}`
+                                  }
+                                  icon={
+                                    <PlugIcon
+                                      className={`size-4 shrink-0${
+                                        mcpBlockedReason && !mcpCatalog.loading
+                                          ? " text-amber-600 dark:text-amber-500"
+                                          : ""
+                                      }`}
+                                    />
+                                  }
+                                  disabled={reusesExistingSession}
+                                  className={`${AUTOMATION_CONTROL_TRIGGER_CLASS_NAME} w-full`}
+                                  data-testid="task-mcp-services-trigger"
+                                />
+                              </PopoverTrigger>
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            {reusesExistingSession
+                              ? "The continued session keeps its MCP services"
+                              : (mcpBlockedReason ?? "MCP services every run starts with")}
+                          </TooltipContent>
+                        </Tooltip>
+                        <PopoverContent
+                          align="end"
+                          collisionPadding={12}
+                          className="flex max-h-[var(--radix-popover-content-available-height)] w-72 max-w-[calc(100vw-2rem)] flex-col p-0"
+                          data-testid="task-mcp-services-menu"
+                        >
+                          <div className="shrink-0 border-b border-border px-3 py-2.5">
+                            <PickerSectionHeader>MCP services</PickerSectionHeader>
+                            <p className="mt-0.5 text-xs text-muted-foreground">
+                              Every run starts with these. Runs are unattended, so sign in to each
+                              one now.
+                            </p>
+                          </div>
+                          <McpRegistryPicker
+                            attached={mcpServices}
+                            onToggle={toggleMcpService}
+                            busy={mutationPending}
+                            onAuthorizingChange={setMcpAuthorizing}
+                            catalog={mcpCatalog}
+                          />
+                        </PopoverContent>
+                      </Popover>
+                    )}
+                    {mcpBlockedReason && !mcpCatalog.loading && (
+                      <p
+                        role="alert"
+                        data-testid="task-mcp-services-blocked"
+                        className="text-sm text-destructive sm:col-span-6"
+                      >
+                        {mcpBlockedReason}
+                      </p>
                     )}
                     <Collapsible
                       open={advancedOpen}
@@ -2565,3 +2688,8 @@ const SANDBOX_HOST = "__sandbox__";
 // other dialogs (project settings) can reuse it without pulling this file's
 // module graph. Re-exported here to keep existing imports and tests stable.
 export { isBackdropOverlay, isInsidePopper, shouldGuardDialogDismiss };
+
+/** Whether two MCP service lists name the same services, in any order. */
+function sameServices(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((service) => right.includes(service));
+}

@@ -110,6 +110,18 @@ describe("listScheduledTasks", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}));
     await expect(listScheduledTasks()).resolves.toEqual([]);
   });
+
+  // Servers that predate task MCP services omit the key.
+  it.each([
+    ["absent", {}, []],
+    ["present", { mcp_services: ["github", "slack"] }, ["github", "slack"]],
+  ])("maps a task's MCP services (%s)", async (_, extra, mcpServices) => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ scheduled_tasks: [{ ...TASK_WIRE, ...extra }] }),
+    );
+    const [task] = await listScheduledTasks();
+    expect(task.mcpServices).toEqual(mcpServices);
+  });
 });
 
 describe("getScheduledTask", () => {
@@ -279,6 +291,16 @@ describe("createScheduledTask", () => {
     expect(bodies[0].project_id).toBe("proj_1");
     expect(bodies[1]).not.toHaveProperty("project_id");
   });
+
+  it("sends picked MCP services and omits an empty pick", async () => {
+    fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
+    const base = { name: "n", prompt: "p", rrule: "FREQ=DAILY", agentId: "ag_1" };
+    await createScheduledTask({ ...base, mcpServices: ["github"] });
+    await createScheduledTask({ ...base, mcpServices: [] });
+    const bodies = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body));
+    expect(bodies[0].mcp_services).toEqual(["github"]);
+    expect(bodies[1]).not.toHaveProperty("mcp_services");
+  });
 });
 
 describe("updateScheduledTask", () => {
@@ -299,6 +321,15 @@ describe("updateScheduledTask", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, project_id: projectId }));
     await updateScheduledTask("st_1", { projectId });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ project_id: projectId });
+  });
+
+  it.each([
+    ["replaces the MCP services", ["slack"]],
+    ["sends an explicit [] to turn them all off", []],
+  ])("%s", async (_, mcpServices) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, mcp_services: mcpServices }));
+    await updateScheduledTask("st_1", { mcpServices });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ mcp_services: mcpServices });
   });
 });
 
