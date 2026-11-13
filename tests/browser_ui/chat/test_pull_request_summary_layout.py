@@ -44,8 +44,8 @@ def test_summary_chips_keep_names_and_actions_inside(
     font_size: int,
 ) -> None:
     """Reviewer logins stay readable and each chip's button stays inside it; narrow
-    rails stack Reviewers above Labels, and a review state truncates, keeping its full
-    text in the tooltip, only once its chip fills the column."""
+    rails stack Labels under Reviewers with a top divider, and a review state
+    truncates, keeping its full text in the tooltip, only once its chip fills the column."""
     chat = chat_session_contract
     api = f"/v1/sessions/{chat.session_id}"
     linked = {
@@ -117,11 +117,16 @@ def test_summary_chips_keep_names_and_actions_inside(
     assert abs(box(rail)["width"] - rail_width) <= TOLERANCE
 
     reviewers_box, labels_box = box(reviewers), box(labels)
+    top_border, left_border = labels.locator("xpath=..").evaluate(
+        "el => [getComputedStyle(el).borderTopWidth, getComputedStyle(el).borderLeftWidth]"
+    )
     if rail_width < 480:
         assert labels_box["y"] >= reviewers_box["y"] + reviewers_box["height"]
+        assert (top_border, left_border) == ("1px", "0px")
     else:
         assert labels_box["x"] >= reviewers_box["x"] + reviewers_box["width"]
         assert abs(labels_box["y"] - reviewers_box["y"]) <= TOLERANCE
+        assert top_border == "0px"
 
     for reviewer in _REVIEWERS:
         login = reviewer["login"]
