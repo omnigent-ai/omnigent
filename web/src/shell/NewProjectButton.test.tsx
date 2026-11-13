@@ -12,7 +12,7 @@ const mocks = vi.hoisted(() => ({
   createDirectory: vi.fn(),
   cloneRepository: vi.fn(),
   projectError: null as Error | null,
-  projects: [] as { name: string }[],
+  projects: [] as { id: string | null; name: string }[],
   serverInfo: "loading" as unknown,
 }));
 
@@ -494,7 +494,7 @@ describe("NewProjectButton project repositories", () => {
 
   it("refuses a name that another project already uses", () => {
     mocks.serverInfo = projectServerInfo;
-    mocks.projects = [{ name: "Garden" }];
+    mocks.projects = [{ id: "project_1", name: "Garden" }];
     renderButton([laptop]);
 
     nameProject("Garden");
@@ -506,6 +506,24 @@ describe("NewProjectButton project repositories", () => {
     expect(mocks.cloneRepository).not.toHaveBeenCalled();
     expect(mocks.createProject).not.toHaveBeenCalled();
   });
+
+  it.each([true, false])(
+    "creates a project from a label-only legacy project (feature enabled: %s)",
+    async (enabled) => {
+      mocks.serverInfo = {
+        ...projectServerInfo,
+        features: { project_repository_creation: enabled },
+      };
+      mocks.projects = [{ id: null, name: "Garden" }];
+      renderButton([laptop]);
+
+      nameProject("Garden");
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+
+      await waitFor(() => expect(mocks.createProject).toHaveBeenCalledTimes(1));
+      expect(mocks.createProject.mock.calls[0][0].name).toBe("Garden");
+    },
+  );
 
   it("keeps a branch typed before Add when the URL is added to the selection", async () => {
     mocks.serverInfo = projectServerInfo;

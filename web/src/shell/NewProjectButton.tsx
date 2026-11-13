@@ -229,7 +229,8 @@ export function NewProjectButton({
     const submission = ++submissionGeneration.current;
     setSubmitError(null);
 
-    if (projects.some((project) => project.name === trimmed)) {
+    // Label-only legacy projects (no id) can be promoted to a project of the same name.
+    if (projects.some((project) => project.id !== null && project.name === trimmed)) {
       setSubmitError("A project with this name already exists. Use a different name.");
       return;
     }
