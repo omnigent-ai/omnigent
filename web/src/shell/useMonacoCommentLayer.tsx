@@ -13,13 +13,13 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
 import { AtSignIcon, MessageSquarePlusIcon } from "lucide-react";
 import type { OnMount } from "@monaco-editor/react";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { getEmbedRoot } from "@/lib/host";
 import { useChatStore } from "@/store/chatStore";
-import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 
 // The IStandaloneCodeEditor instance, derived from the onMount signature so we
 // don't deep-import Monaco's types here. The diff editor's getModifiedEditor()
@@ -101,11 +101,13 @@ interface UseMonacoCommentLayerOptions {
   /** In-progress comment body; clicking away won't clear an active draft. */
   pendingBodyRef?: React.RefObject<string>;
   /**
-   * Workspace-relative path of the file being viewed. When set on a native
-   * coding-agent session, an "Attach to agent" button appears beside "Add
-   * comment" that tags the selected line span into the chat composer.
+   * Workspace-relative path of the file being viewed. With `attachToAgent`, an
+   * "Attach to agent" button appears beside "Add comment" that tags the
+   * selected line span into the chat composer.
    */
   path?: string;
+  /** Whether the session's agent opens an attached workspace path. */
+  attachToAgent?: boolean;
 }
 
 /**
@@ -123,9 +125,9 @@ export function useMonacoCommentLayer({
   canComment,
   pendingBodyRef,
   path,
+  attachToAgent = false,
 }: UseMonacoCommentLayerOptions): React.ReactNode {
-  const sessionHarness = useChatStore((s) => s.sessionHarness);
-  const canAttachToAgent = !!path && nativeCodingAgentForHarness(sessionHarness) !== undefined;
+  const canAttachToAgent = !!path && attachToAgent;
   const decorationsRef = useRef<DecorationsCollection | null>(null);
   // Floating "Add comment" button position in viewport coords, or null.
   const [buttonPos, setButtonPos] = useState<{ left: number; top: number } | null>(null);
@@ -328,7 +330,7 @@ export function useMonacoCommentLayer({
           e.preventDefault();
           handleAddComment();
         }}
-        className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+        className={ADD_COMMENT_BUTTON_CLASS_NAME}
       >
         <MessageSquarePlusIcon className="size-3.5" />
         Add comment
@@ -341,7 +343,7 @@ export function useMonacoCommentLayer({
             e.preventDefault();
             handleAttachToAgent();
           }}
-          className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+          className={ADD_COMMENT_BUTTON_CLASS_NAME}
         >
           <AtSignIcon className="size-3.5" />
           Attach to agent

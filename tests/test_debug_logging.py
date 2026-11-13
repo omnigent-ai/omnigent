@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -240,12 +242,278 @@ def test_insert_auth_rejection_refreshes_credentials_and_retries_same_batch(
     sink._client = client  # type: ignore[assignment]
     sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
     sink._delivered_any = False
+    sink._reset_held_rows()
     batch: list[dl.DebugLogRow] = [{"message": "same batch"}]
 
     sink._post(batch)
 
     assert command_calls == 2
     assert client.insert_payloads == [json.dumps(batch), json.dumps(batch)]
+
+
+def _command_secret_sink(
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[int],
+    token_bodies: list[object] | None = None,
+    insert_statuses: list[int] | None = None,
+) -> tuple[dl.ZerobusLogHandler, list[str], list[int]]:
+    """A worker-less sink whose secret command exits with *outcomes* in turn.
+
+    Token mints answer with *token_bodies* in turn, the last one repeating;
+    inserts answer with *insert_statuses* in turn, then 200. Only accepted
+    inserts are recorded.
+    """
+    bodies = token_bodies or [{"access_token": "token", "expires_in": 3600}]
+    statuses = iter(insert_statuses or [])
+    mints: list[object] = []
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://workspace.example.com")
+    monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+    inserted: list[str] = []
+    command_calls: list[int] = []
+
+    def run(*_: object, **__: object) -> object:
+        returncode = outcomes[min(len(command_calls), len(outcomes) - 1)]
+        command_calls.append(returncode)
+        return type("Completed", (), {"returncode": returncode, "stdout": "secret"})()
+
+    class Client:
+        def post(self, url: str, **kwargs: object) -> httpx.Response:
+            if url.endswith("/oidc/v1/token"):
+                body = bodies[min(len(mints), len(bodies) - 1)]
+                mints.append(body)
+                return httpx.Response(200, json=body)
+            status = next(statuses, 200)
+            if status == 200:
+                inserted.append(kwargs["content"])  # type: ignore[arg-type]
+            return httpx.Response(status)
+
+    monkeypatch.setattr(dl.subprocess, "run", run)
+    return _bare_zerobus_sink(Client()), inserted, command_calls
+
+
+def test_mint_failure_holds_rows_and_delivers_them_after_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink, inserted, command_calls = _command_secret_sink(monkeypatch, [1, 0])
+    first: list[dl.DebugLogRow] = [{"message": "startup"}]
+    second: list[dl.DebugLogRow] = [{"message": "later"}]
+
+    sink._post(first)
+    assert inserted == []
+    assert sink._has_held_rows()
+    assert sink._mint_backoff_s == dl._MINT_RETRY_INITIAL_S
+
+    # Inside the backoff window rows queue up without re-running the helper.
+    sink._post(second)
+    assert command_calls == [1]
+    assert inserted == []
+
+    sink._mint_retry_at = 0.0  # backoff elapsed
+    sink._post([])
+    assert command_calls == [1, 0]
+    assert inserted == [json.dumps([*first, *second])]
+    assert not sink._has_held_rows()
+    assert sink._mint_backoff_s == 0.0
+
+
+def test_mint_failure_backoff_grows_and_held_rows_stay_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl, "_HELD_MAX_RECORDS", 3)
+    sink, inserted, command_calls = _command_secret_sink(monkeypatch, [1])
+
+    backoffs: list[float] = []
+    for index in range(6):
+        sink._mint_retry_at = 0.0
+        sink._post([{"message": f"row-{index}"}])
+        backoffs.append(sink._mint_backoff_s)
+
+    assert inserted == []
+    assert len(command_calls) == 6
+    assert [row["message"] for row in sink._held_rows] == ["row-3", "row-4", "row-5"]
+    # Failures double the backoff from its floor until the ceiling caps it.
+    assert backoffs == [5.0, 10.0, 20.0, 40.0, 80.0, dl._MINT_RETRY_MAX_S]
+    assert dl._MINT_RETRY_MAX_S == 120.0
+
+
+def test_held_rows_cap_keeps_the_newest_production_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    sink, _, _ = _command_secret_sink(monkeypatch, [1])
+    rows: list[dl.DebugLogRow] = [{"message": f"row-{index}"} for index in range(1_001)]
+
+    sink._post(rows)
+
+    assert dl._HELD_MAX_RECORDS == 1_000
+    assert list(sink._held_rows) == rows[1:]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"access_token": "token", "expires_in": "invalid"},
+        {"access_token": "token", "expires_in": None},
+        ["not", "an", "object"],
+    ],
+)
+def test_malformed_mint_response_preserves_held_rows(
+    monkeypatch: pytest.MonkeyPatch, malformed: object
+) -> None:
+    valid = {"access_token": "token", "expires_in": 3600}
+    sink, inserted, command_calls = _command_secret_sink(
+        monkeypatch, [1, 0], token_bodies=[malformed, valid]
+    )
+    held: list[dl.DebugLogRow] = [{"message": "startup"}]
+    sink._post(held)
+    assert command_calls == [1]
+
+    # The helper recovers but the token response is unusable: keep holding.
+    sink._mint_retry_at = 0.0
+    sink._post([])
+    assert inserted == []
+    assert [row["message"] for row in sink._held_rows] == ["startup"]
+
+    sink._mint_retry_at = 0.0
+    sink._post([])
+    assert inserted == [json.dumps(held)]
+    assert not sink._has_held_rows()
+
+
+def test_held_rows_are_dropped_not_retried_during_shutdown_drain(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    sink, inserted, command_calls = _command_secret_sink(monkeypatch, [1])
+    sink._post([{"message": "startup"}])
+    sink._drain_deadline = time.monotonic() + 5.0
+
+    with pytest.raises(dl._ShutdownDeadline) as dropped:
+        sink._post([])
+
+    assert dropped.value.rows == 1
+    # An unresolved secret command is never run under the shutdown deadline.
+    assert command_calls == [1]
+    assert inserted == []
+    assert not sink._has_held_rows()
+    # The earlier "holding" diag must not throttle away the drop notice.
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("holding 1 row(s)" in message for message in messages)
+    assert any("dropping 1 held row(s)" in message for message in messages)
+
+
+def test_mint_failure_mid_batch_holds_only_the_unsent_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl, "_BATCH_MAX_RECORDS", 1)
+    # The first token is already stale, so the second chunk re-mints and fails.
+    sink, inserted, _ = _command_secret_sink(
+        monkeypatch, [0], token_bodies=[{"access_token": "token", "expires_in": 0}, {}]
+    )
+    rows: list[dl.DebugLogRow] = [{"message": "sent"}, {"message": "held"}]
+
+    sink._post(rows)
+
+    assert inserted == [json.dumps(rows[:1])]
+    assert list(sink._held_rows) == rows[1:]
+
+
+def test_insert_401_then_failed_remint_holds_the_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    sink, inserted, command_calls = _command_secret_sink(
+        monkeypatch, [0, 1, 0], insert_statuses=[401]
+    )
+    batch: list[dl.DebugLogRow] = [{"message": "rejected"}]
+
+    sink._post(batch)
+    assert command_calls == [0, 1]  # the 401 dropped the cached secret
+    assert inserted == []
+    assert list(sink._held_rows) == batch
+
+    sink._mint_retry_at = 0.0
+    sink._post([])
+    assert inserted == [json.dumps(batch)]
+    assert not sink._has_held_rows()
+
+
+def test_post_reraises_shutdown_deadline_with_the_unsent_row_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dl, "_BATCH_MAX_RECORDS", 1)
+    sink, _, _ = _command_secret_sink(monkeypatch, [0])
+    chunk_calls: list[int] = []
+
+    def post_chunk(chunk: list[dl.DebugLogRow]) -> bool:
+        chunk_calls.append(len(chunk))
+        if len(chunk_calls) == 2:
+            raise dl._ShutdownDeadline(len(chunk))
+        return True
+
+    monkeypatch.setattr(sink, "_post_chunk", post_chunk)
+
+    with pytest.raises(dl._ShutdownDeadline) as dropped:
+        sink._post([{"message": f"row-{index}"} for index in range(3)])
+
+    assert chunk_calls == [1, 1]
+    assert dropped.value.rows == 2
+
+
+def test_unexpected_chunk_error_drops_only_that_chunk(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(dl, "_diag_last", {})
+    monkeypatch.setattr(dl, "_BATCH_MAX_RECORDS", 1)
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    sink, inserted, _ = _command_secret_sink(monkeypatch, [0])
+    later: list[dl.DebugLogRow] = [{"message": "later"}]
+
+    sink._post([{"message": object()}, *later])  # the first row is not JSON-serializable
+
+    assert inserted == [json.dumps(later)]
+    assert not sink._has_held_rows()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("dropped 1 row(s) after an unexpected upload error" in m for m in messages)
+
+
+def test_uploader_delivers_held_rows_on_idle_tick(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://workspace.example.com")
+    monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl, "_MINT_RETRY_INITIAL_S", 0.05)
+    outcomes = iter((1, 0))
+    delivered = threading.Event()
+    payloads: list[str] = []
+
+    def run(*_: object, **__: object) -> object:
+        returncode = next(outcomes, 0)
+        return type("Completed", (), {"returncode": returncode, "stdout": "secret"})()
+
+    class Client:
+        def post(self, url: str, **kwargs: object) -> httpx.Response:
+            if url.endswith("/oidc/v1/token"):
+                return httpx.Response(200, json={"access_token": "token", "expires_in": 3600})
+            payloads.append(kwargs["content"])  # type: ignore[arg-type]
+            delivered.set()
+            return httpx.Response(200)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(dl.subprocess, "run", run)
+    monkeypatch.setattr(dl.httpx, "Client", lambda **_: Client())
+    config = dl.config_from_env()
+    assert config is not None
+    sink = dl.ZerobusLogHandler(config, "runner")
+    try:
+        record = logging.LogRecord("omnigent.test", logging.INFO, __file__, 1, "early", (), None)
+        sink.emit(record)
+
+        # No further rows arrive: the held row is retried on its own.
+        assert delivered.wait(timeout=2.0)
+        assert [row["message"] for row in json.loads(payloads[0])] == ["early"]
+    finally:
+        sink.close()
 
 
 def test_client_secret_command_runs_on_uploader_thread(
@@ -357,7 +625,8 @@ def test_record_to_row_shape_and_coercions() -> None:
     }
 
 
-def test_record_to_row_redacts_token_like_text_fields() -> None:
+@pytest.mark.parametrize("captured_stack", [False, True])
+def test_record_to_row_redacts_token_like_text_fields(captured_stack: bool) -> None:
     secret = "aB3" + "xY7" * 12
     try:
         raise ValueError(f"credential={secret}")
@@ -375,6 +644,9 @@ def test_record_to_row_redacts_token_like_text_fields() -> None:
             func="do_it",
         )
     record.attributes = {"upstream_response": secret, "attempt": 3}
+    if captured_stack:
+        record.exc_info = None
+        record.captured_stack_trace = f'File "{secret}.py", line 1, in blocking_call'
 
     row = dl.record_to_row(record, source="runner")
 
@@ -385,6 +657,9 @@ def test_record_to_row_redacts_token_like_text_fields() -> None:
     assert secret not in attributes["upstream_response"]
     assert attributes["attempt"] == "3"
     assert "[REDACTED]" in str(row)
+    if captured_stack:
+        assert "blocking_call" in str(row["stack_trace"])
+        assert "[REDACTED]" in str(row["stack_trace"])
 
 
 def test_record_to_row_reads_session_id_from_extra(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -427,6 +702,30 @@ def test_record_to_row_without_event_or_attributes() -> None:
     row = dl.record_to_row(record, source="host")
     assert row["event_name"] is None
     assert row["attributes"] == {}
+
+
+async def test_log_attributes_follow_task_and_thread_without_leaking() -> None:
+    record = logging.makeLogRecord({"msg": "ordinary lifecycle log"})
+
+    async def read(task_id: str) -> dict:
+        with dl.log_attributes_scope(task_id=task_id, run_id="outer"):
+            with dl.log_attributes_scope(run_id="inner"):
+                row = await asyncio.to_thread(dl.record_to_row, record, "server")
+                assert row["attributes"] == {"task_id": task_id, "run_id": "inner"}
+            return dl.record_to_row(record, "server")
+
+    rows = await asyncio.gather(read("first"), read("second"))
+    assert [row["attributes"] for row in rows] == [
+        {"task_id": "first", "run_id": "outer"},
+        {"task_id": "second", "run_id": "outer"},
+    ]
+    assert dl.record_to_row(record, "server")["attributes"] == {}
+    record.attributes = {"run_id": "explicit", "secret": "Bearer test-secret-token"}
+    with dl.log_attributes_scope(run_id="ambient", token="Bearer ambient-secret-token"):
+        attributes = dl.record_to_row(record, "server")["attributes"]
+    assert attributes["run_id"] == "explicit"
+    assert "test-secret-token" not in attributes["secret"]
+    assert "ambient-secret-token" not in attributes["token"]
 
 
 def test_record_to_row_captures_stack_trace() -> None:
@@ -744,12 +1043,16 @@ def test_emit_revives_closed_uploader(_configured_env: None) -> None:
         sink.close()
         assert sink._closed
         assert not first_thread.is_alive()
+        # Rows held by the old worker (or a fork's parent) must not carry over.
+        sink._held_rows = ({"message": "parent"},)
+        sink._mint_retry_at = sink._mint_backoff_s = 60.0
         # A subsequent record revives the worker (fresh thread) and enqueues.
         record = logging.LogRecord("omnigent.x", logging.INFO, __file__, 1, "hi", (), None)
         sink.emit(record)
         assert not sink._closed
         assert sink._thread is not first_thread
         assert sink._thread.is_alive()
+        assert (sink._held_rows, sink._mint_retry_at, sink._mint_backoff_s) == ((), 0.0, 0.0)
     finally:
         sink.close()
 
@@ -855,36 +1158,85 @@ def test_runner_primary_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
     assert dl.runner_primary_session_id() is None
 
 
-def test_close_tears_down_captured_worker_not_a_concurrent_revive(
+def test_close_does_not_revive_while_old_worker_is_in_flight(
     _configured_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A concurrent emit() can revive the sink (fresh client/thread) during
-    # close()'s join. close() must tear down the worker it captured at entry,
-    # never the revived one — otherwise it closes a live client out from under
-    # the new uploader thread.
-    config = dl.config_from_env()
-    assert config is not None
-    sink = dl.ZerobusLogHandler(config, "server")
-    old_client = sink._client
+    gate = threading.Event()
+    client = _FakeZerobus([httpx.ConnectError("offline"), 200], insert_gate=gate)
+    sink, logger = _live_zerobus_sink(monkeypatch, client)
     old_thread = sink._thread
-    orig_join = old_thread.join
-
-    def _join_then_revive(timeout: float | None = None) -> None:
-        orig_join(timeout)
-        sink._closed = False
-        sink._start_worker()  # stand in for a concurrent emit() revive
-
-    monkeypatch.setattr(old_thread, "join", _join_then_revive)
     try:
-        sink.close()
-        assert old_client.is_closed  # the captured worker is torn down
-        assert sink._client is not old_client  # the revived worker survives
-        assert not sink._client.is_closed
+        logger.info("in flight")
+        assert client.in_insert.wait(timeout=2)
+        sink.close(timeout=0.1)
+        assert old_thread.is_alive()
+        logger.info("late during close")
+        assert sink._thread is old_thread
+        assert sink._drain_deadline is not None
+        gate.set()  # the old insert fails after its shutdown deadline
+        old_thread.join(timeout=2)
+        assert not old_thread.is_alive()
+        assert client.inserts == 1  # no retry after the deadline
+        logger.info("after worker stopped")  # non-terminal reconfiguration can revive
         assert sink._thread is not old_thread
-        assert sink._thread.is_alive()
+        for _ in range(100):
+            if client.inserts == 2:
+                break
+            time.sleep(0.01)
+        assert client.inserted == ["after worker stopped"]
     finally:
-        sink._closed = False
-        sink.close()
+        gate.set()
+        logger.removeHandler(sink)
+        sink.shutdown()
+
+
+def test_shutdown_never_revives_after_worker_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    delivered: list[str] = []
+    sink = dl.DebugLogHandler(
+        "runner", lambda batch: delivered.extend(str(r["message"]) for r in batch)
+    )
+    monkeypatch.setattr(dl, "_active_sink", sink)
+    old_thread = sink._thread
+    dl.close_debug_log_sink(timeout=1)
+    assert not old_thread.is_alive()
+    sink.emit(logging.LogRecord("test.shutdown", logging.INFO, __file__, 1, "late", (), None))
+    assert sink._thread is old_thread
+    assert delivered == []
+
+
+def test_close_waits_for_emit_before_stopping_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    delivered: list[str] = []
+    sink = dl.DebugLogHandler(
+        "runner", lambda batch: delivered.extend(str(r["message"]) for r in batch)
+    )
+    entered, release = threading.Event(), threading.Event()
+    original = dl.record_to_row
+
+    def paused_record_to_row(record: logging.LogRecord, source: str) -> dl.DebugLogRow:
+        entered.set()
+        assert release.wait(timeout=2)
+        return original(record, source)
+
+    monkeypatch.setattr(dl, "record_to_row", paused_record_to_row)
+    record = logging.LogRecord("test.close", logging.INFO, __file__, 1, "row", (), None)
+    emit = threading.Thread(target=lambda: sink.emit(record))
+    close = threading.Thread(target=lambda: sink.close(timeout=1))
+    try:
+        emit.start()
+        assert entered.wait(timeout=2)
+        close.start()
+        release.set()
+        emit.join(timeout=2)
+        close.join(timeout=2)
+        assert not emit.is_alive() and not close.is_alive()
+        assert delivered == ["row"]
+        assert not sink._thread.is_alive()
+    finally:
+        release.set()
+        emit.join(timeout=2)
+        if close.ident is not None:
+            close.join(timeout=2)
+        sink.shutdown()
 
 
 def test_attach_suppresses_handler_init_failure(
@@ -927,7 +1279,7 @@ def test_parse_app_host_non_apps_urls_yield_nothing() -> None:
     # Managed service (dbc-<hash> host), localhost, a custom domain, and empty
     # input carry no parseable Databricks Apps identity.
     assert dl._parse_databricks_app_host(
-        "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
+        "https://dbc-12345678-abcd.cloud.databricks.com/omnigent"
     ) == (None, None)
     assert dl._parse_databricks_app_host("http://localhost:8000") == (None, None)
     assert dl._parse_databricks_app_host("https://omnigent.example.com") == (None, None)
@@ -975,7 +1327,7 @@ def test_process_identity_managed_service_is_none(monkeypatch: pytest.MonkeyPatc
     # Managed service: no DATABRICKS_* env and the server URL is a dbc-<hash> host,
     # not an Apps URL. Identity arrives per-record, so the process constant is empty.
     monkeypatch.setenv(
-        dl.SERVER_URL_ENV_VAR, "https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent"
+        dl.SERVER_URL_ENV_VAR, "https://dbc-12345678-abcd.cloud.databricks.com/omnigent"
     )
     assert dl._process_identity() == (None, None)
 
@@ -983,6 +1335,93 @@ def test_process_identity_managed_service_is_none(monkeypatch: pytest.MonkeyPatc
 def test_process_identity_unset_is_none() -> None:
     # OSS / local: nothing set anywhere.
     assert dl._process_identity() == (None, None)
+
+
+_HOSTED_API = "https://example.databricks.com/api/2.0/omnigent"
+
+
+@pytest.fixture
+def _data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    return tmp_path
+
+
+def _fail_get(url: str, **kwargs: object) -> httpx.Response:
+    raise AssertionError(f"unexpected probe of {url}")
+
+
+def test_publish_origin_identity_probes_without_changing_auth_state(
+    _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unauthenticated header can attribute logs but cannot update login state.
+    from omnigent.cli_auth import load_databricks_org_id
+
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs: object) -> httpx.Response:
+        calls.append(url)
+        return httpx.Response(401, headers={"x-databricks-org-id": "123456"})
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+
+    assert dl.publish_origin_identity(_HOSTED_API) == "123456"
+    assert calls == [f"{_HOSTED_API}/v1/me"]
+    assert dl._process_identity()[0] == "123456"
+    assert load_databricks_org_id(_HOSTED_API) is None
+    assert not (_data_dir / "auth_tokens.json").exists()
+
+    monkeypatch.setattr(httpx, "get", _fail_get)
+    assert dl.publish_origin_identity(_HOSTED_API) == "123456"
+
+
+def test_publish_origin_identity_prefers_url_selector(
+    _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(httpx, "get", _fail_get)
+    assert dl.publish_origin_identity(f"{_HOSTED_API}?o=123") == "123"
+    assert dl._process_identity()[0] == "123"
+
+
+def test_publish_origin_identity_skips_non_workspace_servers(
+    _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(httpx, "get", _fail_get)
+    assert dl.publish_origin_identity("http://127.0.0.1:6767") is None
+    assert dl.publish_origin_identity("https://omnigents-1.aws.databricksapps.com") is None
+    assert dl._process_identity() == (None, None)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(401),
+        httpx.Response(401, headers={"x-databricks-org-id": "not-an-id"}),
+    ],
+)
+def test_publish_origin_identity_ignores_missing_or_malformed_header(
+    _data_dir: Path,
+    origin_identity_probe: None,
+    monkeypatch: pytest.MonkeyPatch,
+    response: httpx.Response,
+) -> None:
+    monkeypatch.setattr(httpx, "get", lambda url, **kwargs: response)
+    assert dl.publish_origin_identity(_HOSTED_API) is None
+    assert dl._process_identity()[0] is None
+
+
+def test_publish_origin_identity_probes_unreachable_server_once(
+    _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def unreachable(url: str, **kwargs: object) -> httpx.Response:
+        calls.append(url)
+        raise httpx.ConnectError("unreachable")
+
+    monkeypatch.setattr(httpx, "get", unreachable)
+    assert dl.publish_origin_identity(_HOSTED_API) is None
+    assert dl.publish_origin_identity(_HOSTED_API) is None
+    assert len(calls) == 1
 
 
 def test_record_to_row_prefers_record_workspace_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1245,3 +1684,345 @@ def test_runner_defaults_and_explicit_child_attribution(monkeypatch: pytest.Monk
         record.attributes = {"runner_id": "explicit_runner", "request_id": "explicit_request"}
         assert dl.record_to_row(record, "runner")["session_id"] == "explicit_child"
         assert dl.record_to_row(record, "runner")["attributes"]["runner_id"] == "explicit_runner"
+
+
+def _sink_logger(name: str, sink: dl.DebugLogHandler) -> logging.Logger:
+    """Return an isolated logger that writes only to *sink*.
+
+    :param name: Logger name, unique per test.
+    :param sink: Handler under test.
+    :returns: Configured logger.
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(sink)
+    return logger
+
+
+def test_close_drains_backlog_beyond_one_batch() -> None:
+    """Shutdown sends every queued row, not just one batch, ending with the last.
+
+    A crash row is logged last; a single-batch drain behind an in-flight upload
+    would drop it once more than one batch is pending.
+    """
+    in_flight = threading.Event()
+    release = threading.Event()
+    delivered: list[str] = []
+
+    def send(batch: list[dl.DebugLogRow]) -> None:
+        if not in_flight.is_set():
+            in_flight.set()
+            release.wait(timeout=5.0)
+        delivered.extend(str(row["message"]) for row in batch)
+
+    sink = dl.DebugLogHandler("runner", send)
+    logger = _sink_logger("test.debug_logging.backlog", sink)
+    try:
+        logger.info("first")
+        assert in_flight.wait(timeout=5.0)
+        for i in range(dl._BATCH_MAX_RECORDS + 50):
+            logger.info("row %d", i)
+        logger.critical("runner exiting: uncaught RuntimeError: boom")
+        threading.Timer(0.1, release.set).start()
+        sink.close(timeout=5.0)
+    finally:
+        logger.removeHandler(sink)
+
+    assert len(delivered) == dl._BATCH_MAX_RECORDS + 52
+    assert delivered[-1] == "runner exiting: uncaught RuntimeError: boom"
+
+
+def test_close_wakes_idle_worker_promptly() -> None:
+    """Closing an idle sink does not wait out the worker's flush interval."""
+    sink = dl.DebugLogHandler("runner", lambda batch: None)
+    started = time.monotonic()
+    sink.close(timeout=5.0)
+    assert time.monotonic() - started < dl._FLUSH_INTERVAL_S / 2
+
+
+# ── bounded shutdown drain ──────────────────────────────────────────────────
+
+
+def test_close_drain_stops_at_the_deadline_and_counts_the_rest(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A slow endpoint can't stretch close(); unsent rows are dropped and counted."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    delivered: list[str] = []
+    gate = threading.Event()
+
+    def slow_send(batch: list[dl.DebugLogRow]) -> None:
+        gate.wait(timeout=5)
+        time.sleep(0.2)
+        delivered.extend(str(row["message"]) for row in batch)
+
+    sink = dl.DebugLogHandler("runner", slow_send)
+    logger = _sink_logger("test.debug_logging.bounded", sink)
+    try:
+        for i in range(500):
+            logger.info("row %d", i)
+        gate.set()
+        started = time.monotonic()
+        sink.close(timeout=0.5)
+        elapsed = time.monotonic() - started
+    finally:
+        logger.removeHandler(sink)
+    sink._thread.join(timeout=5)  # let a batch already being sent finish
+
+    assert elapsed < 0.9
+    (drop,) = [r for r in caplog.records if "shutdown deadline passed" in r.getMessage()]
+    dropped = int(drop.getMessage().split("dropped ")[1].split(" ")[0])
+    assert 0 < len(delivered) < 500
+    assert len(delivered) + dropped == 500  # nothing both sent and dropped
+
+
+class _FakeZerobus:
+    """Fake httpx client: mints a token, answers inserts from a script."""
+
+    def __init__(
+        self,
+        outcomes: list[object],
+        *,
+        mint_delay: float = 0.0,
+        insert_delay: float = 0.0,
+        mint_gate: threading.Event | None = None,
+        insert_gate: threading.Event | None = None,
+    ) -> None:
+        self._outcomes = outcomes
+        self._mint_delay = mint_delay
+        self._insert_delay = insert_delay
+        self._mint_gate = mint_gate
+        self._insert_gate = insert_gate
+        self.mints = 0
+        self.inserts = 0
+        self.insert_timeouts: list[float] = []
+        self.inserted: list[str] = []
+        self.in_mint = threading.Event()
+        self.in_insert = threading.Event()
+
+    def post(self, url: str, **kwargs: object) -> httpx.Response:
+        if url.endswith("/oidc/v1/token"):
+            self.mints += 1
+            self.in_mint.set()
+            if self._mint_gate is not None:
+                self._mint_gate.wait(timeout=10)
+            time.sleep(self._mint_delay)
+            return httpx.Response(200, json={"access_token": "token", "expires_in": 3600})
+        self.inserts += 1
+        self.insert_timeouts.append(float(kwargs["timeout"]))  # type: ignore[arg-type]
+        self.in_insert.set()
+        if self._insert_gate is not None:
+            self._insert_gate.wait(timeout=10)
+        time.sleep(self._insert_delay)
+        outcome = self._outcomes[min(self.inserts, len(self._outcomes)) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        assert isinstance(outcome, int)
+        if outcome == 200:
+            self.inserted.extend(r["message"] for r in json.loads(str(kwargs["content"])))
+        return httpx.Response(outcome)
+
+    def close(self) -> None:
+        pass
+
+
+def _bare_zerobus_sink(client: object) -> dl.ZerobusLogHandler:
+    config = dl.config_from_env()
+    assert config is not None
+    sink = object.__new__(dl.ZerobusLogHandler)
+    sink._config = config
+    sink._client = client  # type: ignore[assignment]
+    sink._tokens = dl._TokenSource(config, client)  # type: ignore[arg-type]
+    sink._delivered_any = False
+    sink._reset_held_rows()
+    return sink
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "inserts"),
+    [
+        # The insert may have landed: resending could duplicate it.
+        ([httpx.ReadTimeout("slow")], 1),
+        ([httpx.RemoteProtocolError("reset")], 1),
+        # Never sent: safe to retry.
+        ([httpx.ConnectError("offline")], 3),
+        ([httpx.ConnectError("blip"), 200], 2),
+    ],
+)
+def test_post_retries_only_requests_that_cannot_have_landed(
+    _configured_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[object],
+    inserts: int,
+) -> None:
+    monkeypatch.setattr(dl.time, "sleep", lambda _s: None)
+    client = _FakeZerobus(outcomes)
+    _bare_zerobus_sink(client)._post([{"message": "m"}])
+    assert client.inserts == inserts
+
+
+def test_post_during_the_drain_fits_the_deadline(_configured_env: None) -> None:
+    client = _FakeZerobus([200])
+    sink = _bare_zerobus_sink(client)
+    sink._drain_deadline = time.monotonic() + 0.5
+
+    sink._post([{"message": "m"}])
+
+    assert client.inserts == 1
+    assert 0 < client.insert_timeouts[0] <= 0.5
+
+
+@pytest.mark.parametrize(
+    ("budget", "mint_delay"),
+    [(-1.0, 0.0), (0.25, 0.2)],
+    ids=["spent-deadline", "mint-uses-up-the-budget"],
+)
+def test_post_sends_nothing_without_time_left(
+    _configured_env: None, budget: float, mint_delay: float
+) -> None:
+    client = _FakeZerobus([200], mint_delay=mint_delay)
+    sink = _bare_zerobus_sink(client)
+    sink._drain_deadline = time.monotonic() + budget
+
+    with pytest.raises(dl._ShutdownDeadline):
+        sink._post([{"message": "m"}])
+
+    assert client.inserts == 0
+    assert client.mints == (0 if budget < 0 else 1)  # no mint starts without time left
+
+
+def test_shutdown_mint_never_runs_an_unresolved_secret_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The secret command is an unbounded subprocess; never run it at shutdown."""
+    monkeypatch.setenv(dl.CLIENT_ID_ENV_VAR, "cid")
+    monkeypatch.setenv(dl.CLIENT_SECRET_COMMAND_ENV_VAR, "credential-helper")
+    monkeypatch.setenv(dl.WORKSPACE_URL_ENV_VAR, "https://ws.cloud.databricks.com")
+    monkeypatch.setenv(dl.ENDPOINT_ENV_VAR, _INSERT_URL)
+    config = dl.config_from_env()
+    assert config is not None
+    ran: list[object] = []
+    monkeypatch.setattr(dl.subprocess, "run", lambda *a, **_k: ran.append(a))
+    tokens = dl._TokenSource(config, _FakeZerobus([200]))  # type: ignore[arg-type]
+
+    assert tokens.token(deadline=time.monotonic() + 1) is None
+    assert ran == []
+
+
+def _live_zerobus_sink(
+    monkeypatch: pytest.MonkeyPatch, client: _FakeZerobus
+) -> tuple[dl.ZerobusLogHandler, logging.Logger]:
+    monkeypatch.setattr(dl.DebugLogHandler, "_FLUSH_WAIT", 0.01)
+    monkeypatch.setattr(dl.httpx, "Client", lambda **_: client)
+    config = dl.config_from_env()
+    assert config is not None
+    sink = dl.ZerobusLogHandler(config, "host")
+    return sink, _sink_logger(f"test.debug_logging.live.{id(sink)}", sink)
+
+
+def _dropped_counts(caplog: pytest.LogCaptureFixture) -> list[int]:
+    return [
+        int(r.getMessage().split("dropped ")[1].split(" ")[0])
+        for r in caplog.records
+        if "shutdown deadline passed" in r.getMessage()
+    ]
+
+
+def test_close_reports_all_rows_discarded_after_post_budget_expires(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Once the worker exits, one diagnostic accounts for its discarded rows."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    gate = threading.Event()
+    # The pre-close insert succeeds; the drain's next batch then fails before
+    # reaching ZeroBus until _post() itself runs out of budget mid-retry, and
+    # the drain drops the rest of the queue.
+    client = _FakeZerobus(
+        [200, httpx.ConnectError("offline")], insert_gate=gate, insert_delay=0.15
+    )
+    sink, logger = _live_zerobus_sink(monkeypatch, client)
+    try:
+        logger.info("first")
+        assert client.in_insert.wait(timeout=2)
+        for i in range(249):
+            logger.info("row %d", i)
+        threading.Timer(0.05, gate.set).start()  # the pre-close insert returns mid-close
+        sink.close(timeout=0.5)
+    finally:
+        logger.removeHandler(sink)
+    sink._thread.join(timeout=5)  # accounting can finish after close() returns
+
+    drops = _dropped_counts(caplog)
+    assert client.inserted == ["first"]
+    assert drops == [249]  # one diagnostic, every unsent row counted
+
+
+def test_close_deadline_is_observed_after_inflight_token_mint(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A mint that began before close() and finishes after the deadline starts no insert."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    mint_gate = threading.Event()
+    client = _FakeZerobus([200], mint_gate=mint_gate)
+    sink, logger = _live_zerobus_sink(monkeypatch, client)
+    try:
+        logger.info("waiting on the token")
+        assert client.in_mint.wait(timeout=2)
+        sink.close(timeout=0.2)
+        mint_gate.set()  # the mint finishes only after the deadline
+    finally:
+        logger.removeHandler(sink)
+    sink._thread.join(timeout=5)
+
+    assert client.inserts == 0
+    assert _dropped_counts(caplog) == [1]
+
+
+def test_close_deadline_is_observed_after_inflight_insert_fails(
+    _configured_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed pre-close insert isn't retried past the deadline with a fresh 10s timeout."""
+    monkeypatch.setattr(dl, "_diag_last", {})
+    caplog.set_level(logging.WARNING, logger=dl.__name__)
+    insert_gate = threading.Event()
+    client = _FakeZerobus([httpx.ConnectError("offline")], insert_gate=insert_gate)
+    sink, logger = _live_zerobus_sink(monkeypatch, client)
+    try:
+        logger.info("in flight")
+        assert client.in_insert.wait(timeout=2)
+        sink.close(timeout=0.2)
+        insert_gate.set()  # fails with ConnectError after the deadline
+    finally:
+        logger.removeHandler(sink)
+    sink._thread.join(timeout=5)
+
+    assert client.inserts == 1
+    assert _dropped_counts(caplog) == [1]
+
+
+def test_near_deadline_auth_rejection_does_not_start_a_new_mint(_configured_env: None) -> None:
+    client = _FakeZerobus([401, 200], insert_delay=0.25)
+    sink = _bare_zerobus_sink(client)
+    sink._drain_deadline = time.monotonic() + 0.3  # the 401 lands with ~0.05s left
+
+    with pytest.raises(dl._ShutdownDeadline):
+        sink._post([{"message": "m"}])
+
+    assert client.mints == 1
+    assert client.inserts == 1
+
+
+def test_stage_timings_split_wall_time_into_marked_stages() -> None:
+    """Each mark closes the stage since the previous one; repeats accumulate."""
+    moments = iter([0.0, 0.010, 0.250, 0.300, 0.400])
+    timings = dl.StageTimings(clock=lambda: next(moments))
+
+    timings.mark("config")
+    timings.mark("catalog")
+    timings.mark("config")
+
+    assert timings.attributes() == {"config_ms": 60, "catalog_ms": 240, "total_ms": 400}

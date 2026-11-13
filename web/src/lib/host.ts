@@ -1,6 +1,8 @@
-import type { ReactNode } from "react";
+import type { ComponentType, ReactNode, Ref } from "react";
 
 import { getBasePath, withBasePath } from "./basePath.ts";
+import { updatesRoutingKey } from "./sessionHost.ts";
+import { clientRoutingKey, SLICE_KEY_HEADER, SLICE_KEY_PARAM } from "./routingKey.ts";
 
 /**
  * Embed host integration seam.
@@ -54,7 +56,8 @@ export type OmnigentInteractionKind =
   | "list_sessions"
   | "get_session"
   | "create_session_sandbox"
-  | "create_session_computer";
+  | "create_session_computer"
+  | "create_scheduled_task";
 
 /** Terminal outcome of an interaction, set on the `complete` phase. */
 export type OmnigentInteractionStatus = "success" | "failure" | "cancelled" | "timed_out";
@@ -94,7 +97,24 @@ export type OmnigentAnalyticsEvent =
       durationMs?: number;
     };
 
+/**
+ * Trusted host renderer for untrusted HTML. Before executing any supplied HTML,
+ * enforce sandboxing and an opaque or separate, unprivileged origin that prevents
+ * access to the host app. Expose the content iframe before forwarding every load.
+ */
+export interface HtmlPreviewFrameProps {
+  /** Prepared HTML includes an inline comment bridge; the frame's CSP must allow it. */
+  htmlContent: string;
+  iframeRef: Ref<HTMLIFrameElement>;
+  onLoad: () => void;
+}
+
 export interface OmnigentHostConfig {
+  /**
+   * Install before the app mounts and keep the component identity stable for that
+   * mount. Omitted by older hosts, which retain the sandboxed srcdoc preview.
+   */
+  htmlPreviewFrame?: ComponentType<HtmlPreviewFrameProps>;
   /** Stable server/workspace identity used to scope browser-local extension storage. */
   serverIdentity?: string;
   /**
@@ -130,6 +150,14 @@ export interface OmnigentHostConfig {
    */
   resolveWebSocketUrl?: (path: string) => string;
   /**
+   * Maps a web API path (e.g. a workspace file with `?download=true`) to a URL
+   * the browser can load directly as `<video src>`, carrying in the URL any
+   * auth the host's `fetcher` would add as headers. Set it when the host page's
+   * CSP blocks `blob:` media. When omitted, media is fetched through `fetcher`
+   * and played from an object URL.
+   */
+  resolveMediaUrl?: (path: string) => string;
+  /**
    * Turns a relative share-link path (basename already included, e.g.
    * `<basename>/c/:id`) into the full absolute share URL — the host prepends
    * its origin and adds any query params it needs. When omitted (standalone),
@@ -145,9 +173,8 @@ export interface OmnigentHostConfig {
    */
   cliServerUrlSuffix?: string;
   /**
-   * Optional URL to the host's own appearance/theme settings. When the host
-   * owns light/dark (the embed's own switcher is hidden), the settings screen
-   * links here so users can find where to change it. Omitted standalone.
+   * Optional URL to the host's appearance settings, linked beside the browser
+   * embed's automatic theme option. Omitted standalone and hidden in Electron.
    */
   themeSettingsUrl?: string;
   /**
@@ -173,6 +200,10 @@ let hostConfig: OmnigentHostConfig = {};
 let hostConfigGeneration = 0;
 let embedRoot: HTMLElement | null = null;
 let embedScopeRoot: HTMLElement | null = null;
+
+export function getOmnigentHtmlPreviewFrame(): OmnigentHostConfig["htmlPreviewFrame"] {
+  return hostConfig.htmlPreviewFrame;
+}
 
 export function getOmnigentServerIdentity(): string | null {
   if (hostConfig.serverIdentity?.trim()) return hostConfig.serverIdentity.trim();
@@ -211,6 +242,11 @@ export function getOmnigentHostGeneration(): number {
  */
 export function isDatabricksWorkspace(): boolean {
   return hostConfig.fetcher != null || import.meta.env.VITE_DATABRICKS_WORKSPACE === "true";
+}
+
+/** Whether the deployment routes host and runner traffic by host ID. */
+export function isHostRoutingEnabled(): boolean {
+  return isDatabricksWorkspace() || import.meta.env.VITE_OMNIGENT_HOST_ROUTING === "true";
 }
 
 /**
@@ -300,25 +336,74 @@ export function getThemeRoots(): HTMLElement[] {
   return typeof document !== "undefined" ? [document.documentElement] : [];
 }
 
+/** Routing options for a request to the Omnigent server. */
+export interface RoutingOptions {
+  /** Send no slice key, to reach a host whose tunnels connected without one. */
+  unkeyed?: boolean;
+  /** The request names no host: key it by the modal host, else this client's key. */
+  hostless?: boolean;
+}
+
+/** The fallback key for a request that names no host of its own. */
+function fallbackRoutingKey(options?: RoutingOptions): string {
+  return options?.hostless ? updatesRoutingKey() : clientRoutingKey();
+}
+
+/**
+ * `init` with the fallback slice key added when host routing is on and the
+ * request carries no key yet, so every request names a replica.
+ */
+export function withRoutingKey(
+  init?: RequestInit,
+  options?: RoutingOptions,
+): RequestInit | undefined {
+  if (options?.unkeyed || !isHostRoutingEnabled()) return init;
+  const headers = new Headers(init?.headers);
+  if (headers.has(SLICE_KEY_HEADER)) return init;
+  headers.set(SLICE_KEY_HEADER, fallbackRoutingKey(options));
+  return { ...init, headers };
+}
+
+/** `path` with the fallback slice key as a query parameter when it carries none. */
+export function withRoutingKeyParam(path: string, options?: RoutingOptions): string {
+  if (options?.unkeyed || !isHostRoutingEnabled()) return path;
+  const [base, query = ""] = path.split("?", 2);
+  const params = new URLSearchParams(query);
+  if (params.has(SLICE_KEY_PARAM)) return path;
+  params.set(SLICE_KEY_PARAM, fallbackRoutingKey(options));
+  return `${base}?${params}`;
+}
+
 /**
  * Single network choke point. Delegates to the host fetcher when embedded,
  * otherwise calls native `fetch` with the path unchanged (standalone).
  */
-export function hostFetch(path: string, init?: RequestInit): Promise<Response> {
+export function hostFetch(
+  path: string,
+  init?: RequestInit,
+  options?: RoutingOptions,
+): Promise<Response> {
+  const routedInit = withRoutingKey(init, options);
   if (hostConfig.fetcher) {
     // The host owns path rebasing (it proxies onto its own API surface), so
     // the path is passed through untouched — `withBasePath` is standalone-only.
-    return hostConfig.fetcher(path, init);
+    return hostConfig.fetcher(path, routedInit);
   }
-  return fetch(withBasePath(path), init);
+  return fetch(withBasePath(path), routedInit);
 }
 
-export function resolveWebSocketUrl(path: string): string {
+export function resolveWebSocketUrl(path: string, options?: RoutingOptions): string {
+  const routedPath = withRoutingKeyParam(path, options);
   if (hostConfig.resolveWebSocketUrl) {
-    return hostConfig.resolveWebSocketUrl(path);
+    return hostConfig.resolveWebSocketUrl(routedPath);
   }
   const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${window.location.host}${withBasePath(path)}`;
+  return `${scheme}//${window.location.host}${withBasePath(routedPath)}`;
+}
+
+/** The host's directly loadable media URL for an API path, or null to fetch through `fetcher`. */
+export function resolveMediaUrl(path: string): string | null {
+  return hostConfig.resolveMediaUrl ? hostConfig.resolveMediaUrl(path) : null;
 }
 
 /**

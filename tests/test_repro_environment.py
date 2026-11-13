@@ -21,6 +21,7 @@ def test_isolates_inherited_native_state(tmp_path):
             "OMNIGENT_CONFIG_HOME": "/parent",
             "CLAUDE_CONFIG_DIR": "/parent-claude",
             "OPENAI_API_KEY": "parent-key",
+            "OMNIGENT_PROCESS_LOG_FILE": "/parent/logs/runner/runner.log",
             "NO_PROXY": "example.test",
         },
         tmp_path,
@@ -28,17 +29,17 @@ def test_isolates_inherited_native_state(tmp_path):
     assert "LLM_API_KEY" not in env
     assert "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD" not in env
     assert "OPENAI_API_KEY" not in env
+    assert "OMNIGENT_PROCESS_LOG_FILE" not in env
     assert env["OMNIGENT_CONFIG_HOME"] == str(tmp_path / "config")
     assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "claude-config")
     assert "127.0.0.1" in env["NO_PROXY"]
 
 
-def test_onboarding_uses_selected_claude_directory(monkeypatch, tmp_path):
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "selected"))
-    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+def test_onboarding_uses_selected_claude_directory(tmp_path):
+    env = isolated_env({"HOME": str(tmp_path / "home"), "CLAUDE_CONFIG_DIR": "/parent"}, tmp_path)
     workspace = tmp_path / "workspace"
-    ensure_claude_workspace_trusted(workspace)
-    state = json.loads((tmp_path / "selected/.claude.json").read_text())
+    ensure_claude_workspace_trusted(workspace, env=env)
+    state = json.loads((Path(env["CLAUDE_CONFIG_DIR"]) / ".claude.json").read_text())
     assert state["hasCompletedOnboarding"]
     assert state["projects"][str(workspace)]["hasTrustDialogAccepted"]
     assert not (tmp_path / "home/.claude.json").exists()
@@ -271,6 +272,25 @@ def test_generated_provider_config_disables_runner_idle_shutdown(monkeypatch, tm
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     write_model_config(tmp_path, "http://127.0.0.1:12345", "mock-claude", "mock-codex")
     assert _load_runner_idle_timeout_s_from_config() == 0
+
+
+def test_generated_codex_provider_prices_sessions_like_the_e2e_fixture(monkeypatch, tmp_path):
+    from dev.repro_env.runtime import write_model_config
+    from omnigent.llms.context_window import fetch_model_pricing_with_provider
+    from omnigent.onboarding.provider_config import load_config
+    from tests.helpers.ui_configuration import _CODEX_MOCK_PRICING_PER_MILLION
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
+    write_model_config(tmp_path, "http://127.0.0.1:12345", "mock-claude", "mock-codex")
+
+    pricing = fetch_model_pricing_with_provider("mock-codex", load_config(), "codex")
+
+    assert pricing is not None, "prepared codex provider must price codex-native sessions"
+    input_rate, output_rate, cache_read_rate = _CODEX_MOCK_PRICING_PER_MILLION
+    assert pricing.input_per_token == pytest.approx(input_rate / 1_000_000)
+    assert pricing.output_per_token == pytest.approx(output_rate / 1_000_000)
+    assert pricing.cache_read_per_token == pytest.approx(cache_read_rate / 1_000_000)
 
 
 def test_supervisor_terminates_children_when_relay_cleanup_fails(tmp_path, monkeypatch):

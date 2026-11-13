@@ -34,6 +34,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -49,6 +50,34 @@ RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
+
+ADMIN_VIEW_COOKIE = "omnigent_admin_view"
+_admin_view_enabled: ContextVar[bool] = ContextVar("admin_view_enabled", default=True)
+
+
+def effective_admin(eligible: bool) -> bool:
+    """Apply the browser view without changing the account's admin role."""
+    return eligible and _admin_view_enabled.get()
+
+
+class AdminViewMiddleware:
+    """Apply the browser preference to HTTP requests and WebSocket connections."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self._app(scope, receive, send)
+            return
+        token = _admin_view_enabled.set(
+            HTTPConnection(scope).cookies.get(ADMIN_VIEW_COOKIE) != "off"
+        )
+        try:
+            await self._app(scope, receive, send)
+        finally:
+            _admin_view_enabled.reset(token)
+
 
 # Path prefixes a restricted (device-grant or machine client-credential)
 # access token may reach.
@@ -72,6 +101,7 @@ _DELEGATED_ALLOWED_PREFIXES = (
     "/v1/agents",
     "/v1/hosts",
     "/v1/sessions",
+    "/v1/mcp",
     "/v1/skills",
     "/v1/runners",
     "/oauth/token",
@@ -547,6 +577,19 @@ class UnifiedAuthProvider(AuthProvider):
             return "/login"
         return None
 
+    @property
+    def session_cookie_name(self) -> str | None:
+        """The session cookie this server sets, or ``None`` without one.
+
+        ``__Host-ap_session`` on HTTPS and ``ap_session`` on plain HTTP,
+        for the ``oidc`` and ``accounts`` sources; header mode has none.
+        """
+        if self._source == "oidc" and self._oidc_config is not None:
+            return self._oidc_config.session_cookie_name
+        if self._source == "accounts" and self._accounts_config is not None:
+            return self._accounts_config.session_cookie_name
+        return None
+
     def get_user_id(self, request: HTTPConnection) -> str | None:
         """Extract user identity from the active source.
 
@@ -757,6 +800,34 @@ class UnifiedAuthProvider(AuthProvider):
         if self._local_single_user:
             return RESERVED_USER_LOCAL
         return None
+
+
+def authentication_requires_identity(provider: AuthProvider | None) -> bool:
+    """Whether missing credentials are denied rather than mapped to the local user."""
+    return provider is not None and not (
+        isinstance(provider, UnifiedAuthProvider)
+        and provider._source == "header"
+        and provider._local_single_user
+    )
+
+
+def auth_mode(provider: AuthProvider | None) -> str:
+    """Name the sign-in mode a client should expect from an app's provider.
+
+    :param provider: The app's auth provider, or ``None`` when auth is off.
+    :returns: ``"oidc"``, ``"accounts"``, or ``"header"`` for the built-in
+        sources, ``"custom"`` for an embedding application's own provider,
+        and ``"none"`` when there is no provider.
+    """
+    if provider is None:
+        return "none"
+    if isinstance(provider, UnifiedAuthProvider) and provider._source in (
+        "oidc",
+        "accounts",
+        "header",
+    ):
+        return provider._source
+    return "custom"
 
 
 class AccountAuthorityMiddleware:

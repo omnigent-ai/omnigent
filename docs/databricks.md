@@ -5,7 +5,7 @@ infrastructure. Covers the four canonical integration points:
 
 1. **Databricks Apps** as the managed runtime for the omnigent server
 2. **Mosaic AI Foundation Model APIs** as the LLM provider
-3. **Mosaic AI Gateway** as the governance and audit layer over LLM calls
+3. **Databricks Unity Gateway** as the governance and audit layer over LLM calls
 4. **MLflow Tracing in Unity Catalog** as the long-term trace store
 
 omnigent's fine standalone with any OTLP backend and any LLM
@@ -16,7 +16,7 @@ governance, audit, cost tracking, and managed scale matter.
 > [Omnigent on Databricks](https://docs.databricks.com/aws/en/omnigent/)
 > (Beta) is a fully managed service: Databricks operates the omnigent
 > server for you, already wired to workspace identity, Foundation
-> Models, AI Gateway, and MLflow Tracing. You enable the **Omnigent**
+> Models, Unity Gateway, and MLflow Tracing. You enable the **Omnigent**
 > preview in your workspace settings and follow the quickstart there.
 > No deploy tooling, no Lakebase bootstrap, no bundle to maintain. That
 > is the recommended path for most Databricks users.
@@ -34,6 +34,11 @@ section starts with a short context paragraph, then the concrete
 commands. If you already use both, skim the quick start at the top of
 each section.
 
+To connect the local Antigravity CLI (`omni agy`) to Databricks model services,
+see [Native agy credentials and gateways](native-agy-gateways.md#databricks).
+That route requires the workspace's native Gemini API; a model exposed only
+through the OpenAI Responses API is not sufficient.
+
 ## What you get
 
 When omnigent runs on Databricks with the four integration points
@@ -46,7 +51,7 @@ wired:
   `tool.name`). Searchable, filterable, retained per UC governance.
 - **Per-key LLM cost and audit.** Every LLM call (whether to
   Mosaic AI Foundation Models, OpenAI, Anthropic, or a custom
-  endpoint) flows through Mosaic AI Gateway. Per-key cost tracking,
+  endpoint) flows through Databricks Unity Gateway. Per-key cost tracking,
   rate limits, PII guardrails, audit logs, all enforced at the
   gateway. Switching providers or rotating keys is a Gateway config
   change, not an agent change.
@@ -156,7 +161,7 @@ print(f'input={r.usage.prompt_tokens} output={r.usage.completion_tokens}')
 omni server
 ```
 
-Verified output (run against e2-dogfood workspace):
+Verified output (run against a test workspace):
 
 ```
 HELLO
@@ -264,7 +269,7 @@ print(f'Model:    {r.model}')
 "
 ```
 
-Output (verified against e2-dogfood):
+Output (verified against a test workspace):
 
 ```
 Response: 'GATEWAY OK'
@@ -289,9 +294,9 @@ your agent spec uses.
 
 ---
 
-## 3. Mosaic AI Gateway as the LLM governance layer
+## 3. Databricks Unity Gateway as the LLM governance layer
 
-![LLM call flow through AI Gateway](images/databricks/llm-call-flow.png)
+![LLM call flow through Unity Gateway](images/databricks/llm-call-flow.png)
 
 ### Context
 
@@ -388,7 +393,7 @@ restart.
 
 ### Verified end-to-end
 
-Created a real External Model endpoint on e2-dogfood that proxies
+Created a real External Model endpoint on a test workspace that proxies
 through `databricks-model-serving` to `databricks-claude-sonnet-4`,
 then called it via the same OpenAI SDK pattern omnigent uses. The
 Gateway config included `usage_tracking_config.enabled=true` and a
@@ -466,7 +471,7 @@ subscriptions but is out of band for compliance.
 
 ### What you get on Databricks vs raw provider calls
 
-| Capability | Raw provider call from omnigent | Through AI Gateway |
+| Capability | Raw provider call from omnigent | Through Unity Gateway |
 |---|---|---|
 | Cost tracking per agent / user | Build it yourself | Automatic, queryable in UC |
 | Rate limits per key | Provider-level, coarse | Per-key, configurable per minute / hour / day |
@@ -542,8 +547,8 @@ for a specific request in MLflow by stripping the `resp_` prefix.
 ### Verified end-to-end
 
 Emitted a synthetic trace from a local Python script (using the same
-`mlflow.start_span` API omnigent's `TracingContext` wraps) against the
-e2-dogfood Databricks workspace's MLflow OTLP receiver. Verified the
+`mlflow.start_span` API omnigent's `TracingContext` wraps) against a
+test Databricks workspace's MLflow OTLP receiver. Verified the
 trace landed in UC and the spans carry the expected attributes:
 
 ```
@@ -564,7 +569,7 @@ The trace is queryable via `mlflow.search_traces()` and shows up in
 the workspace MLflow Traces UI at
 `/ml/experiments/<experiment_id>/traces/<trace_id>` per UC RBAC.
 
-Workspace MLflow Traces UI (e2-dogfood) showing the verification trace
+Workspace MLflow Traces UI (test workspace) showing the verification trace
 in the experiment table:
 
 ![MLflow Traces list](images/databricks/mlflow-trace-list.png)
@@ -605,7 +610,7 @@ explicit consent and PII handling in place.
 |---|---|---|
 | `DATABRICKS_HOST` | Workspace URL | Apps env or local shell |
 | `DATABRICKS_TOKEN` | Personal access token or service principal token | Apps env (Workspace Secret) or local shell |
-| `OPENAI_BASE_URL` | LLM provider endpoint, points at Foundation Models or AI Gateway | Apps env or harness spawn-env |
+| `OPENAI_BASE_URL` | LLM provider endpoint, points at Foundation Models or Unity Gateway | Apps env or harness spawn-env |
 | `OPENAI_API_KEY` | Auth for the above endpoint | Apps env or harness spawn-env |
 | `MLFLOW_TRACKING_URI` | Set to `databricks` for workspace-hosted MLflow | Apps env |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | Set to `http/protobuf` for the MLflow OTLP receiver | Apps env |
@@ -687,7 +692,7 @@ observability series shipped in PRs [#1050](https://github.com/omnigent-ai/omnig
 [#1072](https://github.com/omnigent-ai/omnigent/pull/1072), and
 [#1083](https://github.com/omnigent-ai/omnigent/pull/1083).
 
-Verified end-to-end against the e2-dogfood Databricks workspace
+Verified end-to-end against a test Databricks workspace
 (2026-06-24):
 
 - Foundation Model call output (`databricks-claude-sonnet-4`,

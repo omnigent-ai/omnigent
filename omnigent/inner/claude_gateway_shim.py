@@ -4,7 +4,7 @@ Claude Code CLIs from 2.1.168 (and likely earlier 2.1.16x) drop the
 ``thinking.display`` field from ``POST /v1/messages`` bodies whenever
 experimental betas are disabled — the request builder gates ``display``
 on the same internal flag as the experimental beta headers. The
-Databricks AI gateway path must set
+Databricks Unity Gateway path must set
 ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`` (the gateway's beta
 allowlist rejects several of the CLI's experimental betas with HTTP
 400 "invalid beta flag"), so gateway Opus requests lose ``display``
@@ -30,47 +30,39 @@ comes first).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable, Iterator, MutableMapping
+from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any, TypeAlias
 
 import httpx
 import uvicorn
 
+from omnigent.databricks_ai_gateway import (
+    CLAUDE_CODE_AGENT,
+    is_databricks_ai_gateway_url,
+    is_ug_route,
+    with_gateway_attribution_pairs,
+)
+from omnigent.telemetry.surface import harness_client_surface
+from omnigent.util.uvicorn_server import NoSignalServer
+
 logger = logging.getLogger(__name__)
-
-
-class _NoSignalServer(uvicorn.Server):
-    """
-    uvicorn Server that never installs process signal handlers.
-
-    ``uvicorn.Server.serve()`` replaces the process's SIGINT/SIGTERM
-    handlers for its whole lifetime when run on the main thread. The
-    harness subprocess already runs its own uvicorn server whose
-    graceful shutdown is driven by SIGTERM (see
-    ``omnigent/runtime/harnesses/_runner.py``); a second
-    signal-capturing server would steal those handlers and break the
-    harness's shutdown path. The shim is stopped explicitly via
-    :meth:`ClaudeGatewayShim.aclose` (or dies with the process), so it
-    needs no signal handling of its own.
-    """
-
-    @contextlib.contextmanager
-    def capture_signals(self) -> Iterator[None]:
-        """No-op replacement for uvicorn's signal-handler swap."""
-        yield
 
 
 # Databricks-hosted Claude model ids that default to
 # ``thinking.display="omitted"`` — Opus 4.7+ (e.g.
 # ``databricks-claude-opus-4-8``) and Fable, which shares Opus's
-# adaptive-only thinking surface. Sonnet/Haiku stream visible thinking
-# without a display field, so the shim leaves them untouched.
+# adaptive-only thinking surface. Both the legacy serving-endpoint
+# spelling (``databricks-claude-opus-*``) and the Unity Catalog spelling
+# (``system.ai.claude-opus-*``) name the same Databricks-hosted tiers.
+# Sonnet/Haiku stream visible thinking without a display field, so the
+# shim leaves them untouched.
 DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES: tuple[str, ...] = (
     "databricks-claude-opus-",
     "databricks-claude-fable-",
+    "system.ai.claude-opus-",
+    "system.ai.claude-fable-",
 )
 
 # Hop-by-hop headers (RFC 9110 §7.6.1) must not be forwarded by an
@@ -164,6 +156,13 @@ class ClaudeGatewayShim:
 
     def __init__(self, upstream_base_url: str) -> None:
         self._upstream_base_url = upstream_base_url.rstrip("/")
+        # Resolved once per shim: is_ug_route reads ug's state file.
+        self._attribution_via_ug: bool | None = (
+            is_ug_route(self._upstream_base_url)
+            if is_databricks_ai_gateway_url(self._upstream_base_url)
+            else None
+        )
+        self._client_surface = harness_client_surface()
         self._client: httpx.AsyncClient | None = None
         self._server: uvicorn.Server | None = None
         self._serve_task: asyncio.Task[None] | None = None
@@ -218,7 +217,7 @@ class ClaudeGatewayShim:
             lifespan="off",  # plain ASGI callable; no lifespan protocol
             interface="asgi3",  # bound methods defeat uvicorn's auto-detection
         )
-        server = _NoSignalServer(config)
+        server = NoSignalServer(config)
         self._server = server
         self._serve_task = asyncio.create_task(server.serve(), name="claude-gateway-shim-serve")
         deadline = asyncio.get_running_loop().time() + _START_TIMEOUT_SECONDS
@@ -253,7 +252,7 @@ class ClaudeGatewayShim:
         if self._serve_task is not None:
             try:
                 await asyncio.wait_for(self._serve_task, timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 self._serve_task.cancel()
             self._serve_task = None
         if self._client is not None:
@@ -295,6 +294,13 @@ class ClaudeGatewayShim:
             name = raw_name.decode("latin-1")
             if name.lower() not in _REQUEST_HEADER_EXCLUDES:
                 headers.append((name, raw_value.decode("latin-1")))
+        if self._attribution_via_ug is not None:
+            headers = with_gateway_attribution_pairs(
+                headers,
+                CLAUDE_CODE_AGENT,
+                via_ug=self._attribution_via_ug,
+                client_surface=self._client_surface,
+            )
         query = scope.get("query_string", b"").decode("latin-1")
         url = f"{self._upstream_base_url}{path}" + (f"?{query}" if query else "")
 

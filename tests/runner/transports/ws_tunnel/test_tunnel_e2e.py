@@ -76,7 +76,7 @@ async def _drain_session_outbound(session: RunnerSession) -> None:
         data = await session.outbound_queue.get()
         if data is None:
             return
-        await session.ws.send_text(data)
+        await session.ws.send_text(data.data)
 
 
 class _ThreadHandoffWS:

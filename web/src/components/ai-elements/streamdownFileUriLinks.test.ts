@@ -33,15 +33,24 @@ describe("rewriteFileUriLinks", () => {
     expect(rewriteHref("FILE:///tmp/ws/report.md")).toEqual({ href: "/tmp/ws/report.md" });
   });
 
+  it("preserves a root-level file's line and column for sanitization", () => {
+    expect(rewriteHref("README.md:12:3")).toEqual({ href: "README.md#L12C3" });
+  });
+
   it("treats a localhost authority as the local machine, per RFC 8089", () => {
     expect(rewriteHref("file://localhost/tmp/ws/report.md")).toEqual({
       href: "/tmp/ws/report.md",
     });
   });
 
-  it("decodes percent-escapes so the path matches the file on disk", () => {
+  it("keeps percent-escapes for markWorkspaceFileLinks to decode exactly once", () => {
+    // Decoding here too would double-decode: `report%2520final.md` names a
+    // file literally called `report%20final.md`, not `report final.md`.
     expect(rewriteHref("file:///tmp/my%20notes/report.md")).toEqual({
-      href: "/tmp/my notes/report.md",
+      href: "/tmp/my%20notes/report.md",
+    });
+    expect(rewriteHref("file:///ws/report%2520final.md")).toEqual({
+      href: "/ws/report%2520final.md",
     });
   });
 
@@ -70,6 +79,9 @@ describe("rewriteFileUriLinks", () => {
     ["https://example.com/report.md", "http(s) URL"],
     ["/tmp/ws/report.md", "already a plain path"],
     ["mailto:someone@example.com", "other scheme"],
+    ["javascript:12", "unsafe scheme with a numeric payload"],
+    ["javascript:example.md:12", "unsafe scheme with a filename-like payload"],
+    ["https://example.com/report.md:12", "URL with a colon suffix"],
     ["#section-two", "in-page anchor"],
   ])("ignores %s (%s)", (href) => {
     expect(rewriteHref(href)).toEqual({ href });

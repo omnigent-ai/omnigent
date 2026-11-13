@@ -11,12 +11,15 @@ import { createContext, useContext } from "react";
 export interface FilePosition {
   line: number;
   column?: number;
+  /** Last line of a cited range (`file.ts:10-20`), greater than `line`. */
+  endLine?: number;
 }
 
 export type OpenFileOptions = Partial<FilePosition>;
 
+/** `path` is where the viewer goes next; null when its tab closes or the session is left. */
 export type FileNavigationGuard = (
-  path: string,
+  path: string | null,
   options: OpenFileOptions | undefined,
   navigate: () => void,
 ) => void;
@@ -25,8 +28,12 @@ interface FileViewerContextType {
   openFile: (path: string, options?: OpenFileOptions) => void;
   /** The mounted viewer confirms dirty navigation before selection or URL changes. */
   registerNavigationGuard?: (guard: FileNavigationGuard) => () => void;
-  /** Open GitHub in the workspace rail or mobile drawer. */
-  openGithubTab: () => void;
+  /** Runs the registered guards, then `commit` once the viewer allows leaving its file. */
+  guardFileNavigation?: FileNavigationGuard;
+  /** Open Pull Requests in the workspace rail or mobile drawer. */
+  openGithubTab: (prUrl?: string) => void;
+  /** Show a host-absolute folder in the Files tree; absent where no Files panel exists. */
+  openFolder?: (absolutePath: string) => void;
   /**
    * Returns true when `path` is a known workspace file (present in the
    * session's changed-files list). Used as the synchronous fast path for
@@ -65,11 +72,16 @@ export function useFileViewer(): ((path: string, options?: OpenFileOptions) => v
   return useContext(FileViewerContext)?.openFile ?? null;
 }
 
+/** Returns the callback that shows a folder in the Files tree, or `null` when there is none. */
+export function useFolderOpener(): ((absolutePath: string) => void) | null {
+  return useContext(FileViewerContext)?.openFolder ?? null;
+}
+
 /**
- * Returns a callback that opens the GitHub rail tab or mobile drawer, or `null`
+ * Returns a callback that opens the Pull Requests rail tab or mobile drawer, or `null`
  * when used outside AppShell (tests, Storybook).
  */
-export function useOpenGithubTab(): (() => void) | null {
+export function useOpenGithubTab(): ((prUrl?: string) => void) | null {
   return useContext(FileViewerContext)?.openGithubTab ?? null;
 }
 

@@ -1,7 +1,10 @@
-import type { Conversation } from "@/hooks/useConversations";
+import { arrayMove } from "@dnd-kit/sortable";
+import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import type { SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
+import { isIndentedSibling, isSessionPinned, orderSessionFamilies } from "@/lib/sessionFamilies";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -211,38 +214,188 @@ export function filterConversations(
   });
 }
 
-// Sort by `updated_at` desc so the order matches the row's relative-time
-// pill. The active chat uses its frozen snapshot from
-// `activeOverride` instead of its live `updated_at`, so sending a message
-// in the chat you're already viewing doesn't move it.
-//
-// `frozenKeys` (when non-null) pins EVERY row's sort key at its
-// first-seen value: a row's key is read from the map, or captured into it
-// on first sight. The sidebar passes its map while the pointer is inside
-// the list, so background `updated_at` bumps can't slide rows under the
-// cursor — a mid-interaction reorder sends clicks, right-clicks, and the
-// renames they trigger to the wrong session. Rows first seen while frozen
-// (a folder expanding, a page loading) capture their key on entry, and
-// the caller clears the map when the pointer leaves so the order snaps
-// back to reality.
-export function sortByUpdatedAtDesc(
+/** A saved Custom order indexed for sorting. */
+export interface CustomSortOrder {
+  since: number;
+  positions: ReadonlyMap<string, number>;
+}
+
+export function customSortOrder(order: SidebarCustomOrder): CustomSortOrder {
+  return { since: order.since, positions: new Map(order.ids.map((id, index) => [id, index])) };
+}
+
+function customOrderId(row: Conversation): string {
+  return row.family?.id ?? row.id;
+}
+
+// Newest first; equal timestamps fall back to id, so arrival order never shows.
+// Freeze update timestamps for the active chat and hovered list; creation
+// timestamps stay immutable, including when the selected order changes.
+export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
   frozenKeys?: Map<string, number> | null,
+  sortBy: SessionSortBy = "updated_at",
+  custom?: CustomSortOrder | null,
 ): Conversation[] {
-  const effective = (c: Conversation): number => {
-    if (frozenKeys) {
-      const frozen = frozenKeys.get(c.id);
-      if (frozen !== undefined) return frozen;
-      // Capture the override value for the active row so dropping the
-      // override mid-hover (navigating to another chat) can't move it.
-      const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
-      frozenKeys.set(c.id, live);
-      return live;
-    }
-    return activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+  const byId = new Map(conversations.map((row) => [row.id, row]));
+  const sortRow = (row: Conversation) =>
+    (row.provisional && byId.get(row.family?.representative_id ?? row.id)) || row;
+  const effective = (row: Conversation): number => {
+    const c = sortRow(row);
+    const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+    const updatedAt = frozenKeys?.get(c.id) ?? live;
+    frozenKeys?.set(c.id, updatedAt);
+    return sortBy === "created_at" ? c.created_at : updatedAt;
   };
-  return [...conversations].sort((a, b) => effective(b) - effective(a));
+  // Custom: saved rows by position, later-created sessions above, history (ties too) below.
+  const rank = (c: Conversation): number => {
+    if (!custom) return 0;
+    const representative = byId?.get(c.family?.representative_id ?? c.id) ?? c;
+    return (
+      custom.positions.get(customOrderId(c)) ??
+      (representative.created_at > custom.since ? -1 : Infinity)
+    );
+  };
+  return [...conversations].sort((a, b) => {
+    const aSort = sortRow(a);
+    const bSort = sortRow(b);
+    const aRank = rank(aSort);
+    const bRank = rank(bSort);
+    if (aRank !== bRank) return aRank - bRank;
+    const byTime =
+      aRank === -1 ? bSort.created_at - aSort.created_at : effective(bSort) - effective(aSort);
+    return byTime || bSort.id.localeCompare(aSort.id);
+  });
+}
+
+export function sidebarSortBy(base: SidebarCustomOrder["base"]): SessionSortBy {
+  return base === "created" ? "created_at" : "updated_at";
+}
+
+/** Start Custom from the automatic order on screen: every loaded row keeps its slot. */
+export function startCustomOrder(
+  base: SidebarCustomOrder["base"],
+  rows: Conversation[],
+  activeOverride: ActiveChatOverride | null,
+  frozenKeys: Map<string, number> | null,
+): SidebarCustomOrder {
+  return {
+    base,
+    // Server timestamps, so a skewed device clock can't misfile new sessions.
+    since: rows.reduce((latest, row) => Math.max(latest, row.created_at, row.updated_at), 0),
+    ids: [
+      ...new Set(
+        sortConversations(rows, activeOverride, frozenKeys, sidebarSortBy(base)).map(customOrderId),
+      ),
+    ],
+  };
+}
+
+/**
+ * Move `fromId` into `toId`'s slot, or return null for a no-op. Unloaded saved
+ * rows keep their slots. Positions are saved through the deepest row the move
+ * touches, so the history below it keeps following the base order.
+ */
+export function moveCustomOrder(
+  order: SidebarCustomOrder,
+  rows: Conversation[],
+  fromId: string,
+  toId: string,
+  activeOverride: ActiveChatOverride | null,
+  frozenKeys: Map<string, number> | null,
+): SidebarCustomOrder | null {
+  const orderIds = new Map(rows.map((row) => [row.id, customOrderId(row)]));
+  const savedIds = [...new Set(order.ids.map((id) => orderIds.get(id) ?? id))];
+  const custom = customSortOrder({ ...order, ids: savedIds });
+  const seen = new Set<string>();
+  const unsaved = orderSessionFamilies(
+    sortConversations(
+      rows.filter((row) => !custom.positions.has(customOrderId(row))),
+      activeOverride,
+      frozenKeys,
+      sidebarSortBy(order.base),
+      custom,
+    ),
+  ).filter((row) => {
+    const id = customOrderId(row);
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+  const newIds = unsaved.filter((row) => row.created_at > order.since).map(customOrderId);
+  const sequence = [
+    ...newIds,
+    ...savedIds,
+    ...unsaved.filter((row) => row.created_at <= order.since).map(customOrderId),
+  ];
+  const from = sequence.indexOf(orderIds.get(fromId) ?? fromId);
+  const to = sequence.indexOf(orderIds.get(toId) ?? toId);
+  if (from < 0 || to < 0 || from === to) return null;
+  const savedEnd = Math.max(newIds.length + savedIds.length, from + 1, to + 1);
+  return { ...order, ids: arrayMove(sequence, from, to).slice(0, savedEnd) };
+}
+
+/** Status groups, in the order the grouped sidebar renders them. */
+export const STATUS_BUCKETS = ["Needs attention", "Unread", "Working", "Draft", "Done"] as const;
+export type StatusBucket = (typeof STATUS_BUCKETS)[number];
+
+/** What a session needs from the viewer. `unseen` / `hasDraft` come from client stores. */
+export function statusBucket(c: Conversation, unseen: boolean, hasDraft: boolean): StatusBucket {
+  const parkedInTerminal = c.status === "running" && Boolean(c.blocked_on);
+  if ((c.pending_elicitations_count ?? 0) > 0 || c.status === "failed" || parkedInTerminal) {
+    return "Needs attention";
+  }
+  if (c.status === "running" || c.background_work_running) return "Working";
+  if (unseen) return "Unread";
+  if (hasDraft) return "Draft";
+  return "Done";
+}
+
+export const DATE_BUCKETS = [
+  "today",
+  "yesterday",
+  "in the last 7 days",
+  "in the last 30 days",
+  "earlier",
+] as const;
+export type DateBucket = (typeof DATE_BUCKETS)[number];
+
+/** Bucket a timestamp (unix seconds) by local calendar day relative to `now`. */
+export function dateBucket(timestamp: number, now: Date): DateBucket {
+  // Local midnights via the Date constructor, so DST days aren't an hour off.
+  const midnight = (daysAgo: number) =>
+    new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo).getTime();
+  const at = timestamp * 1000;
+  if (at >= midnight(0)) return "today";
+  if (at >= midnight(1)) return "yesterday";
+  if (at >= midnight(7)) return "in the last 7 days";
+  if (at >= midnight(30)) return "in the last 30 days";
+  return "earlier";
+}
+
+/**
+ * Split `rows` into groups in `order`, keeping input order within each
+ * group. A row with no key (or one outside `order`) lands in the last group
+ * rather than vanishing.
+ */
+export function groupConversations<K extends string>(
+  rows: readonly Conversation[],
+  keyOf: (c: Conversation) => K | undefined,
+  order: readonly K[],
+  keepEmpty?: K,
+): { title: K; conversations: Conversation[] }[] {
+  const byKey = new Map<K, Conversation[]>(order.map((key) => [key, []]));
+  const fallback = byKey.get(order[order.length - 1]);
+  for (const row of rows) {
+    const key = keyOf(row);
+    const bucket = (key !== undefined && byKey.get(key)) || fallback;
+    bucket?.push(row);
+  }
+  return order.flatMap((title) => {
+    const conversations = byKey.get(title) ?? [];
+    return conversations.length > 0 || title === keepEmpty ? [{ title, conversations }] : [];
+  });
 }
 
 // Decide the next `activeOverride` value given the current route and
@@ -312,17 +465,107 @@ export function dedupeConversationsById(conversations: readonly Conversation[]):
 
 // Order pinned conversations by when they were pinned, not by `updated_at` —
 // a pinned session holds its slot even when a new message bumps its
-// `updated_at`. The `omnigent.pinned` label value is the epoch-ms pin time;
-// sort ascending so the oldest pin ranks first (top) and a freshly pinned
-// session lands at the bottom of the group (matching the prior localStorage
-// behaviour). A missing/unparseable value sinks to the bottom, stably.
+// `updated_at`. The `omnigent.pinned` label value is the epoch-ms pin time,
+// or a value between two neighbours once the user drags to reorder (see
+// `pinOrderWrites`); sort ascending so a freshly pinned session lands at the
+// bottom. A missing/unparseable value sinks to the bottom, stably.
 export function orderByPinnedTimestamp(conversations: readonly Conversation[]): Conversation[] {
   const pinnedAt = (c: Conversation): number => {
-    const raw = c.labels?.[PINNED_LABEL_KEY];
-    const ms = raw ? Number(raw) : NaN;
+    const ms = pinnedSortValue(c);
     return Number.isFinite(ms) ? ms : Number.MAX_SAFE_INTEGER;
   };
   return [...conversations].sort((a, b) => pinnedAt(a) - pinnedAt(b));
+}
+
+// A pinned family member sorts by the family's pin time; NaN when there's no value.
+function pinnedSortValue(c: Conversation): number {
+  const raw =
+    c.family?.pinned_at ?? (!isIndentedSibling(c) ? c.labels?.[PINNED_LABEL_KEY] : undefined);
+  return raw ? Number(raw) : NaN;
+}
+
+/** A pin label rewrite: the new `omnigent.pinned` sort value for one session. */
+export interface PinOrderWrite {
+  id: string;
+  pinnedAt: number;
+}
+
+/** A pinned family moves as one unit; nested rows only provide context. */
+export function isPinOrderUnit(conversation: Conversation): boolean {
+  return (
+    !conversation.family ||
+    (conversation.family.representative_id === conversation.id && isSessionPinned(conversation))
+  );
+}
+
+/**
+ * The pin label writes that move `fromId` into `toId`'s slot of the (already
+ * pin-ordered) Pinned list. A `fromId` that isn't pinned yet is inserted just
+ * above `toId`, or just below it with `below`. The label value is the list's
+ * sort key, so a move normally rewrites only the moved session, to a value
+ * between its new neighbours. When there's no room between them (equal or
+ * missing values), every pin is renumbered from the lowest existing value (rows
+ * already at their new value are skipped). Returns `[]` for a no-op.
+ */
+export function pinOrderWrites(
+  rows: readonly Conversation[],
+  fromId: string,
+  toId: string,
+  below = false,
+): PinOrderWrite[] {
+  const pinned = rows.filter(isPinOrderUnit);
+  const from = pinned.findIndex((c) => c.id === fromId);
+  const target = pinned.findIndex((c) => c.id === toId);
+  if (target < 0 || from === target) return [];
+  const to = from < 0 && below ? target + 1 : target;
+  const moved = [...pinned];
+  const [row] = from < 0 ? [{ id: fromId } as Conversation] : moved.splice(from, 1);
+  moved.splice(to, 0, row);
+  const value = (c: Conversation | undefined): number => (c ? pinnedSortValue(c) : NaN);
+  const prev = value(moved[to - 1]);
+  const next = value(moved[to + 1]);
+  let pinnedAt = prev + (next - prev) / 2;
+  if (to === 0) pinnedAt = next - 1;
+  else if (to === moved.length - 1) pinnedAt = prev + 1;
+  if (
+    Number.isFinite(pinnedAt) &&
+    (to === 0 || pinnedAt > prev) &&
+    (to === moved.length - 1 || pinnedAt < next)
+  ) {
+    return [{ id: fromId, pinnedAt }];
+  }
+  // Renumber from the lowest existing value, unless it's too large to count up
+  // from in distinct steps; then use a range just below now, so a later pin
+  // (stamped `Date.now()`) still lands at the bottom.
+  const finite = pinned.map(value).filter(Number.isFinite);
+  const lowest = finite.length > 0 ? Math.min(...finite) : NaN;
+  const base =
+    Math.abs(lowest) + moved.length <= Number.MAX_SAFE_INTEGER ? lowest : Date.now() - moved.length;
+  // Skip rows that already hold their renumbered value.
+  return moved
+    .map((c, index) => ({ id: c.id, pinnedAt: base + index }))
+    .filter((w, index) => value(moved[index]) !== w.pinnedAt);
+}
+
+/**
+ * The pin label writes that put a not-yet-pinned `fromId` at the bottom of the
+ * (already pin-ordered) Pinned list, numbered past the highest value any shown
+ * row sorts by, including a family member shown without its representative.
+ * Rows with no value sort last, so they're numbered first, in their shown
+ * order; no existing row changes place. Returns `[]` (a plain pin) when there's
+ * nothing to number past, or the values are too large to step past.
+ */
+export function appendPinWrites(rows: readonly Conversation[], fromId: string): PinOrderWrite[] {
+  const values = rows.map(pinnedSortValue);
+  const finite = values.filter(Number.isFinite);
+  // A nested family row can't take a value without splitting it out of its
+  // family, so when one has none the new pin stays above the unvalued rows.
+  const unvalued = rows.filter((_, index) => !Number.isFinite(values[index]));
+  const renumber = unvalued.every(isPinOrderUnit) ? unvalued : [];
+  if (finite.length === 0 && renumber.length === 0) return [];
+  const start = finite.length > 0 ? Math.max(...finite) + 1 : Date.now() - renumber.length;
+  if (start + renumber.length > Number.MAX_SAFE_INTEGER) return [];
+  return [...renumber, { id: fromId }].map(({ id }, index) => ({ id, pinnedAt: start + index }));
 }
 
 // ── Drag-and-drop ────────────────────────────────────────────────────────────
@@ -342,7 +585,11 @@ export interface SidebarDragSource {
     drop that landed on nothing droppable (e.g. "Shared with me", which is
     never a target — sessions can't be filed there). */
 export type SidebarDropTarget =
-  { type: "project"; name: string } | { type: "ungroup" } | { type: "pin" } | null;
+  | { type: "project"; name: string }
+  | { type: "ungroup" }
+  | { type: "pin" }
+  | { type: "pin-order"; id: string }
+  | null;
 
 /** The action a drop resolves to. `move` files the session into a project;
     `ungroup` removes it from its current project (the caller still confirms
@@ -358,8 +605,9 @@ export type SidebarDropTarget =
 export type SidebarDropAction =
   | { kind: "move"; project: string; unpin: boolean }
   | { kind: "ungroup"; project: string; unpin: boolean }
-  | { kind: "pin" }
+  | { kind: "pin"; targetId?: string }
   | { kind: "unpin" }
+  | { kind: "reorder-pin"; targetId: string }
   | { kind: "none" };
 
 /**
@@ -375,6 +623,8 @@ export type SidebarDropAction =
  * - Dropped on the ungroup zone while unfiled → `unpin` if pinned, else `none`.
  * - Dropped on the pin zone while not already pinned → `pin`.
  * - Dropped on the pin zone while already pinned → `none`.
+ * - Dropped on another pinned row while pinned → `reorder-pin`; while unpinned →
+ *   `pin` with that row as `targetId`, so it's pinned into that slot.
  * - Dropped on nothing → `none`.
  */
 export function resolveSidebarDrop(
@@ -394,8 +644,23 @@ export function resolveSidebarDrop(
     // floats pinned sessions out of their project into the Pinned section).
     return source.isPinned ? { kind: "none" } : { kind: "pin" };
   }
+  if (target.type === "pin-order") {
+    if (!source.isPinned) return { kind: "pin", targetId: target.id };
+    return target.id === source.id
+      ? { kind: "none" }
+      : { kind: "reorder-pin", targetId: target.id };
+  }
   // Ungroup (dropped on "Chats" / the fallback strip): land it in the flat list.
   if (source.project) return { kind: "ungroup", project: source.project, unpin: source.isPinned };
   // No project label: only meaningful if pinned (unpin → it drops into Chats).
   return source.isPinned ? { kind: "unpin" } : { kind: "none" };
+}
+
+/**
+ * Whether the Sessions list accepts a dragged session: a filed one (ungroup) or
+ * a pinned one (unpin). Grouped views already list filed sessions in place, so
+ * there it only unpins a pin that has no project to lose.
+ */
+export function sessionsListAcceptsDrop(source: SidebarDragSource, grouped: boolean): boolean {
+  return grouped ? source.isPinned && !source.project : !!source.project || source.isPinned;
 }

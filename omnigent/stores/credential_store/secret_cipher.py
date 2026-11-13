@@ -47,6 +47,10 @@ CREDENTIAL_CIPHER_ENV_VAR = "OMNIGENT_CREDENTIAL_CIPHER"
 _SOFT_FAIL_KMS_CODES = frozenset({"InvalidCiphertextException", "IncorrectKeyException"})
 
 
+class SecretTooLargeError(ValueError):
+    """The serialized secret exceeds the configured encryption backend limit."""
+
+
 @runtime_checkable
 class SecretCipher(Protocol):
     """Port for encrypting integration secrets at rest.
@@ -145,8 +149,8 @@ class KmsSecretCipher:
 
     Each secret is a single ``kms:Encrypt`` call under ``key_id`` with the row
     identity as the encryption context; the ciphertext blob is stored base64.
-    The blobs are small (a token JSON object), well under the 4 KB KMS
-    ``Encrypt`` limit, so no envelope/data-key layer is needed. The KMS client
+    Serialized secrets must fit the 4096-byte KMS ``Encrypt`` limit. Larger
+    credentials require another backend, such as Vault Transit. The KMS client
     is created lazily so importing this module never requires boto3 or AWS
     credentials — only constructing the cipher (which only happens when a key is
     configured) does.
@@ -174,9 +178,15 @@ class KmsSecretCipher:
         return self._client
 
     def encrypt(self, plaintext: str, *, context: SecretContext) -> str:
+        encoded = plaintext.encode("utf-8")
+        if len(encoded) > 4096:
+            raise SecretTooLargeError(
+                "Credential exceeds the KMS limit of 4096 serialized bytes. "
+                "Ask your administrator to configure Vault Transit for larger credentials."
+            )
         response = self._kms.encrypt(
             KeyId=self._key_id,
-            Plaintext=plaintext.encode("utf-8"),
+            Plaintext=encoded,
             EncryptionContext=_kms_context(context),
         )
         return base64.b64encode(response["CiphertextBlob"]).decode("ascii")

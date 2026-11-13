@@ -143,8 +143,12 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
       "https://test-\(UUID().uuidString.lowercased()).cloud.databricks.com/omnigent?o=123")
     let credentials = MemoryDatabricksCredentialStore()
     try credentials.save(credentialTokens(), for: context.scope)
+    let sessions = FakeWorkspaceSessions()
+    sessions.hold = true
+    let authenticating = expectation(description: "workspace session request")
+    sessions.onRequest = { authenticating.fulfill() }
     let bootstrap = makeBootstrap(
-      credentials, login: FakeWorkspaceLogin(), sessions: FakeWorkspaceSessions())
+      credentials, login: FakeWorkspaceLogin(), sessions: sessions)
     let model = WebViewModel()
     let suite = "omnigent-test-\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
@@ -166,6 +170,14 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
     webView.onLoad = { loaded.fulfill() }
     coordinator.load(context.pageURL, in: webView)
     XCTAssertTrue(webView.requests.isEmpty)
+    await fulfillment(of: [authenticating], timeout: 10)
+    let shell = WebShellView(
+      initialURL: context.pageURL, connectToNewServer: {}, switchToServer: { _ in },
+      loadFailed: { _, _ in }, loadSucceeded: {})
+    XCTAssertTrue(model.isAuthenticating)
+    XCTAssertFalse(model.serverSwitcherHidden)
+    XCTAssertTrue(shell.showsServerSwitcher(for: model))
+    sessions.release()
     await fulfillment(of: [loaded], timeout: 10)
     XCTAssertEqual(webView.requests.first?.url, context.pageURL)
     XCTAssertNil(webView.requests.first?.value(forHTTPHeaderField: "Authorization"))
@@ -233,7 +245,8 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
   func testConfigurationAndSessionFailuresStillHaveMessages() {
     for error: Error in [
       DatabricksOAuthError.invalidClientID, DatabricksSessionError.missingCookie,
-      DatabricksSessionError.networkUnavailable, DatabricksSessionError.rejected(403),
+      DatabricksSessionError.networkUnavailable(DatabricksTransportFailure(URLError(.timedOut))),
+      DatabricksSessionError.rejected(403),
     ] {
       XCTAssertEqual(
         OmnigentWebView.Coordinator.workspaceErrorMessage(error), error.localizedDescription)
@@ -254,6 +267,32 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
     XCTAssertNil(
       OmnigentWebView.Coordinator.workspaceErrorMessage(
         DatabricksSessionError.cancelled, databricksInternalFeaturesEnabled: true))
+  }
+
+  func testWrappedUnreachableHostKeepsTheSharedPageLoadGuidance() {
+    let unreachable = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotFindHost)
+    let guidance = OmnigentWebView.connectionErrorMessage(
+      for: unreachable, databricksInternalFeaturesEnabled: true)
+    let failure = DatabricksTransportFailure(unreachable)
+    for error: Error in [
+      DatabricksSessionError.networkUnavailable(failure),
+      DatabricksOAuthError.networkUnavailable(failure),
+    ] {
+      XCTAssertEqual(
+        OmnigentWebView.Coordinator.workspaceErrorMessage(
+          error, databricksInternalFeaturesEnabled: true), guidance)
+      XCTAssertEqual(
+        OmnigentWebView.Coordinator.workspaceErrorMessage(
+          error, databricksInternalFeaturesEnabled: false),
+        "Could not reach Databricks. Please try again. (NSURLErrorDomain -1003)")
+    }
+    // A timeout is not a DNS failure, so it keeps the message that names its code.
+    let timedOut = DatabricksSessionError.networkUnavailable(
+      DatabricksTransportFailure(URLError(.timedOut)))
+    XCTAssertEqual(
+      OmnigentWebView.Coordinator.workspaceErrorMessage(
+        timedOut, databricksInternalFeaturesEnabled: true),
+      "Could not reach Databricks. Please try again. (NSURLErrorDomain -1001)")
   }
 
   func testSilentRecoveryDoesNotPresentBrowserWhenGrantIsMissing() async throws {

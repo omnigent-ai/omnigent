@@ -79,7 +79,9 @@ struct DatabricksOAuthClient: DatabricksTokenRefreshing {
       if Task.isCancelled || (error as? URLError)?.code == .cancelled {
         throw CancellationError()
       }
-      throw DatabricksOAuthError.networkUnavailable
+      let failure = DatabricksTransportFailure(error)
+      NSLog("[omnigent] Databricks token request failed: \(failure)")
+      throw DatabricksOAuthError.networkUnavailable(failure)
     }
     try Task.checkCancellation()
     guard let http = response as? HTTPURLResponse, http.url == request.url else {
@@ -136,13 +138,7 @@ struct DatabricksOAuthClient: DatabricksTokenRefreshing {
     request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     request.timeoutInterval = 30
-    let unreserved = CharacterSet(
-      charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-    let fields = [("client_id", scope.clientID)] + fields
-    request.httpBody = Data(
-      fields.map {
-        "\($0.0.addingPercentEncoding(withAllowedCharacters: unreserved)!)=\($0.1.addingPercentEncoding(withAllowedCharacters: unreserved)!)"
-      }.joined(separator: "&").utf8)
+    request.httpBody = OAuthSupport.formBody([("client_id", scope.clientID)] + fields)
     return request
   }
 

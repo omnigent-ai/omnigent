@@ -915,22 +915,24 @@ def _make_assistant_message_body(
 
 
 @pytest.mark.asyncio
-async def test_output_allow_verdict():
-    """OUTPUT policy evaluation returns allow when the engine
-    ALLOWs the assistant response.
-    """
+@pytest.mark.parametrize("turn_final", [True, False, None])
+@pytest.mark.parametrize("text", ["This is a safe response.", ""])
+async def test_output_allow_verdict(text: str, turn_final: bool | None) -> None:
+    """Nonempty responses forward finality; empty responses skip evaluation."""
     from omnigent.server.routes.sessions import _evaluate_output_policy
 
     conv_store = _FakeConversationStore()
     agent_store = _FakeAgentStore(agent=_make_agent())
     conv = conv_store.get_conversation("sess_1")
-    body = _make_assistant_message_body("This is a safe response.")
+    body = _make_assistant_message_body(text)
 
     spec = _make_spec_with_guardrails()
     loaded = LoadedAgent(spec=spec, workdir="/tmp/fake")
     allow_result = PolicyResult(action=PolicyAction.ALLOW)
+    captured: list[EvaluationContext] = []
 
-    async def _eval(_ctx: Any) -> PolicyResult:
+    async def _eval(ctx: EvaluationContext) -> PolicyResult:
+        captured.append(ctx)
         return allow_result
 
     with (
@@ -949,9 +951,18 @@ async def test_output_allow_verdict():
             conv_store,
             agent_store,
             None,
+            turn_final=turn_final,
         )
 
     assert result is None
+    if text:
+        mock_build.assert_called_once()
+        assert len(captured) == 1
+        ctx = captured[0]
+        assert (ctx.phase, ctx.content, ctx.turn_final) == (Phase.RESPONSE, text, turn_final)
+    else:
+        mock_build.assert_not_called()
+        assert not captured
 
 
 @pytest.mark.asyncio
@@ -1028,3 +1039,31 @@ def test_build_evaluation_context_request_dict_still_works() -> None:
     # ``content`` fallback also honored.
     ctx2 = _build_evaluation_context(Phase.REQUEST, {"content": "hi"}, {})
     assert ctx2.content == {"user_content": "hi", "attachments": []}
+
+
+def test_build_evaluation_context_tool_result_keeps_reported_failure() -> None:
+    """A producer's ``is_error: true`` reaches result policies.
+
+    ``detect_thrashing`` counts it as an error even when the result text
+    doesn't look like one.
+    """
+    ctx = _build_evaluation_context(
+        Phase.TOOL_RESULT,
+        {"result": "cat: /nonexistent: No such file or directory", "is_error": True},
+        {"request_data": {"name": "exec"}},
+    )
+    assert ctx.content == {
+        "result": "cat: /nonexistent: No such file or directory",
+        "is_error": True,
+    }
+
+
+@pytest.mark.parametrize("flag", [False, "true", 1])
+def test_build_evaluation_context_tool_result_drops_other_flags(flag: object) -> None:
+    """Only a boolean ``True`` passes through, so policies never see a guess."""
+    ctx = _build_evaluation_context(
+        Phase.TOOL_RESULT,
+        {"result": "ok", "is_error": flag},
+        {"request_data": {"name": "exec"}},
+    )
+    assert ctx.content == {"result": "ok"}

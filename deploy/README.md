@@ -99,6 +99,13 @@ deploy/
 ├── microsandbox/      ← microsandbox sandbox-provider guide (local libkrun
 │   └── README.md         microVMs, embedded SDK, no daemon); NOT a server target.
 │
+├── aws-lambda-microvm/ ← AWS Lambda MicroVMs sandbox-provider guide + MicroVM
+│   ├── Dockerfile        image build inputs (hooks shim on the host image);
+│   ├── entrypoint.sh     server-managed only. NOT a server deploy target.
+│   ├── hooks_server.py
+│   ├── start_host.sh
+│   └── README.md
+│
 ├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
 │   ├── databricks.yml     bundle declarative config
 │   ├── deploy.py          build + `bundle deploy`/`run` orchestrator
@@ -133,7 +140,7 @@ deploy/
 > **On Databricks?** The fully managed
 > [Omnigent on Databricks](https://docs.databricks.com/aws/en/omnigent/)
 > (Beta) is the recommended path: Databricks operates the server for
-> you, wired to workspace identity, Foundation Models, AI Gateway, and
+> you, wired to workspace identity, Foundation Models, Unity Gateway, and
 > MLflow Tracing. Enable the **Omnigent** preview in your workspace
 > settings. The self-managed Databricks Apps bundle above is for when
 > you need control the managed service does not expose yet.
@@ -254,6 +261,64 @@ or a workspace API path) all work with the same command; for Databricks it
 runs `databricks auth login` against the right workspace for you (requires
 the `databricks` extra).
 
+### OIDC login client upgrades
+
+OIDC ticket login requires PKCE and explicit browser approval. This is a
+breaking change for older CLIs, mobile apps, Slack integrations, and custom
+clients: their next login cannot complete until they are updated. Existing
+sessions and refresh grants keep their normal expiry and revocation behavior.
+Browser-only login and the other authentication modes are unchanged.
+
+An old client's empty login request opens an **Update Omnigent to sign in**
+page. CLI users should run `omni upgrade` and retry their login; mobile users
+should update the app through their normal distribution channel; Slack users
+need their administrator to update the integration. The terminal or Slack
+message may still say the login was rejected because installed old clients
+do not display the server's detailed error text.
+Update the centrally managed Slack bot before the server: its old error modal
+can replace the upgrade link before the user opens it.
+
+The server returns HTTP 200 only to let these clients open the instructions.
+Its `ticket` field is a fixed, non-redeemable notice marker: no login ticket
+or credentials are created, and polling returns terminal HTTP 410. Requests
+containing invalid PKCE data still return HTTP 400. There is no legacy login
+fallback.
+
+Before deploying the server, make client builds containing the PKCE update
+available through your CLI, mobile, and Slack distribution channels, and
+announce that older clients must upgrade to sign in again. Test both an old
+and an updated client against a staging server with your actual identity
+provider. The old client must show the upgrade page without signing in; the
+updated client must complete fresh sign-in and browser approval. Preserve
+PKCE and consent enforcement if rolling back an unrelated deployment issue.
+
+Updated clients send proof in `X-Omnigent-Code-Verifier`; proxies must forward
+this header without logging it. Query-based proof remains supported for API
+compatibility, so do not retain `/auth/cli-poll` query strings either: a ticket
+and verifier together can redeem an approved login. Approval requires a browser
+session authenticated for that specific ticket; ordinary browser sessions,
+runner tokens, and refresh-issued tokens cannot approve it. Existing sessions
+remain valid elsewhere. Generic OIDC ticket flows require fresh IdP authentication
+and a signed ID token with `auth_time` at or after the reauthentication request.
+Verify that your IdP honors `prompt=login` with a positive `max_age` (300 seconds
+by default; `OMNIGENT_OIDC_REAUTH_MAX_AGE` changes it) and supplies `auth_time`;
+missing or stale claims fail closed. GitHub OAuth may reuse its provider session,
+but still requires ticket-specific browser sign-in and approval.
+For an IdP that cannot supply a fresh `auth_time` (for example, Cloudflare
+Access), set `OMNIGENT_OIDC_REQUIRE_REAUTH=0`. The server still sends
+`prompt=login` and requires PKCE, ticket-specific sign-in, and approval, but it
+no longer verifies that the IdP asked for credentials again.
+If the IdP fails the sign-in when asked to re-authenticate (for example,
+self-managed GitLab), also set `OMNIGENT_OIDC_REAUTH_PROMPT=0` to stop sending
+`prompt=login` and `max_age`. The IdP then reuses its session, so only the
+ticket-specific approval screen confirms the request.
+Polling responses forbid caching, including successful credential responses.
+CLI and Slack display a comparison code; native mobile apps currently rely
+on explicit browser approval without displaying that code in the app. Include
+the actual native apps in staging checks before publishing a mobile build.
+
+### Register the host
+
 Then register the machine as a host, so sessions created in the web UI can
 run on it:
 
@@ -314,6 +379,51 @@ Gensee reads `GENSEE_CONTROLLER_API_TOKEN`; see
 All credentials come from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
+
+**Host token expiry.** Set `sandbox.token_ttl_s` to control the token validity
+window in seconds. Omitted or `null` keeps the provider default (seven days
+for most providers; Modal uses 25 hours, and Blaxel, E2B, and CoreWeave derive
+it from sandbox lifetime). Values must be integers from `300` to `31536000`
+(5 minutes to 365 days). Allow enough time for sandbox startup and repository
+setup before the first host connection.
+
+```yaml
+sandbox:
+  server_url: https://your-host
+  token_ttl_s: 86400                 # shared default: 1 day
+  providers:
+    - provider: daytona
+    - provider: kubernetes
+      token_ttl_s: 604800            # override: 7 days
+```
+
+With a single `provider`, put `token_ttl_s` beside it. In a `providers` list,
+an entry can override the shared value or use `null` to restore its provider
+default. Restart the server after editing the configuration. The setting
+applies to newly issued tokens and future renewals; lowering it does not
+shorten an expiry already granted to an existing token.
+
+Connected hosts renew the same token halfway through this window, on the next
+heartbeat. Ordinary heartbeats keep their existing cost. Expiry is measured
+from the last renewal; disconnected hosts receive no renewals, and an expired
+token cannot open a new connection. Renewal also extends the validity of any
+leaked copy of that token. This setting does not change sandbox lifetime or
+Mac/Arca user-login credentials.
+
+**Stopping archived sessions' sandboxes.** Set `sandbox.stop_on_archive: true`
+(off by default) to stop a session's sandbox when the session is archived, after
+its runner is stopped. It is a per-provider setting: in a `providers:` list, a
+value next to `providers` is every entry's default, and an entry can override it.
+The sandbox is stopped, not deleted, so unarchiving the session and sending a
+message resumes the same sandbox. It applies only to providers that can resume
+a stopped sandbox (`capabilities.resume_stopped`) and implement `stop()`; on a
+provider whose `stop()` raises `SandboxCapabilityError`, the option has no
+effect (the server logs that at debug level). Only a sandbox no other session
+uses is stopped: another session on the same host, or a side chat or sub-agent
+of the session, keeps it running even when archived, and so does a scheduled
+task run's sandbox. Deleting the session still terminates the sandbox, and so does
+the reaper below once a stopped sandbox's host passes its offline limit; the
+next message then starts a fresh sandbox instead.
 
 The optional reaper runs once for the whole `sandbox:` deployment, including
 multi-provider configurations. It queries managed host rows directly and
@@ -420,6 +530,40 @@ overrides this auto-selection.
 > `403` even though the host connects. Framework-level; applies to every sandbox
 > provider (Modal / Daytona / Islo / Kubernetes / …).
 
+### Ending accounts sessions
+
+An `accounts` session lasts `OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS` (default 8).
+To end one user's sessions sooner, change the password (Account menu → Change
+password) or have an admin reset it (Members → Reset). Either one invalidates
+the browser sessions, CLI logins, refresh tokens, and unused sign-in links
+issued to that user so far. A password change keeps the browser that made it
+signed in.
+
+The user's scheduled tasks and host registrations are kept, but that does not
+mean they keep running. A host that is already connected keeps its connection,
+and still looks online, but launches on it fail, including scheduled runs,
+until it reconnects:
+
+- A host signed in with the user's credentials (`omnigent host` after
+  `omnigent login`) cannot reconnect with them. Run `omnigent login`, then
+  restart the host.
+- A managed host, which the server starts in a sandbox, connects with its own
+  launch token rather than the user's credentials. It needs no login: once it
+  reconnects with that token, before the token expires, launches work again.
+
+CLIs need `omnigent login` too.
+
+Servers running a release without this behaviour keep the user's sessions when
+they change or reset a password. During a rolling upgrade, repeat a change made
+while such instances were still serving.
+
+Rotating `OMNIGENT_ACCOUNTS_COOKIE_SECRET` signs out every user at once: it
+invalidates all session tokens, CLI logins, and refresh tokens. Unused sign-in
+and invite links are looked up by value, not signed with the secret, so they
+keep working until they expire (sign-in links after
+`OMNIGENT_ACCOUNTS_MAGIC_TTL_MINUTES`, default 10; invites after
+`OMNIGENT_ACCOUNTS_INVITE_TTL_HOURS`, default 72).
+
 ### Browser origin allowlist
 
 Independent of the auth mode above, the server also checks the browser
@@ -465,6 +609,12 @@ docker compose up -d        # restart to apply
 
 Your team signs in with their existing accounts, and there are no passwords
 for you to manage. Nothing else about the app changes.
+
+Generic OIDC also supports public PKCE clients without a client secret,
+PS256-signed identity tokens, and operator-configured authorization/token/JWKS
+endpoints. See [public clients and explicit endpoints](docker/README.md#public-pkce-clients-and-explicit-endpoints)
+for configuration and security considerations. Existing client-secret login
+remains the default.
 
 > [!TIP]
 > The only outside step is creating an app with your provider (e.g. Google
@@ -553,6 +703,7 @@ start.
 ```yaml
 branding:
   app_name: "Acme Agent"        # tab title, sidebar wordmark, login screen
+  server_name: "Acme Engineering"  # this server's name in the desktop app's server list
   heading: "How can I help?"     # landing hero; "" hides it, omit to keep the default
   logo:                          # a bare string sets `main`; or per-variant:
     main: logo.png               # branding-assets/logo.png
@@ -576,6 +727,37 @@ sign-in. Any unset field keeps its built-in default, so a partial block is fine.
 The small "Powered by Omnigent" credit under the landing composer appears only
 once you set custom branding; `powered_by: false` hides it even then. It always
 shows the Omnigent mascot, never your logo.
+
+`server_name` names this particular server, so people who connect the desktop
+app to several servers can tell them apart. It is published in the
+unauthenticated `GET /.well-known/omnigent.json` manifest, not in `/v1/info`.
+Desktop builds that read it always show the host next to it, and a name set by
+device policy (`omnigentServerName`) takes precedence. When unset, the desktop shows the
+host; it does not fall back to `app_name`.
+
+## Curating the New Chat picker
+
+Limit and order what New Chat offers, and choose where a fresh chat starts, with
+two optional keys in the same server config as `branding:` (`omnigent server -c
+config.yaml`, `OMNIGENT_CONFIG`, or `<data_dir>/config.yaml` — `/data/config.yaml`
+in the Docker stack). Takes effect on the next server start.
+
+```yaml
+restrict_to_agent_names: [polly, claude-native-ui]  # New Chat offers only these, in this order
+default_agent_name: polly                            # where a user with no history starts
+```
+
+With `restrict_to_agent_names` set, New Chat shows one flat list: no Harnesses
+heading, no "Other..." submenus, no "Create custom agent" and no Smart Routing.
+A user's own earlier pick wins over `default_agent_name` while it is still
+offered. The server logs a warning at startup for a name it can't offer.
+
+This is display only, not access control: the API, the CLI, the automation and
+project-default pickers, and existing sessions still reach every agent. To
+remove packaged agents everywhere, use `OMNIGENT_SEEDED_AGENTS` ([Trimming the
+packaged built-in agents](docker/README.md#trimming-the-packaged-built-in-agents));
+an agent it removes stays hidden even when `restrict_to_agent_names` lists it.
+Both keys are served on the unauthenticated `GET /v1/info`.
 
 ## Adding a new deploy target
 

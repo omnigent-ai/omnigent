@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json as _json
 import re
-import socket
 import subprocess
 import sys
 import time
@@ -38,6 +37,7 @@ from typing import Any
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e_ui.conftest import (
     _create_bundled_session,
     _ensure_runner_online,
@@ -93,13 +93,6 @@ tools:
     type: mcp
     url: http://127.0.0.1:{port}/mcp
 """
-
-
-def _find_free_port() -> int:
-    """Bind port 0 and return the OS-assigned free port."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _start_mcp_server(port: int, timeout_s: float = 30.0) -> subprocess.Popen[bytes]:
@@ -213,7 +206,7 @@ def test_mcp_tool_call_recovers_after_mcp_server_restart(
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
 
-    port = _find_free_port()
+    port = find_free_port()
     mcp_proc = _start_mcp_server(port)
     session_id: str | None = None
     try:

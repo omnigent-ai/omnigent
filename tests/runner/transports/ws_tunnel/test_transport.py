@@ -70,6 +70,21 @@ async def test_handle_async_request_raises_connect_error_on_race() -> None:
         await transport.handle_async_request(_make_request())
 
 
+@pytest.mark.asyncio
+async def test_handle_async_request_rejects_replaced_generation() -> None:
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+    request = _make_request()
+    request.extensions["runner_tunnel_generation"] = old.generation
+    new = reg.register("r1", _NoopWS(), _hello())
+
+    with pytest.raises(ConnectionError, match="before request was sent"):
+        await transport.handle_async_request(request)
+    assert not new.in_flight
+    assert new.outbound_queue.empty()
+
+
 # ── handle_async_request: successful response ──────────
 
 
@@ -115,6 +130,12 @@ async def test_handle_async_request_returns_response() -> None:
 
     response = await task
     assert response.status_code == 200
+    assert response.extensions["omnigent_runner_connection"] == {
+        "runner_id": "r1",
+        "runner_version": session.hello.runner_version,
+        "connection_id": session.hello.connection_id,
+        "generation": session.generation,
+    }
 
     # Drain the streaming body.
     body = b""
@@ -124,6 +145,9 @@ async def test_handle_async_request_returns_response() -> None:
 
     # After iteration, the request should be closed.
     assert req_id not in session.in_flight
+    replacement = reg.register("r1", _NoopWS(), _hello())
+    assert response.extensions["omnigent_runner_connection"]["generation"] == session.generation
+    assert replacement.generation != session.generation
 
 
 @pytest.mark.asyncio
@@ -151,6 +175,29 @@ async def test_handle_async_request_with_body() -> None:
 
     response = await task
     assert response.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_response_end_before_head_aborts_request_and_releases_slot() -> None:
+    """An end frame without a head must not leave the transport waiting forever."""
+    reg = TunnelRegistry()
+    session = reg.register("r1", _NoopWS(), _hello())
+    transport = WSTunnelTransport(reg, "r1")
+
+    task = asyncio.create_task(transport.handle_async_request(_make_request("GET", "/bad")))
+    for _ in range(100):
+        if session.in_flight:
+            break
+        await asyncio.sleep(0)
+    else:
+        pytest.fail("request did not open before the bounded test window")
+
+    req_id = next(iter(session.in_flight))
+    assert reg.route_response_frame("r1", ResponseEndFrame(id=req_id)) is True
+
+    with pytest.raises(httpx.RemoteProtocolError, match=r"before response\.head"):
+        await asyncio.wait_for(task, timeout=0.2)
+    assert req_id not in session.in_flight
 
 
 # ── _TunneledByteStream: abort propagation ─────────────
@@ -213,3 +260,61 @@ async def test_transport_aclose_is_noop() -> None:
     reg = TunnelRegistry()
     transport = WSTunnelTransport(reg, "r1")
     await transport.aclose()  # Should not raise.
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "reported"),
+    [
+        pytest.param("POST", "/v1/sessions/conv_1/events", True, id="session-event"),
+        pytest.param("GET", "/v1/sessions/conv_1/events", False, id="read"),
+        pytest.param("POST", "/v1/sessions/conv_1/resources", False, id="other-post"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_session_event_sends_report_work_dispatched(
+    method: str, path: str, reported: bool
+) -> None:
+    """Only a session event sent to the runner counts as new work for keepalive."""
+    dispatched: list[str] = []
+    reg = TunnelRegistry(on_work_dispatched=dispatched.append)
+    reg.register("r1", _NoopWS(), _hello())
+    frame_sent = asyncio.Event()
+    send_text = reg.send_text
+
+    async def _send_text(*args: object, **kwargs: object) -> None:
+        await send_text(*args, **kwargs)  # type: ignore[arg-type]
+        frame_sent.set()
+
+    reg.send_text = _send_text  # type: ignore[method-assign]
+    task = asyncio.create_task(
+        WSTunnelTransport(reg, "r1").handle_async_request(_make_request(method, path))
+    )
+    try:
+        # The hook runs right after the request frame is handed to the tunnel.
+        await asyncio.wait_for(frame_sent.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert dispatched == (["r1"] if reported else [])
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_failing_work_dispatched_hook_does_not_fail_the_request() -> None:
+    def _boom(_runner_id: str) -> None:
+        raise RuntimeError("keepalive down")
+
+    reg = TunnelRegistry(on_work_dispatched=_boom)
+    reg.register("r1", _NoopWS(), _hello())
+    task = asyncio.create_task(
+        WSTunnelTransport(reg, "r1").handle_async_request(
+            _make_request("POST", "/v1/sessions/conv_1/events")
+        )
+    )
+    async with asyncio.timeout(1):
+        while not (session := reg.get("r1")) or not session.in_flight:
+            await asyncio.sleep(0.001)
+    req_id = next(iter(session.in_flight))
+    reg.route_response_frame("r1", ResponseHeadFrame(id=req_id, status=202, headers=[]))
+    reg.route_response_frame("r1", ResponseEndFrame(id=req_id))
+    assert (await task).status_code == 202

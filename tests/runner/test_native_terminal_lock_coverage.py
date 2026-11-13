@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.harness_plugins import _BUILTIN_NATIVE_PROVIDERS
-from omnigent.runner.app import _require_full_native_lock_coverage
+from omnigent.runner.app_support import _require_full_native_lock_coverage
 from omnigent.runner.native.interrupt import _UNIFORM_INTERRUPT, _UNIFORM_STOP
 
 # Built-in native harnesses are dispatched by ``agent.key`` (e.g. "devin").

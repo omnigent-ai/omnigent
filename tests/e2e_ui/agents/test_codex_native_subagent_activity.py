@@ -86,4 +86,6 @@ def test_codex_spawn_activity_appears_in_agents_rail(
     child_row = rail.locator('[data-testid="subagent-row"]')
     expect(child_row).to_have_count(1, timeout=30_000)
     expect(child_row).to_contain_text("Codex")
-    expect(child_row.get_by_test_id("subagent-status-dot")).to_have_attribute("aria-label", "Done")
+    expect(child_row.get_by_test_id("subagent-status-avatar")).to_have_attribute(
+        "aria-label", "Done"
+    )

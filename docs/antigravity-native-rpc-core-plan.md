@@ -56,7 +56,7 @@
 
 **Files:**
 - Modify: `omnigent/antigravity_native_rpc.py`
-- Test: `tests/test_antigravity_native_rpc.py`
+- Test: `tests/harnesses/antigravity_native/test_antigravity_native_rpc.py`
 
 **Interfaces:**
 - Produces: `get_trajectory_steps(port:int, cascade_id:str) -> list[dict]`; `cancel_cascade_steps(port:int, cascade_id:str) -> bool`. Both reuse `_rpc_url`/`_sync_client`/`_assert_loopback_url`.
@@ -80,7 +80,7 @@ def test_cancel_cascade_steps_true_on_200(monkeypatch):
     assert rpc.cancel_cascade_steps(52548, "conv-uuid") is True
 ```
 
-- [ ] **Step 2: Run, verify FAIL** — `uv run --group test pytest tests/test_antigravity_native_rpc.py -k "trajectory_steps or cancel_cascade" -v` → fail (undefined).
+- [ ] **Step 2: Run, verify FAIL** — `uv run --group test pytest tests/harnesses/antigravity_native/test_antigravity_native_rpc.py -k "trajectory_steps or cancel_cascade" -v` → fail (undefined).
 - [ ] **Step 3: Implement** `get_trajectory_steps` (POST `{"cascadeId": cascade_id}` to `GetCascadeTrajectorySteps`, parse `.get("steps", [])`) and `cancel_cascade_steps` (POST `{"cascadeId": cascade_id}` to `CancelCascadeSteps`, return `resp.status_code < 400`), both via `_sync_client` + `_assert_loopback_url`, mirroring `_conversation_matches`.
 - [ ] **Step 4: Run, verify PASS.**
 - [ ] **Step 5: Commit** (`feat(antigravity-native): RPC client — trajectory steps + cancel`).
@@ -89,7 +89,7 @@ def test_cancel_cascade_steps_true_on_200(monkeypatch):
 
 ### Task 3: RPC client — `handle_user_interaction` (unary)
 
-**Files:** Modify `omnigent/antigravity_native_rpc.py`; Test `tests/test_antigravity_native_rpc.py`
+**Files:** Modify `omnigent/antigravity_native_rpc.py`; Test `tests/harnesses/antigravity_native/test_antigravity_native_rpc.py`
 
 **Interfaces:**
 - Produces: `handle_user_interaction(port:int, cascade_id:str, *, trajectory_id:str, step_index:int, payload:dict) -> None` (raises `AntigravityRpcError` on non-200, carrying the body so callers can detect the overloaded `"input not registered"`). `payload` is the variant dict, e.g. `{"askQuestion": {...}}` or `{"permission": {"allow": True}}`.
@@ -124,7 +124,7 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 
 ### Task 4: Step→item mapper — assistant text, tool calls, results, status
 
-**Files:** Create `omnigent/antigravity_native_steps.py`; Test `tests/test_antigravity_native_steps.py`
+**Files:** Create `omnigent/antigravity_native_steps.py`; Test `tests/harnesses/antigravity_native/test_antigravity_native_steps.py`
 
 **Interfaces:**
 - Consumes: Task 1 step fixtures.
@@ -140,7 +140,7 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 
 ### Task 5: Mapper — `WAITING` interaction extractor
 
-**Files:** Modify `omnigent/antigravity_native_steps.py`; Test `tests/test_antigravity_native_steps.py`
+**Files:** Modify `omnigent/antigravity_native_steps.py`; Test `tests/harnesses/antigravity_native/test_antigravity_native_steps.py`
 
 **Interfaces:**
 - Produces: `pending_interaction(step:dict) -> PendingInteraction | None` where `PendingInteraction` = `{kind: "ask_question"|"permission", trajectory_id, step_index, spec: dict}` (spec = the `askQuestion`/`permission` block + `runCommand`/question text). Returns `None` unless `status == CORTEX_STEP_STATUS_WAITING`.
@@ -153,7 +153,7 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 
 ### Task 6: Read driver — poll/stream steps → post items
 
-**Files:** Create `omnigent/antigravity_native_reader.py`; Test `tests/test_antigravity_native_reader.py`
+**Files:** Create `omnigent/antigravity_native_reader.py`; Test `tests/harnesses/antigravity_native/test_antigravity_native_reader.py`
 
 **Interfaces:**
 - Consumes: `get_trajectory_steps` (Task 2), `map_step_to_events` (Task 4), `pending_interaction` (Task 5), `_native_post_delivery.post_session_event_with_retry`.
@@ -180,7 +180,7 @@ def test_handle_user_interaction_raises_on_500(monkeypatch):
 
 ### Task 8: Interaction bridge — detect → elicit → deliver (timeout loop)
 
-**Files:** Create `omnigent/antigravity_native_interactions.py`; Test `tests/test_antigravity_native_interactions.py`
+**Files:** Create `omnigent/antigravity_native_interactions.py`; Test `tests/harnesses/antigravity_native/test_antigravity_native_interactions.py`
 
 **Interfaces:**
 - Consumes: `pending_interaction` (Task 5), `handle_user_interaction` (Task 3), the elicitation adapter (Task 7), the server hook/registry (`_publish_and_wait_for_harness_elicitation` via a new `POST /v1/sessions/{id}/hooks/antigravity-elicitation-request`, mirroring codex).

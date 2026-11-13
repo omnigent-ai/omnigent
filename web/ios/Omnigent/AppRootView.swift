@@ -47,6 +47,7 @@ struct AppRootView: View {
           // resolves against an un-polluted server identity.
           loadSucceeded: {
             guard isCurrentServer(serverURL) else { return }
+            settings.connectionSucceeded()
             settings.rememberRecentServer(serverURL)
           },
           signedOut: { context, cleanup in
@@ -65,13 +66,21 @@ struct AppRootView: View {
                 }
               }
             }
+          },
+          serverURL: serverURL,
+          serverSignedOut: { signedOutURL, message in
+            settings.stopAutoOpening(oidcServer: signedOutURL)
+            guard isCurrentServer(serverURL) else { return }
+            mode = .setup(prefill: serverURL.absoluteString, error: message)
           }
         )
         .id(DatabricksWebContext.contextIdentity(for: serverURL))
       }
     }
     .environmentObject(theme)
+    .background(Color(uiColor: DesignTokens.nativeBackground).ignoresSafeArea())
     .preferredColorScheme(theme.source.colorScheme)
+    .onAppear { theme.apply(theme.source) }
     .task {
       guard shouldAutoOpenSavedServer else { return }
       // A deep link that arrived before this task ran already moved us off the
@@ -99,6 +108,8 @@ struct AppRootView: View {
           }
           return
         }
+        // A server that refused the last sign-in stays on the Connect screen, prefilled.
+        guard settings.autoOpenServerURL == saved else { return }
         mode = .web(serverURL: url, path: nil)
       }
     }
@@ -196,14 +207,15 @@ extension AppRootView {
     guard let deepLink = DeepLink.parse(url) else {
       #if DEBUG
         if ProcessInfo.processInfo.environment["OMNIGENT_DEEPLINK_TRACE"] != nil {
-          NSLog("[DeepLink] REJECTED \(url.absoluteString)")
+          NSLog("[DeepLink] REJECTED")
         }
       #endif
       return
     }
     #if DEBUG
       if ProcessInfo.processInfo.environment["OMNIGENT_DEEPLINK_TRACE"] != nil {
-        NSLog("[DeepLink] ACCEPTED origin=\(deepLink.origin) path=\(deepLink.path)")
+        let route = deepLink.path.split(separator: "?", maxSplits: 1).first ?? ""
+        NSLog("[DeepLink] ACCEPTED origin=\(deepLink.origin) path=\(route)")
       }
     #endif
     let targetOrigin = deepLink.origin
@@ -260,7 +272,16 @@ extension AppRootView {
 
   /// Append a conversation under the mount without moving it into the server's query or fragment.
   static func conversationURL(for serverURL: URL, path: String) -> URL {
-    serverURL.appendingPathComponent(path)
+    guard let route = URLComponents(string: path), let query = route.percentEncodedQuery else {
+      return serverURL.appendingPathComponent(path)
+    }
+    let destination = serverURL.appendingPathComponent(route.path)
+    guard var components = URLComponents(url: destination, resolvingAgainstBaseURL: false) else {
+      return destination
+    }
+    components.percentEncodedQuery = [components.percentEncodedQuery, query]
+      .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "&")
+    return components.url ?? destination
   }
 }
 

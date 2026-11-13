@@ -17,27 +17,24 @@
 const { defaultSchemeFor } = require("./url");
 
 /**
- * v1 accepted SPA path. `/c/<conversationId>` — a single path segment after
- * `/c/`, with an optional trailing slash. Anything else (other routes,
- * nested paths, empty id) is dropped silently: an unrecognized deep link
- * must never crash or mis-navigate, and the SPA's own router stays the
- * authority on what a valid conversation id is.
+ * Accepts the server root or a one-segment conversation route.
  */
-const DEEP_LINK_PATH_RE = /^\/c\/[^/]+\/?$/;
+const DEEP_LINK_PATH_RE = /^\/$|^\/c\/[^/]+\/?$/;
 
 /**
  * Parse an `omnigent://` deep link into a server origin + an in-app path.
  *
  * The origin is the http(s) origin inferred from the link's host (loopback →
  * http, else https), normalized via normalizeUrl. The path is the SPA
- * conversation route (`/c/<id>`), basename-less — the same shape the SPA
+ * conversation route (`/c/<id>`) with optional file-view parameters,
+ * basename-less — the same shape the SPA
  * already emits for notification `navigatePath`, so the embedded
  * (workspace) build's `basenamedRouting` rebases it under the mount.
  *
  * @param {string} raw e.g. ``"omnigent://localhost:8000/c/conv_abc"``.
  * @returns {{ origin: string, path: string } | null} ``null`` for anything
- *   that isn't a valid `omnigent://.../c/<id>` link (wrong scheme, no host,
- *   non-`/c/` path, unparseable input).
+ *   that isn't a valid `omnigent://.../c/<id>` or `omnigent://.../` link
+ *   (wrong scheme, no host, other path, unparseable input).
  */
 function parseOmnigentDeepLink(raw) {
   let url;
@@ -49,7 +46,9 @@ function parseOmnigentDeepLink(raw) {
   if (url.protocol !== "omnigent:") return null;
   // No host → a bare `omnigent://` or `omnigent:`; nothing to connect to.
   if (url.host === "") return null;
-  const path = url.pathname;
+  // A non-special scheme keeps an EMPTY pathname for `omnigent://host` —
+  // treat it as the server-home root so host-only links work.
+  const path = url.pathname === "" ? "/" : url.pathname;
   if (!DEEP_LINK_PATH_RE.test(path)) return null;
   // Infer the http(s) scheme from the host the same way the setup page does,
   // so a deep link to `localhost` is http and to a remote host is https. The
@@ -64,7 +63,16 @@ function parseOmnigentDeepLink(raw) {
   } catch {
     return null;
   }
-  return { origin, path };
+  // Retain encoded values so file names keep their form-style space/plus semantics.
+  const query = url.search
+    .slice(1)
+    .split("&")
+    .filter((item) => {
+      const name = new URLSearchParams(item).keys().next().value;
+      return name === "file" || name === "fullscreen";
+    })
+    .join("&");
+  return { origin, path: query ? `${path}?${query}` : path };
 }
 
 /**
@@ -129,4 +137,35 @@ function chooseDeepLinkStrategy(state) {
   return { strategy: "consent-unknown" };
 }
 
-module.exports = { parseOmnigentDeepLink, chooseDeepLinkStrategy, DEEP_LINK_PATH_RE };
+/**
+ * Claim a CLI navigation before its browser fallback deadline. Ordinary links
+ * need no acknowledgment. The endpoint is always loopback, never a supplied URL.
+ * @param {string} raw A parsed Omnigent deep link.
+ * @returns {Promise<boolean>} Whether the desktop should handle the request.
+ */
+async function acceptCliDeepLink(raw) {
+  if (!parseOmnigentDeepLink(raw)) return false;
+  const acknowledgments = new URL(raw).searchParams.getAll("desktop_ack");
+  if (acknowledgments.length === 0) return true;
+  if (acknowledgments.length !== 1) return false;
+  const match = acknowledgments[0].match(/^([1-9][0-9]{0,4}):([a-f0-9]{64})$/);
+  if (!match || Number(match[1]) > 65535) return false;
+  try {
+    const response = await fetch(`http://127.0.0.1:${match[1]}/desktop-open/${match[2]}`, {
+      method: "POST",
+      redirect: "error",
+      signal: AbortSignal.timeout(2000),
+    });
+    return response.status === 204;
+  } catch {
+    // The CLI already fell back, or the acknowledgment endpoint is unavailable.
+    return false;
+  }
+}
+
+module.exports = {
+  parseOmnigentDeepLink,
+  chooseDeepLinkStrategy,
+  acceptCliDeepLink,
+  DEEP_LINK_PATH_RE,
+};

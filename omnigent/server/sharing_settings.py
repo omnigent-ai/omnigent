@@ -1,6 +1,6 @@
 """File-backed session-sharing settings for the OSS server.
 
-Two server-wide sharing policies default from env vars at boot but can be
+Server-wide sharing policies default from env vars at boot but can be
 overridden at runtime from the Settings → Sharing admin panel, each persisted to
 a plaintext file in :func:`resolve_data_dir` (next to the ``admins`` roster) so
 it survives restarts without a database migration and takes effect without a
@@ -10,14 +10,20 @@ redeploy:
   (``on`` / ``read_only`` / ``restricted_read_only`` / ``off``);
 - whether *public* (anyone-with-the-link) read access may be granted —
   ``OMNIGENT_PUBLIC_SHARING`` → ``<data_dir>/public_sharing`` (``on`` / ``off``);
+- the public permission ceiling: ``OMNIGENT_PUBLIC_SHARING_MAX_LEVEL`` →
+  ``<data_dir>/public_sharing_max_level`` (``read`` / ``edit``, default read);
 - which *new* sessions start public: ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` →
   ``<data_dir>/default_public_sessions`` (``off`` / ``sandbox`` / ``all``).
+- peer messaging: ``<data_dir>/peer_session_messaging`` (``on`` / ``off``,
+  default on), limited by the deployment's orchestration and messaging flags.
+- where **Add nested agent** may run → ``<data_dir>/sibling_session_destinations``
+  (``current_host`` / ``current_host_or_new_sandbox`` / ``any_host``).
 
-A missing, empty, or unreadable file means "no override recorded", so the caller
-falls back to the env-var default; an unrecognized value is likewise ignored
-(falling back rather than silently changing behavior). Reads are mtime-cached
-per file so the per-request hot path is cheap, mirroring the ``admins`` roster
-loader.
+Missing sharing overrides fall back to the env-var default, as do empty,
+unreadable, or unrecognized sharing values. Nested agent destinations use the
+default only for an absent file; invalid or unreadable overrides restrict
+creation to the current host. Sharing reads are mtime-cached; destination
+restrictions are read fresh so cached permissions cannot outlive a read failure.
 """
 
 from __future__ import annotations
@@ -26,18 +32,26 @@ import contextlib
 import logging
 import os
 import tempfile
+from collections.abc import Callable, Iterator
+from contextvars import ContextVar
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from starlette.types import ASGIApp, Receive, Scope, Send
+
 from omnigent.server.admin_list import resolve_data_dir
-from omnigent.server.auth import SharingMode, workspace_sharing_blocked
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, SharingMode, workspace_sharing_blocked
+from omnigent.server.feature_flags import Feature, FeatureFlags
 
 logger = logging.getLogger(__name__)
 
 _SHARING_MODE_FILE = "sharing_mode"
 _PUBLIC_SHARING_FILE = "public_sharing"
+_PUBLIC_SHARING_MAX_LEVEL_FILE = "public_sharing_max_level"
 _DEFAULT_PUBLIC_SESSIONS_FILE = "default_public_sessions"
+_PEER_SESSION_MESSAGING_FILE = "peer_session_messaging"
+_SIBLING_SESSION_DESTINATIONS_FILE = "sibling_session_destinations"
 # Public sharing is enabled unless a value explicitly says otherwise, so a typo
 # or a stray value fails OPEN (never silently disables a working feature).
 _PUBLIC_FALSY = ("0", "false", "no", "off")
@@ -56,6 +70,61 @@ def resolve_sharing_mode_path() -> Path:
 def resolve_public_sharing_path() -> Path:
     """Path of the file holding the admin public-sharing override."""
     return resolve_data_dir() / _PUBLIC_SHARING_FILE
+
+
+class PublicSharingMaxLevel(str, Enum):
+    """Maximum effective public permission, independent of the sign-in provider."""
+
+    READ = "read"
+    EDIT = "edit"
+
+    @property
+    def level(self) -> int:
+        return LEVEL_EDIT if self is PublicSharingMaxLevel.EDIT else LEVEL_READ
+
+    @classmethod
+    def coerce(cls, value: object) -> PublicSharingMaxLevel:
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value.strip().lower())
+            except ValueError:
+                pass
+        return cls.READ
+
+
+_public_sharing_max_level: ContextVar[Callable[[], PublicSharingMaxLevel]] = ContextVar(
+    "public_sharing_max_level", default=lambda: PublicSharingMaxLevel.READ
+)
+
+
+def effective_public_level(level: int | None) -> int | None:
+    """Apply the live ceiling outside the raw grant cache, including on open streams."""
+    if level is None:
+        return None
+    return min(level, _public_sharing_max_level.get()().level)
+
+
+@contextlib.contextmanager
+def public_sharing_policy_scope(max_level: Callable[[], PublicSharingMaxLevel]) -> Iterator[None]:
+    token = _public_sharing_max_level.set(max_level)
+    try:
+        yield
+    finally:
+        _public_sharing_max_level.reset(token)
+
+
+class PublicSharingPolicyMiddleware:
+    """Keep each application's live public policy in its request/task context."""
+
+    def __init__(self, app: ASGIApp, max_level: Callable[[], PublicSharingMaxLevel]) -> None:
+        self._app = app
+        self._max_level = max_level
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        with public_sharing_policy_scope(self._max_level):
+            await self._app(scope, receive, send)
 
 
 def resolve_default_public_sessions_path() -> Path:
@@ -92,23 +161,45 @@ class DefaultPublicSessions(str, Enum):
         return cls.OFF
 
 
-def _read_override_text(path: Path) -> str | None:
+class SiblingSessionDestinations(str, Enum):
+    """Hosts a nested agent may target."""
+
+    CURRENT_HOST = "current_host"
+    CURRENT_HOST_OR_NEW_SANDBOX = "current_host_or_new_sandbox"
+    ANY_HOST = "any_host"
+
+    @classmethod
+    def coerce(cls, value: object) -> SiblingSessionDestinations:
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value.strip().lower())
+            except ValueError:
+                pass
+        return cls.CURRENT_HOST
+
+
+def _read_override_text(
+    path: Path, *, raise_errors: bool = False, use_cache: bool = True
+) -> str | None:
     """mtime-cached read of an override file's stripped contents.
 
-    Returns ``None`` for a missing or unreadable file (never raises), so callers
-    fall back to their env-var default.
+    Missing files return ``None``. Other storage errors also return ``None``
+    unless ``raise_errors`` is set.
     """
     key = str(path)
     try:
         mtime = path.stat().st_mtime
-    except OSError:
-        return None
-    cached = _cache.get(key)
-    if cached is not None and cached[0] == mtime:
-        return cached[1]
-    try:
+        cached = _cache.get(key)
+        if use_cache and cached is not None and cached[0] == mtime:
+            return cached[1]
         raw = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
     except OSError:
+        if raise_errors:
+            raise
         return None
     _cache[key] = (mtime, raw)
     return raw
@@ -185,6 +276,49 @@ def write_public_sharing_override(enabled: bool) -> None:
     _write_override_text(resolve_public_sharing_path(), "on" if enabled else "off")
 
 
+def peer_session_messaging_available(flags: FeatureFlags) -> bool:
+    """Whether the deployment permits admins to enable peer messaging."""
+    return flags.enabled(Feature.SESSION_ORCHESTRATION) and flags.enabled(
+        Feature.PEER_SESSION_MESSAGING
+    )
+
+
+def peer_session_messaging_enabled(flags: FeatureFlags) -> bool:
+    """Apply the live admin setting within the deployment's limits."""
+    if not peer_session_messaging_available(flags):
+        return False
+    try:
+        raw = _read_override_text(
+            resolve_data_dir() / _PEER_SESSION_MESSAGING_FILE, raise_errors=True
+        )
+    except OSError:
+        logger.warning("Cannot read peer messaging setting; refusing messages", exc_info=True)
+        return False
+    # Invalid stored values must not restore messaging after an admin disabled it.
+    return raw is None or raw.lower() == "on"
+
+
+def write_peer_session_messaging_override(enabled: bool) -> None:
+    """Persist the admin messaging setting atomically."""
+    _write_override_text(
+        resolve_data_dir() / _PEER_SESSION_MESSAGING_FILE, "on" if enabled else "off"
+    )
+
+
+def public_sharing_max_level_env_default() -> PublicSharingMaxLevel:
+    return PublicSharingMaxLevel.coerce(os.environ.get("OMNIGENT_PUBLIC_SHARING_MAX_LEVEL"))
+
+
+def read_public_sharing_max_level_override() -> PublicSharingMaxLevel | None:
+    raw = _read_override_text(resolve_data_dir() / _PUBLIC_SHARING_MAX_LEVEL_FILE)
+    # Invalid overrides must not restore a more permissive boot default.
+    return PublicSharingMaxLevel.coerce(raw) if raw is not None else None
+
+
+def write_public_sharing_max_level_override(level: PublicSharingMaxLevel) -> None:
+    _write_override_text(resolve_data_dir() / _PUBLIC_SHARING_MAX_LEVEL_FILE, level.value)
+
+
 def default_public_sessions_env_default() -> DefaultPublicSessions:
     """Boot default from ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` (``off`` if unset)."""
     return DefaultPublicSessions.coerce(os.environ.get("OMNIGENT_DEFAULT_PUBLIC_SESSIONS"))
@@ -210,6 +344,33 @@ def read_default_public_sessions_override() -> DefaultPublicSessions | None:
 def write_default_public_sessions_override(policy: DefaultPublicSessions) -> None:
     """Persist the admin default-public-sessions override atomically."""
     _write_override_text(resolve_default_public_sessions_path(), policy.value)
+
+
+def read_sibling_session_destinations_override() -> SiblingSessionDestinations | None:
+    try:
+        raw = _read_override_text(
+            resolve_data_dir() / _SIBLING_SESSION_DESTINATIONS_FILE,
+            raise_errors=True,
+            use_cache=False,
+        )
+    except (OSError, UnicodeError):
+        logger.warning(
+            "Could not read nested agent destinations; using current_host", exc_info=True
+        )
+        return SiblingSessionDestinations.CURRENT_HOST
+    if raw is None:
+        return None
+    try:
+        return SiblingSessionDestinations(raw.lower())
+    except ValueError:
+        logger.warning(
+            "Unrecognized sibling_session_destinations override %r; using current_host", raw
+        )
+        return SiblingSessionDestinations.CURRENT_HOST
+
+
+def write_sibling_session_destinations_override(policy: SiblingSessionDestinations) -> None:
+    _write_override_text(resolve_data_dir() / _SIBLING_SESSION_DESTINATIONS_FILE, policy.value)
 
 
 def default_public_policy(state: Any) -> DefaultPublicSessions:

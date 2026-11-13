@@ -90,6 +90,9 @@ describe("sidebar Stop session item", () => {
     openKebab();
     fireEvent.click(screen.getByTestId("stop-conversation"));
 
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      "stops its runner, including side chats running on it",
+    );
     // The confirm dialog gates the mutation — nothing fires on item click.
     expect(mocks.stop.mutate).not.toHaveBeenCalled();
 
@@ -97,34 +100,26 @@ describe("sidebar Stop session item", () => {
     expect(mocks.stop.mutate).toHaveBeenCalledTimes(1);
     // Failure: the dialog stopped a different row's session.
     expect(mocks.stop.mutate.mock.calls[0][0]).toBe("conv_1");
+    // A failed stop reports via toast, not an in-dialog message, so the
+    // mutation is given an onError handler.
+    expect(typeof mocks.stop.mutate.mock.calls[0][1]?.onError).toBe("function");
+    // The dialog closes immediately rather than blocking on the kill.
+    expect(screen.queryByTestId("stop-session-confirm")).toBeNull();
   });
 
-  it("spins the confirm button while the stop is in flight", () => {
-    // The stop can take seconds. Without the spinner the button only fades
-    // (disabled), which reads as a hang rather than work in progress.
+  it("closes the dialog immediately on confirm even while the stop is pending", () => {
+    // The stop can take seconds. The dialog must not stay open (blocking the
+    // rest of the sidebar) while it runs — it closes right away and the stop
+    // continues in the background.
     mocks.stop.isPending = true;
     mockConversations([HOST_SPAWNED]);
     renderSidebar();
     openKebab();
     fireEvent.click(screen.getByTestId("stop-conversation"));
 
-    const confirm = screen.getByTestId("stop-session-confirm");
-    expect(confirm).toHaveAttribute("aria-busy", "true");
-    expect(confirm).toBeDisabled();
-    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
-  });
-
-  it("clears a prior stop failure when the dialog is opened", () => {
-    mockConversations([HOST_SPAWNED]);
-    renderSidebar();
-    openKebab();
-    fireEvent.click(screen.getByTestId("stop-conversation"));
-
-    // Failure: reset() not invoked on the menu item's onSelect — a stale
-    // "couldn't stop" error from a previous attempt would greet the
-    // reopened dialog. The reset can't live on the Dialog's onOpenChange:
-    // Radix doesn't fire it for this programmatic (setState) open.
-    expect(mocks.stop.reset).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Stop session" }));
+    expect(mocks.stop.mutate).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("stop-session-confirm")).toBeNull();
   });
 
   it("shows for a CLI-launched claude-native session (no host)", () => {
@@ -140,6 +135,11 @@ describe("sidebar Stop session item", () => {
     renderSidebar();
     openKebab();
     expect(screen.getByTestId("stop-conversation")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("stop-conversation"));
+    expect(screen.getByRole("dialog")).toHaveTextContent(
+      "This terminates the running session for My Session. Conversation histories are kept.",
+    );
+    expect(screen.getByRole("dialog")).not.toHaveTextContent("stops its runner");
   });
 
   it("is hidden for a local in-process runner (runner_id, no host_id)", () => {

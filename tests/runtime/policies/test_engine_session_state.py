@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from omnigent.llms.context_window import ModelPricing
+from omnigent.policies.builtins.cel import cel_policy
 from omnigent.policies.function import FunctionPolicy
 from omnigent.policies.types import EvaluationContext
 from omnigent.runtime.policies.engine import PolicyEngine
@@ -29,6 +30,7 @@ from omnigent.spec.types import (
     Phase,
     PhaseSelector,
     PolicyAction,
+    StateUpdate,
     StateUpdateAction,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -140,6 +142,39 @@ def _build_engine(
 
 
 # ── Reading session_state from the event ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cel_reserved_state_update_denies_without_partial_writes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    policy = FunctionPolicy(
+        FunctionPolicySpec(name="cel_state", on=[PhaseSelector(phase=Phase.REQUEST)]),
+        cel_policy(
+            expression=(
+                '{"result": "ALLOW", "state_updates": ['
+                '{"key": "counter", "action": "increment", "value": 1},'
+                '{"key": "_policy_test", "action": "set", "value": 1}]}'
+            )
+        ),
+    )
+    conv = conversation_store.create_conversation()
+    conversation_store.set_session_state(conv.id, {"counter": 2})
+    engine = PolicyEngine(
+        policies=[policy],
+        label_defs={},
+        ask_timeout=30,
+        conversation_id=conv.id,
+        initial_labels={},
+        initial_session_state={"counter": 2},
+        conversation_store=conversation_store,
+    )
+    result = await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hello"))
+    assert result.action is PolicyAction.DENY
+    assert not result.state_updates
+    stored = conversation_store.get_conversation(conv.id)
+    assert stored is not None
+    assert stored.session_state == {"counter": 2}
 
 
 @pytest.mark.asyncio
@@ -644,3 +679,158 @@ async def test_record_usage_persists_to_store(
     assert reloaded.session_usage["cache_read_input_tokens"] == 400
     assert reloaded.session_usage["cache_creation_input_tokens"] == 200
     assert reloaded.session_usage["total_cost_usd"] == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "key",
+    [
+        "_policy_test",
+        "_policy_cost_ask_approved_usd",
+        "_policy_user_daily_ask_approved_usd",
+        "_policy_user_period_ask_approved_usd",
+        "_policy_cost_unpriced_approved",
+        "subagent_cost_ask_approved_usd",
+        "subagent_cost_over_budget_approved_usd",
+    ],
+)
+async def test_reserved_state_requires_approval_across_policy_types(
+    conversation_store: SqlAlchemyConversationStore, key: str
+) -> None:
+    from omnigent.policies.builtins.risk_score import risk_score_policy
+
+    policy = FunctionPolicy(
+        FunctionPolicySpec(name="counter", on=[PhaseSelector(phase=Phase.TOOL_CALL)]),
+        risk_score_policy(state_key=key, tool_points={"read_file": 1}),
+    )
+    engine = _build_engine(conversation_store, [policy])
+    result = await engine.evaluate(
+        EvaluationContext(
+            phase=Phase.TOOL_CALL,
+            tool_name="read_file",
+            content={"name": "read_file", "arguments": {}},
+        )
+    )
+    assert result.action is PolicyAction.DENY
+    assert not result.state_updates
+    assert engine.session_state == {}
+    # The shared writer validates the whole batch before any ordinary write.
+    with pytest.raises(ValueError, match="approved ASK"):
+        engine.apply_state_updates(
+            [
+                StateUpdate(key="counter", action=StateUpdateAction.SET, value=1),
+                StateUpdate(key=key, action=StateUpdateAction.SET, value=1),
+            ]
+        )
+    assert engine.session_state == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["accept", "cancel"])
+async def test_reserved_state_is_written_only_after_approval(
+    conversation_store: SqlAlchemyConversationStore, verdict: str
+) -> None:
+    from omnigent.runtime.policies.approval import _await_elicitation
+    from tests.runtime.policies.test_approval import _accepting_park, _Recorder
+
+    key = "subagent_cost_ask_approved_usd"
+    policy = _state_writing_policy("budget", {key: 1}, action="ASK")
+    engine = _build_engine(conversation_store, [policy])
+    result = await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hello"))
+    assert result.action is PolicyAction.ASK
+    assert engine.session_state == {}
+    recorder = _Recorder()
+    approved = await _await_elicitation(
+        result=result,
+        phase=Phase.REQUEST,
+        content_preview="hello",
+        task_id="task_test",
+        root_task_id="task_test",
+        policy_engine=engine,
+        register=recorder.register,
+        emit=recorder.emit,
+        park=_accepting_park('{"action": "' + verdict + '"}'),
+    )
+    assert approved == (verdict == "accept")
+    assert engine.session_state == ({key: 1} if approved else {})
+
+
+@pytest.mark.asyncio
+async def test_later_deny_discards_pending_approval_state(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    engine = _build_engine(
+        conversation_store,
+        [
+            _state_writing_policy("budget", {"subagent_cost_ask_approved_usd": 1}, action="ASK"),
+            _state_writing_policy("stop", {}, action="DENY"),
+        ],
+    )
+    result = await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hello"))
+    assert result.action is PolicyAction.DENY
+    assert not result.state_updates
+    assert engine.session_state == {}
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {1: "value"},
+        [{"key": 1, "action": "set"}],
+        [StateUpdate(key=1, action=StateUpdateAction.SET, value=1)],
+    ],
+)
+def test_state_update_keys_must_be_strings(updates: Any) -> None:
+    from omnigent.policies.function import _coerce_state_updates
+
+    with pytest.raises(TypeError, match="strings"):
+        _coerce_state_updates(updates, spec_name="counter")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "key",
+    ["_policy_spawn_bounds_dispatches", "_policy_tool_call_count", "_policy_loop_recent_hashes"],
+)
+@pytest.mark.parametrize("action", ["ALLOW", "ASK"])
+async def test_runtime_counters_require_their_builtin(
+    conversation_store: SqlAlchemyConversationStore, key: str, action: str
+) -> None:
+    policy = _state_writing_policy("spawn_bounds", {key: 1}, action=action)
+    engine = _build_engine(conversation_store, [policy])
+    result = await engine.evaluate(EvaluationContext(phase=Phase.REQUEST, content="hello"))
+    assert result.action is PolicyAction.DENY
+    assert engine.session_state == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "key"),
+    [
+        ("orchestration.spawn_bounds", "_policy_spawn_bounds_dispatches"),
+        ("safety.max_tool_calls_per_session", "_policy_tool_call_count"),
+        ("safety.detect_loop", "_policy_loop_recent_hashes"),
+    ],
+)
+async def test_builtin_counters_keep_automatic_writes(
+    conversation_store: SqlAlchemyConversationStore, path: str, key: str
+) -> None:
+    from omnigent.policies.function import resolve_function_policy
+
+    policy = resolve_function_policy(
+        FunctionPolicySpec(
+            name="runtime_counter",
+            on=None,
+            function=FunctionRef(path=f"omnigent.policies.builtins.{path}", arguments={}),
+        )
+    )
+    engine = _build_engine(conversation_store, [policy])
+    result = await engine.evaluate(
+        EvaluationContext(
+            phase=Phase.TOOL_CALL,
+            tool_name="sys_session_send",
+            content={"name": "sys_session_send", "arguments": {}},
+        )
+    )
+    assert result.action is PolicyAction.ALLOW
+    assert key in engine.session_state

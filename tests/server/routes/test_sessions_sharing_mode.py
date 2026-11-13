@@ -21,6 +21,8 @@ lifespan) since none of these paths need the runtime.
 
 from __future__ import annotations
 
+import errno
+import uuid
 from pathlib import Path
 
 import httpx
@@ -41,12 +43,16 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
     workspace_sharing_blocked,
 )
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.sharing_settings import (
+    SiblingSessionDestinations,
     read_public_sharing_override,
     read_sharing_mode_override,
+    read_sibling_session_destinations_override,
     resolve_sharing_mode_path,
     write_public_sharing_override,
     write_sharing_mode_override,
+    write_sibling_session_destinations_override,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -68,6 +74,9 @@ def _isolate_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sharing overrides are isolated, and reset the module cache so no value
     leaks across tests."""
     monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "")
+    monkeypatch.delenv("OMNIGENT_PUBLIC_SHARING_MAX_LEVEL", raising=False)
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     sharing_settings._cache = {}
 
 
@@ -77,6 +86,7 @@ def _build_app(
     *,
     sharing_mode: SharingMode | object | None = None,
     public_sharing: bool | object | None = None,
+    public_sharing_max_level: str | None = None,
     permission_store: SqlAlchemyPermissionStore | None = None,
     auth_provider: AuthProvider | None = None,
 ) -> FastAPI:
@@ -92,6 +102,7 @@ def _build_app(
         auth_provider=auth_provider,
         sharing_mode=sharing_mode,
         public_sharing=public_sharing,
+        public_sharing_max_level=public_sharing_max_level,
     )
 
 
@@ -112,6 +123,7 @@ def _seed_owned_session(
     sharing_mode: SharingMode = SharingMode.ON,
     public_sharing: bool | object | None = None,
     workspace: str | None = None,
+    public_sharing_max_level: str | None = None,
 ) -> tuple[FastAPI, str]:
     """Build an app whose ``_OWNER`` identity manages a real session.
 
@@ -132,10 +144,180 @@ def _seed_owned_session(
         tmp_path,
         sharing_mode=sharing_mode,
         public_sharing=public_sharing,
+        public_sharing_max_level=public_sharing_max_level,
         permission_store=permission_store,
         auth_provider=UnifiedAuthProvider(source="header"),
     )
     return app, conv.id
+
+
+@pytest.mark.asyncio
+async def test_public_permission_ceiling_defaults_to_read(db_uri: str, tmp_path: Path) -> None:
+    app, session_id = _seed_owned_session(db_uri, tmp_path)
+    async with _client(app, _OWNER) as owner:
+        info = (await owner.get("/v1/info")).json()
+        assert info["public_sharing_max_level"] == "read"
+        response = await owner.put(
+            f"/v1/sessions/{session_id}/permissions",
+            json={"user_id": RESERVED_USER_PUBLIC, "level": LEVEL_EDIT},
+        )
+        assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_public_edit_grant_obeys_live_ceiling_and_authentication(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    from tests.server.helpers import create_test_agent
+
+    app, session_id = _seed_owned_session(db_uri, tmp_path)
+    async with _client(app, _OWNER) as bootstrap:
+        created = await create_test_agent(bootstrap, user=_OWNER)
+        session_id = created["_session_id"]
+    store = SqlAlchemyPermissionStore(db_uri)
+    store.ensure_user(_ADMIN, is_admin=True)
+    store.ensure_user(_GRANTEE)
+    store.grant(_GRANTEE, session_id, LEVEL_READ)
+    async with (
+        _client(app, _ADMIN) as admin,
+        _client(app, _OWNER) as owner,
+        _client(app, _GRANTEE) as member,
+        _client(app) as anonymous,
+    ):
+        permissions_url = f"/v1/sessions/{session_id}/permissions"
+        read_grant = await owner.put(
+            permissions_url, json={"user_id": RESERVED_USER_PUBLIC, "level": LEVEL_READ}
+        )
+        assert read_grant.status_code == 200
+        enabled = await admin.put("/v1/sharing", json={"public_sharing_max_level": "edit"})
+        assert enabled.status_code == 200
+        assert enabled.json()["public_sharing_max_level"] == "edit"
+        assert (await member.get(f"/v1/sessions/{session_id}")).json()["permission_level"] == 1
+        edit_grant = await owner.put(
+            permissions_url, json={"user_id": RESERVED_USER_PUBLIC, "level": LEVEL_EDIT}
+        )
+        assert edit_grant.status_code == 200
+        assert (await member.get(f"/v1/sessions/{session_id}")).json()["permission_level"] == 2
+        assert (await anonymous.get(f"/v1/sessions/{session_id}")).status_code == 401
+        assert (
+            await member.put(
+                permissions_url, json={"user_id": "third@sharing.test", "level": LEVEL_READ}
+            )
+        ).status_code == 403
+        for level in (LEVEL_MANAGE, LEVEL_OWNER):
+            assert (
+                await owner.put(
+                    permissions_url, json={"user_id": RESERVED_USER_PUBLIC, "level": level}
+                )
+            ).status_code == (400 if level == LEVEL_MANAGE else 422)
+        assert (
+            await member.post(
+                f"/v1/sessions/{session_id}/agent-title", json={"title": "Shared session"}
+            )
+        ).status_code == 200
+        lowered = await admin.put("/v1/sharing", json={"public_sharing_max_level": "read"})
+        assert lowered.status_code == 200
+        # The snapshot's raw grant cache is already warm; the cap must still apply.
+        assert (await member.get(f"/v1/sessions/{session_id}")).json()["permission_level"] == 1
+        assert (
+            await member.post(
+                f"/v1/sessions/{session_id}/agent-title", json={"title": "Denied rename"}
+            )
+        ).status_code == 403
+        assert store.get(RESERVED_USER_PUBLIC, session_id).level == LEVEL_EDIT
+        assert (await owner.get(f"/v1/sessions/{session_id}")).json()["permission_level"] == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [SharingMode.READ_ONLY, SharingMode.OFF])
+async def test_public_edit_ceiling_cannot_bypass_sharing_mode(
+    db_uri: str, tmp_path: Path, mode: SharingMode
+) -> None:
+    app, session_id = _seed_owned_session(
+        db_uri, tmp_path, sharing_mode=mode, public_sharing_max_level="edit"
+    )
+    async with _client(app, _OWNER) as owner:
+        response = await owner.put(
+            f"/v1/sessions/{session_id}/permissions",
+            json={"user_id": RESERVED_USER_PUBLIC, "level": LEVEL_EDIT},
+        )
+        assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_public_ceiling_requires_auth_and_validates_before_writes(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _build_app(db_uri, tmp_path)
+    async with _client(app) as client:
+        for invalid in ("edit", "manage", ""):
+            response = await client.put(
+                "/v1/sharing",
+                json={"public_sharing": False, "public_sharing_max_level": invalid},
+            )
+            assert response.status_code in (400, 403)
+            assert (await client.get("/v1/sharing")).json()["public_sharing_enabled"] is True
+        assert (await client.get("/v1/sharing")).json()["public_sharing_max_level_options"] == [
+            "read"
+        ]
+    monkeypatch.setenv("OMNIGENT_PUBLIC_SHARING_MAX_LEVEL", "edit")
+    app = _build_app(db_uri, tmp_path)
+    async with _client(app) as client:
+        assert (await client.get("/v1/info")).json()["public_sharing_max_level"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_deployment_managed_public_ceiling_is_not_writable(
+    db_uri: str, tmp_path: Path
+) -> None:
+    store = SqlAlchemyPermissionStore(db_uri)
+    store.ensure_user(_ADMIN, is_admin=True)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        auth_provider=UnifiedAuthProvider(source="header"),
+        permission_store=store,
+        public_sharing_max_level="edit",
+    )
+    async with _client(app, _ADMIN) as admin:
+        state = (await admin.get("/v1/sharing")).json()
+        assert state["public_sharing_max_level"] == "edit"
+        assert state["public_sharing_max_level_editable"] is False
+        assert (
+            await admin.put("/v1/sharing", json={"public_sharing_max_level": "read"})
+        ).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_explicit_local_identity_provider_cannot_enable_public_edit(
+    db_uri: str, tmp_path: Path
+) -> None:
+    store = SqlAlchemyPermissionStore(db_uri)
+    store.ensure_user(_ADMIN, is_admin=True)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=True),
+        permission_store=store,
+    )
+    async with _client(app, _ADMIN) as admin:
+        assert (
+            await admin.put("/v1/sharing", json={"public_sharing_max_level": "edit"})
+        ).status_code == 403
+        assert (await admin.get("/v1/info")).json()["public_sharing_max_level"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_invalid_public_ceiling_override_fails_closed(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_PUBLIC_SHARING_MAX_LEVEL", "edit")
+    app, _ = _seed_owned_session(db_uri, tmp_path)
+    path = sharing_settings.resolve_data_dir() / "public_sharing_max_level"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("manage\n")
+    async with _client(app, _OWNER) as owner:
+        assert (await owner.get("/v1/info")).json()["public_sharing_max_level"] == "read"
 
 
 def _admin_app(
@@ -359,6 +541,66 @@ async def test_revoke_is_unaffected_by_read_only(db_uri: str, tmp_path: Path) ->
         assert revoke.status_code == 204, revoke.text
 
 
+# ── Gate order: the sharing mode is checked before the public checks ──
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode,public_sharing,level,expected_message",
+    [
+        # Read-only cap (403) wins over the public ceiling (400) for an edit grant.
+        (
+            SharingMode.READ_ONLY,
+            True,
+            LEVEL_EDIT,
+            "Sharing is limited to read-only access on this Omnigent server.",
+        ),
+        # The OFF refusal (403) wins over the public kill switch (403).
+        (
+            SharingMode.OFF,
+            False,
+            LEVEL_READ,
+            "Sharing has been disabled for this Omnigent server.",
+        ),
+    ],
+)
+async def test_sharing_mode_refusal_precedes_public_checks(
+    db_uri: str,
+    tmp_path: Path,
+    mode: SharingMode,
+    public_sharing: bool,
+    level: int,
+    expected_message: str,
+) -> None:
+    """A public grant refused by the sharing mode reports the mode's message and status."""
+    app, sid = _seed_owned_session(
+        db_uri,
+        tmp_path,
+        sharing_mode=mode,
+        public_sharing=public_sharing,
+        public_sharing_max_level="read",
+    )
+    async with _client(app, _OWNER) as c:
+        resp = await c.put(
+            f"/v1/sessions/{sid}/permissions",
+            json={"user_id": RESERVED_USER_PUBLIC, "level": level},
+        )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["message"] == expected_message
+
+
+async def test_access_check_precedes_sharing_gate(db_uri: str, tmp_path: Path) -> None:
+    """A caller with no access to a missing session gets 404 even when sharing is OFF."""
+    app, _ = _seed_owned_session(db_uri, tmp_path, sharing_mode=SharingMode.OFF)
+    async with _client(app, _GRANTEE) as c:
+        resp = await c.put(
+            f"/v1/sessions/{uuid.uuid4().hex}/permissions",
+            json={"user_id": "carol@sharing.test", "level": LEVEL_READ},
+        )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["message"] == "Conversation not found"
+
+
 # ── workspace_sharing_blocked — the home/root cwd predicate ──────────
 
 
@@ -535,13 +777,19 @@ async def test_put_rejects_unknown_value(db_uri: str, tmp_path: Path) -> None:
         assert read_sharing_mode_override() is None
 
 
-async def test_admin_endpoint_requires_admin(db_uri: str, tmp_path: Path) -> None:
-    """A non-admin identity is forbidden from reading or writing the mode."""
+@pytest.mark.parametrize("email,status", [(None, 401), ("intruder@sharing.test", 403)])
+async def test_admin_endpoint_requires_admin(
+    db_uri: str, tmp_path: Path, email: str | None, status: int
+) -> None:
+    """Only authenticated admins can read or write the server-wide settings."""
     app = _admin_app(db_uri, tmp_path)  # only _ADMIN is an admin
-    async with _client(app, "intruder@sharing.test") as c:
-        assert (await c.get("/v1/sharing")).status_code == 403
-        put = await c.put("/v1/sharing", json={"sharing_mode": "off"})
-        assert put.status_code == 403, put.text
+    async with _client(app, email) as c:
+        assert (await c.get("/v1/sharing")).status_code == status
+        for body in ({"sharing_mode": "off"}, {"peer_session_messaging": False}):
+            put = await c.put("/v1/sharing", json=body)
+            assert put.status_code == status, put.text
+    assert read_sharing_mode_override() is None
+    assert not (sharing_settings.resolve_data_dir() / "peer_session_messaging").exists()
 
 
 async def test_put_rejected_when_not_writable(db_uri: str, tmp_path: Path) -> None:
@@ -560,6 +808,178 @@ async def test_put_requires_a_field(db_uri: str, tmp_path: Path) -> None:
     async with _client(app, _ADMIN) as c:
         resp = await c.put("/v1/sharing", json={})
         assert resp.status_code == 400, resp.text
+
+
+async def test_peer_messaging_setting_persists_across_apps(db_uri: str, tmp_path: Path) -> None:
+    app = _admin_app(db_uri, tmp_path)
+    async with _client(app, _ADMIN) as admin:
+        state = (await admin.get("/v1/sharing")).json()
+        assert state["peer_session_messaging_enabled"] is True
+        assert state["peer_session_messaging_editable"] is True
+    for enabled in (False, True):
+        async with _client(app, _ADMIN) as admin:
+            response = await admin.put("/v1/sharing", json={"peer_session_messaging": enabled})
+            assert response.status_code == 200, response.text
+            assert response.json()["peer_session_messaging_enabled"] is enabled
+            assert response.json()["peer_session_messaging_editable"] is True
+        sharing_settings._cache.clear()
+        app = _admin_app(db_uri, tmp_path)
+        async with _client(app, _ADMIN) as admin:
+            state = (await admin.get("/v1/sharing")).json()
+            assert state["peer_session_messaging_enabled"] is enabled
+
+
+@pytest.mark.parametrize("feature", ["peer_session_messaging", "session_orchestration"])
+async def test_deployment_disabled_peer_messaging_rejects_mixed_update(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, feature: str
+) -> None:
+    monkeypatch.setenv("OMNIGENT_FEATURES", f"-{feature}")
+    sharing_settings.write_peer_session_messaging_override(True)
+    app = _admin_app(db_uri, tmp_path)
+    async with _client(app, _ADMIN) as admin:
+        state = (await admin.get("/v1/sharing")).json()
+        assert state["peer_session_messaging_enabled"] is False
+        assert state["peer_session_messaging_editable"] is False
+        response = await admin.put(
+            "/v1/sharing", json={"sharing_mode": "off", "peer_session_messaging": False}
+        )
+        assert response.status_code == 403, response.text
+    assert read_sharing_mode_override() is None
+    assert (sharing_settings.resolve_data_dir() / "peer_session_messaging").read_text() == "on\n"
+
+
+@pytest.mark.parametrize(
+    "body,status",
+    [
+        ({"sharing_mode": "off", "peer_session_messaging": "false"}, 422),
+        ({"sharing_mode": "off", "peer_session_messaging": 0}, 422),
+        ({"sharing_mode": "off", "peer_session_messaging": 1}, 422),
+        ({"sharing_mode": "typo", "peer_session_messaging": False}, 400),
+    ],
+)
+async def test_peer_messaging_validates_mixed_update_before_writes(
+    db_uri: str, tmp_path: Path, body: dict[str, object], status: int
+) -> None:
+    app = _admin_app(db_uri, tmp_path)
+    async with _client(app, _ADMIN) as admin:
+        response = await admin.put("/v1/sharing", json=body)
+        assert response.status_code == status, response.text
+    assert read_sharing_mode_override() is None
+    assert not (sharing_settings.resolve_data_dir() / "peer_session_messaging").exists()
+
+
+@pytest.mark.parametrize(
+    "raw,error,enabled",
+    [
+        (None, None, True),
+        ("on", None, True),
+        ("off", None, False),
+        ("", None, False),
+        ("typo", None, False),
+        ("off", "read_text", False),
+        ("off", "stat", False),
+    ],
+)
+def test_peer_messaging_override_values(
+    raw: str | None, error: str | None, enabled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = sharing_settings.resolve_data_dir() / "peer_session_messaging"
+    if raw is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(raw)
+    if error is not None:
+        sharing_settings.write_peer_session_messaging_override(False)
+        if error == "stat":
+            assert (
+                sharing_settings.peer_session_messaging_enabled(resolve_feature_flags({})) is False
+            )
+        original = getattr(Path, error)
+
+        def storage_error(self, *args, **kwargs):
+            if self == path:
+                raise OSError(errno.EIO, "Storage unavailable")
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, error, storage_error)
+        assert sharing_settings._read_override_text(path) is None
+    assert sharing_settings.peer_session_messaging_enabled(resolve_feature_flags({})) is enabled
+
+
+def test_sibling_destination_override_is_live_and_defaults_to_any_host(
+    db_uri: str, tmp_path: Path
+) -> None:
+    app = _build_app(db_uri, tmp_path)
+    assert app.state.sibling_session_destinations() is SiblingSessionDestinations.ANY_HOST
+    assert read_sibling_session_destinations_override() is None
+
+    write_sibling_session_destinations_override(
+        SiblingSessionDestinations.CURRENT_HOST_OR_NEW_SANDBOX
+    )
+    assert (
+        app.state.sibling_session_destinations()
+        is SiblingSessionDestinations.CURRENT_HOST_OR_NEW_SANDBOX
+    )
+
+
+@pytest.mark.parametrize("operation", ["stat", "read_text"])
+def test_unreadable_sibling_destination_override_stays_restricted(
+    tmp_path, monkeypatch, operation
+):
+    monkeypatch.setattr(sharing_settings, "resolve_data_dir", lambda: tmp_path)
+    write_sibling_session_destinations_override(SiblingSessionDestinations.ANY_HOST)
+    assert read_sibling_session_destinations_override() is SiblingSessionDestinations.ANY_HOST
+
+    def unreadable(*args, **kwargs):
+        raise PermissionError("policy unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, operation, unreadable)
+        assert (
+            read_sibling_session_destinations_override() is SiblingSessionDestinations.CURRENT_HOST
+        )
+
+
+@pytest.mark.parametrize("contents", [b"", b"typo", b"\xff"])
+def test_invalid_sibling_destination_file_stays_restricted(tmp_path, monkeypatch, contents):
+    monkeypatch.setattr(sharing_settings, "resolve_data_dir", lambda: tmp_path)
+    (tmp_path / "sibling_session_destinations").write_bytes(contents)
+    assert read_sibling_session_destinations_override() is SiblingSessionDestinations.CURRENT_HOST
+
+
+async def test_admin_updates_sibling_destinations_and_info_live(
+    db_uri: str, tmp_path: Path
+) -> None:
+    app = _admin_app(db_uri, tmp_path)
+    async with _client(app, _ADMIN) as client:
+        state = (await client.get("/v1/sharing")).json()
+        assert state["sibling_session_destinations"] == "any_host"
+        assert state["sibling_session_destinations_options"] == [
+            "current_host",
+            "current_host_or_new_sandbox",
+            "any_host",
+        ]
+
+        updated = await client.put(
+            "/v1/sharing",
+            json={"sibling_session_destinations": "current_host_or_new_sandbox"},
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["sibling_session_destinations"] == ("current_host_or_new_sandbox")
+        assert (await client.get("/v1/info")).json()["sibling_session_destinations"] == (
+            "current_host_or_new_sandbox"
+        )
+        assert (
+            read_sibling_session_destinations_override()
+            is SiblingSessionDestinations.CURRENT_HOST_OR_NEW_SANDBOX
+        )
+
+        invalid = await client.put(
+            "/v1/sharing", json={"sibling_session_destinations": "other_sandbox"}
+        )
+        assert invalid.status_code == 400, invalid.text
+        assert app.state.sibling_session_destinations() is (
+            SiblingSessionDestinations.CURRENT_HOST_OR_NEW_SANDBOX
+        )
 
 
 # ── Public-access switch (OMNIGENT_PUBLIC_SHARING) ───────────────────
@@ -804,3 +1224,8 @@ async def test_read_only_grantee_cannot_edit_other_labels(db_uri: str, tmp_path:
             json={"labels": {"omnigent.pinned": "1721760000000", "omni_project": "Moonshot"}},
         )
         assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.parametrize("value", [None, "", "typo", 7])
+def test_sibling_destinations_coerce_fails_closed(value) -> None:
+    assert SiblingSessionDestinations.coerce(value) is SiblingSessionDestinations.CURRENT_HOST

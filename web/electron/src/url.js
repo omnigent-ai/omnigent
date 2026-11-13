@@ -12,15 +12,14 @@
   const api = factory();
   if (typeof module === "object" && module.exports) {
     module.exports = api;
-  } else {
-    root.omnigentUrl = api;
   }
+  root.omnigentUrl = api;
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
   /**
    * Hostnames that resolve to the local machine. A schemeless URL defaults to
-   * https:// (the workspace / remote case the internal user guide documents),
+   * https:// (the workspace / remote case the user guide documents),
    * but these default to http:// — local dev servers are virtually always plain
    * http, and the setup placeholder shows http://localhost.
    */
@@ -85,7 +84,7 @@
 
   /**
    * Normalize persisted recent-server targets for the setup-page picker. The
-   * stored target may include an internal mount such as `/omnigent`; the picker
+   * stored target may include a mount path such as `/omnigent`; the picker
    * shows and reconnects through the user-facing root URL instead. Invalid and
    * duplicate entries are omitted.
    *
@@ -152,6 +151,20 @@
       return false;
     }
     return url.protocol === "http:" && !LOCAL_HOSTS.has(url.hostname);
+  }
+
+  /**
+   * True when a server URL names this computer, which no other machine can reach.
+   *
+   * @param {string} raw
+   * @returns {boolean}
+   */
+  function isLoopbackServerUrl(raw) {
+    try {
+      return LOCAL_HOSTS.has(new URL(raw).hostname);
+    } catch {
+      return false;
+    }
   }
 
   /** Path where the Omnigent SPA is mounted in a Databricks workspace. */
@@ -240,11 +253,10 @@
   }
 
   /**
-   * True when a server URL is hosted by Databricks — a workspace domain
+   * True when a server URL is hosted by Databricks: a workspace domain
    * (workspace-mounted Omnigent) or a Databricks App. Https-only: a local or
-   * self-hosted server is never "Databricks-managed", whatever its hostname
-   * claims. Used to scope Databricks-internal desktop features (e.g. the Arca
-   * host option) to Databricks-managed servers.
+   * self-hosted server is never "managed", whatever its hostname claims. Used
+   * to scope managed desktop features (e.g. the Arca host option) to managed servers.
    *
    * @param {string | null | undefined} rawUrl
    * @returns {boolean}
@@ -364,7 +376,73 @@
     serverVersion: null,
     minDesktopVersion: null,
     ui: Object.freeze({}),
+    auth: null,
+    serverName: null,
   });
+
+  /** Sign-in modes a server may name in its manifest's `auth.mode`. */
+  const MANIFEST_AUTH_MODES = new Set(["oidc", "accounts", "header", "custom", "none"]);
+  /** The only session cookies an Omnigent server sets. */
+  const SESSION_COOKIE_NAMES = new Set(["__Host-ap_session", "ap_session"]);
+  /** Longest server name the shell displays, in characters. */
+  const MAX_SERVER_NAME_LENGTH = 64;
+
+  /**
+   * The manifest's `auth` block, or null when absent or untrustworthy. The
+   * manifest is unauthenticated server input, so only known modes and the two
+   * real cookie names pass, and a `__Host-` cookie only for an https server
+   * (Chromium rejects it on http).
+   *
+   * @param {unknown} raw The manifest's `auth` value.
+   * @param {string} serverUrl The URL the manifest was fetched for.
+   * @returns {{ mode: string, sessionCookie: string | null } | null}
+   */
+  function parseManifestAuth(raw, serverUrl) {
+    if (raw === null || typeof raw !== "object" || !MANIFEST_AUTH_MODES.has(raw.mode)) {
+      return null;
+    }
+    let sessionCookie = null;
+    if (typeof raw.session_cookie === "string" && SESSION_COOKIE_NAMES.has(raw.session_cookie)) {
+      sessionCookie = raw.session_cookie;
+    }
+    let https = false;
+    try {
+      https = new URL(serverUrl).protocol === "https:";
+    } catch {
+      // Not a URL: treat as not https.
+    }
+    if (sessionCookie?.startsWith("__Host-") && !https) sessionCookie = null;
+    return { mode: raw.mode, sessionCookie };
+  }
+
+  /**
+   * A server-supplied display name made safe to show: control and invisible
+   * format characters (bidi marks and overrides, zero-width characters)
+   * removed, whitespace collapsed, at most {@link MAX_SERVER_NAME_LENGTH}
+   * user-perceived characters. Null when nothing is left.
+   *
+   * @param {unknown} raw
+   * @returns {string | null}
+   */
+  function sanitizeServerName(raw) {
+    if (typeof raw !== "string") return null;
+    const cleaned = raw
+      .replace(/[\p{Cc}\p{Cf}]/gu, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const graphemes =
+      typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+        ? Array.from(
+            new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(cleaned),
+            (s) => s.segment,
+          )
+        : Array.from(cleaned);
+    const name =
+      graphemes.length > MAX_SERVER_NAME_LENGTH
+        ? graphemes.slice(0, MAX_SERVER_NAME_LENGTH).join("").trimEnd()
+        : cleaned;
+    return name || null;
+  }
 
   /**
    * Timeout for the manifest fetch. Short and non-fatal for the same reason as
@@ -391,7 +469,9 @@
    * @param {string} serverUrl A normalized absolute http(s) server URL.
    * @param {{ signal?: AbortSignal }} [options] Optional connection cancellation.
    * @returns {Promise<{manifestVersion: number, serverVersion: string | null,
-   *   minDesktopVersion: string | null, ui: Record<string, unknown>}>}
+   *   minDesktopVersion: string | null, ui: Record<string, unknown>,
+   *   auth: { mode: string, sessionCookie: string | null } | null,
+   *   serverName: string | null}>}
    */
   async function fetchServerManifest(serverUrl, { signal } = {}) {
     signal?.throwIfAborted();
@@ -443,6 +523,8 @@
       // Passed through as-is: unknown keys are the extension point, so the
       // shell must not filter to the ones this release happens to know.
       ui: body.ui !== null && typeof body.ui === "object" ? body.ui : {},
+      auth: parseManifestAuth(body.auth, serverUrl),
+      serverName: sanitizeServerName(body.server_name),
     };
   }
 
@@ -453,6 +535,7 @@
     normalizeRecentServers,
     serverDisplayLabel,
     isPlainHttpRemote,
+    isLoopbackServerUrl,
     normalizeSavedServerUrl,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,
@@ -463,6 +546,9 @@
     WELL_KNOWN_MANIFEST_PATH,
     MANIFEST_FETCH_TIMEOUT_MS,
     PRE_MANIFEST_BASELINE,
+    MAX_SERVER_NAME_LENGTH,
+    parseManifestAuth,
+    sanitizeServerName,
     fetchServerManifest,
   };
 });

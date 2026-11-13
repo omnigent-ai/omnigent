@@ -30,6 +30,7 @@ def test_metadata_survives_deleted_cwd(
     monkeypatch.setattr("omnigent.runtime.get_terminal_registry", Mock)
     spec = AgentSpec(
         spec_version=1,
+        skills_filter="none",
         os_env=os_env,
         async_enabled=enabled,
         timers=enabled,

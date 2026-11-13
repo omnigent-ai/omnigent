@@ -23,6 +23,20 @@ tests), then does one of two things:
   the PR itself, prepares a reviewer-facing body for a workflow-owned publisher,
   or stops after a local commit when `skip_push` is enabled.
 
+## Prompt trial
+
+Resolve opts into `executor.config.system_prompt_preset: claude_code`: Claude
+Code's coding prompt plus Resolve's existing instructions. Tools, permissions,
+model settings, and review requirements are unchanged. Other SDK agents keep
+their current prompt unless they opt in.
+
+After 3–5 days, compare time to a validated fix, review rounds, unresolved
+findings, and token cost with the preceding period, separating new fixes from
+reviews of existing PRs. The harness logs `system_prompt_preset=claude_code`;
+use that marker to identify trial sessions. This is a before/after observation,
+not a controlled benchmark. Remove the setting from `config.yaml` to roll back
+for new sessions; there is no automatic expiry.
+
 ## Prerequisites
 
 - A configured Claude provider (`omnigent setup` — an Anthropic API key, a
@@ -116,6 +130,15 @@ on an existing PR,
 not gated mid-run, so it works with nobody at a terminal; the ready-for-review PR
 is the review gate after the fact.
 
+Before choosing a fix, Resolve reconstructs the exact reported configuration,
+checks competing causes, and looks for the design rationale in code and history.
+It does not reverse intentional behavior simply to make a repro test pass.
+Uncertain product choices go to PR review as a supported proposal, with a draft
+and `partially_fixed` outcome when a material choice remains. Missing required
+inputs, credentials, or authorization still block dependent work. Workflow-owned
+publication follows its supplied contract; the prompt does not add draft support
+to the publisher. No new test-selection gate is introduced.
+
 ## What it does
 
 1. Recovers the repro handoff (verdict, facets, journey, `bug_url`) and the reproduction
@@ -145,14 +168,17 @@ is the review gate after the fact.
    not flaky-green on a clean machine. When the repro handoff carries
    before-fix recordings, **re-records the same drivers on the fixed tree**
    (building the SPA up front, then pytest-playwright `--video` for web/terminal
-   facets, the VHS tape for CLI facets), captions each after clip with the actions
-   it performs, and carries the before clips' captions through — so the captioned
+   facets, the VHS tape for CLI facets), burns timed action/outcome captions below
+   each new after clip with `dev/caption_recording.py`, inspects the render, and
+   carries the before clips and their captions through unchanged — so the captioned
    before/after pair lands in the PR's Demo section and, for Linear bugs with a
    key available, on the ticket.
 6. *(author path)* Commits the focused, locally validated fix, then follows the
    selected publication mode. Direct runs push and open a **ready-for-review
-   PR**. Workflow-owned runs prepare the validated PR body and handoff without
-   GitHub writes. Local-only runs stop at the commit. Full repository validation
+   PR**, or a draft proposal for an unresolved design choice. Draft proposals
+   retain an incomplete handoff and skip the readiness loop. Workflow-owned runs
+   prepare the validated PR body and handoff without GitHub writes. Local-only
+   runs stop at the commit. Full repository validation
    and independent review happen after publication.
 7. *(direct author path and review path)* **Drives the open PR to a landable
    state** — iterating until ready or concretely blocked. Workflow-owned author
@@ -198,11 +224,14 @@ essential constraints, and completion contract. Detailed procedures live in
 | --- | --- |
 | Input, preflight, and existing-fix discovery | `resolve-inputs` (mode-specific resources) |
 | Inherited repro and behavioral baseline | `resolve-repro-audit` |
-| Final diff, consumers, focused checks, and evidence | `resolve-impact-assessment` |
+| Final diff, consumers, focused checks, and evidence | `otto-impact-assessment` |
 | Author or review | `resolve-author-fix` / `resolve-review-pr` |
 | Commit and selected publication mode | `resolve-publish` |
-| Open PR: CI, Polly/OCR, preview, and human validation | `resolve-drive-pr` (substep resources) |
+| Open PR: CI, Polly/OCR, preview, and human validation | `resolve-drive-pr` (substep resources; CI and preview from `otto-drive-pr`) |
 | Complete output contract | `resolve-handoff` |
+
+Skills named `otto-*` are shared with other Otto agents. They live in
+[`dev/agent-skills/`](../agent-skills/) and are linked into `skills/`.
 
 The CLI transports these files with the agent bundle. They need not exist in
 the target checkout. Claude loads them through its native Skill tool; other
@@ -255,7 +284,7 @@ Run the bundled helper against a ready PR in a repository with both review
 workflows installed (read-only):
 
 ```bash
-python3 dev/resolve-agent/skills/resolve-drive-pr/review_cycle.py snapshot --repository omnigent-ai/omnigent --pr-number <pr>
+python3 dev/agent-skills/otto-pr-review-loop/review_cycle.py snapshot --repository omnigent-ai/omnigent --pr-number <pr>
 ```
 
 A new head must show both reviews incomplete until that head has Polly's reviewed

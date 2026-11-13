@@ -1,4 +1,5 @@
-import { useQuery, type QueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useCallback, useSyncExternalStore } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { setSessionParent } from "@/lib/sessionHost";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -86,6 +87,44 @@ interface ChildSessionWire {
 interface ChildSessionsResponse {
   object: "list";
   data: ChildSessionWire[];
+  last_id?: string | null;
+  has_more?: boolean;
+}
+
+const CHILD_SESSIONS_PAGE_SIZE = "100";
+
+/** True for the server's 400 `stale_cursor`: the list changed under a page cursor. */
+export async function isStaleCursorResponse(res: Response): Promise<boolean> {
+  if (res.status !== 400) return false;
+  const body = (await res
+    .clone()
+    .json()
+    .catch(() => null)) as { error?: { code?: unknown } } | null;
+  return body?.error?.code === "stale_cursor";
+}
+
+async function fetchChildSessionRows(
+  sessionId: string,
+  after: string | null,
+  rows: ChildSessionWire[],
+  restarted: boolean,
+): Promise<ChildSessionWire[]> {
+  // The first page keeps the plain URL; later pages continue after its last row.
+  const query =
+    after === null ? "" : `?${new URLSearchParams({ limit: CHILD_SESSIONS_PAGE_SIZE, after })}`;
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions${query}`,
+  );
+  // The list changed between pages: read it again once.
+  if (after !== null && !restarted && (await isStaleCursorResponse(res))) {
+    return fetchChildSessionRows(sessionId, null, [], true);
+  }
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const json = (await res.json()) as ChildSessionsResponse;
+  rows.push(...json.data);
+  return json.has_more && json.last_id
+    ? fetchChildSessionRows(sessionId, json.last_id, rows, restarted)
+    : rows;
 }
 
 /**
@@ -96,6 +135,11 @@ interface ChildSessionsResponse {
  */
 export function childSessionsQueryKey(conversationId: string): readonly unknown[] {
   return ["conversation", conversationId, "child_sessions"];
+}
+
+/** True for any key built by ``childSessionsQueryKey``. */
+function isChildSessionsQueryKey(key: readonly unknown[]): boolean {
+  return key.length === 3 && key[0] === "conversation" && key[2] === "child_sessions";
 }
 
 /**
@@ -121,6 +165,26 @@ export function cachedTreeContains(
   targetId: string,
   maxDepth: number,
 ): boolean {
+  return findCachedDescendant(queryClient, rootId, targetId, maxDepth) !== null;
+}
+
+/**
+ * Find ``targetId``'s summary in the cached child-session lists under
+ * ``rootId``. Synchronous and cache-only, like ``cachedTreeContains``.
+ *
+ * @param queryClient - The app QueryClient holding child-session caches.
+ * @param rootId - Root session whose cached tree to walk, e.g. ``"conv_root"``.
+ * @param targetId - Session to look for, e.g. ``"conv_grandchild"``.
+ * @param maxDepth - Levels below the root to examine, e.g. ``MAX_TREE_DEPTH``.
+ * @returns The cached summary, or ``null`` when no cached list holds it.
+ */
+export function findCachedDescendant(
+  queryClient: QueryClient,
+  rootId: string,
+  targetId: string,
+  maxDepth: number,
+): ChildSessionInfo | null {
+  const visited = new Set([rootId]);
   let frontier = [rootId];
   for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
     const next: string[] = [];
@@ -128,13 +192,15 @@ export function cachedTreeContains(
       const children = queryClient.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey(id));
       if (!children) continue;
       for (const child of children) {
-        if (child.id === targetId) return true;
+        if (child.id === targetId) return child;
+        if (visited.has(child.id)) continue;
+        visited.add(child.id);
         next.push(child.id);
       }
     }
     frontier = next;
   }
-  return false;
+  return null;
 }
 
 /**
@@ -170,22 +236,18 @@ interface UseChildSessionsResult {
 }
 
 /**
- * Fetch child sessions for a parent session.
+ * Fetch every child session of a parent session, following the pages.
  *
  * Exported for unit testing of the HTTP-shape contract; production
  * code should call ``useChildSessions``.
  */
 export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions`,
-  );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as ChildSessionsResponse;
+  const rows = await fetchChildSessionRows(sessionId, null, [], false);
   // Children run on this session's runner: record the link so their
   // session-scoped requests key by this session's host before their own
   // snapshot loads.
-  for (const row of json.data) setSessionParent(row.id, sessionId);
-  return json.data.map((row) => ({
+  for (const row of rows) setSessionParent(row.id, sessionId);
+  return rows.map((row) => ({
     id: row.id,
     title: row.title,
     task_summary: row.task_summary ?? null,
@@ -239,4 +301,38 @@ export function useChildSessions(
     isLoading,
     error: (error as Error | null) ?? null,
   };
+}
+
+/**
+ * Summary of ``targetId`` as listed under ``ancestorId``'s spawn tree.
+ *
+ * Direct children come from ``useChildSessions`` (fetched when not yet
+ * cached); deeper descendants are read from lists the Agents rail has
+ * cached. Re-renders when any cached child-session list changes.
+ *
+ * @param ancestorId - Session whose tree to search, e.g. ``"conv_root"``;
+ *   ``null`` disables the lookup.
+ * @param targetId - Descendant to find, e.g. ``"conv_child123"``.
+ * @returns The descendant's summary, or ``null`` while unknown.
+ */
+export function useDescendantSession(
+  ancestorId: string | null,
+  targetId: string,
+): ChildSessionInfo | null {
+  const queryClient = useQueryClient();
+  useChildSessions(ancestorId);
+  const subscribe = useCallback(
+    (onChange: () => void) =>
+      queryClient.getQueryCache().subscribe((event) => {
+        if (event.type === "updated" && isChildSessionsQueryKey(event.query.queryKey)) onChange();
+      }),
+    [queryClient],
+  );
+  // Cached rows keep their identity until their list changes, so the
+  // snapshot is stable between unrelated cache events.
+  return useSyncExternalStore(subscribe, () =>
+    ancestorId === null
+      ? null
+      : findCachedDescendant(queryClient, ancestorId, targetId, MAX_TREE_DEPTH),
+  );
 }

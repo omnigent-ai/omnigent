@@ -38,11 +38,6 @@ Usage::
 from __future__ import annotations
 
 import json
-import os
-import secrets
-import signal
-import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -54,10 +49,10 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.server_runner import ServerRunner, server_runner
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
-    find_free_port,
     poll_session_until_terminal,
     reset_mock_llm,
     send_user_message_to_session,
@@ -107,163 +102,41 @@ def non_git_workspace() -> Iterator[Path]:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-_non_git_runner_state: dict[str, str] = {}
-
-
 @pytest.fixture(scope="module")
-def non_git_runner_id() -> str:
-    """A stable runner id for the module-scoped non-git server.
-
-    The runner id is derived from a binding token shared with the
-    server so the server's tunnel allowlist accepts exactly this
-    runner's WebSocket upgrade.
-
-    :returns: Runner id string, e.g. ``"runner_token_abc123..."``.
-    """
-    from omnigent.runner.identity import token_bound_runner_id
-
-    if "runner_id" not in _non_git_runner_state:
-        token = secrets.token_urlsafe(32)
-        _non_git_runner_state["binding_token"] = token
-        _non_git_runner_state["runner_id"] = token_bound_runner_id(token)
-    return _non_git_runner_state["runner_id"]
-
-
-@pytest.fixture(scope="module")
-def non_git_server(
+def non_git_stack(
     llm_api_key: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
     non_git_workspace: Path,
-    non_git_runner_id: str,
-) -> Iterator[str]:
-    """Spawn a real ``omnigent server`` whose CWD is a non-git workspace.
-
-    The server is started with ``cwd=non_git_workspace``.  Inside
-    ``server()``, ``Path.cwd()`` resolves to ``non_git_workspace`` and
-    is passed as ``workspace_cwd`` to the runner subprocess.  The
-    runner's :func:`create_filesystem_registry` then sees a non-git
-    directory and returns an :class:`AgentEditFilesystemRegistry`.
-
-    :param llm_api_key: The ``--llm-api-key`` option value.
-    :param mock_llm_server_url: Mock LLM server URL.
-    :param tmp_path_factory: pytest temp path factory.
-    :param non_git_workspace: Non-git workspace directory (used as CWD).
-    :param non_git_runner_id: Runner id to register.
-    :returns: Server base URL, e.g. ``"http://localhost:18600"``.
-    """
-    port = find_free_port()
-    db_path = tmp_path_factory.mktemp("e2e_ng") / "e2e.db"
-    artifact_dir = tmp_path_factory.mktemp("e2e_ng_artifacts")
-    server_log = tmp_path_factory.mktemp("e2e_ng_logs") / "server.log"
-
-    binding_token = _non_git_runner_state["binding_token"]
-    env: dict[str, str] = {
-        **os.environ,
+) -> Iterator[ServerRunner]:
+    """Run both processes in the workspace observed by the filesystem registry."""
+    env = {
         "OPENAI_API_KEY": llm_api_key,
-        "PYTHONPATH": (f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"),
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OMNIGENT_SKIP_ONBOARD": "1",
         "OMNIGENT_NO_UPDATE_CHECK": "1",
     }
-    if mock_llm_server_url is not None:
-        env["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
+    with server_runner(
+        tmp_path_factory.mktemp("non_git_stack"),
+        workspace=non_git_workspace,
+        server_cwd=non_git_workspace,
+        server_env=env,
+        health_timeout=HEALTH_TIMEOUT_S,
+        poll_interval=POLL_INTERVAL_S,
+        wait_ready=False,
+    ) as stack:
+        stack.start_runner(cwd=non_git_workspace, env=env)
+        yield stack
 
-    log_handle = open(server_log, "w")  # noqa: SIM115
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "omnigent.cli",
-            "server",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{db_path}",
-            "--artifact-location",
-            str(artifact_dir),
-        ],
-        env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
-        # CWD = non_git_workspace so that Path.cwd() inside server()
-        # resolves to the non-git temp dir, causing the runner to use
-        # AgentEditFilesystemRegistry instead of GitFilesystemRegistry.
-        cwd=str(non_git_workspace),
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
-    base_url = f"http://localhost:{port}"
 
-    # Spawn runner as sibling subprocess.
-    runner_log = tmp_path_factory.mktemp("e2e_ng_runner_logs") / "runner.log"
-    runner_log_handle = open(runner_log, "w")  # noqa: SIM115
-    runner_proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env={
-            **env,
-            "OMNIGENT_RUNNER_ID": non_git_runner_id,
-            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-            "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-            "RUNNER_SERVER_URL": base_url,
-            # Without a workspace the runner builds no filesystem
-            # registry (app.py), so record_change is a no-op and writes
-            # never surface in GET .../changes. The real CLI always sets
-            # this via _start_cli_runner_process.
-            "OMNIGENT_RUNNER_WORKSPACE": str(non_git_workspace),
-        },
-        cwd=str(non_git_workspace),
-        stdout=runner_log_handle,
-        stderr=subprocess.STDOUT,
-    )
+@pytest.fixture(scope="module")
+def non_git_runner_id(non_git_stack: ServerRunner) -> str:
+    return non_git_stack.runner_id
 
-    health_iters = int(HEALTH_TIMEOUT_S / POLL_INTERVAL_S)
-    for _ in range(health_iters):
-        try:
-            health_resp = httpx.get(f"{base_url}/health", timeout=2)
-            runner_resp = httpx.get(
-                f"{base_url}/v1/runners/{non_git_runner_id}/status",
-                timeout=2,
-            )
-            if (
-                health_resp.status_code == 200
-                and runner_resp.status_code == 200
-                and runner_resp.json().get("online") is True
-            ):
-                break
-        except httpx.ConnectError:
-            pass
-        time.sleep(POLL_INTERVAL_S)
-    else:
-        if runner_proc.poll() is None:
-            runner_proc.kill()
-            runner_proc.wait(timeout=5)
-        runner_log_handle.close()
-        proc.kill()
-        log_handle.close()
-        log_contents = server_log.read_text() if server_log.exists() else ""
-        runner_log_contents = runner_log.read_text() if runner_log.exists() else ""
-        raise RuntimeError(
-            f"Non-git server did not start within {HEALTH_TIMEOUT_S}s.\n"
-            f"Server log: {log_contents[-3000:]}\n"
-            f"Runner log: {runner_log_contents[-3000:]}"
-        )
 
-    try:
-        yield base_url
-    finally:
-        if runner_proc.poll() is None:
-            runner_proc.send_signal(signal.SIGTERM)
-            try:
-                runner_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                runner_proc.kill()
-                runner_proc.wait(timeout=5)
-        runner_log_handle.close()
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-        log_handle.close()
+@pytest.fixture(scope="module")
+def non_git_server(non_git_stack: ServerRunner) -> str:
+    return non_git_stack.base_url
 
 
 @pytest.fixture(scope="module")

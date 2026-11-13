@@ -6,7 +6,7 @@ its frame arrives):
 
 * Settings › "Import sessions" (``ImportSessionsPanel``) — pick a machine,
   harness, and count, then import via ``POST /v1/imports/local/stream``; the
-  result lists each new session as its NDJSON frame lands.
+  result shows an aggregate count with a link to the normal session list.
 * The empty landing (``NewChatLandingScreen``) — a single "Import your recent
   sessions" button that opens Settings › Import.
 
@@ -46,11 +46,11 @@ def _fulfill_ndjson(route: Route, events: list[dict[str, object]]) -> None:
     route.fulfill(status=200, content_type="application/x-ndjson", body=body)
 
 
-def test_settings_import_panel_imports_and_links_sessions(
+def test_settings_import_panel_shows_compact_summary(
     page: Page,
     live_server: str,
 ) -> None:
-    """Settings › Import: submit imports the current host's recent sessions and links them.
+    """Settings › Import keeps large batches compact and links to the normal list.
 
     :param page: Playwright page fixture (fresh context per test).
     :param live_server: Base URL of the spawned server serving the built SPA.
@@ -62,11 +62,10 @@ def test_settings_import_panel_imports_and_links_sessions(
         _fulfill_ndjson(
             route,
             [
-                {"event": "session", "session_id": "conv_imp_1", "title": "First imported"},
-                # A session with no synthesizable title still links.
-                {"event": "session", "session_id": "conv_imp_2", "title": None},
-                {"event": "done", "imported": 2, "already_imported": 0, "failed": 0},
-            ],
+                {"event": "session", "session_id": f"conv_imp_{i}", "title": f"Imported {i}"}
+                for i in range(35)
+            ]
+            + [{"event": "done", "imported": 35, "already_imported": 0, "failed": 0}],
         )
 
     page.route("**/v1/hosts", lambda r: _fulfill_json(r, _HOSTS_BODY))
@@ -80,17 +79,15 @@ def test_settings_import_panel_imports_and_links_sessions(
     expect(page.get_by_test_id("import-source-select")).to_be_visible()
     expect(page.get_by_test_id("import-limit-select")).to_be_visible()
 
+    page.get_by_test_id("import-limit-select").click()
+    page.get_by_role("option", name="Last 50", exact=True).click()
     page.get_by_test_id("import-submit").click()
 
-    expect(page.get_by_test_id("import-result")).to_contain_text("Imported 2", timeout=30_000)
-    expect(page.get_by_test_id("import-result-link-conv_imp_1")).to_contain_text("First imported")
-    # The null-title session links under the placeholder label rather than 500-ing.
-    expect(page.get_by_test_id("import-result-link-conv_imp_2")).to_contain_text(
-        "Untitled session"
-    )
-
-    # Panel defaults: the online host, all harnesses, the 25-session count.
-    assert captured["post"] == {"host_id": _HOST_ID, "source": "all", "limit": 25}
+    expect(page.get_by_test_id("import-result")).to_contain_text("Imported 35", timeout=30_000)
+    panel = page.get_by_test_id("import-sessions-panel")
+    expect(panel.get_by_role("list")).to_have_count(0)
+    expect(panel.get_by_role("link", name="View sessions")).to_have_attribute("href", "/")
+    assert captured["post"] == {"host_id": _HOST_ID, "source": "all", "limit": 50}
 
 
 def test_settings_import_panel_imports_one_session_by_id(

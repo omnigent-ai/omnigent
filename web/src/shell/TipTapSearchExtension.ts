@@ -14,6 +14,7 @@ import { Plugin, PluginKey } from "@tiptap/pm/state";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import type { RefObject } from "react";
+import { SOFT_BREAK_NODE } from "./TipTapSoftBreak";
 
 export const searchDecorationKey = new PluginKey<DecorationSet>("searchDecoration");
 
@@ -42,7 +43,9 @@ interface VisibleSegment {
  * Flatten the doc into one visible-text string plus segments mapping each run
  * back to PM positions. Adjacent text nodes inside a block concatenate (so a
  * match can cross a formatting boundary like `**bold**`); a newline separator
- * is inserted between blocks so a match can't span two blocks.
+ * is inserted between blocks so a match can't span two blocks. A soft break
+ * contributes the space it renders as, so a phrase typed with a space matches
+ * across a hard-wrapped source line.
  */
 function buildVisibleTextMap(doc: ProseMirrorNode): { text: string; segments: VisibleSegment[] } {
   const segments: VisibleSegment[] = [];
@@ -60,6 +63,11 @@ function buildVisibleTextMap(doc: ProseMirrorNode): { text: string; segments: Vi
     if (node.isText && node.text) {
       segments.push({ text: node.text, from: pos, visibleFrom: text.length, separator: false });
       text += node.text;
+      return false;
+    }
+    if (node.type.name === SOFT_BREAK_NODE) {
+      segments.push({ text: " ", from: pos, visibleFrom: text.length, separator: false });
+      text += " ";
       return false;
     }
     return true;

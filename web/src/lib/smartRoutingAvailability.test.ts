@@ -231,7 +231,7 @@ describe("smartRoutingDroppedMessage", () => {
   it("blames the server's router set when only the built-in judge is configured", () => {
     const message = smartRoutingDroppedMessage({ kind: "external-router-required" }, context);
     expect(message).toBe(
-      "Smart Routing across harnesses needs the workspace AI gateway router on this server — switched to Claude Code.",
+      "Smart Routing across harnesses needs the workspace Unity Gateway router on this server — switched to Claude Code.",
     );
     expect(message).not.toContain("machine-2");
   });
@@ -262,25 +262,25 @@ describe("smartRoutingDroppedMessage", () => {
     );
   });
 
-  it("names the arm that isn't on the workspace AI gateway", () => {
+  it("names the arm that isn't on the workspace Unity Gateway", () => {
     expect(
       smartRoutingDroppedMessage(
         { kind: "not-gateway-backed", harnesses: ["codex-native"] },
         context,
       ),
     ).toBe(
-      "Smart Routing needs Codex running on the workspace AI gateway on machine-2 — switched to Claude Code.",
+      "Smart Routing needs Codex running on the workspace Unity Gateway on machine-2 — switched to Claude Code.",
     );
   });
 
-  it("names both arms when neither is on the workspace AI gateway", () => {
+  it("names both arms when neither is on the workspace Unity Gateway", () => {
     expect(
       smartRoutingDroppedMessage(
         { kind: "not-gateway-backed", harnesses: ["claude-native", "codex-native"] },
         context,
       ),
     ).toBe(
-      "Smart Routing needs Claude Code and Codex running on the workspace AI gateway on machine-2 — switched to Claude Code.",
+      "Smart Routing needs Claude Code and Codex running on the workspace Unity Gateway on machine-2 — switched to Claude Code.",
     );
   });
 

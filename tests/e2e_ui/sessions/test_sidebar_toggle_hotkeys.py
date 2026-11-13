@@ -1,9 +1,10 @@
-"""E2E: ⌘⌥[ / ⌘⌥] toggle the left and right sidebars from the app shell.
+"""E2E: in a browser, ⌘⌥[ toggles the left sidebar and ⌘⌥] the right.
 
 Covers ``useSidebarToggleHotkeys`` (``web/src/hooks/useSidebarToggleHotkeys.ts``),
 wired in ``AppShell``: a window-level keydown listener flips the left
 (Conversations) sidebar on ⌘/Ctrl + ⌥/Alt + ``[`` and the right (Workspace)
-rail on ⌘/Ctrl + ⌥/Alt + ``]``. The hook matches the physical ``e.code``
+rail on ⌘/Ctrl + ⌥/Alt + ``]`` (the desktop app uses ⌘B / ⇧⌘B instead; see
+the hook). The hook matches the physical ``e.code``
 (``BracketLeft`` / ``BracketRight``) rather than the character, because ⌥ on
 macOS turns ``[``/``]`` into ``“``/``‘`` — only a code match survives the
 modifier. CI runs Linux chromium, so this presses the ``Control+Alt`` chord
@@ -12,14 +13,13 @@ modifier. CI runs Linux chromium, so this presses the ``Control+Alt`` chord
 Two design points this exercises end-to-end that the unit test cannot:
 
 - the listener is bound at the window, so the chord fires *even while the
-  composer is focused* (a sibling of the ⌘↑/↓ session-switch and ⌘↵ approve
-  hotkeys). We focus the composer with an unsent draft, then collapse the
-  Conversations sidebar with the chord, and assert the draft is untouched —
+  composer is focused* (like the ⌘↵ approve hotkey). We focus the composer
+  with an unsent draft, then collapse the Conversations sidebar with the
+  chord, and assert the draft is untouched —
   proving the chord toggled the panel without stealing the keystroke or
   navigating away.
-- the right-rail toggle runs the shared ``toggleRightPanel`` (open-state +
-  per-session persistence + URL sync), the same path the header's collapse
-  button uses, so the two can't drift.
+- the right-rail shortcut toggles in one press, and reopening puts focus on
+  the rail's tab strip for keyboard use.
 
 No LLM turn is needed — this is pure client-side keyboard + layout state — so
 it skips the nightly/real-agent markers the approval suites carry. The seeded
@@ -31,6 +31,7 @@ and always has content (the Agents tab is unconditional).
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime, timedelta
 
 from playwright.sync_api import Page, expect
 
@@ -50,7 +51,7 @@ def test_sidebar_toggle_hotkeys(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """⌘⌥[ flips the Conversations sidebar; ⌘⌥] flips the Workspace rail."""
+    """⌘⌥[ toggles Conversations; ⌘⌥] focuses then closes Workspace."""
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -82,14 +83,15 @@ def test_sidebar_toggle_hotkeys(
     page.keyboard.press(_LEFT_CHORD)
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
 
-    # ⌘⌥] collapses the Workspace rail (unmounts it via the shared
-    # toggleRightPanel path) ...
+    # ⌘⌥] is a plain toggle too: with focus outside the rail, it closes the
+    # open Workspace rail in one press.
     page.keyboard.press(_RIGHT_CHORD)
     expect(workspace).to_have_count(0)
 
-    # ... and ⌘⌥] again brings it back.
+    # The chord brings it back with focus on its tab strip.
     page.keyboard.press(_RIGHT_CHORD)
     expect(workspace).to_be_visible()
+    expect(workspace.locator("[data-workspace-tab]:focus")).to_have_count(1)
 
 
 def test_sidebar_click_cancels_pending_peek(
@@ -98,6 +100,8 @@ def test_sidebar_click_cancels_pending_peek(
 ) -> None:
     """A quick press pins the sidebar open instead of losing to the peek timer."""
     base_url, session_id = seeded_session
+    clock_start = datetime.now(UTC)
+    page.clock.install(time=clock_start)
     page.goto(f"{base_url}/c/{session_id}")
 
     conversations = page.locator(_CONVERSATIONS)
@@ -108,12 +112,13 @@ def test_sidebar_click_cancels_pending_peek(
 
     trigger = page.get_by_role("button", name="Open sidebar")
     expect(trigger).to_be_visible()
+    page.clock.pause_at(clock_start + timedelta(hours=1))
     trigger.hover()
-    page.wait_for_timeout(300)
+    page.clock.run_for(300)
 
     page.mouse.down()
     try:
-        page.wait_for_timeout(200)
+        page.clock.run_for(200)
         expect(conversations).to_have_attribute("data-collapsed", "true")
         expect(conversations).not_to_have_class(_PEEK_CLASS)
     finally:
@@ -121,7 +126,7 @@ def test_sidebar_click_cancels_pending_peek(
 
     expect(conversations).not_to_have_attribute("data-collapsed", "true")
     expect(conversations).not_to_have_class(_PEEK_CLASS)
-    page.wait_for_timeout(200)
+    page.clock.run_for(200)
     expect(conversations).not_to_have_class(_PEEK_CLASS)
 
 
@@ -144,15 +149,15 @@ def test_sidebar_peek_is_opaque_in_dark_mode(
     page.get_by_role("button", name="Open sidebar").hover()
     expect(conversations).to_have_class(_PEEK_CLASS)
 
-    colors = conversations.evaluate(
-        """element => {
+    expected_color = page.evaluate(
+        """() => {
           const probe = document.createElement("div");
           probe.style.backgroundColor = "var(--card-solid)";
           document.body.appendChild(probe);
           const expected = getComputedStyle(probe).backgroundColor;
-          const actual = getComputedStyle(element).backgroundColor;
           probe.remove();
-          return { actual, expected };
+          return expected;
         }"""
     )
-    assert colors["actual"] == colors["expected"]
+    # The peek class can be present before its background transition settles.
+    expect(conversations).to_have_css("background-color", expected_color)

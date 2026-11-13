@@ -42,6 +42,7 @@ from pathlib import Path
 from playwright.async_api import Route, async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 # ---------------------------------------------------------------------------
@@ -197,6 +198,7 @@ async def _drive_mobile_enter_newline(base_url: str, session_id: str) -> None:
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
+            await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
 
             # Seed a recent workspace so the host chip auto-fills and the Send
             # button can become enabled.

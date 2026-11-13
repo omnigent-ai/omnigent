@@ -40,9 +40,15 @@ export interface SetupStepWire {
 interface HarnessCatalogRow {
   id?: string;
   label?: string;
-  // Declared capability profile. Only ``integration_mode`` is read here, to
-  // recognize the generic-ACP family without hardcoding vendor ids.
-  capabilities?: { integration_mode?: string | null } | null;
+  // Declared capability profile: ``integration_mode`` recognizes the
+  // generic-ACP family, ``effort`` names the reasoning-effort ladder, and
+  // ``workspace_file_mentions`` marks agents that open "@"-mentioned paths, so
+  // none of them needs vendor ids hardcoded here.
+  capabilities?: {
+    integration_mode?: string | null;
+    effort?: string | null;
+    workspace_file_mentions?: boolean | null;
+  } | null;
 }
 
 /** ``capabilities.integration_mode`` of every generic-ACP harness. */
@@ -55,31 +61,55 @@ interface HarnessCatalogWire {
   setup_steps?: Record<string, SetupStepWire[]>;
 }
 
-interface HarnessCatalog {
+export interface HarnessCatalog {
   /** harness id → picker label, merged over the built-in defaults. */
   labels: Record<string, string>;
   /** harness spelling → ordered setup steps (install/auth) the server describes. */
   setupSteps: Record<string, SetupStepWire[]>;
   /** ids the server declares generic-ACP — see {@link useAcpHarnessIds}. */
   acpHarnesses: ReadonlySet<string>;
+  /** harness id → declared effort family (``anthropic``, ``openai``, …). */
+  effortFamilies: Record<string, string>;
+  /** ids the server declares ``workspace_file_mentions`` for. */
+  fileMentionHarnesses: ReadonlySet<string>;
 }
 
-async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
+/** Pull each row's declared effort family; rows without one are skipped. */
+export function effortFamiliesFromCatalog(
+  rows: readonly HarnessCatalogRow[],
+): Record<string, string> {
+  const families: Record<string, string> = {};
+  for (const row of rows) {
+    const family = row.capabilities?.effort;
+    if (typeof row.id === "string" && typeof family === "string") families[row.id] = family;
+  }
+  return families;
+}
+
+export async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
   const res = await authenticatedFetch("/v1/harnesses");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HarnessCatalogWire;
   const labels: Record<string, string> = { ...BRAIN_HARNESS_LABELS };
   const acpHarnesses = new Set<string>();
+  const fileMentionHarnesses = new Set<string>();
   for (const row of body.data ?? []) {
     if (typeof row.id !== "string") continue;
     if (typeof row.label === "string") labels[row.id] = row.label;
     if (row.capabilities?.integration_mode === ACP_INTEGRATION_MODE) acpHarnesses.add(row.id);
+    if (row.capabilities?.workspace_file_mentions === true) fileMentionHarnesses.add(row.id);
   }
   // The server keys setup_steps by every spelling (codex-native, opencode, …)
   // so the dialog resolves whatever harness the session declares.
   const setupSteps =
     body.setup_steps && typeof body.setup_steps === "object" ? body.setup_steps : {};
-  return { labels, setupSteps, acpHarnesses };
+  return {
+    labels,
+    setupSteps,
+    acpHarnesses,
+    effortFamilies: effortFamiliesFromCatalog(body.data ?? []),
+    fileMentionHarnesses,
+  };
 }
 
 // Every hook below shares one request + cache entry, each selecting its own
@@ -171,6 +201,24 @@ const NO_ACP_HARNESSES: ReadonlySet<string> = new Set<string>();
  */
 export function useAcpHarnessIds(enabled = true): ReadonlySet<string> {
   return useHarnessCatalog((c) => c.acpHarnesses, NO_ACP_HARNESSES, enabled);
+}
+
+const NO_FILE_MENTION_HARNESSES: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Catalog harness ids whose agent opens an "@"-mentioned workspace path
+ * (``capabilities.workspace_file_mentions``). Native wrappers aren't catalog
+ * rows; ``harnessSupportsFileMentions`` covers them via the native registry.
+ */
+export function useFileMentionHarnesses(): ReadonlySet<string> {
+  return useHarnessCatalog((c) => c.fileMentionHarnesses, NO_FILE_MENTION_HARNESSES);
+}
+
+const NO_EFFORT_FAMILIES: Record<string, string> = {};
+
+/** harness id → declared effort family, from ``/v1/harnesses`` ``capabilities.effort``. */
+export function useHarnessEffortFamilies(enabled = true): Record<string, string> {
+  return useHarnessCatalog((c) => c.effortFamilies, NO_EFFORT_FAMILIES, enabled);
 }
 
 /**

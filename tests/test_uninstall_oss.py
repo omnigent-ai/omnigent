@@ -80,6 +80,9 @@ def test_uninstall_script_removes_profile_block_and_runs_wheel_last(tmp_path: Pa
         "keep2\n"
     )
     fake_bin, uv_log = _fake_uv(tmp_path)
+    databricks = fake_bin / "databricks"
+    databricks.write_text("#!/bin/sh\nexit 0\n")
+    databricks.chmod(0o755)
 
     result = _run_uninstall(
         home, "--yes", "--json", path=f"{fake_bin}:{os.environ.get('PATH', '')}"
@@ -92,6 +95,13 @@ def test_uninstall_script_removes_profile_block_and_runs_wheel_last(tmp_path: Pa
     assert profile.read_text() == "keep\nkeep2\n"
     assert uv_log.read_text().strip() == "tool uninstall omnigent"
     assert list(home.glob(".zshrc.omnigent.bak.*"))
+    assert any(
+        action["artifact"] == "shared_dep"
+        and action["path"] == "databricks"
+        and action["status"] == "reported"
+        for action in payload["actions"]
+    )
+    assert os.access(databricks, os.X_OK)
 
 
 def test_uninstall_script_bare_command_is_dry_run(tmp_path: Path) -> None:

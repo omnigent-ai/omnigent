@@ -8,18 +8,15 @@
 //   - Native-REBUILD harnesses (Claude Code, Codex, Pi, Hermes, Qwen Code)
 //     record a resumable on-disk session file the runner rebuilds from the
 //     copied Omnigent items (a same-family native source clones the source
-//     file instead; cross-family rebuilds, format-agnostic) — carry on BOTH
-//     fork and switch. Mirrors `_FORK_HISTORY_NATIVE_HARNESSES`.
+//     file instead; cross-family rebuilds, format-agnostic). Mirrors
+//     `_FORK_HISTORY_NATIVE_HARNESSES`.
 //   - PREAMBLE harnesses (Cursor, OpenCode) have no rebuildable local store,
-//     so prior turns replay as a text preamble on the fork's first message —
-//     FORK-ONLY. An in-place switch-agent has no first-message injection
-//     point, so switching into one starts fresh. Mirrors
-//     `_CURSOR_FORK_HISTORY_HARNESSES`.
+//     so prior turns replay as a text preamble on the fork's first message.
+//     Mirrors `_CURSOR_FORK_HISTORY_HARNESSES`.
 //
-// Hence two predicates: forkTargetCarriesHistory (rebuild ∪ preamble ∪ SDK)
-// and switchTargetCarriesHistory (rebuild ∪ SDK — no preamble). Native
-// harnesses with no carry path (kiro/kimi/goose) are offered by neither; an
-// unclassifiable harness (catalog harness=null) is conservatively dropped.
+// forkTargetCarriesHistory is rebuild ∪ preamble ∪ SDK. Native harnesses with
+// no carry path (kiro/kimi/goose) aren't offered; an unclassifiable harness
+// (catalog harness=null) is conservatively dropped.
 
 /** Provider family a harness consumes, or null when unknown. */
 export function harnessFamily(
@@ -109,10 +106,9 @@ const NATIVE_REBUILD_HARNESSES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Native harnesses that carry FORK history only as a text preamble on the
- * fork's first message (no rebuildable local store) — FORK-ONLY. An in-place
- * switch-agent has no first-message injection point, so switching into one
- * starts fresh. Mirrors Python `_CURSOR_FORK_HISTORY_HARNESSES`.
+ * Native harnesses that carry fork history only as a text preamble on the
+ * fork's first message (no rebuildable local store). Mirrors Python
+ * `_CURSOR_FORK_HISTORY_HARNESSES`.
  */
 const PREAMBLE_FORK_HARNESSES: ReadonlySet<string> = new Set([
   "cursor-native",
@@ -154,23 +150,6 @@ export function forkTargetCarriesHistory(targetHarness: string | null | undefine
 }
 
 /**
- * Whether switching a session in place to `targetHarness` keeps history (and
- * so should be offered in the switch-agent picker). Same as
- * {@link forkTargetCarriesHistory} MINUS the preamble harnesses: the
- * text-preamble path is fork-only (switch-agent has no first-message
- * injection point), so a switch into cursor/opencode would silently start
- * fresh and must not be offered. Mirrors the server, where switch-agent stamps
- * carry-history only for `_FORK_HISTORY_NATIVE_HARNESSES`, never the cursor
- * set.
- *
- * @param targetHarness - The harness the switch would bind.
- */
-export function switchTargetCarriesHistory(targetHarness: string | null | undefined): boolean {
-  if (!targetHarness) return false;
-  return NATIVE_REBUILD_HARNESSES.has(targetHarness) || harnessFamily(targetHarness) !== null;
-}
-
-/**
  * Strip ONE trailing `" (fork <id>)"` / `" (switch <id>)"` suffix.
  *
  * Internal one-layer primitive for {@link agentRootName}; not exported,
@@ -197,8 +176,7 @@ function agentBaseName(name: string): string {
  *
  * Use this for ALL clone-name → catalog matching: the new-session picker
  * dropping session agents that shadow a built-in (`useAvailableAgents`),
- * the in-session model-picker / agent-info label (`agentDisplayLabel`), and
- * the switch-agent dialog excluding the current agent's origin. A
+ * and the in-session model-picker / agent-info label (`agentDisplayLabel`). A
  * single-layer strip would leave `"claude-native-ui (fork ag_a)"`, miss the
  * match, and surface the clone as a spurious "custom" agent / duplicate
  * built-in / raw suffixed label.

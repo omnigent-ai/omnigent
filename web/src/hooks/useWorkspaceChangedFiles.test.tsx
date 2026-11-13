@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEffect } from "react";
 import type { ReactNode } from "react";
@@ -31,13 +31,20 @@ import {
   resolveChatFilePath,
   runnerOfflineRetryDelay,
   shouldRetryRunnerOffline,
+  useSessionActive,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceDirectory,
   useWorkspaceEnvironment,
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
+  useWorkspaceServeable,
 } from "./useWorkspaceChangedFiles";
+import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
+
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { conversationRegistry } from "@/store/conversationRegistry";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
 const hostOnlineMock = vi.mocked(useSessionHostOnline);
@@ -174,9 +181,27 @@ function FileSearchProbe({
 function FileSearchTruncatedProbe({ id, query }: { id: string; query: string }) {
   const { data } = useWorkspaceFileSearch(id, query);
   return (
-    <output data-testid="truncated">
-      {data === undefined ? "pending" : String(data.truncated)}
-    </output>
+    <>
+      <output data-testid="truncated">
+        {data === undefined ? "pending" : String(data.truncated)}
+      </output>
+      <output data-testid="has-more">
+        {data === undefined ? "pending" : String(data.hasMore)}
+      </output>
+    </>
+  );
+}
+
+/** Go to File's status for a live search, as its dialog derives it. */
+function GoToFileStatusProbe({ id, query }: { id: string; query: string }) {
+  const search = useWorkspaceFileSearch(id, query);
+  const serveable = useWorkspaceServeable(id);
+  const state = goToFileSearchState({ ...search, query, searchedQuery: query, serveable });
+  return (
+    <>
+      <output data-testid="phase">{state.phase}</output>
+      <output data-testid="message">{goToFileStatusMessage(state, query, 0)}</output>
+    </>
   );
 }
 
@@ -243,6 +268,21 @@ afterEach(() => {
 });
 
 describe("useWorkspaceChangedFiles gating", () => {
+  it("preserves optional repository identity and workspace-relative paths", async () => {
+    onlineMock.mockReturnValue(true);
+    const entries = [
+      { path: "api/app.py", name: "app.py", repository_root: "api" },
+      { path: "notes.md", name: "notes.md" },
+    ].map((entry) => ({ ...entry, status: "modified", bytes: 12, modified_at: null }));
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse({ object: "list", data: entries, has_more: false }));
+    const { result } = renderHook(() => useWorkspaceChangedFiles("conv_repos"), { wrapper: Wrap });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.data).toMatchObject(entries);
+    expect(result.current.data?.data[1].repository_root).toBeUndefined();
+  });
+
   it("does not fetch when the runner is offline and the host is also down", async () => {
     onlineMock.mockReturnValue(false);
     hostOnlineMock.mockReturnValue(false);
@@ -317,6 +357,47 @@ describe("useWorkspaceChangedFiles gating", () => {
     expect(fetchMock.mock.calls[1][0]).toBe(
       "/v1/sessions/conv_live/resources/environments/default/changes",
     );
+  });
+
+  it("aborts the prior conversation's changed-files request", async () => {
+    onlineMock.mockReturnValue(true);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0 } },
+    });
+    let priorSignal: AbortSignal | undefined;
+    let nextSignal: AbortSignal | undefined;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/resources/environments/default")) {
+        return Promise.resolve(environmentResponse());
+      }
+      if (url.includes("/conv_prior/") && url.endsWith("/changes")) {
+        priorSignal = init?.signal ?? undefined;
+        return new Promise<Response>(() => {});
+      }
+      if (url.includes("/conv_next/") && url.endsWith("/changes")) {
+        nextSignal = init?.signal ?? undefined;
+      }
+      return Promise.resolve(changedFilesResponse());
+    });
+
+    const { rerender } = render(
+      <QueryClientProvider client={queryClient}>
+        <ChangedFilesProbe id="conv_prior" />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(priorSignal).toBeDefined());
+    expect(priorSignal?.aborted).toBe(false);
+
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <ChangedFilesProbe id="conv_next" />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(priorSignal?.aborted).toBe(true));
+    await waitFor(() => expect(nextSignal).toBeDefined());
+    expect(nextSignal?.aborted).toBe(false);
   });
 
   it("fetches when status is unknown (undefined)", async () => {
@@ -716,6 +797,95 @@ describe("useWorkspaceFileSearch truncation", () => {
     );
 
     await waitFor(() => expect(screen.getByTestId("truncated")).toHaveTextContent("true"));
+    expect(screen.getByTestId("has-more")).toHaveTextContent("false");
+  });
+
+  it("reports has_more separately, so a full result page isn't shown as complete", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(
+      jsonResponse({ object: "list", data: [], has_more: true, truncated: false }),
+    );
+
+    render(
+      <Wrap>
+        <FileSearchTruncatedProbe id="conv_live" query="src" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("has-more")).toHaveTextContent("true"));
+    expect(screen.getByTestId("truncated")).toHaveTextContent("false");
+  });
+});
+
+describe("Go to File status from a live search", () => {
+  // Liveness can lag: the runner may be gone, or the session may have no OS
+  // environment, while the health signal still reads online or unknown.
+  const unavailableText = "This session's files aren't available right now.";
+
+  it("says the files are unavailable, not that nothing matched, on a 404 while online", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(new Response(null, { status: 404 }));
+
+    render(
+      <Wrap>
+        <GoToFileStatusProbe id="conv_live" query="readme" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("phase")).toHaveTextContent("unavailable"));
+    expect(screen.getByTestId("message")).toHaveTextContent(unavailableText);
+  });
+
+  it("says the files are unavailable on a runner_unavailable 503 while liveness is unknown", async () => {
+    onlineMock.mockReturnValue(undefined);
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+
+    render(
+      <Wrap>
+        <GoToFileStatusProbe id="conv_live" query="readme" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("phase")).toHaveTextContent("unavailable"));
+    expect(screen.getByTestId("message")).toHaveTextContent(unavailableText);
+  });
+
+  it("says nothing matched only when the workspace answered with no files", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    render(
+      <Wrap>
+        <GoToFileStatusProbe id="conv_live" query="readme" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("phase")).toHaveTextContent("settled"));
+    expect(screen.getByTestId("message")).toHaveTextContent("No files match “readme”.");
+  });
+
+  it("cancels a search request that a newer query replaced", async () => {
+    onlineMock.mockReturnValue(true);
+    const signals: AbortSignal[] = [];
+    fetchMock.mockImplementation((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.signal) signals.push(init.signal);
+      return new Promise<Response>(() => {});
+    });
+
+    const { rerender } = render(
+      <Wrap>
+        <FileSearchTruncatedProbe id="conv_live" query="ap" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(signals).toHaveLength(1));
+    rerender(
+      <Wrap>
+        <FileSearchTruncatedProbe id="conv_live" query="app" />
+      </Wrap>,
+    );
+    await waitFor(() => expect(signals).toHaveLength(2));
+    await waitFor(() => expect(signals[0].aborted).toBe(true));
+    expect(signals[1].aborted).toBe(false);
   });
 });
 
@@ -920,6 +1090,9 @@ describe("resolveChatFilePath", () => {
     ["/home/u/ws/foo.md?x=1", ROOT, HOME, null, "absolute with ?query → unresolvable"],
     ["/etc/hosts#L1", ROOT, HOME, null, "outside path with #fragment → unresolvable"],
     ["https://example.com/x", ROOT, HOME, null, "URL → unresolvable"],
+    ["C:\\Users\\u\\ws\\a.ts", ROOT, HOME, null, "Windows drive path → unresolvable"],
+    ["C:/Users/u/ws/a.ts", ROOT, HOME, null, "Windows drive path, forward slashes"],
+    ["\\\\host\\share\\a.ts", ROOT, HOME, null, "Windows UNC path → unresolvable"],
   ])("%o (root=%o, home=%o) → %o (%s)", (text, root, home, expected, _why) => {
     expect(
       resolveChatFilePath(text as string, root as string | null, home as string | null),
@@ -977,7 +1150,7 @@ function FileExistenceProbe({
 }) {
   const result = useWorkspaceFileExists(id, path, trusted);
   useEffect(() => {
-    onResult(result);
+    onResult({ exists: result.exists, settled: result.settled });
   }, [result, onResult]);
   return null;
 }
@@ -1012,6 +1185,95 @@ describe("useWorkspaceFileExists", () => {
     );
   });
 
+  it("finds a file on a later page of a large parent directory", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          object: "list",
+          data: [dirEntry("docs/first.md")],
+          last_id: "docs/first.md",
+          has_more: true,
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          object: "list",
+          data: [dirEntry("docs/target.md")],
+          last_id: "docs/target.md",
+          has_more: false,
+        }),
+      );
+    const results: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_1" path="docs/target.md" onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(results.at(-1)).toEqual({ exists: true, settled: true }));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toContain("after=docs%2Ffirst.md");
+  });
+
+  it.each(["HTTP 500", "malformed JSON"])(
+    "keeps confirmed files when a later page fails with %s",
+    async (failure) => {
+      const failedPage =
+        failure === "HTTP 500"
+          ? jsonResponse({ error: {} }, 500)
+          : Object.assign(jsonResponse({}), {
+              json: async () => {
+                throw new SyntaxError("Invalid JSON");
+              },
+            });
+      fetchMock
+        .mockResolvedValueOnce(
+          jsonResponse({
+            object: "list",
+            data: [dirEntry("docs/target.md")],
+            last_id: "docs/target.md",
+            has_more: true,
+          }),
+        )
+        .mockResolvedValueOnce(failedPage);
+      const found: { exists: boolean; settled: boolean }[] = [];
+      const missing: { exists: boolean; settled: boolean }[] = [];
+      render(
+        <Wrap>
+          <FileExistenceProbe id="conv_1" path="docs/target.md" onResult={(r) => found.push(r)} />
+          <FileExistenceProbe id="conv_1" path="docs/unseen.md" onResult={(r) => missing.push(r)} />
+        </Wrap>,
+      );
+
+      await waitFor(() => expect(found.at(-1)).toEqual({ exists: true, settled: true }));
+      expect(missing.at(-1)).toEqual({ exists: false, settled: false });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("leaves absence unverified after scanning 10,000 entries", async () => {
+    let pageIndex = 0;
+    fetchMock.mockImplementation(() => {
+      const index = pageIndex++;
+      const data = Array.from({ length: 1000 }, (_, i) =>
+        dirEntry(`docs/${String(index * 1000 + i).padStart(5, "0")}.md`),
+      );
+      return Promise.resolve(
+        jsonResponse({ object: "list", data, last_id: data.at(-1)?.id, has_more: true }),
+      );
+    });
+    const results: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_1" path="docs/target.md" onResult={(r) => results.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(10));
+    await flushMicrotasks();
+    expect(results.at(-1)).toEqual({ exists: false, settled: false });
+  });
+
   it("reports false when the file is absent from the parent listing", async () => {
     // Sibling exists, target does not → must not be treated as present.
     fetchMock.mockResolvedValue(
@@ -1042,6 +1304,27 @@ describe("useWorkspaceFileExists", () => {
     expect(results.length).toBeGreaterThan(0);
     expect(results).not.toContain(true);
     expect(results.at(-1)).toBe(false);
+  });
+
+  it("reports a listed folder as a directory, not as a verified-absent file", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [
+          dirEntry("experimental/data/mobile-touch-targets", "directory"),
+          dirEntry("experimental/data/notes.md"),
+        ],
+        has_more: false,
+      }),
+    );
+    const { result } = renderHook(
+      () => useWorkspaceFileExists("conv_1", "experimental/data/mobile-touch-targets", true),
+      { wrapper: Wrap },
+    );
+
+    await waitFor(() => expect(result.current.settled).toBe(true));
+    expect(result.current).toEqual({ exists: false, isDirectory: true, settled: true });
+    expect(fetchMock.mock.calls[0][0]).toContain("/filesystem/experimental/data?");
   });
 
   it("reports false (and 404-tolerant) when the parent directory is missing", async () => {
@@ -1424,6 +1707,44 @@ describe("runner-offline retry liveness gate", () => {
 
     expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
+
+  it("stops retrying once the loaded snapshot shows the sandbox asleep", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-23T00:00:00Z"));
+    // Page load: the first 503 lands while the snapshot is still loading.
+    onlineMock.mockReturnValue(undefined);
+    sessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+    const qc = new QueryClient({ defaultOptions: { queries: { staleTime: 0 } } });
+    const tree = () => (
+      <QueryClientProvider client={qc}>
+        <EnvironmentProbe id="conv_asleep" />
+      </QueryClientProvider>
+    );
+
+    const view = render(tree());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // The snapshot lands: an idle-stopped managed sandbox with both tunnels down.
+    sessionMock.mockReturnValue({
+      session: {
+        hostId: "host_1",
+        hostResumable: true,
+        permissionLevel: null,
+        createdAt: Math.floor(Date.now() / 1000) - 3600,
+      } as Session,
+      isLoading: false,
+      error: null,
+    });
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(false);
+    view.rerender(tree());
+    await vi.advanceTimersByTimeAsync(130_000);
+
+    // The retry already scheduled at the first failure still runs; none after it.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("browse-location listings normalize to paths relative to the location", () => {
@@ -1572,4 +1893,25 @@ describe("browse-location wire form (survives a slash-merging proxy)", () => {
     expect(url).toContain("/filesystem/src/inner?");
     expect(url).not.toContain("base=");
   });
+});
+
+it.each([false, true])("gates background workspace activity on grid flag %s", (enabled) => {
+  stubChatStore(null, "idle");
+  const entry = conversationRegistry.acquire("grid-session");
+  const view = renderHook(() => useSessionActive("grid-session"), {
+    wrapper: ({ children }) => (
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: enabled } }}
+      >
+        {children}
+      </CapabilitiesProvider>
+    ),
+  });
+  expect(view.result.current).toBe(false);
+  act(() => entry.setState({ sessionStatus: "running" }));
+  expect(view.result.current).toBe(enabled);
+  act(() => entry.setState({ sessionStatus: "idle" }));
+  expect(view.result.current).toBe(false);
+  view.unmount();
+  conversationRegistry.clear();
 });

@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import type { Conversation } from "@/hooks/useConversations";
-import { collectCommentInboxItems, collectInboxItems, sumPendingApprovals } from "./inbox";
+import {
+  collectCommentInboxItems,
+  collectInboxItems,
+  collectUnreadInboxItems,
+  groupInboxEntries,
+  inboxTimeGroup,
+  sumPendingApprovals,
+} from "./inbox";
 
 function makeRow(overrides: Partial<Conversation> & { id: string }): Conversation {
   return {
@@ -260,5 +267,83 @@ describe("sumPendingApprovals", () => {
       makeRow({ id: "d", pending_elicitations_count: 3 }),
     ];
     expect(sumPendingApprovals(rows)).toBe(5);
+  });
+});
+
+describe("collectUnreadInboxItems", () => {
+  // Stand-in for the sidebar dot's predicate: unseen when finished and
+  // newer than a fixed baseline.
+  const unseenAfter =
+    (baseline: number) => (_id: string, updatedAt: number, status: string | undefined) =>
+      status !== "running" && status !== undefined && updatedAt > baseline;
+
+  it("lists unseen sessions newest first, tagging failed turns as errors", () => {
+    const rows = [
+      makeRow({ id: "old", status: "idle", updated_at: 2_000 }),
+      makeRow({ id: "new", status: "failed", updated_at: 3_000 }),
+      makeRow({ id: "seen", status: "idle", updated_at: 500 }),
+    ];
+    const items = collectUnreadInboxItems(rows, unseenAfter(1_000));
+    expect(items.map((i) => [i.row.id, i.kind])).toEqual([
+      ["new", "error"],
+      ["old", "done"],
+    ]);
+  });
+
+  it("skips archived rows and rows already listed as approvals", () => {
+    // A session with a pending prompt shows as its approval card; listing it
+    // again as unread would put one session in the inbox twice.
+    const rows = [
+      makeRow({ id: "archived", status: "idle", updated_at: 2_000, archived: true }),
+      makeRow({ id: "awaiting", status: "idle", updated_at: 2_000, pending_elicitations_count: 1 }),
+      makeRow({ id: "unread", status: "idle", updated_at: 2_000 }),
+    ];
+    const items = collectUnreadInboxItems(rows, unseenAfter(1_000));
+    expect(items.map((i) => i.row.id)).toEqual(["unread"]);
+  });
+
+  it("defers to the predicate, so running sessions stay out", () => {
+    const rows = [makeRow({ id: "running", status: "running", updated_at: 2_000 })];
+    expect(collectUnreadInboxItems(rows, unseenAfter(1_000))).toEqual([]);
+  });
+});
+
+describe("inboxTimeGroup", () => {
+  // Wednesday 2026-10-07 15:00 local time.
+  const now = new Date(2026, 9, 7, 15, 0, 0);
+  const at = (date: Date) => date.getTime() / 1000;
+
+  it("buckets by recency, using local calendar days", () => {
+    expect(inboxTimeGroup(at(new Date(2026, 9, 7, 14, 57)), now)).toBe("Just now");
+    expect(inboxTimeGroup(at(new Date(2026, 9, 7, 0, 5)), now)).toBe("Earlier today");
+    // Late last night is "Yesterday" even though it's under 24 hours ago.
+    expect(inboxTimeGroup(at(new Date(2026, 9, 6, 23, 50)), now)).toBe("Yesterday");
+    expect(inboxTimeGroup(at(new Date(2026, 9, 1, 9, 0)), now)).toBe("This week");
+    expect(inboxTimeGroup(at(new Date(2026, 8, 30, 9, 0)), now)).toBe("Older");
+  });
+
+  it("treats a timestamp slightly in the future (clock skew) as just now", () => {
+    expect(inboxTimeGroup(at(new Date(2026, 9, 7, 15, 1)), now)).toBe("Just now");
+  });
+});
+
+describe("groupInboxEntries", () => {
+  it("sorts newest first and groups consecutive entries by recency", () => {
+    const now = new Date(2026, 9, 7, 15, 0, 0);
+    const minutesAgo = (m: number) => now.getTime() / 1000 - m * 60;
+    const groups = groupInboxEntries(
+      [
+        { id: "yesterday", at: minutesAgo(16 * 60) },
+        { id: "fresh", at: minutesAgo(1) },
+        { id: "morning", at: minutesAgo(5 * 60) },
+        { id: "noon", at: minutesAgo(3 * 60) },
+      ],
+      now,
+    );
+    expect(groups.map((g) => [g.label, g.entries.map((e) => e.id)])).toEqual([
+      ["Just now", ["fresh"]],
+      ["Earlier today", ["noon", "morning"]],
+      ["Yesterday", ["yesterday"]],
+    ]);
   });
 });

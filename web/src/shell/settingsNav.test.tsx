@@ -22,7 +22,9 @@ const mocks = vi.hoisted(() => ({
   // so this is the ONLY signal that hides account/sharing chrome.
   singleUser: false,
   isAdmin: false,
-  customizeEnabled: true,
+  agentInstall: false,
+  enabledConnections: [] as string[],
+  nestedAgents: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -30,7 +32,9 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
-    features: { customize: mocks.customizeEnabled },
+    agent_install: mocks.agentInstall,
+    enabled_connections: mocks.enabledConnections,
+    sibling_sessions: mocks.nestedAgents,
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -47,12 +51,12 @@ import {
   useTrackSettingsReturn,
 } from "./settingsNav";
 
-function renderBody(opts: { onNavClick?: () => void } = {}) {
+function renderBody(opts: { onNavClick?: () => void; harnessesOffered?: boolean } = {}) {
   const onNavClick = opts.onNavClick ?? vi.fn();
   render(
     <TooltipProvider>
       <MemoryRouter initialEntries={["/settings/appearance"]}>
-        <SettingsSidebarBody onNavClick={onNavClick} />
+        <SettingsSidebarBody onNavClick={onNavClick} harnessesOffered={opts.harnessesOffered} />
       </MemoryRouter>
     </TooltipProvider>,
   );
@@ -64,7 +68,9 @@ beforeEach(() => {
   mocks.loginUrl = null;
   mocks.singleUser = false;
   mocks.isAdmin = false;
-  mocks.customizeEnabled = true;
+  mocks.agentInstall = false;
+  mocks.enabledConnections = [];
+  mocks.nestedAgents = false;
 });
 afterEach(cleanup);
 
@@ -76,6 +82,11 @@ describe("settingsNavGroups", () => {
       label: "General",
       icon: SettingsIcon,
     });
+    expect(general?.items.slice(0, 3).map((item) => item.id)).toEqual([
+      "general",
+      "appearance",
+      "harnesses",
+    ]);
   });
 
   it("flags Keyboard shortcuts as hidden on mobile, but not the other items", () => {
@@ -112,6 +123,14 @@ describe("settingsNavGroups", () => {
     expect(ids(false)).not.toContain("updates");
     expect(ids(true)).toContain("cli");
     expect(ids(true)).toContain("updates");
+  });
+
+  it("places Desktop immediately after General", () => {
+    expect(settingsNavGroups(false, true).map((group) => group.title)).toEqual([
+      "General",
+      "Desktop",
+      "Archived",
+    ]);
   });
 
   it("includes the Admin group (Members / Policies / Sharing) for any admin, in accounts OR OIDC mode", () => {
@@ -154,6 +173,57 @@ describe("settingsNavGroups", () => {
 });
 
 describe("SettingsSidebarBody", () => {
+  it.each([
+    { customAgents: false, harnessesOffered: true },
+    { customAgents: false, harnessesOffered: false },
+    { customAgents: true, harnessesOffered: true },
+    { customAgents: true, harnessesOffered: false },
+  ])(
+    "lists Harnesses only while the deployment offers one: %o",
+    ({ customAgents, harnessesOffered }) => {
+      mocks.agentInstall = customAgents;
+      renderBody({ harnessesOffered });
+      expect(!!screen.queryByTestId("settings-nav-harnesses")).toBe(harnessesOffered);
+      expect(!!screen.queryByTestId("settings-nav-custom-agents")).toBe(customAgents);
+    },
+  );
+
+  it.each([
+    [true, true, false, true],
+    [true, false, false, false],
+    [false, true, false, false],
+    [false, true, true, true],
+    [false, false, true, false],
+  ])(
+    "gates Admin General by admin=%s, nested agents=%s, single user=%s",
+    (isAdmin, enabled, singleUser, visible) => {
+      mocks.isAdmin = isAdmin;
+      mocks.nestedAgents = enabled;
+      mocks.singleUser = singleUser;
+      renderBody();
+      const entry = screen.queryByTestId("settings-nav-admin");
+      expect(entry !== null).toBe(visible);
+      if (entry) expect(entry).toHaveAttribute("href", "/settings/admin");
+    },
+  );
+
+  it.each([
+    { connections: [], mcp: false, integrations: false },
+    { connections: ["mcp"], mcp: true, integrations: false },
+    { connections: ["github", "mcp"], mcp: true, integrations: true },
+    { connections: ["github"], mcp: false, integrations: true },
+  ])(
+    "separates MCP navigation from sandbox accounts: $connections",
+    ({ connections, mcp, integrations }) => {
+      mocks.enabledConnections = connections;
+      renderBody();
+      expect(!!screen.queryByTestId("settings-nav-mcp")).toBe(mcp);
+      expect(!!screen.queryByTestId("settings-nav-integrations")).toBe(integrations);
+      if (mcp)
+        expect(screen.getByTestId("settings-nav-mcp")).toHaveAttribute("href", "/settings/mcp");
+    },
+  );
+
   it("renders Back as a standard sidebar row without a collapse button", () => {
     renderBody();
     const backLink = screen.getByRole("link", { name: "Back" });
@@ -320,12 +390,13 @@ describe("SettingsSidebarBody", () => {
 });
 
 describe("useSettingsRoute", () => {
-  function routeHook(path: string) {
-    const w = ({ children }: { children: ReactNode }) => (
-      <MemoryRouter initialEntries={[path]}>{children}</MemoryRouter>
-    );
-    return renderHook(() => useSettingsRoute(), { wrapper: w }).result.current;
-  }
+  it.each([false, true])("gates the admin general route on nesting=%s", (enabled) => {
+    mocks.nestedAgents = enabled;
+    expect(routeHook("/settings/admin")).toEqual({
+      inSettings: true,
+      section: enabled ? "admin" : "general",
+    });
+  });
 
   it("treats /settings/members and /settings/policies as in-settings sections on an accounts deploy", () => {
     // The core of the fix: Members / Policies now live UNDER /settings, so the
@@ -398,38 +469,12 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/inbox").inSettings).toBe(false);
   });
 
-  it("parses the customize sub-section and defaults a bare/unknown one to the first", () => {
-    expect(routeHook("/settings/customize/harnesses")).toEqual({
+  it("parses the harness details segment of the harnesses section", () => {
+    expect(routeHook("/settings/harnesses")).toEqual({ inSettings: true, section: "harnesses" });
+    expect(routeHook("/settings/harnesses/claude-native")).toEqual({
       inSettings: true,
-      section: "customize",
-      subSection: "harnesses",
-    });
-    expect(routeHook("/settings/customize/skills")).toEqual({
-      inSettings: true,
-      section: "customize",
-      subSection: "skills",
-    });
-    // Bare or unknown sub-section falls back to the first sub-section.
-    expect(routeHook("/settings/customize")).toEqual({
-      inSettings: true,
-      section: "customize",
-      subSection: "harnesses",
-    });
-    expect(routeHook("/settings/customize/nope")).toEqual({
-      inSettings: true,
-      section: "customize",
-      subSection: "harnesses",
-    });
-  });
-
-  it("falls back to General for a customize deep link when the feature is disabled", () => {
-    mocks.customizeEnabled = false;
-    // Disabled (the default deploy) → the section resolves to General instead
-    // of an empty customize page, and no subSection is set.
-    expect(routeHook("/settings/customize")).toEqual({ inSettings: true, section: "general" });
-    expect(routeHook("/settings/customize/skills")).toEqual({
-      inSettings: true,
-      section: "general",
+      section: "harnesses",
+      harness: "claude-native",
     });
   });
 
@@ -445,6 +490,79 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/ml/omnigent-embed/settings/members")).toEqual({
       inSettings: true,
       section: "members",
+    });
+  });
+});
+
+function routeHook(path: string) {
+  const w = ({ children }: { children: ReactNode }) => (
+    <MemoryRouter initialEntries={[path]}>{children}</MemoryRouter>
+  );
+  return renderHook(() => useSettingsRoute(), { wrapper: w }).result.current;
+}
+
+describe("custom agent settings availability", () => {
+  it.each(["agent/space %2F?#é", "a%percent", "simple-id"])(
+    "decodes the agent ID once: %s",
+    (agentId) => {
+      mocks.agentInstall = true;
+      expect(
+        routeHook(`/ml/omnigent-embed/settings/custom-agents/${encodeURIComponent(agentId)}`),
+      ).toEqual({
+        inSettings: true,
+        section: "custom-agents",
+        agentId,
+      });
+    },
+  );
+
+  it("falls back to the agent list for malformed URL escapes", () => {
+    mocks.agentInstall = true;
+    expect(routeHook("/settings/custom-agents/%E0%A4%A")).toEqual({
+      inSettings: true,
+      section: "custom-agents",
+    });
+  });
+
+  it.each([false, true])("gates nav and direct routes with API=%s", (api) => {
+    mocks.agentInstall = api;
+    renderBody();
+    const enabled = api;
+    expect(!!screen.queryByTestId("settings-nav-custom-agents")).toBe(enabled);
+    expect(!!screen.queryByRole("heading", { name: "Customize" })).toBe(enabled);
+    const group = screen.getByRole("heading", { name: enabled ? "Customize" : "General" });
+    expect(group.parentElement).toContainElement(screen.getByTestId("settings-nav-harnesses"));
+    if (enabled) {
+      expect(group.parentElement).toContainElement(
+        screen.getByTestId("settings-nav-custom-agents"),
+      );
+    }
+    for (const suffix of ["", "/new", "/agent-1"]) {
+      expect(routeHook(`/settings/custom-agents${suffix}`).section).toBe(
+        api ? "custom-agents" : "general",
+      );
+    }
+  });
+
+  it("groups Harnesses and Custom agents under Customize and parses embedded detail routes", () => {
+    mocks.agentInstall = true;
+    const groups = settingsNavGroups(false, true, false, false, false, true);
+    expect(groups.map((group) => group.title)).toEqual([
+      "General",
+      "Customize",
+      "Desktop",
+      "Archived",
+    ]);
+    expect(
+      groups.find((group) => group.title === "Customize")?.items.map((item) => item.id),
+    ).toEqual(["harnesses", "custom-agents"]);
+    expect(
+      groups.flatMap((group) => group.items).filter((item) => item.id === "harnesses"),
+    ).toHaveLength(1);
+    expect(routeHook("/ml/omnigent-embed/settings/custom-agents/agent-1")).toEqual({
+      inSettings: true,
+      section: "custom-agents",
+      agentId: "agent-1",
     });
   });
 });
