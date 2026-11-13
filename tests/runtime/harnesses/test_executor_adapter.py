@@ -415,25 +415,34 @@ async def test_executor_error_terminates_with_response_failed(
 
 
 @pytest.mark.parametrize(
-    ("policy", "message", "error_code"),
+    ("policy", "message", "error_code", "preparation_harness"),
     [
         (
             "{not-json",
             "HARNESS_ANTIGRAVITY_OS_ENV must contain a valid OS environment policy",
             "ValueError",
+            None,
         ),
         (
             '{"sandbox": {"type": "linux_bwrap"}}',
             "The selected harness cannot enforce os_env.sandbox",
             "UnsupportedHarnessSandboxError",
+            None,
         ),
         (
             '{"sandbox": {"type": "linux_bwrap"}}',
             "The requested sandbox could not be prepared.",
             "HarnessSandboxPreparationError",
+            "claude-sdk",
+        ),
+        (
+            '{"sandbox": {"type": "linux_bwrap"}}',
+            "The requested sandbox could not be prepared.",
+            "HarnessSandboxPreparationError",
+            "qwen",
         ),
     ],
-    ids=["invalid-policy", "unsupported-policy", "backend-error"],
+    ids=["invalid-policy", "unsupported-policy", "backend-error", "non-claude-launcher-error"],
 )
 async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry(
     monkeypatch: pytest.MonkeyPatch,
@@ -441,14 +450,19 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
     policy: str,
     message: str,
     error_code: str,
+    preparation_harness: str | None,
 ) -> None:
-    """Child-side policy rejection terminates the turn and permits a same-session retry."""
+    """Policy failures settle the turn and permit a same-session corrected retry."""
     import asyncio
-    from unittest.mock import Mock
+    import os
+    from unittest.mock import AsyncMock, Mock
 
     from omnigent.inner import antigravity_harness
     from omnigent.inner.executor import MockExecutor, TextChunk, TurnComplete
+    from omnigent.runner import create_runner_app
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from tests.runner.conftest import _drain_session_event_queue, _FakeProcessManager
+    from tests.runner.helpers import NullServerClient
 
     executor = MockExecutor()
     executor.enqueue_events(
@@ -459,7 +473,7 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
     policy_env = "HARNESS_ANTIGRAVITY_OS_ENV"
     builder = antigravity_harness._build_antigravity_executor
     private_diagnostic = "/private/host/toolchain/unfinished-scan-directory"
-    if error_code == "HarnessSandboxPreparationError":
+    if preparation_harness == "claude-sdk":
         from omnigent.inner import claude_sdk_executor
         from omnigent.inner.os_env_serialization import resolve_harness_os_env
         from omnigent.inner.sandbox import SandboxPolicy
@@ -496,6 +510,40 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
 
         builder = build_claude_with_mock_executor
 
+    elif preparation_harness == "qwen":
+        from omnigent.inner import sandbox
+        from omnigent.inner.os_env_serialization import resolve_harness_os_env
+        from omnigent.inner.qwen_executor import QwenExecutor
+
+        policy_env = "HARNESS_QWEN_OS_ENV"
+        monkeypatch.setattr(
+            sandbox,
+            "resolve_sandbox",
+            Mock(
+                return_value=sandbox.SandboxPolicy(
+                    backend_type="linux_bwrap",
+                    active=True,
+                    read_roots=[],
+                    write_roots=[],
+                    write_files=[],
+                    allow_network=True,
+                )
+            ),
+        )
+        launcher = Mock(side_effect=OSError(f"Launcher creation failed: {private_diagnostic}"))
+        monkeypatch.setattr(sandbox, "create_exec_launcher", launcher)
+
+        def build_qwen_with_scripted_recovery() -> Executor:
+            qwen = QwenExecutor(qwen_path="/test/qwen", os_env=resolve_harness_os_env(policy_env))
+            monkeypatch.setattr(qwen, "_build_spawn_env", AsyncMock(return_value={}))
+            # Exercise real startup failure; reuse scripted completion after launcher repair.
+            if launcher.side_effect is not None:
+                return qwen
+            qwen._sandbox_launch_path([])
+            return constructor()
+
+        builder = build_qwen_with_scripted_recovery
+
     monkeypatch.setenv(policy_env, policy)
     factory = Mock(wraps=builder)
     session_id = "conv_factory_policy_retry"
@@ -510,11 +558,21 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
                 transport=httpx.ASGITransport(app=app),
                 base_url="http://harness",
                 headers={"Authorization": "Bearer spawn-token"},
-            ) as client,
+            ) as harness_client,
+            contextlib.AsyncExitStack() as resources,
         ):
-            async with client.stream(
-                "POST", f"/v1/sessions/{session_id}/events", json=_start_turn_body()
-            ) as response:
+            runner = create_runner_app(
+                process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+                server_client=NullServerClient(),  # type: ignore[arg-type]
+            )
+            runner_client = await resources.enter_async_context(
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=runner), base_url="http://runner"
+                )
+            )
+            request_body = {**_start_turn_body(), "harness": "openai-agents"}
+            event_url = f"/v1/sessions/{session_id}/events?stream=true"
+            async with runner_client.stream("POST", event_url, json=request_body) as response:
                 assert response.status_code == 200
                 failed_events = [event async for event in _stream_iter(response)]
             assert [event.event for event in failed_events] == [
@@ -529,6 +587,11 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
             assert private_diagnostic not in json.dumps([event.data for event in failed_events])
             if error_code == "HarnessSandboxPreparationError":
                 assert private_diagnostic in caplog.text
+            queued = _drain_session_event_queue(runner.state.session_event_queues.get(session_id))
+            queued_failures = [event for event in queued if event["type"] == "response.failed"]
+            assert len(queued_failures) == 1
+            assert queued_failures[0]["response"]["error"] == failed["error"]
+            assert private_diagnostic not in json.dumps(queued)
             factory.assert_called_once_with()
             constructor.assert_not_called()
             assert adapter._executor is None
@@ -537,10 +600,12 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
             assert adapter._active_turn_ctx is None
             assert adapter._in_flight == {}
 
-            monkeypatch.setenv(policy_env, '{"sandbox": {"type": "none"}}')
-            async with client.stream(
-                "POST", f"/v1/sessions/{session_id}/events", json=_start_turn_body()
-            ) as response:
+            if preparation_harness == "qwen":
+                launcher.side_effect = None
+                launcher.return_value = "/test/sandbox-launcher"
+            else:
+                monkeypatch.setenv(policy_env, '{"sandbox": {"type": "none"}}')
+            async with runner_client.stream("POST", event_url, json=request_body) as response:
                 assert response.status_code == 200
                 retry_events = [event async for event in _stream_iter(response)]
             assert retry_events[0].event == "response.created"
@@ -552,6 +617,9 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
                 and event.data["delta"] == "fake retry response"
                 for event in retry_events
             )
+            if preparation_harness == "qwen":
+                assert json.loads(policy) == json.loads(os.environ[policy_env])
+                assert launcher.call_count == 2
             assert factory.call_count == 2
             constructor.assert_called_once()
             assert adapter._executor is executor

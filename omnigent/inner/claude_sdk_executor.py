@@ -110,11 +110,10 @@ from .executor import (
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
-    HarnessSandboxPreparationError,
-    HarnessSandboxValidationError,
     SandboxPolicy,
     create_exec_launcher,
     get_backend,
+    harness_sandbox_preparation,
     resolve_sandbox,
     validate_harness_sandbox,
     with_additional_read_roots,
@@ -1894,25 +1893,25 @@ def prepare_claude_cli_path(
 
     if spec is None:
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
-    resolved_cwd = _resolve_sandbox_cwd(cwd if cwd is not None else spec.cwd)
-    # Named relative roots use the runner base; "." follows the selected session cwd.
-    if (
-        spec.cwd
-        and pathlib.Path(spec.cwd) != pathlib.Path(".")
-        and not pathlib.Path(spec.cwd).is_absolute()
-        and resolved_cwd == _resolve_sandbox_cwd(None)
-    ):
-        resolved_cwd = _resolve_sandbox_cwd(spec.cwd)
-    validate_harness_sandbox(spec, "Claude SDK", cwd=resolved_cwd if cwd is not None else None)
-    sandbox_spec = spec.sandbox or OSEnvSandboxSpec()
-    if sandbox_spec.type == "none":
-        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
-    if real_cli_path is None:
-        raise OSError("Claude SDK requires a CLI path to apply the requested sandbox")
-    if _sandbox_disabled_by_env():
-        raise OSError("OMNIGENT_CLAUDE_SDK_NO_SANDBOX conflicts with the requested sandbox")
+    with harness_sandbox_preparation():
+        resolved_cwd = _resolve_sandbox_cwd(cwd if cwd is not None else spec.cwd)
+        # Named relative roots use the runner base; "." follows the selected session cwd.
+        if (
+            spec.cwd
+            and pathlib.Path(spec.cwd) != pathlib.Path(".")
+            and not pathlib.Path(spec.cwd).is_absolute()
+            and resolved_cwd == _resolve_sandbox_cwd(None)
+        ):
+            resolved_cwd = _resolve_sandbox_cwd(spec.cwd)
+        validate_harness_sandbox(spec, "Claude SDK", cwd=resolved_cwd if cwd is not None else None)
+        sandbox_spec = spec.sandbox or OSEnvSandboxSpec()
+        if sandbox_spec.type == "none":
+            return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
+        if real_cli_path is None:
+            raise OSError("Claude SDK requires a CLI path to apply the requested sandbox")
+        if _sandbox_disabled_by_env():
+            raise OSError("OMNIGENT_CLAUDE_SDK_NO_SANDBOX conflicts with the requested sandbox")
 
-    try:
         sandbox = resolve_sandbox(spec, resolved_cwd)
         if not sandbox.active:
             raise OSError("Claude SDK requires an active sandbox for the requested policy")
@@ -1934,10 +1933,6 @@ def prepare_claude_cli_path(
             sandbox=sandbox,
             cwd=str(resolved_cwd),
         )
-    except HarnessSandboxValidationError:
-        raise
-    except Exception as exc:
-        raise HarnessSandboxPreparationError(str(exc)) from exc
 
 
 def prepare_tight_cli_process(
@@ -2582,24 +2577,19 @@ class ClaudeSDKExecutor(Executor):
         if self._cli_sandbox is None or self._real_cli_path is None:
             return relay, None
         try:
-            launcher = create_exec_launcher(
-                self._real_cli_path,
-                _client_cli_sandbox(
-                    self._cli_sandbox,
-                    managed_config_dirs=_claude_managed_config_dirs(),
-                    bridge_dir=relay.bridge_dir if relay is not None else None,
-                    socket_dir=relay.socket_dir if relay is not None else None,
-                ),
-                cwd=self._cli_sandbox_cwd,
-            )
-        except BaseException as exc:
+            with harness_sandbox_preparation():
+                launcher = create_exec_launcher(
+                    self._real_cli_path,
+                    _client_cli_sandbox(
+                        self._cli_sandbox,
+                        managed_config_dirs=_claude_managed_config_dirs(),
+                        bridge_dir=relay.bridge_dir if relay is not None else None,
+                        socket_dir=relay.socket_dir if relay is not None else None,
+                    ),
+                    cwd=self._cli_sandbox_cwd,
+                )
+        except BaseException:
             _release_client_cli(relay, None)
-            if (
-                self._os_env_spec is not None
-                and isinstance(exc, Exception)
-                and not isinstance(exc, HarnessSandboxValidationError)
-            ):
-                raise HarnessSandboxPreparationError(str(exc)) from exc
             raise
         options.cli_path = launcher
         return relay, launcher

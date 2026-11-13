@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import dataclasses
@@ -19,9 +20,12 @@ import pytest
 
 from omnigent.inner.sandbox import (
     HOST_SANDBOX_BACKEND_ENV,
+    HarnessSandboxPreparationError,
+    HarnessSandboxValidationError,
     SandboxPolicy,
     _launcher_inline_source,
     create_exec_launcher,
+    harness_sandbox_preparation,
     run_launcher,
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
@@ -810,3 +814,28 @@ def test_harness_policy_validation_rejects_unenforceable_network_or_backend(feat
         policy.type = feature
     with pytest.raises(ValueError, match=r"does not support|cannot enforce"):
         validate_harness_sandbox(OSEnvSpec(sandbox=policy), "Example")
+
+
+@pytest.mark.parametrize(
+    "failure,preserved",
+    [
+        (OSError("private sandbox diagnostic"), False),
+        (NotImplementedError("backend unavailable"), False),
+        (RuntimeError("launcher unavailable"), False),
+        (HarnessSandboxValidationError("unsupported policy", reason="fork"), True),
+        (HarnessSandboxPreparationError("already classified"), True),
+        (asyncio.CancelledError(), True),
+    ],
+)
+def test_harness_sandbox_preparation_preserves_error_boundaries(
+    failure: BaseException, preserved: bool
+) -> None:
+    with pytest.raises(type(failure) if preserved else HarnessSandboxPreparationError) as raised:
+        with harness_sandbox_preparation():
+            raise failure
+    if preserved:
+        assert raised.value is failure
+    else:
+        assert raised.value.__cause__ is failure
+        assert str(raised.value) == str(failure)
+        assert str(failure) not in raised.value.client_message

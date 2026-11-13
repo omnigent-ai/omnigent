@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 from abc import ABC, abstractmethod
-from collections.abc import MutableMapping, Sequence
+from collections.abc import Iterator, MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import ClassVar, Protocol, cast
@@ -572,6 +573,17 @@ class HarnessSandboxPreparationError(OSError):
         "The requested sandbox could not be prepared. "
         "Check the host sandbox configuration and retry."
     )
+
+
+@contextlib.contextmanager
+def harness_sandbox_preparation() -> Iterator[None]:
+    """Keep sandbox setup diagnostics in logs without reclassifying policy or cancellation."""
+    try:
+        yield
+    except (HarnessSandboxValidationError, HarnessSandboxPreparationError):
+        raise
+    except Exception as exc:
+        raise HarnessSandboxPreparationError(str(exc)) from exc
 
 
 def validate_harness_sandbox(
