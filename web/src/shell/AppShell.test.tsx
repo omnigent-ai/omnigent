@@ -4204,6 +4204,7 @@ describe("Right workspace card visibility", () => {
   });
 
   it("restores Browser after closing a file and retains the file when its background browser closes", async () => {
+    stubMatchMedia({ width: 1280 });
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       browserOpenOrNavigate: vi.fn(),
@@ -4754,10 +4755,12 @@ describe("AppShell fullscreen file links", () => {
   });
 
   it("clears fullscreen and viewer parameters when the linked file is closed", () => {
+    // At a desktop width the sidebar starts open, which the fullscreen link hides.
+    stubMatchMedia({ width: 1280 });
     renderShell("/c/conv_abc", undefined, {
       sessionNavTo: "/c/conv_abc?file=AGENTS.md&fullscreen=1&diff=1&comment=c1&view=chat",
     });
-    fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     fireEvent.click(screen.getByTestId("nav-session"));
     fireEvent.click(
       within(screen.getByTestId("file-viewer-inline")).getByRole("button", {
