@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
@@ -1325,6 +1326,14 @@ describe("CodeViewer data-file routing", () => {
         else Reflect.deleteProperty(target, name);
       }
     }
+  });
+
+  it("opens an Excel workbook on its table even in source mode", async () => {
+    const workbook = readFileSync("src/shell/__fixtures__/sales.xlsx").toString("base64");
+    renderViewer(workbook, true, "sales.xlsx", { viewMode: "source", encoding: "base64" });
+    expect(await screen.findByRole("tab", { name: "Sales" })).toBeDefined();
+    expect(screen.queryByText(/Preview not available/)).toBeNull();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
   });
 
   it("shows the shared truncation banner for a partial file", () => {

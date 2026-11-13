@@ -2747,6 +2747,16 @@ describe("FileViewer 3D model files", () => {
     expect(viewModeOf()).toBe("source");
   });
 
+  it.each(["sales.xlsx", "events.parquet"])(
+    "opens %s on its table, with no source toggle, even from a line link",
+    (path) => {
+      renderViewer({ open: true, path, position: { line: 3 } });
+      expect(viewModeOf()).toBe("preview");
+      expect(screen.queryByRole("button", { name: "View source" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "View preview" })).toBeNull();
+    },
+  );
+
   it("suppresses the diff toggle for a model file even when it is a changed file", () => {
     // Report the model as a changed file — an ordinary changed file would get a
     // "Show diff" button; a model must not.

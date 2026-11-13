@@ -1,4 +1,5 @@
-// Parsing for the read-only table preview of delimited data files (.csv, .tsv).
+// Parsing for the read-only table preview of data files: delimited text
+// (.csv, .tsv) here, Excel and Parquet in xlsx.ts and parquet.ts.
 
 /** Rows the preview keeps; the rest are only counted. */
 export const DATA_TABLE_MAX_ROWS = 1000;
@@ -10,6 +11,14 @@ export const DATA_TABLE_MAX_COLUMNS = 500;
 export const DATA_TABLE_MAX_CELLS = 200_000;
 
 const DELIMITED_EXTENSIONS = new Set(["csv", "tsv"]);
+/** Binary formats read in the browser; they always open on the table. */
+const SPREADSHEET_EXTENSIONS = new Set(["xlsx", "parquet"]);
+const DELIMITER_LABELS: Record<string, string> = {
+  ",": "comma-separated",
+  ";": "semicolon-separated",
+  "\t": "tab-separated",
+  "|": "pipe-separated",
+};
 const CANDIDATE_DELIMITERS = [",", ";", "\t", "|"] as const;
 const SNIFF_RECORDS = 20;
 
@@ -23,16 +32,32 @@ export interface DataTable {
   /** Fields in the content's widest row, kept or not. */
   totalColumns: number;
   columnTypes: DataColumnType[];
-  delimiter: string;
-  /** How the bytes were decoded, e.g. "utf-8" or "windows-1252". */
-  encoding: string;
+  /** Where the table came from, e.g. "comma-separated · windows-1252" or "Parquet". */
+  description: string;
 }
 
-/** Whether *path* opens in the table preview. */
-export function isDataTablePath(path: string): boolean {
+function extensionOf(path: string): string | null {
   const name = path.split("/").pop() ?? "";
   const dot = name.lastIndexOf(".");
-  return dot > 0 && DELIMITED_EXTENSIONS.has(name.slice(dot + 1).toLowerCase());
+  return dot > 0 ? name.slice(dot + 1).toLowerCase() : null;
+}
+
+/** Whether *path* is delimited text that opens in the table preview, with a source view. */
+export function isDataTablePath(path: string): boolean {
+  return DELIMITED_EXTENSIONS.has(extensionOf(path) ?? "");
+}
+
+/** Whether *path* is an Excel workbook or Parquet file, which open only as a table. */
+export function isSpreadsheetPath(path: string): boolean {
+  return SPREADSHEET_EXTENSIONS.has(extensionOf(path) ?? "");
+}
+
+/** The bytes of base64 *content*, as the server sends a binary file. */
+export function decodeBase64(content: string): Uint8Array {
+  const binary = atob(content);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
 /**
@@ -51,9 +76,7 @@ export function decodeDataFile(
   encoding: "utf-8" | "base64",
 ): { text: string; encoding: string } {
   if (encoding !== "base64") return { text: stripBom(content), encoding: "utf-8" };
-  const binary = atob(content);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  const bytes = decodeBase64(content);
   if (bytes[0] === 0xff && bytes[1] === 0xfe) {
     return { text: new TextDecoder("utf-16le").decode(bytes.subarray(2)), encoding: "utf-16le" };
   }
@@ -294,14 +317,60 @@ export function compareCells(a: string, b: string, type: DataColumnType): number
 }
 
 /**
- * Parse a delimited file for the table preview.
+ * Build the preview table from records whose first is the header.
  *
- * The first record is the header. Short rows are padded and long ones keep
- * their extra cells under generated column names.
+ * Keeps at most ``DATA_TABLE_MAX_COLUMNS`` columns and as many rows as fit in
+ * ``DATA_TABLE_MAX_CELLS``, since padding fills every row to the widest one.
+ * Short rows are padded and long ones keep their extra cells under generated
+ * column names.
+ *
+ * @param records - The header, then at most ``DATA_TABLE_MAX_ROWS`` data rows.
+ * @param totalRows - Data rows in the file, kept or not.
+ * @param totalColumns - Fields in the file's widest row, kept or not.
+ * @param description - Where the table came from, e.g. ``"Parquet"``.
+ * @returns The table, or ``null`` when there is no header row.
+ */
+export function tableFromRecords(
+  records: string[][],
+  totalRows: number,
+  totalColumns: number,
+  description: string,
+): DataTable | null {
+  if (records.length === 0) return null;
+  const [header, ...parsedRows] = records;
+  const width = Math.min(
+    DATA_TABLE_MAX_COLUMNS,
+    Math.max(header.length, ...parsedRows.map((row) => row.length)),
+  );
+  const rows = parsedRows.slice(0, Math.max(1, Math.floor(DATA_TABLE_MAX_CELLS / width) - 1));
+  const columns = Array.from(
+    { length: width },
+    (_, index) => header[index] ?? `column ${index + 1}`,
+  );
+  const padded = rows.map((row) =>
+    row.length === width
+      ? row
+      : row.length > width
+        ? row.slice(0, width)
+        : [...row, ...Array<string>(width - row.length).fill("")],
+  );
+  return {
+    header: columns,
+    rows: padded,
+    totalRows,
+    totalColumns: Math.max(totalColumns, width),
+    columnTypes: columns.map((_, index) => inferColumnType(padded.map((row) => row[index]))),
+    description,
+  };
+}
+
+/**
+ * Parse a delimited file for the table preview.
  *
  * @param text - The decoded file text.
  * @param path - The file's path, which picks the delimiter for ``.tsv``.
- * @param encoding - How *text* was decoded, reported back unchanged.
+ * @param encoding - How *text* was decoded, e.g. ``"windows-1252"``; named
+ *   in the description when it isn't UTF-8.
  * @returns The table, or ``null`` when the file has no header row.
  */
 export function parseDataTable(text: string, path: string, encoding = "utf-8"): DataTable | null {
@@ -311,25 +380,8 @@ export function parseDataTable(text: string, path: string, encoding = "utf-8"): 
     keepChars: DATA_TABLE_MAX_CHARS,
     keepFields: DATA_TABLE_MAX_COLUMNS,
   });
-  if (records.length === 0) return null;
-  const [header, ...parsedRows] = records;
-  const width = Math.max(header.length, ...parsedRows.map((row) => row.length));
-  // Padding fills every kept row to the widest one, so wide tables keep fewer rows.
-  const rows = parsedRows.slice(0, Math.max(1, Math.floor(DATA_TABLE_MAX_CELLS / width) - 1));
-  const columns = Array.from(
-    { length: width },
-    (_, index) => header[index] ?? `column ${index + 1}`,
-  );
-  const padded = rows.map((row) =>
-    row.length === width ? row : [...row, ...Array<string>(width - row.length).fill("")],
-  );
-  return {
-    header: columns,
-    rows: padded,
-    totalRows: count - 1,
-    totalColumns: widest,
-    columnTypes: columns.map((_, index) => inferColumnType(padded.map((row) => row[index]))),
-    delimiter,
-    encoding,
-  };
+  const description = [DELIMITER_LABELS[delimiter], encoding === "utf-8" ? null : encoding]
+    .filter(Boolean)
+    .join(" · ");
+  return tableFromRecords(records, count - 1, widest, description);
 }

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+from pathlib import Path
+
 from playwright.sync_api import Locator, Page, expect
 
 from tests.browser_ui.files.test_file_line_navigation import (
@@ -39,6 +42,29 @@ def _open_table(page: Page, session: BrowserSession, width: int, height: int) ->
     table = page.get_by_role("table", name=_FILE_PATH)
     expect(table).to_be_visible(timeout=30_000)
     return table
+
+
+_FIXTURES = Path(__file__).parents[3] / "web" / "src" / "shell" / "__fixtures__"
+
+
+def _serve_binary_file(page: Page, session: BrowserSession, path: str, data: bytes) -> None:
+    """Serve *path* as the runner sends a binary workspace file: base64."""
+    _mock_markdown_files(page, session, {path: ""})
+    base_url, session_id = session
+    environment_url = f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
+    session.contract.route(
+        f"{environment_url}/filesystem/{path}",
+        lambda route: route.fulfill(
+            json={
+                "object": "session.environment.filesystem.file_content",
+                "path": path,
+                "content": base64.b64encode(data).decode(),
+                "encoding": "base64",
+                "content_type": None,
+                "bytes": len(data),
+            }
+        ),
+    )
 
 
 def _scroller(table: Locator) -> Locator:
@@ -89,3 +115,33 @@ def test_a_wide_csv_scrolls_sideways_at_phone_width(
     assert page.evaluate("() => document.documentElement.scrollWidth <= window.innerWidth"), (
         "the page itself scrolls sideways"
     )
+
+
+def test_a_workbook_opens_a_tab_per_sheet_and_parquet_as_a_table(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """Excel and Parquet files are read in the browser and shown on the table, never as binary."""
+    base_url, session_id = seeded_session
+    _serve_binary_file(
+        page, seeded_session, "src/sales.xlsx", (_FIXTURES / "sales.xlsx").read_bytes()
+    )
+    page.set_viewport_size({"width": 1500, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}?file=src/sales.xlsx")
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(viewer.get_by_role("tab")).to_have_text(["Sales", "Notes", "Empty"], timeout=30_000)
+    expect(viewer.get_by_role("cell", name="2026-01-15 09:30:00")).to_be_visible()
+    viewer.get_by_role("tab", name="Notes").click()
+    expect(viewer.get_by_role("cell", name="café, crème")).to_be_visible()
+    expect(viewer.get_by_role("button", name="View source")).to_have_count(0)
+
+    _serve_binary_file(
+        page,
+        seeded_session,
+        "src/sales.parquet",
+        (_FIXTURES / "sales.snappy.parquet").read_bytes(),
+    )
+    page.goto(f"{base_url}/c/{session_id}?file=src/sales.parquet")
+    expect(viewer.get_by_test_id("data-table-summary")).to_contain_text(
+        "3 rows · 7 columns · Parquet", timeout=30_000
+    )
+    expect(viewer.get_by_text("Preview not available")).to_have_count(0)
