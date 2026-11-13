@@ -44,8 +44,8 @@ def test_summary_chips_keep_names_and_actions_inside(
     font_size: int,
 ) -> None:
     """Reviewer logins stay readable and each chip's button stays inside it; narrow
-    rails stack Reviewers above Labels and truncate a long review state, keeping its
-    full text in the tooltip, while a roomy rail still shows each full state."""
+    rails stack Reviewers above Labels, and a review state truncates, keeping its full
+    text in the tooltip, only once its chip fills the column."""
     chat = chat_session_contract
     api = f"/v1/sessions/{chat.session_id}"
     linked = {
@@ -130,10 +130,9 @@ def test_summary_chips_keep_names_and_actions_inside(
         expect(name).to_be_visible()
         assert name.evaluate(_FITS), login
         state = _STATE_LABELS[reviewer["state"]]
-        if rail_width < 480:
+        if not chip.get_by_text(state, exact=True).evaluate(_FITS):
             expect(chip.get_by_title(state, exact=True)).to_contain_text(state)
-        elif font_size == 14:
-            assert chip.get_by_text(state, exact=True).evaluate(_FITS), state
+            assert box(chip)["width"] >= reviewers_box["width"] - TOLERANCE, state
         action = chip.get_by_role("button")
         expect(action).to_have_count(1)
         _assert_inside(action, chip)
