@@ -22,6 +22,8 @@ CSV and TSV files open as a read-only table in the file viewer instead of as hig
 
 ## Driving it with the repro environment
 
+Preconditions: install this checkout's web dependencies. Component checks need nothing else; the browser test also needs a build of this checkout and its Playwright Chromium, and runs against a sealed mock backend, so no server is started.
+
 - Component checks cover parsing, delimiter and encoding detection, type inference, bounds, sorting, filtering, copying and routing: `pnpm --filter web test src/shell/dataTable.test.ts src/shell/DataTablePreview.test.tsx src/shell/CodeViewer.test.tsx src/shell/FileViewer.test.tsx`.
 - Human check: with a runner online, ask the agent to write a CSV of a few thousand rows to the workspace, including a quoted field with a comma and a blank cell. Open it from Files and from the agent's file link. Sort a number column both ways, filter a text column, copy a cell and a row, switch to Source and back, and download it. Repeat with a semicolon-separated export and a Latin-1 file containing `é`.
 
