@@ -25,7 +25,7 @@ describe("taskActionMessage", () => {
 
   it("tells the agent it may go ahead with a task waiting for the user", () => {
     expect(taskActionMessage("proceed", "Approve the deploy")).toBe(
-      `It's fine to continue the task "Approve the deploy". Go ahead with it, then go on with the rest of the plan.`,
+      `It's fine to continue the task "Approve the deploy". Mark it started and go ahead with it (or mark it done if its work is already done), then go on with the rest of the plan.`,
     );
   });
 });

@@ -6816,7 +6816,7 @@ describe("Composer workflow entry point", () => {
     );
     taskAction("proceed", "Approve the deploy");
     expect(onSend).toHaveBeenLastCalledWith(
-      `It's fine to continue the task "Approve the deploy". Go ahead with it, then go on with the rest of the plan.`,
+      `It's fine to continue the task "Approve the deploy". Mark it started and go ahead with it (or mark it done if its work is already done), then go on with the rest of the plan.`,
     );
 
     rerender(

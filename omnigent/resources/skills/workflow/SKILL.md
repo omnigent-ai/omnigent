@@ -138,8 +138,11 @@ When the user asks to review the plan before the work starts:
   in one call, each question with your options and your recommendation. It
   marks the step `needs_input`, puts the questions in the user's Inbox, and
   waits for the answer. Use it, not your own question tool (such as
-  AskUserQuestion or request_user_input). Write `started` when you resume the
-  step after the answer.
+  AskUserQuestion or request_user_input).
+- When the user answers a step that waits for them, in the Inbox, in the chat
+  or with **Continue** in the Tasks tab, write `started` on it before you work
+  on it again, or `done` if its work is already done, for example by another
+  step. Don't leave a step you acted on waiting for the user.
 - If the user asks you to stop and wait for them, write `needs_input` on every
   ready step, with text like "Paused at your request", then ask once whether
   to go on, with `sys_workflow_request_input` on the next of them.

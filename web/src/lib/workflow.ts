@@ -77,7 +77,7 @@ export type TaskAction = "run" | "continue" | "proceed";
  */
 export function taskActionMessage(action: TaskAction, taskName: string): string {
   if (action === "proceed") {
-    return `It's fine to continue the task "${taskName}". Go ahead with it, then go on with the rest of the plan.`;
+    return `It's fine to continue the task "${taskName}". Mark it started and go ahead with it (or mark it done if its work is already done), then go on with the rest of the plan.`;
   }
   const verb = action === "run" ? "Run" : "Continue";
   return `${verb} the task "${taskName}", then go on with the rest of the plan.`;
