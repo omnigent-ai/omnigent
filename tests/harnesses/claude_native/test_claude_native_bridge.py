@@ -5039,6 +5039,7 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
                 "enabledPlugins": {"extra@market": False},
                 "skillOverrides": {"custom-skill": "off", "auto-mode-setup": "on"},
                 "permissions": {"allow": ["Read(first.txt)"], "deny": ["Bash(blocked)"]},
+                "deniedMcpServers": [{"serverName": "first-denial"}],
                 "cleanupPeriodDays": 21,
             }
         ),
@@ -5053,6 +5054,7 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
         "env": {"SEAT_KEY": "seat-2", "B": "2"},
         "hooks": {"UserPromptSubmit": [later_hook]},
         "permissions": {"allow": ["Read(first.txt)", "Read(second.txt)"]},
+        "deniedMcpServers": [{"serverName": "later-denial"}],
         "enabledPlugins": {"other@market": False},
         "cleanupPeriodDays": 42,
     }
@@ -5081,23 +5083,13 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
     assert settings["skillOverrides"] == {"custom-skill": "off", "auto-mode-setup": "off"}
     assert settings["permissions"]["allow"][:2] == ["Read(first.txt)", "Read(second.txt)"]
     assert settings["permissions"]["deny"] == ["Bash(blocked)"]
+    assert settings["deniedMcpServers"] == [{"serverName": "later-denial"}]
     assert settings["hooks"]["UserPromptSubmit"][0] == caller_hook
     assert settings["hooks"]["UserPromptSubmit"][1] == later_hook
     assert settings["hooks"]["UserPromptSubmit"][2:] == baseline["hooks"]["UserPromptSubmit"]
     assert settings["statusLine"]["command"] == claude_native_bridge._status_line_command(
         bridge_dir, "cat"
     )
-    payload = '{"model":{"id":"example-model"},"context_window":{"context_window_size":123}}'
-    result = subprocess.run(
-        ["/bin/sh", "-c", settings["statusLine"]["command"]],
-        input=payload,
-        text=True,
-        capture_output=True,
-        check=True,
-        timeout=5,
-    )
-    assert result.stdout == payload
-    assert (bridge_dir / claude_native_bridge.CONTEXT_RAW_FILE).read_text() == payload
     for event, entries in baseline["hooks"].items():
         assert all(entry in settings["hooks"][event] for entry in entries)
 
@@ -15635,8 +15627,14 @@ def test_message_display_shell_command_round_trips(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("caller_settings", [False, True], ids=["global", "caller"])
+@pytest.mark.parametrize(
+    "suffix",
+    ["", " # caller status", "\ncat <<'STATUS_EOF'\ncaller status\nSTATUS_EOF"],
+    ids=["simple", "trailing-comment", "heredoc"],
+)
 def test_statusline_shell_command_captures_and_chains(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caller_settings: bool, suffix: str
 ) -> None:
     """The statusLine shim captures raw stdin atomically and chains the user command.
 
@@ -15647,11 +15645,17 @@ def test_statusline_shell_command_captures_and_chains(
     from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE, sync_raw_status_context
 
     chain_out = tmp_path / "chain_out.json"
+    chain_command = f"tee {shlex.quote(str(chain_out))}{suffix}"
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.read_user_status_line_command",
-        lambda: f"cat > {chain_out}",
+        lambda: None if caller_settings else chain_command,
     )
-    args = augment_claude_args((), bridge_dir=tmp_path)
+    caller_args = (
+        ("--settings", json.dumps({"statusLine": {"type": "command", "command": chain_command}}))
+        if caller_settings
+        else ()
+    )
+    args = augment_claude_args(caller_args, bridge_dir=tmp_path)
     settings = _load_invocation_settings(args)
     command = settings["statusLine"]["command"]
     assert "python" not in command, f"statusLine path must not spawn python: {command}"
@@ -15666,6 +15670,7 @@ def test_statusline_shell_command_captures_and_chains(
         ["/bin/sh", "-c", command], input=payload, capture_output=True, text=True
     )
     assert result.returncode == 0, result.stderr
+    assert result.stdout == payload + ("caller status\n" if "<<" in suffix else "")
     assert (tmp_path / CONTEXT_RAW_FILE).read_text("utf-8") == payload
     assert chain_out.read_text("utf-8") == payload
 

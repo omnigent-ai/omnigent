@@ -3046,7 +3046,7 @@ def _status_line_command(bridge_dir: Path, chain_command: str | None) -> str:
         f" && mv -f {raw_quoted}.$$.tmp {raw_quoted}"
     )
     if chain_command is not None:
-        command += f"; printf '%s' \"$p\" | ( {chain_command} )"
+        command += f"; printf '%s' \"$p\" | (\n{chain_command}\n)"
     return command
 
 
@@ -3439,6 +3439,7 @@ def _merge_caller_settings(
     key Omnigent does not set is taken from the caller. Later caller values win
     before Omnigent's own values take precedence. Options that would disable
     the required bridge hooks are rejected.
+    Caller MCP-denial lists use the last caller value; saved denials append later.
 
     :param settings: Omnigent's invocation settings.
     :param callers: Parsed caller settings, in flag order.
