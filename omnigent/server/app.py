@@ -271,6 +271,7 @@ class ServerInfoResponse(BaseModel):
     databricks_features: bool
     managed_sandboxes_enabled: bool
     durable_initial_input: bool = False
+    pending_child_spawn_v1: bool = False
     sandbox_provider: str | None
     sandbox_providers: list[str]
     # UI-relevant capability flags per launchable provider, e.g.
@@ -2424,6 +2425,8 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         session_pull_requests.install_refresher(pull_request_refresher)
+        if session_spawn_recovery is not None:
+            session_spawn_recovery.start(app_inst)
         try:
             with monitor_event_loop():
                 yield
@@ -2453,6 +2456,8 @@ def create_app(
             await cancel_managed_launch_tasks(
                 drain_s=sandbox_config.shutdown_drain_s if sandbox_config is not None else 0.0
             )
+            if session_spawn_recovery is not None:
+                await session_spawn_recovery.shutdown()
             if startup_inputs is not None:
                 await startup_inputs.shutdown()
             await background_title_coordinator.shutdown()
@@ -2501,6 +2506,41 @@ def create_app(
         else None
     )
     app.state.startup_inputs = startup_inputs
+    from omnigent.server.session_spawn_activation import SessionSpawnActivator
+    from omnigent.server.session_spawns import SessionSpawnCoordinator, SessionSpawnRecovery
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    session_spawn_coordinator = None
+    session_spawn_recovery = None
+    if (
+        startup_inputs is not None
+        and isinstance(conversation_store, SqlAlchemyConversationStore)
+        and (permission_store is None or isinstance(permission_store, SqlAlchemyPermissionStore))
+        and agent_cache is not None
+        and file_store is not None
+        and artifact_store is not None
+    ):
+        session_spawn_coordinator = SessionSpawnCoordinator(
+            conversation_store,
+            startup_inputs,
+            activate=SessionSpawnActivator(
+                app,
+                conversation_store,
+                agent_store,
+                agent_cache,
+                permission_store,
+                file_store,
+                artifact_store,
+                router=runner_router,
+                projects=project_store,
+            ),
+            cleanup_blob=artifact_store.delete,
+            artifact_store=artifact_store,
+        )
+        session_spawn_recovery = SessionSpawnRecovery(session_spawn_coordinator)
+    app.state.session_spawns = session_spawn_coordinator
+    app.state.session_spawn_recovery = session_spawn_recovery
     app.state.permission_store = permission_store
     app.state.host_store = host_store
     app.state.scheduled_task_store = scheduled_task_store
@@ -3901,6 +3941,9 @@ def create_app(
                 "databricks_features": databricks_features,
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
                 "durable_initial_input": startup_inputs is not None,
+                "pending_child_spawn_v1": isinstance(
+                    app.state.session_spawns, SessionSpawnCoordinator
+                ),
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,

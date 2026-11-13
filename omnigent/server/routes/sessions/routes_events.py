@@ -1337,6 +1337,8 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        if body.type not in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE):
+            await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         native_harness = (
             await asyncio.to_thread(
                 _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
@@ -2003,6 +2005,10 @@ def register_events_routes(
             startup = getattr(request.app.state, "startup_inputs", None)
             if startup is not None:
                 await startup.cancel(session_id)
+                if await asyncio.to_thread(
+                    conversation_store.spawn_activation_pending, session_id
+                ):
+                    return {"queued": False}
         stop_codex_side_chat = (
             body.type == _STOP_SESSION_TYPE
             and _is_codex_native_subagent(conv)

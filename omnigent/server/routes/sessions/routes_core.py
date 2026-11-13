@@ -1769,7 +1769,7 @@ def register_core_routes(
                 body.sibling_source_id = sibling_source.id
                 body.project_id = sibling_source.project_id
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
-        resp, conv = await _create_session_from_existing_agent(
+        created = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
             runner_router,
@@ -1790,6 +1790,8 @@ def register_core_routes(
             ),
             created_by_labels=source.labels if source is not None else None,
         )
+        assert isinstance(created, tuple)
+        resp, conv = created
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
         # Without this, the runner doesn't know this session exists
@@ -3769,6 +3771,7 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
+        await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
         # A session shared with edit access must not let collaborators refile,
         # rename, pin or archive the owner's other sessions through agent tools.
         # Only those tools name a calling session, so other PATCHes are unaffected.

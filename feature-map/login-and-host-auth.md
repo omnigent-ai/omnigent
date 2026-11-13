@@ -65,7 +65,11 @@ be able to write resources without a separate Omnigent account.
   not renew credentials, shared-agent writes and session deletion are denied,
   forks retain their source project, child and descendant listings hide foreign
   branches behind opaque cursors, and strict mode rejects incompatible runners
-  until they are upgraded. Header/proxy
+  until they are upgraded. New named child spawns on supporting servers reserve
+  before first-input admission; failed pending attempts can be aborted, while
+  admitted or uncertain work is retained. Abandoned reservations become eligible
+  for expiry after 24 hours without extending the lifetime on retries.
+  Header/proxy
   providers decline minting without interrupting binding-token callbacks.
   Credential discovery prefers advertised scoped support; legacy custom
   providers work only when legacy issuance is advertised. A scoped selection
@@ -296,6 +300,16 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   and strict-mode negotiation. This does not run a live OIDC
   provider, every harness, or an older deployed runner. The header-mode repro
   environment cannot establish accounts/OIDC confinement.
+  Pending-child component coverage:
+  `tests/server/integration/test_sessions_subagent_context.py::test_pending_child_http_protocol`
+  runs the runner tool through the registered app routes, real capability probe,
+  isolated stores and mocked authenticated runner identity.
+  `tests/stores/test_session_spawn_store.py::test_abort_and_first_input_cannot_both_win`
+  covers admission versus explicit abort or expiry;
+  `tests/stores/test_session_spawn_store.py::test_global_pending_expiry_is_bounded_and_survives_revocation`
+  covers expiry after parent/account revocation with shared files preserved.
+  These are isolated protocol checks, not live identity-provider or vendor-runtime
+  evidence.
 - **`embedded-resource-write` (in-process app and real stores):**
   `tests/server/test_external_account_authority.py::test_custom_auth_project_routes_without_users`.
   Run with plain `uv run pytest`; it constructs `create_app` with a custom

@@ -803,8 +803,18 @@ Update this top-level README with a row in the table above.
   agent-bundle/MCP configuration writes and recursive session deletion are denied.
   Owner-uploaded agents remain reusable and readable by known ID, including their
   bundle contents, across the owner's runners; their definitions are read-only
-  to confined bearers. Failed child-spawn cleanup reports a warning if deletion
-  requires owner credentials. The owner must remove any orphaned session.
+  to confined bearers.
+- Servers advertising `pending_child_spawn_v1` reserve new named children before
+  accepting their first input. A failed spawn can abort only its exact pending
+  reservation; admitted or uncertain work is retained for reconciliation.
+  Reservations become eligible for automatic expiry 24 hours after creation,
+  including after parent or account access is revoked; retries do not renew that
+  deadline. Admission committed before expiry wins and is never expired. Cleanup
+  preserves shared files and does not stop hosts, runners or other sessions.
+  Older or unsupported servers retain the conservative fallback: uncertain child
+  sessions require owner inspection and cleanup. Generic runner deletion remains
+  denied. Payload cleanup tombstones and materialization markers are retained;
+  there is no automatic tombstone garbage collection.
 - Custom `AuthProvider`s retain their two-argument `mint_runner_token` contract
   for callers without a protocol header. Declaring `runner_token_scope` alone
   does not enable scoped issuance. Built-in accounts/OIDC custom managed-token

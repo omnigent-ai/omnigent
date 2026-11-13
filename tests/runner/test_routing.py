@@ -46,6 +46,9 @@ class _ConversationStore:
         """
         self._conversations = conversations
 
+    def require_spawn_activated(self, conversation_id: str) -> None:
+        """This in-memory fixture has no pending spawn reservations."""
+
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """
         Return a conversation by id.
@@ -59,6 +62,9 @@ class _ConversationStore:
 
 class _FailOnReadConversationStore:
     """Conversation store that rejects persistence reads."""
+
+    def require_spawn_activated(self, conversation_id: str) -> None:
+        """Allow the fixture's already-active conversation."""
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """Fail because the caller should use its preloaded conversation."""

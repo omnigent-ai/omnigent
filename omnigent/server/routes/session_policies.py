@@ -181,6 +181,7 @@ def create_session_policies_router(
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
             )
+        conversation_store.require_spawn_activated(session_id)
         _require_session_exists(session_id)
         if body.type == "python":
             # Restrict handlers to the registry allowlist.
@@ -336,6 +337,7 @@ def create_session_policies_router(
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
             )
+        conversation_store.require_spawn_activated(session_id)
         # Validate handler against the existing policy's type.
         if body.handler is not None:
             existing = store.get(policy_id, session_id)
@@ -413,6 +415,7 @@ def create_session_policies_router(
             await require_access(
                 user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
             )
+        conversation_store.require_spawn_activated(session_id)
         store.delete(policy_id, session_id)
         invalidate_session_policy_specs_cache(session_id)
         _logger.info(

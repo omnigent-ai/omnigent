@@ -17,6 +17,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import httpx
@@ -5859,6 +5860,8 @@ async def ensure_runner_connected(
         out (propagated from ``_maybe_relaunch_managed_sandbox``).
     """
 
+    await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
+
     from omnigent.server.routes import sessions as _facade
 
     async def _reread() -> Conversation:
@@ -6745,6 +6748,7 @@ async def _ensure_runner_session_initialized(
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
+    await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
     try:
         if initializer is not None:
             resp = await initializer.initialize(
@@ -8957,6 +8961,7 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
+    await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_runtime_support, conv)
     if body.type == "message":
@@ -12455,6 +12460,34 @@ async def _inherited_mcp_labels(
     return inherited
 
 
+@dataclass(frozen=True)
+class PreparedNamedChild:
+    """Validated child creation data, frozen by the pending-spawn receipt codec."""
+
+    create_arguments: dict[str, Any]
+    sandbox_profile: dict[str, Any] | None
+    selected_harness: str | None
+    request_body: dict[str, Any]
+    agent_version: int
+    agent_bundle_location: str
+    client_surface: str
+
+    def to_payload(self) -> dict[str, Any]:
+        from omnigent.server.startup_inputs import STARTUP_LABEL
+
+        arguments = dict(self.create_arguments)
+        arguments["labels"] = {**(arguments.get("labels") or {}), STARTUP_LABEL: "pending"}
+        return {
+            "arguments": arguments,
+            "request": self.request_body,
+            "sandbox_profile": self.sandbox_profile,
+            "selected_harness": self.selected_harness,
+            "agent_version": self.agent_version,
+            "agent_bundle_location": self.agent_bundle_location,
+            "client_surface": self.client_surface,
+        }
+
+
 async def _create_session_from_existing_agent(
     conversation_store: ConversationStore,
     agent_store: AgentStore,
@@ -12473,7 +12506,8 @@ async def _create_session_from_existing_agent(
     created_by_project_id: str | None = None,
     created_by_scheduled_task_id: str | None = None,
     created_by_labels: Mapping[str, str] | None = None,
-) -> tuple[SessionResponse, Conversation]:
+    _prepare_named_child: bool = False,
+) -> tuple[SessionResponse, Conversation] | PreparedNamedChild:
     """
     Create a session bound to an already-registered agent.
 
@@ -12517,6 +12551,43 @@ async def _create_session_from_existing_agent(
     from omnigent.server.routes._session_create_validation import (
         resolve_project_session_create,
     )
+
+    prepared_request = (
+        body.model_dump(mode="json", exclude_unset=True) if _prepare_named_child else {}
+    )
+    if _prepare_named_child:
+        allowed = {
+            "agent_id",
+            "parent_session_id",
+            "title",
+            "sub_agent_name",
+            "labels",
+            "harness_override",
+            "model_override",
+            "reasoning_effort",
+        }
+        if (
+            not body.parent_session_id
+            or not body.sub_agent_name
+            or not body.title
+            or agent_cache is None
+            or body.model_fields_set - allowed
+            or created_by_session_id is not None
+        ):
+            raise OmnigentError(
+                "Pending spawn requires a named child with inherited placement",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        await _require_access(
+            user_id, body.parent_session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        spawn_parent = await asyncio.to_thread(
+            conversation_store.get_conversation, body.parent_session_id
+        )
+        if spawn_parent is None or spawn_parent.agent_id != body.agent_id:
+            raise OmnigentError(
+                "Pending spawn must use its parent's agent", code=ErrorCode.INVALID_INPUT
+            )
 
     project_resolution = await resolve_project_session_create(
         body=body,
@@ -13236,27 +13307,40 @@ async def _create_session_from_existing_agent(
                 "harness_override": harness_override,
             }
         )
-        with creation_stage("create_persistence_ms"):
-            conv = conversation_store.create_conversation(
-                agent_id=agent.id,
-                title=body.title,
-                parent_conversation_id=body.parent_session_id,
-                runner_id=inherited_runner_id,
-                kind="sub_agent" if body.parent_session_id else "default",
-                sub_agent_name=body.sub_agent_name,
-                host_id=body.host_id,
-                workspace=canonical_workspace,
-                git_branch=git_branch,
-                terminal_launch_args=validated_launch_args,
-                project_id=project_id,
-                labels=initial_labels or None,
-                model_override=model_override,
-                reasoning_effort=reasoning_effort,
-                cost_control_mode_override=cost_control_mode_override,
-                subagent_routing_override=subagent_routing_override,
-                harness_override=harness_override,
-                **snapshot_kwargs,
+        create_arguments: dict[str, Any] = dict(
+            agent_id=agent.id,
+            title=body.title,
+            parent_conversation_id=body.parent_session_id,
+            runner_id=inherited_runner_id,
+            kind="sub_agent" if body.parent_session_id else "default",
+            sub_agent_name=body.sub_agent_name,
+            host_id=body.host_id,
+            workspace=canonical_workspace,
+            git_branch=git_branch,
+            terminal_launch_args=validated_launch_args,
+            project_id=project_id,
+            labels=initial_labels or None,
+            model_override=model_override,
+            reasoning_effort=reasoning_effort,
+            cost_control_mode_override=cost_control_mode_override,
+            subagent_routing_override=subagent_routing_override,
+            harness_override=harness_override,
+            **snapshot_kwargs,
+        )
+        if _prepare_named_child:
+            if inference_snapshot is None and _parent_for_routing is not None:
+                create_arguments["inference_snapshot"] = _parent_for_routing.inference_snapshot
+            return PreparedNamedChild(
+                create_arguments,
+                sandbox_profile,
+                selected_harness,
+                prepared_request,
+                agent.version,
+                agent.bundle_location,
+                client_surface,
             )
+        with creation_stage("create_persistence_ms"):
+            conv = conversation_store.create_conversation(**create_arguments)
             if body.sibling_source_id is not None:
                 from omnigent.server.session_families import complete_sibling_creation
 

@@ -889,10 +889,38 @@ class SqlAlchemyPermissionStore(PermissionStore):
             self._resolve_cache_generation += 1
             self._resolve_cache.clear()
 
+    @staticmethod
+    def _resolve_access_rows(
+        session: Session, user_id: str, conversation_id: str, *, lock: bool = False
+    ) -> ResolvedAccess:
+        workspace_id = current_workspace_id()
+        user = session.get(
+            SqlUser, (workspace_id, user_id), with_for_update=lock, populate_existing=lock
+        )
+        grant = session.get(
+            SqlSessionPermission,
+            (workspace_id, user_id, conversation_id),
+            with_for_update=lock,
+            populate_existing=lock,
+        )
+        public = session.get(
+            SqlSessionPermission,
+            (workspace_id, RESERVED_USER_PUBLIC, conversation_id),
+            with_for_update=lock,
+            populate_existing=lock,
+        )
+        return ResolvedAccess(
+            is_admin=user is not None and user.deleted_at is None and user.is_admin,
+            user_grant_level=grant.level if grant is not None else None,
+            public_grant_level=public.level if public is not None else None,
+        )
+
     def resolve_access(
         self,
         user_id: str | None,
         conversation_id: str,
+        *,
+        _metadata_session: Session | None = None,
     ) -> ResolvedAccess:
         """Resolve admin flag + user + public grants together. See base class."""
         if user_id is None:
@@ -901,7 +929,10 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 user_grant_level=None,
                 public_grant_level=None,
             )
-        workspace_id = current_workspace_id()
+        if _metadata_session is not None:
+            return self._resolve_access_rows(
+                _metadata_session, user_id, conversation_id, lock=True
+            )
         cache_enabled = self._resolve_cache_ttl_s > 0
         generation = 0
         if cache_enabled:
@@ -919,21 +950,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         # calling is_admin + check_access + get_permission_level separately
         # did — see the GET /v1/sessions/{id} snapshot path).
         with self._session("resolve_access") as session:
-            user_row = session.get(SqlUser, (workspace_id, user_id))
-            user_grant = session.get(
-                SqlSessionPermission, (workspace_id, user_id, conversation_id)
-            )
-            public_grant = session.get(
-                SqlSessionPermission,
-                (workspace_id, RESERVED_USER_PUBLIC, conversation_id),
-            )
-            access = ResolvedAccess(
-                is_admin=user_row is not None
-                and user_row.deleted_at is None
-                and user_row.is_admin,
-                user_grant_level=user_grant.level if user_grant is not None else None,
-                public_grant_level=public_grant.level if public_grant is not None else None,
-            )
+            access = self._resolve_access_rows(session, user_id, conversation_id)
         # Cache only a positive standing: a no-access result is left uncached so
         # a freshly granted user is authorized on their next request, not after
         # the TTL elapses.

@@ -350,6 +350,7 @@ class RunnerRouter:
 
     def require_runtime_support(self, conversation: Conversation) -> None:
         """Validate the connected runner before sending it a restricted agent."""
+        self._conversation_store.require_spawn_activated(conversation.id)
         connection = self._registry.get(conversation.runner_id) if conversation.runner_id else None
         if connection is None or self._agent_store is None or self._agent_cache is None:
             return

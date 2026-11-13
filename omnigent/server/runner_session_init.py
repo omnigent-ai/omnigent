@@ -191,6 +191,10 @@ class RunnerSessionInitializer:
         trigger: str = "unspecified",
     ) -> httpx.Response:
         """Initialize once for the current connection and persisted snapshot."""
+        if self._conversation_store is not None:
+            await asyncio.to_thread(
+                self._conversation_store.require_spawn_activated, conversation.id
+            )
         runner_id = conversation.runner_id
         agent_id = conversation.agent_id
         if runner_id is None or agent_id is None:

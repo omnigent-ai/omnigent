@@ -224,3 +224,276 @@ async def test_confined_failed_send_retains_work_without_cleanup(created_child: 
         assert requests == []
     finally:
         subagent_work.unregister_subagent_work(CHILD_ID)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "prepare-lost",
+        "prepare-unknown",
+        "input-lost",
+        "input-rejected",
+        "abort-lost",
+        "input-unknown",
+        "input-cancelled",
+        "mapping",
+    ],
+)
+async def test_pending_spawn_preserves_exact_receipt_and_work(fault: str | None) -> None:
+    from uuid import uuid4
+
+    parent, child, source, copied = (uuid4().hex for _ in range(4))
+    path = f"/v1/sessions/{parent}/spawns"
+    receipt = {}
+    calls = []
+    inputs = []
+    prepares = []
+    state = "pending"
+
+    def handle(request):
+        nonlocal state
+        route, method = request.url.path, request.method
+        calls.append((method, route))
+        if method == "GET" and route == "/v1/info":
+            return httpx.Response(200, json={"pending_child_spawn_v1": True})
+        if method == "GET" and route == f"/v1/sessions/{parent}":
+            return httpx.Response(200, json={"id": parent, "agent_id": "parent-agent"})
+        if method == "GET" and route == f"/v1/sessions/{parent}/child_sessions":
+            assert not prepares, "Never reconcile a pending spawn by title"
+            return httpx.Response(200, json={"data": []})
+        if method == "GET" and route == f"{path}/epoch":
+            return httpx.Response(200, json={"epoch": 1})
+        if method == "POST" and route == path:
+            payload = json.loads(request.content)
+            prepares.append(payload)
+            assert subagent_work.get_subagent_work(child) is None
+            assert payload["cost_budget"] == {"max_cost_usd": 2.0}
+            assert payload["file_ids"] == [source]
+            receipt.update(
+                {
+                    "epoch": 1,
+                    "nonce": payload["nonce"],
+                    "child_id": child,
+                    "files": {
+                        source: {
+                            "new_id": copied,
+                            "content_type": "image/png",
+                            "filename": "photo.png",
+                        }
+                    },
+                    "labels": {},
+                }
+            )
+            if fault == "mapping":
+                receipt["files"] = {}
+            if fault in ("prepare-lost", "prepare-unknown"):
+                raise httpx.ReadTimeout("lost prepare response", request=request)
+            return httpx.Response(201, json={**receipt, "state": state})
+        if method == "GET" and route == f"{path}/{receipt['nonce']}":
+            assert request.url.params["epoch"] == "1"
+            if fault == "input-unknown":
+                return httpx.Response(503)
+            return httpx.Response(
+                200, json={**receipt, "state": "unknown" if fault == "prepare-unknown" else state}
+            )
+        if method == "POST" and route == f"{path}/{receipt['nonce']}/input":
+            assert subagent_work.get_subagent_work(child) is not None
+            inputs.append(json.loads(request.content))
+            if fault == "input-cancelled":
+                raise asyncio.CancelledError()
+            if fault in ("input-rejected", "abort-lost"):
+                return httpx.Response(503)
+            state = "admitted"
+            if fault in ("input-lost", "input-unknown"):
+                raise httpx.ReadTimeout("lost input response", request=request)
+            return httpx.Response(202, json={**receipt, "state": state})
+        if method == "POST" and route == f"{path}/{receipt['nonce']}/abort":
+            if fault == "input-unknown":
+                return httpx.Response(503)
+            if state == "pending":
+                state = "aborted"
+            if fault == "abort-lost":
+                raise httpx.ReadTimeout("lost abort response", request=request)
+            return httpx.Response(200, json={**receipt, "state": state})
+        raise AssertionError(f"Unexpected request: {method} {route}")
+
+    auth = httpx.Auth()
+    auth.runner_confined = True
+    inbox = asyncio.Queue()
+    subagent_work._session_inboxes_ref[parent] = inbox
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handle), base_url="http://server", auth=auth
+        ) as client:
+            call = execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "researcher",
+                        "title": "task",
+                        "args": {
+                            "input": "first",
+                            "file_ids": [source],
+                            "cost_budget": {"max_cost_usd": 2.0},
+                        },
+                    }
+                ),
+                server_client=client,
+                conversation_id=parent,
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=inbox,
+            )
+            if fault == "input-cancelled":
+                with pytest.raises(asyncio.CancelledError):
+                    await call
+                output = "cancelled"
+            else:
+                output = await call
+        assert len(prepares) == 1
+        assert len(inputs) == (0 if fault in ("mapping", "prepare-unknown") else 1)
+        if inputs:
+            assert inputs[0]["input"]["data"]["content"] == [
+                {"type": "input_text", "text": "first"},
+                {"type": "input_image", "file_id": copied},
+            ]
+        if fault in (None, "prepare-lost", "input-lost"):
+            assert json.loads(output)["conversation_id"] == child
+            assert state == "admitted"
+            assert subagent_work.get_subagent_work(child) is not None
+        elif fault == "input-unknown":
+            assert "Retain" in output
+            assert subagent_work.get_subagent_work(child) is not None
+        else:
+            assert output.startswith("Error") or output == "cancelled"
+            assert subagent_work.get_subagent_work(child) is None
+            if fault != "prepare-unknown":
+                assert state == "aborted"
+        assert not any(method == "DELETE" for method, _ in calls)
+        assert ("POST", "/v1/sessions") not in calls
+    finally:
+        subagent_work._session_inboxes_ref.pop(parent, None)
+        subagent_work.unregister_child_session(child)
+        subagent_work.unregister_subagent_work(child)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["retry", "explicit", "exhausted", "generic", "mismatch"])
+async def test_pending_spawn_retries_only_definite_auto_name_rejection(outcome: str) -> None:
+    from uuid import uuid4
+
+    parent, child = uuid4().hex, uuid4().hex
+    path = f"/v1/sessions/{parent}/spawns"
+    prepares = []
+    reconciles = []
+
+    def handle(request):
+        route, method = request.url.path, request.method
+        if method == "GET" and route == "/v1/info":
+            return httpx.Response(200, json={"pending_child_spawn_v1": True})
+        if method == "GET" and route == f"/v1/sessions/{parent}":
+            return httpx.Response(200, json={"id": parent, "agent_id": "parent-agent"})
+        if method == "GET" and route == f"/v1/sessions/{parent}/child_sessions":
+            assert not prepares
+            return httpx.Response(200, json={"data": []})
+        if method == "GET" and route == f"{path}/epoch":
+            return httpx.Response(200, json={"epoch": 1})
+        if method == "POST" and route == path:
+            payload = json.loads(request.content)
+            prepares.append(payload)
+            if outcome == "retry" and len(prepares) == 2:
+                return httpx.Response(
+                    201,
+                    json={
+                        "epoch": 1,
+                        "nonce": payload["nonce"],
+                        "child_id": child,
+                        "state": "pending",
+                        "files": {},
+                        "labels": {},
+                    },
+                )
+            rejection = {
+                "epoch": 1,
+                "nonce": payload["nonce"],
+                "state": "rejected",
+                "reason": "name_conflict",
+            }
+            if outcome == "generic":
+                rejection = {"error": "conflict"}
+            elif outcome == "mismatch":
+                rejection["nonce"] = uuid4().hex
+            return httpx.Response(409, json=rejection)
+        latest = prepares[-1]
+        if method == "GET" and route == f"{path}/{latest['nonce']}":
+            reconciles.append(route)
+            return httpx.Response(
+                200, json={"epoch": 1, "nonce": latest["nonce"], "state": "unknown"}
+            )
+        if method == "POST" and route == f"{path}/{latest['nonce']}/input":
+            assert outcome == "retry"
+            return httpx.Response(
+                202,
+                json={
+                    "epoch": 1,
+                    "nonce": latest["nonce"],
+                    "child_id": child,
+                    "state": "admitted",
+                },
+            )
+        raise AssertionError(f"Unexpected request: {method} {route}")
+
+    auth = httpx.Auth()
+    auth.runner_confined = True
+    inbox = asyncio.Queue()
+    subagent_work._session_inboxes_ref[parent] = inbox
+    arguments = {"agent": "researcher", "args": {"input": "first"}}
+    if outcome == "explicit":
+        arguments["title"] = "named"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handle), base_url="http://server", auth=auth
+        ) as client:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(arguments),
+                server_client=client,
+                conversation_id=parent,
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+                session_inbox=inbox,
+            )
+        assert len(prepares) == {"retry": 2, "exhausted": 6}.get(outcome, 1)
+        assert len({item["nonce"] for item in prepares}) == len(prepares)
+        assert len({item["create"]["title"] for item in prepares}) == len(prepares)
+        assert len(reconciles) == (1 if outcome in ("generic", "mismatch") else 0)
+        if outcome == "retry":
+            assert json.loads(output)["conversation_id"] == child
+        else:
+            assert output.startswith("Error")
+    finally:
+        subagent_work._session_inboxes_ref.pop(parent, None)
+        subagent_work.unregister_child_session(child)
+        subagent_work.unregister_subagent_work(child)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,payload", [(503, {}), (401, {}), (200, []), (200, {"pending_child_spawn_v1": "true"})]
+)
+async def test_pending_spawn_discovery_failure_never_falls_back(status, payload):
+    from uuid import uuid4
+
+    from omnigent.runner.pending_spawns import PendingSpawnError, prepare_pending_spawn
+
+    def handle(request):
+        assert request.method == "GET" and request.url.path == "/v1/info"
+        return httpx.Response(status, json=payload)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://server"
+    ) as client:
+        with pytest.raises(PendingSpawnError, match="Could not determine"):
+            await prepare_pending_spawn(
+                client, parent_id=uuid4().hex, create={}, file_ids=[], cost_budget=None
+            )

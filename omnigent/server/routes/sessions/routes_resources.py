@@ -441,6 +441,8 @@ def register_resources_routes(
                 permission_store,
                 conversation_store,
             )
+            if request.method not in ("GET", "HEAD"):
+                await asyncio.to_thread(conversation_store.require_spawn_activated, session_id)
             # _require_access_and_level already fetched the conversation for
             # non-admin callers — reuse it to avoid a second DB round-trip.
             if access.conversation is not None:

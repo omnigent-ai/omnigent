@@ -674,6 +674,18 @@ class ConversationStore(ABC):
         """
         ...
 
+    def spawn_activation_pending(self, conversation_id: str) -> bool:
+        """Whether a reserved child still awaits its required activation checks."""
+        del conversation_id
+        return False
+
+    def require_spawn_activated(self, conversation_id: str) -> None:
+        """Refuse runtime effects until pending-child activation is durable."""
+        from omnigent.errors import ErrorCode, OmnigentError
+
+        if self.spawn_activation_pending(conversation_id):
+            raise OmnigentError("Child activation is pending", code=ErrorCode.CONFLICT)
+
     def get_runner_scope(self, conversation_id: str) -> RunnerSessionScope | None:
         """Look up runner authorization state; stores may avoid hydrating full sessions."""
         conversation = self.get_conversation(conversation_id)
