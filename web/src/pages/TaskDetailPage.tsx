@@ -804,8 +804,8 @@ function RunRow({
       className={cn(
         "relative rounded-lg",
         highlighted && "animate-message-highlight",
-        // The row's timeline sits under its link, so the whole row lights up.
-        showTasks && "transition-colors hover:bg-muted",
+        // The row's timeline sits under its link, so the whole row lights up, once.
+        showTasks && "transition-colors hover:bg-muted has-[a:focus-visible]:bg-muted",
       )}
       style={highlighted ? { animationDuration: `${RUN_HIGHLIGHT_DURATION_MS}ms` } : undefined}
     >
@@ -815,8 +815,12 @@ function RunRow({
           data-testid="run-open"
           className={cn(
             commonClassName,
-            "cursor-pointer transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none",
-            showTasks && (workflowId ? "pr-18" : "pr-11"),
+            "cursor-pointer focus-visible:outline-none",
+            showTasks
+              ? workflowId
+                ? "pr-18"
+                : "pr-11"
+              : "transition-colors hover:bg-muted focus-visible:bg-muted",
           )}
         >
           {body}

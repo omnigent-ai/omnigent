@@ -303,6 +303,19 @@ describe("ChatHeader — workspace pane alignment", () => {
       session.container.querySelector("header")!.classList.contains("session-header-glass"),
     ).toBe(!mobile);
   });
+
+  it("lets a page's content take clicks under the header, away from its controls", () => {
+    // A page scrolls under the header without a backdrop, e.g. its Back link.
+    const page = renderHeader({ sidebarOpen: true });
+    expect(page.container.querySelector("header")).toHaveClass(
+      "pointer-events-none",
+      "*:pointer-events-auto",
+    );
+    page.unmount();
+
+    const session = renderHeader({ sidebarOpen: true, conversationId: "conv-1" });
+    expect(session.container.querySelector("header")).not.toHaveClass("pointer-events-none");
+  });
 });
 
 describe("ChatHeader — workspace pane shortcut", () => {

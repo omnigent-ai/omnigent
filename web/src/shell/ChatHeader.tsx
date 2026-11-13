@@ -588,6 +588,8 @@ export function ChatHeader({
         // Mobile keeps only the individual glass button surfaces.
         "chat-header absolute inset-x-0 top-0 z-30 flex h-[76px] md:h-12 items-center justify-between px-4 py-4 md:py-3 md:right-[var(--workspace-panel-offset,0px)]",
         conversationId && !isMobile && "session-header-glass",
+        // Pages scroll under the header without a background, so only its controls take clicks.
+        !conversationId && "pointer-events-none *:pointer-events-auto",
         settingsMode && "settings-mobile-header",
       )}
     >

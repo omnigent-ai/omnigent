@@ -1468,6 +1468,17 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("inbox-button")).toBeInTheDocument();
   });
 
+  it("marks Workflows active (not New session) on a workflow's page", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/workflows/1e7bf4052f44451895933c8413947d27", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { workflows_page: true },
+    });
+
+    expect(screen.getByTestId("workflows-nav")).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
   it("marks Automations active (not New session) on /tasks/:taskId (detail route)", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/tasks/task_abc123", undefined, AUTOMATIONS_INFO);
