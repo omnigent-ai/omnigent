@@ -394,6 +394,48 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     assert "--settings" in spec["args"]
 
 
+@pytest.mark.parametrize("with_config", [False, True])
+def test_claude_terminal_request_preserves_opaque_launcher(tmp_path, monkeypatch, with_config):
+    import shlex
+
+    monkeypatch.chdir(tmp_path)
+    captured = []
+
+    def launch(command, args):
+        payload = "exec " + shlex.join([command, *args])
+        captured.append(payload)
+        return "bash", ["-lc", payload]
+
+    monkeypatch.setattr(claude_native, "resolve_claude_launch", launch)
+    bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
+    caller = tmp_path / "caller.json"
+    caller.write_text('{"env":{"CALLER":"present"}}')
+    body = claude_native._claude_terminal_request(
+        ("--settings", str(caller)),
+        command="claude",
+        bridge_dir=bridge_dir,
+        claude_config=(
+            SimpleNamespace(
+                env={},
+                model=None,
+                api_key_helper=None,
+                model_overrides={},
+                subscription_auth=False,
+            )
+            if with_config
+            else None
+        ),
+    )
+    assert body["spec"]["args"][-2:] == ["-lc", captured[0]]
+    assert body["spec"]["command"] == ("env" if with_config else "bash")
+    assert "claude_settings_generation" not in body
+    assert not list(bridge_dir.glob("*.boundary.json"))
+    serialized = shlex.split(captured[0])
+    assert serialized[:4] == ["exec", "claude", "--settings", str(caller)]
+    assert "--mcp-config" in serialized
+    assert len(list(bridge_dir.glob("claude-settings-*.json"))) == 1
+
+
 def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) -> None:
     """
     Ucode config reaches the terminal env, settings, and model argv.

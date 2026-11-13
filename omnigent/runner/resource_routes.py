@@ -615,11 +615,20 @@ def register_resource_routes(
                     runner_mcp_disabled_servers_active_harnesses,
                 )
 
+                generation = body.get("claude_settings_generation")
+                if declared_terminal is not None and (
+                    env_spec.command != spec.get("command", "bash")
+                    or env_spec.args != spec.get("args", [])
+                ):
+                    # A declaration replaces the client's invocation, so its
+                    # settings generation does not describe this terminal.
+                    generation = None
+
                 async def prepare_claude(instance: TerminalInstance) -> None:
                     await finalize_claude_caller_settings(
                         instance,
                         bridge_dir=bridge_dir_for_bridge_id(bridge_id),
-                        generation=body.get("claude_settings_generation"),
+                        generation=generation,
                         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
                     )
 

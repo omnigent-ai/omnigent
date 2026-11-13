@@ -7022,12 +7022,12 @@ def _claude_terminal_request(
     # Let a registered launcher plugin (e.g. a wrapper such as isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by
     # default. See omnigent.claude_launcher.
-    augmented_args = args
+    augmented_args = list(args)
     command, args = resolve_claude_launch(command, args)
     claude_args_start = (
         len(args) - len(augmented_args)
         if augmented_args and args[-len(augmented_args) :] == augmented_args
-        else 0
+        else None
     )
     spec: _JsonObject = {
         "command": command,
@@ -7068,20 +7068,24 @@ def _claude_terminal_request(
         spec["command"] = "env"
         args = [*env_args, command, *args]
         spec["args"] = args
-        claude_args_start += len(env_args) + 1
+        if claude_args_start is not None:
+            claude_args_start += len(env_args) + 1
     from omnigent.harnesses.claude_native.bridge import record_claude_settings_boundary
 
-    generation = record_claude_settings_boundary(
-        bridge_dir, args, claude_args_start=claude_args_start
-    )
-    return {
+    request: _JsonObject = {
         "terminal": _TERMINAL_NAME,
         "session_key": _TERMINAL_SESSION_KEY,
         "spec": spec,
         # Boolean opt-in; the runner derives the bridge dir from session_id.
         "bridge_inject_dir": True,
-        "claude_settings_generation": generation,
     }
+    # Opaque launcher payloads retain their original argv; do not parse shell
+    # text or claim a deferred-settings boundary we cannot establish.
+    if claude_args_start is not None:
+        request["claude_settings_generation"] = record_claude_settings_boundary(
+            bridge_dir, args, claude_args_start=claude_args_start
+        )
+    return request
 
 
 def _merge_default_model_arg(

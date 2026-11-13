@@ -1919,10 +1919,13 @@ async def test_failed_launch_rolls_back_only_new_relay(
         "legacy",
         "invalid-generation",
         "missing-boundary",
+        "declared-replacement",
+        "declared-identical",
+        "declared-identical-invalid",
     ],
 )
 async def test_cli_caller_settings_finalize_under_terminal_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, terminal_registry_singleton
 ) -> None:
     from omnigent.harnesses.claude_native.main import _claude_terminal_request
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -1960,6 +1963,14 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
         command="claude",
         bridge_dir=bridge_dir,
     )
+    if mode.startswith("declared-"):
+        spec.terminals = {
+            body["terminal"]: TerminalEnvSpec(
+                command="bash" if mode == "declared-replacement" else body["spec"]["command"],
+                args=["-l"] if mode == "declared-replacement" else list(body["spec"]["args"]),
+                os_env=spec.os_env,
+            )
+        }
     generation = body["claude_settings_generation"]
     baseline_path = bridge_dir / f"claude-settings-{generation}.json"
     boundary = baseline_path.with_suffix(".boundary.json").read_text()
@@ -1967,7 +1978,7 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
     assert "ORDER" not in boundary
     if mode == "mismatch":
         body["spec"]["args"].append("changed-after-preparation")
-    if mode == "invalid-generation":
+    if mode in {"invalid-generation", "declared-identical-invalid"}:
         body["claude_settings_generation"] = "../previous-launch"
     if mode == "missing-boundary":
         baseline_path.with_suffix(".boundary.json").unlink()
@@ -2021,7 +2032,13 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
             response = await client.post(
                 f"/v1/sessions/{session_id}/resources/terminals", json=body
             )
-            if mode in {"disable-hooks", "mismatch", "invalid-generation", "missing-boundary"}:
+            if mode in {
+                "disable-hooks",
+                "mismatch",
+                "invalid-generation",
+                "missing-boundary",
+                "declared-identical-invalid",
+            }:
                 assert response.status_code == 500, response.text
                 assert response.json()["error"]["code"] == "terminal_launch_failed"
                 assert not finalized
@@ -2030,6 +2047,11 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
                 assert response.status_code == 200, response.text
                 assert len(finalized) == 1
                 final_args = finalized[0]
+                if mode == "declared-replacement":
+                    assert final_args == ["-l"]
+                    assert json.loads(baseline_path.read_text()) == baseline
+                    await client.delete(f"/v1/sessions/{session_id}")
+                    return
                 settings_index = max(i for i, arg in enumerate(final_args) if arg == "--settings")
                 settings = json.loads(Path(final_args[settings_index + 1]).read_text())
                 assert json.loads(baseline_path.read_text()) == baseline
