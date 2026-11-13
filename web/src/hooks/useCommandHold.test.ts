@@ -430,6 +430,18 @@ describe("useCommandHoldTracking off macOS", () => {
       vi.advanceTimersByTime(1000);
     });
     expect(result.current).toBe(false);
+
+    // Once AltGraph lifts, Shift alone cannot revive the hold; a fresh Ctrl press can.
+    setAltGraph(false);
+    key("keyup", "AltGraph", OTHER_COMMAND);
+    key("keydown", "Shift", { ctrlKey: true, shiftKey: true });
+    elapseRevealDelay();
+    expect(result.current).toBe(false);
+
+    key("keyup", "Control");
+    key("keydown", "Control", OTHER_COMMAND);
+    elapseRevealDelay();
+    expect(result.current).toBe(true);
   });
 
   it("hides when AltGraph is pressed during the delay", () => {

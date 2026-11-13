@@ -70,7 +70,7 @@ export function useCommandHoldTracking(
       return !altGraph;
     };
     const onKeyDown = (e: globalThis.KeyboardEvent): void => {
-      // A fresh command-key press means its release was missed, so start a new hold.
+      // A non-repeat command keydown starts a new hold, recovering from a missed keyup.
       if (e.key === commandKey && !e.repeat) holdCanceled = false;
       const joinsHold = joiningKeys.has(e.key);
       // The physical modifier, not shortcut eligibility: ⌃⌘K still drops K's keyup.
