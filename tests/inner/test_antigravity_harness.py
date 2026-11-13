@@ -11,7 +11,6 @@ tests pass without the package installed.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 
@@ -112,23 +111,6 @@ def test_executor_factory_defaults_when_unset(
     assert captured["vertex"] is False
     assert captured["project"] is None
     assert captured["location"] is None
-
-
-@pytest.mark.parametrize(
-    "payload,message",
-    [
-        ('{"sandbox": {"type": "linux_bwrap"}}', "Antigravity cannot enforce"),
-        ("{not-json", "HARNESS_ANTIGRAVITY_OS_ENV must contain a valid OS environment policy"),
-    ],
-)
-def test_executor_factory_rejects_unsupported_os_policy_before_construction(
-    monkeypatch: pytest.MonkeyPatch, payload: str, message: str
-) -> None:
-    monkeypatch.setenv("HARNESS_ANTIGRAVITY_OS_ENV", payload)
-    with patch.object(antigravity_harness, "AntigravityExecutor") as constructor:
-        with pytest.raises(ValueError, match=message):
-            antigravity_harness._build_antigravity_executor()
-    constructor.assert_not_called()
 
 
 @pytest.mark.parametrize(

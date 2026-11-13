@@ -655,6 +655,8 @@ When a later turn supplies a changed OS policy, the runtime replaces its retaine
 worker before running that turn so the new policy reaches a fresh process.
 Launch-policy overrides such as `enforce_sandbox` are reapplied before deriving
 the spawn environment, including after an agent revision changes.
+Whole-process `allow_network: false` also blocks network-based model-provider
+access, so those providers cannot run under that policy.
 
 Sandbox launchers also grant read access to the installed `omnigent` Python
 package. With an editable installation, this includes that package's source
