@@ -927,8 +927,9 @@ def _recover_placeholder_cascade(
         )
         log.foreign_misses[cascade_id] = misses + 1
         return None
-    # The scan above took seconds; a cold-start may have bound a real id meanwhile.
-    if not update_conversation_id(bridge_dir, cascade_id, expect_placeholder=True):
+    # The scan took seconds: a cold-start may have bound a real id, or a recreated
+    # terminal reseeded the placeholder. Write only over the state this scan read.
+    if not update_conversation_id(bridge_dir, cascade_id, expected_state=state):
         return None
     _logger.info(
         "agy reader adopted the TUI-minted cascade past a stale placeholder "

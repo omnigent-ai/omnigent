@@ -1105,6 +1105,7 @@ def update_conversation_id(
     active_turn_id: str | None = None,
     *,
     expect_placeholder: bool = False,
+    expected_state: AntigravityNativeBridgeState | None = None,
 ) -> bool:
     """
     Update the agy conversation id in bridge state.
@@ -1119,10 +1120,8 @@ def update_conversation_id(
     forever, surfaced only as a generic "conversation not ready". The caller
     decides how to react (it stays best-effort; this never raises).
 
-    ``expect_placeholder`` makes the write itself refuse to replace a real id, and
-    the read-check-write runs under one process-wide lock, so two writers racing
-    to replace the same placeholder (a cold-start and the reader's placeholder
-    recovery, threads of one process) cannot clobber each other's binding.
+    The guards are checked under one process-wide lock, so racing writers cannot
+    clobber each other's binding.
 
     :param bridge_dir: Native Antigravity bridge directory.
     :param conversation_id: New agy conversation id, e.g.
@@ -1131,9 +1130,12 @@ def update_conversation_id(
         ``"turn_abc123"``, or ``None`` when no turn is running yet.
     :param expect_placeholder: When ``True``, only replace an ``agy_conv_*``
         placeholder; a real id already in state is kept and ``False`` returned.
+    :param expected_state: When set, only write if bridge state still names this
+        session and conversation, e.g. the placeholder a recovery scan started
+        from; a recreated terminal's new placeholder is kept and ``False`` returned.
     :returns: ``True`` when the new id was written, ``False`` when there was no
-        existing state to update (the id was dropped; a WARNING was logged) or
-        ``expect_placeholder`` found a real id already bound.
+        existing state to update (the id was dropped; a WARNING was logged) or a
+        guard kept the current state.
     """
     with _STATE_UPDATE_LOCK:
         state = read_bridge_state(bridge_dir)
@@ -1150,6 +1152,19 @@ def update_conversation_id(
                 "Antigravity bridge: state at %s already binds conversation %s; keeping it "
                 "instead of replacing it with %s",
                 bridge_dir,
+                state.conversation_id,
+                conversation_id,
+            )
+            return False
+        if expected_state is not None and (state.session_id, state.conversation_id) != (
+            expected_state.session_id,
+            expected_state.conversation_id,
+        ):
+            _logger.info(
+                "Antigravity bridge: state at %s changed from conversation %s to %s; "
+                "not replacing it with %s",
+                bridge_dir,
+                expected_state.conversation_id,
                 state.conversation_id,
                 conversation_id,
             )
