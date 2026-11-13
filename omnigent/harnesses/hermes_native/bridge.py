@@ -269,9 +269,10 @@ def build_hermes_native_spawn_env(session_id: str) -> dict[str, str]:
 
 
 # Keys from the user's ``~/.hermes/config.yaml`` that the per-session
-# HERMES_HOME needs in order to authenticate with the inference provider.
+# HERMES_HOME needs for config migrations and inference-provider authentication.
 _USER_CONFIG_KEYS = frozenset(
     {
+        "_config_version",
         "model",
         "providers",
         "custom_providers",
@@ -284,7 +285,7 @@ _HERMES_HOME_SUBDIR = "hermes_home"
 
 
 def _load_user_hermes_config() -> _ConfigObject:
-    """Load inference-relevant keys from the user's ``~/.hermes/config.yaml``."""
+    """Load config-version and inference keys from the user's ``~/.hermes/config.yaml``."""
     user_config = Path.home() / ".hermes" / "config.yaml"
     if not user_config.is_file():
         return {}
@@ -712,6 +713,32 @@ def _state_db_path(bridge_dir: Path) -> Path | None:
     return None
 
 
+def _await_session_ready(db_path: Path, timeout_s: float) -> bool:
+    """Wait for Hermes to initialize its store and persist a session row.
+
+    Read-only opens leave creation to Hermes. Missing files, partial schemas,
+    and transient SQLite errors are retried until the bounded deadline.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            con = sqlite3.connect(
+                f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=min(2.0, remaining)
+            )
+            try:
+                if con.execute("SELECT 1 FROM sessions LIMIT 1").fetchone() is not None:
+                    return True
+            finally:
+                con.close()
+        except (OSError, sqlite3.Error):
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_DELIVERY_POLL_INTERVAL_S, remaining))
+
+
 def _max_message_id(db_path: Path) -> int:
     """Return ``MAX(messages.id)`` in the Hermes ``state.db``, or ``0`` on error.
 
@@ -721,8 +748,8 @@ def _max_message_id(db_path: Path) -> int:
     session legitimately starts at ``0``.
     """
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
-    except sqlite3.Error:
+        con = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
+    except (OSError, sqlite3.Error):
         return 0
     try:
         row = con.execute("SELECT MAX(id) FROM messages").fetchone()
@@ -816,6 +843,7 @@ def inject_user_message(
     ``load-buffer``/``paste-buffer -p`` so interior newlines stay data, not
     submits), settles, then submits with a *single* Enter.
 
+    Wait for the session store to contain a session before the first paste.
     On a NEW session Hermes blocks input while cold-starting its MCP server, so
     the first paste can be silently dropped — and a dropped first message
     permanently off-by-ones the server's pending-input FIFO, scrambling every
@@ -845,6 +873,10 @@ def inject_user_message(
     # Snapshot the store high-water mark BEFORE delivery so a new row afterwards
     # is unambiguous proof Hermes accepted this turn.
     db_path = _state_db_path(bridge_dir)
+    if db_path is not None and not _await_session_ready(db_path, timeout_s):
+        raise RuntimeError(
+            "hermes did not finish initializing its session store; no message was sent"
+        )
     baseline_id = _max_message_id(db_path) if db_path is not None else None
 
     _deliver_once(

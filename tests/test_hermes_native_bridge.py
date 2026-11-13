@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -96,6 +97,7 @@ def test_inject_user_message_single_delivery_when_store_confirms(tmp_path, monke
     calls: list[tuple[str, ...]] = []
     _patch_inject_tmux(monkeypatch, calls)
     monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
+    monkeypatch.setattr(b, "_await_session_ready", lambda *_args: True)
     # Baseline 0, then a new row (id=1) confirms delivery on the first check.
     ids = iter([0, 1])
     monkeypatch.setattr(b, "_max_message_id", lambda _p: next(ids))
@@ -114,6 +116,7 @@ def test_inject_user_message_retries_once_when_first_not_confirmed(tmp_path, mon
     monkeypatch.setattr(b, "_settle_pane", lambda *a, **k: settle_calls.append((a, k)))
     monkeypatch.setattr(b, "_DELIVERY_CONFIRM_TIMEOUT_S", 0.0)  # first confirm fails fast
     monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
+    monkeypatch.setattr(b, "_await_session_ready", lambda *_args: True)
     # baseline=0 → confirm#1 sees 0 (fail) → confirm#2 sees 1 (success after retry).
     seq = iter([0, 0, 1])
     monkeypatch.setattr(b, "_max_message_id", lambda _p: next(seq))
@@ -132,6 +135,7 @@ def test_inject_user_message_raises_when_never_confirmed(tmp_path, monkeypatch) 
     _patch_inject_tmux(monkeypatch, calls)
     monkeypatch.setattr(b, "_DELIVERY_CONFIRM_TIMEOUT_S", 0.0)
     monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
+    monkeypatch.setattr(b, "_await_session_ready", lambda *_args: True)
     monkeypatch.setattr(b, "_max_message_id", lambda _p: 0)  # never advances
 
     with pytest.raises(RuntimeError, match="did not accept"):
@@ -139,6 +143,73 @@ def test_inject_user_message_raises_when_never_confirmed(tmp_path, monkeypatch) 
 
     # Both attempts ran (two pastes) before giving up.
     assert sum(1 for a in calls if a[0] == "load-buffer") == 2
+
+
+@pytest.mark.parametrize("initial", ["missing", "empty", "schema"])
+def test_inject_user_message_waits_for_session_store(tmp_path, monkeypatch, initial) -> None:
+    """A first message stays undelivered until Hermes has committed a session row."""
+    calls: list[tuple[str, ...]] = []
+    _patch_inject_tmux(monkeypatch, calls)
+    db = tmp_path / "state #1.db"
+    if initial == "empty":
+        db.touch()
+    elif initial == "schema":
+        with sqlite3.connect(db) as con:
+            con.executescript(b._SESSIONS_DDL + b._MESSAGES_DDL)
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: db)
+    initialized = False
+
+    def initialize_store(_seconds: float) -> None:
+        nonlocal initialized
+        if initialized:
+            return
+        assert calls == [], "no paste before store readiness"
+        with sqlite3.connect(db) as con:
+            con.executescript(b._SESSIONS_DDL + b._MESSAGES_DDL)
+            con.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                ("session", "cli", 0.0),
+            )
+        initialized = True
+
+    def tmux(_socket, *args) -> None:
+        assert initialized
+        calls.append(args)
+        if args[-1] == "Enter":
+            with sqlite3.connect(db) as con:
+                con.execute(
+                    "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                    ("session", "user", "do something now"),
+                )
+
+    monkeypatch.setattr(
+        b, "time", SimpleNamespace(monotonic=b.time.monotonic, sleep=initialize_store)
+    )
+    monkeypatch.setattr(b, "_run_tmux", tmux)
+    b.inject_user_message(tmp_path, content="do something now", timeout_s=1.0)
+    assert sum(1 for args in calls if args[-1] == "Enter") == 1
+
+
+@pytest.mark.parametrize("initial", ["missing", "empty", "schema", "invalid"])
+def test_inject_user_message_does_not_send_when_store_is_unready(
+    tmp_path, monkeypatch, initial
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    _patch_inject_tmux(monkeypatch, calls)
+    db = tmp_path / "state.db"
+    if initial == "empty":
+        db.touch()
+    elif initial == "schema":
+        with sqlite3.connect(db) as con:
+            con.executescript(b._SESSIONS_DDL)
+    elif initial == "invalid":
+        db.write_text("not a database")
+    before = db.read_bytes() if db.exists() else None
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: db)
+    with pytest.raises(RuntimeError, match="no message was sent"):
+        b.inject_user_message(tmp_path, content="do something now", timeout_s=0.0)
+    assert calls == []
+    assert (db.read_bytes() if db.exists() else None) == before
 
 
 def test_inject_user_message_requires_content(tmp_path) -> None:
@@ -383,15 +454,16 @@ def test_write_policy_hook_config_merges_user_model(tmp_path, monkeypatch) -> No
     import yaml
 
     (user_hermes / "config.yaml").write_text(
-        yaml.dump({"model": "claude-sonnet-4-20250514", "providers": {"anthropic": {}}})
+        yaml.dump({"_config_version": 12, "model": "test-model", "providers": {"test": {}}})
     )
 
     monkeypatch.setattr(b.Path, "home", staticmethod(lambda: tmp_path))
 
     hermes_home = b.write_policy_hook_config(bridge_dir, "http://localhost:6767", "s2")
     config = json.loads((hermes_home / "config.yaml").read_text())
-    assert config["model"] == "claude-sonnet-4-20250514"
-    assert config["providers"] == {"anthropic": {}}
+    assert config["_config_version"] == 12
+    assert config["model"] == "test-model"
+    assert config["providers"] == {"test": {}}
     assert config["hooks_auto_accept"] is True
 
 
