@@ -14,7 +14,7 @@ import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { GraphZoomControls } from "@/components/GraphZoomControls";
 import { Button } from "@/components/ui/button";
 import { getEmbedRoot } from "@/lib/host";
-import type { StepProgress, StepState } from "@/lib/sessionJournal";
+import { failedUpstream, type StepProgress, type StepState } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 import {
   layoutWorkflowSteps,
@@ -22,7 +22,7 @@ import {
   type StepNodeData,
   type WorkflowStep,
 } from "@/lib/workflowGraphLayout";
-import { SEGMENT_COLORS, STATE_LABELS, StepGlyph } from "@/shell/TasksPanel";
+import { CantStart, SEGMENT_COLORS, STATE_LABELS, StepGlyph } from "@/shell/TasksPanel";
 
 import "@xyflow/react/dist/style.css";
 
@@ -64,10 +64,17 @@ function StepNode({ data }: NodeProps<Node<StepNodeData>>) {
         <StepGlyph state={data.state ?? "waiting"} number={data.number} />
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium leading-[18px]">{data.name}</p>
-          {data.goal && (
+          {/* A step that can't start says why in place of its goal, which stays on hover. */}
+          {data.failedNames ? (
             <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
-              {data.goal}
+              <CantStart failedNames={data.failedNames} />
             </p>
+          ) : (
+            data.goal && (
+              <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
+                {data.goal}
+              </p>
+            )
           )}
         </div>
       </div>
@@ -88,14 +95,21 @@ function StepsFlow({
   progress?: readonly StepProgress[];
   full?: boolean;
 }) {
-  const { nodes, edges } = useMemo(
-    () =>
-      layoutWorkflowSteps(
-        steps,
-        progress && new Map(progress.map((item) => [item.step.id, item.state])),
-      ),
-    [steps, progress],
-  );
+  const { nodes, edges } = useMemo(() => {
+    if (!progress) return layoutWorkflowSteps(steps);
+    const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
+    const failedNames = new Map(
+      [...failedUpstream(progress)].map(([id, failed]) => [
+        id,
+        failed.map((failedId) => names.get(failedId) ?? failedId),
+      ]),
+    );
+    return layoutWorkflowSteps(
+      steps,
+      new Map(progress.map((item) => [item.step.id, item.state])),
+      failedNames,
+    );
+  }, [steps, progress]);
   return (
     <ReactFlow
       nodes={nodes}

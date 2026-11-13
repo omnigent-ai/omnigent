@@ -95,4 +95,20 @@ describe("WorkflowGraphOverlay", () => {
     fireEvent.click(screen.getByRole("button", { name: "Exit fullscreen" }));
     expect(onClose).toHaveBeenCalledOnce();
   });
+
+  it("says which failed step keeps a step from starting, in place of its goal", () => {
+    render(
+      <WorkflowGraphOverlay
+        title="Triage flaky tests"
+        steps={STEPS}
+        progress={progress("failed", "waiting")}
+        onClose={vi.fn()}
+      />,
+    );
+    const fix = screen.getAllByTestId("workflow-step-node")[1]!;
+    expect(fix).toHaveTextContent("Can't start · Explore the failures failed");
+    expect(fix).not.toHaveTextContent("The suite passes");
+    // The goal is still there on hover.
+    expect(fix).toHaveAttribute("title", "The suite passes");
+  });
 });

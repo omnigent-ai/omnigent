@@ -179,18 +179,23 @@ export function StepGlyph({ state, number }: { state: StepState; number?: number
   }
 }
 
+/** "Can't start · Run the tests failed", for a task held up by the failed tasks named. */
+export function CantStart({ failedNames }: { failedNames: readonly string[] }) {
+  return (
+    <>
+      <span className="font-medium">{CANT_START}</span>
+      {` · ${listNames(failedNames)} failed`}
+    </>
+  );
+}
+
 /** @param failedNames - The failed tasks it waits on, by name, when that's why it can't start. */
 function stepDetail(item: StepProgress, failedNames: readonly string[] = []): ReactNode {
   const text = item.status ? textOf(item.status) : null;
   switch (item.state) {
     case "waiting":
       if (failedNames.length === 0) return item.step.goal;
-      return (
-        <>
-          <span className="font-medium">{CANT_START}</span>
-          {` · ${listNames(failedNames)} failed`}
-        </>
-      );
+      return <CantStart failedNames={failedNames} />;
     case "ready":
       return (
         <>
