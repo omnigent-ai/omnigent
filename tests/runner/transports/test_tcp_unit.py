@@ -104,10 +104,48 @@ async def test_create_tcp_client_without_auth_headers() -> None:
 # ── RunnerTCPSubprocess config ──────────────────────────
 
 
-def test_runner_tcp_subprocess_base_url() -> None:
+@pytest.mark.parametrize(
+    "host, expected",
+    [
+        ("192.0.2.1", "http://192.0.2.1:9090"),
+        ("::1", "http://[::1]:9090"),
+        ("[::1]", "http://[::1]:9090"),
+        ("2001:db8::1", "http://[2001:db8::1]:9090"),
+    ],
+)
+def test_runner_tcp_subprocess_base_url(host: str, expected: str) -> None:
     """base_url builds correctly from host and port."""
-    sub = RunnerTCPSubprocess(host="10.0.0.1", port=9090)
-    assert sub.base_url == "http://10.0.0.1:9090"
+    sub = RunnerTCPSubprocess(host=host, port=9090)
+    assert sub.base_url == expected
+    assert sub.host == host.strip("[]")
+
+
+@pytest.mark.parametrize(
+    "host, family, address",
+    [
+        ("127.0.0.1", socket.AF_INET, ("127.0.0.1", 0)),
+        ("::1", socket.AF_INET6, ("::1", 0, 0, 0)),
+        ("server.example.test", socket.AF_INET6, ("::1", 0, 0, 0)),
+        ("server.example.test", socket.AF_INET, ("127.0.0.1", 0)),
+        ("fe80::1%lo0", socket.AF_INET6, ("fe80::1", 0, 0, 1)),
+    ],
+)
+def test_pick_free_port_uses_requested_interface(
+    host: str, family: int, address: tuple[str, int] | tuple[str, int, int, int]
+) -> None:
+    answers = [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", address)]
+    with (
+        patch(
+            "omnigent.runner.transports.tcp.socket.getaddrinfo", return_value=answers
+        ) as resolve,
+        patch("omnigent.runner.transports.tcp.socket.socket") as socket_factory,
+    ):
+        listener = socket_factory.return_value.__enter__.return_value
+        listener.getsockname.return_value = (host, 45678)
+        assert _pick_free_port(host) == 45678
+        resolve.assert_called_once_with(host, 0, type=socket.SOCK_STREAM)
+        socket_factory.assert_called_once_with(family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+        listener.bind.assert_called_once_with(address)
 
 
 def test_runner_tcp_subprocess_defaults() -> None:
