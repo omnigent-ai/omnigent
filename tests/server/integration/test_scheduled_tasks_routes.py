@@ -4286,15 +4286,47 @@ async def test_only_the_owner_reaches_an_automations_permissions(
         ("bob@example.com", 2, 400),
         ("bob@example.com", 3, 400),
         ("bob@example.com", 4, 422),
+        # Wider than the user and grant ID columns.
+        ("x" * 200 + "@example.com", 1, 400),
     ],
 )
 async def test_grant_refuses_what_an_automation_cannot_be_shared_with(
     auth_client: httpx.AsyncClient, db_uri: str, user_id: str, level: int, status: int
 ) -> None:
     task_id = await _create_task(auth_client)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    users = {user.id for user in permissions.list_users()}
     refused = await _share(auth_client, task_id, user_id, level=level)
     assert refused.status_code == status, refused.text
     assert _task_grantees(db_uri, task_id) == []
+    # Refused before any write.
+    assert {user.id for user in permissions.list_users()} == users
+
+
+@_SHARING
+async def test_grant_stores_the_canonical_id_and_tolerates_a_name_lookup_failure(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def canonical(
+        self: SqlAlchemyPermissionStore, grants: list[tuple[str, int]]
+    ) -> list[tuple[str, int]]:
+        return [(user_id.lower(), level) for user_id, level in grants]
+
+    def unavailable(self: SqlAlchemyPermissionStore, user_ids: list[str]) -> dict[str, str]:
+        raise RuntimeError("directory unavailable")
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "validate_grants", canonical)
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "display_names", unavailable)
+    task_id = await _create_task(auth_client)
+    # The owner check sees the canonical ID.
+    assert (await _share(auth_client, task_id, "Alice@Example.com")).status_code == 400
+    shared = await _share(auth_client, task_id, "Bob@Example.com")
+    assert shared.status_code == 200, shared.text
+    assert shared.json()["display_name"] == "bob@example.com"
+    assert _task_grantees(db_uri, task_id) == ["bob@example.com"]
+    listed = await auth_client.get(_permissions_url(task_id), headers=_headers())
+    assert listed.status_code == 200, listed.text
+    assert [p["display_name"] for p in listed.json()["permissions"]] == ["bob@example.com"]
 
 
 @_SHARING
@@ -4332,6 +4364,21 @@ async def test_grant_follows_the_sharing_policy(
 
 
 @_SHARING
+@pytest.mark.parametrize(("workspace", "status"), [("/repo", 200), ("/home/alice", 403)])
+async def test_restricted_grant_checks_the_continued_sessions_workspace(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, workspace: str, status: int, db_uri: str
+) -> None:
+    # The automation pins no workspace; its runs work in the session's.
+    session_id = _owned_session(db_uri, workspace=workspace)
+    task_id = await _create_task(
+        auth_client, session_mode="continue", session_id=session_id, workspace=None
+    )
+    auth_app.state.sharing_mode = lambda: SharingMode.RESTRICTED_READ_ONLY
+    shared = await _share(auth_client, task_id, "bob@example.com")
+    assert shared.status_code == status, shared.text
+
+
+@_SHARING
 @pytest.mark.parametrize("header", [ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER])
 async def test_agents_cannot_reach_an_automations_permissions(
     auth_client: httpx.AsyncClient, db_uri: str, header: str
@@ -4364,10 +4411,18 @@ def _agent_headers(db_uri: str) -> dict[str, str]:
 
 
 @_SHARING
-@pytest.mark.parametrize("field", ["session_id", "host_id", "workspace", "execution_target"])
+@pytest.mark.parametrize(
+    "field",
+    # A new session mode or agent clears the continued session.
+    ["session_id", "host_id", "workspace", "execution_target", "session_mode", "agent_id"],
+)
 async def test_agents_cannot_retarget_a_shared_automation(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, field: str
 ) -> None:
+    # Each change must otherwise be valid: the check runs on what the update would save.
+    auth_app.state.sandbox_config = _sandbox_deployment()
+    other_host = "5d0f8c6a1b2e4f3a9c7d6e5f4a3b2c1d"
+    auth_app.state.host_store.upsert_on_connect(other_host, "alice-desktop", "alice@example.com")
     task_id = await _create_task(
         auth_client, session_mode="continue", session_id=_owned_session(db_uri)
     )
@@ -4375,9 +4430,11 @@ async def test_agents_cannot_retarget_a_shared_automation(
     before = (await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())).json()
     change = {
         "session_id": _owned_session(db_uri),
-        "host_id": "5d0f8c6a1b2e4f3a9c7d6e5f4a3b2c1d",
+        "host_id": other_host,
         "workspace": "/repo/other",
         "execution_target": "managed_sandbox",
+        "session_mode": "new",
+        "agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME),
     }[field]
     transport = httpx.ASGITransport(app=auth_app, client=("192.0.2.10", 12345))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as agent:
@@ -4394,16 +4451,35 @@ async def test_agents_cannot_retarget_a_shared_automation(
 async def test_agents_can_still_edit_a_shared_automation_in_place(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    shared = await _create_task(auth_client)
-    assert (await _share(auth_client, shared, "bob@example.com")).status_code == 200
+    session_id = _owned_session(db_uri)
+    shared = await _create_task(auth_client, session_mode="continue", session_id=session_id)
+    shared_new = await _create_task(auth_client)
+    for task_id in (shared, shared_new):
+        assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
     unshared = await _create_task(auth_client)
+    unchanged = {
+        "session_id": session_id,
+        "host_id": _HOST_ID,
+        "workspace": "/repo",
+        "execution_target": "connected_host",
+    }
+    edits = (
+        (shared, {"name": "renamed"}),
+        (shared, unchanged),
+        # The route keeps the stored target for a null one.
+        (shared_new, {"execution_target": None}),
+        (unshared, {"workspace": "/x"}),
+    )
     transport = httpx.ASGITransport(app=auth_app, client=("192.0.2.10", 12345))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as agent:
-        for task_id, fields in ((shared, {"name": "renamed"}), (unshared, {"workspace": "/x"})):
+        for task_id, fields in edits:
             edited = await agent.patch(
                 f"/v1/scheduled-tasks/{task_id}", json=fields, headers=_agent_headers(db_uri)
             )
-            assert edited.status_code == 200, edited.text
+            assert edited.status_code == 200, (fields, edited.text)
+    assert (await auth_client.get(f"/v1/scheduled-tasks/{shared}", headers=_headers())).json()[
+        "session_id"
+    ] == session_id
     # The owner can move a shared automation themselves.
     moved = await auth_client.patch(
         f"/v1/scheduled-tasks/{shared}", json={"workspace": "/x"}, headers=_headers()
@@ -4489,8 +4565,33 @@ async def test_grant_changes_reach_a_continued_session_at_once(
 
 
 @_SHARING
+async def test_retrying_a_revoke_removes_the_grantee_after_a_failed_sync(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.auth import LEVEL_OWNER
+
+    session_id = _owned_session(db_uri)
+    task_id = await _create_task(auth_client, session_mode="continue", session_id=session_id)
+    assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
+    revoke = SqlAlchemyPermissionStore.revoke
+
+    def failing(self: SqlAlchemyPermissionStore, user_id: str, conversation_id: str) -> bool:
+        raise RuntimeError("transient database error")
+
+    url = _permissions_url(task_id, "bob@example.com")
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "revoke", failing)
+    assert (await auth_client.delete(url, headers=_headers())).status_code == 204
+    assert _task_grantees(db_uri, task_id) == []
+    assert "bob@example.com" in _session_grants(db_uri, session_id)
+    # The automation grant is gone, but the retry still reaches the session.
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "revoke", revoke)
+    assert (await auth_client.delete(url, headers=_headers())).status_code == 204
+    assert _session_grants(db_uri, session_id) == {"alice@example.com": LEVEL_OWNER}
+
+
+@_SHARING
 async def test_session_permissions_name_the_automation_that_manages_them(
-    auth_client: httpx.AsyncClient, db_uri: str
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.server.auth import LEVEL_MANAGE
     from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
@@ -4518,6 +4619,9 @@ async def test_session_permissions_name_the_automation_that_manages_them(
     permissions.ensure_user("carol@example.com")
     permissions.grant("carol@example.com", session_id, LEVEL_MANAGE)
     assert await manager(session_id, "carol@example.com") is None
+    # Another of its runs' sessions is not the one it continues.
+    older = _owned_session(db_uri, labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id})
+    assert await manager(older) is None
 
     # A new-session automation's runs keep their own sharing.
     new_task = await _create_task(auth_client)
@@ -4525,3 +4629,33 @@ async def test_session_permissions_name_the_automation_that_manages_them(
     assert (await _share(auth_client, new_task, "bob@example.com")).status_code == 200
     assert await manager(run_session) is None
     assert "bob@example.com" not in _session_grants(db_uri, run_session)
+
+    def unavailable(self: SqlAlchemyScheduledTaskStore, scheduled_task_id: str) -> None:
+        raise RuntimeError("scheduled task store unavailable")
+
+    # The grants still load when the automation can't be read.
+    monkeypatch.setattr(SqlAlchemyScheduledTaskStore, "get", unavailable)
+    assert await manager(session_id) is None
+
+
+@_SHARING
+async def test_no_marker_for_a_session_its_automations_owner_does_not_own(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.server.auth import LEVEL_MANAGE
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+
+    task_id = await _create_task(auth_client, session_mode="continue")
+    # Carol owns the session; Alice, the automation's owner, can only manage it.
+    session_id = _owned_session(
+        db_uri, "carol@example.com", labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id}
+    )
+    SqlAlchemyPermissionStore(db_uri).grant("alice@example.com", session_id, LEVEL_MANAGE)
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    assert schedules.adopt_session(task_id, session_id, snapshot=schedules.get(task_id)) == (
+        "adopted"
+    )
+    assert (await _share(auth_client, task_id, "bob@example.com")).status_code == 200
+    listed = await auth_client.get(f"/v1/sessions/{session_id}/permissions", headers=_headers())
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["managed_by_automation"] is None

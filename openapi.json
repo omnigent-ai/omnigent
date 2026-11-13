@@ -17563,7 +17563,7 @@
         ]
       },
       "put": {
-        "description": "Share one of the caller's automations with a user or group.\n\nRead is the only level, and an automation is never public. A\ncontinue-session automation's session is shared with them too. Auto-creates\nthe grantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting grant.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent, a server that cannot share automations or the sharing policy, 400 for an empty ID, the owner, `__public__` or a level other than read.",
+        "description": "Share one of the caller's automations with a user or group.\n\nRead is the only level, and an automation is never public. A\ncontinue-session automation's session is shared with them too. Auto-creates\nthe grantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting grant.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent, a server that cannot share automations or the sharing policy, 400 for an empty or over-long ID, the owner, `__public__` or a level other than read.",
         "operationId": "grant_scheduled_task_permission_v1_scheduled_tasks__scheduled_task_id__permissions_put",
         "parameters": [
           {

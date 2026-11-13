@@ -18,6 +18,8 @@ from omnigent.errors import ErrorCode, OmnigentError
 
 # Largest page a grants list returns; the session permissions route allows the same.
 MAX_GRANTS_PAGE_SIZE = 1000
+# Widest grantee ID: the width of users.id and of the grant tables' user_id.
+MAX_GRANTEE_ID_CHARS = 128
 
 _Grant = TypeVar("_Grant")
 
@@ -37,6 +39,15 @@ def read_all_grants(
         page, cursor = list_page(resource_id, limit=MAX_GRANTS_PAGE_SIZE, after_user_id=cursor)
         grants.extend(page)
     return grants
+
+
+def require_grantee_id_fits(user_id: str) -> None:
+    """Raise ``INVALID_INPUT`` for a grantee ID wider than :data:`MAX_GRANTEE_ID_CHARS`."""
+    if len(user_id) > MAX_GRANTEE_ID_CHARS:
+        raise OmnigentError(
+            f"A grantee ID may be at most {MAX_GRANTEE_ID_CHARS} characters.",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def scheduled_task_sharing_unsupported() -> OmnigentError:

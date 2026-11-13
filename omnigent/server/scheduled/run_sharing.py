@@ -288,6 +288,46 @@ async def sync_task_session(
     )
 
 
+async def revoke_from_task_session(
+    task: ScheduledTask, user_id: str, *, permission_store: PermissionStore | None
+) -> None:
+    """Revoke *user_id* from a continue-session automation's session, for the revoke route.
+
+    Runs whether or not the automation's grant still existed, so retrying a revoke
+    whose sync failed still removes them; runs skip revocation once the automation
+    has no grants. Leaves the owner's grant, ``__public__`` and a session the
+    automation's owner doesn't own alone, as the sync does. Never raises.
+
+    :param task: The automation the grantee was removed from.
+    :param user_id: The removed grantee, e.g. ``"alice@example.com"``.
+    :param permission_store: The server's permission store; ``None`` does nothing.
+    """
+    owner = task.user_id or RESERVED_USER_LOCAL
+    if (
+        not task.continues_session
+        or permission_store is None
+        or not permission_store.supports_scheduled_task_grants
+        or user_id in (owner, RESERVED_USER_PUBLIC)
+    ):
+        return
+    assert task.session_id is not None
+    try:
+        if not await asyncio.to_thread(
+            permission_store.check_access, owner, task.session_id, LEVEL_OWNER
+        ):
+            return
+        grant = await asyncio.to_thread(permission_store.get, user_id, task.session_id)
+        if grant is not None and grant.level != LEVEL_OWNER:
+            await asyncio.to_thread(permission_store.revoke, user_id, task.session_id)
+    except Exception:
+        _logger.exception(
+            "automation %s: could not revoke %r from session %s",
+            task.id,
+            user_id,
+            task.session_id,
+        )
+
+
 async def delete_task_grants(
     permission_store: PermissionStore | None, scheduled_task_id: str
 ) -> None:

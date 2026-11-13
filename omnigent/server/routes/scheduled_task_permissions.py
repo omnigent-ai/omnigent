@@ -9,7 +9,8 @@ next run's sync is the backstop.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+import logging
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from fastapi import APIRouter, Query, Request
@@ -27,7 +28,11 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.feature_flags import Feature
-from omnigent.server.scheduled.run_sharing import is_managed_run_session, sync_task_session
+from omnigent.server.scheduled.run_sharing import (
+    is_managed_run_session,
+    revoke_from_task_session,
+    sync_task_session,
+)
 from omnigent.server.schemas import GrantPermissionRequest
 from omnigent.server.session_sharing import (
     SCHEDULED_TASK_GRANT_LEVELS,
@@ -38,9 +43,12 @@ from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 from omnigent.stores.permission_store import (
     MAX_GRANTS_PAGE_SIZE,
     PermissionStore,
+    require_grantee_id_fits,
     scheduled_task_sharing_unsupported,
 )
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+
+_logger = logging.getLogger(__name__)
 
 # Fields that decide where an automation's runs happen, and so what its grantees see.
 _TARGET_FIELDS = ("session_id", "host_id", "workspace", "execution_target")
@@ -112,7 +120,7 @@ def has_scheduled_task_grants(permission_store: PermissionStore | None, task_id:
 
 async def require_agent_keeps_shared_target(
     request: Request,
-    requested: Mapping[str, object],
+    fields: Mapping[str, object],
     task: ScheduledTask,
     permission_store: PermissionStore | None,
 ) -> None:
@@ -121,18 +129,22 @@ async def require_agent_keeps_shared_target(
     Its grantees would see the new session, host or workspace, and agents act on
     untrusted input. A person can still make the change.
 
-    :param requested: The fields the update sets, as sent.
+    :param fields: The fields the update writes, after the route derives them, so a
+        session cleared by a mode, agent or service change counts.
+    :param task: The automation before the update.
     :raises OmnigentError: ``FORBIDDEN`` for such an update.
     """
     if not request_from_agent(request):
         return
-    retargeted = any(
-        name in requested
-        and requested[name] != getattr(task, name)
-        # A null target is ignored rather than cleared.
-        and not (name == "execution_target" and requested[name] is None)
-        for name in _TARGET_FIELDS
-    )
+
+    def changed(name: str) -> bool:
+        value = fields.get(name, getattr(task, name))
+        # The update keeps the stored target for a null one.
+        if name == "execution_target" and value is None:
+            return False
+        return value != getattr(task, name)
+
+    retargeted = any(changed(name) for name in _TARGET_FIELDS)
     if retargeted and await asyncio.to_thread(
         has_scheduled_task_grants, permission_store, task.id
     ):
@@ -192,6 +204,15 @@ async def automation_managing_session(
     ):
         return None
     return task
+
+
+def _display_names(store: PermissionStore, user_ids: Sequence[str]) -> dict[str, str]:
+    """The store's display names, or the IDs themselves when the lookup fails."""
+    try:
+        return store.display_names(user_ids)
+    except Exception:
+        _logger.exception("could not look up display names for %d grantees", len(user_ids))
+        return {user_id: user_id for user_id in user_ids}
 
 
 def register_scheduled_task_permissions_routes(
@@ -267,7 +288,7 @@ def register_scheduled_task_permissions_routes(
         grants, next_cursor = await asyncio.to_thread(
             store.list_for_scheduled_task, task.id, limit=limit, after_user_id=after
         )
-        names = await asyncio.to_thread(store.display_names, [g.user_id for g in grants])
+        names = await asyncio.to_thread(_display_names, store, [g.user_id for g in grants])
         return ScheduledTaskPermissionList(
             permissions=[
                 ScheduledTaskPermissionObject(
@@ -301,8 +322,8 @@ def register_scheduled_task_permissions_routes(
         :returns: The resulting grant.
         :raises OmnigentError: 404 when the caller does not own the automation, 403
             for an agent, a server that cannot share automations or the sharing
-            policy, 400 for an empty ID, the owner, ``__public__`` or a level other
-            than read.
+            policy, 400 for an empty or over-long ID, the owner, ``__public__`` or a
+            level other than read.
         """
         store = require_sharing(request)
         task = await owned_task(request, scheduled_task_id)
@@ -311,16 +332,8 @@ def register_scheduled_task_permissions_routes(
                 "Name a user or group to share the automation with",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if body.user_id == (task.user_id or RESERVED_USER_LOCAL):
-            raise OmnigentError(
-                "An automation's owner cannot be granted access to it",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        if body.user_id == RESERVED_USER_PUBLIC:
-            raise OmnigentError(
-                "Automations cannot be shared publicly; name a user or group",
-                code=ErrorCode.INVALID_INPUT,
-            )
+        # Before any write: ensure_user would otherwise fail or leave a user row.
+        require_grantee_id_fits(body.user_id)
         if body.level not in SCHEDULED_TASK_GRANT_LEVELS:
             raise OmnigentError(
                 "Automations can only be shared with read access",
@@ -341,13 +354,25 @@ def register_scheduled_task_permissions_routes(
         [(grantee, level)] = await asyncio.to_thread(
             store.validate_grants, [(body.user_id, body.level)]
         )
+        # On the canonical ID, which is how the store names the owner and the public.
+        if grantee == (task.user_id or RESERVED_USER_LOCAL):
+            raise OmnigentError(
+                "An automation's owner cannot be granted access to it",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if grantee == RESERVED_USER_PUBLIC:
+            raise OmnigentError(
+                "Automations cannot be shared publicly; name a user or group",
+                code=ErrorCode.INVALID_INPUT,
+            )
         target = await asyncio.to_thread(store.get_user, grantee)
         with target_account_scope(grantee, target.account_generation if target else None):
             await asyncio.to_thread(store.ensure_user, grantee)
             perm = await asyncio.to_thread(store.grant_for_scheduled_task, grantee, task.id, level)
         await sync_session(request, task)
         add_audit_attrs(target_user_id=grantee, level=level)
-        names = await asyncio.to_thread(store.display_names, [perm.user_id])
+        # The grant is committed, so a failed name lookup must not fail the request.
+        names = await asyncio.to_thread(_display_names, store, [perm.user_id])
         return ScheduledTaskPermissionObject(
             user_id=perm.user_id,
             scheduled_task_id=perm.scheduled_task_id,
@@ -380,7 +405,10 @@ def register_scheduled_task_permissions_routes(
         store = require_sharing(request)
         task = await owned_task(request, scheduled_task_id)
         revoked = await asyncio.to_thread(store.revoke_for_scheduled_task, target_user_id, task.id)
-        # Without a change, an automation nobody shares must leave its session alone.
+        # Always, so a retry still removes them when an earlier sync failed.
+        await revoke_from_task_session(task, target_user_id, permission_store=store)
+        # A full sync only after a change, so an automation nobody shares never
+        # overwrites its session's other shares.
         if revoked:
             await sync_session(request, task)
         add_audit_attrs(target_user_id=target_user_id)

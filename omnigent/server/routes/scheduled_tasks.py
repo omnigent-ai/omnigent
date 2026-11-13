@@ -1283,9 +1283,6 @@ def create_scheduled_tasks_router(
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
-        await require_agent_keeps_shared_target(
-            request, body.model_dump(exclude_unset=True), existing, permission_store
-        )
         legacy_workspace = (
             existing.execution_target == "managed_sandbox"
             and existing.workspace is not None
@@ -1470,6 +1467,8 @@ def create_scheduled_tasks_router(
             await _require_mode_fits_session(request, continuing)
         project_owner = _project_owner(owner)
         try:
+            # On the derived fields, so a session the update clears counts as a change.
+            await require_agent_keeps_shared_target(request, fields, existing, permission_store)
             if fields.get("project_id") is not None:
                 fields["project_id"] = await _owned_project_id(project_owner, fields["project_id"])
             updated = store.update(scheduled_task_id, expected_schedule=existing, **fields)

@@ -332,17 +332,22 @@ def register_permissions_routes(
             permission_store.list_for_session, session_id, limit=limit, after_user_id=after
         )
         state = request.app.state
-        managing = await automation_managing_session(
-            session_id,
-            user_id,
-            conversation_store=conversation_store,
-            scheduled_task_store=(
-                getattr(state, "scheduled_task_store", None)
-                if getattr(state, "automations_available", lambda: False)()
-                else None
-            ),
-            permission_store=permission_store,
-        )
+        try:
+            managing = await automation_managing_session(
+                session_id,
+                user_id,
+                conversation_store=conversation_store,
+                scheduled_task_store=(
+                    getattr(state, "scheduled_task_store", None)
+                    if getattr(state, "automations_available", lambda: False)()
+                    else None
+                ),
+                permission_store=permission_store,
+            )
+        except Exception:
+            # The marker only informs the share dialog; the grants list must still load.
+            _logger.exception("could not find the automation managing session %s", session_id)
+            managing = None
         return {
             "permissions": [
                 PermissionObject(

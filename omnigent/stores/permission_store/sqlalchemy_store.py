@@ -44,17 +44,23 @@ from omnigent.server.auth import (
     effective_admin,
 )
 from omnigent.server.sharing_settings import effective_public_level
-from omnigent.stores.permission_store import MAX_GRANTS_PAGE_SIZE, PermissionStore
+from omnigent.stores.permission_store import (
+    MAX_GRANTEE_ID_CHARS,
+    MAX_GRANTS_PAGE_SIZE,
+    PermissionStore,
+    require_grantee_id_fits,
+)
 
 # Sentinel rows excluded from list_users() — never real, actionable
 # actors. Mirrors accounts_store._HIDDEN_LIST_USERS so the admin user
 # list is identical across auth modes.
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
 
-# Width of scheduled_task_shares.user_id, which SQLite does not enforce.
-_GRANTEE_ID_TYPE = SqlScheduledTaskShare.__table__.c.user_id.type
-assert isinstance(_GRANTEE_ID_TYPE, String) and _GRANTEE_ID_TYPE.length is not None
-_GRANTEE_ID_MAX_CHARS: int = _GRANTEE_ID_TYPE.length
+# SQLite does not enforce these widths, so grants check MAX_GRANTEE_ID_CHARS themselves.
+assert all(
+    isinstance(column.type, String) and column.type.length == MAX_GRANTEE_ID_CHARS
+    for column in (SqlScheduledTaskShare.__table__.c.user_id, SqlUser.__table__.c.id)
+)
 # Never automation grantees: automations are never public, and ``local`` is the
 # single-user identity rather than someone to share with.
 _RESERVED_GRANTEES = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
@@ -188,11 +194,7 @@ def _reserved_grantee_error(user_id: str) -> OmnigentError:
 
 def _require_storable_scheduled_task_grant(user_id: str, level: int) -> None:
     """Refuse a grant the share table cannot hold or the store must never hold."""
-    if len(user_id) > _GRANTEE_ID_MAX_CHARS:
-        raise OmnigentError(
-            f"A grantee ID may be at most {_GRANTEE_ID_MAX_CHARS} characters.",
-            code=ErrorCode.INVALID_INPUT,
-        )
+    require_grantee_id_fits(user_id)
     # A fast path; the grant rechecks under the key's collation, which folds accents too.
     if user_id.strip().casefold() in _RESERVED_GRANTEES:
         raise _reserved_grantee_error(user_id)
