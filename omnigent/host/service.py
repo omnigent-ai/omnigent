@@ -157,7 +157,11 @@ def _systemd_unit(
         "[Service]",
         "Type=simple",
         *env_lines,
-        "ExecStart=" + " ".join(_systemd_quote(part, escape_dollar=True) for part in command),
+        # systemd expands dollars in arguments, but treats argv[0] literally.
+        "ExecStart="
+        + " ".join(
+            _systemd_quote(part, escape_dollar=index > 0) for index, part in enumerate(command)
+        ),
         "Restart=on-failure",
         "RestartPreventExitStatus=78 143",
         "RestartSec=10s",

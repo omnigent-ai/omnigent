@@ -292,7 +292,7 @@ def test_service_refuses_unusable_wrapper(
 
 @pytest.mark.parametrize("by_path", [False, True], ids=["path-lookup", "absolute-path"])
 def test_wrapper_command_keeps_quoted_words(tmp_path: Path, by_path: bool) -> None:
-    wrapper = tmp_path / "tool dir" / "my wrapper"
+    wrapper = tmp_path / "tool $dir" / "my wrapper"
     wrapper.parent.mkdir()
     wrapper.write_text("#!/bin/sh\n")
     wrapper.chmod(0o755)
@@ -311,13 +311,13 @@ def test_wrapper_command_keeps_quoted_words(tmp_path: Path, by_path: bool) -> No
 
 def test_systemd_unit_escapes_specifiers_and_literal_dollars() -> None:
     unit = service._systemd_unit(
-        command=["/opt/$tools/python", "--server", "https://example.com/%h/$target"],
+        command=["/opt/%literal/$tools/python", "--server", "https://example.com/%h/$target"],
         environment={"CONFIG": "$HOME/%h"},
     ).decode()
 
     assert 'Environment="CONFIG=$HOME/%%h"' in unit
     assert (
-        'ExecStart="/opt/$$tools/python" "--server" "https://example.com/%%h/$$target"'
+        'ExecStart="/opt/%%literal/$tools/python" "--server" "https://example.com/%%h/$$target"'
     ) in unit
 
 
