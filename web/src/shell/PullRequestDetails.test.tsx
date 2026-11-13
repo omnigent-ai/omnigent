@@ -666,6 +666,52 @@ function inlineReviewThread(): ReviewThread {
   };
 }
 
+it("names the provider's thread status and comment link", () => {
+  stubFetch();
+  const thread: ReviewThread = {
+    ...inlineReviewThread(),
+    resolved: true,
+    status_label: "Won't fix",
+    can_reply: false,
+    comments: {
+      data: [
+        {
+          id: "root",
+          author: "reviewer",
+          body: "Why?",
+          created_at: null,
+          url: "https://example.com/comment/1",
+        },
+      ],
+      has_more: false,
+      next_cursor: null,
+    },
+  };
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <PullRequestReviewThread
+        thread={thread}
+        context={{
+          conversationId: "conv_1",
+          prUrl: PR_URL,
+          providerLabel: "Azure DevOps",
+          account: null,
+          canReply: false,
+          loadComments: vi.fn(),
+          loadingComments: null,
+        }}
+      />
+    </QueryClientProvider>,
+  );
+  const header = screen.getByRole("button", { expanded: false });
+  expect(header).toHaveTextContent("Won't fix");
+  expect(header).not.toHaveTextContent("Resolved");
+  fireEvent.click(header);
+  expect(
+    screen.getByRole("link", { name: "Open review comment on Azure DevOps" }),
+  ).toBeInTheDocument();
+});
+
 it("renders suggestions as replacement diffs while keeping ordinary Markdown and code", async () => {
   const thread = inlineReviewThread();
   const fileDiff = parsePatchFiles(
@@ -737,6 +783,7 @@ it.each(["unmount", "rerender"])(
           context={{
             conversationId: "conv_1",
             prUrl,
+            providerLabel: "GitHub",
             account: "octocat",
             canReply: true,
             loadComments: vi.fn(),

@@ -249,7 +249,7 @@ _FATAL_WAITING_REASONS: frozenset[str] = frozenset(
 # Pod env (which lands in the Pod spec / etcd). A name matches iff one of its
 # ``_``-delimited segments is in this set — so ``MONKEY`` / ``KEYBOARD`` do not.
 _SENSITIVE_KEY_SEGMENTS: frozenset[str] = frozenset(
-    {"TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "CREDENTIALS"}
+    {"TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL", "CREDENTIALS", "PAT"}
 )
 
 # Reserved env names the Pod sets itself — an env passthrough naming one is an

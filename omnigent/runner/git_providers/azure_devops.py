@@ -17,7 +17,7 @@ import re
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 from urllib.parse import quote
@@ -29,6 +29,7 @@ from omnigent.git_providers.azure_devops import (
 )
 from omnigent.runner.git_providers import (
     CHANGED_FILE_OBJECT,
+    COMMIT_OBJECT,
     FILE_DIFF_OBJECT,
     INFO_OBJECT,
     PR_DIFF_OBJECT,
@@ -61,6 +62,8 @@ _CAPABILITIES = ProviderCapabilities(
     base_remote_selection=False,
     line_counts=False,
     linked_pr_diff=False,
+    review_threads=True,
+    commit_history=True,
 )
 _AUTH_HINT = "Run az login on the host or set AZURE_DEVOPS_EXT_PAT."
 _INACCESSIBLE = "Cannot access this pull request with the Azure DevOps credentials on the host"
@@ -99,6 +102,28 @@ _EVALUATION_BUCKETS = {
 }
 _NOT_APPLICABLE = "notapplicable"
 _BUILD_POLICY_TYPE = "0609b952-1397-4640-95ec-e00a01b2c241"
+# Reviewer votes as the panel's review states, labeled where the state alone loses meaning.
+_VOTES: dict[int, tuple[str, str | None]] = {
+    10: ("APPROVED", None),
+    5: ("APPROVED", "Approved with suggestions"),
+    0: ("PENDING", None),
+    -5: ("CHANGES_REQUESTED", "Waiting for author"),
+    -10: ("CHANGES_REQUESTED", "Rejected"),
+}
+_THREAD_STATUS_LABELS = {
+    "active": "Active",
+    "pending": "Pending",
+    "fixed": "Resolved",
+    "wontfix": "Won't fix",
+    "closed": "Closed",
+    "bydesign": "By design",
+}
+_RESOLVED_THREAD_STATUSES = frozenset({"fixed", "wontfix", "closed", "bydesign"})
+_THREADS_FAILED = "Azure DevOps could not load review conversations. Refresh to retry."
+_COMMITS_FAILED = "Azure DevOps could not load the pull request's commits. Refresh to retry."
+_FOREIGN_COMMIT = "That commit is not part of the selected pull request."
+# The GitHub panel's commit cap.
+_MAX_PR_COMMITS = 250
 # The panel runs git unattended, so neither git nor Git Credential Manager may prompt.
 _NO_PROMPT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never"}
 
@@ -291,6 +316,23 @@ def _pr_text(root: str, ref: str, path: str) -> str | None:
     return text
 
 
+def _patch(root: str, old: str, new: str) -> str | None:
+    """Return git's patch from ``old`` to ``new``, or ``None`` when git fails."""
+    return _git_out(
+        root,
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--find-renames",
+        # Fixed prefixes keep the patch parseable whatever diff.noPrefix says.
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        old,
+        new,
+    )
+
+
 # ── REST ──────────────────────────────────────────────────────────────────────
 
 
@@ -425,6 +467,15 @@ def _target_repo(root: str, reference: PullRequestRef | None) -> AzureRepo | Non
     return remotes[0][1] if remotes else None
 
 
+def _workspace_remote(root: str, reference: PullRequestRef | None) -> tuple[str, AzureRepo] | None:
+    """Return the workspace remote of the reference's repository, or its first for a branch PR."""
+    remotes = _remotes(root)
+    if reference is None:
+        return remotes[0] if remotes else None
+    wanted = reference.repository.lower()
+    return next((pair for pair in remotes if _name(pair[1]).lower() == wanted), None)
+
+
 def _name(repo: AzureRepo) -> str:
     """Return ``org/project/repo``, the panel's ``repo.name_with_owner``."""
     return f"{repo.org}/{repo.project}/{repo.repo}"
@@ -551,6 +602,18 @@ def _inline_location(context: object) -> str | None:
     return f"{location}:{line}" if line else location
 
 
+def _visible_comments(thread: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Yield the thread's comments that people wrote, skipping deleted and system ones."""
+    comments = thread.get("comments")
+    for comment in comments if isinstance(comments, list) else []:
+        if (
+            isinstance(comment, dict)
+            and not comment.get("isDeleted")
+            and comment.get("commentType") != "system"
+        ):
+            yield comment
+
+
 def _comments(threads: list[dict[str, Any]], pr_url: str) -> list[dict[str, Any]]:
     """Shape the threads' comments, skipping deleted and system ones, capped at 100."""
     shaped: list[dict[str, Any]] = []
@@ -560,14 +623,7 @@ def _comments(threads: list[dict[str, Any]], pr_url: str) -> list[dict[str, Any]
         location = _inline_location(thread.get("threadContext"))
         thread_id = _number(thread.get("id"))
         url = None if thread_id is None else f"{pr_url}?discussionId={thread_id}"
-        comments = thread.get("comments")
-        for comment in comments if isinstance(comments, list) else []:
-            if (
-                not isinstance(comment, dict)
-                or comment.get("isDeleted")
-                or comment.get("commentType") == "system"
-            ):
-                continue
+        for comment in _visible_comments(thread):
             body = str(comment.get("content") or "")
             shaped.append(
                 {
@@ -581,6 +637,162 @@ def _comments(threads: list[dict[str, Any]], pr_url: str) -> list[dict[str, Any]
             if len(shaped) > _MAX_COMMENTS:
                 return shaped
     return shaped
+
+
+def _reviewers(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    """Shape the PR's reviewers with their votes; a reviewer who declined reads as dismissed."""
+    reviewers = pr.get("reviewers")
+    shaped: list[dict[str, Any]] = []
+    for reviewer in reviewers if isinstance(reviewers, list) else []:
+        name = _text(_nested(reviewer, "displayName"))
+        if name is None:
+            continue
+        if reviewer.get("hasDeclined") is True:
+            state, label = "DISMISSED", "Declined"
+        else:
+            state, label = _VOTES.get(_number(reviewer.get("vote")) or 0, ("PENDING", None))
+        shaped.append(
+            {
+                "login": name,
+                "kind": "team" if reviewer.get("isContainer") is True else "user",
+                "state": state,
+                "state_label": label,
+            }
+        )
+    return shaped
+
+
+def _labels(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    """Shape the PR's active tags as labels, which have no color or description."""
+    labels = pr.get("labels")
+    return [
+        {"name": name, "color": None, "description": None}
+        for label in (labels if isinstance(labels, list) else [])
+        if _nested(label, "active") is not False and (name := _text(_nested(label, "name")))
+    ]
+
+
+def _merge_state(pr: dict[str, Any], evaluations: list[dict[str, Any]] | None) -> str:
+    """Return an active PR's state as GitHub's ``mergeStateStatus`` names it.
+
+    A blocking policy that has not approved blocks completion. Failing or pending optional
+    policies leave the PR mergeable but unstable. Unread policies leave the state unknown.
+    """
+    merge_status = str(pr.get("mergeStatus") or "").lower()
+    if merge_status == "conflicts":
+        return "DIRTY"
+    if pr.get("isDraft") is True:
+        return "DRAFT"
+    if merge_status in {"rejectedbypolicy", "failure"}:
+        return "BLOCKED"
+    if evaluations is None:
+        return "UNKNOWN"
+    unapproved = [
+        evaluation
+        for evaluation in evaluations
+        if isinstance(evaluation, dict)
+        and str(evaluation.get("status") or "").lower() not in {"approved", _NOT_APPLICABLE}
+        and _nested(evaluation, "configuration", "isEnabled") is not False
+    ]
+    if any(_nested(policy, "configuration", "isBlocking") is not False for policy in unapproved):
+        return "BLOCKED"
+    if merge_status != "succeeded":
+        return "UNKNOWN"
+    return "UNSTABLE" if unapproved else "CLEAN"
+
+
+_SIDES = (("RIGHT", "rightFile"), ("LEFT", "leftFile"))
+_ORIGINAL_SIDES = (("RIGHT", "origRightFile"), ("LEFT", "origLeftFile"))
+
+
+def _position(
+    context: object, sides: tuple[tuple[str, str], ...] = _SIDES
+) -> tuple[str, int, int | None] | None:
+    """Return a thread's ``(side, end line, start line)``, preferring the right side.
+
+    A comment on a removed line has only a left-side position. The start line is ``None``
+    unless the comment spans several lines.
+    """
+    for side, prefix in sides:
+        start = _number(_nested(context, f"{prefix}Start", "line"))
+        if start:
+            end = max(_number(_nested(context, f"{prefix}End", "line")) or start, start)
+            return side, end, start if end > start else None
+    return None
+
+
+def _review_thread(thread: object, pr_url: str, latest: int) -> dict[str, Any] | None:
+    """Shape a thread on a file for the Changes tab; ``None`` for a PR-level or empty thread.
+
+    Positions are tracked to the ``latest`` iteration. A thread left on an earlier iteration
+    that Azure DevOps could not track to it is outdated and keeps only its old position.
+    """
+    if not isinstance(thread, dict) or thread.get("isDeleted"):
+        return None
+    context = thread.get("threadContext")
+    path = _text(_nested(context, "filePath"))
+    thread_id = _number(thread.get("id"))
+    if path is None or thread_id is None:
+        return None
+    url = f"{pr_url}?discussionId={thread_id}"
+    comments = [
+        {
+            "id": str(comment_id),
+            "author": _text(_nested(comment, "author", "displayName")),
+            "body": str(comment.get("content") or ""),
+            "minimized": False,
+            "created_at": _text(comment.get("publishedDate")),
+            "url": url,
+        }
+        for comment in _visible_comments(thread)
+        if (comment_id := _number(comment.get("id"))) is not None
+    ]
+    if not comments:
+        return None
+    pr_context = thread.get("pullRequestThreadContext")
+    left_on = _number(_nested(pr_context, "iterationContext", "secondComparingIteration"))
+    tracked_to = _number(_nested(pr_context, "trackingCriteria", "secondComparingIteration"))
+    outdated = left_on is not None and latest not in (left_on, tracked_to)
+    position = _position(context)
+    side, line, start_line = position or ("RIGHT", None, None)
+    original = _position(_nested(pr_context, "trackingCriteria"), _ORIGINAL_SIDES)
+    original_line, original_start_line = original[1:] if original else (line, start_line)
+    if outdated:
+        original_line, original_start_line = line, start_line
+        line = start_line = None
+    status = str(thread.get("status") or "").lower()
+    return {
+        "id": str(thread_id),
+        "path": path.removeprefix("/"),
+        "side": side,
+        "line": line,
+        "start_line": start_line,
+        "start_side": side if start_line is not None else None,
+        "original_line": original_line,
+        "original_start_line": original_start_line,
+        "subject_type": "LINE" if position else "FILE",
+        "resolved": status in _RESOLVED_THREAD_STATUSES,
+        "outdated": outdated,
+        "can_reply": False,
+        "diff_hunk": "",
+        "status_label": _THREAD_STATUS_LABELS.get(status),
+        "comments": {"data": comments, "has_more": False, "next_cursor": None},
+    }
+
+
+def _commit_entry(entry: object) -> dict[str, Any] | None:
+    """Shape one REST commit as ``session.github.commit``, titled by its first line."""
+    sha = _nested(entry, "commitId")
+    if not isinstance(sha, str) or not _COMMIT_ID.fullmatch(sha):
+        return None
+    message = _nested(entry, "comment")
+    return {
+        "object": COMMIT_OBJECT,
+        "sha": sha,
+        "title": (message if isinstance(message, str) else "").strip().split("\n", 1)[0].strip(),
+        "author": _text(_nested(entry, "author", "name")),
+        "date": _text(_nested(entry, "author", "date")),
+    }
 
 
 def _evaluations(
@@ -666,7 +878,11 @@ def _pr_payload(
         "checks": checks,
         "body": description if isinstance(description, str) and description.strip() else None,
         "comments": comments[:_MAX_COMMENTS],
+        "reviewers": _reviewers(pr),
+        "labels": _labels(pr),
     }
+    if payload["state"] == "OPEN":
+        payload["merge_state_status"] = _merge_state(pr, policy_rows)
     if thread_rows is None or len(comments) > _MAX_COMMENTS:
         payload["comments_partial"] = True
     return payload, details_partial
@@ -715,6 +931,53 @@ def _unavailable_diff(reason: str, message: str) -> dict[str, Any]:
     }
 
 
+def _outside_workspace() -> dict[str, Any]:
+    return {"object": PR_DIFF_OBJECT, "patch": "", "unavailable_reason": PR_OUTSIDE_WORKSPACE}
+
+
+def _revisions_unavailable() -> dict[str, Any]:
+    return _unavailable_diff(
+        "revisions_unavailable",
+        "Azure DevOps has no revisions ready for this pull request. Try again shortly.",
+    )
+
+
+def _commits_unavailable() -> dict[str, Any]:
+    return _unavailable_diff(
+        "commits_unavailable",
+        "Commits are unavailable locally. Refresh after the background fetch.",
+    )
+
+
+def _require_head(
+    client: AzureDevOpsClient, repo: AzureRepo, number: int, head_sha: str
+) -> dict[str, Any]:
+    """Read the PR, refusing it when its head is no longer ``head_sha``.
+
+    :raises ValueError: When the PR moved.
+    :raises _RestFailure: When the PR cannot be read.
+    """
+    pr = _call(client.get_pull_request, repo.project, repo.repo, number)
+    if _commit(pr, "lastMergeSourceCommit") != head_sha:
+        raise ValueError(_PR_CHANGED)
+    return pr
+
+
+def _require_commit(
+    client: AzureDevOpsClient, repo: AzureRepo, number: int, commit_sha: str
+) -> None:
+    """Refuse a commit that is not one of the PR's, so only the PR's history is served.
+
+    :raises ValueError: When the PR's listed commits lack ``commit_sha``.
+    :raises _RestFailure: When the commits cannot be read.
+    """
+    listed, _ = _call(
+        client.pull_request_commits, repo.project, repo.repo, number, _MAX_PR_COMMITS
+    )
+    if commit_sha not in {_nested(entry, "commitId") for entry in listed}:
+        raise ValueError(_FOREIGN_COMMIT)
+
+
 class AzureDevOpsPullRequests:
     """The session PR panel for repositories on Azure DevOps Services.
 
@@ -728,7 +991,7 @@ class AzureDevOpsPullRequests:
 
     @property
     def capabilities(self) -> ProviderCapabilities:
-        """Every optional panel feature is off."""
+        """Review conversations and commit history are on; the panel's write features are off."""
         return _CAPABILITIES
 
     def _client(
@@ -737,6 +1000,19 @@ class AzureDevOpsPullRequests:
         from omnigent.runner.azure_devops_client import AzureDevOpsClient
 
         return AzureDevOpsClient(org, token, deadline=deadline, transport=self._transport)
+
+    def _reference_client(
+        self, reference: PullRequestRef, deadline: float
+    ) -> tuple[AzureDevOpsClient, AzureRepo]:
+        """Return a client for a tracked PR's organization, and the PR's repository.
+
+        :raises ValueError: When the PR names no repository or the host has no credential.
+        """
+        repo = _reference_repo(reference)
+        token = _token() if repo is not None else None
+        if repo is None or token is None:
+            raise ValueError(_INACCESSIBLE)
+        return self._client(repo.org, token, deadline=deadline), repo
 
     def workspace_info(self, root: str) -> dict[str, Any]:
         """Return the checked-out branch, the workspace's Azure DevOps repository, and its PR."""
@@ -983,17 +1259,10 @@ class AzureDevOpsPullRequests:
         With ``pinned`` ``(head, base)``, the patch is of those commits, not the PR's current ones.
         """
         empty: dict[str, Any] = {"object": PR_DIFF_OBJECT, "patch": ""}
-        remotes = _remotes(root)
-        if reference is None:
-            if not remotes:
-                return empty
-            remote, repo = remotes[0]
-        else:
-            wanted = reference.repository.lower()
-            match = next((pair for pair in remotes if _name(pair[1]).lower() == wanted), None)
-            if match is None:
-                return {**empty, "unavailable_reason": PR_OUTSIDE_WORKSPACE}
-            remote, repo = match
+        match = _workspace_remote(root, reference)
+        if match is None:
+            return empty if reference is None else _outside_workspace()
+        remote, repo = match
         token = _token()
         if token is None:
             return _unavailable_diff("authentication_required", _AUTH_HINT)
@@ -1015,37 +1284,42 @@ class AzureDevOpsPullRequests:
             _commit(pr, "lastMergeTargetCommit"),
         )
         if head is None or base is None:
-            return _unavailable_diff(
-                "revisions_unavailable",
-                "Azure DevOps has no revisions ready for this pull request. Try again shortly.",
-            )
+            return _revisions_unavailable()
         if not self._ensure_commits(root, remote, number, pr, (head, base), deadline):
-            return _unavailable_diff(
-                "commits_unavailable",
-                "Commits are unavailable locally. Refresh after the background fetch.",
-            )
+            return _commits_unavailable()
         merge_base = _merge_base(root, base, head)
         if merge_base is None:
             return _unavailable_diff(
                 "merge_base_unavailable", "The pull request's merge base could not be resolved."
             )
-        patch = _git_out(
-            root,
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--find-renames",
-            # Fixed prefixes keep the patch parseable whatever diff.noPrefix says.
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-            merge_base,
-            head,
-        )
+        patch = _patch(root, merge_base, head)
         if patch is None:
             return _unavailable_diff(
                 "diff_failed", "Git could not produce this pull request's diff."
             )
+        return {"object": PR_DIFF_OBJECT, "patch": patch}
+
+    def _local_patch(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        pr: dict[str, Any],
+        old: str,
+        new: str,
+        deadline: float,
+    ) -> dict[str, Any]:
+        """Diff two of a tracked PR's commits in the workspace, fetching its commits first."""
+        match = _workspace_remote(root, reference)
+        if match is None:
+            return _outside_workspace()
+        head, base = _commit(pr, "lastMergeSourceCommit"), _commit(pr, "lastMergeTargetCommit")
+        if head is None or base is None:
+            return _revisions_unavailable()
+        if not self._ensure_commits(root, match[0], reference.number, pr, (head, base), deadline):
+            return _commits_unavailable()
+        patch = _patch(root, old, new)
+        if patch is None:
+            return _unavailable_diff("diff_failed", "Git could not produce this commit's diff.")
         return {"object": PR_DIFF_OBJECT, "patch": patch}
 
     def _ensure_commits(
@@ -1180,6 +1454,189 @@ class AzureDevOpsPullRequests:
         except _RestFailure:
             return None
         return None if listed is None else _short_ref(listed.get("targetRefName"))
+
+    def review_threads(
+        self,
+        root: str,  # noqa: ARG002 - conversations are read from Azure DevOps
+        reference: PullRequestRef,
+        *,
+        after: str,
+        head_sha: str,
+        base_sha: str,
+    ) -> dict[str, Any]:
+        """Read the PR's file conversations, tracked to its latest iteration, on one page.
+
+        The page names the PR's head and base only when that iteration is at the head, so the
+        panel places no conversation on a revision it was not tracked to.
+
+        :raises ValueError: When the conversations cannot be read, or when ``after`` asks for
+            a later page of a PR that moved.
+        """
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
+        client, repo = self._reference_client(reference, deadline)
+        page: dict[str, Any] = {"data": [], "has_more": False, "next_cursor": None}
+        try:
+            with client:
+                pr = _call(client.get_pull_request, repo.project, repo.repo, reference.number)
+                head = _commit(pr, "lastMergeSourceCommit")
+                base = _commit(pr, "lastMergeTargetCommit")
+                if after:
+                    # Every conversation is on the first page.
+                    if (head, base) != (head_sha, base_sha):
+                        raise ValueError(
+                            "The pull request changed; refresh before loading more conversations."
+                        )
+                    return {**page, "head_sha": head, "base_sha": base}
+                iterations = _call(client.iterations, repo.project, repo.repo, reference.number)
+                latest = _latest_iteration(iterations)
+                if latest is None:
+                    return {**page, "head_sha": None, "base_sha": None}
+                threads = _call(
+                    client.threads,
+                    repo.project,
+                    repo.repo,
+                    reference.number,
+                    iteration=latest["id"],
+                )
+        except _RestFailure as exc:
+            raise ValueError(_THREADS_FAILED) from exc
+        verified = head is not None and base is not None
+        verified = verified and _commit(latest, "sourceRefCommit") == head
+        page["data"] = [
+            shaped
+            for thread in threads
+            if (shaped := _review_thread(thread, reference.url, latest["id"])) is not None
+        ]
+        return {
+            **page,
+            "head_sha": head if verified else None,
+            "base_sha": base if verified else None,
+        }
+
+    def review_thread_comments(
+        self,
+        root: str,  # noqa: ARG002 - conversations are read from Azure DevOps
+        reference: PullRequestRef,
+        *,
+        thread_id: str,
+        after: str,
+    ) -> dict[str, Any]:
+        """Return a conversation's comments after the comment id ``after``, on one page.
+
+        :raises ValueError: When the conversation is not one of the PR's file conversations,
+            or ``after`` is not a comment id.
+        """
+        if not after.isdecimal():
+            raise ValueError("Invalid review conversation identifier or cursor")
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
+        client, repo = self._reference_client(reference, deadline)
+        try:
+            with client:
+                threads = _call(client.threads, repo.project, repo.repo, reference.number)
+        except _RestFailure as exc:
+            raise ValueError(_THREADS_FAILED) from exc
+        shaped = next(
+            (
+                value
+                for thread in threads
+                if str(_number(thread.get("id"))) == thread_id
+                and (value := _review_thread(thread, reference.url, 0)) is not None
+            ),
+            None,
+        )
+        if shaped is None:
+            raise ValueError(
+                "This review conversation is unavailable on the selected pull request."
+            )
+        later = [
+            comment for comment in shaped["comments"]["data"] if int(comment["id"]) > int(after)
+        ]
+        return {"data": later, "has_more": False, "next_cursor": None}
+
+    def reply_to_review_thread(
+        self, root: str, reference: PullRequestRef, *, thread_id: str, body: str
+    ) -> dict[str, Any]:
+        """Reject the request: replying to Azure DevOps conversations is not supported yet."""
+        del root, reference, thread_id, body
+        raise ValueError("Replying to Azure DevOps conversations is not supported yet.")
+
+    def create_review_thread(
+        self, root: str, reference: PullRequestRef, *, body: str, anchor: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Reject the request: starting Azure DevOps conversations is not supported yet."""
+        del root, reference, body, anchor
+        raise ValueError("Starting Azure DevOps conversations is not supported yet.")
+
+    def commits(
+        self,
+        root: str,  # noqa: ARG002 - commits are listed by Azure DevOps
+        reference: PullRequestRef,
+        *,
+        head_sha: str,
+    ) -> dict[str, Any]:
+        """List the PR's commits oldest first, between two checks that its head is ``head_sha``.
+
+        :raises ValueError: When the PR moved or its commits cannot be read.
+        """
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
+        client, repo = self._reference_client(reference, deadline)
+        try:
+            with client:
+                _require_head(client, repo, reference.number, head_sha)
+                listed, has_more = _call(
+                    client.pull_request_commits,
+                    repo.project,
+                    repo.repo,
+                    reference.number,
+                    _MAX_PR_COMMITS,
+                )
+                _require_head(client, repo, reference.number, head_sha)
+        except _RestFailure as exc:
+            raise ValueError(_COMMITS_FAILED) from exc
+        # Azure DevOps lists a PR's commits newest first.
+        shaped = [
+            value for entry in reversed(listed) if (value := _commit_entry(entry)) is not None
+        ]
+        return {"object": "list", "data": shaped, "has_more": has_more}
+
+    def commit_diff(
+        self, root: str, reference: PullRequestRef, *, commit_sha: str
+    ) -> dict[str, Any]:
+        """Return one of the PR's commits as a patch against its first parent, from local git.
+
+        :raises ValueError: When the commit is not one of the PR's, or the PR cannot be read.
+        """
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
+        client, repo = self._reference_client(reference, deadline)
+        try:
+            with client:
+                pr = _call(client.get_pull_request, repo.project, repo.repo, reference.number)
+                _require_commit(client, repo, reference.number, commit_sha)
+        except _RestFailure as exc:
+            raise ValueError(_COMMITS_FAILED) from exc
+        return self._local_patch(root, reference, pr, f"{commit_sha}^", commit_sha, deadline)
+
+    def compare_diff(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, from_sha: str
+    ) -> dict[str, Any]:
+        """Return the PR's changes after its commit ``from_sha`` up to ``head_sha``, from git.
+
+        The commit list is read between two head checks. The patch compares two fixed commits,
+        so it needs no check of its own.
+
+        :raises ValueError: When the PR moved, ``from_sha`` is not one of its commits, or the
+            PR cannot be read.
+        """
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
+        client, repo = self._reference_client(reference, deadline)
+        try:
+            with client:
+                pr = _require_head(client, repo, reference.number, head_sha)
+                _require_commit(client, repo, reference.number, from_sha)
+                _require_head(client, repo, reference.number, head_sha)
+        except _RestFailure as exc:
+            raise ValueError(_COMMITS_FAILED) from exc
+        return self._local_patch(root, reference, pr, from_sha, head_sha, deadline)
 
     def set_preference(
         self,

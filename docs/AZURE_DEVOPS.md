@@ -25,6 +25,19 @@ Before either of these, `resolve_token` reads
 in epoch seconds) and uses its token until `expires_at` passes. Nothing writes
 this file yet, and it is reserved for a later sandbox credential part.
 
+When Omnigent starts a background host and runner, it does not forward
+`AZURE_DEVOPS_EXT_PAT`. To use the token there, opt in before you start the host:
+
+```sh
+export OMNIGENT_RUNNER_ENV_PASSTHROUGH=AZURE_DEVOPS_EXT_PAT
+```
+
+Keep any existing names in the comma-separated list. Restart the host and
+reconnect the session after you set it. Create the token for one organization,
+because Azure DevOps is retiring tokens for all accessible organizations.
+`AZURE_CONFIG_DIR` is forwarded, so `az` in a runner reads the same sign-in as
+the host.
+
 The host looks for `az` on `PATH`, then at `/opt/homebrew/bin/az` and
 `/usr/local/bin/az`. Processes started by a service manager or a desktop app
 often run without Homebrew on `PATH`.
@@ -89,6 +102,10 @@ or `az repos`.
   minute.
 - **No line counts.** Azure DevOps does not return added and removed line
   counts for changed files.
+- **Read-only review conversations.** Changes shows each file conversation
+  with its Azure DevOps status, such as "Won't fix". Reply to, start, and
+  resolve conversations in Azure DevOps. Inline comments also stay in the
+  Comments list with their file and line.
 - **Slow local diffs.** Local Git commands have separate 30-second timeouts.
   Large or slow checkouts can exceed the runner proxy's request limit even
   when REST calls and background-fetch waits stay within their budget.
@@ -117,7 +134,8 @@ On a host with an Azure repository, run `az login` or set
 `AZURE_DEVOPS_EXT_PAT` before starting Omnigent. Open a session in that repository,
 then click the composer’s `!N` link or open **Pull Requests** in the workspace
 panel. Confirm the Azure DevOps heading, request title, Summary, Comments, and
-Changes. Repeat at a mobile viewport to check the full-screen drawer. Link a
+Changes. Summary lists the reviewers with their votes and the tags. Changes
+shows the file conversations and the request's commits. Repeat at a mobile viewport to check the full-screen drawer. Link a
 request from another repository and confirm its summary loads while the diff
 explains the workspace limitation.
 

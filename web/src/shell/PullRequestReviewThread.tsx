@@ -16,6 +16,8 @@ import { PullRequestReviewBody } from "./PullRequestReviewBody";
 export interface ReviewThreadContext {
   conversationId: string;
   prUrl: string;
+  /** The provider's display name, e.g. "GitHub". */
+  providerLabel: string;
   account: string | null;
   canReply: boolean;
   canCreate?: boolean;
@@ -64,7 +66,9 @@ export function PullRequestReviewThread({
         <MessageSquareIcon className="size-3.5 shrink-0" />
         <span className="min-w-0 flex-1 truncate">{lineLabel}</span>
         {thread.outdated && <span className="text-xs text-muted-foreground">Outdated</span>}
-        {thread.resolved && <span className="text-xs text-muted-foreground">Resolved</span>}
+        {(thread.status_label || thread.resolved) && (
+          <span className="text-xs text-muted-foreground">{thread.status_label || "Resolved"}</span>
+        )}
         <span className="text-xs text-muted-foreground">
           {thread.comments.data.length}
           {thread.comments.has_more ? "+" : ""}
@@ -99,7 +103,7 @@ export function PullRequestReviewThread({
                         href={comment.url}
                         target="_blank"
                         rel="noreferrer"
-                        aria-label="Open review comment on GitHub"
+                        aria-label={`Open review comment on ${context.providerLabel}`}
                         className="ml-auto shrink-0"
                       >
                         <ExternalLinkIcon className="size-3.5" />

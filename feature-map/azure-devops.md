@@ -8,6 +8,10 @@ CLI sign-in reads the request. The panel identifies Azure requests with `!`.
 
 - `summary`: organization/project/repository, request title, description and status.
 - `comments`: request comments on their own tab, whose label shows the count.
+- `reviewers`: read-only reviewers with their votes, such as "Waiting for author", and the request's tags.
+- `readiness`: the request list shows conflicts and ready from merge status, draft state, and blocking policies.
+- `review-threads`: read-only file conversations in Changes, labeled with their Azure DevOps status.
+- `commits`: the request's commits, one commit's diff, and the changes since a commit.
 - `changes`: local file diff and expanded context pinned to displayed revisions, with a path filter and copy-path and open actions. Find searches the fetched patch from the toolbar search button, or Cmd/Ctrl+F while focus is in the Changes tab.
 - `local-review`: submit session-local Agent comments from Changes and send their
   context chips together through chat; hover to preview and click to return.

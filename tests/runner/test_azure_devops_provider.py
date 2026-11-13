@@ -52,7 +52,7 @@ HINT = "Run az login on the host or set AZURE_DEVOPS_EXT_PAT."
 INACCESSIBLE = "Cannot access this pull request with the Azure DevOps credentials on the host"
 BUILD_POLICY = {"id": "0609b952-1397-4640-95ec-e00a01b2c241", "displayName": "Build"}
 REVIEWERS_POLICY = {"id": "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd", "displayName": "Reviewers"}
-NO_CAPABILITIES = {
+CAPABILITIES = {
     "account_switching": False,
     "base_remote_selection": False,
     "line_counts": False,
@@ -61,12 +61,12 @@ NO_CAPABILITIES = {
     "merging": False,
     "reviewer_editing": False,
     "comment_posting": False,
-    "review_threads": False,
+    "review_threads": True,
     "review_thread_replies": False,
     "review_thread_creation": False,
     "details_editing": False,
     "attachment_uploads": False,
-    "commit_history": False,
+    "commit_history": True,
     "merge_as_account": False,
 }
 # Keys of the panel's end-to-end info fixture, less GitHub's legacy fields.
@@ -362,7 +362,7 @@ def test_workspace_info_shows_the_branch_pr_without_legacy_fields(
             "accounts": None,
             "selected_account": None,
         },
-        "capabilities": NO_CAPABILITIES,
+        "capabilities": CAPABILITIES,
         "branch": "feature",
         "base_ref": "main",
         "repo": {"name_with_owner": "contoso/web/app"},
@@ -383,6 +383,9 @@ def test_workspace_info_shows_the_branch_pr_without_legacy_fields(
         "checks": NO_CHECKS,
         "body": "## Summary\n\nAdds CI.",
         "comments": [],
+        "reviewers": [],
+        "labels": [],
+        "merge_state_status": "UNKNOWN",
     }
     find, *_ = ado_transport.requests
     assert ("searchCriteria.sourceRefName", "refs/heads/feature") in request_query(find)
@@ -507,7 +510,7 @@ def test_outside_a_git_checkout(
         "reason": "not_a_git_repo",
         "provider": "azure_devops",
         "auth": None,
-        "capabilities": NO_CAPABILITIES,
+        "capabilities": CAPABILITIES,
     }
     assert ado_transport.requests == []
 
@@ -639,12 +642,12 @@ def evaluation(
     *,
     build_id: int | None = None,
     policy_type: dict[str, str] = BUILD_POLICY,
+    blocking: bool | None = None,
 ) -> dict[str, Any]:
-    return {
-        "status": status,
-        "configuration": {"type": policy_type, "settings": {"displayName": name}},
-        "context": {"buildId": build_id},
-    }
+    configuration: dict[str, Any] = {"type": policy_type, "settings": {"displayName": name}}
+    if blocking is not None:
+        configuration["isBlocking"] = blocking
+    return {"status": status, "configuration": configuration, "context": {"buildId": build_id}}
 
 
 def test_checks_merge_the_latest_statuses_with_build_policy_evaluations(
@@ -806,6 +809,341 @@ def test_comments_skip_deleted_and_system_entries_and_prefix_inline_ones(
         shaped("`src/old.py:3`\n\nWhy remove it?", 4),
         shaped("`README.md`\n\nTypo", 5),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Reviewers, labels, and merge state
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("fields", "state", "label"),
+    [
+        ({"vote": 10}, "APPROVED", None),
+        ({"vote": 5}, "APPROVED", "Approved with suggestions"),
+        ({"vote": 0}, "PENDING", None),
+        ({"vote": -5}, "CHANGES_REQUESTED", "Waiting for author"),
+        ({"vote": -10}, "CHANGES_REQUESTED", "Rejected"),
+        ({"vote": 0, "hasDeclined": True}, "DISMISSED", "Declined"),
+    ],
+)
+def test_reviewers_show_each_vote(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    fields: dict[str, Any],
+    state: str,
+    label: str | None,
+) -> None:
+    reviewers = [{"displayName": "Ada", **fields}, {"displayName": "Core", "isContainer": True}]
+    # A reviewer without a display name cannot be shown.
+    serve(ado_transport, pull_request(reviewers=[*reviewers, {"vote": 10}]))
+
+    pr = facet.reference_info(str(tmp_path), reference())["pr"]
+
+    assert pr["reviewers"] == [
+        {"login": "Ada", "kind": "user", "state": state, "state_label": label},
+        {"login": "Core", "kind": "team", "state": "PENDING", "state_label": None},
+    ]
+
+
+def test_labels_are_the_active_tags(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    tags = [{"name": "ui", "active": True}, {"name": "old", "active": False}, {"name": ""}]
+    serve(ado_transport, pull_request(labels=tags))
+
+    pr = facet.reference_info(str(tmp_path), reference())["pr"]
+
+    assert pr["labels"] == [{"name": "ui", "color": None, "description": None}]
+
+
+@pytest.mark.parametrize(
+    ("fields", "evaluations", "expected"),
+    [
+        ({"mergeStatus": "conflicts", "isDraft": True}, [], "DIRTY"),
+        ({"mergeStatus": "succeeded", "isDraft": True}, [], "DRAFT"),
+        ({"mergeStatus": "rejectedByPolicy"}, [], "BLOCKED"),
+        ({"mergeStatus": "succeeded"}, [evaluation("queued", "Build")], "BLOCKED"),
+        (
+            {"mergeStatus": "succeeded"},
+            [evaluation("rejected", "Two reviewers", policy_type=REVIEWERS_POLICY)],
+            "BLOCKED",
+        ),
+        (
+            {"mergeStatus": "succeeded"},
+            [evaluation("approved", "Build"), evaluation("rejected", "Lint", blocking=False)],
+            "UNSTABLE",
+        ),
+        (
+            {"mergeStatus": "succeeded"},
+            [evaluation("approved", "Build"), evaluation("notApplicable", "Docs")],
+            "CLEAN",
+        ),
+        ({"mergeStatus": "queued"}, [], "UNKNOWN"),
+    ],
+    ids=["conflicts", "draft", "policy", "pending", "rejected", "optional", "clean", "queued"],
+)
+def test_merge_state_follows_the_merge_status_and_policies(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    fields: dict[str, Any],
+    evaluations: list[dict[str, Any]],
+    expected: str,
+) -> None:
+    serve(ado_transport, pull_request(**fields), evaluations=evaluations)
+
+    pr = facet.reference_info(str(tmp_path), reference())["pr"]
+
+    assert pr["merge_state_status"] == expected
+
+
+def test_merge_state_is_unknown_without_policies_and_absent_once_closed(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    serve(ado_transport, pull_request(mergeStatus="succeeded"))
+    fail(ado_transport, EVALUATIONS, 500)
+    unread = facet.reference_info(str(tmp_path), reference())["pr"]
+    serve(ado_transport, pull_request(status="completed", mergeStatus="succeeded"))
+    completed = facet.reference_info(str(tmp_path), reference())["pr"]
+
+    assert unread["merge_state_status"] == "UNKNOWN"
+    assert "merge_state_status" not in completed
+
+
+# ---------------------------------------------------------------------------
+# Review conversations
+# ---------------------------------------------------------------------------
+
+
+def file_thread(
+    thread_id: int,
+    context: dict[str, Any],
+    *,
+    status: str = "active",
+    left_on: int = 2,
+    tracking: dict[str, Any] | None = None,
+    comments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Return a thread on a file, left on iteration ``left_on``, as the REST API sends it."""
+    pr_context: dict[str, Any] = {
+        "iterationContext": {"firstComparingIteration": 1, "secondComparingIteration": left_on}
+    }
+    if tracking is not None:
+        pr_context["trackingCriteria"] = tracking
+    return {
+        "id": thread_id,
+        "status": status,
+        "threadContext": context,
+        "pullRequestThreadContext": pr_context,
+        "comments": [{**comment("Please check"), "id": 1}] if comments is None else comments,
+    }
+
+
+def serve_threads(
+    transport: RecordingTransport,
+    threads: list[dict[str, Any]],
+    *,
+    iteration_head: str = HEAD,
+) -> None:
+    """Route PR 7 at iteration 2 and its threads."""
+    transport.route("GET", PULL, json=pull_request())
+    iterations = [{"id": 1}, {"id": 2, "sourceRefCommit": {"commitId": iteration_head}}]
+    transport.route("GET", f"{PULL}/iterations", json={"value": iterations})
+    transport.route("GET", f"{PULL}/threads", json={"value": threads})
+
+
+def test_review_threads_are_the_file_threads_tracked_to_the_latest_iteration(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    right = {"filePath": "/src/app.py", "rightFileStart": {"line": 12}}
+    threads = [
+        {"id": 1, "status": "active", "comments": [{**comment("On the PR"), "id": 1}]},
+        {**file_thread(2, right), "isDeleted": True},
+        file_thread(
+            3, right, comments=[{**comment("Ada voted 10", comment_type="system"), "id": 1}]
+        ),
+        file_thread(
+            4,
+            right,
+            comments=[
+                {**comment("Rename this", author="Bo"), "id": 1},
+                {**comment("Never mind", deleted=True), "id": 2},
+                {**comment("Done"), "id": 3},
+            ],
+        ),
+        file_thread(
+            5,
+            {"filePath": "/src/old.py", "leftFileStart": {"line": 3}, "leftFileEnd": {"line": 5}},
+            status="fixed",
+        ),
+        file_thread(6, {"filePath": "/README.md"}, status="wontFix"),
+        file_thread(
+            7,
+            {"filePath": "/src/app.py", "rightFileStart": {"line": 20}},
+            left_on=1,
+            tracking={"secondComparingIteration": 2, "origRightFileStart": {"line": 18}},
+        ),
+        file_thread(8, {"filePath": "/src/app.py", "rightFileStart": {"line": 9}}, left_on=1),
+    ]
+    serve_threads(ado_transport, threads)
+
+    page = facet.review_threads(str(tmp_path), reference(), after="", head_sha="", base_sha="")
+
+    def shaped(thread_id: int, **fields: Any) -> dict[str, Any]:
+        url = f"{PR_URL}?discussionId={thread_id}"
+        return {
+            "id": str(thread_id),
+            "path": "src/app.py",
+            "side": "RIGHT",
+            "line": None,
+            "start_line": None,
+            "start_side": None,
+            "original_line": None,
+            "original_start_line": None,
+            "subject_type": "LINE",
+            "resolved": False,
+            "outdated": False,
+            "can_reply": False,
+            "diff_hunk": "",
+            "status_label": "Active",
+            "comments": {
+                "data": [
+                    {
+                        "id": "1",
+                        "author": "Ada",
+                        "body": "Please check",
+                        "minimized": False,
+                        "created_at": "2026-09-01T10:00:00Z",
+                        "url": url,
+                    }
+                ],
+                "has_more": False,
+                "next_cursor": None,
+            },
+            **fields,
+        }
+
+    url = f"{PR_URL}?discussionId=4"
+    assert page == {
+        "data": [
+            shaped(
+                4,
+                line=12,
+                original_line=12,
+                comments={
+                    "data": [
+                        {
+                            "id": "1",
+                            "author": "Bo",
+                            "body": "Rename this",
+                            "minimized": False,
+                            "created_at": "2026-09-01T10:00:00Z",
+                            "url": url,
+                        },
+                        {
+                            "id": "3",
+                            "author": "Ada",
+                            "body": "Done",
+                            "minimized": False,
+                            "created_at": "2026-09-01T10:00:00Z",
+                            "url": url,
+                        },
+                    ],
+                    "has_more": False,
+                    "next_cursor": None,
+                },
+            ),
+            shaped(
+                5,
+                path="src/old.py",
+                side="LEFT",
+                line=5,
+                start_line=3,
+                start_side="LEFT",
+                original_line=5,
+                original_start_line=3,
+                resolved=True,
+                status_label="Resolved",
+            ),
+            shaped(
+                6, path="README.md", subject_type="FILE", resolved=True, status_label="Won't fix"
+            ),
+            shaped(7, line=20, original_line=18),
+            shaped(8, outdated=True, original_line=9),
+        ],
+        "has_more": False,
+        "next_cursor": None,
+        "head_sha": HEAD,
+        "base_sha": BASE,
+    }
+    [threads_request] = [r for r in ado_transport.requests if request_path(r).endswith("/threads")]
+    assert ("$iteration", "2") in request_query(threads_request)
+
+
+def test_review_threads_at_another_iteration_head_name_no_revision(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    serve_threads(
+        ado_transport,
+        [file_thread(4, {"filePath": "/src/app.py", "rightFileStart": {"line": 12}})],
+        iteration_head="d" * 40,
+    )
+
+    page = facet.review_threads(str(tmp_path), reference(), after="", head_sha="", base_sha="")
+
+    assert [thread["id"] for thread in page["data"]] == ["4"]
+    assert (page["head_sha"], page["base_sha"]) == (None, None)
+
+
+def test_a_later_review_thread_page_is_empty_unless_the_pr_moved(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request())
+
+    page = facet.review_threads(
+        str(tmp_path), reference(), after="1", head_sha=HEAD, base_sha=BASE
+    )
+
+    assert page == {
+        "data": [],
+        "has_more": False,
+        "next_cursor": None,
+        "head_sha": HEAD,
+        "base_sha": BASE,
+    }
+    with pytest.raises(ValueError, match="pull request changed"):
+        facet.review_threads(
+            str(tmp_path), reference(), after="1", head_sha="d" * 40, base_sha=BASE
+        )
+
+
+def test_review_thread_comments_after_a_comment_come_from_that_thread(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    comments = [{**comment("First"), "id": 1}, {**comment("Second", author="Bo"), "id": 2}]
+    right = {"filePath": "/src/app.py", "rightFileStart": {"line": 12}}
+    ado_transport.route(
+        "GET", f"{PULL}/threads", json={"value": [file_thread(4, right, comments=comments)]}
+    )
+
+    result = facet.review_thread_comments(str(tmp_path), reference(), thread_id="4", after="1")
+
+    assert [entry["body"] for entry in result["data"]] == ["Second"]
+    assert (result["has_more"], result["next_cursor"]) == (False, None)
+    with pytest.raises(ValueError, match="unavailable on the selected pull request"):
+        facet.review_thread_comments(str(tmp_path), reference(), thread_id="9", after="1")
+
+
+def test_review_threads_that_cannot_be_read_raise(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    serve_threads(ado_transport, [])
+    fail(ado_transport, f"{PULL}/threads", 503)
+
+    with pytest.raises(ValueError, match="could not load review conversations"):
+        facet.review_threads(str(tmp_path), reference(), after="", head_sha="", base_sha="")
 
 
 # ---------------------------------------------------------------------------
@@ -1459,6 +1797,144 @@ def test_pr_diff_for_a_pr_outside_the_workspace_remote(
     assert ado_transport.requests == []
 
 
+# ---------------------------------------------------------------------------
+# Commits
+# ---------------------------------------------------------------------------
+
+
+def commit_ref(sha: str, message: str) -> dict[str, Any]:
+    """Return a pull request commit as the REST API lists it."""
+    return {"commitId": sha, "comment": message, "author": {"name": "Ada", "date": "2026-09-01"}}
+
+
+def test_commits_are_listed_oldest_first_across_pages(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request())
+    pages = iter(
+        [
+            httpx.Response(
+                200,
+                json={"value": [commit_ref("e" * 40, "Second\n\nDetails")]},
+                headers={"x-ms-continuationtoken": "next"},
+            ),
+            httpx.Response(200, json={"value": [commit_ref("f" * 40, "First")]}),
+        ]
+    )
+    ado_transport.route("GET", f"{PULL}/commits", handler=lambda _request: next(pages))
+
+    result = facet.commits(str(tmp_path), reference(), head_sha=HEAD)
+
+    def shaped(sha: str, title: str) -> dict[str, Any]:
+        return {
+            "object": "session.github.commit",
+            "sha": sha,
+            "title": title,
+            "author": "Ada",
+            "date": "2026-09-01",
+        }
+
+    assert result == {
+        "object": "list",
+        "data": [shaped("f" * 40, "First"), shaped("e" * 40, "Second")],
+        "has_more": False,
+    }
+    first, second = [r for r in ado_transport.requests if request_path(r).endswith("/commits")]
+    assert ("continuationToken", "next") not in request_query(first)
+    assert ("continuationToken", "next") in request_query(second)
+
+
+def test_commits_past_the_cap_report_more(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(azure_devops_facet, "_MAX_PR_COMMITS", 1)
+    ado_transport.route("GET", PULL, json=pull_request())
+    ado_transport.route(
+        "GET",
+        f"{PULL}/commits",
+        json={"value": [commit_ref("e" * 40, "Second")]},
+        headers={"x-ms-continuationtoken": "next"},
+    )
+
+    result = facet.commits(str(tmp_path), reference(), head_sha=HEAD)
+
+    assert [commit["sha"] for commit in result["data"]] == ["e" * 40]
+    assert result["has_more"] is True
+
+
+def test_commits_of_a_pr_that_moves_during_the_listing_are_refused(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    heads = iter([HEAD, "d" * 40])
+    ado_transport.route(
+        "GET",
+        PULL,
+        handler=lambda _request: httpx.Response(200, json=pull_request(head=next(heads))),
+    )
+    ado_transport.route("GET", f"{PULL}/commits", json={"value": []})
+
+    with pytest.raises(ValueError, match="pull request changed"):
+        facet.commits(str(tmp_path), reference(), head_sha=HEAD)
+
+
+def test_commit_diff_is_one_pr_commit_against_its_parent(
+    facet: AzureDevOpsPullRequests, forge: Forge, ado_transport: RecordingTransport
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request(head=forge.head_sha, base=forge.base_sha))
+    ado_transport.route(
+        "GET", f"{PULL}/commits", json={"value": [commit_ref(forge.head_sha, "feature")]}
+    )
+
+    result = facet.commit_diff(str(forge.workspace), reference(), commit_sha=forge.head_sha)
+
+    assert result == {"object": "session.github.pr_diff", "patch": result["patch"]}
+    assert "rename from old_name.py\nrename to new_name.py" in result["patch"]
+    # Only the PR's own commits are served, not any commit the credential can read.
+    with pytest.raises(ValueError, match="not part of the selected pull request"):
+        facet.commit_diff(str(forge.workspace), reference(), commit_sha=forge.base_sha)
+
+
+def test_compare_diff_shows_the_changes_after_a_pr_commit(
+    facet: AzureDevOpsPullRequests, forge: Forge, ado_transport: RecordingTransport
+) -> None:
+    (forge.seed / "added.py").write_text("newer\n")
+    git(forge.seed, "commit", "-am", "second")
+    git(forge.seed, "push", "origin", "feature")
+    head = git(forge.seed, "rev-parse", "HEAD")
+    ado_transport.route("GET", PULL, json=pull_request(head=head, base=forge.base_sha))
+    listed = [commit_ref(head, "second"), commit_ref(forge.head_sha, "feature")]
+    ado_transport.route("GET", f"{PULL}/commits", json={"value": listed})
+
+    result = facet.compare_diff(
+        str(forge.workspace), reference(), head_sha=head, from_sha=forge.head_sha
+    )
+
+    assert re.findall(r"^diff --git .*$", result["patch"], flags=re.MULTILINE) == [
+        "diff --git a/added.py b/added.py"
+    ]
+
+
+def test_commit_diff_of_a_pr_outside_the_workspace_is_unavailable(
+    facet: AzureDevOpsPullRequests, workspace: Path, ado_transport: RecordingTransport
+) -> None:
+    pull = "/contoso/other/_apis/git/repositories/lib/pullrequests/7"
+    ado_transport.route("GET", pull, json=pull_request())
+    ado_transport.route("GET", f"{pull}/commits", json={"value": [commit_ref(HEAD, "feature")]})
+
+    result = facet.commit_diff(
+        str(workspace), reference(repository="contoso/other/lib"), commit_sha=HEAD
+    )
+
+    assert result == {
+        "object": "session.github.pr_diff",
+        "patch": "",
+        "unavailable_reason": "pr_outside_workspace",
+    }
+
+
 def test_file_diff_reads_local_commits_with_git(
     facet: AzureDevOpsPullRequests, forge: Forge, ado_transport: RecordingTransport
 ) -> None:
@@ -1703,7 +2179,7 @@ def test_set_preference_rejects_account_and_remote_choices(
 
 
 def test_module_instance_handles_unsupported_actions(tmp_path: Path) -> None:
-    assert PULL_REQUESTS.capabilities.to_json() == NO_CAPABILITIES
+    assert PULL_REQUESTS.capabilities.to_json() == CAPABILITIES
     assert PULL_REQUESTS.shell_pr_operations([]) == []
     assert PULL_REQUESTS.pr_from_object({"url": PR_URL}) is None
     assert PULL_REQUESTS.mcp_prs("create_pull_request", {}, {}) is None
@@ -1712,6 +2188,8 @@ def test_module_instance_handles_unsupported_actions(tmp_path: Path) -> None:
         PULL_REQUESTS.repo_labels(str(tmp_path), reference())
     with pytest.raises(ValueError, match="labels is not supported"):
         PULL_REQUESTS.edit_labels(str(tmp_path), reference(), add=["bug"], remove=[])
+    with pytest.raises(ValueError, match="conversations is not supported"):
+        PULL_REQUESTS.reply_to_review_thread(str(tmp_path), reference(), thread_id="4", body="")
 
 
 def test_importing_the_facet_loads_neither_httpx_nor_the_rest_client() -> None:

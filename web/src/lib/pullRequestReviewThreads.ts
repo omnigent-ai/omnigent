@@ -66,6 +66,8 @@ export interface ReviewThread {
   original_start_line?: number | null;
   subject_type: "LINE" | "FILE";
   resolved: boolean;
+  /** The provider's status name, e.g. "Won't fix"; absent when it only reports `resolved`. */
+  status_label?: string | null;
   outdated: boolean;
   can_reply: boolean;
   diff_hunk: string;

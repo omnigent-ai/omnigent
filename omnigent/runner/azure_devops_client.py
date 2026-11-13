@@ -516,13 +516,44 @@ class AzureDevOpsClient:
         )
         return _list_field(payload, "value")
 
-    def threads(self, project: str, repo: str, pr_id: int) -> list[dict[str, Any]]:
+    def threads(
+        self, project: str, repo: str, pr_id: int, *, iteration: int | None = None
+    ) -> list[dict[str, Any]]:
         """List the comment threads of a pull request.
 
+        :param iteration: Track thread positions to this iteration, the right side of the diff.
         :raises AzureDevOpsError: On a non-2xx response.
         """
-        payload = self._get_json([*_pull_request_segments(project, repo, pr_id), "threads"])
+        payload = self._get_json(
+            [*_pull_request_segments(project, repo, pr_id), "threads"],
+            [] if iteration is None else [("$iteration", iteration)],
+        )
         return _list_field(payload, "value")
+
+    def pull_request_commits(
+        self, project: str, repo: str, pr_id: int, limit: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """List up to ``limit`` of a pull request's commits, in the order Azure DevOps sends them.
+
+        Pages through the endpoint 100 commits at a time with its continuation token.
+
+        :returns: The commits, and whether the pull request has more.
+        :raises AzureDevOpsError: On a non-2xx response.
+        """
+        segments = [*_pull_request_segments(project, repo, pr_id), "commits"]
+        commits: list[dict[str, Any]] = []
+        continuation = ""
+        while len(commits) < limit:
+            params: list[tuple[str, str | int]] = [("$top", min(_PAGE_SIZE, limit - len(commits)))]
+            if continuation:
+                params.append(("continuationToken", continuation))
+            response = self._send(segments, params)
+            batch = _list_field(_parse(response), "value")
+            commits.extend(batch)
+            continuation = response.headers.get("x-ms-continuationtoken") or ""
+            if not continuation or not batch:
+                return commits[:limit], len(commits) > limit
+        return commits[:limit], True
 
     def item_content(self, project: str, repo: str, path: str, commit: str) -> str | None:
         """Return the text of ``path`` at ``commit``.

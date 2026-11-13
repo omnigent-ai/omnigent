@@ -160,6 +160,7 @@ def test_real_builder_preserves_forge_cli_settings(harness, hostile_env, monkeyp
         "GLAB_CONFIG_DIR": "/test/glab",
         "GITLAB_HOST": "git.example.test:8443",
         "GLAB_HOST": "git.example.test:8443",
+        "AZURE_CONFIG_DIR": "/test/azure",
     }
     monkeypatch.setattr("os.environ", {**hostile_env, **settings})
     env = SPAWN_ENV_BUILDERS[harness]()

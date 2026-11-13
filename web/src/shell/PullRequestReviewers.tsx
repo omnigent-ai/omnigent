@@ -104,9 +104,12 @@ function PullRequestReviewerRow({
   edit?: ReviewerEdit;
   onToggle?: () => void;
 }) {
-  const state = REVIEWER_STATE_META[reviewer.state];
+  // A newer host can send a state this client doesn't know.
+  const state = Object.hasOwn(REVIEWER_STATE_META, reviewer.state)
+    ? REVIEWER_STATE_META[reviewer.state]
+    : { label: reviewer.state, className: "text-muted-foreground", Icon: CircleDotIcon };
   const StateIcon = edit ? Loader2Icon : state.Icon;
-  const stateLabel = edit ? REVIEWER_EDIT_LABEL[edit] : state.label;
+  const stateLabel = edit ? REVIEWER_EDIT_LABEL[edit] : reviewer.state_label || state.label;
   const subject = reviewerSubject(reviewer);
   const pending = reviewer.state === "PENDING";
 

@@ -56,6 +56,7 @@ NO_CAPABILITIES = {
     "commit_history": False,
     "merge_as_account": False,
 }
+CAPABILITIES = {**NO_CAPABILITIES, "review_threads": True, "commit_history": True}
 LEGACY_FIELDS = {"gh_available", "authenticated", "accounts", "selected_account"}
 CHANGES = [
     {"changeType": "edit", "item": {"path": "/src/app.py", "gitObjectType": "blob"}},
@@ -198,7 +199,7 @@ def test_pr_info_returns_the_azure_devops_payload_for_the_branch_pr(
     info = pr_resource.pr_info(str(workspace), session_id=SESSION)
 
     assert info["provider"] == "azure_devops"
-    assert info["capabilities"] == NO_CAPABILITIES
+    assert info["capabilities"] == CAPABILITIES
     assert info["auth"]["cli"] == {"name": "az", "available": False}
     assert not LEGACY_FIELDS & info.keys()
     assert info["repo"] == {"name_with_owner": "contoso/web/app"}
@@ -372,18 +373,37 @@ def test_changed_files_of_a_tracked_pr_come_from_azure_devops(
     assert paths(ado_transport) == [f"{PULL}/iterations", f"{PULL}/iterations/2/changes"]
 
 
-def test_commit_history_is_refused_for_azure_devops_pull_requests(workspace: Path) -> None:
+def test_commits_and_conversations_of_a_tracked_pr_come_from_azure_devops(
+    workspace: Path, ado_transport: RecordingTransport
+) -> None:
     track(PR_URL)
+    ado_transport.route("GET", PULL, json=pull_request())
+    listed = [
+        {"commitId": "e" * 40, "comment": "Second"},
+        {"commitId": "f" * 40, "comment": "First"},
+    ]
+    ado_transport.route("GET", f"{PULL}/commits", json={"value": listed})
+    iterations = [{"id": 1, "sourceRefCommit": {"commitId": "a" * 40}}]
+    ado_transport.route("GET", f"{PULL}/iterations", json={"value": iterations})
+    thread = {
+        "id": 4,
+        "status": "active",
+        "threadContext": {"filePath": "/src/app.py", "rightFileStart": {"line": 3}},
+        "comments": [{"id": 1, "content": "Rename this", "commentType": "text"}],
+    }
+    ado_transport.route("GET", f"{PULL}/threads", json={"value": [thread]})
 
-    assert AzureDevOpsPullRequests().capabilities.commit_history is False
-    message = "Listing commits is not supported for Azure DevOps pull request"
-    with pytest.raises(ValueError, match=message):
-        pr_resource.pr_commits(
-            str(workspace), session_id=SESSION, pr_url=PR_URL, head_sha="a" * 40
-        )
-    with pytest.raises(ValueError, match=message):
-        pr_resource.pr_commit_diff(
-            str(workspace), session_id=SESSION, pr_url=PR_URL, commit_sha="a" * 40
+    commits = pr_resource.pr_commits(
+        str(workspace), session_id=SESSION, pr_url=PR_URL, head_sha="a" * 40
+    )
+    threads = pr_resource.pr_review_threads(str(workspace), session_id=SESSION, pr_url=PR_URL)
+
+    assert [commit["title"] for commit in commits["data"]] == ["First", "Second"]
+    assert [(entry["path"], entry["line"]) for entry in threads["data"]] == [("src/app.py", 3)]
+    assert (threads["head_sha"], threads["base_sha"]) == ("a" * 40, "b" * 40)
+    with pytest.raises(ValueError, match="Review conversations on Azure DevOps pull request"):
+        pr_resource.reply_to_pr_review_thread(
+            str(workspace), session_id=SESSION, pr_url=PR_URL, thread_id="4", body="Done"
         )
 
 
