@@ -1246,6 +1246,9 @@ def _signal_harness_elicitation_resolved_by_id(
     """
     Resolve or pre-resolve one parked harness elicitation by id.
 
+    A severed wait's card awaiting a hook re-park clears at once too,
+    instead of expiring as unanswered after the re-park grace.
+
     :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
     :param elicitation_id: Harness elicitation id, e.g.
         ``"elicit_codex_abc123"``.
@@ -1267,6 +1270,10 @@ def _signal_harness_elicitation_resolved_by_id(
     _prune_pre_resolved_harness_elicitations()
     parked = _harness_parked_elicitations.get(elicitation_id)
     if parked is None:
+        severed = _harness_severed_elicitations.get(elicitation_id)
+        if severed is not None and severed.session_id == session_id:
+            # Its woken deferred clear publishes the resolved card.
+            severed.resolved_elsewhere.set()
         _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
             session_id=session_id,
             created_at=time.time(),

@@ -4515,6 +4515,67 @@ async def test_codex_hook_gap_verdict_returned_on_repost(
         pending_elicitations.reset_for_tests()
 
 
+async def test_codex_resolved_event_clears_severed_card(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Another Codex client answering while the hook is between polls clears
+    the web card at once, and the retry adopts that terminal resolution
+    instead of re-asking or later expiring the card as unanswered.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    async def _disconnect_immediately(_request: Any) -> None:
+        return
+
+    monkeypatch.setattr(sessions_route, "_poll_request_disconnect", _disconnect_immediately)
+    pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(client, "test-codex-resolved-severed")
+    session_id = await _create_session(client, agent["id"])
+
+    collector = await start_session_stream_collector(session_id)
+    try:
+        severed = await client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=_CODEX_REPARK_PAYLOAD,
+        )
+        assert severed.status_code == 200, severed.text
+        assert severed.content == b""
+        request_event = await collector.next_event()
+        assert request_event["type"] == "response.elicitation_request"
+        elicitation_id = request_event["elicitation_id"]
+        assert elicitation_id in _harness_severed_elicitations
+
+        resolved_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_elicitation_resolved",
+                "data": {"elicitation_id": elicitation_id},
+            },
+        )
+        assert resolved_resp.status_code == 202, resolved_resp.text
+        # Well inside the unpatched re-park grace.
+        resolved = await collector.next_event(timeout=5.0)
+        assert resolved["type"] == "response.elicitation_resolved", resolved
+        assert resolved["elicitation_id"] == elicitation_id
+        assert "reason" not in resolved, resolved
+        assert pending_elicitations.count_for(session_id) == 0
+
+        retry = await client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=_CODEX_REPARK_PAYLOAD,
+        )
+        assert retry.status_code == 200, retry.text
+        assert retry.content == b""
+        for task in set(sessions_route._deferred_elicitation_clear_tasks):
+            await asyncio.wait_for(task, timeout=5.0)
+        await collector.assert_no_event(within=0.2)
+    finally:
+        await collector.stop()
+        pending_elicitations.reset_for_tests()
+
+
 # ── Antigravity elicitation hook tests ──────────────────────────────────────
 
 
