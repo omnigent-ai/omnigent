@@ -786,6 +786,7 @@ async def test_reminder_creates_a_one_time_task_that_continues_this_session() ->
         "permission_mode": None,
         "session_mode": "continue",
         "session_id": "conv_1",
+        "kind": "reminder",
         "first_run_at": 1794351660,  # 2026-11-10T23:01:00Z
     }
     assert client.headers[-1] == {

@@ -64,7 +64,12 @@ from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
 )
-from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.rrule import (
+    RRuleSearchError,
+    RRuleValidationError,
+    is_one_time_rule,
+    validate_rrule,
+)
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
@@ -147,6 +152,9 @@ class CreateScheduledTaskRequest(BaseModel):
     source_session_id: str | None = Field(default=None, min_length=1)
     # Expected first-run epoch; reject the create if the schedule resolves differently.
     first_run_at: int | None = Field(default=None, gt=0, le=_MAX_FIRST_RUN_AT)
+    # "reminder" marks a one-time message into session_id, which clients can list
+    # apart from automations.
+    kind: Literal["automation", "reminder"] = "automation"
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
@@ -158,6 +166,12 @@ class CreateScheduledTaskRequest(BaseModel):
             raise ValueError(_SESSION_ID_WITHOUT_CONTINUE_MSG)
         if self.source_session_id is not None and self.session_mode != "new":
             raise ValueError(_SOURCE_SESSION_CONTINUE_MSG)
+        if self.kind == "reminder" and (
+            self.session_id is None or not is_one_time_rule(self.rrule)
+        ):
+            raise ValueError(
+                "kind 'reminder' needs a one-time (COUNT=1) rule that continues a given session_id"
+            )
         _validate_worktree_target(
             self.base_branch, self.execution_target, self.host_id, self.workspace
         )
@@ -268,6 +282,7 @@ def _to_response(
         "session_mode": task.session_mode,
         "session_id": task.session_id,
         "source_session_id": task.source_session_id,
+        "kind": task.kind,
         "workspace": task.workspace,
         "base_branch": task.base_branch,
         "host_id": task.host_id,
@@ -1041,6 +1056,7 @@ def create_scheduled_tasks_router(
                 project_id=project_id,
                 execution_target=body.execution_target,
                 first_run_at=body.first_run_at,
+                kind=body.kind,
             )
         except Exception as exc:
             if source_copy is not None:

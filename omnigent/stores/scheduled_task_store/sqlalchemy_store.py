@@ -27,10 +27,12 @@ from omnigent.db.db_models import (
 from omnigent.db.enum_codecs import (
     SCHEDULED_TASK_STATE,
     decode_scheduled_task_execution_target,
+    decode_scheduled_task_kind,
     decode_scheduled_task_run_status,
     decode_scheduled_task_session_mode,
     decode_scheduled_task_state,
     encode_scheduled_task_execution_target,
+    encode_scheduled_task_kind,
     encode_scheduled_task_run_status,
     encode_scheduled_task_session_mode,
     encode_scheduled_task_state,
@@ -50,6 +52,7 @@ from omnigent.server.scheduled.run_reconciler import (
 )
 from omnigent.server.scheduled.schedule import (
     continued_sandbox_host_id,
+    fits_reminder,
     is_trigger_automation,
     next_scheduled_time,
     occurrence_host_id,
@@ -140,6 +143,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         mcp_services=decode_mcp_services(row.mcp_services),
         max_cost_usd=row.max_cost_usd,
         session_mode=decode_scheduled_task_session_mode(row.session_mode),
+        kind=decode_scheduled_task_kind(row.kind),
         session_id=row.session_id,
         source_session_id=row.source_session_id,
         workspace=row.workspace,
@@ -263,8 +267,25 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         state: str = "active",
         delegation_ref: str | None = None,
         first_run_at: int | None = None,
+        kind: str = "automation",
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
+        encoded_kind = encode_scheduled_task_kind(kind)
+        if kind == "reminder" and not fits_reminder(
+            ScheduledTask(
+                id=scheduled_task_id,
+                name=name,
+                prompt=prompt,
+                rrule=rrule,
+                user_id=user_id,
+                agent_id=agent_id,
+                timezone=timezone,
+                created_at=0,
+                session_mode=session_mode,
+                session_id=session_id,
+            )
+        ):
+            raise ValueError("a reminder needs a one-time rule that continues a given session")
         created_at = now_epoch()
 
         def write(session: Session) -> ScheduledTask:
@@ -284,6 +305,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 mcp_services=encode_mcp_services(mcp_services),
                 max_cost_usd=max_cost_usd,
                 session_mode=encode_scheduled_task_session_mode(session_mode),
+                kind=encoded_kind,
                 session_id=session_id,
                 source_session_id=source_session_id,
                 workspace=workspace,
@@ -550,6 +572,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 row.last_run_conversation_id != last_run_conversation_id
             ):
                 row.last_run_conversation_id = last_run_conversation_id
+                changed = True
+            if row.kind == encode_scheduled_task_kind("reminder") and not fits_reminder(
+                _to_entity(row)
+            ):
+                # An edit that makes it recur or leave its session makes it an automation.
+                row.kind = encode_scheduled_task_kind("automation")
                 changed = True
             # Becoming or ceasing to be a trigger changes who picks the next poll.
             trigger_changed = (

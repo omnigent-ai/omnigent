@@ -2253,6 +2253,15 @@
             ],
             "title": "Host Id"
           },
+          "kind": {
+            "default": "automation",
+            "enum": [
+              "automation",
+              "reminder"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
           "max_cost_usd": {
             "anyOf": [
               {

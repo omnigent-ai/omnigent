@@ -5320,6 +5320,7 @@ async def _execute_reminder_set(
                 "permission_mode": None,
                 "session_mode": "continue",
                 "session_id": conversation_id,
+                "kind": "reminder",
                 # The server refuses the task unless its first run is this minute,
                 # so a request that arrives late can't move to next year's match.
                 "first_run_at": int(when.timestamp()),

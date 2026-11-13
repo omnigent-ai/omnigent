@@ -118,6 +118,76 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.host_id is None
     assert task.delegation_ref is None
     assert task.state == "active"
+    assert task.kind == "automation"
+
+
+_REMINDER_RULE = "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=14;BYHOUR=15;BYMINUTE=0;BYSECOND=0;COUNT=1"
+
+
+def _reminder_fields(**overrides: Any) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "name": "Reminder: check CI",
+        "prompt": "check CI",
+        "rrule": _REMINDER_RULE,
+        "user_id": "u",
+        "agent_id": _uid("ag"),
+        "timezone": "UTC",
+        "session_mode": "continue",
+        "session_id": _uid("conv"),
+        "kind": "reminder",
+    }
+    fields.update(overrides)
+    return fields
+
+
+def test_a_reminder_round_trips(store: SqlAlchemyScheduledTaskStore) -> None:
+    created = store.create(scheduled_task_id=_uid("st_reminder"), **_reminder_fields())
+    assert created.kind == "reminder"
+    assert store.get(created.id).kind == "reminder"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rrule": "FREQ=MINUTELY"},
+        {"session_id": None},
+        {"session_mode": "new", "session_id": None},
+    ],
+    ids=["recurring", "no_session", "new_session_mode"],
+)
+def test_create_refuses_a_reminder_that_does_not_fit(
+    store: SqlAlchemyScheduledTaskStore, overrides: dict[str, Any]
+) -> None:
+    with pytest.raises(ValueError, match="a reminder needs"):
+        store.create(scheduled_task_id=_uid("st_bad_reminder"), **_reminder_fields(**overrides))
+    assert store.list() == []
+
+
+def test_create_rejects_an_unknown_kind(store: SqlAlchemyScheduledTaskStore) -> None:
+    with pytest.raises(ValueError, match=r"scheduled_tasks\.kind"):
+        store.create(scheduled_task_id=_uid("st_bad_kind"), **_reminder_fields(kind="trigger"))
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"rrule": "FREQ=MINUTELY"},
+        {"session_id": None},
+        {"session_mode": "new", "session_id": None},
+    ],
+    ids=["recurs", "leaves_its_session", "new_session_mode"],
+)
+def test_an_edit_that_stops_a_reminder_fitting_makes_it_an_automation(
+    store: SqlAlchemyScheduledTaskStore, edit: dict[str, Any]
+) -> None:
+    task_id = store.create(scheduled_task_id=_uid("st_demote"), **_reminder_fields()).id
+    assert store.update(task_id, name="renamed").kind == "reminder"
+    assert store.update(task_id, **edit).kind == "automation"
+    # Restoring the old shape does not make it a reminder again.
+    restored = store.update(
+        task_id, rrule=_REMINDER_RULE, session_mode="continue", session_id=_uid("conv")
+    )
+    assert restored.kind == "automation"
 
 
 # ── state enum ────────────────────────────────────────────────────────────────

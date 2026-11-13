@@ -123,6 +123,7 @@ class ScheduledTaskStore(ABC):
         state: str = "active",
         delegation_ref: str | None = None,
         first_run_at: int | None = None,
+        kind: str = "automation",
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -162,10 +163,13 @@ class ScheduledTaskStore(ABC):
         :param first_run_at: Epoch seconds the first run must fall at, checked
             against the schedule computed from the task's recorded creation timestamp, in
             the same write. ``None`` skips the check.
+        :param kind: ``"automation"`` (default), or ``"reminder"`` for a one-time
+            (``COUNT=1``) task that continues ``session_id``.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ScheduledTaskFirstRunMismatchError: If ``first_run_at`` is set and
             the first run differs; nothing is saved.
-        :raises ValueError: If ``state`` is not a recognized value.
+        :raises ValueError: If ``state`` or ``kind`` is not a recognized value, or a
+            reminder's rule, session mode or session doesn't fit one.
         """
         ...
 
