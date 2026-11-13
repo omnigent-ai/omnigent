@@ -216,12 +216,12 @@ def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
     stale = service.enable_user_host_service("https://example.com", environment=environment)
     assert _recorded_command(stale)[0] == str(cache_python)
     calls.clear()
+    shutil.rmtree(cache_venv)
 
     installed = service.enable_user_host_service(
         "https://example.com",
         environment={**environment, "OMNIGENT_WRAPPER_COMMAND": "wrapper omni"},
     )
-    shutil.rmtree(cache_venv)
 
     command = _recorded_command(installed)
     assert os.access(command[0], os.X_OK), f"service launches missing {command[0]}"

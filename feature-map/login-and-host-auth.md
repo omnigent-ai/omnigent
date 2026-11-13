@@ -317,7 +317,7 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   in plaintext in the per-user service definition, readable only by its owner
   (0600), so the service can retain them across logins.
 - Under a CLI wrapper (`OMNIGENT_WRAPPER_COMMAND`), `host enable` launches the
-  service through the wrapper's resolved path and the hidden `host service-entry`
+  service through the wrapper's resolved path and the hidden `host-service-entry`
   command, not the current interpreter, which can live in a cache venv deleted
   between boots. Re-running `host enable` repairs a service definition that still
   names a missing cache interpreter.
