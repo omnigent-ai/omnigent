@@ -274,6 +274,15 @@ def test_native_parent_teardown_preserves_child_outcome(
             )
 
         host = _wait(online_host, "real host registration")
+        # The online row can precede the live tunnel used for workspace validation.
+        _wait(
+            lambda: (
+                client.get(
+                    f"/v1/hosts/{host['host_id']}/filesystem", params={"limit": 1}
+                ).is_success
+            ),
+            "host filesystem RPC readiness",
+        )
         spec = {
             "name": "native-teardown-parent",
             "prompt": "Delegate research to the worker using sys_session_send.",

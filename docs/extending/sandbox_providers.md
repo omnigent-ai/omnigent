@@ -2,9 +2,15 @@
 
 Omnigent supports running agent hosts in remote sandboxes. Built-in providers
 (Modal, Daytona, Blaxel, CoreWeave Sandbox, E2B, Gensee, Islo, OpenShell,
-Boxlite, Kubernetes, microsandbox)
+Boxlite, Kubernetes, microsandbox, and experimental Substrate)
 ship with the core package. Third-party packages can add new providers through
 the `omnigent.sandbox_providers` entrypoint group.
+
+The experimental `substrate` provider runs managed hosts as Agent Substrate
+Actors while the server stays on Kubernetes. See the
+[deployment runbook](../../deploy/kubernetes/overlays/substrate-runners/README.md)
+for prerequisites and qualification limits. Updated hosts support automatic
+work-aware idle suspension; exported memory snapshots remain unsupported.
 
 ## Harness providers and model lists
 
@@ -234,7 +240,10 @@ Disabling `reaper.enabled` stops age-based offline cleanup. Retries of teardown
 already requested by session or host deletion continue running.
 
 The server resolves the provider through the registry and calls
-`prepare()` → `provision()` → `start_host()` → wait for online registration.
+`prepare()` → `provision()` → register the managed host → `materialize()` →
+`start_host()` → wait for online registration. `materialize()` defaults to
+returning the provisioned ID unchanged. Providers reserving an ID can allocate
+there; the server persists the returned concrete ID before activation.
 Each managed sandbox authenticates back with a server-minted per-launch token.
 `start_host()` must start the host under the `host_id` it is given: the token
 only resolves for that id, and a client may have chosen the id at create time

@@ -848,6 +848,16 @@ def test_encode_injects_traceparent_under_active_span() -> None:
     assert decoded.workspace == "/tmp/ws"
 
 
+def test_quiescence_frames_round_trip() -> None:
+    from omnigent.host.frames import HostQuiesceFrame, HostQuiesceResultFrame
+
+    for frame in (
+        HostQuiesceFrame("operation", "generation"),
+        HostQuiesceResultFrame("operation", "busy"),
+    ):
+        assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
 def test_hello_frame_round_trip() -> None:
     """
     Verify HostHelloFrame survives encode → decode.

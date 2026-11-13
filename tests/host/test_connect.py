@@ -967,6 +967,106 @@ async def test_local_host_does_not_dial_port_after_its_server_exits(
     assert _connection_refused(refused.value)
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("_runners", {"runner": object()}),
+        ("_idle_runners", [object()]),
+        ("_pending_runner_launches", {"runner": set()}),
+        ("_runner_stop_tasks", {object()}),
+        ("_owned_subprocess_ops", 1),
+        ("_active_harness_logins", {"login": object()}),
+        ("_idle_uncertain", True),
+    ],
+)
+async def test_idle_quiesce_refuses_work_and_uncertainty(monkeypatch, field, value):
+    from omnigent.host.idle import activation_generation
+
+    monkeypatch.setenv("OMNIGENT_HOST_IDLE_SUSPEND", "1")
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    host = _make_host_process()
+    host._idle_seen_runner = True
+    assert host._can_quiesce_idle(activation_generation())
+    setattr(host, field, value)
+    assert not host._can_quiesce_idle(activation_generation())
+    assert not host._idle_quiescing
+
+
+async def test_idle_quiesce_latches_before_ack_and_rejects_late_launch(monkeypatch):
+    from omnigent.host.frames import HostQuiesceFrame, HostQuiesceResultFrame
+    from omnigent.host.idle import activation_generation
+
+    monkeypatch.setenv("OMNIGENT_HOST_IDLE_SUSPEND", "1")
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    host = _make_host_process()
+    host._idle_seen_runner = True
+    ws = AsyncMock()
+    await host._dispatch_host_frame(ws, HostQuiesceFrame("quiesce", activation_generation()))
+    assert host._idle_quiescing
+    result = decode_host_frame(ws.send.call_args_list[0].args[0])
+    assert isinstance(result, HostQuiesceResultFrame) and result.status == "ok"
+    ws.close.assert_awaited_once()
+    host._handle_launch = AsyncMock()
+    await host._dispatch_host_frame(ws, HostLaunchRunnerFrame("late", "binding", "/work"))
+    host._handle_launch.assert_not_awaited()
+    assert decode_host_frame(ws.send.call_args.args[0]).error_code == "host_quiescing"
+
+
+@pytest.mark.parametrize("idle_marker", [False, True])
+@pytest.mark.parametrize("other_alive", [False, True])
+async def test_runner_exit_requires_idle_attestation(
+    monkeypatch, tmp_path, idle_marker, other_alive
+):
+    from omnigent.host.idle import activation_generation
+
+    monkeypatch.setenv("OMNIGENT_HOST_IDLE_SUSPEND", "1")
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "launch-token")
+    host = _make_host_process()
+    marker = tmp_path / "launch.connected"
+    marker.touch()
+    if idle_marker:
+        marker.with_suffix(".idle").write_text(json.dumps({"runner_id": "runner", "pid": 123}))
+    proc = Mock(pid=123, returncode=0)
+    proc.poll.return_value = 0
+    handle = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log", connect_marker=marker)
+    host._runners["runner"] = handle
+    host._idle_runners.append(handle)
+    host._idle_seen_runner = True
+    if other_alive:
+        other_marker = tmp_path / "other.connected"
+        other_marker.touch()
+        other_proc = Mock(pid=124, returncode=None)
+        other_handle = _RunnerHandle(
+            proc=other_proc, log_path=tmp_path / "other.log", connect_marker=other_marker
+        )
+        host._runners["other"] = other_handle
+        host._idle_runners.append(other_handle)
+    await host._watch_runner("runner")
+    assert host._can_quiesce_idle(activation_generation()) is (idle_marker and not other_alive)
+    if other_alive:
+        other_marker.with_suffix(".idle").write_text(
+            json.dumps({"runner_id": "other", "pid": 124})
+        )
+        other_proc.returncode = 0
+        other_proc.poll.return_value = 0
+        await host._watch_runner("other")
+        assert host._can_quiesce_idle(activation_generation()) is idle_marker
+
+
+async def test_preflight_refusal_does_not_poison_idle_detection(monkeypatch):
+    monkeypatch.setenv("OMNIGENT_HOST_IDLE_SUSPEND", "1")
+    host = _make_host_process()
+    host._handle_launch = AsyncMock(
+        return_value=HostLaunchRunnerResultFrame(
+            request_id="refused", status="failed", error="harness unavailable"
+        )
+    )
+    await host._dispatch_host_frame(
+        AsyncMock(), HostLaunchRunnerFrame("refused", "binding", "/work")
+    )
+    assert not host._idle_uncertain
+
+
 def _cleanup_host(host: HostProcess) -> None:
     """Terminate a test host's spawned runners and exit watchers.
 

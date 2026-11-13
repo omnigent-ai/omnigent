@@ -757,10 +757,16 @@ class Lab:
                 return None
             for row in response.json().get("hosts", []):
                 if row.get("host_id") == self.host_id and row.get("status") == "online":
-                    return True
+                    # The row is committed before the live tunnel is registered.
+                    probe = observer.get(
+                        f"/v1/hosts/{self.host_id}/filesystem", params={"limit": 1}
+                    )
+                    return True if probe.status_code == 200 else None
             return None
 
-        wait_for(_online, timeout=_STARTUP_TIMEOUT_S, what="the host daemon to register")
+        wait_for(
+            _online, timeout=_STARTUP_TIMEOUT_S, what="the host daemon to serve filesystem RPCs"
+        )
 
     def _start_runner(self) -> None:
         from omnigent.runner.identity import token_bound_runner_id

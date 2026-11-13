@@ -11,7 +11,8 @@ It shells out to ``grpc_tools.protoc`` (the ``grpcio-tools`` dev dependency),
 which bundles both the compiler and the well-known-type protos, so imports such
 as ``google/protobuf/struct.proto`` resolve with no system ``protoc`` install.
 Service stubs come from the ``protoc-gen-connectrpc`` plugin (also a dev
-dependency), which emits nothing for schemas without a service.
+dependency), which emits nothing for schemas without a service. The vendored
+Substrate schema uses gRPC descriptors directly and needs only message bindings.
 
 Pass ``--check`` to verify the committed bindings are up to date without
 writing: it regenerates into a temp dir, compares, and exits non-zero (printing
@@ -29,6 +30,7 @@ from __future__ import annotations
 import argparse
 import filecmp
 import importlib.util
+import re
 import shutil
 import subprocess
 import sys
@@ -49,6 +51,11 @@ def _protos() -> list[Path]:
     return sorted(p.relative_to(_REPO_ROOT) for p in (_REPO_ROOT / _API_ROOT).rglob("*.proto"))
 
 
+def normalize_stub(text: str) -> str:
+    """Protoc marks extension-number globals ClassVar, which is class-only."""
+    return re.sub(r"(?m)^(\w+: )_ClassVar\[([^\n]+)\]$", r"\1\2", text)
+
+
 def _run_protoc(out_dir: Path) -> None:
     """Compile every API schema into ``out_dir`` (rooted like the repo)."""
     if importlib.util.find_spec("grpc_tools") is None or not _CONNECT_PLUGIN.exists():
@@ -56,20 +63,31 @@ def _run_protoc(out_dir: Path) -> None:
             "grpc_tools or protoc-gen-connectrpc not found. Install the dev dependencies first:\n"
             "  uv sync --group lint"
         )
-    cmd = [
-        sys.executable,
-        "-m",
-        "grpc_tools.protoc",
-        f"--proto_path={_REPO_ROOT}",
-        f"--python_out={out_dir}",
-        f"--pyi_out={out_dir}",
-        f"--plugin=protoc-gen-connectrpc={_CONNECT_PLUGIN}",
-        f"--connectrpc_out={out_dir}",
-        # Stubs use the google protobuf messages that ``--python_out`` emits.
-        "--connectrpc_opt=protobuf=google",
-        *(str(p) for p in _protos()),
-    ]
-    subprocess.run(cmd, check=True, cwd=_REPO_ROOT)
+    for proto in _protos():
+        cmd = [
+            sys.executable,
+            "-m",
+            "grpc_tools.protoc",
+            f"--proto_path={_REPO_ROOT}",
+            f"--python_out={out_dir}",
+            f"--pyi_out={out_dir}",
+        ]
+        # Substrate uses gRPC descriptors, not Connect client/server stubs.
+        if not proto.is_relative_to(_API_ROOT / "substrate"):
+            cmd.extend(
+                [
+                    f"--plugin=protoc-gen-connectrpc={_CONNECT_PLUGIN}",
+                    f"--connectrpc_out={out_dir}",
+                    "--connectrpc_opt=protobuf=google",
+                ]
+            )
+        cmd.append(str(proto))
+        subprocess.run(cmd, check=True, cwd=_REPO_ROOT)
+        stub = out_dir / proto.with_name(f"{proto.stem}_pb2.pyi")
+        original = stub.read_text()
+        normalized = normalize_stub(original)
+        if normalized != original:
+            stub.write_text(normalized)
 
 
 def _generated(root: Path) -> list[Path]:

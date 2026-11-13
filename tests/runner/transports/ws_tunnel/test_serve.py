@@ -2157,7 +2157,10 @@ async def test_handle_tunnel_frame_dispatches_after_malformed_frame() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_tunnel_frame_marks_request_activity() -> None:
+@pytest.mark.parametrize(
+    ("cancel_before_dispatch", "method"), [(False, "GET"), (False, "POST"), (True, "POST")]
+)
+async def test_handle_tunnel_frame_marks_request_activity(method, cancel_before_dispatch) -> None:
     """HTTP request frames reset the runner idle timer.
 
     :returns: None.
@@ -2173,20 +2176,35 @@ async def test_handle_tunnel_frame_marks_request_activity() -> None:
         del text
 
     dispatch_tasks: dict[str, asyncio.Task[None]] = {}
-    raw = encode_frame(RequestFrame(id="req-activity", method="GET", path="/health"))
+    raw = encode_frame(RequestFrame(id="req-activity", method=method, path="/health"))
+    from omnigent.runner.busy_check import MutatingRequestActivity
+
+    activity = MutatingRequestActivity()
+    started = []
+
+    async def app(scope, receive, send):
+        started.append(True)
+        await _noop_app(scope, receive, send)
 
     await _handle_tunnel_frame(
-        _noop_app,
+        app,
         raw,
         _send_text,
         dispatch_tasks,
         {},
         on_activity=lambda: activities.append("activity"),
+        on_request_activity=activity.admit,
     )
 
     task = dispatch_tasks.get("req-activity")
     assert task is not None
+    assert not started
+    assert activity.active == (1 if method == "POST" else 0)
+    if cancel_before_dispatch:
+        task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+    assert activity.active == 0
+    assert bool(started) is not cancel_before_dispatch
     assert activities == ["activity"]
 
 

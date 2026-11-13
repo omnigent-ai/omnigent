@@ -9,3 +9,6 @@ modules:
 lint:
   use:
     - STANDARD
+  # Vendored upstream schema; retain its original names and annotations.
+  ignore:
+    - omnigent/api/substrate

@@ -1,0 +1,11 @@
+# Build the base host from this checkout first, then supply its immutable digest.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+RUN usermod -d /home/omnigent sandbox \
+ && install -d -o sandbox -g sandbox /home/omnigent \
+ && install -d -m 700 -o sandbox -g sandbox /run/omnigent-bootstrap
+ENV HOME=/home/omnigent IS_SANDBOX=1
+WORKDIR /home/omnigent
+USER sandbox
+CMD ["python3", "-m", "omnigent.host.substrate_bootstrap"]

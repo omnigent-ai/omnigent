@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
 import logging
 import re
 import subprocess
@@ -3110,7 +3111,10 @@ def _registering_host(host_store: HostStore) -> Callable[[HostStartInvocation], 
     return _register
 
 
-async def test_launch_persists_start_assigned_sandbox_id(db_uri: str) -> None:
+@pytest.mark.parametrize("before_activation", [False, True])
+async def test_launch_persists_start_assigned_sandbox_id(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, before_activation: bool
+) -> None:
     """
     A provider that assigns the real sandbox id only at start (Lambda
     MicroVMs' run-microvm) has that id persisted over the reserved
@@ -3121,6 +3125,23 @@ async def test_launch_persists_start_assigned_sandbox_id(db_uri: str) -> None:
     fake = FakeSandboxLauncher(
         on_host_start=_registering_host(host_store), started_sandbox_id="microvm-real-1"
     )
+    if before_activation:
+        fake.started_sandbox_id = None
+
+        def materialize(sandbox_id: str) -> str:
+            assert sandbox_id == "sb-fake-1"
+            return "microvm-real-1"
+
+        monkeypatch.setattr(fake, "materialize", materialize)
+        register = fake._on_host_start
+
+        def activated(invocation: HostStartInvocation) -> None:
+            host = host_store.get_host(invocation.host_id)
+            assert host is not None and host.sandbox_id == "microvm-real-1"
+            assert register is not None
+            register(invocation)
+
+        fake._on_host_start = activated
     config = _injected_config(fake)
 
     result = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
@@ -3132,6 +3153,51 @@ async def test_launch_persists_start_assigned_sandbox_id(db_uri: str) -> None:
     await terminate_managed_host(host, host_store, config)
     assert fake.terminated == ["microvm-real-1"]
     assert host_store.get_host(result.host_id) is None
+
+
+async def test_deletion_during_materialization_retains_late_identity(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    entered, finish = threading.Event(), threading.Event()
+    fake = FakeSandboxLauncher(on_host_start=_registering_host(store))
+    config = _injected_config(fake)
+
+    def allocate(_sandbox_id: str) -> str:
+        entered.set()
+        assert finish.wait(5)
+        return "actor-concrete"
+
+    def unavailable(_sandbox_id: str) -> None:
+        raise click.ClickException("Allocation or cleanup is still pending")
+
+    monkeypatch.setattr(fake, "materialize", allocate)
+    monkeypatch.setattr(fake, "terminate", unavailable)
+    launch = asyncio.create_task(
+        launch_managed_host(
+            config=config,
+            owner=_OWNER,
+            host_store=store,
+            host_id=host_id,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        host = store.get_host(host_id)
+        assert host is not None
+        await terminate_managed_host(host, store, config)
+    finally:
+        finish.set()
+    with pytest.raises(HTTPException):
+        await launch
+    tombstone = store.get_host(host_id, include_deleted=True)
+    assert tombstone is not None and tombstone.deleted_at is not None
+    assert tombstone.sandbox_id == "actor-concrete"
+    assert fake.host_starts == []
+    monkeypatch.setattr(fake, "terminate", lambda _: None)
+    await terminate_managed_host(tombstone, store, config)
+    assert store.get_host(host_id, include_deleted=True) is None
 
 
 async def test_launch_failure_terminates_start_assigned_sandbox_id(
@@ -3154,8 +3220,9 @@ async def test_launch_failure_terminates_start_assigned_sandbox_id(
     assert fake.terminated == ["microvm-real-2"]
 
 
+@pytest.mark.parametrize("before_activation", [False, True])
 async def test_launch_terminates_real_sandbox_when_id_write_fails(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, before_activation: bool
 ) -> None:
     """
     If persisting the start-assigned id fails, the row still names the reserved
@@ -3167,20 +3234,28 @@ async def test_launch_terminates_real_sandbox_when_id_write_fails(
     def _failing_write(*_args: object, **_kwargs: object) -> Host | None:
         raise RuntimeError("database unavailable")
 
-    monkeypatch.setattr(host_store, "update_sandbox_id", _failing_write)
+    monkeypatch.setattr(
+        host_store,
+        "bind_materialized_sandbox" if before_activation else "update_sandbox_id",
+        _failing_write,
+    )
     fake = FakeSandboxLauncher(
         on_host_start=_registering_host(host_store), started_sandbox_id="microvm-real-3"
     )
 
+    if before_activation:
+        fake.started_sandbox_id = None
+        monkeypatch.setattr(fake, "materialize", lambda _: "microvm-real-3")
+    host_id = uuid.uuid4().hex
     with pytest.raises(HTTPException) as exc:
         await launch_managed_host(
-            config=_injected_config(fake), owner=_OWNER, host_store=host_store
+            config=_injected_config(fake), owner=_OWNER, host_store=host_store, host_id=host_id
         )
 
     assert exc.value.status_code == 502
     assert "microvm-real-3" in fake.terminated
-    assert len(fake.host_starts) == 1
-    assert host_store.get_host(fake.host_starts[0].host_id) is None
+    assert len(fake.host_starts) == (0 if before_activation else 1)
+    assert host_store.get_host(host_id) is None
 
 
 @pytest.mark.parametrize("superseded", [False, True])
@@ -4827,6 +4902,47 @@ async def test_resume_preserves_host_keeps_token_and_skips_restart(db_uri: str) 
     assert host_store.resolve_launch_token(first.host_id, first_token) is not None
 
 
+@pytest.mark.parametrize("matching_proof", [False, True])
+async def test_preserved_host_credential_renewal_is_generation_checked(
+    db_uri: str,
+    matching_proof: bool,
+) -> None:
+    store = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    token = "expired-host-token"
+    store.register_managed_host(
+        host_id=host_id,
+        name="host",
+        user_id=_OWNER,
+        token=token,
+        provider="lambda_microvm",
+        sandbox_id="actor",
+        token_expires_at=now_epoch() - 1,
+    )
+    fake = _LambdaFakeLauncher()
+    fake.preserved_host_token_hash = hashlib.sha256(
+        (token if matching_proof else "wrong-token").encode()
+    ).hexdigest()
+    assert store.resolve_launch_token(host_id, token) is None
+
+    def reconnect(sandbox_id: str) -> None:
+        fake.resumed.append(sandbox_id)
+        assert store.resolve_launch_token(host_id, token) is not None
+        store.upsert_on_connect(host_id=host_id, name="host", user_id=_OWNER, managed_token=token)
+
+    fake.resume = reconnect
+    if matching_proof:
+        await resume_managed_host(host_id, store, _injected_config(fake))
+        assert store.is_online(host_id)
+        assert fake.resumed == ["actor"]
+    else:
+        with pytest.raises(HTTPException, match="activation changed"):
+            await resume_managed_host(host_id, store, _injected_config(fake))
+        assert store.resolve_launch_token(host_id, token) is None
+        assert fake.resumed == []
+    assert fake.host_starts == []
+
+
 @pytest.mark.parametrize("stale", [False, True])
 @pytest.mark.parametrize("heartbeat", [False, True])
 async def test_lambda_forced_wake_preserves_existing_tunnel_liveness(
@@ -4950,8 +5066,11 @@ async def test_managed_online_timeout_is_applied_at_startup(
     assert result.stdout.strip() == "600 720"
 
 
+@pytest.mark.parametrize("dynamic_probe", [False, True])
 async def test_resume_preserving_host_claims_before_asking_the_provider(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    dynamic_probe: bool,
 ) -> None:
     """A generation the reaper detached first is never resumed, only released."""
     host_store = HostStore(db_uri)
@@ -4978,6 +5097,13 @@ async def test_resume_preserving_host_claims_before_asking_the_provider(
 
     monkeypatch.setattr(host_store, "claim_managed_host_resume", _detach_before_claim)
     fake = _LambdaFakeLauncher()
+    if dynamic_probe:
+
+        def restore_during_probe(sandbox_id: str) -> bool:
+            fake.resumed.append(sandbox_id)
+            return True
+
+        monkeypatch.setattr(fake, "resume_keeps_host", restore_during_probe)
 
     await resume_managed_host(host.host_id, host_store, _injected_config(fake))
 

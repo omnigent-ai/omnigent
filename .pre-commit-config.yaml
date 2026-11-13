@@ -198,7 +198,7 @@ repos:
         name: protobuf bindings are up to date
         language: system
         entry: .venv/bin/python scripts/gen_protobuf.py --check
-        files: ^omnigent/api/.*(\.proto|_pb2\.pyi?|_connect\.py)$
+        files: ^(omnigent/api/.*(\.proto|_pb2\.pyi?|_connect\.py)|scripts/gen_protobuf\.py)$
         pass_filenames: false
 
       # Hold the API protos to buf's STANDARD style rules (buf.yaml). buf comes

@@ -102,6 +102,13 @@ def _canonical_host_id(host_id: str) -> str:
 
 def _fail_pending_harness_startup(conn: HostConnection) -> None:
     """Settle launch settings requests when their tunnel can no longer reply."""
+    for pending in (conn.pending_guarded_launches, conn.pending_quiesce):
+        while pending:
+            _, future = pending.popitem()
+            if not future.done():
+                future.set_exception(
+                    ConnectionError("Host disconnected during a managed operation")
+                )
     while conn.pending_harness_startup:
         _, future = conn.pending_harness_startup.popitem()
         if not future.done():
@@ -542,6 +549,10 @@ class HostConnection:
     pending_launches: dict[str, asyncio.Future[HostLaunchResult]] = field(
         default_factory=dict,
     )
+    pending_guarded_launches: dict[str, asyncio.Future[HostLaunchResult]] = field(
+        default_factory=dict
+    )
+    pending_quiesce: dict[str, asyncio.Future[dict[str, str]]] = field(default_factory=dict)
     pending_stops: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -664,6 +675,7 @@ class HostRegistry:
         feature_flags: FeatureFlags | None = None,
     ) -> None:
         """Initialize an empty host registry with fail-closed launch activation."""
+        self.idle_launch_dispatcher: Callable[[HostConnection, str], bool] | None = None
         self._mcp_disabled_servers = mcp_disabled_servers
         self._feature_flags = feature_flags or FeatureFlags()
         self._lock = threading.RLock()
@@ -985,7 +997,16 @@ class HostRegistry:
                 transfer_from_host_id,
             )
 
+    def connections(self) -> list[HostConnection]:
+        with self._lock:
+            return list(self._hosts.values())
+
     def send_text(self, conn: HostConnection, data: str) -> None:
+        if self.idle_launch_dispatcher is not None and self.idle_launch_dispatcher(conn, data):
+            return
+        self.send_text_direct(conn, data)
+
+    def send_text_direct(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.
 
         Must be called on the host WebSocket's owning event loop.

@@ -65,6 +65,7 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsResultFrame,
     HostProbeAccountsResultFrame,
+    HostQuiesceResultFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -916,7 +917,24 @@ async def _receive_loop(
                     _logger.exception("on_host_update callback failed for %s", host_id)
             continue
 
+        if isinstance(frame, HostQuiesceResultFrame):
+            quiesce_future = conn.pending_quiesce.pop(frame.request_id, None)
+            if quiesce_future is not None and not quiesce_future.done():
+                quiesce_future.set_result({"status": frame.status})
+            continue
+
         if isinstance(frame, HostLaunchRunnerResultFrame):
+            guarded = conn.pending_guarded_launches.pop(frame.request_id, None)
+            if guarded is not None and not guarded.done():
+                guarded.set_result(
+                    {
+                        "status": frame.status,
+                        "runner_id": frame.runner_id,
+                        "error": frame.error,
+                        "error_code": frame.error_code,
+                        "workspace_recreated": frame.workspace_recreated,
+                    }
+                )
             future = conn.pending_launches.pop(frame.request_id, None)
             if future is not None and not future.done():
                 future.set_result(
