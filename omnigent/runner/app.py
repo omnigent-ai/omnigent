@@ -6639,9 +6639,16 @@ def create_runner_app(
                 compatible_env = _compatible_stream_spawn_env(
                     harness_name or "", body["spawn_env"]
                 )
-            except ValueError as exc:
+            except ValueError:
                 return JSONResponse(
-                    status_code=400, content={"error": "invalid_input", "detail": str(exc)}
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": (
+                            "spawn_env must be an object. A model override must be a string "
+                            "without NUL characters."
+                        ),
+                    },
                 )
             if compatible_env and body.get("model_override") is None:
                 legacy_model_env = compatible_env
