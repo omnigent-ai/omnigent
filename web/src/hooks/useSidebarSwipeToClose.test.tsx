@@ -1,7 +1,7 @@
 import { cleanup, render } from "@testing-library/react";
 import { useRef } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { useSidebarSwipeToClose } from "./useSidebarSwipeToClose";
+import { OWNS_LEFT_SWIPE_ATTRIBUTE, useSidebarSwipeToClose } from "./useSidebarSwipeToClose";
 
 const DRAWER_WIDTH = 300;
 const HOLD_MS = 250;
@@ -26,6 +26,9 @@ function Harness(props: {
       <button type="button" ref={scrimRef} data-testid="scrim" />
       <aside ref={drawerRef} data-testid="drawer">
         <div data-testid="row">row</div>
+        <div data-testid="swipe-row" {...{ [OWNS_LEFT_SWIPE_ATTRIBUTE]: "" }}>
+          <span data-testid="swipe-row-title">title</span>
+        </div>
         <div data-testid="scroller" style={{ overflowX: "auto" }}>
           <span data-testid="scroller-content">wide</span>
         </div>
@@ -248,6 +251,17 @@ describe("useSidebarSwipeToClose", () => {
       expect(moves.some((move) => move.defaultPrevented)).toBe(false);
       expect(end.defaultPrevented).toBe(false);
     }
+  });
+
+  it("leaves a swipe that starts on content owning its leftward swipe alone", () => {
+    const { getByTestId, onDragProgress, onSettle } = setup();
+
+    const { moves, end } = swipe(getByTestId("swipe-row-title"), { dx: -150 });
+
+    expect(onDragProgress).not.toHaveBeenCalled();
+    expect(onSettle).not.toHaveBeenCalled();
+    expect(moves.some((move) => move.defaultPrevented)).toBe(false);
+    expect(end.defaultPrevented).toBe(false);
   });
 
   it("does nothing while disabled", () => {

@@ -406,8 +406,8 @@ describe("UserBubble awaiting-agent marker", () => {
   it.each([false, true])(
     "shares the timestamp row while keeping mobile pending status visible (mobile=%s)",
     (mobile) => {
-      vi.stubGlobal("matchMedia", () => ({
-        matches: mobile,
+      vi.stubGlobal("matchMedia", (query: string) => ({
+        matches: query === "(min-width: 768px)" ? !mobile : mobile,
         addEventListener: vi.fn(),
         removeEventListener: vi.fn(),
       }));

@@ -285,12 +285,26 @@ export const MobileMorePage: Story = {
   args: { harnessEntries: otherHarnesses },
   beforeEach: () => {
     const original = window.matchMedia.bind(window);
-    window.matchMedia = (query) => {
-      if (query !== "(max-width: 767.98px)" && query !== "(pointer: coarse)")
-        return original(query);
+    // Simulate a narrow touch device: phone width, coarse pointer, no hover.
+    const mobileTouchMatches: Record<string, boolean> = {
+      "(max-width: 767.98px)": true,
+      "(max-width: 767px)": true,
+      "(min-width: 768px)": false,
+      "(pointer: coarse)": true,
+      "(any-pointer: coarse)": true,
+      "(pointer: fine)": false,
+      "(any-pointer: fine)": false,
+      "(hover: hover)": false,
+      "(any-hover: hover)": false,
+      "(hover: none)": true,
+      "(any-hover: none)": true,
+    };
+    window.matchMedia = (query: string) => {
+      const matches = mobileTouchMatches[query];
+      if (matches === undefined) return original(query);
       return {
         media: query,
-        matches: true,
+        matches,
         onchange: null,
         addListener: () => undefined,
         removeListener: () => undefined,
