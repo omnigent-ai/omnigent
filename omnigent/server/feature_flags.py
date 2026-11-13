@@ -45,6 +45,7 @@ class Feature(StrEnum):
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
+    SESSION_OVERVIEW = "session_overview"
 
 
 @dataclass(frozen=True)
@@ -214,6 +215,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Mount only the sidebar session rows near the viewport",
         owner="web",
         review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SESSION_OVERVIEW,
+        description="Session cost sidebar beside chat, toggled from a header cost chip",
+        owner="web",
+        review_by_release="0.25.0",
     ),
 )
 

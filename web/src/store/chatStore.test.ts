@@ -794,10 +794,13 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().blocks).toHaveLength(1);
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+    // Unknown while the read runs is loading, not unavailable.
+    expect(useChatStore.getState().sessionUsageLoading).toBe(true);
 
     finishUsage(usage("conv_usage", 3.5));
     await tick();
 
+    expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
     expect(useChatStore.getState().sessionUsageByModel).toEqual({
       "model-a": {
@@ -866,6 +869,7 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().conversationLoadError).toBeNull();
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+    expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     expect(readUsage).toHaveBeenCalledOnce();
   });
 
@@ -1096,6 +1100,8 @@ describe("chatStore — lazy subtree usage", () => {
 
       await advanceReconcileInterval();
       expect(readUsage).toHaveBeenCalledTimes(2);
+      // A background re-read keeps the settled answer instead of loading again.
+      expect(useChatStore.getState().sessionUsageLoading).toBe(false);
       handleSessionEvent({
         type: "session_status",
         conversationId: "conv_usage",
