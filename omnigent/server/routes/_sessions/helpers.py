@@ -29,6 +29,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass
 from datetime import UTC
+from itertools import batched
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
@@ -1626,21 +1627,74 @@ def _publish_elicitation_resolved_to_ancestors(
             )
 
 
+def _pending_elicitation_ancestor_ids(
+    conv_store: ConversationStore,
+    conv: Conversation,
+    pending_session_ids: set[str],
+) -> set[str]:
+    """Find branches from indexed pending sessions back to the selected session."""
+    conversations: dict[str, Conversation | None] = {conv.id: conv}
+    frontier = pending_session_ids
+    while frontier:
+        rows: dict[str, Conversation] = {}
+        for batch in batched(sorted(frontier), 100):
+            rows.update(conv_store.get_conversations(list(batch)))
+        conversations.update({session_id: rows.get(session_id) for session_id in frontier})
+        frontier = {
+            row.parent_conversation_id
+            for row in rows.values()
+            if not row.archived
+            and row.kind == "sub_agent"
+            and (
+                not row.root_conversation_id
+                or not conv.root_conversation_id
+                or row.root_conversation_id == conv.root_conversation_id
+            )
+            and row.parent_conversation_id is not None
+            and row.parent_conversation_id not in conversations
+        }
+
+    ancestor_ids: set[str] = set()
+    for session_id in pending_session_ids:
+        path: set[str] = set()
+        current_id: str | None = session_id
+        while current_id != conv.id:
+            current = conversations.get(current_id) if current_id is not None else None
+            if (
+                current is None
+                or current.id in path
+                or current.archived
+                or current.kind != "sub_agent"
+            ):
+                break
+            path.add(current.id)
+            current_id = current.parent_conversation_id
+        else:
+            ancestor_ids.update(path - {session_id})
+            ancestor_ids.add(conv.id)
+    return ancestor_ids
+
+
 @restart_on_stale_cursor
 def _descendant_sessions(
     conv_store: ConversationStore,
     session_id: str,
+    *,
+    parent_ids: set[str] | None = None,
 ) -> list[Conversation]:
     """
     Return descendant sub-agent conversations for a session.
 
     :param conv_store: Store used to list conversations.
     :param session_id: Ancestor session id, e.g. ``"conv_root123"``.
+    :param parent_ids: Limit traversal to these parents when supplied.
     :returns: Sub-agent conversations below ``session_id``. Empty
         for sessions with no descendants.
     """
     descendants: list[Conversation] = []
-    queue: deque[str] = deque([session_id])
+    queue: deque[str] = deque(
+        [session_id] if parent_ids is None or session_id in parent_ids else []
+    )
     seen = {session_id}
     while queue:
         parent_id = queue.popleft()
@@ -1657,7 +1711,8 @@ def _descendant_sessions(
                     continue
                 seen.add(child.id)
                 descendants.append(child)
-                queue.append(child.id)
+                if parent_ids is None or child.id in parent_ids:
+                    queue.append(child.id)
             if not page.has_more or page.last_id is None:
                 break
             after = page.last_id
@@ -1678,10 +1733,8 @@ def _pending_elicitation_snapshot_for_session(
     Duplicate ids are skipped because live mirroring also records the
     ancestor copy in the in-memory index.
 
-    The descendant walk costs one ``list_conversations`` query per
-    session in the tree, so it is skipped entirely unless some session
-    other than ``conv`` has an outstanding prompt in the in-memory
-    index (the common case is none anywhere).
+    Prune stable pending branches using the store's ordering and visibility.
+    Changed pending sessions or invalid ancestry metadata use the full walk.
 
     :param conv_store: Store used to list descendant sub-agents.
     :param conv: Session conversation being snapshotted.
@@ -1689,21 +1742,36 @@ def _pending_elicitation_snapshot_for_session(
         :class:`SessionResponse.pending_elicitations`.
     """
     events = pending_elicitations.snapshot_for(conv.id)
-    if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
+    pending_session_ids = set(pending_elicitations.pending_session_ids()) - {conv.id}
+    if not pending_session_ids:
         return events
-    seen = {
-        event.get("elicitation_id")
-        for event in events
-        if isinstance(event.get("elicitation_id"), str)
-    }
-    for child in _descendant_sessions(conv_store, conv.id):
-        for event in pending_elicitations.snapshot_for(child.id):
-            elicitation_id = event.get("elicitation_id")
-            if isinstance(elicitation_id, str) and elicitation_id in seen:
-                continue
-            if isinstance(elicitation_id, str):
-                seen.add(elicitation_id)
-            events.append(_targeted_elicitation_event(event, target_session_id=child.id))
+    try:
+        ancestor_ids = _pending_elicitation_ancestor_ids(conv_store, conv, pending_session_ids)
+    except (TypeError, ValueError):
+        _logger.warning(
+            "Pending approval ancestry hydration failed; walking the selected tree", exc_info=True
+        )
+        ancestor_ids = None
+    for parent_ids in (ancestor_ids, None):
+        if parent_ids is None:
+            events = pending_elicitations.snapshot_for(conv.id)
+        seen = {
+            event.get("elicitation_id")
+            for event in events
+            if isinstance(event.get("elicitation_id"), str)
+        }
+        for child in _descendant_sessions(conv_store, conv.id, parent_ids=parent_ids):
+            for event in pending_elicitations.snapshot_for(child.id):
+                elicitation_id = event.get("elicitation_id")
+                if isinstance(elicitation_id, str) and elicitation_id in seen:
+                    continue
+                if isinstance(elicitation_id, str):
+                    seen.add(elicitation_id)
+                events.append(_targeted_elicitation_event(event, target_session_id=child.id))
+        if parent_ids is None or pending_session_ids == (
+            set(pending_elicitations.pending_session_ids()) - {conv.id}
+        ):
+            break
     return events
 
 
