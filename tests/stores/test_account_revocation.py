@@ -35,6 +35,7 @@ def test_account_generation_survives_delete_and_rejects_old_writes(db_uri: str) 
         for write in (
             lambda: permissions.ensure_user("alice"),
             lambda: permissions.grant("alice", uuid.uuid4().hex, 3),
+            lambda: permissions.grant_if_absent("alice", uuid.uuid4().hex, 1),
             lambda: permissions.grant_for_scheduled_task("alice", uuid.uuid4().hex, 1),
             lambda: HostStore(db_uri).upsert_on_connect(uuid.uuid4().hex, "laptop", "alice"),
             lambda: DeviceGrantStore(db_uri).create_redeemed_grant(
@@ -1100,6 +1101,7 @@ def test_target_without_registration_cannot_acquire_new_account(db_uri, existing
             for write in (
                 lambda: permissions.ensure_user("target"),
                 lambda: permissions.grant("target", uuid.uuid4().hex, 1),
+                lambda: permissions.grant_if_absent("target", uuid.uuid4().hex, 1),
                 lambda: permissions.grant_for_scheduled_task("target", uuid.uuid4().hex, 1),
             ):
                 with pytest.raises(OmnigentError, match="revoked"):

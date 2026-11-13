@@ -79,6 +79,25 @@ class PermissionStore(ABC):
         """
         ...
 
+    def grant_if_absent(self, user_id: str, conversation_id: str, level: int) -> bool:
+        """Grant *level* only when *user_id* holds no grant on the session.
+
+        Unlike :meth:`grant`, never changes an existing grant, so adding someone can't
+        lower access they were given meanwhile. As for :meth:`grant`, the caller
+        authorizes the request and calls :meth:`ensure_user` first. This default reads,
+        then grants, so a grant committed in between can still be overwritten; stores
+        with a conditional write override it so a stored level never changes.
+
+        :param user_id: The grantee, e.g. ``"alice@example.com"``.
+        :param conversation_id: The session to grant access to.
+        :param level: Numeric permission level for a new grant.
+        :returns: ``True`` if a grant was written, ``False`` if one already existed.
+        """
+        if self.get(user_id, conversation_id) is not None:
+            return False
+        self.grant(user_id, conversation_id, level)
+        return True
+
     @abstractmethod
     def revoke(self, user_id: str, conversation_id: str) -> bool:
         """Remove a permission grant.

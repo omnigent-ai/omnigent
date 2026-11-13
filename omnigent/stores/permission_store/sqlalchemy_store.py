@@ -150,25 +150,28 @@ def _upsert_grant(
     model: type[SqlSessionPermission] | type[SqlScheduledTaskShare],
     key: dict[str, str],
     level: int,
+    *,
+    keep_existing: bool = False,
 ) -> Insert:
     """Build an insert of one grant row that overwrites the level of an existing row.
 
     :param key: The row's primary key columns other than ``workspace_id``.
+    :param keep_existing: Leave an existing row as it is instead.
     """
     key_columns = ["workspace_id", *key]
     if dialect == "sqlite":
-        return (
-            sqlite_insert(model)
-            .values(**key, level=level)
-            .on_conflict_do_update(index_elements=key_columns, set_={"level": level})
-        )
+        insert = sqlite_insert(model).values(**key, level=level)
+        if keep_existing:
+            return insert.on_conflict_do_nothing(index_elements=key_columns)
+        return insert.on_conflict_do_update(index_elements=key_columns, set_={"level": level})
     if dialect == "mysql":
-        return mysql_insert(model).values(**key, level=level).on_duplicate_key_update(level=level)
-    return (
-        pg_insert(model)
-        .values(**key, level=level)
-        .on_conflict_do_update(index_elements=key_columns, set_={"level": level})
-    )
+        mysql = mysql_insert(model).values(**key, level=level)
+        # ``level = level`` keeps the stored value.
+        return mysql.on_duplicate_key_update(level=model.level if keep_existing else level)
+    postgres = pg_insert(model).values(**key, level=level)
+    if keep_existing:
+        return postgres.on_conflict_do_nothing(index_elements=key_columns)
+    return postgres.on_conflict_do_update(index_elements=key_columns, set_={"level": level})
 
 
 def _reserved_grantee_error(user_id: str) -> OmnigentError:
@@ -494,6 +497,47 @@ class SqlAlchemyPermissionStore(PermissionStore):
             conversation_id=conversation_id,
             level=level,
         )
+
+    def grant_if_absent(self, user_id: str, conversation_id: str, level: int) -> bool:
+        """Insert a grant unless the grantee holds one. See base class for contract.
+
+        The insert itself keeps an existing row, so a stored level never changes. An
+        insert's row count isn't reliable on every backend, so a locking read decides
+        the result. On MySQL its gap lock and on SQLite the write lock hold off a
+        concurrent insert. On PostgreSQL and CockroachDB, a grant committed between the
+        read and the insert is kept, though the call still returns ``True``.
+        """
+
+        def write(session: Session) -> bool:
+            require_active_account(session, user_id)
+            held = session.execute(
+                select(SqlSessionPermission.level)
+                .where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == user_id,
+                    SqlSessionPermission.conversation_id == conversation_id,
+                )
+                .with_for_update()
+            ).first()
+            if held is not None:
+                return False
+            session.execute(
+                _upsert_grant(
+                    self._engine.dialect.name,
+                    SqlSessionPermission,
+                    {"user_id": user_id, "conversation_id": conversation_id},
+                    level,
+                    keep_existing=True,
+                )
+            )
+            return True
+
+        written = run_write_transaction(
+            self._session_immediate, "grant_permission_if_absent", write
+        )
+        if written:
+            self._invalidate_resolve_cache_for_session(conversation_id)
+        return written
 
     def revoke(self, user_id: str, conversation_id: str) -> bool:
         """Remove a permission grant. See base class for contract."""
