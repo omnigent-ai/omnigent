@@ -27,6 +27,10 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapp
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from omnigent.util.claude_launch_args import (
+    claude_legacy_launch_prompt,
+    without_claude_session_id_arg,
+)
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -46,6 +50,7 @@ if TYPE_CHECKING:
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
+    from omnigent.terminals.registry import TerminalRegistry
 
 import click
 import httpx
@@ -183,6 +188,72 @@ def _publish_tmux_target_for_bridge(
         socket_path=instance.socket_path,
         tmux_target=instance.tmux_target,
     )
+
+
+def _readvertise_live_claude_tmux_target(
+    bridge_dir: Path,
+    instance: TerminalInstance,
+    *,
+    terminal_registry: TerminalRegistry,
+    session_id: str,
+) -> None:
+    """
+    Advertise a registered live Claude pane whose ``tmux.json`` is missing or stale.
+
+    Injection can only reach the pane once the advertisement names its socket
+    and target. Publication runs through
+    :meth:`TerminalRegistry.publish_if_registered`, so a pane closed or
+    replaced since the caller's probe never advertises over its successor.
+    Failures are logged and leave injection to its existing wait.
+
+    :param bridge_dir: The session's claude-native bridge directory.
+    :param instance: The registered, alive ``claude`` pane instance.
+    :param terminal_registry: Registry that holds *instance*.
+    :param session_id: Owning session/conversation id.
+    :returns: None.
+    """
+    from omnigent.harnesses.claude_native.bridge import read_tmux_target, write_tmux_target
+
+    expected = {"socket_path": str(instance.socket_path), "tmux_target": instance.tmux_target}
+    try:
+        try:
+            advertised = read_tmux_target(bridge_dir)
+        except (OSError, ValueError):
+            # The registered pane remains authoritative when its file cannot be read.
+            advertised = None
+        if advertised == expected:
+            return
+        published = terminal_registry.publish_if_registered(
+            session_id,
+            instance.name,
+            instance.session_key,
+            instance,
+            lambda: write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            ),
+        )
+        if published:
+            _logger.warning(
+                "live claude pane had %s tmux advertisement for conv=%s; re-advertised",
+                "no" if advertised is None else "a stale",
+                session_id,
+                extra={"session_id": session_id},
+            )
+        else:
+            _logger.info(
+                "claude pane for conv=%s was closed or replaced before re-advertising; skipped",
+                session_id,
+                extra={"session_id": session_id},
+            )
+    except Exception:
+        _logger.warning(
+            "failed to re-advertise claude tmux target for conv=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
 
 
 # Background transcript-forwarder tasks for host-spawned claude-native and
@@ -1955,8 +2026,10 @@ async def _auto_create_opencode_terminal(
         extra_providers=extra_providers,
     )
     # The per-session XDG_CONFIG_HOME hides the user's global config; carry over
-    # their providers, default model, plugins and MCP servers (v1 or v2 spelling).
-    config = maybe_merge_user_provider_config(config)
+    # providers, the default model, and plugins, but never ambient user MCP
+    # servers. The agent spec plus the Omnigent relay above are the complete
+    # task-scoped tool allowlist for this bridge-owned session.
+    config = maybe_merge_user_provider_config(config, include_user_mcp_servers=False)
     write_opencode_provider_config(
         xdg_config_home,
         config,
@@ -8039,9 +8112,7 @@ def _claude_legacy_launch_prompt(terminal_launch_args: list[str] | None) -> str 
         ``["hello", "--permission-mode", "auto"]``.
     :returns: The leading positional, e.g. ``"hello"``, or ``None``.
     """
-    if not terminal_launch_args or terminal_launch_args[0].startswith("-"):
-        return None
-    return terminal_launch_args[0]
+    return claude_legacy_launch_prompt(terminal_launch_args)
 
 
 async def _claude_prompt_in_history(
@@ -8122,19 +8193,7 @@ def _without_claude_session_id_arg(args: list[str]) -> list[str]:
     """
     if "--fork-session" in args:
         return args
-    kept: list[str] = []
-    skip_value = False
-    for arg in args:
-        if skip_value:
-            skip_value = False
-            continue
-        if arg == "--session-id":
-            skip_value = True
-            continue
-        if arg.startswith("--session-id="):
-            continue
-        kept.append(arg)
-    return kept
+    return without_claude_session_id_arg(args)
 
 
 def _build_claude_native_base_args(

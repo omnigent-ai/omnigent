@@ -98,13 +98,14 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "sidebar_grouping_ui": True,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
-        "automations_v2": False,
+        "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
         "session_orchestration": True,
-        "sibling_sessions": False,
+        "sibling_sessions": True,
         "codex_plan_at_launch": True,
     }
+    assert data["sibling_sessions"] is True
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
     # installable_harnesses is the allowlist the SPA offers setup for; blank
@@ -121,8 +122,12 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
     assert data["scheduled_task_subhour"] is True
+    # Lets the trigger form save its header; older servers would send it to the model.
+    assert data["scheduled_task_trigger_headers"] is True
     assert data["automation_trigger_poll_minutes"] == 10
     assert data["scheduled_task_harness_settings"] is True
+    # Lets sys_session_create refuse permission_mode on servers that would ignore it.
+    assert data["session_create_permission_modes"] is True
     # Gates the automation picker's approval-skipping modes; older servers reject them.
     assert data["scheduled_task_approval_skipping_modes"] is True
     assert data["agent_detail"] is True
@@ -135,6 +140,10 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert "external_output_text_delta" not in data["session_event_types"]
     # Gates the web's claude-sdk /clear, which older servers list "clear" without.
     assert data["session_claude_sdk_clear"] is True
+    # Gates the Codex forwarder's non-blocking async question cards.
+    assert data["codex_nonblocking_decline"] is True
+    # Gates the web's /rewind and the items type filter its picker uses.
+    assert data["session_rewind"] is True
     # This app wires no project store, so automations cannot take a project.
     assert data["scheduled_task_projects"] is False
     # This app wires no scheduled-task store, so it has no automations to offer.
@@ -155,6 +164,10 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert ServerInfoResponse.model_validate(data).session_event_types == []
     del data["session_claude_sdk_clear"]
     assert ServerInfoResponse.model_validate(data).session_claude_sdk_clear is False
+    del data["codex_nonblocking_decline"]
+    assert ServerInfoResponse.model_validate(data).codex_nonblocking_decline is False
+    del data["session_rewind"]
+    assert ServerInfoResponse.model_validate(data).session_rewind is False
     del data["automations_enabled"]
     assert ServerInfoResponse.model_validate(data).automations_enabled is False
 
