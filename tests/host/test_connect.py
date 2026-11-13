@@ -4459,6 +4459,66 @@ async def test_handle_runner_status_unknown_for_untracked_runner() -> None:
     assert result.status == "unknown"
 
 
+@pytest.mark.parametrize("probe", ["process", "sign_in"])
+@pytest.mark.parametrize("replacement", ["alive", "dead", "removed", "pending"])
+async def test_runner_status_rechecks_launch_after_blocking_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe: str, replacement: str
+) -> None:
+    """A retired launch cannot supply the liveness verdict for its replacement."""
+    host = _make_host_process()
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    old_proc = Mock(spec=subprocess.Popen, pid=1234)
+    old_proc.poll.return_value = None
+    old_marker = tmp_path / "old.connected"
+    host._runners["runner-owned"] = _RunnerHandle(
+        old_proc, tmp_path / "old.log", connect_marker=old_marker
+    )
+
+    def paused_probe(*_args: object) -> bool | int | None:
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5), "test did not release the old launch's probe"
+        return 1 if probe == "process" else True
+
+    if probe == "process":
+        old_proc.poll.side_effect = paused_probe
+    else:
+        monkeypatch.setattr("omnigent.host.connect.runner_sign_in_is_pending", paused_probe)
+    new_proc = Mock(spec=subprocess.Popen, pid=5678)
+    new_proc.poll.return_value = 1 if replacement == "dead" else None
+    new_handle = _RunnerHandle(new_proc, tmp_path / "new.log")
+    query = asyncio.create_task(
+        host._handle_runner_status(HostRunnerStatusFrame("status", "runner-owned"))
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        host._runners.pop("runner-owned")
+        if replacement == "pending":
+            completion = loop.create_future()
+            host._track_pending_runner_launch("runner-owned", completion)
+        elif replacement != "removed":
+            host._runners["runner-owned"] = new_handle
+        release.set()
+        if replacement == "pending":
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(query), 0.05)
+            host._runners["runner-owned"] = new_handle
+            completion.set_result(None)
+        result = await asyncio.wait_for(query, 5)
+        expected = "unknown" if replacement == "removed" else replacement
+        assert (result.request_id, result.status) == (
+            "status",
+            "alive" if expected == "pending" else expected,
+        )
+        old_proc.terminate.assert_not_called()
+        new_proc.terminate.assert_not_called()
+    finally:
+        release.set()
+        query.cancel()
+        await asyncio.gather(query, return_exceptions=True)
+
+
 @pytest.mark.parametrize("forked", [False, True])
 async def test_alive_runner_ids_preserves_exit_reporting(tmp_path: Path, forked: bool) -> None:
     """Inventory omits observed exits without taking ownership from the watcher."""
