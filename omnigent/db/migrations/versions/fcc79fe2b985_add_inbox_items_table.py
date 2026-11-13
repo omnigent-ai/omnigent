@@ -26,7 +26,7 @@ from sqlalchemy.dialects.mysql import VARBINARY
 from omnigent.db.db_models import Uuid16
 
 revision: str = "fcc79fe2b985"
-down_revision: str | None = "a7d4c2e9f610"
+down_revision: str | None = "a8be64286ffc"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

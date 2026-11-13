@@ -7,6 +7,7 @@ import {
   composerInlineMentions,
   expandMentionTokens,
   findMentionTokens,
+  harnessSupportsFileMentions,
   mentionTokenAtCaret,
   newFileMentionToken,
   presentMentions,
@@ -285,5 +286,24 @@ describe("recallSessionMentions", () => {
   it("leaves markers the user typed alone when there is no trailing hint", () => {
     const text = `why does ${plan("s_x")} look like this?`;
     expect(recallSessionMentions(text)).toEqual({ main: text, others: [], sessions: [] });
+  });
+});
+
+describe("harnessSupportsFileMentions", () => {
+  const declared = new Set(["claude-sdk"]);
+
+  it("covers native harnesses through the agent registry", () => {
+    expect(harnessSupportsFileMentions("claude-native", new Set())).toBe(true);
+    expect(harnessSupportsFileMentions("native-pi", new Set())).toBe(true);
+  });
+
+  it("covers other harnesses only when the server declares them", () => {
+    expect(harnessSupportsFileMentions("claude-sdk", declared)).toBe(true);
+    expect(harnessSupportsFileMentions("claude-sdk", new Set())).toBe(false);
+    expect(harnessSupportsFileMentions("openai-agents", declared)).toBe(false);
+  });
+
+  it("is false before the session's harness is known", () => {
+    expect(harnessSupportsFileMentions(null, declared)).toBe(false);
   });
 });
