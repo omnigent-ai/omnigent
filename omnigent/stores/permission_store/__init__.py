@@ -15,6 +15,9 @@ from collections.abc import Sequence
 from omnigent.entities import Account, ResolvedAccess, ScheduledTaskPermission, SessionPermission
 from omnigent.errors import ErrorCode, OmnigentError
 
+# Largest page a grants list returns; the session permissions route allows the same.
+MAX_GRANTS_PAGE_SIZE = 1000
+
 
 class PermissionStore(ABC):
     """Abstract base for session permission persistence.
@@ -384,11 +387,13 @@ class PermissionStore(ABC):
         row was purged, so callers check that the task is live before trusting them.
 
         :param scheduled_task_id: The task to query.
-        :param limit: Max grants to return (default 100).
+        :param limit: Max grants to return, 1 to :data:`MAX_GRANTS_PAGE_SIZE`
+            (default 100).
         :param after_user_id: Exclusive cursor — return grants with
             user_id > this value.
         :returns: Tuple of (grants ordered by user_id, next_cursor). next_cursor
             is the user_id to pass as after_user_id, or None on the last page.
+        :raises OmnigentError: ``INVALID_INPUT`` when *limit* is out of range.
         """
         return [], None
 
@@ -413,7 +418,9 @@ class PermissionStore(ABC):
         """Delete every grant on a scheduled task.
 
         Call after the task is deleted, so a concurrent grant sees the deletion
-        and is refused instead of leaving a grant behind. ``ScheduledTaskStore.delete``
+        and is refused instead of leaving a grant behind. Implementations may delete
+        in batches that each commit, so a failure can leave some grants; they are
+        inert on a deleted task, and calling again finishes. ``ScheduledTaskStore.delete``
         can remove the task row in the same call; grants this call misses are then
         orphans that nothing else removes, which is why readers check the task first.
 

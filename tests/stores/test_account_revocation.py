@@ -313,32 +313,37 @@ def _create_task(db_uri: str, owner: str) -> str:
     )
 
 
-def test_deletion_removes_automation_grants_held_and_owned(db_uri: str) -> None:
+def test_deletion_removes_automation_grants_held_and_owned(db_uri, monkeypatch):
     from omnigent.db.db_models import workspace_scope
 
     accounts = SqlAlchemyAccountStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
+    # One grant or task per batch, so each cleanup spans several transactions.
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 1)
     with workspace_scope(202):
         permissions.ensure_user("alice")
         elsewhere = _create_task(db_uri, "dave")
         permissions.grant_for_scheduled_task("alice", elsewhere, 1)
     accounts.create_user_with_password("alice", "alice-hash")
-    permissions.ensure_user("carol")
-    owned, owned_deleted, other = (
-        _create_task(db_uri, owner) for owner in ("alice", "alice", "dave")
+    for grantee in ("carol", "erin"):
+        permissions.ensure_user(grantee)
+    owned, owned_deleted, other, another = (
+        _create_task(db_uri, owner) for owner in ("alice", "alice", "dave", "dave")
     )
     for task_id, grantee in (
         (owned, "carol"),
+        (owned, "erin"),
         (owned_deleted, "carol"),
         (other, "alice"),
         (other, "carol"),
+        (another, "alice"),
     ):
         permissions.grant_for_scheduled_task(grantee, task_id, 1)
     # Marking a task deleted leaves its grants in place.
     assert SqlAlchemyScheduledTaskStore(db_uri).update(owned_deleted, state="deleted")
 
     assert accounts.delete_user("alice") is True
-    for task_id in (owned, owned_deleted):
+    for task_id in (owned, owned_deleted, another):
         assert permissions.list_for_scheduled_task(task_id) == ([], None)
     assert [grant.user_id for grant in permissions.list_for_scheduled_task(other)[0]] == ["carol"]
     with pytest.raises(OmnigentError, match="revoked"):
@@ -347,6 +352,51 @@ def test_deletion_removes_automation_grants_held_and_owned(db_uri: str) -> None:
     assert permissions.resolve_scheduled_task_access(["alice"], other) is None
     with workspace_scope(202):
         assert permissions.resolve_scheduled_task_access(["alice"], elsewhere) == 1
+
+
+def test_reregistration_finishes_an_interrupted_grant_cleanup(db_uri, monkeypatch):
+    from omnigent.stores.permission_store import sqlalchemy_store as permission_module
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    monkeypatch.setattr(accounts, "_cleanup_batch_size", 1)
+    accounts.create_user_with_password("bob", "bob-hash")
+    task_ids = [_create_task(db_uri, "dave") for _ in range(3)]
+    for task_id in task_ids:
+        permissions.grant_for_scheduled_task("bob", task_id, 1)
+
+    def held_grants() -> int:
+        return sum(
+            permissions.resolve_scheduled_task_access(["bob"], task_id) is not None
+            for task_id in task_ids
+        )
+
+    delete_batch = permission_module._delete_grant_batch
+    batches = 0
+
+    def interrupted_after_one_batch(*args, **kwargs):
+        nonlocal batches
+        batches += 1
+        if batches > 1:
+            raise RuntimeError("test cleanup interruption")
+        return delete_batch(*args, **kwargs)
+
+    monkeypatch.setattr(permission_module, "_delete_grant_batch", interrupted_after_one_batch)
+    assert accounts.delete_user("bob") is True
+    assert held_grants() == 2
+    monkeypatch.setattr(permission_module, "_delete_grant_batch", delete_batch)
+
+    # A grant still held refuses the name; registration's own cleanup is skipped here.
+    finish_cleanup = accounts_module.delete_deleted_account_grants
+    monkeypatch.setattr(accounts_module, "delete_deleted_account_grants", lambda *a, **k: 0)
+    with pytest.raises(OmnigentError) as caught:
+        accounts.create_user_with_password("bob", "replacement-hash")
+    assert caught.value.code == ErrorCode.CONFLICT
+    assert accounts.get_user("bob") is None
+    monkeypatch.setattr(accounts_module, "delete_deleted_account_grants", finish_cleanup)
+
+    assert accounts.create_user_with_password("bob", "replacement-hash").id == "bob"
+    assert held_grants() == 0
 
 
 def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str) -> None:
@@ -398,6 +448,10 @@ def test_cleanup_failure_rolls_back_revocation(
     session_id, host_id = uuid.uuid4().hex, uuid.uuid4().hex
     permissions.grant("alice", session_id, 3)
     hosts.upsert_on_connect(host_id, "laptop", "alice")
+    permissions.ensure_user("carol")
+    owned_task, other_task = _create_task(db_uri, "alice"), _create_task(db_uri, "dave")
+    permissions.grant_for_scheduled_task("carol", owned_task, 1)
+    permissions.grant_for_scheduled_task("alice", other_task, 1)
     costs.add_daily_cost("alice", "2026-09-18", 1.0)
     costs.set_daily_ask_approved("alice", "2026-09-18", 0.5)
 
@@ -414,6 +468,10 @@ def test_cleanup_failure_rolls_back_revocation(
         "cost_usd": 1.0,
         "ask_approved_usd": 0.5,
     }
+    # The task tombstone rolls back, and grant cleanup only follows a committed deletion.
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(owned_task).state == "active"
+    assert permissions.resolve_scheduled_task_access(["carol"], owned_task) == 1
+    assert permissions.resolve_scheduled_task_access(["alice"], other_task) == 1
 
 
 @pytest.mark.parametrize("operation", ["cost", "approval", "subagent_cost"])
@@ -555,7 +613,7 @@ def test_automation_grant_serializes_with_owner_deletion(db_uri, monkeypatch, de
     permissions.grant_for_scheduled_task("carol", task_id, 1)
     reached, resume, second_started = Event(), Event(), Event()
     # Pause each writer once it holds the task row: deletion after it tombstones the
-    # task, the grant before it writes the grant row the deletion also removes.
+    # task, the grant before it writes the grant row the cleanup after deletion removes.
     module, name = (
         (accounts_module, "_revoke_durable_authority")
         if delete_first

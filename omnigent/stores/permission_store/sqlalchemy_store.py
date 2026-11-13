@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Sequence
+from functools import partial
 from typing import TypeVar, cast
 
 from sqlalchemy import String, delete, exists, func, literal, select, update
@@ -14,11 +15,11 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import InstrumentedAttribute, Session
 from sqlalchemy.sql.dml import Insert
 from sqlalchemy.sql.elements import ColumnElement
 
-from omnigent.db.account_authority import account_generation, require_active_account
+from omnigent.db.account_authority import account_generation, lock_account, require_active_account
 from omnigent.db.db_models import (
     SqlScheduledTask,
     SqlScheduledTaskShare,
@@ -28,6 +29,7 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.enum_codecs import encode_scheduled_task_state
 from omnigent.db.utils import (
+    NamedManagedSessionMaker,
     get_or_create_engine,
     make_named_managed_session_maker,
     run_write_transaction,
@@ -42,7 +44,7 @@ from omnigent.server.auth import (
     effective_admin,
 )
 from omnigent.server.sharing_settings import effective_public_level
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import MAX_GRANTS_PAGE_SIZE, PermissionStore
 
 # Sentinel rows excluded from list_users() — never real, actionable
 # actors. Mirrors accounts_store._HIDDEN_LIST_USERS so the admin user
@@ -169,6 +171,13 @@ def _upsert_grant(
     )
 
 
+def _reserved_grantee_error(user_id: str) -> OmnigentError:
+    return OmnigentError(
+        f"An automation cannot be shared with {user_id!r}.",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
 def _require_storable_scheduled_task_grant(user_id: str, level: int) -> None:
     """Refuse a grant the share table cannot hold or the store must never hold."""
     if len(user_id) > _GRANTEE_ID_MAX_CHARS:
@@ -176,12 +185,9 @@ def _require_storable_scheduled_task_grant(user_id: str, level: int) -> None:
             f"A grantee ID may be at most {_GRANTEE_ID_MAX_CHARS} characters.",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Case-insensitive, as MySQL's keys would match a variant to the reserved row.
+    # A fast path; the grant rechecks under the key's collation, which folds accents too.
     if user_id.strip().casefold() in _RESERVED_GRANTEES:
-        raise OmnigentError(
-            f"An automation cannot be shared with {user_id!r}.",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        raise _reserved_grantee_error(user_id)
     if level not in session_sharing.SCHEDULED_TASK_GRANT_LEVELS:
         raise OmnigentError(
             f"Automations cannot grant permission level {level!r}.",
@@ -228,7 +234,14 @@ def _grant_page(
     """Read one page of a resource's grants ordered by grantee.
 
     The cursor is the last returned user_id; the next page reads ``user_id > cursor``.
+
+    :raises OmnigentError: ``INVALID_INPUT`` unless ``1 <= limit <= MAX_GRANTS_PAGE_SIZE``.
     """
+    if not 1 <= limit <= MAX_GRANTS_PAGE_SIZE:
+        raise OmnigentError(
+            f"limit must be between 1 and {MAX_GRANTS_PAGE_SIZE}.",
+            code=ErrorCode.INVALID_INPUT,
+        )
     stmt = (
         select(model)
         .where(model.workspace_id == current_workspace_id(), resource)
@@ -241,6 +254,122 @@ def _grant_page(
     page = rows[:limit]
     next_cursor = page[-1].user_id if len(rows) > limit else None
     return [to_entity(row) for row in page], next_cursor
+
+
+def _delete_grant_batch(
+    session: Session,
+    *,
+    match: ColumnElement[bool],
+    key_column: InstrumentedAttribute[str],
+    after: str | None,
+    batch_size: int,
+    proceed: Callable[[Session], bool] | None,
+) -> tuple[str | None, int]:
+    """Delete up to *batch_size* matching grants past *after*; return the last key and count."""
+    if proceed is not None and not proceed(session):
+        return None, 0
+    stmt = (
+        select(key_column)
+        .where(SqlScheduledTaskShare.workspace_id == current_workspace_id(), match)
+        .order_by(key_column)
+        .limit(batch_size)
+    )
+    if after is not None:
+        stmt = stmt.where(key_column > after)
+    keys = list(session.execute(stmt).scalars())
+    if not keys:
+        return None, 0
+    result = cast(
+        CursorResult[tuple[object]],
+        session.execute(
+            delete(SqlScheduledTaskShare).where(
+                SqlScheduledTaskShare.workspace_id == current_workspace_id(),
+                match,
+                key_column.in_(keys),
+            )
+        ),
+    )
+    return keys[-1], result.rowcount
+
+
+def _delete_grants_in_batches(
+    session_maker: NamedManagedSessionMaker,
+    operation_name: str,
+    *,
+    match: ColumnElement[bool],
+    key_column: InstrumentedAttribute[str],
+    batch_size: int,
+    proceed: Callable[[Session], bool] | None = None,
+) -> int:
+    """Walk an index over the matching grants, deleting one batch per transaction.
+
+    Stops at an empty batch, or when *proceed* returns ``False`` at the start of one.
+    """
+    deleted, after = 0, None
+    while True:
+        after, count = run_write_transaction(
+            session_maker,
+            operation_name,
+            partial(
+                _delete_grant_batch,
+                match=match,
+                key_column=key_column,
+                after=after,
+                batch_size=batch_size,
+                proceed=proceed,
+            ),
+        )
+        if after is None:
+            return deleted
+        deleted += count
+
+
+def delete_scheduled_task_grants(
+    session_maker: NamedManagedSessionMaker, scheduled_task_id: str, *, batch_size: int
+) -> int:
+    """Delete a task's grants along the primary key, one bounded batch per transaction."""
+    return _delete_grants_in_batches(
+        session_maker,
+        "delete_scheduled_task_grant_batch",
+        match=SqlScheduledTaskShare.scheduled_task_id == scheduled_task_id,
+        key_column=SqlScheduledTaskShare.user_id,
+        batch_size=batch_size,
+    )
+
+
+def delete_deleted_account_grants(
+    session_maker: NamedManagedSessionMaker, user_id: str, *, batch_size: int
+) -> int:
+    """Delete the grants a deleted account held, one bounded batch per transaction.
+
+    Walks ``ix_scheduled_task_shares_user_id``. Each batch first locks the account and
+    stops once the name belongs to a live account again, whose grants are its own.
+    """
+
+    def account_is_deleted(session: Session) -> bool:
+        account = lock_account(session, user_id)
+        return account is None or account.deleted_at is not None
+
+    return _delete_grants_in_batches(
+        session_maker,
+        "delete_deleted_account_grant_batch",
+        match=SqlScheduledTaskShare.user_id == user_id,
+        key_column=SqlScheduledTaskShare.scheduled_task_id,
+        batch_size=batch_size,
+        proceed=account_is_deleted,
+    )
+
+
+def holds_scheduled_task_grants(session: Session, user_id: str) -> bool:
+    """Whether any grant to *user_id* remains in the workspace, in one indexed probe."""
+    return session.execute(
+        select(
+            exists().where(
+                SqlScheduledTaskShare.workspace_id == current_workspace_id(),
+                SqlScheduledTaskShare.user_id == user_id,
+            )
+        )
+    ).scalar_one()
 
 
 def _to_scheduled_task_permission(row: SqlScheduledTaskShare) -> ScheduledTaskPermission:
@@ -260,6 +389,9 @@ class SqlAlchemyPermissionStore(PermissionStore):
     (SQLite ``ON CONFLICT DO UPDATE``, PostgreSQL
     ``ON CONFLICT ... DO UPDATE``).
     """
+
+    # Grants deleted per transaction; tests shrink it to span several batches.
+    _cleanup_batch_size = 100
 
     def __init__(self, storage_location: str) -> None:
         """Initialize the SQLAlchemy permission store.
@@ -811,6 +943,17 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     level,
                 )
             )
+            # The stored key's collation may match a reserved ID the fast path let through.
+            reserved = session.execute(
+                select(SqlScheduledTaskShare.user_id).where(
+                    SqlScheduledTaskShare.workspace_id == current_workspace_id(),
+                    SqlScheduledTaskShare.scheduled_task_id == scheduled_task_id,
+                    SqlScheduledTaskShare.user_id == user_id,
+                    SqlScheduledTaskShare.user_id.in_(sorted(_RESERVED_GRANTEES)),
+                )
+            ).first()
+            if reserved is not None:
+                raise _reserved_grantee_error(user_id)
 
         run_write_transaction(self._session_immediate, "grant_scheduled_task_permission", write)
         return ScheduledTaskPermission(
@@ -875,20 +1018,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
             ).scalar_one()
 
     def delete_for_scheduled_task(self, scheduled_task_id: str) -> int:
-        """Delete every grant on a scheduled task. See base class for contract."""
-
-        def write(session: Session) -> int:
-            result = cast(
-                CursorResult[tuple[object]],
-                session.execute(
-                    delete(SqlScheduledTaskShare).where(
-                        SqlScheduledTaskShare.workspace_id == current_workspace_id(),
-                        SqlScheduledTaskShare.scheduled_task_id == scheduled_task_id,
-                    )
-                ),
-            )
-            return result.rowcount
-
-        return run_write_transaction(
-            self._session_immediate, "delete_scheduled_task_permissions", write
+        """Delete every grant on a scheduled task, one batch per transaction. See base class."""
+        return delete_scheduled_task_grants(
+            self._session_immediate, scheduled_task_id, batch_size=self._cleanup_batch_size
         )

@@ -29,7 +29,8 @@ from omnigent.server.auth import (
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
-from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store import MAX_GRANTS_PAGE_SIZE, PermissionStore
+from omnigent.stores.permission_store import sqlalchemy_store as permission_module
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
@@ -1445,6 +1446,11 @@ def test_list_for_scheduled_task_pages_by_user_id(
             break
     assert pages == [user_ids[:2], user_ids[2:4], user_ids[4:]]
     assert cursors == [user_ids[1], user_ids[3], None]
+    for limit in (0, -1, MAX_GRANTS_PAGE_SIZE + 1):
+        with pytest.raises(OmnigentError) as caught:
+            store.list_for_scheduled_task(task_id, limit=limit)
+        assert caught.value.code == ErrorCode.INVALID_INPUT
+    assert len(store.list_for_scheduled_task(task_id, limit=MAX_GRANTS_PAGE_SIZE)[0]) == 5
 
 
 @pytest.mark.usefixtures("wider_scheduled_task_grant_levels")
@@ -1465,19 +1471,31 @@ def test_resolve_scheduled_task_access_returns_highest_principal_level(
 
 
 def test_delete_for_scheduled_task_removes_only_that_tasks_grants(
-    store: SqlAlchemyPermissionStore, db_uri: str
+    store: SqlAlchemyPermissionStore, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Grants go in batches that each commit on their own, until a batch comes back empty."""
     task_id, other_task_id = _create_scheduled_task(db_uri), _create_scheduled_task(db_uri)
-    for user_id in ("alice@example.com", "bob@example.com"):
+    user_ids = [f"user{i}@example.com" for i in range(5)]
+    for user_id in user_ids:
         _ensure_user(store, user_id)
         store.grant_for_scheduled_task(user_id, task_id, 1)
-    store.grant_for_scheduled_task("alice@example.com", other_task_id, 1)
+    store.grant_for_scheduled_task("user0@example.com", other_task_id, 1)
+    monkeypatch.setattr(store, "_cleanup_batch_size", 2)
+    transactions: list[str] = []
+    run_write_transaction = permission_module.run_write_transaction
 
-    assert store.delete_for_scheduled_task(task_id) == 2
+    def counting_transaction(session_maker, operation_name, callback, **kwargs):
+        transactions.append(operation_name)
+        return run_write_transaction(session_maker, operation_name, callback, **kwargs)
+
+    monkeypatch.setattr(permission_module, "run_write_transaction", counting_transaction)
+
+    assert store.delete_for_scheduled_task(task_id) == 5
+    assert transactions == ["delete_scheduled_task_grant_batch"] * 4
     assert store.delete_for_scheduled_task(task_id) == 0
     assert store.list_for_scheduled_task(task_id) == ([], None)
     assert store.list_for_scheduled_task(other_task_id) == (
-        [ScheduledTaskPermission("alice@example.com", other_task_id, 1)],
+        [ScheduledTaskPermission("user0@example.com", other_task_id, 1)],
         None,
     )
 
@@ -1530,14 +1548,17 @@ def test_scheduled_task_grant_refuses_what_the_store_must_not_hold(
 def test_scheduled_task_grants_follow_the_key_collation(
     store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:
-    """MySQL's case-insensitive keys fold a grantee's variant into one grant and refuse the
-    owner's, whose run-session grant would overwrite the owner's own session grant."""
+    """MySQL's keys fold case and accents: a grantee's variant merges into one grant, and
+    variants of the owner or a reserved ID are refused. An owner variant's run-session
+    grant would overwrite the owner's own session grant."""
     task_id = _create_scheduled_task(db_uri, owner="alice@example.com")
+    accent_variants = ["__públic__", "lócal"]
     for user_id in (
         "bob@example.com",
         "Bob@example.com",
         "alice@example.com",
         "Alice@example.com",
+        *accent_variants,
     ):
         _ensure_user(store, user_id)
         try:
@@ -1550,7 +1571,7 @@ def test_scheduled_task_grants_follow_the_key_collation(
     assert {grant.user_id for grant in grants} == (
         {"bob@example.com"}
         if folds_case
-        else {"bob@example.com", "Bob@example.com", "Alice@example.com"}
+        else {"bob@example.com", "Bob@example.com", "Alice@example.com", *accent_variants}
     )
     assert store.resolve_scheduled_task_access(["BOB@example.com"], task_id) == (
         LEVEL_READ if folds_case else None
