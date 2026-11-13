@@ -1001,6 +1001,12 @@ def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> Non
     os.replace(tmp, settings_path)
 
 
+# Serializes bridge-state writes in this process, so a guarded conversation-id update
+# (cold-start, reader recovery) is atomic against other writes and a terminal's
+# clear/reseed. Reentrant because update_conversation_id writes while holding it.
+_STATE_UPDATE_LOCK = threading.RLock()
+
+
 def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) -> None:
     """
     Persist shared native Antigravity state atomically.
@@ -1009,25 +1015,26 @@ def write_bridge_state(bridge_dir: Path, state: AntigravityNativeBridgeState) ->
     :param state: State payload to persist.
     :returns: None.
     """
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = bridge_dir / _STATE_FILE
-    fd, tmp_name = tempfile.mkstemp(prefix=f"{_STATE_FILE}.", dir=str(bridge_dir))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "session_id": state.session_id,
-                    "conversation_id": state.conversation_id,
-                    "active_turn_id": state.active_turn_id,
-                },
-                handle,
-                sort_keys=True,
-            )
-            handle.write("\n")
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+    with _STATE_UPDATE_LOCK:
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = bridge_dir / _STATE_FILE
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{_STATE_FILE}.", dir=str(bridge_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "session_id": state.session_id,
+                        "conversation_id": state.conversation_id,
+                        "active_turn_id": state.active_turn_id,
+                    },
+                    handle,
+                    sort_keys=True,
+                )
+                handle.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
 
 
 def clear_bridge_state(bridge_dir: Path) -> None:
@@ -1047,9 +1054,10 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native Antigravity bridge directory.
     :returns: None.
     """
-    for runtime_file in (_STATE_FILE, _TMUX_FILE):
-        with contextlib.suppress(FileNotFoundError):
-            (bridge_dir / runtime_file).unlink()
+    with _STATE_UPDATE_LOCK:
+        for runtime_file in (_STATE_FILE, _TMUX_FILE):
+            with contextlib.suppress(FileNotFoundError):
+                (bridge_dir / runtime_file).unlink()
 
 
 def read_bridge_state(bridge_dir: Path) -> AntigravityNativeBridgeState | None:
@@ -1092,11 +1100,6 @@ def read_bridge_state(bridge_dir: Path) -> AntigravityNativeBridgeState | None:
         conversation_id=conversation_id,
         active_turn_id=parsed_active_turn_id,
     )
-
-
-# Serializes conversation-id replacement across the writers that can race for one
-# placeholder: a cold-start and the reader's recovery run as threads of one process.
-_STATE_UPDATE_LOCK = threading.Lock()
 
 
 def update_conversation_id(

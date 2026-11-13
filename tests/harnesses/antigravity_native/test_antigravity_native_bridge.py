@@ -482,15 +482,29 @@ def test_update_conversation_id_expect_placeholder_keeps_a_real_id(bridge_dir: P
     assert state.active_turn_id == "turn_live"
 
 
+@pytest.mark.parametrize(
+    ("second_writer", "expected_results", "expected_conversation_id"),
+    [
+        pytest.param(
+            "update", {"first": True, "second": False}, "conv_agy_first", id="racing-update"
+        ),
+        pytest.param("recreate", {"first": True}, "agy_conv_relaunch", id="terminal-recreation"),
+    ],
+)
 def test_update_conversation_id_expect_placeholder_serializes_racing_writers(
-    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second_writer: str,
+    expected_results: dict[str, bool],
+    expected_conversation_id: str,
 ) -> None:
     """
-    Two writers replacing the same placeholder are serialized: the second waits
-    for the first's write and then keeps the first's real id.
+    A guarded update paused before its write holds off other bridge-state writers.
+    A second update waits and keeps the first's id; a terminal recreation waits,
+    then clears and reseeds, so its new placeholder survives.
 
-    Guards the cold-start vs reader-recovery race, where both run as threads of
-    one process; a re-check before an unlocked write would let them interleave.
+    Guards cold-start vs reader recovery, and a recovery worker that outlives its
+    cancelled reader: all are threads of one process.
     """
     write_bridge_state(
         bridge_dir,
@@ -514,21 +528,36 @@ def test_update_conversation_id_expect_placeholder_serializes_racing_writers(
             bridge_dir, f"conv_agy_{name}", expect_placeholder=True
         )
 
-    first = threading.Thread(target=write, args=("first",))
-    first.start()
-    assert first_is_writing.wait(5)
-    second = threading.Thread(target=write, args=("second",))
-    second.start()
-    second.join(0.3)
-    assert second.is_alive(), "the second writer must wait for the first to finish"
-    release_first.set()
-    first.join(5)
-    second.join(5)
+    def recreate_terminal() -> None:
+        clear_bridge_state(bridge_dir)
+        write_bridge_state(
+            bridge_dir,
+            AntigravityNativeBridgeState(
+                session_id="conv_test", conversation_id="agy_conv_relaunch"
+            ),
+        )
 
-    assert results == {"first": True, "second": False}
+    first = threading.Thread(target=write, args=("first",))
+    if second_writer == "update":
+        second = threading.Thread(target=write, args=("second",))
+    else:
+        second = threading.Thread(target=recreate_terminal)
+    try:
+        first.start()
+        assert first_is_writing.wait(5)
+        second.start()
+        second.join(0.3)
+        assert second.is_alive(), "the second writer must wait for the first to finish"
+    finally:
+        release_first.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+
+    assert results == expected_results
     state = read_bridge_state(bridge_dir)
     assert state is not None
-    assert state.conversation_id == "conv_agy_first"
+    assert state.conversation_id == expected_conversation_id
 
 
 # ---------------------------------------------------------------------------
