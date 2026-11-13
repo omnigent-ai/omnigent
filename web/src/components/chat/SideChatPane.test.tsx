@@ -1465,6 +1465,14 @@ describe("unsent composer state survives the pane moving", () => {
     },
   );
 
+  it("is one row tall only in a grid cell", () => {
+    const view = renderPane(<SideChatPane childId={childId} fullSession />);
+    expect(screen.getByTestId("side-chat-input")).not.toHaveAttribute("rows");
+    view.unmount();
+    renderPane(<SideChatPane childId={childId} fullSession gridComposer={{}} />);
+    expect(screen.getByTestId("side-chat-input")).toHaveAttribute("rows", "1");
+  });
+
   it("sends a shared draft's tagged file and session as their markers", async () => {
     conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
     useChatStore.getState().updateSideChatComposer(childId, () => ({

@@ -471,23 +471,16 @@ export function GridSessionPane({
                   childId={sessionId}
                   fullSession
                   readOnly={!canEdit}
-                  composerActions={
-                    session
-                      ? {
-                          leading: (
-                            <>
-                              {/* Status only; switching hosts stays in the full-screen view. */}
-                              <HostBadge sessionId={sessionId} appearance="composer" readOnly />
-                              <GridPermissionPicker
-                                session={session}
-                                permissionLevel={permissionLevel}
-                              />
-                            </>
-                          ),
-                          trailing: <SideChatSettings session={session} fullSession />,
-                        }
-                      : undefined
-                  }
+                  gridComposer={{
+                    leading: session && (
+                      <>
+                        {/* Status only; switching hosts stays in the full-screen view. */}
+                        <HostBadge sessionId={sessionId} appearance="composer" readOnly />
+                        <GridPermissionPicker session={session} permissionLevel={permissionLevel} />
+                      </>
+                    ),
+                    trailing: session && <SideChatSettings session={session} fullSession />,
+                  }}
                 />
               </RenderErrorBoundary>
             </div>
@@ -620,17 +613,19 @@ export function GridSessionPane({
 function useSharedSessionDraft(sessionId: string) {
   // Seeds before the composer's own effects, such as a failed-send restore, run.
   useLayoutEffect(() => {
+    const { updateSideChatComposer, clearSideChatComposer } = useChatStore.getState();
+    // A sub-agent tab of this session shares the composer entry; it gets its own back on close.
+    const outside = useChatStore.getState().sideChatComposers[sessionId];
     const saved = getSessionDraft(sessionId);
     const { quotes, text } = restoreReplyDraft(saved?.text ?? "", saved?.replyDraft);
-    useChatStore.getState().updateSideChatComposer(sessionId, (current) => ({
-      ...current,
+    updateSideChatComposer(sessionId, () => ({
       text,
       quotes,
       files: saved?.files ?? [],
       mentions: saved?.mentions,
     }));
     let synced = useChatStore.getState().sideChatComposers[sessionId];
-    return useChatStore.subscribe((state) => {
+    const unsubscribe = useChatStore.subscribe((state) => {
       const composer = state.sideChatComposers[sessionId];
       if (composer === synced) return;
       synced = composer;
@@ -642,6 +637,11 @@ function useSharedSessionDraft(sessionId: string) {
         mentions: composer?.mentions,
       });
     });
+    return () => {
+      unsubscribe();
+      if (outside) updateSideChatComposer(sessionId, () => outside);
+      else clearSideChatComposer(sessionId);
+    };
   }, [sessionId]);
 }
 

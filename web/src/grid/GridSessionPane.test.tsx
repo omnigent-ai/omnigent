@@ -145,10 +145,10 @@ vi.mock("./GridSessionsContext", () => ({
 vi.mock("@/components/chat/SideChatPane", () => ({
   SideChatPane: ({
     childId,
-    composerActions,
+    gridComposer,
   }: {
     childId: string;
-    composerActions?: { leading?: ReactNode; trailing?: ReactNode };
+    gridComposer?: { leading?: ReactNode; trailing?: ReactNode };
   }) => {
     const context = useContext(FileViewerContext)!;
     const terminal = useTerminalFirst();
@@ -181,8 +181,8 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         <button type="button" onClick={() => context.openGithubTab(LINKED_PR)}>
           Open PR
         </button>
-        {composerActions?.leading}
-        {composerActions?.trailing}
+        {gridComposer?.leading}
+        {gridComposer?.trailing}
       </>
     );
   },
@@ -246,7 +246,10 @@ it("keeps each cell's single-session draft and tags, and switches that session's
   fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
   const mentions = { files: [{ path: "notes.md", isDir: false }], sessions: [] };
   setSessionDraft("second", { text: "Unsent idea", files: [], mentions });
-  render(
+  const subagentTabDraft = { text: "Typed in a sub-agent tab", files: [] };
+  useChatStore.getState().updateSideChatComposer("second", () => subagentTabDraft);
+  document.title = "Single session";
+  const view = render(
     <MemoryRouter>
       <TooltipProvider>
         <RearrangeableGrid
@@ -255,6 +258,7 @@ it("keeps each cell's single-session draft and tags, and switches that session's
       </TooltipProvider>
     </MemoryRouter>,
   );
+  expect(document.title).toBe("Test grid");
   expect(useChatStore.getState().sideChatComposers.second).toMatchObject({
     text: "Unsent idea",
     mentions,
@@ -279,6 +283,12 @@ it("keeps each cell's single-session draft and tags, and switches that session's
   await waitFor(() =>
     expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
   );
+  view.unmount();
+  expect(document.title).toBe("Single session");
+  // Leaving the grid hands the shared composer entry back untouched.
+  expect(useChatStore.getState().sideChatComposers.second).toBe(subagentTabDraft);
+  expect(useChatStore.getState().sideChatComposers.first).toBeUndefined();
+  expect(getSessionDraft("second")?.text).toBe("Edited in the grid");
 });
 
 it("opens agent-requested files only in the active workspace and respects navigation guards", () => {

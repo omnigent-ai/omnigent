@@ -172,7 +172,7 @@ export function SideChatPane({
   onStart,
   readOnly: restoredReadOnly = false,
   fullSession = false,
-  composerActions,
+  gridComposer,
 }: {
   childId: string;
   selectionParentId?: string;
@@ -181,8 +181,8 @@ export function SideChatPane({
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
   fullSession?: boolean;
-  /** Extra session controls for the composer's leading and trailing action groups. */
-  composerActions?: { leading?: ReactNode; trailing?: ReactNode };
+  /** A grid cell's composer: one row tall, with the cell session's controls. */
+  gridComposer?: { leading?: ReactNode; trailing?: ReactNode };
 }) {
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
@@ -530,7 +530,7 @@ export function SideChatPane({
                 starting={starting}
                 onStart={onStart ? startSideChat : undefined}
                 onSend={followSentMessage}
-                extraActions={composerActions}
+                gridComposer={gridComposer}
               />
             )}
           </div>
@@ -561,7 +561,7 @@ function SideChatComposer({
   starting,
   onStart,
   onSend,
-  extraActions,
+  gridComposer,
 }: {
   fullSession: boolean;
   childId: string;
@@ -577,7 +577,7 @@ function SideChatComposer({
   onStart?: (text: string) => Promise<void>;
   /** Called when a live tab sends or queues a follow-up. */
   onSend: () => void;
-  extraActions?: { leading?: ReactNode; trailing?: ReactNode };
+  gridComposer?: { leading?: ReactNode; trailing?: ReactNode };
 }) {
   const send = useChatStore((s) => s.send);
   const sendSlashCommand = useChatStore((s) => s.sendSlashCommand);
@@ -1105,7 +1105,7 @@ function SideChatComposer({
           // Menu rows preventDefault on mousedown so selecting one keeps focus.
           onBlur: () => setInputFocused(false),
           placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
-          rows: 1,
+          rows: gridComposer ? 1 : undefined,
           disabled: !ready,
           "data-testid": "side-chat-input",
           onKeyDown: handleKeyDown,
@@ -1167,7 +1167,7 @@ function SideChatComposer({
                 planActive={false}
                 testIdPrefix="side-chat"
               />
-              {extraActions?.leading}
+              {gridComposer?.leading}
             </>
           ),
           trailing: (
@@ -1191,7 +1191,7 @@ function SideChatComposer({
                   }
                 />
               )}
-              {extraActions?.trailing}
+              {gridComposer?.trailing}
               <ComposerMicButton
                 className="size-8 md:size-7"
                 disabled={!ready}

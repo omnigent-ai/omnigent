@@ -187,7 +187,12 @@ export function RearrangeableGrid({
   const { selectedSessionId: activeSessionId, selectSession } = useGridSessions()!;
   const title = gridTitle(grid, useSessionTitles());
   useEffect(() => {
+    // Leaving the grid restores the title the page had before it.
+    const previous = document.title;
     document.title = title;
+    return () => {
+      document.title = previous;
+    };
   }, [title]);
   const workspaceKey = `grid:${grid.id}`;
   const [workspace, setWorkspace] = useState(() => {
