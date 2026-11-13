@@ -312,11 +312,11 @@ def test_databricks_request_headers_org_only(token_dir) -> None:
 
     # Compare routing headers only; _routing_headers drops the always-present User-Agent.
     store_databricks_auth(
-        server_url="https://acme.databricks.com/api/2.0/omnigent",
-        workspace_host="https://acme.databricks.com",
+        server_url="https://acme.example.com/api/2.0/omnigent",
+        workspace_host="https://acme.example.com",
         org_id="2850744067564480",
     )
-    assert _routing_headers("https://acme.databricks.com/api/2.0/omnigent") == {
+    assert _routing_headers("https://acme.example.com/api/2.0/omnigent") == {
         "X-Databricks-Org-Id": "2850744067564480",
         "X-Databricks-Omnigent-Slice-Key": "client_key",
     }
