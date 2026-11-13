@@ -188,30 +188,6 @@ def _parse_native_hook_allow_cache_seconds(raw: object) -> Callable[[], float] |
     return lambda: seconds
 
 
-def _parse_shared_preferences_authority_id(raw: object) -> str | None:
-    """Parse the ``shared_preferences_authority_id`` server config value.
-
-    :param raw: The configured deployment identifier, e.g. ``"prod-eu"``;
-        ``None`` when the key is absent.
-    :returns: The validated identifier, or ``None`` to leave the shared
-        preferences API unmounted.
-    :raises click.ClickException: If the value is not a valid identifier.
-    """
-    if raw is None:
-        return None
-    from pydantic import TypeAdapter, ValidationError
-
-    from omnigent.preference_sync import Name
-
-    try:
-        return TypeAdapter(Name).validate_python(raw)
-    except ValidationError:
-        raise click.ClickException(
-            "Invalid shared_preferences_authority_id: expected a nonempty string "
-            "of at most 128 characters without surrounding whitespace."
-        ) from None
-
-
 def _routing_config_text(routing_cfg: Mapping[str, object], key: str) -> str:
     value = routing_cfg.get(key)
     if isinstance(value, str):
@@ -4895,9 +4871,19 @@ def server(
     from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     cfg = _load_config(config_path)
-    authority_id = _parse_shared_preferences_authority_id(
-        cfg.get("shared_preferences_authority_id")
-    )
+    authority_id = cfg.get("shared_preferences_authority_id")
+    if authority_id is not None:
+        from pydantic import TypeAdapter, ValidationError
+
+        from omnigent.preference_sync import Name
+
+        try:
+            authority_id = TypeAdapter(Name).validate_python(authority_id)
+        except ValidationError:
+            raise click.ClickException(
+                "Invalid shared_preferences_authority_id: expected a nonempty string "
+                "of at most 128 characters without surrounding whitespace."
+            ) from None
     server_config: dict[str, Any] | None = cfg
     if config_path is None:
         # Without -c, create_app gets the resolved server config (OMNIGENT_CONFIG
