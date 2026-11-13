@@ -863,6 +863,8 @@ def test_hello_frame_round_trip() -> None:
         runners=["runner_token_aaa", "runner_token_bbb"],
         interactive_shells=["zsh", "bash"],
         connection_id="host-connection-1",
+        refreshed_name="ip-10-90-37-46",
+        previous_host_id="a1ed1ab71de2311e20488a989e61701c",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -872,6 +874,8 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
     assert decoded.interactive_shells == ["zsh", "bash"]
     assert decoded.connection_id == "host-connection-1"
+    assert decoded.refreshed_name == "ip-10-90-37-46"
+    assert decoded.previous_host_id == "a1ed1ab71de2311e20488a989e61701c"
 
 
 def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None:
@@ -892,6 +896,8 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     # empty set (feature unsupported), not choke on the missing key.
     assert decoded.capabilities == []
     assert decoded.connection_id is None
+    assert decoded.refreshed_name is None
+    assert decoded.previous_host_id is None
 
 
 def test_hello_frame_capabilities_round_trip() -> None:

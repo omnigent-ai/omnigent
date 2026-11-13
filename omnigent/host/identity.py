@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import socket
 import tempfile
 import uuid
@@ -38,6 +39,18 @@ HOST_TOKEN_ENV_VAR = identity_env.HOST_TOKEN_ENV_VAR
 # auth provider.
 MANAGED_HOST_TOKEN_HEADER = "X-Omnigent-Host-Token"
 
+# Records the hostname a generated ``name`` came from. While ``name`` still
+# equals it, the host registers under the current hostname; a user-edited name is
+# kept. Writers of an explicitly chosen name set it to null.
+NAME_FROM_HOSTNAME_KEY = "name_from_hostname"
+
+# The host_id ``reset-id`` replaced, so a server can move that registration to the new id.
+PREVIOUS_HOST_ID_KEY = "previous_host_id"
+
+# EC2's private-IP hostname, e.g. ``ip-10-90-37-46``. In a config saved before
+# NAME_FROM_HOSTNAME_KEY existed, such a name was generated, never chosen.
+_EC2_PRIVATE_IP_HOSTNAME = re.compile(r"ip(-(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){4}(\..+)?")
+
 
 @dataclass
 class HostIdentity:
@@ -48,10 +61,18 @@ class HostIdentity:
         Format: bare 32-char uuid4 hex.
     :param name: Human-readable name displayed in the Web UI
         host picker, e.g. ``"corey-laptop"``.
+    :param stored_name: The generated name config.yaml still holds when *name*
+        refreshed it from a newer hostname, e.g. ``"ip-10-90-45-193"``. The
+        hello registers it for servers that predate name refreshes. ``None``
+        otherwise.
+    :param previous_host_id: The host_id ``reset-id`` replaced, e.g.
+        ``"a1ed1ab71de2311e20488a989e61701c"``, or ``None``.
     """
 
     host_id: str
     name: str
+    stored_name: str | None = None
+    previous_host_id: str | None = None
 
 
 HOST_SLICE_KEY_ENABLED_ENV_VAR = "OMNIGENT_HOST_SLICE_KEY_ENABLED"
@@ -119,6 +140,41 @@ def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
     return normalized
 
 
+def parse_host_id_or_none(value: object) -> str | None:
+    """Normalize *value* as a host id, or return ``None`` when it is not one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return uuid_to_bytes(value).hex()
+    except InvalidUuidError:
+        return None
+
+
+def _write_config(path: Path, cfg: dict[str, object]) -> None:
+    """Atomically replace *path* with *cfg* as YAML.
+
+    A truncated config would make the next load mint a new host_id. The rename
+    adopts mkstemp's 0600 mode on purpose; keep it for this per-user file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def _name_is_generated(host_section: dict[object, object], name: str, hostname: str) -> bool:
+    """Whether the stored *name* was generated from a hostname rather than chosen."""
+    if NAME_FROM_HOSTNAME_KEY in host_section:
+        return name == host_section[NAME_FROM_HOSTNAME_KEY]
+    return name == hostname or _EC2_PRIVATE_IP_HOSTNAME.fullmatch(name) is not None
+
+
 def load_or_create_host_identity(
     path: Path | None = None,
 ) -> HostIdentity:
@@ -128,6 +184,11 @@ def load_or_create_host_identity(
     section does not exist, generates a fresh ``host_id``, sets
     ``name`` to the machine's hostname, writes the section back,
     and returns the identity.
+
+    A name generated from the hostname follows later hostname changes
+    (e.g. a VM re-provisioned with a new IP-based hostname while its
+    home directory persists), keeping the same ``host_id``. The stored
+    name is left in place and returned as ``stored_name``.
 
     A *partial* host section is completed rather than discarded: a
     config.yaml that names the host (``host: {name: my-box}``) but
@@ -177,6 +238,15 @@ def load_or_create_host_identity(
 
     host_id = host_section.get("host_id")
     name = host_section.get("name")
+    previous_host_id = parse_host_id_or_none(host_section.get(PREVIOUS_HOST_ID_KEY))
+    hostname = socket.gethostname()
+    stored_name: str | None = None
+    record_provenance = False
+    if isinstance(name, str) and _name_is_generated(host_section, name, hostname):
+        record_provenance = NAME_FROM_HOSTNAME_KEY not in host_section
+        host_section[NAME_FROM_HOSTNAME_KEY] = name
+        if name != hostname:
+            name, stored_name = hostname, name
 
     # A host_id read from config.yaml must be a valid (UUID-shaped) id, same
     # as the env override — an invalid one would only fail later, remotely, as
@@ -186,14 +256,21 @@ def load_or_create_host_identity(
         "to have one generated automatically."
     )
 
-    # Fully specified: honor the config as-is, nothing to persist.
+    # Fully specified: honor the config as-is, persisting only a legacy name's provenance.
     if host_id and name:
-        return HostIdentity(
+        identity = HostIdentity(
             host_id=_validated_host_id(
                 host_id, source=f"host_id in {path}", remedy=config_host_id_remedy
             ),
             name=name,
+            stored_name=stored_name,
+            previous_host_id=previous_host_id,
         )
+        if record_provenance:
+            # Best effort: an unwritable config only repeats this on the next start.
+            with contextlib.suppress(OSError):
+                _write_config(path, cfg)
+        return identity
 
     # Otherwise complete the section, preserving any provided value and
     # generating only what's missing, then persist so the identity is
@@ -203,15 +280,15 @@ def load_or_create_host_identity(
         if host_id
         else uuid.uuid4().hex
     )
-    name = name or socket.gethostname()
-    identity = HostIdentity(host_id=host_id, name=name)
+    if not name:
+        name = host_section["name"] = host_section[NAME_FROM_HOSTNAME_KEY] = hostname
+    identity = HostIdentity(
+        host_id=host_id, name=name, stored_name=stored_name, previous_host_id=previous_host_id
+    )
 
     host_section["host_id"] = identity.host_id
-    host_section["name"] = identity.name
     cfg["host"] = host_section
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+    _write_config(path, cfg)
 
     return identity
 
@@ -226,8 +303,9 @@ def reset_host_id(path: Path | None = None) -> tuple[str | None, str]:
     machine register as a brand-new host under the current identity.
 
     The host ``name`` (and every other config key) is preserved; only
-    ``host_id`` changes. A missing config or host section is created, same
-    as :func:`load_or_create_host_identity`.
+    ``host_id`` changes, and the replaced id is kept as ``previous_host_id``.
+    A missing config or host section is created, same as
+    :func:`load_or_create_host_identity`.
 
     :param path: Optional config YAML path. Defaults to the user-level path,
         honoring ``OMNIGENT_CONFIG_HOME`` when set.
@@ -247,24 +325,12 @@ def reset_host_id(path: Path | None = None) -> tuple[str | None, str]:
     old_host_id = host_section.get("host_id")
     new_host_id = uuid.uuid4().hex
     host_section["host_id"] = new_host_id
-    host_section.setdefault("name", socket.gethostname())
+    if isinstance(old_host_id, str):
+        host_section[PREVIOUS_HOST_ID_KEY] = old_host_id
+    if "name" not in host_section:
+        host_section["name"] = host_section[NAME_FROM_HOSTNAME_KEY] = socket.gethostname()
     cfg["host"] = host_section
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic write: reset-id is a recovery command run when things are already
-    # broken, so a crash mid-write must not truncate the whole config. Write a
-    # sibling temp file and rename it over the target (rename is atomic on the
-    # same filesystem). The rename adopts mkstemp's 0600 mode intentionally —
-    # config.yaml holds only host identity, and 0600 is the right posture for a
-    # per-user file; do not "restore" a wider umask mode here.
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    _write_config(path, cfg)
 
     return (old_host_id if isinstance(old_host_id, str) else None), new_host_id
 
