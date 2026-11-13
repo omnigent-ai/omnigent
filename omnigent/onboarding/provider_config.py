@@ -1696,10 +1696,7 @@ def set_default_provider(
             result[provider_name] = entry
             continue
         parsed = _parse_provider(provider_name, entry)
-        served = set(provider_families(parsed))
-        if parsed.kind in {GATEWAY_KIND, LOCAL_KIND}:
-            # Preserve Gemini's explicit opt-in when serializing new defaults.
-            served.discard(GEMINI_FAMILY)
+        served = _default_render_scopes(parsed)
         if provider_name == name:
             new_defaults = parsed.default_families | scope
         else:
@@ -1711,6 +1708,55 @@ def set_default_provider(
             body["default"] = raw_value
         result[provider_name] = body
     return result
+
+
+def _default_render_scopes(entry: ProviderEntry) -> set[str]:
+    """Return the scopes :func:`_default_raw_value` may render as ``default: true``."""
+    served = set(provider_families(entry))
+    if entry.kind in {GATEWAY_KIND, LOCAL_KIND}:
+        # Preserve Gemini's explicit opt-in when serializing new defaults.
+        served.discard(GEMINI_FAMILY)
+    return served
+
+
+def _parses(name: str, raw: dict[str, object]) -> bool:
+    try:
+        _parse_provider(name, raw)
+    except OmnigentError:
+        return False
+    return True
+
+
+def drop_unserved_default_scopes(name: str, entry: dict[str, object]) -> dict[str, object] | None:
+    """Return a copy of *entry* whose ``default`` keeps only scopes it serves.
+
+    Repairs an entry whose ``default`` names a family the provider does not
+    serve, e.g. one rewritten by a build that read its families differently.
+
+    :param name: Provider name, for error messages, e.g. ``"databricks-gemini-work"``.
+    :param entry: The raw provider entry, e.g. ``{"kind": "databricks",
+        "profile": "work", "native_gemini": True, "default": "openai"}``.
+    :returns: The repaired entry (here without ``default``), or ``None`` when
+        the entry is invalid for another reason.
+    """
+    body = {key: value for key, value in entry.items() if key != "default"}
+    try:
+        parsed = _parse_provider(name, body)
+    except OmnigentError:
+        return None
+    if _parses(name, entry):
+        return dict(entry)
+    default_raw = entry.get("default")
+    requested = default_raw if isinstance(default_raw, (list, tuple)) else [default_raw]
+    kept = frozenset(
+        scope
+        for scope in requested
+        if isinstance(scope, str) and _parses(name, {**body, "default": [scope]})
+    )
+    default_value = _default_raw_value(kept, _default_render_scopes(parsed))
+    if default_value is not None:
+        body["default"] = default_value
+    return body
 
 
 def provider_entry_settings(

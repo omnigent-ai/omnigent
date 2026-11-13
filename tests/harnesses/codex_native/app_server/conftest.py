@@ -21,3 +21,15 @@ def _isolate_ucode_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(
         "omnigent.onboarding.ucode_state._STATE_PATH", tmp_path / "no-ucode-state.json"
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_installed_codex_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Keep the host's installed Codex catalog from reordering canned listings.
+
+    Tests of that ordering patch ``_codex_catalog_models`` themselves.
+
+    :param monkeypatch: Fixture used to stub the catalog read.
+    """
+    monkeypatch.setattr("omnigent.harnesses.codex_native.app_server._codex_catalog_models", list)
