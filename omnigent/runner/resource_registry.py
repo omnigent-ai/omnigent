@@ -2746,11 +2746,14 @@ class SessionResourceRegistry:
             ]
             for key in stale_lifecycle_keys:
                 self._terminal_lifecycles.pop(key, None)
+        cancelled: asyncio.CancelledError | None = None
         if self._terminal_registry is not None:
             try:
                 await self._terminal_registry.cleanup_conversation(
                     session_id,
                 )
+            except asyncio.CancelledError as exc:
+                cancelled = exc
             except Exception:
                 _logger.exception(
                     "Error cleaning up terminals for session=%s",
@@ -2758,38 +2761,42 @@ class SessionResourceRegistry:
                 )
         _retire_closed_terminal_poller(status_poller)
 
-        if primary is not None:
+        for environment, component in (
+            (primary, "runner_primary_os_env"),
+            (tool_env, "runner_tool_os_env"),
+        ):
+            if environment is None:
+                continue
             try:
                 await run_sync_cleanup(
-                    primary.close,
-                    component="runner_primary_os_env",
+                    environment.close,
+                    component=component,
                     session_id=session_id,
                 )
+            except asyncio.CancelledError as exc:
+                cancelled = cancelled or exc
             except Exception:
                 _logger.exception(
-                    "Error closing primary env for session=%s",
-                    session_id,
-                )
-        if tool_env is not None:
-            try:
-                await run_sync_cleanup(
-                    tool_env.close,
-                    component="runner_tool_os_env",
-                    session_id=session_id,
-                )
-            except Exception:
-                _logger.exception(
-                    "Error closing sys_os_* env for session=%s",
+                    "Error closing %s for session=%s",
+                    component,
                     session_id,
                 )
         if skills_directory is not None:
             try:
-                await asyncio.to_thread(skills_directory.cleanup)
+                await run_sync_cleanup(
+                    skills_directory.cleanup,
+                    component="runner_codex_skills",
+                    session_id=session_id,
+                )
+            except asyncio.CancelledError as exc:
+                cancelled = cancelled or exc
             except OSError:
                 _logger.exception(
                     "Error cleaning up Codex skills for session=%s",
                     session_id,
                 )
+        if cancelled is not None:
+            raise cancelled
 
     def has_primary_env(self, session_id: str) -> bool:
         """Check if a primary env has been materialized.

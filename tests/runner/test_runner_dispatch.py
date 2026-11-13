@@ -104,6 +104,7 @@ from omnigent.runtime.prompt import (
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
@@ -2804,15 +2805,13 @@ async def _wait_until_dead(pid: int, timeout: float = 5.0) -> None:
     """Wait until *pid* has exited (a zombie counts), so the next call sees it dead."""
     import subprocess
 
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
+    def stopped() -> bool:
         state = subprocess.run(
             ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
         ).stdout.strip()
-        if not state or state.startswith("Z"):
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError(f"process {pid} still running after {timeout}s")
+        return not state or state.startswith("Z")
+
+    await poll_until_async(stopped, timeout_s=timeout, interval_s=0.02)
 
 
 @pytest.mark.asyncio
@@ -2832,52 +2831,54 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
                 sandbox=OSEnvSandboxSpec(type="none"),
             ),
         )
-        helper_pid = await _os_env_helper_pid(registry, spec, "conv_runner_os_env_test")
+        try:
+            helper_pid = await _os_env_helper_pid(registry, spec, "conv_runner_os_env_test")
 
-        write = await _execute_os_env_tool(
-            "sys_os_write",
-            {"path": "note.txt", "content": "Привет 世界\nplanet\n"},
-            agent_spec=spec,
-            conversation_id="conv_runner_os_env_test",
-            resource_registry=registry,
-        )
-        assert json.loads(write)["created"] is True
-        assert root.joinpath("note.txt").read_text() == "Привет 世界\nplanet\n"
+            write = await _execute_os_env_tool(
+                "sys_os_write",
+                {"path": "note.txt", "content": "Привет 世界\nplanet\n"},
+                agent_spec=spec,
+                conversation_id="conv_runner_os_env_test",
+                resource_registry=registry,
+            )
+            assert json.loads(write)["created"] is True
+            assert root.joinpath("note.txt").read_text() == "Привет 世界\nplanet\n"
 
-        edit = await _execute_os_env_tool(
-            "sys_os_edit",
-            {"path": "note.txt", "oldText": "planet", "newText": "world"},
-            agent_spec=spec,
-            conversation_id="conv_runner_os_env_test",
-            resource_registry=registry,
-        )
-        assert json.loads(edit)["replacements"] == 1
+            edit = await _execute_os_env_tool(
+                "sys_os_edit",
+                {"path": "note.txt", "oldText": "planet", "newText": "world"},
+                agent_spec=spec,
+                conversation_id="conv_runner_os_env_test",
+                resource_registry=registry,
+            )
+            assert json.loads(edit)["replacements"] == 1
 
-        read = await _execute_os_env_tool(
-            "sys_os_read",
-            {"path": "note.txt"},
-            agent_spec=spec,
-            conversation_id="conv_runner_os_env_test",
-            resource_registry=registry,
-        )
-        assert "Привет 世界" in read
-        assert json.loads(read)["content"] == "Привет 世界\nworld\n"
+            read = await _execute_os_env_tool(
+                "sys_os_read",
+                {"path": "note.txt"},
+                agent_spec=spec,
+                conversation_id="conv_runner_os_env_test",
+                resource_registry=registry,
+            )
+            assert "Привет 世界" in read
+            assert json.loads(read)["content"] == "Привет 世界\nworld\n"
 
-        shell = await _execute_os_env_tool(
-            "sys_os_shell",
-            {"command": "pwd; echo $PPID"},
-            agent_spec=spec,
-            conversation_id="conv_runner_os_env_test",
-            resource_registry=registry,
-        )
-        shell_result = json.loads(shell)
-        assert shell_result["exit_code"] == 0
-        cwd, pid = shell_result["stdout"].split()
-        assert Path(cwd).resolve() == root.resolve()
-        # Every call in the session ran in the one helper process.
-        assert int(pid) == helper_pid
+            shell = await _execute_os_env_tool(
+                "sys_os_shell",
+                {"command": "pwd; echo $PPID"},
+                agent_spec=spec,
+                conversation_id="conv_runner_os_env_test",
+                resource_registry=registry,
+            )
+            shell_result = json.loads(shell)
+            assert shell_result["exit_code"] == 0
+            cwd, pid = shell_result["stdout"].split()
+            assert Path(cwd).resolve() == root.resolve()
+            # Every call in the session ran in the one helper process.
+            assert int(pid) == helper_pid
 
-        await registry.cleanup_session("conv_runner_os_env_test")
+        finally:
+            await registry.cleanup_session("conv_runner_os_env_test")
         assert not _process_exists(helper_pid)
 
 
@@ -2899,48 +2900,50 @@ async def test_runner_os_env_helper_restarts_and_keys_on_spec(tmp_path: Path) ->
         )
 
     registry = SessionResourceRegistry()
-    spec = agent(tmp_path / "a")
-    crashed = await _os_env_helper_pid(registry, spec, "conv_a")
-    os.kill(crashed, signal.SIGKILL)
-    # Once the death is visible the next call restarts the helper before sending;
-    # a request already in flight to it is not replayed.
-    await _wait_until_dead(crashed)
-    restarted = await _os_env_helper_pid(registry, spec, "conv_a")
-    assert restarted != crashed
-    assert await _os_env_helper_pid(registry, spec, "conv_a") == restarted
+    try:
+        spec = agent(tmp_path / "a")
+        crashed = await _os_env_helper_pid(registry, spec, "conv_a")
+        os.kill(crashed, signal.SIGKILL)
+        # Once the death is visible the next call restarts the helper before sending;
+        # a request already in flight to it is not replayed.
+        await _wait_until_dead(crashed)
+        restarted = await _os_env_helper_pid(registry, spec, "conv_a")
+        assert restarted != crashed
+        assert await _os_env_helper_pid(registry, spec, "conv_a") == restarted
 
-    other_session = await _os_env_helper_pid(registry, spec, "conv_b")
-    assert other_session != restarted
+        other_session = await _os_env_helper_pid(registry, spec, "conv_b")
+        assert other_session != restarted
 
-    moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
-    assert moved != restarted
-    assert not _process_exists(restarted)
+        moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
+        assert moved != restarted
+        assert not _process_exists(restarted)
 
-    # The same spec whose cwd symlink now points elsewhere is a different workspace.
-    (tmp_path / "c").mkdir()
-    link = tmp_path / "link"
-    link.symlink_to(tmp_path / "b")
-    linked = await _os_env_helper_pid(registry, agent(link), "conv_a")
-    link.unlink()
-    link.symlink_to(tmp_path / "c")
-    retargeted = await _os_env_helper_pid(registry, agent(link), "conv_a")
-    assert retargeted != linked
-    moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
+        # The same spec whose cwd symlink now points elsewhere is a different workspace.
+        (tmp_path / "c").mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(tmp_path / "b")
+        linked = await _os_env_helper_pid(registry, agent(link), "conv_a")
+        link.unlink()
+        link.symlink_to(tmp_path / "c")
+        retargeted = await _os_env_helper_pid(registry, agent(link), "conv_a")
+        assert retargeted != linked
+        moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
 
-    # A timed-out command's descendants may outlive it, so its helper is retired.
-    timed_out = await _execute_os_env_tool(
-        "sys_os_shell",
-        {"command": "sleep 30", "timeout": 1},
-        agent_spec=agent(tmp_path / "b"),
-        conversation_id="conv_a",
-        resource_registry=registry,
-    )
-    assert json.loads(timed_out)["timed_out"] is True
-    assert not _process_exists(moved)
-    moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
+        # A timed-out command's descendants may outlive it, so its helper is retired.
+        timed_out = await _execute_os_env_tool(
+            "sys_os_shell",
+            {"command": "sleep 30", "timeout": 1},
+            agent_spec=agent(tmp_path / "b"),
+            conversation_id="conv_a",
+            resource_registry=registry,
+        )
+        assert json.loads(timed_out)["timed_out"] is True
+        assert not _process_exists(moved)
+        moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
 
-    await registry.cleanup_session("conv_a")
-    await registry.cleanup_session("conv_b")
+    finally:
+        await registry.cleanup_session("conv_a")
+        await registry.cleanup_session("conv_b")
     assert not _process_exists(moved)
     assert not _process_exists(other_session)
 
@@ -2950,6 +2953,8 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
     tmp_path: Path,
 ) -> None:
     """Concurrent calls bypass a busy session helper; a cancelled call's helper is closed."""
+    import errno
+
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
@@ -2960,23 +2965,34 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
         ),
     )
     registry = SessionResourceRegistry()
-    session_helper = await _os_env_helper_pid(registry, spec, "conv_busy")
+    blocked: asyncio.Task[str] | None = None
+    gate_fd: int | None = None
     fifo = tmp_path / "gate"
-    os.mkfifo(fifo)
-    (tmp_path / "note.txt").write_text("hi\n")
 
-    blocked = asyncio.create_task(
-        _execute_os_env_tool(
-            "sys_os_shell",
-            {"command": "read line < gate; echo $PPID $line"},
-            agent_spec=spec,
-            conversation_id="conv_busy",
-            resource_registry=registry,
-        )
-    )
-    # Opening the write end returns once the shell is reading the gate.
-    gate = await asyncio.wait_for(asyncio.to_thread(open, fifo, "w"), timeout=10)
+    def open_gate() -> bool:
+        nonlocal gate_fd
+        try:
+            gate_fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno == errno.ENXIO:
+                return False
+            raise
+        return True
+
     try:
+        session_helper = await _os_env_helper_pid(registry, spec, "conv_busy")
+        os.mkfifo(fifo)
+        (tmp_path / "note.txt").write_text("hi\n")
+        blocked = asyncio.create_task(
+            _execute_os_env_tool(
+                "sys_os_shell",
+                {"command": "read line < gate; echo $PPID $line", "timeout": 10},
+                agent_spec=spec,
+                conversation_id="conv_busy",
+                resource_registry=registry,
+            )
+        )
+        await poll_until_async(open_gate, timeout_s=5)
         read = await _execute_os_env_tool(
             "sys_os_read",
             {"path": "note.txt"},
@@ -2987,15 +3003,22 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
         assert json.loads(read)["content"] == "hi\n"
         assert not blocked.done()
         blocked.cancel()
-        gate.write("open\n")
+        assert gate_fd is not None
+        os.write(gate_fd, b"open\n")
+        os.close(gate_fd)
+        gate_fd = None
+        with pytest.raises(asyncio.CancelledError):
+            await blocked
+        assert not _process_exists(session_helper)
+        replacement = await _os_env_helper_pid(registry, spec, "conv_busy")
+        assert replacement != session_helper
     finally:
-        gate.close()
-    with pytest.raises(asyncio.CancelledError):
-        await blocked
-    assert not _process_exists(session_helper)
-    replacement = await _os_env_helper_pid(registry, spec, "conv_busy")
-    assert replacement != session_helper
-    await registry.cleanup_session("conv_busy")
+        if gate_fd is not None:
+            os.close(gate_fd)
+        if blocked is not None:
+            blocked.cancel()
+            await asyncio.gather(blocked, return_exceptions=True)
+        await registry.cleanup_session("conv_busy")
     assert not _process_exists(replacement)
 
 
@@ -3094,21 +3117,29 @@ async def test_runner_os_env_change_restoring_the_original_leaves_changes(
     )
     filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
 
-    for step, (tool_name, args) in enumerate(calls, start=1):
-        result = await _execute_os_env_tool(
-            tool_name,
-            {"path": "file.txt", **args},
-            agent_spec=spec,
-            conversation_id="conv_revert",
-            filesystem_registry=filesystem_registry,
-        )
-        assert "error" not in json.loads(result)
-        if step < len(calls):
-            assert filesystem_registry.list_changed_files("conv_revert", limit=10)
+    resource_registry = SessionResourceRegistry()
+    try:
+        helper_pid = await _os_env_helper_pid(resource_registry, spec, "conv_revert")
+        for step, (tool_name, args) in enumerate(calls, start=1):
+            result = await _execute_os_env_tool(
+                tool_name,
+                {"path": "file.txt", **args},
+                agent_spec=spec,
+                conversation_id="conv_revert",
+                filesystem_registry=filesystem_registry,
+                resource_registry=resource_registry,
+            )
+            assert "error" not in json.loads(result)
+            if step < len(calls):
+                assert filesystem_registry.list_changed_files("conv_revert", limit=10)
 
-    listed = filesystem_registry.list_changed_files("conv_revert", limit=10)
-    assert [entry["status"] for entry in listed] == statuses
-    assert filesystem_registry.get_baseline("file.txt") == baseline
+        listed = filesystem_registry.list_changed_files("conv_revert", limit=10)
+        assert [entry["status"] for entry in listed] == statuses
+        assert filesystem_registry.get_baseline("file.txt") == baseline
+
+        assert await _os_env_helper_pid(resource_registry, spec, "conv_revert") == helper_pid
+    finally:
+        await resource_registry.cleanup_session("conv_revert")
 
 
 @pytest.mark.asyncio

@@ -3087,19 +3087,42 @@ async def test_cleanup_session_closes_primary_env(
 
 
 @pytest.mark.asyncio
-async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe() -> None:
-    """Primary environment cleanup finishes after repeated cancellation."""
+@pytest.mark.parametrize("cancel_stage", ["primary_close", "terminal_cleanup"])
+async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_stage: str,
+) -> None:
+    """Every detached environment closes off-loop before repeated cancellation escapes."""
+    import omnigent.inner.os_env as os_env_module
+
     reg = SessionResourceRegistry()
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
     heartbeat_ran_while_blocked = asyncio.Event()
+    loop_thread = threading.get_ident()
+    closed_on: list[int] = []
+    if cancel_stage == "terminal_cleanup":
+        terminals = TerminalRegistry()
 
-    class _BlockingEnvironment(_FakeOSEnvironment):
+        async def blocked_terminal_cleanup(session_id: str) -> None:
+            del session_id
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(terminals, "cleanup_conversation", blocked_terminal_cleanup)
+        reg._terminal_registry = terminals
+
+    class _TrackedEnvironment(_FakeOSEnvironment):
+        def close(self) -> None:
+            closed_on.append(threading.get_ident())
+            super().close()
+
+    class _BlockingEnvironment(_TrackedEnvironment):
         def close(self) -> None:
             started.set()
             assert release.wait(timeout=2.0)
-            self._closed = True
+            super().close()
             finished.set()
 
     environment = _BlockingEnvironment(
@@ -3107,6 +3130,14 @@ async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe()
         cwd=Path("/tmp"),
     )
     reg._primary_envs["conv_blocked_cleanup"] = environment
+    tool_environment = _TrackedEnvironment(spec=environment.spec, cwd=environment.cwd)
+    monkeypatch.setattr(
+        os_env_module, "create_os_environment", lambda *args, **kwargs: tool_environment
+    )
+    lease = await reg.lease_tool_environment("conv_blocked_cleanup", environment.spec)
+    assert lease is not None
+    await lease.release(reusable=True)
+    skills_dir = reg.codex_skills_dir("conv_blocked_cleanup")
 
     async def heartbeat() -> None:
         while not finished.is_set():
@@ -3131,7 +3162,7 @@ async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe()
         await asyncio.sleep(0)
         cleanup_task.cancel()
         release.set()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError) as cancelled:
             await cleanup_task
     finally:
         release.set()
@@ -3144,6 +3175,10 @@ async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe()
 
     assert finished.is_set()
     assert environment._closed
+    assert tool_environment._closed
+    assert len(closed_on) == 2 and all(thread != loop_thread for thread in closed_on)
+    assert cancelled.value is not None
+    assert not skills_dir.exists()
     assert not reg.has_primary_env("conv_blocked_cleanup")
     assert heartbeat_ran_while_blocked.is_set()
 
