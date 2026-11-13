@@ -1391,6 +1391,8 @@ async def _auto_create_claude_terminal_for_test(
         ("claude-wrapper", ["--"]),
         ("claude-wrapper", ["claude", "--"]),
         ("claude-wrapper", ["--profile", "work", "--"]),
+        ("claude-wrapper", ["--settings", '{"wrapperOption":true}', "claude"]),
+        ("claude-wrapper", ["--settings", '{"disableAllHooks":true}', "claude"]),
         ("sh", ["-c", 'shift; exec claude "$@"', "shell-name", "--"]),
         (
             "claude-wrapper",
@@ -1405,6 +1407,8 @@ async def _auto_create_claude_terminal_for_test(
         "configured-wrapper",
         "configured-subcommand-wrapper",
         "configured-wrapper-options",
+        "configured-wrapper-owned-settings",
+        "configured-wrapper-owned-hook-control",
         "configured-shell-payload",
         "wrapper-claude-settings",
         "configured-claude-settings",
@@ -1450,21 +1454,29 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
         )
         try:
             await kwargs["prepare_terminal"](created.instance)
-            settings_index = created.instance.args.index("--settings") + 1
+            settings_index = (
+                max(
+                    index for index, arg in enumerate(created.instance.args) if arg == "--settings"
+                )
+                + 1
+            )
             settings = json.loads(Path(created.instance.args[settings_index]).read_text())
             assert settings["env"]["ORDER"] == "caller"
             assert settings["hooks"]["UserPromptSubmit"]
             if command == "claude-wrapper":
-                boundary = prefix.index("--") + 1
+                boundary = prefix.index("--") + 1 if "--" in prefix else len(prefix)
                 assert created.instance.args[:boundary] == prefix[:boundary]
+                assert "wrapperOption" not in settings
+                assert "disableAllHooks" not in settings
             if command == "sh":
                 assert created.instance.args[: len(prefix)] == prefix
             if command == "env":
                 boundary = prefix.index("--settings")
                 assert created.instance.args[:boundary] == prefix[:boundary]
-            if "--settings" in prefix:
+            wrapper_settings = command == "claude-wrapper" and "--" not in prefix
+            if "--settings" in prefix and not wrapper_settings:
                 assert settings["env"]["CONFIG_ONLY"] == "yes"
-            assert created.instance.args.count("--settings") == 1
+            assert created.instance.args.count("--settings") == (2 if wrapper_settings else 1)
         finally:
             await created.instance.close()
         raise RuntimeError("stop after prepared settings")

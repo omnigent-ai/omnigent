@@ -97,8 +97,71 @@ def _install_managed_mcp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
-    settings_path = Path(args[args.index("--settings") + 1])
+    settings_index = max(index for index, arg in enumerate(args) if arg == "--settings")
+    settings_path = Path(args[settings_index + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("caller", [False, True])
+async def test_claude_terminal_request_preserves_legacy_bridge_identity(
+    tmp_path, monkeypatch, existing, caller
+) -> None:
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+    from omnigent.inner.terminal import create_terminal_instance
+
+    bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
+    identity = bridge_dir / "claude-settings.json"
+    legacy = '{"disableAllHooks":true,"env":{"LEGACY_ONLY":"stale"}}'
+    if existing:
+        bridge_dir.mkdir(parents=True)
+        identity.write_text(legacy)
+    request = claude_native._claude_terminal_request(
+        ('--settings={"env":{"CALLER":"present"}}',) if caller else (),
+        command="claude",
+        bridge_dir=bridge_dir,
+    )
+    args = request["spec"]["args"]
+    assert identity.read_text() == (legacy if existing else "{}")
+    if not existing and os.name != "nt":
+        assert identity.stat().st_mode & 0o777 == 0o600
+    identity_index = args.index(str(identity))
+    baseline = Path(args[identity_index + 2])
+    baseline_bytes = baseline.read_bytes()
+    assert args[identity_index - 1 : identity_index + 2] == [
+        "--settings",
+        str(identity),
+        "--settings",
+    ]
+    created = create_terminal_instance(
+        "claude",
+        "settings",
+        TerminalEnvSpec(
+            command="claude",
+            args=args,
+            os_env=OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")),
+        ),
+    )
+    try:
+        await bridge.finalize_claude_caller_settings(
+            created.instance,
+            bridge_dir=bridge_dir,
+            generation=request["claude_settings_generation"],
+        )
+        settings = _load_invocation_settings(created.instance.args)
+        assert settings["hooks"]["UserPromptSubmit"]
+        assert "disableAllHooks" not in settings
+        assert "LEGACY_ONLY" not in settings.get("env", {})
+        if caller:
+            assert settings["env"]["CALLER"] == "present"
+        else:
+            assert created.instance.args == args
+        assert str(identity) in created.instance.args
+        assert identity.read_text() == (legacy if existing else "{}")
+        assert baseline.read_bytes() == baseline_bytes
+    finally:
+        await created.instance.close()
 
 
 def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:

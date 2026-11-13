@@ -3159,6 +3159,7 @@ def augment_claude_args(
     turn_routing: bool = False,
     active_harnesses: Collection[str] | None = None,
     defer_caller_settings: bool = False,
+    legacy_bridge_identity: bool = False,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -3214,6 +3215,8 @@ def augment_claude_args(
         ``False`` keeps every prompt off the routing round trip.
     :param defer_caller_settings: Preserve caller settings until the runner can
         read their files under the terminal's resolved sandbox.
+    :param legacy_bridge_identity: Include the canonical settings operand so older
+        runners can discover a CLI launch's bridge. The generated settings win.
     :returns: Augmented argument list for the terminal resource.
     """
     hook_settings = build_hook_settings(
@@ -3252,6 +3255,16 @@ def augment_claude_args(
     else:
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
+    if defer_caller_settings and legacy_bridge_identity:
+        identity_path = bridge_dir / _INVOCATION_SETTINGS_FILE
+        try:
+            fd = os.open(identity_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write("{}")
+        args.extend(["--settings", str(identity_path)])
     args.extend(["--settings", str(settings_path)])
     args = _merge_append_system_prompt(args, append_system_prompt, bridge_dir=bridge_dir)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
@@ -3659,7 +3672,7 @@ async def finalize_claude_caller_settings(
         nonlocal has_bridge_settings
         if path == settings_path:
             has_bridge_settings = True
-        else:
+        elif path != bridge_dir / _INVOCATION_SETTINGS_FILE:
             paths.add(path)
         raise ValueError("settings read is deferred")
 

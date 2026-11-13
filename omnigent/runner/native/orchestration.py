@@ -9983,6 +9983,7 @@ async def _auto_create_claude_terminal(
             # Shell payloads are opaque; only the appended Claude argv has a known boundary.
             claude_args_start = len(configured_prefix)
         elif command_name not in {"claude", "env"}:
+            claude_args_start = len(configured_prefix)
             if "--" in configured_prefix:
                 claude_args_start = configured_prefix.index("--") + 1
         # Validate the binary this terminal will actually spawn: ``launch_command``

@@ -7012,6 +7012,7 @@ def _claude_terminal_request(
         bridge_dir=bridge_dir,
         workspace=Path.cwd(),
         defer_caller_settings=True,
+        legacy_bridge_identity=True,
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
