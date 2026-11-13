@@ -406,13 +406,12 @@ describe("sort order", () => {
     }
   });
 
-  it("sorts a one-time reminder by the server's next run", () => {
-    // A yearly COUNT=1 rule has no next run the client can compute, so only the
-    // server's next_run_at puts a reminder due in two minutes first.
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-    try {
-      setTasks([
+  it.each([
+    {
+      // A yearly COUNT=1 rule has no next run the client can compute, so only the
+      // server's next_run_at puts a reminder due in two minutes first.
+      label: "a one-time reminder by the server's next run",
+      tasks: [
         task({ id: "daily", name: "Daily", state: "active", rrule: "FREQ=DAILY;BYHOUR=6" }),
         task({
           id: "reminder",
@@ -422,22 +421,12 @@ describe("sort order", () => {
           timezone: "UTC",
           nextRunAt: "2026-01-01T00:02:00+00:00",
         }),
-      ]);
-      renderPage();
-      const names = screen
-        .getAllByTestId("scheduled-task-row")
-        .map((r) => r.querySelector(".font-semibold")?.textContent);
-      expect(names).toEqual(["Reminder: check CI", "Daily"]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("prefers the server's next run for recurring tasks, falling back on a bad one", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-    try {
-      setTasks([
+      ],
+      expected: ["Reminder: check CI", "Daily"],
+    },
+    {
+      label: "recurring tasks by the server's next run, falling back on a bad one",
+      tasks: [
         // The browser estimates 06:00, but the server says 23:00: the server wins.
         task({
           id: "server-late",
@@ -455,12 +444,19 @@ describe("sort order", () => {
           timezone: "UTC",
           nextRunAt: "not a time",
         }),
-      ]);
+      ],
+      expected: ["Bad server time", "Server says late"],
+    },
+  ])("sorts $label", ({ tasks, expected }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    try {
+      setTasks(tasks);
       renderPage();
       const names = screen
         .getAllByTestId("scheduled-task-row")
         .map((r) => r.querySelector(".font-semibold")?.textContent);
-      expect(names).toEqual(["Bad server time", "Server says late"]);
+      expect(names).toEqual(expected);
     } finally {
       vi.useRealTimers();
     }

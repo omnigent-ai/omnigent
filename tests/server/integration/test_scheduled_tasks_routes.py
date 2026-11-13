@@ -832,7 +832,7 @@ async def test_the_reminder_tools_request_continues_its_session(
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
-async def test_the_list_leaves_reminders_out_unless_asked(
+async def test_the_list_leaves_reminders_out_until_an_edit_makes_one_an_automation(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
     session_id = _owned_session(db_uri)
@@ -878,47 +878,24 @@ async def test_the_list_leaves_reminders_out_unless_asked(
         )
         assert bad.status_code == 422, bad.text
 
-
-@pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)
-async def test_an_edit_that_stops_a_reminder_fitting_makes_it_an_automation(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
-) -> None:
-    # The store tests cover every edit that demotes a reminder; this one checks the route.
-    session_id = _owned_session(db_uri)
-    rule, fire_at = _one_time_rule_in(hours=2)
-    created = await auth_client.post(
-        "/v1/scheduled-tasks",
-        json={
-            "name": "Reminder: check CI",
-            "prompt": "check CI",
-            "rrule": rule,
-            "timezone": "UTC",
-            "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
-            "session_mode": "continue",
-            "session_id": session_id,
-            "kind": "reminder",
-            "first_run_at": fire_at,
-        },
-        headers=_headers(),
-    )
-    assert created.status_code == 200, created.text
-    task_id = created.json()["id"]
-
     renamed = await auth_client.patch(
-        f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"}, headers=_headers()
+        f"/v1/scheduled-tasks/{reminder_id}", json={"name": "renamed"}, headers=_headers()
     )
     assert renamed.status_code == 200, renamed.text
     assert renamed.json()["kind"] == "reminder"
+    assert await listed({}) == [automation_id]
 
+    # The store tests cover every edit that demotes a reminder; this checks the route.
     edited = await auth_client.patch(
-        f"/v1/scheduled-tasks/{task_id}",
+        f"/v1/scheduled-tasks/{reminder_id}",
         json={"rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"},
         headers=_headers(),
     )
     assert edited.status_code == 200, edited.text
     # The marker can't keep a recurring automation off the list.
     assert edited.json()["kind"] == "automation"
-    assert SqlAlchemyScheduledTaskStore(db_uri).get(task_id).kind == "automation"
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(reminder_id).kind == "automation"
+    assert await listed({}) == sorted([reminder_id, automation_id])
 
 
 @pytest.mark.parametrize("auth_app", ["one_time"], indirect=True)

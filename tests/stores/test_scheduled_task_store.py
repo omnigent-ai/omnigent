@@ -192,7 +192,9 @@ def test_an_edit_that_stops_a_reminder_fitting_makes_it_an_automation(
     assert restored.kind == "automation"
 
 
-@pytest.mark.parametrize("arrival", ["on_time", "late", "late_and_exhausted"])
+@pytest.mark.parametrize(
+    "arrival", ["on_time", "one_second_early", "at_the_minute", "late", "late_and_exhausted"]
+)
 def test_first_run_at_is_checked_against_the_saved_schedule(
     store: SqlAlchemyScheduledTaskStore, monkeypatch: pytest.MonkeyPatch, arrival: str
 ) -> None:
@@ -211,11 +213,15 @@ def test_first_run_at_is_checked_against_the_saved_schedule(
     if arrival == "late_and_exhausted":
         # Ends at the requested minute, so a late create leaves no run at all.
         rule = rule.replace(";COUNT=1", f";UNTIL={when.strftime('%Y%m%dT%H%M%SZ')}")
-    # On time, the task is created two hours early; late, a second after its minute.
-    created_at = fire_at - 7200 if arrival == "on_time" else fire_at + 1
+    # A run must fall strictly after creation, so a task created at its minute is late.
+    created_at = {
+        "on_time": fire_at - 7200,
+        "one_second_early": fire_at - 1,
+        "at_the_minute": fire_at,
+    }.get(arrival, fire_at + 1)
     monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: created_at)
     fields = _reminder_fields(rrule=rule, kind="automation", first_run_at=fire_at)
-    if arrival == "on_time":
+    if arrival in ("on_time", "one_second_early"):
         task = store.create(scheduled_task_id=_uid("st_first_run"), **fields)
         assert task.next_run_at == fire_at
         return
@@ -223,7 +229,7 @@ def test_first_run_at_is_checked_against_the_saved_schedule(
         store.create(scheduled_task_id=_uid("st_first_run"), **fields)
     assert caught.value.expected == fire_at
     # A late COUNT=1 rule would move to the same minute a year later; nothing is saved.
-    if arrival == "late":
+    if arrival != "late_and_exhausted":
         assert caught.value.actual is not None and caught.value.actual > fire_at
     else:
         assert caught.value.actual is None
