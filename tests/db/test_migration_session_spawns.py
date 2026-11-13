@@ -343,7 +343,7 @@ def test_migration_ddl_uses_bounded_binary_types_without_defaults_or_foreign_key
         "other-workspace-only",
     ],
 )
-def test_blob_reference_and_legacy_lookup_plans_use_indexed_searches(
+def test_blob_reference_and_legacy_lookup_use_one_statement_and_indexed_searches(
     database, blob_key, referenced
 ) -> None:
     _migrate(database, _REVISION)
@@ -367,22 +367,20 @@ def test_blob_reference_and_legacy_lookup_plans_use_indexed_searches(
             .where(SqlFile.workspace_id == 0, SqlFile.id == blob_key, SqlFile.blob_key.is_(None))
             .limit(1),
         ]
-        results = []
-        for index, statement in enumerate(statements):
-            compiled = statement.compile(engine)
-            parameters = tuple(
-                bytes.fromhex(value) if isinstance(value, str) else value
-                for name in compiled.positiontup
-                for value in (compiled.params[name],)
+        statement = sa.select(sa.or_(*(query.exists() for query in statements)))
+        compiled = statement.compile(engine)
+        parameters = tuple(
+            bytes.fromhex(value) if isinstance(value, str) else value
+            for name in compiled.positiontup
+            for value in (compiled.params[name],)
+        )
+        plan = " ".join(
+            row[3]
+            for row in connection.exec_driver_sql(
+                "EXPLAIN QUERY PLAN " + str(compiled), parameters
             )
-            plan = " ".join(
-                row[3]
-                for row in connection.exec_driver_sql(
-                    "EXPLAIN QUERY PLAN " + str(compiled), parameters
-                )
-            )
-            assert "SEARCH files USING" in plan and "SCAN" not in plan, plan
-            if index == 0:
-                assert "ix_files_blob_reference" in plan, plan
-            results.append(connection.execute(statement).scalar_one_or_none())
-        assert any(result is not None for result in results) == referenced
+        )
+        assert "ix_files_blob_reference (workspace_id=? AND blob_key=?)" in plan, plan
+        assert "sqlite_autoindex_files_1 (workspace_id=? AND id=?)" in plan, plan
+        assert "SCAN files" not in plan, plan
+        assert connection.execute(statement).scalar_one() is referenced

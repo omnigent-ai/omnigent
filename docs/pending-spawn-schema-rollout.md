@@ -24,9 +24,12 @@ consumers use the copy in the conversation database. Do not apply the complete
 metadata migration chain to a separate conversation database.
 
 `ix_files_blob_reference(workspace_id, blob_key, id)` supports a bounded lookup
-of shared artifact references. The consuming application must issue a separate
-lookup by `(workspace_id, id)` with `blob_key IS NULL` for legacy rows. Wrapping
-both columns in `COALESCE` does not use these equality paths.
+of shared artifact references. The consuming application must also test
+`(workspace_id, id)` with `blob_key IS NULL` for legacy rows. Combine these
+indexed existence checks in one SQL statement so both observe the same snapshot
+under READ COMMITTED. Separate statements can miss a reference moving between
+the two forms. Wrapping both columns in `COALESCE` does not use these equality
+paths.
 
 ## Revision compatibility
 
