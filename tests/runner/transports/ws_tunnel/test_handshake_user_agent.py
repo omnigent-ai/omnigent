@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -18,8 +19,14 @@ import websockets
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.http11 import Request
 
+from omnigent.cli_auth import DATABRICKS_EXTRA_HEADERS_ENV_VAR
 from omnigent.telemetry.request_headers import CLIENT_COMPONENT_ENV_VAR
 from omnigent.telemetry.surface import classify_surface
+
+# Spellings a caller's extra-headers selector may use for User-Agent. Each one
+# must still leave exactly one User-Agent on the wire.
+_EXTRA_UA_KEYS = pytest.mark.parametrize("ua_key", ["User-Agent", "user-agent", "USER-AGENT"])
+_EXTRA_UA_VALUE = "extra-caller/1.0"
 
 
 class _CaptureServer:
@@ -59,12 +66,14 @@ def _assert_one_omnigent_user_agent(capture: _CaptureServer, surface: str) -> No
         assert classify_surface(values[0]) == surface, values
 
 
+@_EXTRA_UA_KEYS
 async def test_runner_tunnel_handshake_sends_runner_user_agent(
-    capture: _CaptureServer, monkeypatch: pytest.MonkeyPatch
+    capture: _CaptureServer, monkeypatch: pytest.MonkeyPatch, ua_key: str
 ) -> None:
     from omnigent.runner.transports.ws_tunnel.serve import _serve_tunnel_once
 
     monkeypatch.setenv(CLIENT_COMPONENT_ENV_VAR, "runner")
+    monkeypatch.setenv(DATABRICKS_EXTRA_HEADERS_ENV_VAR, json.dumps({ua_key: _EXTRA_UA_VALUE}))
 
     async def _app(scope: object, receive: object, send: object) -> None:
         del scope, receive, send
@@ -80,22 +89,24 @@ async def test_runner_tunnel_handshake_sends_runner_user_agent(
     _assert_one_omnigent_user_agent(capture, "runner")
 
 
+@_EXTRA_UA_KEYS
 async def test_native_attach_handshake_sends_omnigent_user_agent(
-    capture: _CaptureServer, monkeypatch: pytest.MonkeyPatch
+    capture: _CaptureServer, monkeypatch: pytest.MonkeyPatch, ua_key: str
 ) -> None:
-    """The native attach client passes ``headers={}``; the UA must still be ours."""
+    """The UA is ours even when the caller passes its own (any casing) in headers."""
     from omnigent.harnesses.claude_native.main import _websocket_connect
 
     monkeypatch.setenv(CLIENT_COMPONENT_ENV_VAR, "runner")
     url = f"ws://127.0.0.1:{capture.port}/v1/sessions/conv_1/terminals/t/attach"
     with pytest.raises(websockets.InvalidStatus):
-        async with _websocket_connect(url, headers={}):
+        async with _websocket_connect(url, headers={ua_key: _EXTRA_UA_VALUE}):
             pass
     _assert_one_omnigent_user_agent(capture, "runner")
 
 
+@_EXTRA_UA_KEYS
 def test_host_tunnel_handshake_sends_host_user_agent(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ua_key: str
 ) -> None:
     """Replays the host's real connect kwargs against a capture server."""
     import websockets.asyncio.client as ws_client
@@ -114,6 +125,7 @@ def test_host_tunnel_handshake_sends_host_user_agent(
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     monkeypatch.setenv(CLIENT_COMPONENT_ENV_VAR, "cli")
+    monkeypatch.setenv(DATABRICKS_EXTRA_HEADERS_ENV_VAR, json.dumps({ua_key: _EXTRA_UA_VALUE}))
     monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
     monkeypatch.setattr(ws_client, "connect", _spy)
     run_host_process(server_url="https://srv.example.com", config_path=tmp_path / "config.yaml")

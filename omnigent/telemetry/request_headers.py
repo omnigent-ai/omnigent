@@ -73,6 +73,22 @@ def client_identity_headers() -> dict[str, str]:
     return {"User-Agent": client_user_agent()}
 
 
+def pop_client_user_agent(headers: dict[str, str]) -> str:
+    """Remove every User-Agent key from *headers* and return this component's UA.
+
+    ``websockets`` adds its own User-Agent on top of ``additional_headers``, so a
+    handshake must pass exactly one, as ``user_agent_header``. The component UA
+    wins over a caller-supplied one, as in ``open_server_client``. Keys match
+    case-insensitively, so a lowercase ``user-agent`` cannot survive.
+
+    :param headers: Handshake headers, mutated in place.
+    :returns: The User-Agent to pass as ``user_agent_header``.
+    """
+    for key in [key for key in headers if key.lower() == "user-agent"]:
+        del headers[key]
+    return client_user_agent()
+
+
 def telemetry_request_headers() -> dict[str, str]:
     """Return the telemetry headers for an outbound server request.
 

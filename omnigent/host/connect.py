@@ -5398,9 +5398,9 @@ class HostProcess:
         ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
         # websockets adds its own User-Agent on top of additional_headers; send only ours.
         ws_headers = dict(headers)
-        from omnigent.telemetry.request_headers import client_user_agent
+        from omnigent.telemetry.request_headers import pop_client_user_agent
 
-        user_agent = ws_headers.pop("User-Agent", None) or client_user_agent()
+        user_agent = pop_client_user_agent(ws_headers)
         try:
             ws_cm = websockets.asyncio.client.connect(
                 url,
