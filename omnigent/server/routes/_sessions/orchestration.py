@@ -842,6 +842,7 @@ _pending_archive_stops: dict[str, asyncio.Task[None]] = {}
 # failure, not a sustained outage.
 _ARCHIVE_STOP_LOOKUP_ATTEMPTS = 3
 _ARCHIVE_STOP_LOOKUP_RETRY_S = 0.2
+_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S = 30.0
 # A session that archives itself keeps its runner until the turn that asked
 # ends. The wait is bounded so a turn that never settles still gets torn down.
 _SELF_ARCHIVE_TURN_POLL_S = 2.0
@@ -1054,7 +1055,13 @@ async def _archive_stop(
             session_id, runner_router, conversation=conv, for_control=True
         )
         if runner_client is not None:
-            response = await runner_client.delete(f"/v1/sessions/{session_id}", timeout=30.0)
+            # Tunnel transports ignore HTTPX timeouts; bound headers and body consumption.
+            response = await asyncio.wait_for(
+                runner_client.delete(
+                    f"/v1/sessions/{session_id}", timeout=_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S
+                ),
+                timeout=_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S,
+            )
             response.raise_for_status()
     except Exception:  # noqa: BLE001
         _logger.warning(
