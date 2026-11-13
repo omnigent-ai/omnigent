@@ -6183,7 +6183,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # A legacy closed child's title carries the closed marker,
                 # which would seal the fork as well.
                 else (
-                    f"Fork of {title_without_closed_marker(source.title)}"
+                    f"Fork of {title_without_closed_marker(source.title, source_conversation_id)}"
                     if source.title
                     else f"Fork of {source_conversation_id[:16]}…"
                 )
