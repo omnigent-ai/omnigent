@@ -5033,7 +5033,7 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
     caller_file.write_text(
         json.dumps(
             {
-                "env": {"SEAT_KEY": "seat-1"},
+                "env": {"SEAT_KEY": "seat-1", "FIRST_ONLY": "kept"},
                 "hooks": {"UserPromptSubmit": [caller_hook]},
                 "statusLine": {"type": "command", "command": "cat"},
                 "enabledPlugins": {"extra@market": False},
@@ -5074,6 +5074,7 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
     assert args[:2] == ["--name", "seat-1"]
     settings = _load_invocation_settings(args)
     assert settings["env"]["SEAT_KEY"] == "seat-2"
+    assert settings["env"]["FIRST_ONLY"] == "kept"
     assert settings["env"]["B"] == "2"
     assert settings["enabledPlugins"] == {"extra@market": False, "other@market": False}
     assert settings["cleanupPeriodDays"] == 42
@@ -18165,7 +18166,14 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    original_args = augment_claude_args(("--model", "test-model"), bridge_dir=bridge_dir)
+    caller_denial = {"serverName": "caller-disabled"}
+    caller_args = (
+        "--model",
+        "test-model",
+        "--settings",
+        json.dumps({"deniedMcpServers": [caller_denial]}),
+    )
+    original_args = augment_claude_args(caller_args, bridge_dir=bridge_dir)
     settings_path = Path(original_args[original_args.index("--settings") + 1])
     original = settings_path.read_bytes()
     if saved:
@@ -18173,19 +18181,18 @@ def test_disabled_mcp_settings_launch_hook(tmp_path, monkeypatch, active, saved)
     with patch(
         "omnigent.mcp_disabled_servers.apply_claude_settings", wraps=apply_claude_settings
     ) as hook:
-        args = augment_claude_args(
-            ("--model", "test-model"), bridge_dir=bridge_dir, active_harnesses=active
-        )
+        args = augment_claude_args(caller_args, bridge_dir=bridge_dir, active_harnesses=active)
     hook.assert_called_once()
     assert hook.call_args.kwargs == {"executor": "claude-native", "active_harnesses": active}
     assert args == original_args
     if active and saved:
         assert json.loads(settings_path.read_bytes()) == {
             **json.loads(original),
-            "deniedMcpServers": [{"serverName": "fixture"}],
+            "deniedMcpServers": [caller_denial, {"serverName": "fixture"}],
         }
     else:
         assert settings_path.read_bytes() == original
+    assert caller_denial in json.loads(settings_path.read_bytes())["deniedMcpServers"]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")

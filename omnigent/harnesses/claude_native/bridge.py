@@ -3225,14 +3225,14 @@ def augment_claude_args(
     )
     from omnigent.mcp_disabled_servers import apply_claude_settings
 
-    hook_settings = apply_claude_settings(
-        hook_settings, executor="claude-native", active_harnesses=active_harnesses
-    )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
     args, caller_settings = _pop_caller_settings(args, workspace=workspace)
     if caller_settings:
         hook_settings = _merge_caller_settings(hook_settings, caller_settings, bridge_dir)
+    hook_settings = apply_claude_settings(
+        hook_settings, executor="claude-native", active_harnesses=active_harnesses
+    )
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     _write_json_file(settings_path, hook_settings)
     from omnigent.onboarding.ambient import claude_code_managed_mcp_present
