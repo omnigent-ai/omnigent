@@ -556,6 +556,17 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("browser-nav-state", listener);
     return () => ipcRenderer.removeListener("browser-nav-state", listener);
   },
+  /**
+   * Subscribe to whether a conversation's view is loading, so the toolbar's
+   * reload button can show progress. Returns an unsubscribe.
+   * @param {(payload: { conversationId: string, isLoading: boolean }) => void} callback
+   * @returns {() => void}
+   */
+  onBrowserLoadingState: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("browser-loading-state", listener);
+    return () => ipcRenderer.removeListener("browser-loading-state", listener);
+  },
 
   // ── Design mode (point-and-prompt) ─────────────────────────────────────
   // Toggle the in-page picker + popup. On Send, the SPA gets the submit via

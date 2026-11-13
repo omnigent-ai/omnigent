@@ -547,6 +547,7 @@ it("restores URL, title and history state for the requested browser tab only", (
     title: "Restored page",
     canGoBack: true,
     canGoForward: false,
+    isLoading: false,
   });
   assert.deepEqual(
     ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: "conv_1" }),
@@ -1205,6 +1206,41 @@ describe("browserIpc — url live-tracking", () => {
       channel: "browser-url-changed",
       payload: { conversationId: viewId, url: wc.getURL(), title: "" },
     });
+  });
+
+  it("reports the page's loading state, starting with the load already under way", async () => {
+    const { ipcMain, registry, sent, event } = setup({ conversationId: null });
+    let loading = true;
+    const wc = makeWebContents();
+    wc.isLoading = () => loading;
+    registry.openOrNavigate = () => ({
+      ok: true,
+      created: true,
+      entry: { view: { webContents: wc } },
+    });
+    await ipcMain.invoke("omnigent:browser-open-or-navigate", event, {
+      conversationId: "conv_1",
+      url: "https://example.com",
+    });
+    const loadingEvents = () =>
+      sent.filter((s) => s.channel === "browser-loading-state").map((s) => s.payload);
+    assert.deepEqual(loadingEvents(), [{ conversationId: "conv_1", isLoading: true }]);
+
+    loading = false;
+    wc.emit("did-stop-loading");
+    wc.emit("did-start-loading");
+    assert.deepEqual(loadingEvents().slice(1), [
+      { conversationId: "conv_1", isLoading: false },
+      { conversationId: "conv_1", isLoading: true },
+    ]);
+  });
+
+  it("has-view reports whether the retained page is loading", () => {
+    const webContents = makeWebContents();
+    webContents.isLoading = () => true;
+    const { ipcMain, event } = setup({ webContents });
+    const r = ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: "conv_1" });
+    assert.equal(r.isLoading, true);
   });
 
   it("did-navigate-in-page only emits for the main frame", async () => {

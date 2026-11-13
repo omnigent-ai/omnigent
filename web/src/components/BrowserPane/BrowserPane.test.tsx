@@ -564,6 +564,61 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
     await waitFor(() => expect(bridge.browserReload).toHaveBeenCalledWith("conv_reload"));
   });
 
+  it("spins the reload icon while its own page loads", async () => {
+    let fireLoading: ((p: { conversationId: string; isLoading: boolean }) => void) | undefined;
+    await renderActive("conv_loading", {
+      onBrowserLoadingState: vi.fn((cb: typeof fireLoading) => {
+        fireLoading = cb;
+        return () => {};
+      }),
+    });
+    const reload = screen.getByRole("button", { name: /reload/i });
+    const icon = () => reload.querySelector("svg");
+    expect(icon()).not.toHaveClass("animate-spin");
+
+    act(() => fireLoading?.({ conversationId: "conv_loading", isLoading: true }));
+    expect(icon()).toHaveClass("animate-spin", "motion-reduce:animate-none");
+    expect(reload).toHaveAttribute("aria-busy", "true");
+    expect(reload).toBeEnabled();
+
+    act(() => fireLoading?.({ conversationId: "conv_other", isLoading: false }));
+    expect(icon()).toHaveClass("animate-spin");
+
+    act(() => fireLoading?.({ conversationId: "conv_loading", isLoading: false }));
+    expect(icon()).not.toHaveClass("animate-spin");
+    expect(reload).toHaveAttribute("aria-busy", "false");
+  });
+
+  it("restores the loading state of a page still loading when the pane mounts", async () => {
+    installBridge({
+      browserHasView: vi.fn().mockResolvedValue({
+        exists: true,
+        url: "https://example.com/slow",
+        isLoading: true,
+      }),
+    });
+    render(<BrowserPane conversationId="conv_slow" />);
+    const reload = screen.getByRole("button", { name: /reload/i });
+    await waitFor(() => expect(reload.querySelector("svg")).toHaveClass("animate-spin"));
+  });
+
+  it("stops spinning when the loading view is closed", async () => {
+    let fireClosed: ((p: { conversationId: string; reason: string | null }) => void) | undefined;
+    installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, isLoading: true }),
+      onBrowserViewClosed: vi.fn((cb: typeof fireClosed) => {
+        fireClosed = cb;
+        return () => {};
+      }),
+    });
+    render(<BrowserPane conversationId="conv_close" />);
+    const reload = screen.getByRole("button", { name: /reload/i });
+    await waitFor(() => expect(reload.querySelector("svg")).toHaveClass("animate-spin"));
+    act(() => fireClosed?.({ conversationId: "conv_close", reason: null }));
+    expect(reload).toBeDisabled();
+    expect(reload.querySelector("svg")).not.toHaveClass("animate-spin");
+  });
+
   it("devtools button calls the open-devtools IPC", async () => {
     const { bridge } = await renderActive("conv_dt");
     screen.getByRole("button", { name: /toggle devtools/i }).click();
