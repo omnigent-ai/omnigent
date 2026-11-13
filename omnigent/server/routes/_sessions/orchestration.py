@@ -127,6 +127,7 @@ from omnigent.runtime.policies.approval import (
     resolve_ask_timeout,
 )
 from omnigent.runtime.policies.builder import (
+    _subtree_conversation_ids,
     _sum_subtree_usage,
     ancestor_ids_from_tree,
     load_session_tree,
@@ -392,6 +393,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
 from omnigent.server.schemas import (
+    AgentCost,
     BackgroundTaskInfo,
     ChildSessionSummary,
     CreatedSessionResponse,
@@ -1489,6 +1491,45 @@ def _publish_subtree_cost_to_ancestors(
         session_stream.publish(ancestor_id, event.model_dump(exclude_none=True))
 
 
+def _agent_costs(tree: list[Conversation], session_id: str) -> list[AgentCost]:
+    """
+    Display costs for *session_id* and its descendants from one loaded tree.
+
+    An agent's cost is its priced subtree total, the figure its own session
+    displays. An agent with nothing priced falls back to its parent's
+    display-only ``subagent_costs_usd`` estimate, which no ancestor sums.
+
+    :param tree: Every conversation in the spawn tree, from
+        :func:`load_session_tree`.
+    :param session_id: Subtree root to report, e.g. ``"conv_abc123"``.
+    :returns: One :class:`AgentCost` per subtree member, in tree order.
+    """
+    rows = {row.id: row for row in tree}
+    totals: dict[str, float] = {}
+    for row in tree:
+        cost = _priced_cost_for_display(row.session_usage)
+        node: str | None = row.id
+        seen: set[str] = set()
+        # Add each priced own cost to the row and every ancestor, guarding cycles.
+        while cost is not None and node in rows and node not in seen:
+            seen.add(node)
+            totals[node] = totals.get(node, 0.0) + cost
+            node = rows[node].parent_conversation_id
+    members = _subtree_conversation_ids(tree, session_id)
+    result: list[AgentCost] = []
+    for row in tree:
+        if row.id not in members:
+            continue
+        if row.id in totals:
+            result.append(AgentCost(id=row.id, cost_usd=totals[row.id]))
+            continue
+        parent = rows.get(row.parent_conversation_id or "")
+        estimates = parent.session_usage.get("subagent_costs_usd") if parent else None
+        estimate = estimates.get(row.id) if isinstance(estimates, dict) else None
+        result.append(AgentCost(id=row.id, cost_usd=estimate, estimated=estimate is not None))
+    return result
+
+
 class _UnresolvedHarness:
     """Sentinel: the caller has not resolved the session harness yet."""
 
@@ -1958,6 +1999,43 @@ async def _persist_relay_reported_model(
     )
 
 
+# Sub-agent estimates kept per session; bounds a client-written usage row.
+_MAX_SUBAGENT_COSTS = 1000
+
+
+def _subagent_costs_from_report(data: dict[str, Any]) -> dict[str, float] | None:
+    """
+    Validate an optional ``subagent_costs_usd`` map from event data.
+
+    :param data: The ``external_session_usage`` event ``data`` dict.
+    :returns: ``{child_id: usd}``, or ``None`` when the key is absent.
+    :raises OmnigentError: When it is not an object of at most
+        :data:`_MAX_SUBAGENT_COSTS` non-empty ids to finite non-negative numbers.
+    """
+    raw = data.get("subagent_costs_usd")
+    if raw is None:
+        return None
+    if (
+        not isinstance(raw, dict)
+        or len(raw) > _MAX_SUBAGENT_COSTS
+        or not all(
+            isinstance(child_id, str)
+            and child_id
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
+            for child_id, value in raw.items()
+        )
+    ):
+        raise OmnigentError(
+            "external_session_usage data.subagent_costs_usd must map child ids "
+            "to finite non-negative numbers",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return {child_id: float(value) for child_id, value in raw.items()}
+
+
 def _persist_native_cumulative_usage(
     session_id: str,
     data: dict[str, Any],
@@ -2004,6 +2082,10 @@ def _persist_native_cumulative_usage(
       a token report that omits it keeps the persisted cached count.
     - ``model`` — LLM model id to price with (e.g. ``"databricks-gpt-5-5"``);
       falls back to the agent spec's model when absent.
+    - ``subagent_costs_usd`` — display-only per-child estimates, e.g.
+      claude-native's ``{"conv_child": 0.55}``. This session's own cost already
+      includes them, so they are stored apart (each child's maximum kept) and
+      never summed into totals, policy or the daily rollup.
 
     The ``total_cost_usd`` key is written only on the priced branches
     below (exact billing, or token-priced when the model is in the
@@ -2027,6 +2109,7 @@ def _persist_native_cumulative_usage(
     cin = _coerce_cumulative_field(data, "cumulative_input_tokens", numeric=False)
     cout = _coerce_cumulative_field(data, "cumulative_output_tokens", numeric=False)
     ccache = _coerce_cumulative_field(data, "cumulative_cache_read_input_tokens", numeric=False)
+    subagent_costs = _subagent_costs_from_report(data)
     if cost is None and policy_cost is None and cin is None and cout is None:
         return None
 
@@ -2177,6 +2260,14 @@ def _persist_native_cumulative_usage(
     # MORE enforcement, never less), which is the safe direction for a budget.
     if policy_cost is not None:
         current["policy_cost_usd"] = max(old_policy_cost, float(policy_cost))
+    if subagent_costs:
+        stored = current.get("subagent_costs_usd")
+        merged: dict[str, float] = dict(stored) if isinstance(stored, dict) else {}
+        for child_id, child_cost in subagent_costs.items():
+            merged[child_id] = max(float(merged.get(child_id, 0.0)), child_cost)
+        if len(merged) > _MAX_SUBAGENT_COSTS:
+            raise OmnigentError("Too many sub-agent cost estimates", code=ErrorCode.INVALID_INPUT)
+        current["subagent_costs_usd"] = merged
 
     conversation_store.set_session_usage(session_id, current)
     # Per-user daily rollup. Native reports cumulative totals, so the turn's

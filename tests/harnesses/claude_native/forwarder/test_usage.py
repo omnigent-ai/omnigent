@@ -516,6 +516,70 @@ async def test_forward_session_cost_splits_display_and_policy(
 
 
 @pytest.mark.asyncio
+async def test_forward_session_cost_attaches_changed_subagent_estimates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Per-child estimates ride a cost post when they changed, and never post alone."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text("parent", encoding="utf-8")
+    status_box = {"value": 0.01}
+    monkeypatch.setattr(
+        forwarder,
+        "read_claude_context_state",
+        lambda _bridge: {"total_cost_usd": status_box["value"]},
+    )
+    monkeypatch.setattr(forwarder, "_session_cost_estimate", lambda **_kw: status_box["value"])
+    estimates = {"value": {"conv_child": 0.2}}
+    monkeypatch.setattr(
+        forwarder, "_subagent_cost_estimates", lambda *_args: dict(estimates["value"])
+    )
+    subagent_state = forwarder.SubagentForwardState(
+        subagents={
+            "aaa": forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child")
+        }
+    )
+    dedupe = forwarder._ForwardDedupeState()
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content)["data"])
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+
+        async def run() -> None:
+            await forwarder._forward_session_cost(
+                client=client,
+                session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                parent_transcript_path=parent,
+                subagent_state=subagent_state,
+                dedupe=dedupe,
+                cost_cache={},
+            )
+
+        await run()
+        assert posted[-1]["subagent_costs_usd"] == {"conv_child": pytest.approx(0.2)}
+        # An estimate that moves while neither cost advances waits: an
+        # estimate-only post would be rejected by servers without the key.
+        estimates["value"] = {"conv_child": 0.3}
+        await run()
+        assert len(posted) == 1
+        status_box["value"] = 0.5
+        await run()
+        assert posted[-1]["subagent_costs_usd"] == {"conv_child": pytest.approx(0.3)}
+        # Unchanged estimates are not re-sent with the next cost advance.
+        status_box["value"] = 0.6
+        await run()
+        assert "subagent_costs_usd" not in posted[-1]
+        assert len(posted) == 3
+
+
+@pytest.mark.asyncio
 async def test_forward_session_cost_posts_status_when_no_subagents(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

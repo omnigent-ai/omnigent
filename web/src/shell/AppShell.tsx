@@ -164,6 +164,13 @@ import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDi
 import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
+import { useAgentCosts } from "@/hooks/useAgentCosts";
+import {
+  readSessionOverviewOpen,
+  SessionCostButton,
+  SessionOverview,
+  writeSessionOverviewOpen,
+} from "./SessionOverview";
 import type { RightRailTab } from "./railTabs";
 
 /**
@@ -1088,6 +1095,7 @@ function AppShellImpl() {
   // SubagentsPanel mounts its own polling usage of the hook against
   // the same rootSessionId, so the cache is shared.
   const { children: childSessions } = useChildSessions(rootSessionId);
+  const { data: agentCosts } = useAgentCosts(rootSessionId);
   // Remember the resolved root so a later click into one of its tree
   // members can hold it steady (see ``rootSessionId`` above).
   useEffect(() => {
@@ -2915,6 +2923,17 @@ function AppShellImpl() {
     !executionLogsOpen &&
     !filesPanelOpen,
   );
+  // The overview docks in the space a collapsed workspace leaves beside chat.
+  const overviewSessionId = isFeatureEnabled(serverInfo, "session_overview")
+    ? serverConversationId
+    : undefined;
+  const overviewDockable =
+    overviewSessionId !== undefined && !workspacePanelVisible && !panelOpen && !canvasMode;
+  const [overviewOpen, setOverviewOpen] = useState(readSessionOverviewOpen);
+  const toggleOverview = useCallback(() => {
+    writeSessionOverviewOpen(!overviewOpen);
+    setOverviewOpen(!overviewOpen);
+  }, [overviewOpen]);
   useEffect(() => {
     if (!workspacePanelVisible || !focusWorkspaceTabsOnOpenRef.current) return;
     focusWorkspaceTabsOnOpenRef.current = false;
@@ -3046,6 +3065,15 @@ function AppShellImpl() {
               >
                 {!extensionOwnsHeader && (
                   <ChatHeader
+                    sessionOverviewControl={
+                      overviewSessionId !== undefined && (
+                        <SessionCostButton
+                          expanded={overviewOpen}
+                          canToggle={overviewDockable}
+                          onToggle={toggleOverview}
+                        />
+                      )
+                    }
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
                     // is a transient card floating over the collapsed layout (the
                     // docked sidebar stays w-0), so the header must keep its
@@ -3138,6 +3166,16 @@ function AppShellImpl() {
                   </SubagentPanelOpenerContext.Provider>
                 </GridSessionMain>
 
+                {overviewDockable && overviewOpen && overviewSessionId && (
+                  <aside className="hidden w-64 shrink-0 flex-col overflow-y-auto px-2 pb-3 pt-12 xl:flex">
+                    <SessionOverview
+                      sessionId={overviewSessionId}
+                      showChangedLines={showFilesPanel}
+                      onClose={toggleOverview}
+                    />
+                  </aside>
+                )}
+
                 {/* Debug-mode execution-logs rail — desktop only, hidden when a
               push panel is open (the panel itself becomes the focus). Only
               rendered in debug mode so the column doesn't occupy space in
@@ -3222,6 +3260,7 @@ function AppShellImpl() {
                     onMobileSideChatsOpenChange={setSideChatsPanelOpen}
                     onHasSideChatTabsChange={setHasSideChatTabs}
                     subagentPanelOpener={openSubagentInPanel}
+                    agentCosts={agentCosts}
                   />
                 )}
               </div>
@@ -3246,6 +3285,7 @@ function AppShellImpl() {
                 filesPanelSort={filesPanelSort}
                 handleFilesSortChange={handleFilesSortChange}
                 rootSessionId={rootSessionId}
+                agentCosts={agentCosts}
                 subagentsPanelOpen={subagentsPanelOpen}
                 setSubagentsPanelOpen={setSubagentsPanelOpen}
                 shellsPanelOpen={shellsPanelOpen}

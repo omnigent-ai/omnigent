@@ -15,6 +15,7 @@ from omnigent.entities import Conversation
 from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
 from omnigent.errors import StaleCursorError
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.runtime.policies.builder import load_session_tree
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -49,10 +50,12 @@ from omnigent.server.routes._sessions.common import (
 )
 from omnigent.server.routes._sessions.helpers import SessionLiveness
 from omnigent.server.routes._sessions.orchestration import (
+    _agent_costs,
     _child_session_summaries_from_conversations,
     _settle_orphaned_running_rows,
 )
 from omnigent.server.schemas import (
+    AgentCostList,
     ChildSessionList,
     PaginatedList,
     SessionItemList,
@@ -228,6 +231,35 @@ def register_items_routes(
             last_id=page.last_id,
             has_more=page.has_more,
         )
+
+    # ── GET /sessions/{session_id}/agent_costs ───────────────────
+
+    @router.get("/sessions/{session_id}/agent_costs", response_model=AgentCostList)
+    async def list_agent_costs(request: Request, session_id: str) -> AgentCostList:
+        """
+        List display costs for a session and every sub-agent beneath it.
+
+        One spawn-tree read serves the whole response. READ on the session
+        covers its descendants, as for ``child_sessions``.
+
+        :param request: Inbound HTTP request carrying the caller identity.
+        :param session_id: Session whose subtree to report, e.g. ``"conv_abc123"``.
+        :returns: An :class:`AgentCostList`.
+        :raises OmnigentError: 403 without READ; 404 when no session exists.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        tree = await asyncio.to_thread(
+            load_session_tree, session_id, conversation_store, conv.root_conversation_id
+        )
+        return AgentCostList(data=_agent_costs(tree, session_id))
 
     # ── GET /sessions/{session_id}/child_sessions ────────────────
 

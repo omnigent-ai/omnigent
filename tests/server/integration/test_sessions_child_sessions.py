@@ -131,6 +131,45 @@ async def test_child_sessions_404_for_nonexistent_session(
     assert resp.status_code == 404
 
 
+# ── Agent costs ──────────────────────────────────────────
+
+
+async def test_agent_costs_report_subtree_totals_and_parent_estimates(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    session = await _create_parent_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    seed = {"conv_store": store, "agent_id": session["agent_id"]}
+    codex = _seed_child(parent_id=session["id"], title="codex:a", **seed)
+    grandchild = _seed_child(parent_id=codex.id, title="codex:b", **seed)
+    mirror = _seed_child(parent_id=session["id"], title="Explore:c", **seed)
+    unpriced = _seed_child(parent_id=session["id"], title="worker:d", **seed)
+    store.set_session_usage(
+        session["id"],
+        {"total_cost_usd": 1.0, "subagent_costs_usd": {mirror.id: 0.25, codex.id: 9.0}},
+    )
+    store.set_session_usage(codex.id, {"total_cost_usd": 0.5})
+    store.set_session_usage(grandchild.id, {"total_cost_usd": 0.0})
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/agent_costs")
+
+    assert resp.status_code == 200
+    assert {row["id"]: (row["cost_usd"], row["estimated"]) for row in resp.json()["data"]} == {
+        # Own and descendant spend; the parent-reported estimate is never added.
+        session["id"]: (1.5, False),
+        # A priced cost wins over any estimate, and a known zero stays zero.
+        codex.id: (0.5, False),
+        grandchild.id: (0.0, False),
+        mirror.id: (0.25, True),
+        unpriced.id: (None, False),
+    }
+    child_resp = await client.get(f"/v1/sessions/{codex.id}/agent_costs")
+    assert {row["id"] for row in child_resp.json()["data"]} == {codex.id, grandchild.id}
+    missing = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/agent_costs")
+    assert missing.status_code == 404
+
+
 # ── Empty ────────────────────────────────────────────────
 
 

@@ -45,6 +45,7 @@ import { Button } from "@/components/ui/button";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { agentCostLabel, agentCostTitle, type AgentCost } from "@/hooks/useAgentCosts";
 import { useSession } from "@/hooks/useSession";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type { SessionItem } from "@/lib/types";
@@ -76,11 +77,13 @@ interface SubagentsPanelProps {
    *  child it is the child's parent id. AppShell resolves this from
    *  ``activeSession.parentSessionId``. */
   rootSessionId: string;
+  /** Display costs by session id, when the session overview feature loaded them. */
+  costs?: Map<string, AgentCost>;
 }
 
 type ViewMode = "list" | "graph";
 
-export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
+export function SubagentsPanel({ conversationId, rootSessionId, costs }: SubagentsPanelProps) {
   const { children, isLoading, error } = useChildSessions(rootSessionId);
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
@@ -123,7 +126,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             </div>
           }
         >
-          <SubagentsGraphView conversationId={conversationId} rootSessionId={rootSessionId} />
+          <SubagentsGraphView
+            conversationId={conversationId}
+            rootSessionId={rootSessionId}
+            costs={costs}
+          />
         </Suspense>
       </div>
     );
@@ -142,7 +149,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
         Add agent
       </button>
       <ul className="relative flex min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2 pb-2 pt-2">
-        <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
+        <MainRow
+          rootSessionId={rootSessionId}
+          isActive={conversationId === rootSessionId}
+          cost={costs?.get(rootSessionId)}
+        />
         {children.map((child, index) => (
           <SubagentRow
             key={child.id}
@@ -152,6 +163,7 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={toggleCollapsedRow}
+            costs={costs}
           />
         ))}
       </ul>
@@ -374,7 +386,30 @@ function mainMessagePreview(items: SessionItem[] | undefined): string | null {
   return null;
 }
 
-function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive: boolean }) {
+/** Cost beside an Agents row title; renders nothing while unknown. */
+function AgentCostTag({ cost }: { cost: AgentCost | undefined }) {
+  const label = agentCostLabel(cost);
+  if (label === null) return null;
+  return (
+    <span
+      data-testid="subagent-cost"
+      title={agentCostTitle(cost)}
+      className="ml-auto shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground"
+    >
+      {label}
+    </span>
+  );
+}
+
+function MainRow({
+  rootSessionId,
+  isActive,
+  cost,
+}: {
+  rootSessionId: string;
+  isActive: boolean;
+  cost: AgentCost | undefined;
+}) {
   const { session } = useSession(rootSessionId);
   const search = sessionNavigationSearch(useLocation().search);
   // Same wrapper-label probe used by the sidebar (Sidebar.tsx) and
@@ -428,6 +463,7 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
                 />
               </span>
               <span className="min-w-0 truncate text-base font-semibold">{label}</span>
+              <AgentCostTag cost={cost} />
             </div>
             {preview && (
               <p
@@ -468,6 +504,7 @@ function SubagentRow({
   conversationId,
   collapsedRows,
   onToggleCollapsed,
+  costs,
 }: {
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
@@ -478,6 +515,7 @@ function SubagentRow({
   conversationId: string;
   collapsedRows: Record<string, boolean>;
   onToggleCollapsed: (id: string) => void;
+  costs: Map<string, AgentCost> | undefined;
 }) {
   const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
@@ -611,6 +649,7 @@ function SubagentRow({
                     {shortModelName(child.routed_model)}
                   </span>
                 ) : null}
+                <AgentCostTag cost={costs?.get(child.id)} />
               </div>
               {child.last_message_preview && (
                 <p className="mt-0.5 truncate text-sm text-muted-foreground">
@@ -631,6 +670,7 @@ function SubagentRow({
             conversationId={conversationId}
             collapsedRows={collapsedRows}
             onToggleCollapsed={onToggleCollapsed}
+            costs={costs}
           />
         ))}
     </>

@@ -212,6 +212,60 @@
         "title": "AgentConfigPatch",
         "type": "object"
       },
+      "AgentCost": {
+        "description": "Display cost of one agent in a session tree.",
+        "properties": {
+          "cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Priced USD cost of this agent including its sub-agents (the same total its own session reports), or the parent harness's estimate when `estimated`. `None` when nothing is priced.",
+            "title": "Cost Usd"
+          },
+          "estimated": {
+            "default": false,
+            "description": "`True` when `cost_usd` is a parent-reported transcript estimate that the parent's total already includes.",
+            "title": "Estimated",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "Session id, e.g. `\"conv_child123\"`.",
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "AgentCost",
+        "type": "object"
+      },
+      "AgentCostList": {
+        "description": "Costs for a session and every descendant; `data` lists `AgentCost`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/AgentCost"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "AgentCostList",
+        "type": "object"
+      },
       "AgentDetailObject": {
         "description": "Agent summary with caller ownership for management actions.",
         "properties": {
@@ -18449,6 +18503,50 @@
         "summary": "Update Mcp Server",
         "tags": [
           "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/agent_costs": {
+      "get": {
+        "description": "List display costs for a session and every sub-agent beneath it.\n\nOne spawn-tree read serves the whole response. READ on the session\ncovers its descendants, as for `child_sessions`.\n\n**Returns:** An `AgentCostList`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 without READ; 404 when no session exists.",
+        "operationId": "list_agent_costs_v1_sessions__session_id__agent_costs_get",
+        "parameters": [
+          {
+            "description": "Session whose subtree to report, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentCostList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Agent Costs",
+        "tags": [
+          "sessions"
         ]
       }
     },

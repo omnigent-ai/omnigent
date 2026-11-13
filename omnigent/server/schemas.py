@@ -3534,6 +3534,30 @@ class SessionList(BaseModel):
     page_boundary: SessionPageBoundary | None = None
 
 
+class AgentCost(BaseModel):
+    """
+    Display cost of one agent in a session tree.
+
+    :param id: Session id, e.g. ``"conv_child123"``.
+    :param cost_usd: Priced USD cost of this agent including its sub-agents
+        (the same total its own session reports), or the parent harness's
+        estimate when ``estimated``. ``None`` when nothing is priced.
+    :param estimated: ``True`` when ``cost_usd`` is a parent-reported
+        transcript estimate that the parent's total already includes.
+    """
+
+    id: str
+    cost_usd: float | None = None
+    estimated: bool = False
+
+
+class AgentCostList(BaseModel):
+    """Costs for a session and every descendant; ``data`` lists ``AgentCost``."""
+
+    object: Literal["list"] = "list"
+    data: list[AgentCost] = Field(default_factory=list)
+
+
 class ChildSessionList(BaseModel):
     """Paginated list of child sessions; ``data`` is a page of ``ChildSessionSummary``."""
 

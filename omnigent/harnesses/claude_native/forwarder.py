@@ -902,6 +902,8 @@ class _ForwardDedupeState:
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
+    # Last per-child transcript cost estimates POSTed as ``subagent_costs_usd``.
+    posted_subagent_costs: dict[str, float] | None = None
     # Last permission mode POSTed as ``external_permission_mode_change`` —
     # mirrors the launch mode and any in-pane shift+tab switch, neither of
     # which the web UI can observe on its own.
@@ -3107,6 +3109,36 @@ def _transcript_cost_size_cached(
     return cost
 
 
+def _subagent_cost_estimates(
+    parent_transcript_path: Path,
+    active_subagents: list[SubagentEntry],
+    cost_cache: dict[Path, _TranscriptCostCacheEntry],
+) -> dict[str, float]:
+    """
+    Price each tracked sub-agent's own transcript, keyed by child conversation.
+
+    Synchronous transcript I/O; call via :func:`asyncio.to_thread`.
+
+    :param parent_transcript_path: Parent transcript JSONL path; its sibling
+        ``subagents/`` directory holds ``agent-<id>.jsonl`` files.
+    :param active_subagents: Sub-agents with a minted child conversation.
+    :param cost_cache: Size-keyed transcript cost cache, mutated in place.
+    :returns: ``{child_conversation_id: usd}`` for priceable transcripts, e.g.
+        ``{"conv_child": 0.55}``.
+    """
+    subagents_dir = _subagents_dir_for_transcript(parent_transcript_path)
+    costs: dict[str, float] = {}
+    for entry in active_subagents:
+        cost = _transcript_cost_size_cached(
+            subagents_dir / f"agent-{entry.subagent_id}.jsonl",
+            include_sidechains=True,
+            cache=cost_cache,
+        )
+        if cost is not None and entry.child_conversation_id:
+            costs[entry.child_conversation_id] = cost
+    return costs
+
+
 def _session_cost_estimate(
     *,
     parent_transcript_path: Path,
@@ -3139,19 +3171,14 @@ def _session_cost_estimate(
     :returns: ``max(S, C)`` in USD, or ``None`` when neither source
         yields a priceable cost.
     """
-    subagents_dir = _subagents_dir_for_transcript(parent_transcript_path)
     estimate: float | None = _transcript_cost_size_cached(
         parent_transcript_path, include_sidechains=False, cache=cost_cache
     )
-    for entry in active_subagents:
-        jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
-        sub_cost = _transcript_cost_size_cached(
-            jsonl_path, include_sidechains=True, cache=cost_cache
-        )
-        if sub_cost is not None:
-            # Seed the accumulator from the parent cost, or 0.0 when the parent
-            # had nothing priceable — so sub-agent cost still contributes to C.
-            estimate = (estimate or 0.0) + sub_cost
+    sub_costs = _subagent_cost_estimates(parent_transcript_path, active_subagents, cost_cache)
+    if sub_costs:
+        # Seed the accumulator from the parent cost, or 0.0 when the parent
+        # had nothing priceable — so sub-agent cost still contributes to C.
+        estimate = (estimate or 0.0) + sum(sub_costs.values())
     candidates = [cost for cost in (status_cost, estimate) if cost is not None]
     if not candidates:
         return None
@@ -3231,6 +3258,7 @@ async def _forward_session_cost(
     # Policy/budget cost: with no sub-agent it equals S; with a sub-agent
     # running it is max(S, real-time transcript estimate) so the gate sees
     # in-flight spend while S is frozen.
+    subagent_costs: dict[str, float] = {}
     if not active_subagents:
         policy_cost = status_cost
     else:
@@ -3241,12 +3269,16 @@ async def _forward_session_cost(
             status_cost=status_cost,
             cost_cache=cost_cache,
         )
+        # Cache hits: the estimate above already priced these transcripts.
+        subagent_costs = await asyncio.to_thread(
+            _subagent_cost_estimates, parent_transcript_path, active_subagents, cost_cache
+        )
     # Build the payload from whichever values are present AND have advanced.
     # Monotonic per field: never walk a total backwards — guards a transient
     # lower transcript read (e.g. just after a rotation) and suppresses
     # steady-state churn. The two fields advance independently (policy_cost
     # moves mid-turn while display_cost/S is frozen).
-    payload: dict[str, float | str] = {}
+    payload: dict[str, object] = {}
     if display_cost is not None and (
         dedupe.posted_cost is None or display_cost > dedupe.posted_cost
     ):
@@ -3268,6 +3300,11 @@ async def _forward_session_cost(
         model = status_state.get("model")
         if isinstance(model, str) and model:
             payload["model"] = model
+    # Display-only estimates, sent beside a cost field so an older server ignores
+    # the key; S already includes this spend, so the server never sums them.
+    # ponytail: an estimate that moves while neither cost advances waits for the next post.
+    if subagent_costs and subagent_costs != dedupe.posted_subagent_costs:
+        payload["subagent_costs_usd"] = subagent_costs
     try:
         await _post_external_session_usage(
             client,
@@ -3297,6 +3334,8 @@ async def _forward_session_cost(
         dedupe.posted_cost = display_cost
     if "policy_cost_usd" in payload:
         dedupe.posted_policy_cost = policy_cost
+    if "subagent_costs_usd" in payload:
+        dedupe.posted_subagent_costs = subagent_costs
 
 
 async def _supervisor_sleep(seconds: float) -> None:
@@ -6072,7 +6111,7 @@ async def _post_external_session_usage(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    usage: Mapping[str, float | str] | None,
+    usage: Mapping[str, object] | None,
     context_window: int | None = None,
     token_usage: dict[str, int] | None = None,
 ) -> None:

@@ -14,7 +14,9 @@ import pytest
 
 from omnigent.errors import OmnigentError
 from omnigent.llms.context_window import ModelPricing
+from omnigent.runtime.policies.builder import load_session_tree, load_session_usage
 from omnigent.server.routes._sessions.orchestration import (
+    _agent_costs,
     _persist_native_cumulative_usage,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -70,6 +72,55 @@ def test_pi_incomplete_cost_does_not_become_a_resume_baseline(
         _persist_native_cumulative_usage(
             conv.id, {"cumulative_input_tokens": 300, "cost_complete": "true"}, store
         )
+
+
+def test_subagent_cost_estimates_stay_display_only(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation(title="claude", agent_id=_AGENT_ID)
+    child = store.create_conversation(
+        kind="sub_agent", title="Explore:a", parent_conversation_id=parent.id, agent_id=_AGENT_ID
+    )
+    _persist_native_cumulative_usage(
+        parent.id, {"cumulative_cost_usd": 1.0, "subagent_costs_usd": {child.id: 0.4}}, store
+    )
+    # A lower estimate keeps the maximum; a new child merges in.
+    _persist_native_cumulative_usage(
+        parent.id,
+        {"policy_cost_usd": 1.2, "subagent_costs_usd": {child.id: 0.3, "conv_other": 0.1}},
+        store,
+    )
+
+    usage = _usage(store, parent.id)
+    assert usage["subagent_costs_usd"] == {child.id: 0.4, "conv_other": 0.1}
+    # The parent's bill already includes the child's spend; nothing adds it again.
+    assert usage["total_cost_usd"] == 1.0
+    assert load_session_usage(parent.id, store)["total_cost_usd"] == 1.0
+    costs = {
+        cost.id: cost for cost in _agent_costs(load_session_tree(parent.id, store), parent.id)
+    }
+    assert (costs[parent.id].cost_usd, costs[parent.id].estimated) == (1.0, False)
+    assert (costs[child.id].cost_usd, costs[child.id].estimated) == (0.4, True)
+
+
+@pytest.mark.parametrize(
+    "estimates",
+    [
+        [0.1],
+        {"conv_x": -1},
+        {"conv_x": float("nan")},
+        {"conv_x": True},
+        {"": 0.1},
+        {f"conv_{index}": 0.1 for index in range(1001)},
+    ],
+)
+def test_invalid_subagent_cost_estimates_reject_the_report(db_uri: str, estimates: object) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="claude", agent_id=_AGENT_ID)
+    with pytest.raises(OmnigentError, match="subagent_costs_usd"):
+        _persist_native_cumulative_usage(
+            conv.id, {"cumulative_cost_usd": 1.0, "subagent_costs_usd": estimates}, store
+        )
+    assert "total_cost_usd" not in _usage(store, conv.id)
 
 
 def test_per_model_cost_sums_across_model_switch(db_uri: str) -> None:

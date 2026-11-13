@@ -3103,6 +3103,36 @@ describe("Extension pages own the header", () => {
   });
 });
 
+describe("Session overview", () => {
+  it.each([true, false])("follows its feature flag in the shell (enabled=%s)", async (enabled) => {
+    writeWorkspacePanelDefault("collapsed");
+    mockConversations([{ id: "conv_overview", permission_level: null }]);
+    renderShell("/c/conv_overview", serverInfo({ features: { session_overview: enabled } }));
+    await waitFor(() => expect(document.querySelector("header.chat-header")).not.toBeNull());
+
+    expect(screen.queryByTestId("header-session-cost") !== null).toBe(enabled);
+    expect(screen.queryByTestId("session-overview") !== null).toBe(enabled);
+    if (!enabled) return;
+    // The header cost hides and reopens the docked overview, remembering the choice.
+    fireEvent.click(screen.getByTestId("header-session-overview-toggle"));
+    expect(screen.queryByTestId("session-overview")).toBeNull();
+    expect(localStorage.getItem("omnigent:session-overview-open")).toBe("false");
+    fireEvent.click(screen.getByTestId("header-session-overview-toggle"));
+    expect(screen.getByTestId("session-overview")).toBeInTheDocument();
+  });
+
+  it("gives the open workspace the space and keeps the cost as plain text", async () => {
+    writeWorkspacePanelDefault("open");
+    mockConversations([{ id: "conv_overview_ws", permission_level: null }]);
+    renderShell("/c/conv_overview_ws", serverInfo({ features: { session_overview: true } }));
+    await screen.findByRole("complementary", { name: "Workspace" });
+
+    expect(screen.getByTestId("header-session-cost")).toBeInTheDocument();
+    expect(screen.queryByTestId("header-session-overview-toggle")).toBeNull();
+    expect(screen.queryByTestId("session-overview")).toBeNull();
+  });
+});
+
 describe("Right workspace card visibility", () => {
   it.each([true, false])(
     "waits for capabilities before validating restored search (enabled=%s)",
