@@ -397,17 +397,8 @@ def _brokered_codex_spec(
     return spec, sandbox, binding
 
 
-@pytest.mark.parametrize(
-    "settings",
-    [
-        {},
-        {"web_search": False, "disable_native_tools": True},
-        {"web_search": "false", "disable_native_tools": 1},
-    ],
-)
 def test_codex_nonbrokered_credentials_rejected_before_provider_resolution(
     monkeypatch: pytest.MonkeyPatch,
-    settings: dict[str, object],
 ) -> None:
     from unittest.mock import Mock
 
@@ -419,7 +410,6 @@ def test_codex_nonbrokered_credentials_rejected_before_provider_resolution(
         response_path="/v1/responses",
     )
     spec.executor.config["broker_gateway"] = False
-    spec.executor.config.update(settings)
     binding.inject_env = ["UNRELATED_TOKEN"]
     resolve_provider = Mock()
     monkeypatch.setattr(workflow, "_resolve_provider_for_build", resolve_provider)

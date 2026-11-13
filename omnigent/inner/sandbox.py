@@ -552,6 +552,10 @@ class HarnessSandboxValidationError(ValueError):
             "The selected harness does not support os_env.sandbox.credential_proxy."
         ),
         "git_ssh": "The selected harness does not support os_env.sandbox.git_ssh.",
+        "tcp_egress": (
+            "The selected harness does not support os_env.sandbox.tcp_egress. "
+            "Use sys_os_shell or a sandboxed terminal."
+        ),
         "scan_limit": "os_env.sandbox.cwd_hidden_scan_max_entries must be a positive integer.",
         "scan_overflow": (
             "os_env.sandbox.cwd_hidden_scan_overflow must be error, warn or unlimited."
@@ -643,6 +647,10 @@ def validate_harness_sandbox(
         raise HarnessSandboxValidationError(
             f"{harness} does not support copy_on_write with {sandbox.type!r}",
             reason="copy_on_write",
+        )
+    if sandbox.tcp_egress is not None:
+        raise HarnessSandboxValidationError(
+            f"{harness} does not support os_env.sandbox.tcp_egress", reason="tcp_egress"
         )
     for feature, supported in (
         ("egress_rules", supports_egress_rules),

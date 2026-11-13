@@ -132,11 +132,6 @@ def prepare_codex_worker(
 ) -> CodexWorkerLaunch:
     """Prepare a contained worker or propagate the containment failure."""
     brokered_gateway = worker_env is not None and worker_env.get(BROKERED_CODEX_ENV) == "1"
-    if os_env is not None and os_env.sandbox is not None and os_env.sandbox.tcp_egress is not None:
-        raise ValueError(
-            "the Codex worker does not support tcp_egress; "
-            "use sys_os_shell or an inherited sandboxed terminal"
-        )
     if os_env is not None:
         with harness_sandbox_preparation():
             validate_harness_sandbox(
