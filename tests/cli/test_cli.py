@@ -2569,11 +2569,13 @@ def test_server_explicit_config_overrides_omnigent_config_env(
     bind_probe.assert_called_once_with("127.0.0.1", 44771)
 
 
+@pytest.mark.parametrize("config_source", ["environment", "data_dir"])
 def test_server_without_config_flag_serves_resolved_server_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    config_source: str,
 ) -> None:
-    """Without ``-c``, ``OMNIGENT_CONFIG`` supplies branding and the user title guidance."""
+    """Without ``-c``, the resolved server config supplies branding and title guidance."""
     import uvicorn.server
     from fastapi.testclient import TestClient
 
@@ -2584,7 +2586,14 @@ def test_server_without_config_flag_serves_resolved_server_config(
     (config_home / "config.yaml").write_text(
         "session_title_instructions: Prefix titles with the current date.\n"
     )
-    monkeypatch.setenv("OMNIGENT_CONFIG", str(server_config_file))
+    if config_source == "environment":
+        monkeypatch.setenv("OMNIGENT_CONFIG", str(server_config_file))
+    else:
+        monkeypatch.delenv("OMNIGENT_CONFIG", raising=False)
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        server_config_file.rename(data_dir / "config.yaml")
+        monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(data_dir / "anchor"))
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
     observed: dict[str, Any] = {}
     from omnigent.server import app as app_module

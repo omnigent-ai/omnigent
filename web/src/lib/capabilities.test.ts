@@ -291,6 +291,7 @@ describe.each([
   "scheduled_task_harness_settings",
   "scheduled_task_approval_skipping_modes",
   "scheduled_task_subhour",
+  "scheduled_task_trigger_headers",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
 ] as const)("resolveServerInfo %s", (capability) => {

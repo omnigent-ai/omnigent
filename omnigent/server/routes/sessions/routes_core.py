@@ -237,6 +237,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _run_managed_launch,
     _session_is_moving,
     _session_is_starting,
+    _settle_orphaned_running_rows,
     _spawn_archive_stop,
     _validate_session_model_selection,
     ensure_runner_connected,
@@ -394,6 +395,7 @@ async def _wake_runner_for_model_change(
         conversation_store=conversation_store,
         runner_router=runner_router,
         raise_host_refusal=True,
+        request=request,
     )
     if runner_client is None:
         raise OmnigentError(
@@ -689,7 +691,7 @@ def register_core_routes(
         """
         try:
             runner_client = await _get_runner_client(
-                session_id, runner_router, conversation=routing
+                session_id, runner_router, conversation=routing, for_control=True
             )
             if runner_client is not None:
                 await runner_client.delete(f"/v1/sessions/{session_id}", timeout=30.0)
@@ -2013,17 +2015,35 @@ def register_core_routes(
             )
             parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
 
-        from omnigent.server.mcp_compatibility import (
+        from omnigent.server.runtime_compatibility import (
             registry_services,
-            require_registry_mcp_runtime,
+            require_runtime_support,
+            uses_tcp_egress,
         )
 
-        require_registry_mcp_runtime(
-            registry_services(spec),
-            host_id=parsed_metadata.host_id,
+        services = registry_services(spec)
+        tcp_egress_required = uses_tcp_egress(spec)
+        runtime_host_id = parsed_metadata.host_id
+        if (
+            runtime_host_id is None
+            and inherited_runner_id
+            and parent_conv is not None
+            and (tcp_egress_required or services)
+        ):
+            from omnigent.runner.routing import routing_host_id
+
+            runtime_host_id = await asyncio.to_thread(
+                routing_host_id, parent_conv, conversation_store
+            )
+        await asyncio.to_thread(
+            require_runtime_support,
+            services,
+            tcp_egress_required=tcp_egress_required,
+            host_id=runtime_host_id,
             runner_id=inherited_runner_id,
             host_registry=getattr(request.app.state, "host_registry", None),
             tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            runner_router=runner_router,
         )
 
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
@@ -2764,55 +2784,20 @@ def register_core_routes(
             pull_requests = _pull_requests_from_summaries(batch.pull_request_summaries)
             # Settle orphaned running/waiting rows only after stale heartbeats
             # and a missing local cache entry justify a cross-replica probe.
-            if liveness_lookup is not None:
-                orphan_suspects = [
-                    conv
-                    for conv in list_batch
-                    if conv.agent_id is not None
-                    and conv.runner_id is not None
-                    and conv.live_status in ("running", "waiting")
-                    and _session_status_cache.get(conv.id) is None
-                    and not runner_seen_is_fresh(conv.runner_last_seen)
-                    and (
-                        permission_store is None
-                        or _permission_level_from_grants(
-                            user_id,
-                            perms_by_conv.get(conv.id, []),
-                            user_is_admin,
-                        )
-                        == LEVEL_OWNER
+            await _settle_orphaned_running_rows(
+                list_batch,
+                conversation_store=conversation_store,
+                liveness_lookup=liveness_lookup,
+                host_store=getattr(request.app.state, "host_store", None),
+                # Only an owner's read may settle a row.
+                may_settle=lambda conv, perms=perms_by_conv: (
+                    permission_store is None
+                    or _permission_level_from_grants(
+                        user_id, perms.get(conv.id, []), user_is_admin
                     )
-                ]
-                if orphan_suspects:
-                    orphan_liveness = await asyncio.to_thread(
-                        liveness_lookup, [conv.id for conv in orphan_suspects]
-                    )
-                    offline_hosts: dict[str, bool | None] = {}
-                    now = int(time.time())
-                    # Heartbeat expiry and reconnect grace can precede the hold.
-                    hold_stale_before = now - HOST_OFFLINE_HOLD_S - 2 * RUNNER_LIVENESS_TTL_S
-                    for conv in orphan_suspects:
-                        result = orphan_liveness.get(conv.id)
-                        # False means no replica has a tunnel and the heartbeat
-                        # expired, so reconnecting runners within grace survive.
-                        if result is not None and not result.runner_online:
-                            if result.host_online is False and conv.host_id is not None:
-                                # A sleeping host can resume its runner; a list read
-                                # must not end that bounded wait on another replica.
-                                if conv.host_id not in offline_hosts:
-                                    offline_hosts[conv.host_id] = await _host_row_offline(
-                                        getattr(request.app.state, "host_store", None),
-                                        conv.host_id,
-                                        updated_since=hold_stale_before,
-                                    )
-                                if offline_hosts[conv.host_id] is not False:
-                                    continue
-                            await asyncio.to_thread(
-                                reconcile_orphaned_running_status,
-                                conv.id,
-                                conversation_store,
-                                now - RUNNER_LIVENESS_TTL_S,
-                            )
+                    == LEVEL_OWNER
+                ),
+            )
             # Build items after reconciliation so each settled row reads its new
             # status straight from the (now-updated) cache.
             items.extend(
@@ -4036,7 +4021,7 @@ def register_core_routes(
                 )
                 if runner_router is not None:
                     await asyncio.to_thread(
-                        runner_router.require_mcp_registry_support,
+                        runner_router.require_runtime_support,
                         dataclasses.replace(conv, runner_id=runner_id),
                     )
                 try:
