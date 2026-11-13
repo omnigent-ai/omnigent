@@ -1398,6 +1398,8 @@ async def _auto_create_claude_terminal_for_test(
         ),
         ("claude", ["--settings", '{"env":{"ORDER":"configured","CONFIG_ONLY":"yes"}}']),
         ("env", ["-C", "sub", "claude", "--settings", "caller.json"]),
+        ("env", ["-C", "sub", "--", "claude", "--settings", "caller.json"]),
+        ("env", ["-S", "-C sub claude", "--settings", "caller.json"]),
     ],
     ids=[
         "configured-wrapper",
@@ -1407,6 +1409,8 @@ async def _auto_create_claude_terminal_for_test(
         "wrapper-claude-settings",
         "configured-claude-settings",
         "configured-env-chdir-settings",
+        "configured-env-delimiter-settings",
+        "configured-env-split-settings",
     ],
 )
 async def test_auto_create_claude_settings_preserve_configured_argument_boundary(
@@ -1455,6 +1459,9 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
                 assert created.instance.args[:boundary] == prefix[:boundary]
             if command == "sh":
                 assert created.instance.args[: len(prefix)] == prefix
+            if command == "env":
+                boundary = prefix.index("--settings")
+                assert created.instance.args[:boundary] == prefix[:boundary]
             if "--settings" in prefix:
                 assert settings["env"]["CONFIG_ONLY"] == "yes"
             assert created.instance.args.count("--settings") == 1

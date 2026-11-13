@@ -7414,6 +7414,14 @@ def _acknowledge_auto_mode_billing_notice(socket_path: str, tmux_target: str) ->
     return last_enter is not None
 
 
+def has_claude_invocation_settings(bridge_dir: Path) -> bool:
+    """Check diagnostic presence of legacy or generated settings without reading contents."""
+    return (bridge_dir / _INVOCATION_SETTINGS_FILE).is_file() or any(
+        _GENERATED_SETTINGS_FILE.fullmatch(path.name) and path.is_file()
+        for path in bridge_dir.glob("claude-settings-*.json")
+    )
+
+
 def bridge_dir_from_launch_args(args: Sequence[str]) -> Path | None:
     """Read the stable bridge identity from the generated invocation settings path."""
     found: Path | None = None

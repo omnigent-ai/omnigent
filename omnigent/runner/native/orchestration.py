@@ -72,7 +72,11 @@ from omnigent.errors import (
     OmnigentError,
 )
 from omnigent.harness_plugins import native_provider_for_key
-from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
+from omnigent.host.harness_startup import (
+    env_wrapper_args_start,
+    env_wrapper_chdir,
+    env_wrapper_environment,
+)
 from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
@@ -9981,9 +9985,6 @@ async def _auto_create_claude_terminal(
         elif command_name not in {"claude", "env"}:
             if "--" in configured_prefix:
                 claude_args_start = configured_prefix.index("--") + 1
-        settings_generation = record_claude_settings_boundary(
-            bridge_dir, launch_args, claude_args_start=claude_args_start
-        )
         # Validate the binary this terminal will actually spawn: ``launch_command``
         # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
         # name resolves against this process's inherited PATH (same lookup tmux's
@@ -10039,6 +10040,16 @@ async def _auto_create_claude_terminal(
             keep_alive_after_exit=True,
         )
         from omnigent.harnesses.claude_native.bridge import finalize_claude_caller_settings
+
+        if command_name == "env":
+            env_start = env_wrapper_args_start(
+                launch_command, launch_args, _claude_terminal_pre_wrapper_env(env_spec)
+            )
+            if env_start is not None:
+                claude_args_start = env_start
+        settings_generation = record_claude_settings_boundary(
+            bridge_dir, launch_args, claude_args_start=claude_args_start
+        )
 
         async def prepare_claude(instance: TerminalInstance) -> None:
             await finalize_claude_caller_settings(
