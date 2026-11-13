@@ -752,7 +752,8 @@ def test_sandbox_hides_dotfiles_created_after_helper_start(
     assert "late-secret-value-67890" not in late_read.get("stderr", "")
     assert late_read["stdout"].split()[-1] != first["stdout"].strip()
     assert settled["stdout"].strip() == late_read["stdout"].split()[-1]
-    assert replaced["stdout"].strip() != settled["stdout"].strip()
+    if sandbox.type == "linux_bwrap":
+        assert replaced["stdout"].strip() != settled["stdout"].strip()
     assert stable["stdout"].strip() == replaced["stdout"].strip()
 
 

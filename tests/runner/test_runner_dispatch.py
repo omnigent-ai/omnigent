@@ -2989,10 +2989,13 @@ async def test_runner_os_env_helper_restarts_replaces_workspace_and_times_out(
 @pytest.mark.posix_only
 async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellation_retires_it(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Concurrent calls bypass a busy session helper; a cancelled call's helper is closed."""
     import errno
+    from unittest.mock import Mock
 
+    import omnigent.inner.os_env as os_env_module
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
@@ -3031,14 +3034,28 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
             )
         )
         await poll_until_async(open_gate, timeout_s=5)
-        read = await _execute_os_env_tool(
-            "sys_os_read",
-            {"path": "note.txt"},
-            agent_spec=spec,
-            conversation_id="conv_busy",
-            resource_registry=registry,
-        )
-        assert json.loads(read)["content"] == "hi\n"
+        fallback_closures = []
+        create_environment = os_env_module.create_os_environment
+        with monkeypatch.context() as fallback_patch:
+
+            def create_fallback(*args, **kwargs):
+                environment = create_environment(*args, **kwargs)
+                close = Mock(wraps=environment.close)
+                fallback_patch.setattr(environment, "close", close)
+                fallback_closures.append(close)
+                return environment
+
+            fallback_patch.setattr(os_env_module, "create_os_environment", create_fallback)
+            read = await _execute_os_env_tool(
+                "sys_os_read",
+                {"path": "note.txt"},
+                agent_spec=spec,
+                conversation_id="conv_busy",
+                resource_registry=registry,
+            )
+            assert json.loads(read)["content"] == "hi\n"
+            assert len(fallback_closures) == 1
+            fallback_closures[0].assert_called_once_with()
         assert not blocked.done()
         blocked.cancel()
         assert gate_fd is not None
