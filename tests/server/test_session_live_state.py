@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,6 +59,14 @@ class _RecordingStore:
         self.blocked_writes: list[tuple[str, str | None]] = []
         self.touches: list[list[str]] = []
         self.clears: list[tuple[str, int | None]] = []
+        # conversation_id -> transcript items, oldest first.
+        self.transcripts: dict[str, list[SimpleNamespace]] = {}
+
+    def list_items(
+        self, conversation_id: str, limit: int = 100, order: str = "asc", **_: object
+    ) -> SimpleNamespace:
+        items = self.transcripts.get(conversation_id, [])
+        return SimpleNamespace(data=(items[::-1] if order == "desc" else items)[:limit])
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
         self.status_writes.append((conversation_id, status))
@@ -409,6 +418,22 @@ def test_unencodable_status_is_dropped_before_enqueue(
     assert recording_store.status_writes == [("conv_1", "running")]
 
 
+# When the fake store's running runs fired.
+_FIRED_AT = 1_000
+
+
+def _transcript_item(type: str, created_at: int, role: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(type=type, created_at=created_at, data=SimpleNamespace(role=role))
+
+
+# A run's session as a fire leaves it: runner bookkeeping, then the prompt.
+_RUN_STARTED = [
+    _transcript_item("resource_event", _FIRED_AT + 1),
+    _transcript_item("message", _FIRED_AT + 4, "user"),
+]
+_RUN_ANSWERED = [*_RUN_STARTED, _transcript_item("message", _FIRED_AT + 90, "assistant")]
+
+
 class _FakeScheduledTaskStore:
     """Scheduled-task-store stand-in recording the hook's lookup + update."""
 
@@ -427,8 +452,8 @@ class _FakeScheduledTaskStore:
         run_id = self._running_by_conv.get(conversation_id)
         if run_id is None:
             return None
-        # Minimal object carrying only the ``id`` the hook reads.
-        return type("_Run", (), {"id": run_id})()
+        # Minimal object carrying only the fields the hook reads.
+        return SimpleNamespace(id=run_id, fired_at=_FIRED_AT, scheduled_at=_FIRED_AT)
 
     def update_run(
         self,
@@ -446,7 +471,9 @@ class _FakeScheduledTaskStore:
 def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
     """A terminal ``idle`` edge flips the conversation's running run to succeeded."""
     sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
-    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    conversations = _RecordingStore()
+    conversations.transcripts["conv_1"] = _RUN_ANSWERED
+    session_live_state.configure(conversations, sched)  # type: ignore[arg-type]
     try:
         session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
         _wait_until(lambda: bool(sched.update_calls))
@@ -457,6 +484,49 @@ def test_scheduled_run_completion_idle_transitions_to_succeeded() -> None:
     run_id, status, error, error_code = sched.update_calls[0]
     assert (run_id, status) == ("run_1", "succeeded")
     assert error is None and error_code is None
+
+
+@pytest.mark.parametrize(
+    ("transcript", "ends_the_run"),
+    [
+        # Claude Code reports idle while it starts, before it has read the prompt.
+        pytest.param(_RUN_STARTED[:1], False, id="agent-starting"),
+        pytest.param(_RUN_STARTED, False, id="prompt-not-yet-read"),
+        # A run started from a copy of a session: the copy keeps its history's times.
+        pytest.param(
+            [
+                _transcript_item("message", _FIRED_AT - 600, "user"),
+                _transcript_item("message", _FIRED_AT - 590, "assistant"),
+                *_RUN_STARTED,
+            ],
+            False,
+            id="copied-history",
+        ),
+        pytest.param(
+            [*_RUN_STARTED, _transcript_item("function_call", _FIRED_AT + 9)],
+            True,
+            id="stopped-after-a-tool-call",
+        ),
+        pytest.param(_RUN_ANSWERED, True, id="agent-replied"),
+    ],
+)
+def test_an_idle_edge_ends_a_scheduled_run_only_after_its_agent_worked(
+    transcript: list[SimpleNamespace], ends_the_run: bool
+) -> None:
+    """An idle edge ends the run only once its agent has written to the session."""
+    sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
+    conversations = _RecordingStore()
+    conversations.transcripts["conv_1"] = transcript
+    session_live_state.configure(conversations, sched)  # type: ignore[arg-type]
+    try:
+        session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
+        # One ordered worker: once this no-op has run, so has the hook.
+        session_live_state.submit("test_barrier", lambda: None).result(timeout=10)
+    finally:
+        session_live_state.configure(None)
+    assert [call[:2] for call in sched.update_calls] == (
+        [("run_1", "succeeded")] if ends_the_run else []
+    )
 
 
 def test_scheduled_run_completion_failed_carries_error_code() -> None:

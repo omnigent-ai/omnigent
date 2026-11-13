@@ -124,6 +124,21 @@ export function currentPlan(entries: readonly JournalEntry[]): JournalEntry | nu
 }
 
 /**
+ * The saved workflow the current plan came from. Only the plan that starts a
+ * run names it, so a replan that keeps one of that plan's steps came from it
+ * too; a plan that shares none, such as one that replaced it, didn't.
+ */
+export function planWorkflowId(entries: readonly JournalEntry[]): string | null {
+  const plan = currentPlan(entries);
+  if (!plan) return null;
+  if (plan.workflow_id) return plan.workflow_id;
+  const start = entries.findLast((entry) => entry.kind === "plan" && entry.workflow_id);
+  if (!start?.workflow_id) return null;
+  const startStepIds = new Set(planSteps(start).map((step) => step.id));
+  return planSteps(plan).some((step) => startStepIds.has(step.id)) ? start.workflow_id : null;
+}
+
+/**
  * Where a step stands. A started step is running only while the session
  * works; a step with no status is ready once every step it depends on is done.
  * A step waits for the user (`needs_input`) when it says so, or while it runs
