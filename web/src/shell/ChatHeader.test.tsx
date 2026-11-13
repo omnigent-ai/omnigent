@@ -850,7 +850,7 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(screen.getByTestId("session-actions-menu")).toHaveClass("rounded-full");
   });
 
-  it("keeps the fallback menu legible over scrolling content", () => {
+  it("keeps the fallback mobile menu solid", () => {
     isMobileMock.mockReturnValue(true);
     renderHeader({
       sidebarOpen: true,
@@ -861,10 +861,10 @@ describe("ChatHeader — floating mobile controls", () => {
     });
 
     fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
-    expect(screen.getByRole("menu")).toHaveClass(
-      "max-md:bg-background/70",
-      "max-md:backdrop-blur-xl",
-    );
+    const menu = screen.getByRole("menu");
+    expect(menu).toHaveClass("max-md:bg-[var(--card-solid)]!", "max-md:backdrop-filter-none!");
+    expect(menu).not.toHaveClass("mobile-menu-glass");
+    expect(menu.parentElement?.querySelector(".mobile-menu-glass-layer")).toBeNull();
     expect(screen.getByLabelText("Working directory: /Users/ajay/projects/omni")).toHaveTextContent(
       "omni",
     );

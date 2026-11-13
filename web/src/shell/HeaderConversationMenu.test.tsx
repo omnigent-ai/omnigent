@@ -737,17 +737,17 @@ describe("HeaderConversationMenu", () => {
     expect(document.body.style.pointerEvents).toBe("none");
   });
 
-  it("keeps the trigger circular while retaining a legible mobile menu surface", () => {
+  it("keeps the trigger circular and the mobile session menu solid", () => {
     mocks.isMobile = true;
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(trigger).toHaveClass("rounded-full");
 
     openMenu();
-    expect(screen.getByRole("menu")).toHaveClass(
-      "max-md:bg-background/70",
-      "max-md:backdrop-blur-xl",
-    );
+    const menu = screen.getByRole("menu");
+    expect(menu).toHaveClass("max-md:bg-[var(--card-solid)]!", "max-md:backdrop-filter-none!");
+    expect(menu).not.toHaveClass("mobile-menu-glass");
+    expect(menu.parentElement?.querySelector(".mobile-menu-glass-layer")).toBeNull();
   });
 
   it("keeps emitting the mobile Share / Agent info analytics ids", () => {
