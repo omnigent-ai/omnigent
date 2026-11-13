@@ -2975,7 +2975,7 @@ function AppShellImpl() {
     !filesPanelOpen,
   );
   // WIP(session_overview): docks beside chat when a wide window leaves the right side
-  // free; otherwise the header cost opens it over chat.
+  // free; otherwise it opens as a popover from the header cost.
   const sessionOverviewEnabled =
     serverConversationId !== undefined && isFeatureEnabled(serverInfo, "session_overview");
   const wideViewport = useIsWideViewport();
@@ -2991,12 +2991,9 @@ function AppShellImpl() {
   const sessionOverviewOpen =
     sessionOverviewEnabled &&
     (sessionOverviewDocked ? sessionOverviewDockedOpen : sessionOverviewOverlayOpen);
-  const toggleSessionOverview = useCallback(() => {
-    const setOpen = sessionOverviewDocked
-      ? setSessionOverviewDockedOpen
-      : setSessionOverviewOverlayOpen;
-    setOpen((open) => !open);
-  }, [sessionOverviewDocked]);
+  const setSessionOverviewOpen = sessionOverviewDocked
+    ? setSessionOverviewDockedOpen
+    : setSessionOverviewOverlayOpen;
   useEffect(() => {
     if (!workspacePanelVisible || !focusWorkspaceTabsOnOpenRef.current) return;
     focusWorkspaceTabsOnOpenRef.current = false;
@@ -3135,9 +3132,15 @@ function AppShellImpl() {
                     sessionOverviewControl={
                       sessionOverviewEnabled && (
                         <SessionCostButton
-                          expanded={sessionOverviewOpen}
-                          onToggle={toggleSessionOverview}
-                        />
+                          docked={sessionOverviewDocked}
+                          open={sessionOverviewOpen}
+                          onOpenChange={setSessionOverviewOpen}
+                        >
+                          <SessionOverview
+                            onClose={() => setSessionOverviewOpen(false)}
+                            changesSessionId={showFilesPanel ? serverConversationId : undefined}
+                          />
+                        </SessionCostButton>
                       )
                     }
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
@@ -3233,17 +3236,6 @@ function AppShellImpl() {
                       </ShellCommandContext.Provider>
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
-                  {sessionOverviewOpen && !sessionOverviewDocked && (
-                    <aside
-                      aria-label="Session overview"
-                      className="absolute right-2 top-12 z-20 w-64 max-md:hidden"
-                    >
-                      <SessionOverview
-                        onClose={toggleSessionOverview}
-                        changesSessionId={showFilesPanel ? serverConversationId : undefined}
-                      />
-                    </aside>
-                  )}
                 </GridSessionMain>
 
                 {sessionOverviewOpen && sessionOverviewDocked && (
@@ -3252,7 +3244,7 @@ function AppShellImpl() {
                     className="flex w-64 shrink-0 flex-col overflow-y-auto px-2 pb-3 pt-12"
                   >
                     <SessionOverview
-                      onClose={toggleSessionOverview}
+                      onClose={() => setSessionOverviewOpen(false)}
                       changesSessionId={showFilesPanel ? serverConversationId : undefined}
                     />
                   </aside>
