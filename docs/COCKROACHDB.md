@@ -23,8 +23,8 @@ v25.2.10, and v25.4.5) runs via the local compatibility suite
 
 CockroachDB releases before v25.2 are deprecated. Support will be removed in
 Omnigent v0.24.0. Until then, v23.2.28 and newer remain supported, and startup
-logs a deprecation warning for releases before v25.2. Upgrade to v25.2.10 or
-newer before upgrading to Omnigent v0.24.0.
+logs a deprecation warning for releases before v25.2. Upgrade to v25.2 or newer
+(v25.2.10 recommended) before upgrading to Omnigent v0.24.0.
 
 CockroachDB v23.2 provides `READ COMMITTED` as an opt-in preview. Enable it
 before starting Omnigent:
