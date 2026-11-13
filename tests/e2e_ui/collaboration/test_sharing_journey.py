@@ -205,7 +205,7 @@ def test_share_grant_downgrade_revoke_journey(
         # An editor is offered a reply to selected text; the READ stage below
         # repeats the gesture against a locked composer.
         _drag_select_text(bob_page, bob_page.locator(_ASSISTANT).first.locator("p").first)
-        expect(bob_page.get_by_role("button", name="Reply ↵")).to_be_visible()
+        expect(bob_page.get_by_role("button", name="Reply")).to_be_visible()
 
         # ── Downgrade to READ: composer locks after reload ───────
         shared.owner.put(
@@ -219,7 +219,7 @@ def test_share_grant_downgrade_revoke_journey(
         # A viewer who cannot send must not be offered a reply to the selection.
         _drag_select_text(bob_page, bob_page.locator(_ASSISTANT).first.locator("p").first)
         bob_page.wait_for_timeout(1_000)
-        expect(bob_page.get_by_role("button", name="Reply ↵")).to_have_count(0)
+        expect(bob_page.get_by_role("button", name="Reply")).to_have_count(0)
         # The API agrees: posting a turn with READ is 403 (has SOME
         # access, so forbidden rather than 404).
         send = shared.bob.post(

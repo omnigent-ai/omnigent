@@ -59,10 +59,10 @@ describe("shortcutGroupsFor", () => {
     const items = shortcutGroupsFor(BROWSER_TAB).find((group) => group.title === "In chats")!.items;
     expect(items).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ label: "Reply to selected chat text", keys: ["↵"] }),
+        expect.objectContaining({ label: "Reply to selected chat text", keys: ["Alt", "↵"] }),
         expect.objectContaining({
           label: "Ask about selected chat text in side chat (when available)",
-          keys: ["Alt", "↵"],
+          keys: ["Alt", "⇧", "↵"],
         }),
       ]),
     );
