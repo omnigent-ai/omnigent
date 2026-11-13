@@ -235,6 +235,8 @@ runs:
         path: |
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/server.log
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/runner.log
+          /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/test_scheduled_renewal_preserv*/*-process.log
+          /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/test_scheduled_renewal_preserv*/server-b.log
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/.omnigent/logs/**/*.log
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/junit.xml
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/progress/progress-*.log
