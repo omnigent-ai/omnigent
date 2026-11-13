@@ -851,6 +851,23 @@ class _HarnessLaunch:
     spec_entry: _SpecEntry | None
 
 
+class _CopyOnWriteSetupError(ValueError):
+    """Distinguish disposable-workspace refusal from other launch validation."""
+
+
+def _copy_on_write_setup_failure(session_id: str, exc: ValueError) -> JSONResponse:
+    _logger.warning("copy_on_write setup failed for %s", session_id, exc_info=exc)
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": "copy_on_write_setup_failed",
+            "detail": _client_safe_error_detail(exc, context="copy_on_write setup"),
+            "hint": "Use executor.harness=openai-agents; start a new session after "
+            "changing copy_on_write paths.",
+        },
+    )
+
+
 @dataclasses.dataclass
 class InstructionComposition:
     """Runner-local, never-serialized view of this turn's instruction state.
@@ -6659,6 +6676,8 @@ def create_runner_app(
                         "detail": SESSION_AGENT_MISSING_MESSAGE,
                     },
                 )
+            except _CopyOnWriteSetupError as exc:
+                return _copy_on_write_setup_failure(conv_id, exc)
             except (ValueError, OmnigentError) as exc:
                 return JSONResponse(
                     status_code=exc.http_status if isinstance(exc, OmnigentError) else 400,
@@ -6730,16 +6749,7 @@ def create_runner_app(
                 spawn_env = dict(spawn_env or {})
                 spawn_env[SHARED_ENVIRONMENT_VAR] = export_shared_environment(policy)
             except ValueError as exc:
-                _logger.warning("copy_on_write setup failed for %s", conv_id, exc_info=True)
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "error": "copy_on_write_setup_failed",
-                        "detail": _client_safe_error_detail(exc, context="copy_on_write setup"),
-                        "hint": "Use executor.harness=openai-agents; start a new session after "
-                        "changing copy_on_write paths.",
-                    },
-                )
+                return _copy_on_write_setup_failure(conv_id, exc)
 
         if spawn_env is None:
             spawn_env = await _resolve_native_spawn_env(
@@ -9792,7 +9802,10 @@ def _build_spawn_env_from_spec(
         )
     from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
 
-    validate_copy_on_write_harness(getattr(spec, "os_env", None), harness)
+    try:
+        validate_copy_on_write_harness(getattr(spec, "os_env", None), harness)
+    except ValueError as exc:
+        raise _CopyOnWriteSetupError(str(exc)) from exc
     effective_spec = spec
     from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
 
@@ -9927,21 +9940,24 @@ def _build_spawn_env_from_spec(
         and spec.os_env.sandbox is not None
         and any(p.copy_on_write for p in spec.os_env.sandbox.write_path_specs)
     ):
-        if resource_registry is None or session_id is None:
-            raise ValueError("copy_on_write harnesses require a session resource registry")
         from omnigent.sandbox.copy_on_write import (
             SHARED_ENVIRONMENT_VAR,
             export_shared_environment,
         )
 
-        environment = resource_registry.resolve_environment(
-            session_id, DEFAULT_ENVIRONMENT_ID, spec
-        )
-        policy = getattr(environment, "sandbox", None)
-        if policy is None:
-            raise ValueError("copy_on_write requires a local sandbox environment")
-        environment.prepare_sandbox(policy)
-        env[SHARED_ENVIRONMENT_VAR] = export_shared_environment(policy)
+        try:
+            if resource_registry is None or session_id is None:
+                raise ValueError("copy_on_write harnesses require a session resource registry")
+            environment = resource_registry.resolve_environment(
+                session_id, DEFAULT_ENVIRONMENT_ID, spec
+            )
+            policy = getattr(environment, "sandbox", None)
+            if policy is None:
+                raise ValueError("copy_on_write requires a local sandbox environment")
+            environment.prepare_sandbox(policy)
+            env[SHARED_ENVIRONMENT_VAR] = export_shared_environment(policy)
+        except ValueError as exc:
+            raise _CopyOnWriteSetupError(str(exc)) from exc
 
     # Point the harness process at this session's subagent-routing endpoint
     # when one is running (started at session init). Scoped to *harness* so a

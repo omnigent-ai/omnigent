@@ -282,7 +282,14 @@ async def test_stream_setup_errors_are_sanitized_before_spawn(
             },
         )
     assert response.status_code == 400, response.text
-    assert response.json()["error"]["code"] == "invalid_input"
+    payload = response.json()
+    assert set(payload) == {"error", "detail", "hint"}
+    assert payload["error"] == "copy_on_write_setup_failed"
+    assert isinstance(payload["detail"], str) and payload["detail"]
+    assert payload["hint"] == (
+        "Use executor.harness=openai-agents; start a new session after "
+        "changing copy_on_write paths."
+    )
     assert "private diagnostic sentinel" not in response.text
     assert not manager.get_client_calls
     if harness == "openai-agents":
