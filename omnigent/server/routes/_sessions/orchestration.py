@@ -5325,6 +5325,7 @@ async def _maybe_relaunch_managed_sandbox(
     conv: Conversation,
     app_state: Any,
     conversation_store: ConversationStore,
+    request: Any = None,
 ) -> bool:
     """
     Relaunch a dead managed sandbox for a session, if it has one.
@@ -5380,6 +5381,9 @@ async def _maybe_relaunch_managed_sandbox(
             return False
     launch = tracker.get(session_id)
     if launch is None or launch.settled.is_set():
+        await _raise_if_managed_wake_misses_host_tunnel(
+            conv=conv, request=request, app_state=app_state
+        )
         # A resumable managed host whose sandbox merely idle-stopped is WOKEN
         # in place (resume: same sandbox + workspace volume) rather than
         # relaunched onto a fresh empty sandbox — same gate the wake itself
@@ -5443,29 +5447,33 @@ async def _maybe_relaunch_managed_sandbox(
 async def _raise_if_managed_wake_misses_host_tunnel(
     *,
     conv: Conversation,
-    request_slice_key: str | None,
+    request: Any,
     app_state: Any,
 ) -> None:
     """
-    Re-address a request that would wake a managed host off its tunnel's replica.
+    Re-address a client request that would wake a managed host off its tunnel's replica.
 
     A managed host dials the replica that owns its slice key: its own id when
     the create keyed it, otherwise the default route. A wake run from any other
-    replica lands its tunnel elsewhere, so the request parks for the whole wake
-    and then fails. Answer ``WRONG_REPLICA`` first so the client re-addresses to
-    the key that starts the wake where the tunnel lands. Sharded deployments
-    only: a single replica has nowhere else to send the request.
+    replica lands its tunnel elsewhere, so the request parks for the whole wake.
+    Answer ``WRONG_REPLICA`` first so the client re-addresses to the key that
+    starts the wake where the tunnel lands. Only a fastapi ``Request`` names a
+    routing key; internal callers pass nothing and skip this check.
 
     :param conv: Session row whose host may need a wake.
-    :param request_slice_key: The slice key that routed the request, or ``None``.
+    :param request: The inbound request, or ``None``/a non-HTTP context to skip.
     :param app_state: ``request.app.state`` — supplies the host registry and store.
     :raises WrongReplicaError: For a keyed host whose key the request does not carry.
     :raises OmnigentError: ``WRONG_REPLICA`` (no key to resend) for an unkeyed host
         reached through a keyed request.
     """
-    from omnigent.server.managed_hosts import host_slice_key_enabled
-    from omnigent.server.routes._host_launch import _deployment_is_sharded
+    from fastapi import Request
 
+    from omnigent.server.managed_hosts import host_slice_key_enabled
+    from omnigent.server.routes._host_launch import _deployment_is_sharded, routed_slice_key
+
+    if not isinstance(request, Request):
+        return
     host_store = getattr(app_state, "host_store", None)
     host_registry = getattr(app_state, "host_registry", None)
     if (
@@ -5477,7 +5485,7 @@ async def _raise_if_managed_wake_misses_host_tunnel(
         return
     keyed = host_slice_key_enabled(conv.labels, conv.host_id)
     expected_key = conv.host_id if keyed else None
-    if request_slice_key == expected_key or host_registry.get(conv.host_id) is not None:
+    if routed_slice_key(request) == expected_key or host_registry.get(conv.host_id) is not None:
         return
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or host.sandbox_provider is None:
@@ -5499,6 +5507,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     conv: Conversation,
     app_state: Any,
     conversation_store: ConversationStore,
+    request: Any = None,
 ) -> bool:
     """
     Wake a resumable managed host whose persisted liveness has gone stale.
@@ -5523,6 +5532,9 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or not host_resume_supported(host, sandbox_config):
         return False
+    await _raise_if_managed_wake_misses_host_tunnel(
+        conv=conv, request=request, app_state=app_state
+    )
     host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
     tunnel_registry = cast(TunnelRegistry | None, getattr(app_state, "tunnel_registry", None))
     host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
@@ -5571,6 +5583,8 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         runner_tunnel_stale,
         extra={"session_id": session_id},
     )
+    # The guard above ran before stale tunnels were torn down; the relaunch must not
+    # re-check against the post-teardown registry.
     return await _maybe_relaunch_managed_sandbox(
         session_id=session_id,
         conv=conv,
@@ -5587,6 +5601,7 @@ async def ensure_runner_connected(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     raise_host_refusal: bool = False,
+    request: Any = None,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Bring a wakeable session's runner online for out-of-band resource access.
@@ -5625,6 +5640,9 @@ async def ensure_runner_connected(
         host rejects launch because the harness is unavailable or the
         workspace is gone. Resource callers keep the legacy ``False``
         behavior; retry recovery opts in because it has no message to persist.
+    :param request: The client's HTTP request, or ``None`` for server-internal
+        callers. A request's routing key guards any wake (see
+        :func:`_raise_if_managed_wake_misses_host_tunnel`).
     :returns: ``(runner_client, conv)`` — the client is ``None`` when no
         runner is reachable and none is wakeable; ``conv`` is re-read after
         any wake/relaunch so the caller sees the rebound row.
@@ -5658,6 +5676,7 @@ async def ensure_runner_connected(
         conv=conv,
         app_state=app_state,
         conversation_store=conversation_store,
+        request=request,
     ):
         conv = await _reread()
         runner_client = await _get_runner_client(
@@ -5753,6 +5772,7 @@ async def ensure_runner_connected(
             conv=conv,
             app_state=app_state,
             conversation_store=conversation_store,
+            request=request,
         ):
             conv = await _reread()
             runner_client = await _get_runner_client(
@@ -6390,15 +6410,19 @@ async def _run_managed_wake(
                         online_elsewhere = True
                         break
             if host_conn is None:
-                # The sandbox booted and its tunnel registered on another replica,
-                # which launches the runner. Not "failed" (a per-pod cached failure
-                # would outlive the recovery) and not "ready" (no runner is bound here,
-                # and "ready" must mean one is). Only "ready" evicts the per-pod status
-                # cache, so evict it directly. The parked request gets WRONG_REPLICA
-                # from _maybe_relaunch_managed_sandbox.
+                # A host that reads live CROSS-REPLICA means the wake SUCCEEDED: the
+                # sandbox booted and its tunnel registered, just not here. Publishing
+                # a terminal "failed" for that is wrong AND it outlives the recovery —
+                # sandbox_status is cached PER POD and only "ready" evicts it, so the
+                # false failure is served back by every later keyed snapshot read (a
+                # 200, with no wrong-replica signal to correct it). Settle as ready
+                # instead; it clears any stale entry. The runner still has to launch
+                # from the replica that owns the tunnel — the request parked on this
+                # rendezvous is sent there by the WRONG_REPLICA raised in
+                # _maybe_relaunch_managed_sandbox.
                 if online_elsewhere or await asyncio.to_thread(host_store.is_online, host_id):
-                    _session_sandbox_status_cache.pop(session_id, None)
                     tracker.finish(session_id)
+                    _publish_sandbox_status(session_id, "ready")
                     return
                 tracker.fail(session_id, "managed host did not reconnect after wake")
                 _publish_sandbox_status(
