@@ -278,6 +278,8 @@ export interface ServerInfo {
   scheduled_task_source_sessions?: boolean;
   /** Connected hosts and continued sandboxes accept ten-minute schedules. */
   scheduled_task_subhour?: boolean;
+  /** Runs drop a trigger prompt's header line before dispatch, so the form can save one. */
+  scheduled_task_trigger_headers?: boolean;
   /** Server default for new trigger templates, from 10 to 240 minutes. */
   automation_trigger_poll_minutes?: number;
   /** Sandbox automations accept a repository URL as their workspace. */
@@ -484,6 +486,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   session_create_permission_modes: false,
   scheduled_task_source_sessions: false,
   scheduled_task_subhour: false,
+  scheduled_task_trigger_headers: false,
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
@@ -667,6 +670,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_create_permission_modes: data.session_create_permission_modes === true,
           scheduled_task_source_sessions: data.scheduled_task_source_sessions === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
+          scheduled_task_trigger_headers: data.scheduled_task_trigger_headers === true,
           automation_trigger_poll_minutes:
             typeof data.automation_trigger_poll_minutes === "number" &&
             Number.isInteger(data.automation_trigger_poll_minutes) &&

@@ -105,7 +105,7 @@ from omnigent.runner.mcp_execution_registry import (
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
     RUNNER_MCP_EXECUTION_DETACHED_MESSAGE,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import (
     ROUTING_DECISION_LABEL_KEY,
@@ -387,6 +387,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
+    reconcile_orphaned_running_status,
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
@@ -5325,6 +5326,7 @@ async def _maybe_relaunch_managed_sandbox(
     conv: Conversation,
     app_state: Any,
     conversation_store: ConversationStore,
+    request: Any = None,
 ) -> bool:
     """
     Relaunch a dead managed sandbox for a session, if it has one.
@@ -5380,6 +5382,9 @@ async def _maybe_relaunch_managed_sandbox(
             return False
     launch = tracker.get(session_id)
     if launch is None or launch.settled.is_set():
+        _raise_if_managed_wake_misses_host_tunnel(
+            conv=conv, host=host, request=request, app_state=app_state
+        )
         # A resumable managed host whose sandbox merely idle-stopped is WOKEN
         # in place (resume: same sandbox + workspace volume) rather than
         # relaunched onto a fresh empty sandbox — same gate the wake itself
@@ -5440,12 +5445,65 @@ async def _maybe_relaunch_managed_sandbox(
     return True
 
 
+def _raise_if_managed_wake_misses_host_tunnel(
+    *,
+    conv: Conversation,
+    host: Host,
+    request: Any,
+    app_state: Any,
+) -> None:
+    """
+    Re-address a client request that would wake a managed host off its tunnel's replica.
+
+    A managed host dials the replica that owns its slice key: its own id when
+    the create keyed it, otherwise the default route. A wake run from any other
+    replica lands its tunnel elsewhere, so the request parks for the whole wake.
+    Answer ``WRONG_REPLICA`` first so the client re-addresses to the key that
+    starts the wake where the tunnel lands. Only a fastapi ``Request`` names a
+    routing key; internal callers pass nothing and skip this check.
+
+    :param conv: Session row whose host may need a wake.
+    :param host: The session's managed host row, already loaded by the caller.
+    :param request: The inbound request, or ``None``/a non-HTTP context to skip.
+    :param app_state: ``request.app.state`` — supplies the host registry.
+    :raises WrongReplicaError: For a keyed host whose key the request does not carry.
+    :raises OmnigentError: ``WRONG_REPLICA`` (no key to resend) for an unkeyed host
+        reached through a keyed request.
+    """
+    from fastapi import Request
+
+    from omnigent.server.managed_hosts import host_slice_key_enabled
+    from omnigent.server.routes._host_launch import _deployment_is_sharded, routed_slice_key
+
+    if not isinstance(request, Request):
+        return
+    host_registry = getattr(app_state, "host_registry", None)
+    if conv.host_id is None or host_registry is None or not _deployment_is_sharded():
+        return
+    keyed = host_slice_key_enabled(conv.labels, conv.host_id)
+    expected_key = conv.host_id if keyed else None
+    if routed_slice_key(request) == expected_key or host_registry.get(conv.host_id) is not None:
+        return
+    if host.sandbox_provider is None:
+        return
+    if keyed:
+        raise WrongReplicaError(
+            f"managed host {conv.host_id} wakes on the replica its slice key names",
+            host_id=conv.host_id,
+        )
+    raise OmnigentError(
+        f"managed host {conv.host_id} wakes on the default replica; retry without its slice key",
+        code=ErrorCode.WRONG_REPLICA,
+    )
+
+
 async def _maybe_wake_stale_resumable_managed_sandbox(
     *,
     session_id: str,
     conv: Conversation,
     app_state: Any,
     conversation_store: ConversationStore,
+    request: Any = None,
 ) -> bool:
     """
     Wake a resumable managed host whose persisted liveness has gone stale.
@@ -5470,6 +5528,9 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or not host_resume_supported(host, sandbox_config):
         return False
+    _raise_if_managed_wake_misses_host_tunnel(
+        conv=conv, host=host, request=request, app_state=app_state
+    )
     host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
     tunnel_registry = cast(TunnelRegistry | None, getattr(app_state, "tunnel_registry", None))
     host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
@@ -5518,6 +5579,8 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         runner_tunnel_stale,
         extra={"session_id": session_id},
     )
+    # The guard above ran before stale tunnels were torn down; the relaunch must not
+    # re-check against the post-teardown registry.
     return await _maybe_relaunch_managed_sandbox(
         session_id=session_id,
         conv=conv,
@@ -5534,6 +5597,7 @@ async def ensure_runner_connected(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     raise_host_refusal: bool = False,
+    request: Any = None,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Bring a wakeable session's runner online for out-of-band resource access.
@@ -5572,6 +5636,9 @@ async def ensure_runner_connected(
         host rejects launch because the harness is unavailable or the
         workspace is gone. Resource callers keep the legacy ``False``
         behavior; retry recovery opts in because it has no message to persist.
+    :param request: The client's HTTP request, or ``None`` for server-internal
+        callers. A request's routing key guards any wake (see
+        :func:`_raise_if_managed_wake_misses_host_tunnel`).
     :returns: ``(runner_client, conv)`` — the client is ``None`` when no
         runner is reachable and none is wakeable; ``conv`` is re-read after
         any wake/relaunch so the caller sees the rebound row.
@@ -5605,6 +5672,7 @@ async def ensure_runner_connected(
         conv=conv,
         app_state=app_state,
         conversation_store=conversation_store,
+        request=request,
     ):
         conv = await _reread()
         runner_client = await _get_runner_client(
@@ -5700,6 +5768,7 @@ async def ensure_runner_connected(
             conv=conv,
             app_state=app_state,
             conversation_store=conversation_store,
+            request=request,
         ):
             conv = await _reread()
             runner_client = await _get_runner_client(
@@ -6629,7 +6698,7 @@ async def _ensure_native_terminal_ready(
 
     async def _post_ensure() -> httpx.Response:
         if runner_router is not None:
-            await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
+            await asyncio.to_thread(runner_router.require_runtime_support, conv)
         return await runner_client.post(
             f"/v1/sessions/{session_id}/resources/terminals",
             json={
@@ -8671,7 +8740,7 @@ async def _dispatch_session_event_to_runner_impl(
         (claude-native message bypass).
     """
     if runner_router is not None:
-        await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
+        await asyncio.to_thread(runner_router.require_runtime_support, conv)
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
@@ -9091,6 +9160,74 @@ async def _host_row_offline(
         and not host_is_live(host)
         and (updated_since is None or host.updated_at >= updated_since)
     )
+
+
+async def _settle_orphaned_running_rows(
+    convs: Sequence[Conversation],
+    *,
+    conversation_store: ConversationStore,
+    liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None,
+    host_store: HostStore | None,
+    may_settle: Callable[[Conversation], bool],
+) -> None:
+    """
+    Settle rows whose persisted ``running`` outlived their runner, before a read.
+
+    Shared by the session list and the child-session list so both report the
+    same status for an orphaned session. Only rows with no local cache entry
+    and a stale runner stamp are probed; a reconnecting runner within grace,
+    or a sleeping host that may resume it, keeps its status.
+
+    :param convs: Rows about to be serialized.
+    :param conversation_store: Store performing the conditional transition.
+    :param liveness_lookup: Bulk runner/host liveness lookup; ``None`` skips.
+    :param host_store: Host registrations, for the sleeping-host hold.
+    :param may_settle: Whether the caller may settle a row, e.g. owners only.
+    """
+    if liveness_lookup is None:
+        return
+    suspects = [
+        conv
+        for conv in convs
+        if conv.agent_id is not None
+        and conv.runner_id is not None
+        and conv.live_status in ("running", "waiting")
+        and _session_status_cache.get(conv.id) is None
+        and not runner_seen_is_fresh(conv.runner_last_seen)
+        and may_settle(conv)
+    ]
+    if not suspects:
+        return
+    liveness = await asyncio.to_thread(liveness_lookup, [conv.id for conv in suspects])
+    offline_hosts: dict[str, bool | None] = {}
+    now = int(time.time())
+    # Heartbeat expiry and reconnect grace can precede the hold.
+    hold_stale_before = now - HOST_OFFLINE_HOLD_S - 2 * RUNNER_LIVENESS_TTL_S
+    for conv in suspects:
+        result = liveness.get(conv.id)
+        # False means no replica has a tunnel and the heartbeat expired, so
+        # reconnecting runners within grace survive.
+        if result is None or result.runner_online:
+            continue
+        # A hostless sub-agent shares its parent's runner, so the hold is the tunnel host's.
+        host_id = conv.host_id or await asyncio.to_thread(
+            routing_host_id, conv, conversation_store
+        )
+        if host_id is not None and result.host_online is not True:
+            # A sleeping host can resume its runner; a read must not end that
+            # bounded wait on another replica.
+            if host_id not in offline_hosts:
+                offline_hosts[host_id] = await _host_row_offline(
+                    host_store, host_id, updated_since=hold_stale_before
+                )
+            if offline_hosts[host_id] is not False:
+                continue
+        await asyncio.to_thread(
+            reconcile_orphaned_running_status,
+            conv.id,
+            conversation_store,
+            now - RUNNER_LIVENESS_TTL_S,
+        )
 
 
 class _RelayTransportLost(Exception):
@@ -12076,7 +12213,7 @@ async def _inherited_mcp_labels(
     uses for a custom server, or a runtime without registry support) is dropped
     whole, so the worker still starts.
     """
-    from omnigent.server.mcp_compatibility import registry_services, require_registry_mcp_runtime
+    from omnigent.server.runtime_compatibility import registry_services, require_runtime_support
 
     selection = session_mcp_selection(request.app.state)
     services = selection.selected_services(source_labels)
@@ -12085,7 +12222,7 @@ async def _inherited_mcp_labels(
     inherited = selection.session_labels(services)
     try:
         await asyncio.to_thread(selection.validate, request, services, spec=spec, user_id=user_id)
-        require_registry_mcp_runtime(
+        require_runtime_support(
             registry_services(selected_mcp_spec(spec, inherited)),
             host_id=host_id,
             runner_id=runner_id,
@@ -12444,9 +12581,14 @@ async def _create_session_from_existing_agent(
 
     inference_snapshot = None
     selection_spec = None
-    from omnigent.server.mcp_compatibility import registry_services, require_registry_mcp_runtime
+    from omnigent.server.runtime_compatibility import (
+        registry_services,
+        require_runtime_support,
+        uses_tcp_egress,
+    )
 
     selected_registry_services = set(body.mcp_registry_services or [])
+    tcp_egress_required = False
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.runtime.workflow import _find_spec_by_name
@@ -12477,6 +12619,7 @@ async def _create_session_from_existing_agent(
             )
             selection_spec = None
         selected_registry_services.update(registry_services(selection_spec))
+        tcp_egress_required = uses_tcp_egress(selection_spec)
         if selection_spec is not None and body.sub_agent_name:
             selection_spec = _find_spec_by_name(selection_spec, body.sub_agent_name)
         from omnigent.server.routes.sandbox_inference import (
@@ -12564,12 +12707,27 @@ async def _create_session_from_existing_agent(
         validate_create_harness_readiness,
     )
 
-    require_registry_mcp_runtime(
+    runtime_host_id = body.host_id
+    if (
+        runtime_host_id is None
+        and inherited_runner_id
+        and _parent_for_routing is not None
+        and (tcp_egress_required or selected_registry_services)
+    ):
+        from omnigent.runner.routing import routing_host_id
+
+        runtime_host_id = await asyncio.to_thread(
+            routing_host_id, _parent_for_routing, conversation_store
+        )
+    await asyncio.to_thread(
+        require_runtime_support,
         selected_registry_services,
-        host_id=body.host_id,
+        tcp_egress_required=tcp_egress_required,
+        host_id=runtime_host_id,
         runner_id=inherited_runner_id,
         host_registry=getattr(request.app.state, "host_registry", None),
         tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+        runner_router=runner_router,
     )
     inherited_mcp_labels: dict[str, str] = {}
     if created_by_labels and not body.mcp_registry_services and not body.sub_agent_name:
@@ -14394,7 +14552,9 @@ async def _get_session_snapshot(
             # Pass the authorized row: the router's own point read would be a
             # second read of the conversation this snapshot already holds, and on
             # a split-DB deployment that is one round trip per backend.
-            routed = runner_router.client_for_session_resources(session_id, conversation=conv)
+            routed = await asyncio.to_thread(
+                runner_router.client_for_session_resources, session_id, conversation=conv
+            )
             runner_client = routed.client
         except (LookupError, httpx.HTTPError, OmnigentError):
             _logger.debug(
@@ -14776,6 +14936,7 @@ __all__ = [
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",
     "_publish_subtree_cost_to_ancestors",
+    "_raise_if_managed_wake_misses_host_tunnel",
     "_read_session_snapshot_inputs",
     "_recover_subagent_status_forward_via_parent",
     "_register_policy_elicitation",

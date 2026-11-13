@@ -1660,7 +1660,7 @@ async def _send_hello(
         pass
 
     from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
-    from omnigent.host.frames import CAP_MCP_REGISTRY
+    from omnigent.host.frames import CAP_MCP_REGISTRY, CAP_TCP_EGRESS
     from omnigent.inner.native_attachments import (
         CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
         CAP_FILESYSTEM_ATTACHMENTS,
@@ -1676,6 +1676,7 @@ async def _send_hello(
                     CAP_FILESYSTEM_ATTACHMENTS,
                     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                     CAP_MCP_REGISTRY,
+                    CAP_TCP_EGRESS,
                     CAP_SIDE_CHAT_SETTINGS,
                     CAP_LONG_BACKGROUND_TITLE_INSTRUCTIONS,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),

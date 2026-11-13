@@ -75,6 +75,7 @@ vi.mock("./Sidebar", () => ({
   isMobileViewport: vi.fn(() => false),
 }));
 vi.mock("./PullRequestPanel", () => ({
+  selectPullRequestInPanel: vi.fn(),
   PullRequestPanel: () => <div data-testid="github-panel">Pull request details</div>,
 }));
 vi.mock("./FilesPanel", () => ({
