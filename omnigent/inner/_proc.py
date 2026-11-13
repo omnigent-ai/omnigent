@@ -222,6 +222,10 @@ def _killpg(pid: int, sig: int, *, owned_pgid: int | None = None) -> bool:
         return False
     try:
         target_pgid = owned_pgid if owned_pgid is not None else _getpgid_fn(pid)
+        # A child can share a foreign parent's or sibling's group. Without a
+        # remembered group, only a group leader owns the group we may signal.
+        if owned_pgid is None and target_pgid != pid:
+            return False
         # pgid <= 1 is never a real agent group: killpg(1, sig) is kill(-1,
         # sig) - a broadcast to every process this user may signal (it took
         # down the CI runner when a mocked pid coerced to 1) - and 0/negative
