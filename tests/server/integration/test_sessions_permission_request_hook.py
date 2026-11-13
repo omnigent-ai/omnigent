@@ -2341,9 +2341,16 @@ async def test_permission_request_hook_clears_index_on_client_disconnect(
 _REATTACH_ELICITATION_ID = f"elicit_claude_{'ab' * 16}"
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "repark_delay_s"),
+    [("Bash", 0.0), ("AskUserQuestion", 1.5)],
+    ids=["approval", "question-after-approval-grace"],
+)
 async def test_permission_hook_repark_within_grace_keeps_card_pending(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    repark_delay_s: float,
 ) -> None:
     """
     A hook retry that re-parks the same ``_omnigent_elicitation_id``
@@ -2353,6 +2360,10 @@ async def test_permission_hook_repark_within_grace_keeps_card_pending(
     This is the proxy-cut path that left headless sub-agents invisibly
     blocked: the old code cleared the card the moment the long-poll was
     severed, while the prompt lived on in an unattended tmux pane.
+
+    A question's retry may land after the approval grace (a front door
+    holding the re-POST until the hook's read timeout); its card must
+    stay answerable until then.
     """
     from omnigent.runtime import pending_elicitations, session_stream
 
@@ -2391,7 +2402,7 @@ async def test_permission_hook_repark_within_grace_keeps_card_pending(
     agent = await create_test_agent(client, "test-permission-repark")
     session_id = await _create_session(client, agent["id"])
     payload = {
-        **(await _claude_permission_payload()),
+        **(await _claude_permission_payload(tool_name=tool_name)),
         "_omnigent_elicitation_id": _REATTACH_ELICITATION_ID,
     }
 
@@ -2423,6 +2434,12 @@ async def test_permission_hook_repark_within_grace_keeps_card_pending(
         f"expected one deferred clear after the severed poll, got "
         f"{len(deferred_tasks)} — disconnect regressed to immediate wipe, or leaked tasks."
     )
+    await asyncio.wait(deferred_tasks, timeout=repark_delay_s)
+    assert pending_elicitations.count_for(session_id) == 1, (
+        f"the card must still be pending when the retry arrives after "
+        f"{repark_delay_s}s, got {pending_elicitations.count_for(session_id)!r}"
+    )
+    assert resolved_events == [], f"card cleared before the retry: {resolved_events!r}"
 
     # Retry re-parks the SAME id while the grace is still running.
     hook_task = asyncio.create_task(
@@ -3922,6 +3939,75 @@ async def test_gated_tool_output_resolves_pending_elicitation(
     )
 
     capture_task.cancel()
+    pending_elicitations.reset_for_tests()
+
+
+async def test_gated_tool_output_clears_severed_question_card(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A question answered in Claude's TUI while its hook is between polls
+    clears the web card at once instead of leaving it answerable for the
+    rest of the question's re-park grace.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    async def _disconnect_immediately(_request: Any) -> None:
+        await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(sessions_route, "_poll_request_disconnect", _disconnect_immediately)
+    pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(client, "test-terminal-resolved-severed-question")
+    session_id = await _create_session(client, agent["id"])
+    collector = await start_session_stream_collector(session_id)
+    payload = {
+        **(await _claude_permission_payload(tool_name="AskUserQuestion")),
+        "_omnigent_elicitation_id": _REATTACH_ELICITATION_ID,
+    }
+
+    severed = await client.post(
+        f"/v1/sessions/{session_id}/hooks/permission-request",
+        json=payload,
+    )
+    assert severed.status_code == 200, severed.text
+    assert severed.content == b""
+    assert pending_elicitations.count_for(session_id) == 1
+
+    call_id = "toolu_question_answered_in_tui"
+    for item_type, item_data in (
+        (
+            "function_call",
+            {
+                "agent": "Claude",
+                "name": "AskUserQuestion",
+                "arguments": json.dumps(payload["tool_input"]),
+                "call_id": call_id,
+            },
+        ),
+        ("function_call_output", {"call_id": call_id, "output": "User answered: ls -la"}),
+    ):
+        mirrored = await _post_external_conversation_item(
+            client,
+            session_id,
+            item_type,
+            item_data,
+            source_id=f"src_question_{item_type}",
+            response_id="resp_question",
+        )
+        assert mirrored.status_code < 300, mirrored.text
+
+    try:
+        async with asyncio.timeout(5):
+            resolved = await collector.next_event()
+            while resolved["type"] != "response.elicitation_resolved":
+                resolved = await collector.next_event()
+    finally:
+        await collector.stop()
+    assert resolved["elicitation_id"] == _REATTACH_ELICITATION_ID
+    # Answered in the terminal, so the card must not claim the prompt expired.
+    assert "reason" not in resolved, resolved
+    assert pending_elicitations.count_for(session_id) == 0
     pending_elicitations.reset_for_tests()
 
 

@@ -517,6 +517,11 @@ def register_hooks_routes(
             # (or None when absent).
             tool_name=tool_name,
             tool_input=tool_input if isinstance(tool_input, dict) else None,
+            repark_grace_s=(
+                _sf._HARNESS_QUESTION_REPARK_GRACE_S
+                if is_claude and tool_name == "AskUserQuestion"
+                else None
+            ),
         )
         if result is None:
             # Disconnect or timeout. Either way Claude is no
