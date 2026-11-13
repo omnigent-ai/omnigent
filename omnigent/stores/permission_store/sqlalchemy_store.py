@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from typing import cast
 
-from sqlalchemy import delete, exists, literal, select, update
+from sqlalchemy import case, delete, exists, literal, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -178,12 +178,19 @@ class SqlAlchemyPermissionStore(PermissionStore):
         user_id: str,
         conversation_id: str,
         level: int,
+        *,
+        ensure_minimum: bool = False,
     ) -> SessionPermission:
         """Upsert a permission grant. See base class for contract."""
 
-        def write(session: Session) -> None:
+        def write(session: Session) -> int:
             require_active_account(session, user_id)
             dialect = self._engine.dialect.name
+            next_level = (
+                case((SqlSessionPermission.level < level, level), else_=SqlSessionPermission.level)
+                if ensure_minimum
+                else level
+            )
             values = {
                 "user_id": user_id,
                 "conversation_id": conversation_id,
@@ -196,14 +203,14 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .values(**values)
                     .on_conflict_do_update(
                         index_elements=["workspace_id", "user_id", "conversation_id"],
-                        set_={"level": level},
+                        set_={"level": next_level},
                     )
                 )
             elif dialect == "mysql":
                 stmt = (
                     mysql_insert(SqlSessionPermission)
                     .values(**values)
-                    .on_duplicate_key_update(level=level)
+                    .on_duplicate_key_update(level=next_level)
                 )
             else:
                 stmt = (
@@ -211,13 +218,22 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     .values(**values)
                     .on_conflict_do_update(
                         index_elements=["workspace_id", "user_id", "conversation_id"],
-                        set_={"level": level},
+                        set_={"level": next_level},
                     )
                 )
             session.execute(stmt)
             session.flush()
+            if ensure_minimum:
+                return session.execute(
+                    select(SqlSessionPermission.level).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == user_id,
+                        SqlSessionPermission.conversation_id == conversation_id,
+                    )
+                ).scalar_one()
+            return level
 
-        run_write_transaction(
+        granted_level = run_write_transaction(
             self._session_immediate,
             "grant_permission",
             write,
@@ -227,7 +243,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         return SessionPermission(
             user_id=user_id,
             conversation_id=conversation_id,
-            level=level,
+            level=granted_level,
         )
 
     def revoke(self, user_id: str, conversation_id: str) -> bool:

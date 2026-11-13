@@ -3818,10 +3818,12 @@ class GrantPermissionRequest(BaseModel):
         access subject to the server's public permission ceiling.
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage.
+    :param ensure_minimum: Preserve a stronger existing grant atomically.
     """
 
     user_id: str
     level: int = Field(ge=1, le=3)
+    ensure_minimum: bool = False
 
 
 class PermissionObject(BaseModel):

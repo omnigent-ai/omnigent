@@ -187,6 +187,32 @@ def test_grant_with_public_sentinel(store: SqlAlchemyPermissionStore, db_uri: st
     assert fetched.level == 1
 
 
+@pytest.mark.parametrize(
+    ("existing_level", "requested_level", "expected_level"),
+    [(None, 1, 1), (1, 2, 2), (1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 1, 4)],
+)
+def test_grant_ensures_minimum_level(
+    store: SqlAlchemyPermissionStore,
+    db_uri: str,
+    existing_level: int | None,
+    requested_level: int,
+    expected_level: int,
+) -> None:
+    """Invitations create or upgrade access without replacing a stronger grant."""
+    user_id = "recipient@example.com"
+    _ensure_user(store, user_id)
+    conv_id = _create_conversation(db_uri)
+    if existing_level is not None:
+        store.grant(user_id, conv_id, existing_level)
+
+    result = store.grant(user_id, conv_id, requested_level, ensure_minimum=True)
+
+    assert result.level == expected_level
+    fetched = store.get(user_id, conv_id)
+    assert fetched is not None
+    assert fetched.level == expected_level
+
+
 # ── revoke ───────────────────────────────────────────────────────────────────
 
 

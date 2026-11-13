@@ -1153,7 +1153,7 @@ describe("PermissionsModal", () => {
         });
         fireEvent.click(screen.getByRole("button", { name: "Grant" }));
 
-        await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol", 1));
+        await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol", 1, true));
         expect(updateSessionMock).not.toHaveBeenCalled();
         expect(screen.getByRole("button", { name: "Copy file link" })).toBeDisabled();
         expect(screen.getByRole("button", { name: "Open in mobile app" })).toBeDisabled();
@@ -1248,7 +1248,7 @@ describe("PermissionsModal", () => {
           "Session access is granted, but file sharing failed: Workspace sharing failed",
         ),
       ).toBeInTheDocument();
-      expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol", 1);
+      expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol", 1, true);
       expect(revokeMock).not.toHaveBeenCalled();
     });
 
@@ -1551,7 +1551,7 @@ describe("PermissionsModal", () => {
         target: { value: "carol" },
       });
       fireEvent.click(screen.getByRole("button", { name: "Grant" }));
-      await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol", 1));
+      await waitFor(() => expect(grantMock).toHaveBeenCalledWith("conv_abc", "carol", 1, true));
     });
 
     it.each([1, 2, 3, 4])(

@@ -33,11 +33,13 @@ class PermissionStore(ABC):
         user_id: str,
         conversation_id: str,
         level: int,
+        *,
+        ensure_minimum: bool = False,
     ) -> SessionPermission:
         """Upsert a permission grant.
 
-        If the user already has a grant on this session, the level
-        is overwritten (can upgrade or downgrade). The caller is
+        By default, an existing grant's level is overwritten (can
+        upgrade or downgrade). The caller is
         responsible for authorization checks (only managers may
         grant).
 
@@ -47,6 +49,8 @@ class PermissionStore(ABC):
             e.g. ``"conv_abc123"``.
         :param level: Numeric permission level (1=read, 2=edit,
             3=manage).
+        :param ensure_minimum: Atomically retain the higher of the existing
+            and requested levels instead of replacing the existing level.
         :returns: The resulting :class:`SessionPermission`.
         """
         ...

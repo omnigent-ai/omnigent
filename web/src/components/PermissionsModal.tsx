@@ -164,11 +164,16 @@ export function PermissionsModal({
   const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
   const publicLevel = publicGrant ? Math.min(publicGrant.level, publicMaxLevel) : 0;
 
-  async function grantAccess(userId: string, level: number, existingLevel = 0) {
+  async function grantAccess(
+    userId: string,
+    level: number,
+    existingLevel = 0,
+    ensureMinimum = false,
+  ) {
     let accessGranted = existingLevel >= level;
     try {
       if (!accessGranted) {
-        await grant.mutateAsync({ userId, level });
+        await grant.mutateAsync({ userId, level, ensureMinimum });
         accessGranted = true;
       }
       await prepareFileShare();
@@ -202,7 +207,7 @@ export function PermissionsModal({
         ? (await refreshPermissions({ throwOnError: true })).data
         : undefined;
       const existingGrant = currentPermissions?.find((p) => p.user_id === trimmed);
-      if (await grantAccess(trimmed, parseInt(newLevel, 10), existingGrant?.level)) {
+      if (await grantAccess(trimmed, parseInt(newLevel, 10), existingGrant?.level, !!filePath)) {
         setNewUserId("");
         setNewLevel("1");
       }
