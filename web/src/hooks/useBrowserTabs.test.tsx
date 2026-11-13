@@ -1,4 +1,6 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { useLayoutEffect } from "react";
+import { toast } from "sonner";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
@@ -17,6 +19,8 @@ import {
   useBrowserTabs,
 } from "./useBrowserTabs";
 
+vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
+
 // Unknown hosts stay public-only unless a test gives the session one.
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsApi>()),
@@ -29,6 +33,8 @@ afterEach(() => {
   cleanup();
   localStorage.clear();
   Reflect.deleteProperty(window, "omnigentDesktop");
+  vi.mocked(getSessionSlim).mockReset();
+  vi.mocked(toast.error).mockClear();
 });
 
 describe("browser tab titles", () => {
@@ -275,6 +281,30 @@ describe("browser soft tabs", () => {
     });
     expect(outcome).toEqual({ ok: false, error });
     expect(result.current.tabs).toEqual([]);
+  });
+
+  it("commits the incoming session's selection in its first render after a switch", () => {
+    writeSessionWorkspaceState("session-a", {
+      openBrowsers: ["a-tab"],
+      selectedBrowserId: "a-tab",
+    });
+    writeSessionWorkspaceState("session-b", {
+      openBrowsers: ["b-tab"],
+      selectedBrowserId: "b-tab",
+    });
+    const committed: (string | null)[] = [];
+    const { rerender } = renderHook(
+      ({ id }) => {
+        const browsers = useBrowserTabs(id);
+        useLayoutEffect(() => {
+          committed.push(browsers.selected);
+        });
+        return browsers;
+      },
+      { initialProps: { id: "session-a" } },
+    );
+    rerender({ id: "session-b" });
+    expect(committed).toEqual(["a-tab", "b-tab"]);
   });
 
   it("keeps a reopen that finishes after a session switch out of the session on screen", async () => {
@@ -608,6 +638,92 @@ describe("browser soft tabs", () => {
     expect(result.current.tabs).toEqual([selected, AGENT_BROWSER_TAB_ID]);
     expect(result.current.viewId).toBe("session-a");
     expect(result.current.agentBrowser).toBe(true);
+  });
+
+  it("opens each Cmd/Ctrl-clicked page link once as a background tab of the clicked session", async () => {
+    let openTab!: (request: { conversationId: string; url: string }) => void;
+    const stopOpenTabs = vi.fn();
+    const browserOpenOrNavigate = vi.fn().mockResolvedValue({ ok: true });
+    const browserSetOpenTabSupported = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, {
+      omnigentDesktop: {
+        browserOpenOrNavigate,
+        browserSetOpenTabSupported,
+        onBrowserOpenTab: vi.fn((callback: typeof openTab) => {
+          openTab = callback;
+          return stopOpenTabs;
+        }),
+      },
+    });
+    vi.mocked(getSessionSlim).mockImplementation(
+      async (id: string) =>
+        ({
+          id,
+          hostId: id === "session-a" ? "this-mac" : "build-host",
+          labels: {},
+        }) as unknown as Session,
+    );
+    openBrowserTab("session-a", "clicked");
+    openBrowserTab("session-b", "other");
+    const rail = renderHook(() => useBrowserTabs("session-a"));
+    const gridRail = renderHook(() => useBrowserTabs("session-a"));
+    const otherSessionRail = renderHook(() => useBrowserTabs("session-b"));
+    expect(browserSetOpenTabSupported.mock.calls).toEqual([[true]]);
+
+    await act(async () => {
+      openTab({
+        conversationId: browserViewId("session-a", "clicked"),
+        url: "http://localhost:3000/linked",
+      });
+    });
+    await waitFor(() => expect(rail.result.current.tabs).toHaveLength(2));
+    const newTab = rail.result.current.tabs[1];
+    expect(rail.result.current.selected).toBe("clicked");
+    expect(gridRail.result.current.tabs).toEqual(["clicked", newTab]);
+    expect(browserOpenOrNavigate.mock.calls).toEqual([
+      [
+        browserViewId("session-a", newTab),
+        "http://localhost:3000/linked",
+        undefined,
+        { force: true, sourceHostId: "this-mac", sessionHostProtocol: SESSION_HOST_PROTOCOL },
+      ],
+    ]);
+    expect(otherSessionRail.result.current.tabs).toEqual(["other"]);
+
+    await act(async () => {
+      openTab({
+        conversationId: browserViewId("session-b", "other"),
+        url: "https://example.com/other",
+      });
+    });
+    await waitFor(() => expect(otherSessionRail.result.current.tabs).toHaveLength(2));
+    const otherNewTab = otherSessionRail.result.current.tabs[1];
+    expect(otherSessionRail.result.current.selected).toBe("other");
+    expect(browserOpenOrNavigate).toHaveBeenLastCalledWith(
+      browserViewId("session-b", otherNewTab),
+      "https://example.com/other",
+      undefined,
+      { force: true, sourceHostId: "build-host", sessionHostProtocol: SESSION_HOST_PROTOCOL },
+    );
+    expect(rail.result.current.tabs).toEqual(["clicked", newTab]);
+
+    browserOpenOrNavigate.mockResolvedValueOnce({ ok: false, error: "browser view cap reached" });
+    await act(async () => {
+      openTab({ conversationId: "session-a", url: "https://example.com/eleventh" });
+    });
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "Couldn't open the link in a new tab: browser view cap reached",
+      ),
+    );
+    expect(rail.result.current.tabs).toEqual(["clicked", newTab]);
+
+    rail.unmount();
+    gridRail.unmount();
+    expect(stopOpenTabs).not.toHaveBeenCalled();
+    otherSessionRail.unmount();
+    expect(stopOpenTabs).toHaveBeenCalledTimes(1);
+    expect(browserSetOpenTabSupported.mock.calls).toEqual([[true], [false]]);
   });
 
   it("keeps existing and agent views when accepted links open independent tabs", async () => {

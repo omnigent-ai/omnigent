@@ -13,10 +13,18 @@ import {
   notifyFoldAssistantNarrationChanged,
 } from "./foldNarrationPreferences";
 import {
+  notifyPeerSessionMessageDisplayChanged,
+  PEER_SESSION_MESSAGES_STORAGE_KEY,
+} from "./peerSessionMessagePreferences";
+import {
   notifyProjectFolderPaginationChanged,
   PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
   PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
 } from "./projectFolderPaginationPreferences";
+import {
+  notifySessionRowQuickActionsChanged,
+  SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
+} from "./sessionRowQuickActionsPreferences";
 import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   notifyHiddenPickerAgentsChanged,
@@ -47,8 +55,10 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  PEER_SESSION_MESSAGES_STORAGE_KEY,
   PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
   PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+  SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
@@ -175,6 +185,8 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   notifyHiddenPickerAgentsChanged();
   notifyProjectFolderPaginationChanged();
   notifyFoldAssistantNarrationChanged();
+  notifyPeerSessionMessageDisplayChanged();
+  notifySessionRowQuickActionsChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);

@@ -241,11 +241,10 @@ describe("TasksPage list", () => {
     expect(screen.getByText(step!)).toBeVisible();
   });
 
-  it("renders the title, subtitle and task rows with schedule text", () => {
+  it("renders the title and task rows with schedule text", () => {
     setTasks([task()]);
     renderPage();
     expect(screen.getByText("Automations")).toBeInTheDocument();
-    expect(screen.getByText(/Run agent sessions on a recurring schedule/i)).toBeInTheDocument();
     const row = screen.getByTestId("scheduled-task-row");
     expect(within(row).getByText("Nightly triage")).toBeInTheDocument();
     // Schedule text is derived client-side from the RRULE.
@@ -303,7 +302,7 @@ describe("TasksPage list", () => {
     setTasks([]);
     renderPage();
     const suggestions = screen.getByTestId("tasks-suggestions");
-    expect(within(suggestions).getByText("Suggested Automations")).toBeInTheDocument();
+    expect(within(suggestions).getByText("Suggested")).toBeInTheDocument();
     const cards = within(suggestions).getAllByTestId(/^suggestion-/);
     expect(cards).toHaveLength(5);
     expect(cards.map((r) => r.getAttribute("data-testid"))).toEqual([
@@ -446,7 +445,7 @@ describe("New automation entry", () => {
   it("opens the setup form directly", () => {
     setTasks([]);
     renderPage();
-    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    fireEvent.click(screen.getByRole("button", { name: "New" }));
     expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-name", "");
     expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-prompt", "");
     expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-trigger", "");
@@ -466,7 +465,7 @@ describe("New automation entry", () => {
   it("opens setup even when the task list failed to load", () => {
     setTasks([], { isError: true });
     renderPage();
-    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    fireEvent.click(screen.getByRole("button", { name: "New" }));
     expect(screen.getByTestId("manual-dialog-open")).toBeInTheDocument();
   });
 });
@@ -557,7 +556,7 @@ describe("after creating an automation", () => {
 
   it("stays on the list when created from the list", () => {
     renderPage("/tasks");
-    fireEvent.click(screen.getAllByRole("button", { name: "New automation" })[0]);
+    fireEvent.click(screen.getAllByRole("button", { name: "New" })[0]);
     fireEvent.click(screen.getByRole("button", { name: "Create setup" }));
     expect(screen.getByRole("tab", { name: "Your automations" })).toHaveAttribute(
       "aria-selected",
@@ -749,7 +748,7 @@ describe("trigger templates", () => {
     renderPage("/tasks?view=templates", "", { ...TRIGGER_INFO, ...overrides });
     expect(screen.getByText(/Automation templates are not available on this server/)).toBeVisible();
     expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "New automation" }));
+    fireEvent.click(screen.getByRole("button", { name: "New" }));
     const dialog = screen.getByTestId("manual-dialog-open");
     expect(dialog).toHaveAttribute("data-initial-name", "");
     expect(dialog).toHaveAttribute("data-initial-prompt", "");

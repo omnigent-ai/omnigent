@@ -31,8 +31,8 @@ import {
   type Host,
 } from "@/hooks/useHosts";
 import { ApiError } from "@/lib/sessionsApi";
-import { INVENTORY_HARNESS_IDS } from "@/hooks/useHarnessInventory";
-import { BRAND_HARNESSES } from "@/components/onboarding/harnessBrand";
+import { useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
+import { INVENTORY_HARNESS_IDS, INVENTORY_HARNESSES } from "@/hooks/useHarnessInventory";
 import {
   HARNESS_CREDENTIAL_COPY,
   harnessInstallableOnHost,
@@ -97,23 +97,36 @@ function hostHarnessKey(hostId: string, harness: string): string {
 
 /**
  * Settings → Harnesses: the harness grid at /settings/harnesses, or one
- * harness's details at /settings/harnesses/<harness>. An unknown slug shows the
- * grid. Host selection lives here so it survives grid ↔ details navigation.
+ * harness's details at /settings/harnesses/<harness>. An unknown slug, or one
+ * the deployment curated out, shows the grid. Host selection lives here so it
+ * survives grid ↔ details navigation.
  */
 export const SettingsHarnessesSection = () => {
   const { harness } = useSettingsRoute();
   const [query, setQuery] = useState("");
   const [installedOnly, setInstalledOnly] = useState(false);
   const info = useServerInfo();
+  const curatedOut = useCuratedOutHarnesses();
+  const offered = useMemo(
+    () => HARNESS_ENTRIES.filter((entry) => !curatedOut.has(entry.harness)),
+    [curatedOut],
+  );
   const queryClient = useQueryClient();
-  const { data: hosts } = useHosts({ refetchOnFocus: true });
   const [searchParams] = useSearchParams();
   const requestedHostId = searchParams.get("host");
   const [selectedHostId, setSelectedHostId] = useState<string | null>(requestedHostId);
+  // A session's link names its host, which may be a sandbox the picker otherwise hides.
+  const [linkedHostId, setLinkedHostId] = useState<string | null>(requestedHostId);
   // In-section links drop `?host`, so only a new deep link replaces the pick.
   useEffect(() => {
-    if (requestedHostId !== null) setSelectedHostId(requestedHostId);
+    if (requestedHostId === null) return;
+    setSelectedHostId(requestedHostId);
+    setLinkedHostId(requestedHostId);
   }, [requestedHostId]);
+  const { data: hosts, isPending: hostsLoading } = useHosts({
+    refetchOnFocus: true,
+    sourceHostId: linkedHostId ?? undefined,
+  });
   const [credentialKinds, setCredentialKinds] = useState<Record<string, HarnessCredentialKind>>({});
   const [readyNotice, setReadyNotice] = useState<{
     harness: string;
@@ -159,14 +172,14 @@ export const SettingsHarnessesSection = () => {
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return HARNESS_ENTRIES.filter(
+    return offered.filter(
       (h) =>
         (!installedOnly || harnessStatus(h.harness, selectedHost).ready) &&
         (!q || h.name.toLowerCase().includes(q) || h.description.toLowerCase().includes(q)),
     );
-  }, [query, installedOnly, selectedHost]);
+  }, [offered, query, installedOnly, selectedHost]);
 
-  const detail = HARNESS_ENTRIES.find((entry) => entry.harness === harness);
+  const detail = offered.find((entry) => entry.harness === harness);
 
   return (
     <div className="@container">
@@ -175,6 +188,7 @@ export const SettingsHarnessesSection = () => {
           key={detail.harness}
           entry={detail}
           host={selectedHost}
+          hostsLoading={hostsLoading}
           canSetup={canSetup}
           installable={harnessInstallableOnHost(info, detail.harness, selectedHost)}
           credentialKind={
@@ -222,10 +236,14 @@ export const SettingsHarnessesSection = () => {
               </TabsList>
             </Tabs>
           </div>
-          {!selectedHost && <NoHostNotice />}
+          {!selectedHost && <NoHostNotice loading={hostsLoading} />}
           {filtered.length === 0 && (
             <p className="text-ui text-muted-foreground">
-              {query.trim() ? `No harnesses match “${query}”.` : "No installed harnesses."}
+              {offered.length === 0
+                ? "This server offers no harnesses to set up."
+                : query.trim()
+                  ? `No harnesses match “${query}”.`
+                  : "No installed harnesses."}
             </p>
           )}
           <div
@@ -293,7 +311,8 @@ export const SettingsHarnessesSection = () => {
   );
 };
 
-function NoHostNotice() {
+function NoHostNotice({ loading }: { loading: boolean }) {
+  if (loading) return <p className="text-ui text-muted-foreground">Loading hosts…</p>;
   return (
     <p className="text-ui text-muted-foreground" data-testid="harness-no-host">
       Connect an online host to see which harnesses are installed and to set them up.
@@ -632,6 +651,7 @@ function HarnessCard({
 function HarnessDetail({
   entry,
   host,
+  hostsLoading,
   canSetup,
   installable,
   credentialKind,
@@ -640,6 +660,7 @@ function HarnessDetail({
 }: {
   entry: HarnessEntry;
   host: Host | null;
+  hostsLoading: boolean;
   canSetup: boolean;
   installable: boolean;
   credentialKind?: HarnessCredentialKind;
@@ -757,7 +778,7 @@ function HarnessDetail({
     </div>
   ) : null;
   // The host inventory only covers these families' MCP servers, skills, and plugins.
-  const family = BRAND_HARNESSES.find((f) => INVENTORY_HARNESS_IDS[f] === entry.harness);
+  const family = INVENTORY_HARNESSES.find((f) => INVENTORY_HARNESS_IDS[f] === entry.harness);
   if (host && family && (status.ready || canFix)) {
     return (
       <HarnessCatalog
@@ -774,7 +795,7 @@ function HarnessDetail({
       {header}
       <div className="mt-6 flex flex-col gap-6">
         {!host ? (
-          <NoHostNotice />
+          <NoHostNotice loading={hostsLoading} />
         ) : status.ready ? (
           <>
             <p className="text-ui text-muted-foreground">

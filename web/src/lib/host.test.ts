@@ -6,6 +6,7 @@ import {
   resolveMediaUrl,
   resolveWebSocketUrl,
   setOmnigentHostConfig,
+  withRoutingKey,
 } from "./host";
 
 afterEach(() => {
@@ -60,9 +61,58 @@ describe("hostFetch base path", () => {
     const { hostFetch: freshHostFetch, setOmnigentHostConfig: setConfig } = await import("./host");
     const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
     setConfig({ fetcher });
-    await freshHostFetch("/v1/sessions");
-    expect(fetcher).toHaveBeenCalledWith("/v1/sessions", undefined);
     vi.resetModules();
+    await freshHostFetch("/v1/sessions");
+    expect(fetcher.mock.calls[0][0]).toBe("/v1/sessions");
+    // The installed fetcher marks a workspace, so the request names a replica.
+    const init = fetcher.mock.calls[0][1] as RequestInit;
+    expect(new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key")).toMatch(
+      /^[0-9a-f]{32}$/,
+    );
+  });
+});
+
+describe("routing key", () => {
+  // An installed fetcher marks a Databricks workspace, which turns host routing on.
+  async function routedHost() {
+    vi.resetModules();
+    const host = await import("./host");
+    host.setOmnigentHostConfig({
+      fetcher: vi.fn().mockResolvedValue(new Response(null, { status: 200 })),
+    });
+    vi.resetModules();
+    return host;
+  }
+
+  it("adds the client key to a request that carries none", async () => {
+    const routed = await routedHost();
+    const key = new Headers(routed.withRoutingKey({ method: "POST" })?.headers).get(
+      "X-Databricks-Omnigent-Slice-Key",
+    );
+    expect(key).toMatch(/^[0-9a-f]{32}$/);
+    const own = routed.withRoutingKey({ headers: { "X-Databricks-Omnigent-Slice-Key": "host_1" } });
+    expect(new Headers(own?.headers).get("X-Databricks-Omnigent-Slice-Key")).toBe("host_1");
+    expect(routed.withRoutingKey({ method: "GET" }, { unkeyed: true })).toEqual({ method: "GET" });
+  });
+
+  it("adds the client key to a WebSocket path that carries none", async () => {
+    const { withRoutingKeyParam, resolveWebSocketUrl: routedWebSocketUrl } = await routedHost();
+    expect(routedWebSocketUrl("/v1/dictation/stream")).toMatch(
+      /\/v1\/dictation\/stream\?omnigent_slice_key=[0-9a-f]{32}$/,
+    );
+    expect(routedWebSocketUrl("/v1/x", { unkeyed: true })).not.toContain("omnigent_slice_key");
+    expect(withRoutingKeyParam("/v1/x?a=1")).toMatch(
+      /^\/v1\/x\?a=1&omnigent_slice_key=[0-9a-f]{32}$/,
+    );
+    expect(withRoutingKeyParam("/v1/x?omnigent_slice_key=host_1")).toBe(
+      "/v1/x?omnigent_slice_key=host_1",
+    );
+    expect(withRoutingKeyParam("/v1/x", { unkeyed: true })).toBe("/v1/x");
+  });
+
+  it("leaves requests unkeyed when host routing is off", () => {
+    expect(withRoutingKey(undefined)).toBeUndefined();
+    expect(resolveWebSocketUrl("/v1/x")).not.toContain("omnigent_slice_key");
   });
 });
 

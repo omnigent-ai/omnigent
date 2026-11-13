@@ -269,7 +269,7 @@ logs separately.
 - `phase: 'workspace landing'` means the bridge redirected and the status came
   from the destination page; it is not a rejection from the session-create endpoint.
 - For a direct `403 PERMISSION_DENIED`, give the request ID and custom client ID
-  to the Databricks platform owner to check the denial reason (client enablement,
+  to the workspace administrator to check the denial reason (client enablement,
   token scope, or workspace permissions). Do not infer the cause from status alone.
 
 ## OIDC sign-in through the system browser
@@ -393,7 +393,7 @@ electron/
   about/index.html         # bundled About UI opened from the macOS app menu
   find/index.html          # the bundled find-in-page bar (Cmd/Ctrl+F)
   icons/                   # app icons
-  docs/managed-preferences.md # public MDM configuration contract
+  docs/managed-preferences.md # MDM configuration reference
 ```
 
 Native niceties beyond notifications/badge: a right-click context menu
@@ -539,12 +539,11 @@ session's agent browser view and are not targeted by the agent relay.
 ### Agent previews on Arca
 
 The verified Arca exception also applies to the address bar and chat/file links.
-Companion or another external tool must forward the remote app's port to the
-desktop first.
+The remote app's port must be forwarded to the desktop first.
 
-On a Databricks-managed server with internal desktop features enabled, an
-Arca session's agent can open and inspect an app through Companion forwarding
-using the existing browser tools and tool approval or autoapproval policy.
+On a managed server with the managed features enabled, an Arca session's agent
+can open and inspect an app through a forwarded port using the existing browser
+tools and tool approval or autoapproval policy.
 Provide the actual forwarded URL to the agent; its local port may differ from
 the app's remote port. Omnigent does not establish or verify forwarding or
 prove that the local endpoint belongs to the Arca host.
@@ -555,7 +554,7 @@ source session on that host, or a subagent inheriting that host, is eligible.
 An older CLI or an unrecognized, failed, or missing identity leaves localhost
 navigation denied; the remembered host-picker label alone does not grant it.
 Eligibility is scoped to the selected server/workspace, not all sessions on
-a Databricks server.
+the server.
 
 After restarting the desktop, launch-time auto-connect restores this identity
 for users who opted into it. Otherwise, the first loopback preview request with
@@ -636,7 +635,9 @@ including the address bar, chat links, and agent actions, enforces this policy.
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
   Page-initiated `window.open` / `target=_blank` never spawns a window: an
   http(s) target navigates the same view in place (still allowlist-checked on
-  a policy-enforced view), and right-click offers "Open Link in Browser" /
+  a policy-enforced view). A Cmd/Ctrl- or middle-clicked link instead opens a
+  new background Browser tab in the same session when the loaded UI declares
+  support (`browser-open-tab`). Right-click offers "Open Link in Browser" /
   "Copy Link Address".
 - `src/browserUrlPolicy.js` — the browser navigation policy: http(s) only, and
   no private, link-local, metadata, or other non-public address in
@@ -947,9 +948,9 @@ install production desktop updates. `build:mac:release` retains
 cross-platform publishing and update-feed checklist, see [the desktop release
 runbook](RELEASING.md).
 
-macOS apps, including unpackaged development, default to V2 onboarding only when the MDM preference
+macOS apps, including unpackaged development, default to V2 onboarding only when the managed preference
 `databricksInternalFeaturesEnabled` is `true`, for both new and existing profiles.
-Public macOS users and Windows/Linux keep the legacy
+Other users and Windows/Linux keep the legacy
 default. The setup-page switch still persists an explicit choice on every
 platform, and `OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved
 choice. A saved server still reconnects on launch.

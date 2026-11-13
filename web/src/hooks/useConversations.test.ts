@@ -3614,6 +3614,112 @@ describe("useMoveToProject", () => {
     expect(queryClient.getQueryData(createdSourceKey)).toEqual(createdSource);
     expect(queryClient.getQueryData(createdTargetKey)).toEqual(createdTarget);
   });
+
+  describe("while the PATCH is in flight", () => {
+    const projects = [
+      { id: "p_old", name: "Old" },
+      { id: "p_new", name: "New" },
+    ];
+    let serverProjectId: string;
+    let settlePatch: (ok: boolean) => void;
+
+    function setup() {
+      serverProjectId = "p_old";
+      fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+        if (url === "/v1/projects")
+          return Promise.resolve(mockResponse({ object: "list", data: projects }));
+        if (init?.method === "PATCH") {
+          return new Promise<Response>((resolve) => {
+            settlePatch = (ok) =>
+              resolve(
+                ok
+                  ? mockResponse(conversation({ id: "conv_move", project_id: "p_new" }))
+                  : mockResponse({}, { ok: false, status: 500 }),
+              );
+          });
+        }
+        return Promise.resolve(
+          mockResponse(
+            infinitePage([conversation({ id: "conv_move", project_id: serverProjectId })]).pages[0],
+          ),
+        );
+      });
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      queryClient.setQueryData(["projects"], projects);
+      queryClient.setQueryData(
+        ["conversations", "", false],
+        infinitePage([conversation({ id: "conv_move", project_id: "p_old" })]),
+      );
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useMoveToProject(), { wrapper });
+      const fetchRow = async (project?: string) =>
+        (
+          await fetchConversationsPage({
+            searchQuery: "",
+            includeArchived: false,
+            project,
+            queryClient,
+          })
+        ).data.find((c) => c.id === "conv_move");
+      return { queryClient, result, fetchRow };
+    }
+
+    it("keeps the move on list fetches until its post-move refetch", async () => {
+      const { queryClient, result, fetchRow } = setup();
+      result.current.mutate({ id: "conv_move", project: "New" });
+      await waitFor(() =>
+        expect(
+          queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+            .pages[0].data[0].project_id,
+        ).toBe("p_new"),
+      );
+
+      // Read before the PATCH committed: the old folder must not show it again.
+      expect((await fetchRow())?.project_id).toBe("p_new");
+      expect(await fetchRow("Old")).toBeUndefined();
+
+      settlePatch(true);
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      // Once the lists have refetched after the commit, a remote move shows through.
+      serverProjectId = "p_third";
+      await waitFor(async () => expect((await fetchRow())?.project_id).toBe("p_third"));
+    });
+
+    it("drops a moving row from its old project folder's fetch", async () => {
+      const { queryClient, result } = setup();
+      result.current.mutate({ id: "conv_move", project: "New" });
+      await waitFor(() =>
+        expect(fetchMock).toHaveBeenCalledWith(
+          "/v1/sessions/conv_move",
+          expect.objectContaining({ method: "PATCH" }),
+        ),
+      );
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const folder = renderHook(() => useProjectSessions("Old", true), { wrapper });
+
+      await waitFor(() => expect(folder.result.current.isSuccess).toBe(true));
+      expect(folder.result.current.data!.pages[0].data).toEqual([]);
+      settlePatch(true);
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    });
+
+    it("stops overriding fetches when the PATCH fails", async () => {
+      const { result, fetchRow } = setup();
+      result.current.mutate({ id: "conv_move", project: "New" });
+      await waitFor(() =>
+        expect(fetchMock).toHaveBeenCalledWith(
+          "/v1/sessions/conv_move",
+          expect.objectContaining({ method: "PATCH" }),
+        ),
+      );
+      settlePatch(false);
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect((await fetchRow())?.project_id).toBe("p_old");
+      expect((await fetchRow("Old"))?.project_id).toBe("p_old");
+    });
+  });
 });
 
 describe("useArchiveConversation", () => {
@@ -4105,6 +4211,65 @@ describe("useDeleteProject", () => {
     expect(JSON.parse((fetchMock.mock.calls[2][1] as RequestInit).body as string)).toEqual({
       archived: true,
     });
+  });
+
+  it("leaves a project with working members untouched until the caller confirms", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        data: [
+          { id: "conv_busy", object: "conversation", status: "running" },
+          { id: "conv_waiting", object: "conversation", pending_elicitations_count: 1 },
+          { id: "conv_bg", object: "conversation", background_work_running: true },
+          { id: "conv_idle", object: "conversation", status: "idle" },
+        ],
+        has_more: false,
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+
+    result.current.mutate({ id: "p_1", name: "Sprint 42" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual({
+      status: "needs_running_confirmation",
+      runningCount: 3,
+    });
+    // Only the member listing ran: no archive PATCH and no project DELETE.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(invalidateSpy).not.toHaveBeenCalled();
+  });
+
+  it("archives working members and deletes the project once stopRunning is confirmed", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [{ id: "conv_busy", object: "conversation", status: "running" }],
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(archivedConv("conv_busy"))
+      .mockResolvedValueOnce(mockResponse({ id: "p_1", object: "project.deleted", deleted: true }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+
+    result.current.mutate({ id: "p_1", name: "Sprint 42", stopRunning: true });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual({
+      status: "deleted",
+      succeeded: ["conv_busy"],
+      failed: [],
+    });
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/sessions/conv_busy");
+    expect((fetchMock.mock.calls[1][1] as RequestInit).method).toBe("PATCH");
+    expect(fetchMock.mock.calls[2][0]).toBe("/v1/projects/p_1");
+    expect((fetchMock.mock.calls[2][1] as RequestInit).method).toBe("DELETE");
   });
 
   it("throws with succeeded/failed split when some archives fail", async () => {

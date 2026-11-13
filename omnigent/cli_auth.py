@@ -682,6 +682,8 @@ DATABRICKS_ORG_ID_HEADER = "X-Databricks-Org-Id"
 # one replica when they carry the same key (the host_id). Omitted for an
 # unsharded / single-replica deployment, which needs no sticky routing.
 OMNIGENT_SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key"
+# httpx request extension marking a deliberate unkeyed re-send; routing hooks keep it unkeyed.
+UNKEYED_REQUEST_EXTENSION = "omnigent_unkeyed"
 
 # Opaque extra request headers for dev/test: a JSON object of header name→value
 # in :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR`. Databricks deployments use it to
@@ -755,7 +757,8 @@ def databricks_request_headers(
         is a host-sharded mount or ``OMNIGENT_HOST_SLICE_KEY_ENABLED=1``
         explicitly enables host routing on an OSS server. ``None`` defaults to
         the runner's own host_id inside a runner process (via
-        ``OMNIGENT_RUNNER_SLICE_KEY``) and otherwise leaves routing to the default.
+        ``OMNIGENT_RUNNER_SLICE_KEY``), then this machine's host identity, then
+        its stored random key; ``""`` sends no key.
     :param org_id: An explicit workspace selector captured from the current
         server URL. When omitted, the selector from the stored login record is
         used. An explicit value wins over stored state.
@@ -784,8 +787,10 @@ def databricks_request_headers(
     #   2. Otherwise, on the CLI, this machine's OWN host_id if it already has a
     #      host identity — a host-less CLI request (session list, /me-adjacent
     #      reads, export) then keys to the replica holding this CLI's own hosts'
-    #      tunnels. Read-only (never mints an identity), so a non-host machine
-    #      stays unkeyed (→ default). Read only when host routing is enabled.
+    #      tunnels. Read-only (never mints an identity).
+    #   3. Otherwise this machine's stored random key, so a non-host machine's
+    #      requests spread across replicas instead of all routing by workspace id.
+    # ``host_id=""`` opts out: it reaches a host whose tunnels connected unkeyed.
     # An explicit opt-in also supports OSS ingress routing by the same host key.
     slice_key_setting = os.environ.get("OMNIGENT_HOST_SLICE_KEY_ENABLED")
     host_routing = is_workspace_hosted_url(server_url) or slice_key_setting == "1"
@@ -799,6 +804,10 @@ def databricks_request_headers(
         identity = load_host_identity_if_present()
         if identity is not None:
             host_id = identity.host_id
+    if host_id is None and host_routing and slice_key_setting != "0":
+        from omnigent.routing_key import client_routing_key
+
+        host_id = client_routing_key()
     # Workspace routing is on by default; OSS requires the explicit opt-in.
     # Setting "0" disables the routing header for either deployment.
     if host_id and host_routing and slice_key_setting != "0":

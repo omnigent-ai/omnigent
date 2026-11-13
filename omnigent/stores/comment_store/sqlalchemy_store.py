@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 
 from sqlalchemy import delete, func, select
@@ -16,7 +17,12 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import Comment, CommentsFingerprint
-from omnigent.stores.comment_store import CommentStore
+from omnigent.entities.comment import PullRequestCommentAnchor
+from omnigent.stores.comment_store import (
+    MAX_COMMENT_PAGE_SIZE,
+    CommentStore,
+    serialize_comment_anchor,
+)
 
 
 def _to_entity(row: SqlComment) -> Comment:
@@ -37,6 +43,9 @@ def _to_entity(row: SqlComment) -> Comment:
         updated_at=row.updated_at,
         anchor_content=row.anchor_content,
         created_by=row.created_by,
+        anchor_metadata=PullRequestCommentAnchor(**json.loads(row.anchor_metadata))
+        if row.anchor_metadata
+        else None,
     )
 
 
@@ -85,6 +94,7 @@ class SqlAlchemyCommentStore(CommentStore):
         end_index: int,
         anchor_content: str | None = None,
         created_by: str | None = None,
+        anchor_metadata: PullRequestCommentAnchor | None = None,
     ) -> Comment:
         """Create and persist a new comment. See base class for contract."""
         # One clock read for both timestamps so a never-edited comment's
@@ -93,6 +103,7 @@ class SqlAlchemyCommentStore(CommentStore):
         # backfill (created_at * 1e6) and docs rely on.
         created_us = now_epoch_us()
         comment_id = uuid.uuid4().hex
+        serialized_anchor = serialize_comment_anchor(anchor_metadata)
 
         def write(session: Session) -> Comment:
             row = SqlComment(
@@ -107,6 +118,7 @@ class SqlAlchemyCommentStore(CommentStore):
                 updated_at=created_us,
                 anchor_content=anchor_content,
                 created_by=created_by,
+                anchor_metadata=serialized_anchor,
             )
             session.add(row)
             return _to_entity(row)
@@ -131,6 +143,30 @@ class SqlAlchemyCommentStore(CommentStore):
         with self._session("list_comments") as session:
             rows = list(session.execute(stmt).scalars().all())
             return [_to_entity(r) for r in rows]
+
+    def list_page(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = MAX_COMMENT_PAGE_SIZE,
+        after_id: str | None = None,
+    ) -> tuple[list[Comment], str | None]:
+        """Read a bounded session page. See base class for contract."""
+        if not 1 <= limit <= MAX_COMMENT_PAGE_SIZE:
+            raise ValueError(f"limit must be between 1 and {MAX_COMMENT_PAGE_SIZE}")
+        stmt = select(SqlComment).where(
+            SqlComment.workspace_id == current_workspace_id(),
+            SqlComment.conversation_id == conversation_id,
+        )
+        if after_id is not None:
+            stmt = stmt.where(SqlComment.id > after_id)
+        # The workspace/conversation/id primary key supports this range and order.
+        stmt = stmt.order_by(SqlComment.id).limit(limit + 1)
+        with self._session("list_comment_page") as session:
+            rows = list(session.execute(stmt).scalars().all())
+            page = rows[:limit]
+            next_cursor = page[-1].id if len(rows) > limit else None
+            return [_to_entity(row) for row in page], next_cursor
 
     def update_comment(
         self,

@@ -259,8 +259,8 @@ async def test_session_snapshot_uses_child_spec_metadata(
 ) -> None:
     """Child snapshots expose their selected spec while parents keep the root spec.
 
-    Each snapshot reads the agent row twice (metadata, then harness), both
-    off the event loop: a sync store read on the loop stalls every request.
+    Each snapshot reads the agent row once, off the event loop, and reuses
+    it for metadata and harness resolution.
     """
     child_spec = AgentSpec(
         spec_version=1,
@@ -353,7 +353,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert child.context_window == 100_000
     assert child.harness == "codex"
     assert cache_loads == [True, True, True, True]
-    assert agent_reads_on_loop == [False, False, False, False]
+    assert agent_reads_on_loop == [False, False]
 
 
 @pytest.mark.asyncio
