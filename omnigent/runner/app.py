@@ -1488,6 +1488,30 @@ def create_runner_app(
     _claude_reconnect_tasks: dict[str, set[asyncio.Task[_JsonObject]]] = {}
     # session_id → deletes in progress; no new Reconnect is admitted meanwhile.
     _deleting_sessions: dict[str, int] = {}
+    # Native pane closes in progress, by session; each holds its session's launch lock.
+    _native_pane_teardowns: dict[str, set[asyncio.Task[None]]] = {}
+    app.state.native_pane_teardowns = _native_pane_teardowns
+
+    async def _settle_native_pane_teardowns(session_id: str) -> None:
+        """Wait for a native pane close still running for *session_id*.
+
+        A route about to drop the session's launch locks calls this first, so the
+        close finishes before a later launch starts a pane under the same id.
+        """
+        teardowns = _native_pane_teardowns.get(session_id)
+        if not teardowns:
+            return
+        _done, unfinished = await asyncio.wait(
+            set(teardowns), timeout=_SESSION_INIT_CANCEL_TIMEOUT_S
+        )
+        if unfinished:
+            _logger.warning(
+                "Closing the native pane of %s did not finish within %.0fs",
+                session_id,
+                _SESSION_INIT_CANCEL_TIMEOUT_S,
+                extra={"session_id": session_id},
+            )
+
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -1656,6 +1680,7 @@ def create_runner_app(
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
+    app.state.session_ingest_conditions = _ingest_cond
     # Server pending IDs owned by each session's current turn, including injections.
     _turn_pending_ids: dict[str, set[str]] = {}
     _interrupted_sessions: set[str] = set()
@@ -4174,6 +4199,7 @@ def create_runner_app(
                     session_id,
                     _SESSION_INIT_CANCEL_TIMEOUT_S,
                 )
+        await _settle_native_pane_teardowns(session_id)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -9093,6 +9119,7 @@ def create_runner_app(
     ) -> JSONResponse:
         _required_terminal_exit_errors.pop(session_id, None)
         _clean_terminal_exit_responses.pop(session_id, None)
+        await _settle_native_pane_teardowns(session_id)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -9124,6 +9151,7 @@ def create_runner_app(
     async def reset_session_state(session_id: str) -> JSONResponse:
         _required_terminal_exit_errors.pop(session_id, None)
         _clean_terminal_exit_responses.pop(session_id, None)
+        await _settle_native_pane_teardowns(session_id)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -9431,13 +9459,13 @@ def create_runner_app(
                 return await _server_confirms_turn_in_flight(conv_id)
             return False
 
-        # Teardowns still running after the caller that started them was cancelled.
-        _abandoned_pane_teardowns: set[asyncio.Task[None]] = set()
-        app.state.abandoned_native_pane_teardowns = _abandoned_pane_teardowns
+        def _owns_launch_lock(pane: PaneRef, lock: asyncio.Lock) -> bool:
+            """Whether *lock* is still the session's launch lock, i.e. the same session."""
+            locks = _native_terminal_ensure_locks[pane.terminal_name]
+            return locks.get(pane.conversation_id) is lock
 
-        def _settle_abandoned_pane_teardown(teardown: asyncio.Task[None]) -> None:
-            _abandoned_pane_teardowns.discard(teardown)
-            # No caller is left to report it.
+        def _report_abandoned_pane_teardown(teardown: asyncio.Task[None]) -> None:
+            # Its caller was cancelled, so no one else reports a failure.
             if not teardown.cancelled() and (error := teardown.exception()) is not None:
                 _logger.warning("native pane teardown failed", exc_info=error)
 
@@ -9450,19 +9478,30 @@ def create_runner_app(
                 finally:
                     # The pane's forwarder, helper server and tool relay outlive it
                     # otherwise; ``finally`` so a partially failed close cannot leak them.
-                    await _native_runtime.teardown_codex_native_app_server(conv_id)
-                    await _cancel_auto_forwarder_task(conv_id)
-                    await _native_runtime.teardown_opencode_native_server(conv_id)
-                    if binding := _session_comment_relays.get(conv_id):
-                        _discard_comment_relay(conv_id, binding.relay)
-                    _publish_terminal_deleted_event(
-                        conversation_id=conv_id,
-                        terminal_name=pane.terminal_name,
-                        session_key="main",
-                        publish_event=_publish_event,
-                    )
+                    # A session deleted or reset meanwhile has dropped this lock: what is
+                    # registered under the id then belongs to a session started since.
+                    for dispose in (
+                        _native_runtime.teardown_codex_native_app_server,
+                        _cancel_auto_forwarder_task,
+                        _native_runtime.teardown_opencode_native_server,
+                    ):
+                        if _owns_launch_lock(pane, lock):
+                            await dispose(conv_id)
+                    if _owns_launch_lock(pane, lock):
+                        if binding := _session_comment_relays.get(conv_id):
+                            _discard_comment_relay(conv_id, binding.relay)
+                        _publish_terminal_deleted_event(
+                            conversation_id=conv_id,
+                            terminal_name=pane.terminal_name,
+                            session_key="main",
+                            publish_event=_publish_event,
+                        )
             finally:
                 lock.release()
+                running = _native_pane_teardowns.get(conv_id, set())
+                running.discard(cast("asyncio.Task[None]", asyncio.current_task()))
+                if not running:
+                    _native_pane_teardowns.pop(conv_id, None)
 
         async def _reap_native_pane(
             pane: PaneRef,
@@ -9512,20 +9551,33 @@ def create_runner_app(
                         extra={"session_id": conv_id},
                     )
                     return
+                # Deleted or reset during the checks above, possibly created again since.
+                current = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+                if not _owns_launch_lock(pane, lock) or (
+                    current is not None and current is not reaped
+                ):
+                    _logger.info(
+                        "native pane reaper: session %s was deleted or reset while the "
+                        "reap checked it; leaving it",
+                        conv_id,
+                        extra={"session_id": conv_id},
+                    )
+                    return
                 # Committed: a cancelled caller (e.g. a Reconnect past its deadline) must
                 # not leave the process or its helpers half torn down. The task frees the
                 # lock, so a replacement launch waits for it.
                 teardown = asyncio.create_task(
                     _tear_down_native_pane(pane, lock), name=f"native-pane-teardown-{conv_id}"
                 )
+                # Registered while it runs: a route dropping the launch lock waits for it.
+                _native_pane_teardowns.setdefault(conv_id, set()).add(teardown)
             finally:
                 if teardown is None:
                     lock.release()
             try:
                 await asyncio.shield(teardown)
             except asyncio.CancelledError:
-                _abandoned_pane_teardowns.add(teardown)
-                teardown.add_done_callback(_settle_abandoned_pane_teardown)
+                teardown.add_done_callback(_report_abandoned_pane_teardown)
                 raise
 
         app.state.native_pane_reaper = NativePaneReaper(

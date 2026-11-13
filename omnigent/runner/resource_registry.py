@@ -2494,10 +2494,18 @@ class SessionResourceRegistry:
                     entry.session_key,
                 )
                 if closed:
+                    # A replacement launched during the close keeps its own role,
+                    # lifecycle and poller.
+                    replaced = (
+                        self._terminal_registry.get(
+                            session_id, entry.terminal_name, entry.session_key
+                        )
+                        is not None
+                    )
                     with self._lock:
-                        self._terminal_roles.pop((session_id, terminal_id), None)
-                        self._terminal_lifecycles.pop((session_id, terminal_id), None)
-                        # A replacement launched during the close keeps its own poller.
+                        if not replaced:
+                            self._terminal_roles.pop((session_id, terminal_id), None)
+                            self._terminal_lifecycles.pop((session_id, terminal_id), None)
                         if poller is not None and self._status_pollers.get(session_id) is poller:
                             del self._status_pollers[session_id]
                     _retire_closed_terminal_poller(poller)
