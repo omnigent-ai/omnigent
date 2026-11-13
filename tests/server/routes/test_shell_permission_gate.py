@@ -301,7 +301,9 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
 
     application = FastAPI()
-    application.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_CONTENT_SEARCH}))
+    application.state.feature_flags = FeatureFlags(
+        frozenset({Feature.WORKSPACE_CONTENT_SEARCH, Feature.WORKSPACE_DIRECT_ACCESS})
+    )
 
     @application.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -1192,3 +1194,28 @@ async def test_pr_edit_requires_a_json_body(
 
     assert resp.status_code == 415, resp.text
     assert runner_client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user", "status"),
+    [
+        ("viewer@example.com", 403),
+        ("owner@example.com", 403),  # an edit collaborator, despite the name
+        ("manager@example.com", 403),
+        # The owner passes the gate; this harness has no connected host to offer.
+        ("real-owner@example.com", 404),
+    ],
+)
+async def test_workspace_direct_access_is_owner_only(
+    client: httpx.AsyncClient, user: str, status: int
+) -> None:
+    """A direct-access token reads the workspace with no per-read server check,
+    so only the session owner may get one."""
+    resp = await client.post(
+        "/v1/sessions/conv_share/workspace/direct-access", headers={"X-Forwarded-Email": user}
+    )
+
+    assert resp.status_code == status, resp.text
+    if status == 404:
+        assert "host is not connected" in resp.text

@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import base64
 import os
+import socket
+import stat
+import time
 from pathlib import Path
 from typing import cast
 
+import httpx
 import pytest
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
@@ -32,7 +36,8 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ListDirectoryRequest,
     ReadFileRequest,
 )
-from omnigent.host.workspace_service import WorkspaceService
+from omnigent.host.workspace_service import WorkspaceService, start_workspace_socket
+from omnigent.host.workspace_tokens import mint_token
 from omnigent.workspace_fs import WorkspaceReader
 
 pytestmark = pytest.mark.asyncio
@@ -214,3 +219,62 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path) -> None:
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
     assert set(response.capabilities) == {"ListDirectory", "ReadFile"}
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="needs Unix sockets")
+async def test_socket_serves_only_valid_tokens_for_this_host(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    _workspace(workspace)
+    listener = await start_workspace_socket(lambda ws: WorkspaceReader(Path(ws)), host_id="host_a")
+    assert listener is not None
+    key = listener.token_key
+
+    def bearer(
+        signing_key: str = key,
+        host_id: str = "host_a",
+        root: str = str(workspace),
+        now: float | None = None,
+    ) -> str:
+        token, _ = mint_token(
+            signing_key, host_id=host_id, session_id="s1", workspace=root, now=now
+        )
+        return f"Bearer {token}"
+
+    try:
+        # Only this user may enter the socket's directory or open the socket.
+        assert stat.S_IMODE(listener.path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(listener.path.stat().st_mode) == 0o600
+        transport = httpx.AsyncHTTPTransport(uds=str(listener.path))
+        async with httpx.AsyncClient(transport=transport, base_url="http://workspace") as http:
+
+            async def list_root(authorization: str | None) -> httpx.Response:
+                headers = {"Authorization": authorization} if authorization else {}
+                return await http.post(
+                    "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListDirectory",
+                    json={},
+                    headers=headers,
+                )
+
+            allowed = await list_root(bearer())
+            assert allowed.status_code == 200, allowed.text
+            assert {"notes.md", "src"} <= {e["name"] for e in allowed.json()["entries"]}
+
+            refused = {
+                "no token": None,
+                "not a token": "Bearer not-a-token",
+                "another host's token": bearer(host_id="host_b"),
+                "another key": bearer(signing_key="another-host-process-key-0123456789"),
+                "expired": bearer(now=time.time() - 3600),
+            }
+            for case, authorization in refused.items():
+                response = await list_root(authorization)
+                assert response.status_code == 401, case
+                assert response.json()["code"] == "unauthenticated", case
+
+            missing = await list_root(bearer(root=str(tmp_path / "gone")))
+            assert missing.status_code == 404
+    finally:
+        await listener.stop()
+
+    assert not listener.path.parent.exists()

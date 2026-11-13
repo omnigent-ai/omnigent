@@ -48,6 +48,7 @@ class Feature(StrEnum):
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
     SESSION_OVERVIEW = "session_overview"
     PROJECT_REPOSITORY_CREATION = "project_repository_creation"
+    WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
 
 
 @dataclass(frozen=True)
@@ -223,6 +224,16 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="web",
         review_by_release="0.25.0",
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_DIRECT_ACCESS,
+        description=(
+            "Owners read a session's workspace straight from its host's local socket; "
+            "the server and the host must both enable it"
+        ),
+        owner="server",
+        review_by_release="0.27.0",
+        frontend_visible=False,
     ),
 )
 

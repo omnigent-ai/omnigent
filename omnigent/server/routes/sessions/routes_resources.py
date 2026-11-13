@@ -38,6 +38,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.workspace_tokens import mint_token
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
@@ -2739,6 +2740,52 @@ def register_resources_routes(
                 "Session runner does not support content search; update the host and restart the session"
             ),
         )
+
+    @router.post(
+        "/sessions/{session_id}/workspace/direct-access",
+        response_model=None,
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def create_workspace_direct_access(request: Request, session_id: str) -> dict[str, Any]:
+        """Give the session owner a short-lived token for its host's workspace socket.
+
+        The owner's desktop app, on the same machine as the host, uses it to call
+        the workspace API without a server round trip. Unconfined sessions only:
+        the host reads the workspace itself and applies no sandbox's hidden paths.
+        Any refusal leaves the client on the server route.
+        """
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_DIRECT_ACCESS):
+            raise HTTPException(status_code=404, detail="Workspace direct access is disabled")
+        conv, is_owner = await _authorize_browse_read_with_owner(session_id, request)
+        if not is_owner:
+            raise HTTPException(
+                status_code=403, detail="Only the session owner can read its workspace directly"
+            )
+        host_id = conv.host_id
+        host = host_registry.get(host_id) if host_registry is not None and host_id else None
+        if host_id is None or host is None:
+            raise HTTPException(status_code=404, detail="The session's host is not connected")
+        socket_path = host.hello.workspace_socket
+        key = host.hello.workspace_token_key
+        if not socket_path or not key:
+            raise HTTPException(
+                status_code=404, detail="The session's host offers no direct access"
+            )
+        reach = await _environment_reach_for_session(conv)
+        if reach is None or not reach[1]:
+            raise HTTPException(
+                status_code=404, detail="Direct access serves unconfined sessions only"
+            )
+        token, expires_at = mint_token(
+            key, host_id=host_id, session_id=session_id, workspace=reach[2]
+        )
+        return {
+            "host_id": host_id,
+            "socket_path": socket_path,
+            "token": token,
+            "expires_at": expires_at,
+        }
 
     @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/search",

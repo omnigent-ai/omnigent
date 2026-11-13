@@ -9,18 +9,30 @@ file routes. Which workspace a call reads comes from the caller-supplied
 Mount it with the generated ASGI app::
 
     WorkspaceServiceASGIApplication(WorkspaceService(reader_for))
+
+:func:`start_workspace_socket` serves it to the session owner's desktop app on
+an owner-only Unix socket, admitting calls that carry a server-issued token
+(see :mod:`omnigent.host.workspace_tokens`).
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
+import shutil
+import tempfile
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from typing import ParamSpec, TypeVar
 
+import uvicorn
 from connectrpc.code import Code
 from connectrpc.errors import ConnectError
 from connectrpc.request import RequestContext
 from google.protobuf.timestamp_pb2 import Timestamp
 
+from omnigent.api.workspace.v1alpha1.workspace_connect import WorkspaceServiceASGIApplication
 from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     CONTENT_ENCODING_BINARY,
     CONTENT_ENCODING_UTF8,
@@ -35,8 +47,11 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ReadFileRequest,
     ReadFileResponse,
 )
+from omnigent.host.workspace_tokens import new_token_key, verify_token
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+
+_logger = logging.getLogger(__name__)
 
 # Matches the largest page the web Files tree asks for.
 _MAX_PAGE_SIZE = 1000
@@ -44,6 +59,9 @@ _MAX_PAGE_SIZE = 1000
 _READ_CHUNK_BYTES = 64 * 1024
 _CAPABILITIES = ("ListDirectory", "ReadFile")
 _ERROR_CODES = {400: Code.INVALID_ARGUMENT, 404: Code.NOT_FOUND}
+# A local socket bind; seconds means something is wrong, and the host goes on without it.
+_SOCKET_STARTUP_TIMEOUT_S = 5.0
+_SOCKET_SHUTDOWN_TIMEOUT_S = 2.0
 
 ReaderForCall = Callable[[RequestContext], WorkspaceReader]
 _Params = ParamSpec("_Params")
@@ -82,7 +100,7 @@ class WorkspaceService:
     ) -> ListDirectoryResponse:
         if request.page_size < 0:
             raise ConnectError(Code.INVALID_ARGUMENT, "page_size must not be negative")
-        reader = self._reader_for(ctx)
+        reader = await _read(self._reader_for, ctx)
         page = await _read(
             reader.list_directory,
             request.path,
@@ -110,7 +128,7 @@ class WorkspaceService:
     ) -> AsyncIterator[ReadFileResponse]:
         if not request.path:
             raise ConnectError(Code.INVALID_ARGUMENT, "path is required")
-        reader = self._reader_for(ctx)
+        reader = await _read(self._reader_for, ctx)
         file = await _read(reader.read_file_bytes, request.path)
         yield ReadFileResponse(
             metadata=FileMetadata(
@@ -122,3 +140,85 @@ class WorkspaceService:
         )
         for start in range(0, len(file.data), _READ_CHUNK_BYTES):
             yield ReadFileResponse(data=file.data[start : start + _READ_CHUNK_BYTES])
+
+
+class WorkspaceSocket:
+    """The workspace API on an owner-only Unix socket.
+
+    :param path: The socket, inside a directory only this user can enter.
+    :param token_key: Key the server signs this socket's tokens with.
+    """
+
+    def __init__(
+        self, server: uvicorn.Server, task: asyncio.Task[None], path: Path, token_key: str
+    ) -> None:
+        self._server = server
+        self._task = task
+        self.path = path
+        self.token_key = token_key
+
+    async def stop(self) -> None:
+        """Stop serving and remove the socket's directory (best-effort)."""
+        self._server.should_exit = True
+        await asyncio.wait({self._task}, timeout=_SOCKET_SHUTDOWN_TIMEOUT_S)
+        if not self._task.done():
+            self._task.cancel()
+            await asyncio.wait({self._task}, timeout=_SOCKET_SHUTDOWN_TIMEOUT_S)
+        shutil.rmtree(self.path.parent, ignore_errors=True)
+
+
+async def start_workspace_socket(
+    reader_for_workspace: Callable[[str], WorkspaceReader], *, host_id: str
+) -> WorkspaceSocket | None:
+    """Serve the workspace API on a fresh owner-only Unix socket.
+
+    A call must carry ``Authorization: Bearer <token>`` with a token minted for
+    this host; the token names the workspace it reads.
+
+    :param reader_for_workspace: Returns the reader for an existing workspace
+        directory, e.g. the host's shared reader cache.
+    :param host_id: This host's id, which tokens must name.
+    :returns: The running socket, or ``None`` when it could not start. Direct
+        access is an optimization, so the host carries on without it.
+    """
+    token_key = new_token_key()
+
+    def reader_for(ctx: RequestContext) -> WorkspaceReader:
+        scheme, _, token = (ctx.request_headers.get("authorization") or "").partition(" ")
+        grant = (
+            verify_token(token_key, token, host_id=host_id)
+            if scheme.lower() == "bearer" and token
+            else None
+        )
+        if grant is None:
+            raise ConnectError(Code.UNAUTHENTICATED, "A valid workspace token is required")
+        workspace = os.path.expanduser(grant.workspace)
+        if not os.path.isdir(workspace):
+            raise ConnectError(Code.NOT_FOUND, "The session's workspace is not on this host")
+        return reader_for_workspace(workspace)
+
+    # mkdtemp's directory is mode 0700, so no other user can reach the socket.
+    path = Path(tempfile.mkdtemp(prefix="omnigent-workspace-")) / "workspace.sock"
+    app = WorkspaceServiceASGIApplication(WorkspaceService(reader_for))
+    config = uvicorn.Config(
+        app,
+        uds=str(path),
+        ws="none",
+        lifespan="off",
+        log_level="warning",
+        access_log=False,
+        log_config=None,
+    )
+    server = uvicorn.Server(config)
+    task = asyncio.create_task(server.serve(), name="host-workspace-socket")
+    socket = WorkspaceSocket(server, task, path, token_key)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _SOCKET_STARTUP_TIMEOUT_S
+    while not server.started:
+        if task.done() or loop.time() >= deadline:
+            _logger.warning("Workspace socket failed to start; direct access is off")
+            await socket.stop()
+            return None
+        await asyncio.sleep(0.01)
+    path.chmod(0o600)
+    return socket
