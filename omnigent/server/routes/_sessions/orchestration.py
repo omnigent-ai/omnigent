@@ -3609,6 +3609,42 @@ def _native_input_reason_code(event: Mapping[str, Any]) -> str:
     return "unknown_lifecycle"
 
 
+def _settle_native_inputs_for_status_failure(
+    session_id: str, response_id: str | None, error: ErrorDetail | None
+) -> None:
+    """
+    Move the inputs of a turn a ``failed`` session status ended to ``native_turn_failed``.
+
+    A native terminal that dies mid-turn fails the turn through a session status
+    rather than a ``response.failed`` lifecycle edge, so the queued input the turn
+    was running keeps an in-turn stage. Its own failure is already reported (the
+    status's error labels and the runner's error item), so marking it lets a later
+    matched mirror skip it without adding a second "never recorded" error.
+
+    :param session_id: Session/conversation identifier.
+    :param response_id: The turn the status names, or the response active at
+        failure when it names none; ``None`` leaves the queue untouched.
+    :param error: The status's failure detail, for the entries' reason code.
+    """
+    if response_id is None:
+        return
+    reason_code = error.code if error is not None and isinstance(error.code, str) else None
+    marked = pending_inputs.mark_turn_failed(session_id, response_id, reason_code=reason_code)
+    if not marked:
+        return
+    _logger.info(
+        "Native inputs of failed turn marked for session=%s",
+        session_id,
+        extra=debug_event(
+            "native_input_turn_failed_by_status",
+            session_id=session_id,
+            response_id=response_id,
+            reason_code=reason_code,
+            pending_ids=marked,
+        ),
+    )
+
+
 def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) -> None:
     """Retain an identity-linked runner lifecycle edge on its queued web input."""
     event_type = event.get("type")
@@ -9795,6 +9831,14 @@ async def _relay_runner_stream_once(
                             # would deliver a premature, lock-out completion.
                             raw_blocked_on = event.get("blocked_on")
                             raw_response_id = event.get("response_id")
+                            if status == "failed":
+                                _settle_native_inputs_for_status_failure(
+                                    session_id,
+                                    raw_response_id
+                                    if isinstance(raw_response_id, str) and raw_response_id
+                                    else _session_active_response_cache.get(session_id),
+                                    status_error,
+                                )
                             # The runner finishing a turn the server had written
                             # off as a runner drop proves the drop was transient:
                             # honor the completion and clear the disconnect cause.

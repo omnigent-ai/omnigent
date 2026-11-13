@@ -1168,3 +1168,68 @@ def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost(
     [skipped] = match.skipped
     assert skipped.content == [_text_block(older)]
     assert match.uncertain == []
+
+
+def test_status_failure_marks_the_inputs_of_the_active_turn() -> None:
+    """A failed session status moves the turn's in-turn inputs to native_turn_failed."""
+    first = pending_inputs.record("conv", [_text_block("first")], stable_id="a" * 32)
+    pending_inputs.mark_lifecycle(
+        "conv", "a" * 32, stage="native_turn_started", lifecycle_response_id="resp_first"
+    )
+    second = pending_inputs.record("conv", [_text_block("second")], stable_id="b" * 32)
+    pending_inputs.mark_lifecycle(
+        "conv", "b" * 32, stage="native_turn_completed", lifecycle_response_id="resp_second"
+    )
+    third = pending_inputs.record("conv", [_text_block("third")], stable_id="c" * 32)
+    pending_inputs.mark_delivery_stage("conv", third, "forward_accepted")
+
+    marked = pending_inputs.mark_turn_failed(
+        "conv", "resp_first", reason_code="required_terminal_exited"
+    )
+
+    assert marked == [first]
+    first_attributes = pending_inputs.delivery_attributes_for("conv", first)
+    assert first_attributes["last_delivery_stage"] == "native_turn_failed"
+    assert first_attributes["cause_class"] == "interrupted_or_lifecycle"
+    assert first_attributes["reason_code"] == "required_terminal_exited"
+    assert first_attributes["lifecycle_response_id"] == "resp_first"
+    # Other turns and inputs the agent never took into a turn are untouched.
+    assert (
+        pending_inputs.delivery_attributes_for("conv", second)["last_delivery_stage"]
+        == "native_turn_completed"
+    )
+    assert (
+        pending_inputs.delivery_attributes_for("conv", third)["last_delivery_stage"]
+        == "forward_accepted"
+    )
+
+
+def test_status_failure_skips_inputs_whose_turn_already_ended() -> None:
+    """An input already failed, cancelled or rejected keeps its own outcome."""
+    for stage, stable in (
+        ("native_turn_failed", "a"),
+        ("native_turn_cancelled", "b"),
+        ("rejected_before_handoff", "c"),
+    ):
+        pending_inputs.record("conv", [_text_block(stage)], stable_id=stable * 32)
+        pending_inputs.mark_lifecycle(
+            "conv", stable * 32, stage=stage, lifecycle_response_id="resp_shared"
+        )
+
+    assert pending_inputs.mark_turn_failed("conv", "resp_shared", reason_code="x") == []
+
+
+def test_status_failure_with_an_unusable_response_or_reason_is_bounded() -> None:
+    """A malformed response id marks nothing; a malformed reason code is dropped."""
+    first = pending_inputs.record("conv", [_text_block("first")], stable_id="a" * 32)
+    pending_inputs.mark_lifecycle(
+        "conv", "a" * 32, stage="native_turn_accepted", lifecycle_response_id="resp_first"
+    )
+
+    assert pending_inputs.mark_turn_failed("conv", "not a response id!") == []
+    assert pending_inputs.mark_turn_failed("conv", "resp_first", reason_code="bad code!") == [
+        first
+    ]
+    attributes = pending_inputs.delivery_attributes_for("conv", first)
+    assert attributes["last_delivery_stage"] == "native_turn_failed"
+    assert "reason_code" not in attributes

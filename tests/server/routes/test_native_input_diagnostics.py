@@ -12,11 +12,13 @@ from omnigent.runtime import pending_inputs, session_stream
 from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_item,
     _record_native_input_lifecycle,
+    _relay_runner_stream_once,
     _settle_undelivered_native_input,
 )
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests.server.routes.test_sessions_runner_relay import _ScriptedRunnerClient
 
 
 @pytest.mark.asyncio
@@ -326,6 +328,130 @@ async def test_skipped_input_whose_turn_failed_does_not_add_a_second_error(
     assert lost.data.content[0]["text"] == "lost in the crash"
     assert lost.response_id == record.attributes["response_id"] == "resp_failed"
     assert not [item for item in items if item.type == "error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("names_response", [False, True])
+async def test_status_failure_of_the_active_turn_settles_its_input_without_a_second_error(
+    db_uri: str, caplog: pytest.LogCaptureFixture, names_response: bool
+) -> None:
+    """A native terminal dying mid-turn fails the turn by status; the input it ran is not lost."""
+    import asyncio
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "claude-native-ui"})
+    first = pending_inputs.record(
+        conv.id, [{"type": "input_text", "text": "lost in the crash"}], stable_id="a" * 32
+    )
+    pending_inputs.record(conv.id, [{"type": "input_text", "text": "later"}], stable_id="b" * 32)
+    release = asyncio.Event()
+    release.set()
+    failed_status: dict[str, object] = {
+        "type": "session.status",
+        "status": "failed",
+        "error": {"code": "required_terminal_exited", "message": "Claude Code's terminal exited"},
+    }
+    if names_response:
+        failed_status["response_id"] = "resp_lost"
+    caplog.set_level(logging.INFO)
+    await _relay_runner_stream_once(
+        conv.id,
+        _ScriptedRunnerClient(
+            release,
+            [
+                {
+                    "type": "response.in_progress",
+                    "response": {"id": "resp_lost"},
+                    "input_stable_id": "a" * 32,
+                },
+                {"type": "session.status", "status": "running", "response_id": "resp_lost"},
+                failed_status,
+            ],
+        ),
+        store,  # type: ignore[arg-type]
+    )
+
+    attributes = pending_inputs.delivery_attributes_for(conv.id, first)
+    assert attributes["last_delivery_stage"] == "native_turn_failed"
+    assert attributes["reason_code"] == "required_terminal_exited"
+    [marked] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_turn_failed_by_status"
+    ]
+    assert marked.attributes["response_id"] == "resp_lost"
+    assert marked.attributes["pending_ids"] == [first]
+
+    await _persist_external_conversation_item(
+        conv.id,
+        conv,
+        SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "later"}],
+                },
+                "response_id": "resp_later",
+                "source_id": "native:later-record:0",
+            },
+        ),
+        store,
+    )
+
+    [settled] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_settled"
+        and record.attributes.get("pending_id") == first
+    ]
+    assert settled.attributes["outcome"] == "skipped_after_failed_turn"
+    items = store.list_items(conv.id).data
+    [lost] = [item for item in items if item.id == settled.attributes["item_id"]]
+    assert lost.data.content[0]["text"] == "lost in the crash"
+    assert lost.response_id == "resp_lost"
+    assert not [item for item in items if item.type == "error"]
+
+
+@pytest.mark.asyncio
+async def test_status_failure_with_no_active_turn_leaves_queued_inputs_alone(
+    db_uri: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failure before any turn names no response, so nothing is marked as failed."""
+    import asyncio
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "claude-native-ui"})
+    first = pending_inputs.record(
+        conv.id, [{"type": "input_text", "text": "never started"}], stable_id="a" * 32
+    )
+    release = asyncio.Event()
+    release.set()
+    caplog.set_level(logging.INFO)
+    await _relay_runner_stream_once(
+        conv.id,
+        _ScriptedRunnerClient(
+            release,
+            [
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": {"code": "native_terminal_start_failed", "message": "boot failed"},
+                }
+            ],
+        ),
+        store,  # type: ignore[arg-type]
+    )
+
+    assert pending_inputs.delivery_attributes_for(conv.id, first)["last_delivery_stage"] == (
+        "server_queued"
+    )
+    assert not [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_turn_failed_by_status"
+    ]
 
 
 @pytest.mark.parametrize("invalid_key", ["input_stable_id", "pending_id", "delivery_attempt_id"])

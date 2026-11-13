@@ -587,6 +587,55 @@ def mark_lifecycle(
     return None
 
 
+# Stages reached once the native agent took the input into a turn. A failure of
+# that turn reported as a session status, not as a ``response.failed`` event,
+# ends these entries' turns without a lifecycle edge of their own.
+_IN_TURN_DELIVERY_STAGES = frozenset(
+    {"native_turn_started", "native_turn_accepted", "native_turn_completed"}
+)
+
+
+def mark_turn_failed(
+    conversation_id: str, response_id: str, *, reason_code: str | None = None
+) -> list[str]:
+    """
+    Record a turn failure reported as a session status on the inputs of that turn.
+
+    A native agent that dies mid-turn (its terminal exits, the runner crashes)
+    never emits ``response.failed`` for the turn; the runner reports the
+    failure as a ``failed`` session status, which names no response. The
+    server knows the turn that was active, so the queued inputs whose
+    lifecycle already linked them to that response move to
+    ``native_turn_failed``: their turn's failure is already visible, and a
+    later match that skips them must not report them as never recorded.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param response_id: The turn the failure ended, e.g. the active response
+        at failure.
+    :param reason_code: Bounded failure code from the status, e.g.
+        ``"required_terminal_exited"``; dropped when not a disposition code.
+    :returns: Ids of the entries marked, in queue order.
+    """
+    if not _DISPOSITION_ID_RE.fullmatch(response_id):
+        return []
+    if reason_code is not None and not _DISPOSITION_CODE_RE.fullmatch(reason_code):
+        reason_code = None
+    marked: list[str] = []
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        for entry in _pending.get(conversation_id, {}).values():
+            if entry.lifecycle_response_id != response_id:
+                continue
+            if entry.last_delivery_stage not in _IN_TURN_DELIVERY_STAGES:
+                continue
+            entry.last_delivery_stage = "native_turn_failed"
+            entry.cause_class = "interrupted_or_lifecycle"
+            if reason_code is not None:
+                entry.reason_code = reason_code
+            marked.append(entry.pending_id)
+    return marked
+
+
 def classify_missing_native_record(entry: DrainedInput) -> DrainedInput:
     """Classify a skipped input from its strongest identity-linked evidence."""
     if entry.cause_class is not None:
