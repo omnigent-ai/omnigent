@@ -1418,6 +1418,18 @@ async def test_native_subagent_session_stamps_terminal_ui_labels(
             ["--dangerously-bypass-approvals-and-sandbox"],
         ),
         (
+            "codex-native",
+            {"permission_mode": "approve-for-me"},
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ],
+        ),
+        (
             "cursor-native",
             {"yolo": True},
             ["--yolo"],
@@ -1431,19 +1443,10 @@ async def test_native_subagent_yolo_args_derived_from_trusted_spec(
     expected_args: list[str],
 ) -> None:
     """
-    A YOLO-declaring native worker bundle gets bypass ``terminal_launch_args``.
+    Named workers persist the permission arguments declared by their own spec.
 
-    The worker sub-agent's own bundle declares its full-bypass intent
-    (``permission_mode: bypassPermissions`` for claude-native,
-    ``yolo: true`` for codex-native / cursor-native). On a sub-agent create,
-    the server derives the matching flag list from that trusted,
-    server-loaded spec and persists it as the child session's
-    ``terminal_launch_args`` — which the runner appends to the native CLI
-    argv so the headless worker can edit without stalling on an
-    ApprovalCard.
-
-    A failure here means the translation seam regressed and the worker
-    would launch in its default prompting mode (and hang headless).
+    Explicit Codex automatic review must survive named sub-agent resolution
+    instead of falling back to the headless bypass default.
     """
     parent = await _create_parent_with_subagents(
         client,
@@ -1460,8 +1463,6 @@ async def test_native_subagent_yolo_args_derived_from_trusted_spec(
         },
     )
     assert resp.status_code == 201, resp.text
-    # The persisted child session carries exactly the YOLO bypass flags;
-    # an empty / None value would mean the worker launches prompting.
     assert resp.json()["terminal_launch_args"] == expected_args
 
 

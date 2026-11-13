@@ -33,6 +33,7 @@ from omnigent.runner.identity import (
 from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, CopyOnWriteEnvironment
 from omnigent.util.json_types import JsonValue
 
+from ._proc import run_isolated
 from .agent_env import strip_desktop_session_env
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
@@ -57,6 +58,7 @@ from .sandbox import (
     with_additional_read_roots,
     with_additional_write_roots,
 )
+from .tcp_egress import TcpEgressBroker, apply_tcp_egress_env, start_tcp_egress_broker
 
 if TYPE_CHECKING:
     import asyncio
@@ -449,6 +451,7 @@ class _HelperProcessClient:
         # the handle when present.
         self._egress_handle: EgressProxyHandle | None = None
         self._git_ssh_broker: GitSshBroker | None = None
+        self._tcp_egress_broker: TcpEgressBroker | None = None
         self._lock = threading.Lock()
         # bwrap --die-with-parent kills the helper when the thread that spawned it
         # exits, and each request runs on its own short-lived thread.
@@ -537,6 +540,8 @@ class _HelperProcessClient:
     def _ensure_started_locked(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
             return
+        if self._proc is not None:
+            self._stop_locked()
         self._start_locked()
 
     def _start_locked(self) -> None:
@@ -610,6 +615,12 @@ class _HelperProcessClient:
             self._git_ssh_broker = start_git_ssh_broker(sandbox.git_ssh, self._tmpdir)
             apply_git_ssh_env(env, self._git_ssh_broker)
             sandbox = replace(sandbox, git_ssh_socket_path=str(self._git_ssh_broker.socket_path))
+        if sandbox.tcp_egress and self._tmpdir is not None:
+            self._tcp_egress_broker = start_tcp_egress_broker(sandbox.tcp_egress, self._tmpdir)
+            apply_tcp_egress_env(env, self._tcp_egress_broker)
+            sandbox = replace(
+                sandbox, tcp_egress_socket_path=str(self._tcp_egress_broker.socket_path)
+            )
 
         if self._tmpdir is not None:
             set_sandbox_env(env, self._tmpdir)
@@ -802,6 +813,12 @@ class _HelperProcessClient:
                 except Exception:
                     logger.exception("Git SSH broker stop failed")
                 self._git_ssh_broker = None
+            if self._tcp_egress_broker is not None:
+                try:
+                    self._tcp_egress_broker.stop()
+                except Exception:
+                    logger.exception("TCP egress broker stop failed")
+                self._tcp_egress_broker = None
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
 
@@ -1921,7 +1938,7 @@ def _shell_impl(
     """
     argv = _shell_argv(shell_path, command)
     try:
-        completed = subprocess.run(
+        completed = run_isolated(
             argv,
             cwd=str(cwd),
             env=_child_shell_env(),
