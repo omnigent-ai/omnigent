@@ -140,7 +140,7 @@ def test_inject_user_message_raises_when_never_confirmed(tmp_path, monkeypatch) 
     monkeypatch.setattr(b, "_await_session_ready", lambda *_args: True)
     monkeypatch.setattr(b, "_max_message_id", lambda _p: 0)  # never advances
 
-    with pytest.raises(RuntimeError, match="delivery is unconfirmed"):
+    with pytest.raises(b.HermesDeliveryUnconfirmed, match="delivery is unconfirmed"):
         b.inject_user_message(tmp_path, content="do something now")
 
     assert sum(1 for a in calls if a[0] == "load-buffer") == 1
@@ -287,7 +287,7 @@ def test_inject_user_message_waits_for_cooked_startup_before_any_keys(tmp_path, 
 
     monkeypatch.setattr(b, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance))
     monkeypatch.setattr(b, "_pane_accepts_input", lambda *_a, **_k: False)
-    with pytest.raises(RuntimeError, match="input is not ready; no message was sent"):
+    with pytest.raises(b.HermesInputNotSent, match="input is not ready; no message was sent"):
         b.inject_user_message(tmp_path, content="do something now", timeout_s=0.5)
     assert elapsed == pytest.approx(0.5)
     assert calls == []
@@ -815,3 +815,40 @@ def test_input_ready_subprocess_uses_remaining_budget(monkeypatch):
         b._await_input_ready("/s", "t", timeout_s=0.5)
     assert budgets == pytest.approx([0.5, 0.3, 0.1])
     assert elapsed == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("failed_command", ["load-buffer", "paste-buffer", "Enter"])
+@pytest.mark.parametrize("exception", [RuntimeError, OSError])
+def test_delivery_command_failure_preserves_transfer_boundary(
+    tmp_path, monkeypatch, failed_command, exception
+):
+    calls = []
+    _patch_inject_tmux(monkeypatch, calls)
+    monkeypatch.setattr(b, "_state_db_path", lambda _bd: None)
+
+    def run(_socket, *args):
+        calls.append(args)
+        if args[0] == failed_command or args[-1] == failed_command:
+            raise exception("terminal command timed out")
+
+    monkeypatch.setattr(b, "_run_tmux", run)
+    error = (
+        b.HermesInputNotSent if failed_command == "load-buffer" else b.HermesDeliveryUnconfirmed
+    )
+    with pytest.raises(error):
+        b.inject_user_message(tmp_path, content="do something now")
+    assert sum(1 for args in calls if args[0] == "paste-buffer") == (
+        failed_command != "load-buffer"
+    )
+    assert sum(1 for args in calls if args[-1] == "Enter") == (failed_command == "Enter")
+    assert not list(tmp_path.glob("paste_*.bin"))
+
+
+@pytest.mark.parametrize("budget", [0.4, 30.0])
+def test_pane_readiness_subprocess_timeout_is_bounded(monkeypatch, budget):
+    def timeout(command, **kwargs):
+        assert kwargs["timeout"] == min(budget, b._TMUX_SEND_TIMEOUT_S)
+        raise b.subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(b.subprocess, "run", timeout)
+    assert b._pane_accepts_input("/s", "t", timeout_s=budget) is False

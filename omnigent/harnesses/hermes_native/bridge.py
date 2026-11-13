@@ -73,6 +73,14 @@ _DELIVERY_CONFIRM_TIMEOUT_S = 24.0
 _DELIVERY_POLL_INTERVAL_S = 0.3
 
 
+class HermesInputNotSent(RuntimeError):
+    """The terminal did not become ready before any message bytes were sent."""
+
+
+class HermesDeliveryUnconfirmed(RuntimeError):
+    """The paste was transferred, but Hermes has not confirmed transcript progress."""
+
+
 def mint_hermes_session_id() -> str:
     """Generate a fresh Hermes session id (UUID4 string)."""
     return str(uuid.uuid4())
@@ -715,7 +723,7 @@ def _await_input_ready(socket_path: str, tmux_target: str, *, timeout_s: float) 
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise RuntimeError("hermes terminal input is not ready; no message was sent")
+            raise HermesInputNotSent("hermes terminal input is not ready; no message was sent")
         if _pane_accepts_input(socket_path, tmux_target, timeout_s=remaining):
             return
         time.sleep(min(_POLL_INTERVAL_S, max(0.0, deadline - time.monotonic())))
@@ -828,43 +836,53 @@ def _deliver_once(
     keep interior newlines as data), waits until *needle* is visibly committed
     (so the trailing Enter isn't folded into the paste), then sends one Enter.
     """
-    _settle_pane(socket_path, tmux_target, timeout_s=settle_timeout_s)
-    _await_input_ready(socket_path, tmux_target, timeout_s=settle_timeout_s)
-    # C-a/C-k clear the current line, not an arbitrary multiline terminal draft.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
-    with tempfile.NamedTemporaryFile(
-        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-    ) as paste_file:
-        # Trailing newline absorbs any trailing backslash so it can't escape Enter.
-        paste_file.write(_paste_payload_bytes(content + "\n"))
-        paste_path = paste_file.name
+    paste_started = False
     try:
-        _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
-        _run_tmux(
-            socket_path,
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting
-            "-b",
-            _PASTE_BUFFER,
-            "-t",
-            tmux_target,
-        )
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(paste_path)
-    # Wait until the paste is visibly committed before Enter. Submitting mid-paste
-    # folds the Enter in as a newline (rapid stdin bursts coalesce), leaving the
-    # message unsent. Poll for the text, then submit; blind-submit if no needle.
-    if needle:
-        deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-        while time.monotonic() < deadline:
-            if needle in _capture_pane(socket_path, tmux_target):
-                break
-            time.sleep(_POLL_INTERVAL_S)
-    time.sleep(_PASTE_SETTLE_S)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        _settle_pane(socket_path, tmux_target, timeout_s=settle_timeout_s)
+        _await_input_ready(socket_path, tmux_target, timeout_s=settle_timeout_s)
+        # C-a/C-k clear the current line, not an arbitrary multiline terminal draft.
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-a")
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-k")
+        with tempfile.NamedTemporaryFile(
+            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+        ) as paste_file:
+            # Trailing newline absorbs any trailing backslash so it can't escape Enter.
+            paste_file.write(_paste_payload_bytes(content + "\n"))
+            paste_path = paste_file.name
+        try:
+            _run_tmux(socket_path, "load-buffer", "-b", _PASTE_BUFFER, paste_path)
+            paste_started = True
+            _run_tmux(
+                socket_path,
+                "paste-buffer",
+                "-p",  # bracketed-paste markers — the TUI keeps newlines as data
+                "-d",  # drop the buffer after pasting
+                "-b",
+                _PASTE_BUFFER,
+                "-t",
+                tmux_target,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(paste_path)
+        # Wait until the paste is visibly committed before Enter. Submitting mid-paste
+        # folds the Enter in as a newline (rapid stdin bursts coalesce), leaving the
+        # message unsent. Poll for the text, then submit; blind-submit if no needle.
+        if needle:
+            deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+            while time.monotonic() < deadline:
+                if needle in _capture_pane(socket_path, tmux_target):
+                    break
+                time.sleep(_POLL_INTERVAL_S)
+        time.sleep(_PASTE_SETTLE_S)
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    except (RuntimeError, OSError) as exc:
+        if paste_started:
+            raise HermesDeliveryUnconfirmed(
+                "hermes message delivery is unconfirmed after transferring input; "
+                "the message was not resent"
+            ) from exc
+        raise HermesInputNotSent(str(exc)) from exc
 
 
 def inject_user_message(
@@ -893,13 +911,16 @@ def inject_user_message(
     """
     if not content:
         raise RuntimeError("hermes-native injection requires non-empty content")
-    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    try:
+        info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    except RuntimeError as exc:
+        raise HermesInputNotSent(str(exc)) from exc
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
     # Fast-fail if the TUI already exited: otherwise _settle_pane polls a dead
     # pane for the full timeout and the web message is silently lost.
     if not _session_alive(socket_path, tmux_target):
-        raise RuntimeError(
+        raise HermesInputNotSent(
             "hermes terminal is no longer running (the TUI exited); restart the session"
         )
     needle = _submit_needle(content)
@@ -907,7 +928,7 @@ def inject_user_message(
     # be interpreted as proof that it is safe to replay input.
     db_path = _state_db_path(bridge_dir)
     if db_path is not None and not _await_session_ready(db_path, timeout_s):
-        raise RuntimeError(
+        raise HermesInputNotSent(
             "hermes did not finish initializing its session store; no message was sent"
         )
     baseline_id = _max_message_id(db_path) if db_path is not None else None
@@ -924,7 +945,7 @@ def inject_user_message(
     # without touching a composer that may now show an approval or other modal.
     if _await_new_message(db_path, baseline_id or 0, _DELIVERY_CONFIRM_TIMEOUT_S):
         return
-    raise RuntimeError(
+    raise HermesDeliveryUnconfirmed(
         "hermes message delivery is unconfirmed; no new transcript row appeared "
         "after one paste, and the message was not resent"
     )
