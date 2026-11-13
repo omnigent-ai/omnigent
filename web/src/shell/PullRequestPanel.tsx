@@ -29,7 +29,7 @@ import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
+import { skipToken, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
   ArrowLeftIcon,
   CopyIcon,
@@ -999,6 +999,18 @@ interface PullRequestPanelView {
 
 const DEFAULT_PANEL_VIEW: PullRequestPanelView = { showingDetails: false, subtab: "summary" };
 
+export function selectPullRequestInPanel(
+  queryClient: QueryClient,
+  conversationId: string,
+  prUrl: string,
+) {
+  queryClient.setQueryData<PullRequestPanelView>(["pull-request-panel-view", conversationId], {
+    selected: prUrl,
+    showingDetails: true,
+    subtab: "summary",
+  });
+}
+
 export function PullRequestPanel({
   conversationId,
   active = true,
@@ -1022,6 +1034,9 @@ export function PullRequestPanel({
   if (localView.conversationId !== conversationId) {
     setLocalView({ conversationId, view: cachedView });
   }
+  useEffect(() => {
+    setLocalView({ conversationId, view: cachedView });
+  }, [conversationId, cachedView]);
   const view = localView.conversationId === conversationId ? localView.view : cachedView;
   const selected = view.selected;
   const showingDetails = view.showingDetails;

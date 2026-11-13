@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ComposerPrLink } from "./ComposerPrLink";
@@ -180,7 +181,7 @@ describe("ComposerPrLink", () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
-  it("links each previewed PR to a new tab beside its title", async () => {
+  it("opens previewed PRs in the sidebar and keeps the new-tab links separate", async () => {
     const prs: ComposerPullRequest[] = [
       {
         url: "https://github.com/example/app/pull/42",
@@ -266,5 +267,25 @@ describe("ComposerPrLink", () => {
     );
     expect(onOpen).not.toHaveBeenCalled();
     expect(screen.getByTestId("composer-pr-preview")).toBeVisible();
+
+    const user = userEvent.setup();
+    await user.tab();
+    const firstRow = screen.getByRole("button", {
+      name: "View example/app #42 in the Pull Requests tab",
+    });
+    await user.tab();
+    expect(firstRow).toHaveFocus();
+    await user.keyboard("{Enter}");
+    expect(onOpen).toHaveBeenLastCalledWith(prs[0].url);
+    await waitFor(() => expect(screen.queryByTestId("composer-pr-preview")).toBeNull());
+
+    fireEvent.focus(trigger);
+    await screen.findByTestId("composer-pr-preview");
+    fireEvent.click(
+      screen.getByRole("button", { name: "View example/app !7 in the Pull Requests tab" }),
+    );
+    expect(onOpen).toHaveBeenLastCalledWith(prs[1].url);
+    expect(onOpen).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(screen.queryByTestId("composer-pr-preview")).toBeNull());
   });
 });
