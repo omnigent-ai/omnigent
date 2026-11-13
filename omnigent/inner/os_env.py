@@ -440,6 +440,7 @@ class _HelperProcessClient:
         self._proc: subprocess.Popen[str] | None = None
         # Recompute callable and value of the running helper's launch fingerprint.
         self._launch: tuple[Callable[[], object], object] | None = None
+        self._launch_env: dict[str, str] | None = None
         # Parent-held containment handle from the sandbox backend's
         # post_spawn hook (e.g. a Windows Job Object). Closed in
         # ``_stop_locked`` to tear down the helper's process tree.
@@ -553,7 +554,11 @@ class _HelperProcessClient:
         self._start_locked()
 
     def _launch_is_stale_locked(self) -> bool:
-        """Whether a fresh launch would now be sandboxed differently, e.g. a new dotfile."""
+        """Whether a fresh launch would have different mounts or inherited values."""
+        if self._launch_env is not None and (
+            build_helper_env(os.environ, self.sandbox) != self._launch_env
+        ):
+            return True
         if self._launch is None:
             return False
         recompute, fingerprint = self._launch
@@ -571,6 +576,7 @@ class _HelperProcessClient:
         if self._copy_on_write_environment is not None:
             self._copy_on_write_environment.prepare(sandbox)
         env = build_helper_env(os.environ, sandbox)
+        self._launch_env = env.copy() if self._relaunch_when_stale else None
         project_root = str(_project_root())
         existing_pythonpath = env.get("PYTHONPATH")
         env["PYTHONPATH"] = (
@@ -792,6 +798,7 @@ class _HelperProcessClient:
         proc = self._proc
         self._proc = None
         self._launch = None
+        self._launch_env = None
         try:
             if proc is None:
                 return
@@ -1160,8 +1167,8 @@ def create_os_environment(
     """Instantiate the configured OS environment.
 
     :param relaunch_when_stale: Relaunch the helper before a request once a
-        fresh launch would be sandboxed differently (e.g. a new dotfile to
-        mask). A relaunch discards the helper's scratch dir.
+        fresh launch would have different mounts or inherited environment
+        values. A relaunch discards the helper's scratch dir.
     """
     if spec is None:
         return None

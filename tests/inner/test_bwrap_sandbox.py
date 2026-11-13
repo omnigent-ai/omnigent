@@ -445,6 +445,46 @@ def test_launch_fingerprint_tracks_new_and_replaced_masked_dotfiles(tmp_path: Pa
     assert backend.launch_fingerprint(argv, policy, tmp_path) != changed
 
 
+@pytest.mark.parametrize("parent_change", ["directory", "symlink", "symlink-target"])
+def test_launch_fingerprint_tracks_masked_ancestors(tmp_path: Path, parent_change: str) -> None:
+    """A changed mask ancestor invalidates even when its leaf identity is unchanged."""
+    cwd = tmp_path / "workspace"
+    parent = cwd / "parent"
+    parent.mkdir(parents=True)
+    staged = cwd / "staged" if parent_change == "symlink" else tmp_path / "staged"
+    staged.mkdir()
+    secret = parent / "secret"
+    secret.write_text("synthetic masked contents")
+    (staged / "secret").hardlink_to(secret)
+    masked = secret
+    if parent_change != "directory":
+        link = cwd / "link"
+        link.symlink_to(parent, target_is_directory=True)
+        masked = link / "secret"
+
+    policy = _make_policy(cwd, mask_paths=[masked])
+    backend = _make_backend()
+    argv = [sys.executable, "-c", "pass"]
+    before = masked.stat()
+    launched = backend.launch_fingerprint(argv, policy, cwd)
+    (parent / "visible").write_text("ordinary directory content churn")
+    assert backend.launch_fingerprint(argv, policy, cwd) == launched
+
+    if parent_change == "symlink":
+        link.unlink()
+        link.symlink_to(staged, target_is_directory=True)
+    else:
+        parent.rename(tmp_path / "displaced")
+        staged.rename(parent)
+    after = masked.stat()
+    assert (after.st_dev, after.st_ino, after.st_ctime_ns) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_ctime_ns,
+    )
+    assert backend.launch_fingerprint(argv, policy, cwd) != launched
+
+
 def test_launch_fingerprint_tracks_explicit_mask_replacement(tmp_path: Path) -> None:
     from dataclasses import replace
 

@@ -387,8 +387,8 @@ class BwrapSandboxBackend(SandboxBackend):
         """Return mask and bind identities, including regular-file mask change times.
 
         A mount stays on the entry it covered, so a masked entry, granted
-        root or default bind source replaced on the host must also force a
-        relaunch. Framework scratch roots are per-launch and excluded.
+        root or intervening mask ancestor replaced on the host must force
+        a relaunch. Framework scratch roots are per-launch and excluded.
         """
         del chdir
         cwd_resolved = cwd.resolve(strict=False)
@@ -412,10 +412,10 @@ class BwrapSandboxBackend(SandboxBackend):
         interpreter_binds += _interpreter_reexpose_after_mask(argv, _tmpfs_mask_dirs(masks))
         return (
             masks,
-            _mount_target_identities(masks),
+            _mount_target_identities(masks, granted),
             roots,
             interpreter_binds,
-            _mount_target_identities(interpreter_binds),
+            _mount_target_identities(interpreter_binds, granted),
         )
 
     def wrap_launcher_argv(
@@ -1065,8 +1065,10 @@ def _socket_mask_args(policy: SandboxPolicy) -> list[str]:
     ]
 
 
-def _mount_target_identities(argv: Sequence[str]) -> list[tuple[int, int, int | None] | None]:
-    """Return identities of mask destinations and their bind sources.
+def _mount_target_identities(
+    argv: Sequence[str], bound_roots: Sequence[str | Path]
+) -> list[tuple[int, int, int | None] | None]:
+    """Return mount identities and destination ancestors up to their bound root.
 
     Destinations are not followed (a mask covers the entry itself); bind
     sources are, since bwrap mounts what a symlinked source points at.
@@ -1077,10 +1079,27 @@ def _mount_target_identities(argv: Sequence[str]) -> list[tuple[int, int, int | 
             targets.append((argv[i + 1], False))
         elif token in _BIND_FLAGS and i + 2 < len(argv):
             targets += [(argv[i + 1], True), (argv[i + 2], False)]
-    return [
+    identities = [
         _path_identity(target, follow_symlinks=follow, track_file_changes=not follow)
         for target, follow in targets
     ]
+    roots = {Path(root) for root in bound_roots}
+    ancestors: dict[Path, None] = {}
+    for target, follow in targets:
+        path = Path(target)
+        if follow or path in roots:
+            continue
+        for index, parent in enumerate(path.parents):
+            if parent in roots:
+                ancestors.update(dict.fromkeys(path.parents[: index + 1]))
+                break
+    # A symlink ancestor and its referent can each be replaced independently.
+    identities.extend(
+        _path_identity(parent, follow_symlinks=follow)
+        for parent in ancestors
+        for follow in (False, True)
+    )
+    return identities
 
 
 def _path_identity(

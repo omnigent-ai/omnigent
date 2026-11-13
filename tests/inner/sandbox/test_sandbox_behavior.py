@@ -706,21 +706,45 @@ def test_sandbox_hides_dotfiles_created_after_helper_start(
     active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
     sandbox_pythonpath_env: None,
 ) -> None:
-    """A reused helper relaunches once a new dotfile needs masking."""
+    """A reused helper preserves masks after new dotfiles or parent replacement."""
+    workspace = tmp_path / "workspace"
+    parent = workspace / "parent"
+    parent.mkdir(parents=True)
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    masked = parent / "secret"
+    masked.write_text("synthetic masked contents")
+    (staged / "secret").hardlink_to(masked)
+    sandbox = active_sandbox_spec_factory()
+    sandbox.mask_paths = [str(masked)]
     os_env = create_os_environment(
         OSEnvSpec(
             type="caller_process",
-            cwd=str(tmp_path),
-            sandbox=active_sandbox_spec_factory(),
+            cwd=str(workspace),
+            sandbox=sandbox,
         ),
         relaunch_when_stale=True,
     )
     # Each launch gets a fresh private scratch dir; PIDs are namespace-local under bwrap.
     try:
         first = run_async(os_env.shell("echo $TMPDIR"))
-        (tmp_path / ".env").write_text("OMNI_TEST_SECRET=late-secret-value-67890")
+        assert run_async(os_env.read("parent/secret")).get("content", "") == ""
+        (workspace / ".env").write_text("OMNI_TEST_SECRET=late-secret-value-67890")
+        assert run_async(os_env.read(".env")).get("content", "") == ""
         late_read = run_async(os_env.shell("cat .env 2>&1; echo $TMPDIR"))
         settled = run_async(os_env.shell("echo $TMPDIR"))
+        before = masked.stat()
+        parent.rename(tmp_path / "displaced")
+        staged.rename(parent)
+        after = masked.stat()
+        assert (after.st_dev, after.st_ino, after.st_ctime_ns) == (
+            before.st_dev,
+            before.st_ino,
+            before.st_ctime_ns,
+        )
+        assert run_async(os_env.read("parent/secret")).get("content", "") == ""
+        replaced = run_async(os_env.shell("echo $TMPDIR"))
+        stable = run_async(os_env.shell("echo $TMPDIR"))
     finally:
         os_env.close()
 
@@ -728,6 +752,8 @@ def test_sandbox_hides_dotfiles_created_after_helper_start(
     assert "late-secret-value-67890" not in late_read.get("stderr", "")
     assert late_read["stdout"].split()[-1] != first["stdout"].strip()
     assert settled["stdout"].strip() == late_read["stdout"].split()[-1]
+    assert replaced["stdout"].strip() != settled["stdout"].strip()
+    assert stable["stdout"].strip() == replaced["stdout"].strip()
 
 
 # ---------------------------------------------------------------------------
