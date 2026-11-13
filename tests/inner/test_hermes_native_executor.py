@@ -94,6 +94,7 @@ async def test_unconfirmed_delivery_preserves_native_work_and_late_input_matchin
 ) -> None:
     import asyncio
     import contextlib
+    import uuid
     from unittest.mock import Mock
 
     from omnigent.runtime import pending_inputs, session_stream
@@ -116,7 +117,8 @@ async def test_unconfirmed_delivery_preserves_native_work_and_late_input_matchin
 
     monkeypatch.setattr(hne, "inject_user_message", inject)
     monkeypatch.setattr(hne, "inject_interrupt", lambda *_a, **_k: interrupted.append(True))
-    monkeypatch.setattr(session_stream, "publish", Mock())
+    publish = Mock()
+    monkeypatch.setattr(session_stream, "publish", publish)
     executor = hne.HermesNativeExecutor(tmp_path)
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
     ctx = TurnContext(
@@ -158,32 +160,48 @@ async def test_unconfirmed_delivery_preserves_native_work_and_late_input_matchin
         assert sent == ["delayed first input"]
         assert interrupted == []
         assert [p["pending_id"] for p in pending_inputs.snapshot_for(conv.id)] == [first, second]
-        for index, text in enumerate(["delayed first input", "next input"]):
-            await _persist_external_conversation_item(
-                conv.id,
-                conv,
-                SessionEventInput(
-                    type="external_conversation_item",
-                    data={
-                        "item_type": "message",
-                        "item_data": {
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": text}],
+        if not steering:
+            for index, text in enumerate(["delayed first input", "next input"]):
+                await _persist_external_conversation_item(
+                    conv.id,
+                    conv,
+                    SessionEventInput(
+                        type="external_conversation_item",
+                        data={
+                            "item_type": "message",
+                            "item_data": {
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": text}],
+                            },
+                            "source_id": f"hermes:late-row:{index}",
                         },
-                        "source_id": f"hermes:late-row:{index}",
-                    },
-                ),
-                store,
-            )
-            assert [p["pending_id"] for p in pending_inputs.snapshot_for(conv.id)] == (
-                [second] if index == 0 else []
-            )
-        saved = store.list_items(conv.id).data
-        assert len(saved) == 2
-        assert [item.data.content[0]["text"] for item in saved] == [
-            "delayed first input",
-            "next input",
-        ]
+                    ),
+                    store,
+                )
+                assert [p["pending_id"] for p in pending_inputs.snapshot_for(conv.id)] == (
+                    [second] if index == 0 else []
+                )
+            saved = store.list_items(conv.id).data
+            expected_ids = [
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL, f"omnigent-external-item:{conv.id}:hermes:late-row:{index}"
+                ).hex
+                for index in range(2)
+            ]
+            assert [item.id for item in saved] == expected_ids
+            consumed = [
+                call.args[1]["data"]
+                for call in publish.call_args_list
+                if call.args[1].get("type") == "session.input.consumed"
+            ]
+            assert [(event["item_id"], event["cleared_pending_id"]) for event in consumed] == [
+                (expected_ids[0], first),
+                (expected_ids[1], second),
+            ]
+            assert [item.data.content[0]["text"] for item in saved] == [
+                "delayed first input",
+                "next input",
+            ]
         await executor.interrupt_session("main")
         assert interrupted == [True], "explicit user Stop still owns interruption"
     finally:

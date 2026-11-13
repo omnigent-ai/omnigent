@@ -735,9 +735,9 @@ def _state_db_path(bridge_dir: Path) -> Path | None:
     Prefers the per-session ``HERMES_HOME`` under *bridge_dir* (created by
     :func:`write_policy_hook_config` and passed to the TUI as ``HERMES_HOME``),
     then ``$HERMES_HOME``, then the default ``~/.hermes``. Returns the EXPECTED
-    path even if the file does not exist yet — on a fresh session Hermes creates
-    ``state.db`` lazily, and the delivery check treats a missing DB as
-    ``MAX(id) == 0`` so the first persisted row still registers as new.
+    path even while startup is still creating it. Injection waits for the
+    transcript schema before sending input; an empty messages table supplies
+    the zero-row baseline for first-message confirmation.
 
     :returns: The state DB path, or ``None`` when no plausible home is known (no
         per-session home, no ``$HERMES_HOME``, no ``~/.hermes`` dir) — the caller
