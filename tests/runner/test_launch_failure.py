@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.errors import ErrorCategory
 from omnigent.llms.errors import REQUEST_SIZE_OVERFLOW_GUIDANCE
+from omnigent.runner import launch_failure
 from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_native_turn_error,
@@ -19,6 +20,12 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_provider_auth_failure,
     diagnose_model_unavailable,
     turn_error_display_message,
+)
+
+# Prepended to the user-lookup probe so its child sees a known or unknown user.
+_KNOWN_USER = "import pwd\npwd.getpwuid = lambda uid: None\n"
+_UNKNOWN_USER = (
+    "import pwd\ndef _unknown(uid):\n    raise KeyError(uid)\npwd.getpwuid = _unknown\n"
 )
 
 # The tail Claude Code prints when refusing --dangerously-skip-permissions as
@@ -185,6 +192,28 @@ def test_unknown_user_outside_macos_is_not_a_lost_login_session(
     )
 
     assert diagnosis is None
+
+
+@pytest.mark.parametrize(
+    ("platform", "user_lookup", "expected_title"),
+    [
+        ("linux", _UNKNOWN_USER, None),
+        ("darwin", _KNOWN_USER, None),
+        ("darwin", _UNKNOWN_USER, "The host lost its macOS login session"),
+    ],
+    ids=["linux-skips-user-lookup", "macos-known-user", "macos-unknown-user"],
+)
+def test_lost_login_session_probe_looks_up_the_user_in_a_child(
+    monkeypatch: pytest.MonkeyPatch, platform: str, user_lookup: str, expected_title: str | None
+) -> None:
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(
+        launch_failure, "_USER_LOOKUP_PROBE", user_lookup + launch_failure._USER_LOOKUP_PROBE
+    )
+
+    diagnosis = launch_failure.diagnose_lost_login_session()
+
+    assert (diagnosis.title if diagnosis else None) == expected_title
 
 
 @pytest.mark.parametrize(

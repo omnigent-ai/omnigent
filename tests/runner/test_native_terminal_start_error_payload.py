@@ -13,9 +13,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-import sys
+import threading
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -31,6 +32,9 @@ from omnigent.runner import launch_failure
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
     _NATIVE_TERMINAL_START_FAILED_CODE,
+    NativeLaunchContext,
+    _ensure_native_terminal,
+    _launch_native_terminal,
     _native_terminal_start_error_payload,
     _native_terminal_start_error_response,
     _publish_native_terminal_start_error,
@@ -47,12 +51,6 @@ _SHORT_MODELS = tuple(f"system.ai.gpt-5-{minor}-sol" for minor in range(1, 6))
 _LONG_MODELS = tuple(
     f"gateway/openai/gpt-5-{minor}-codex-max-preview-2026" for minor in range(1, 6)
 )
-# Prepended to the user-lookup probe so its child sees a known or unknown user.
-_KNOWN_USER = "import pwd\npwd.getpwuid = lambda uid: None\n"
-_UNKNOWN_USER = (
-    "import pwd\ndef _unknown(uid):\n    raise KeyError(uid)\npwd.getpwuid = _unknown\n"
-)
-_GENERIC_CLAUDE_EXIT = "Claude terminal exited with status 1 before becoming available."
 
 
 def test_missing_session_agent_classified_as_lifecycle_condition() -> None:
@@ -386,27 +384,7 @@ def test_pi_early_exit_without_match_falls_back_to_exit_summary(
     assert "Native Pi terminal failed to start" not in message
 
 
-@pytest.mark.parametrize(
-    ("platform", "user_lookup", "expected"),
-    [
-        ("linux", _UNKNOWN_USER, _GENERIC_CLAUDE_EXIT),
-        ("darwin", _KNOWN_USER, _GENERIC_CLAUDE_EXIT),
-        ("darwin", _UNKNOWN_USER, "The host lost its macOS login session: "),
-    ],
-    ids=["linux-skips-user-lookup", "macos-known-user", "macos-unknown-user"],
-)
-def test_claude_early_exit_output_gated_when_capture_disabled(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, platform: str, user_lookup: str, expected: str
-) -> None:
-    """With stderr capture disabled, a non-Codex exit reads no pane output.
-
-    A macOS host still names a lost login session, found by a child's user lookup.
-    """
-    monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
-    monkeypatch.setattr(sys, "platform", platform)
-    monkeypatch.setattr(
-        launch_failure, "_USER_LOOKUP_PROBE", user_lookup + launch_failure._USER_LOOKUP_PROBE
-    )
+def _claude_exited_during_launch(tmp_path: Path) -> TerminalExitedDuringLaunch:
     instance = TerminalInstance(
         name="claude",
         session_key="main",
@@ -415,17 +393,79 @@ def test_claude_early_exit_output_gated_when_capture_disabled(
         command="claude",
     )
     instance._remember_exit_status("1 1")
+    return TerminalExitedDuringLaunch(instance)
+
+
+@pytest.mark.parametrize(
+    ("fallback_diagnosis", "expected"),
+    [
+        (None, "Claude terminal exited with status 1 before becoming available."),
+        (launch_failure._LOGIN_SESSION_LOST, "The host lost its macOS login session: "),
+    ],
+    ids=["no-fallback", "lost-login-session"],
+)
+def test_claude_early_exit_output_gated_when_capture_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fallback_diagnosis: launch_failure.FailureDiagnosis | None,
+    expected: str,
+) -> None:
+    """With stderr capture disabled, a non-Codex exit reads no pane output."""
+    monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    exc = _claude_exited_during_launch(tmp_path)
     read_output = Mock(side_effect=AssertionError("capture is disabled"))
-    monkeypatch.setattr(instance, "last_exit_text", read_output)
+    monkeypatch.setattr(exc.instance, "last_exit_text", read_output)
 
     payload = _native_terminal_start_error_payload(
-        TerminalExitedDuringLaunch(instance), "Claude", session_id="conv_1"
+        exc, "Claude", session_id="conv_1", fallback_diagnosis=fallback_diagnosis
     )
 
     message = payload["message"]
     assert message.startswith(expected), message
     assert "startup terminal output:" not in message
     read_output.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ensure", [False, True], ids=["startup", "reattach"])
+async def test_launch_exit_probes_for_a_lost_login_session_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ensure: bool
+) -> None:
+    """Both launch paths name a lost login session found by a probe off the event loop."""
+    probe_threads: list[int] = []
+
+    def _probe() -> launch_failure.FailureDiagnosis:
+        probe_threads.append(threading.get_ident())
+        return launch_failure._LOGIN_SESSION_LOST
+
+    async def _exit_during_launch(*_args: object, **_kwargs: object) -> None:
+        raise _claude_exited_during_launch(tmp_path)
+
+    monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    monkeypatch.setattr(launch_failure, "diagnose_lost_login_session", _probe)
+    monkeypatch.setattr(orchestration, "_auto_create_claude_terminal", _exit_during_launch)
+    events: list[dict] = []
+    registry = SimpleNamespace(
+        terminal_registry=None, get_terminal_resource=AsyncMock(return_value=None)
+    )
+    ctx = NativeLaunchContext(
+        "conv_1",
+        registry,
+        lambda _session_id, event: events.append(event),
+        server_client=Mock(spec=httpx.AsyncClient),
+    )
+
+    if ensure:
+        response = await _ensure_native_terminal("claude", ctx, ensure_locks={})
+        assert response is not None
+        error = json.loads(response.body)["error"]
+    else:
+        assert await _launch_native_terminal("claude-native", ctx, ensure_locks={}) is False
+        error = next(event["error"] for event in events if event.get("status") == "failed")
+
+    assert error["message"].startswith("The host lost its macOS login session: ")
+    assert len(probe_threads) == 1
+    assert probe_threads[0] != threading.get_ident()
 
 
 def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:

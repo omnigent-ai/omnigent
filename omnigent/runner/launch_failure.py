@@ -355,6 +355,7 @@ def diagnose_lost_login_session() -> FailureDiagnosis | None:
 
     A launch exit whose output is withheld has nothing to classify, so this
     probes the condition directly in a child, which inherits the host's session.
+    The probe blocks for up to two seconds, so run it off the event loop.
 
     :returns: The lost-login-session diagnosis when the lookup fails, else
         ``None`` (including off macOS and when the probe cannot run).
