@@ -45,7 +45,8 @@ def wrap_agy_gateway_launch(argv: list[str], env: dict[str, str]) -> list[str]:
 
 def _model_key(model: str) -> str:
     return (
-        model.removeprefix("system.ai.")
+        model.lower()
+        .removeprefix("system.ai.")
         .removeprefix("databricks-")
         .removesuffix("-preview")
         .replace(".", "-")

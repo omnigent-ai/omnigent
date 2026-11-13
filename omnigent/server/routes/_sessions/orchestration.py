@@ -842,6 +842,7 @@ _pending_archive_stops: dict[str, asyncio.Task[None]] = {}
 # failure, not a sustained outage.
 _ARCHIVE_STOP_LOOKUP_ATTEMPTS = 3
 _ARCHIVE_STOP_LOOKUP_RETRY_S = 0.2
+_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S = 30.0
 # A session that archives itself keeps its runner until the turn that asked
 # ends. The wait is bounded so a turn that never settles still gets torn down.
 _SELF_ARCHIVE_TURN_POLL_S = 2.0
@@ -1047,6 +1048,28 @@ async def _archive_stop(
     _pending_archive_stops.pop(session_id, None)
 
     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
+    # Idle native workers retain processes too. Release only this session's
+    # resources so children sharing an ancestor's runner leave the ancestor up.
+    try:
+        runner_client = await _facade._get_runner_client(
+            session_id, runner_router, conversation=conv, for_control=True
+        )
+        if runner_client is not None:
+            # Tunnel transports ignore HTTPX timeouts; bound headers and body consumption.
+            response = await asyncio.wait_for(
+                runner_client.delete(
+                    f"/v1/sessions/{session_id}", timeout=_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S
+                ),
+                timeout=_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S,
+            )
+            response.raise_for_status()
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Archive runner-session teardown failed for %s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
     if conv.host_id and conv.runner_id:
         try:
             # A sub-agent riding an ancestor's runner leaves it up for the owner.

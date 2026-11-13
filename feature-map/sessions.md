@@ -256,6 +256,13 @@ the header menu), and each place is a separate entry point.
   a third of its width, or after a quick flick, closes it; a shorter drag springs
   back. List scrolling, row taps, long-press reordering and horizontal scrollers
   keep their own touch handling.
+- `session-overview`: behind the `session_overview` release flag (off by
+  default), the desktop chat header shows the session cost as a `$x.xx` chip.
+  Clicking it shows or hides a **Session overview** card with the session cost
+  and per-model token usage, which then leave the desktop Agent info popover.
+  Windows at least 1280px wide with the workspace collapsed and chat in view
+  dock the card open beside chat; other layouts open it over chat. Mobile keeps
+  cost in Agent info.
 
 ## How to get to it (user POV)
 
