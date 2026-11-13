@@ -537,6 +537,11 @@ for draft persistence and parent-isolation checks. The microphone beside
 **Ask a side question...** starts dictation. Edit and resend (pencil) on a sent
 side-chat message loads it into that side chat's composer, not the main one.
 
+**Grid cell** (desktop session grids, see [Sessions](sessions.md)): each cell's
+one-row composer shows the session's host status, permission mode (switchable by
+the owner) and model/effort picker. Picking a fixed model turns Smart Routing off.
+Switch hosts from the full-screen view.
+
 ## Driving it with the repro environment
 
 Preconditions: a running instance (`verify-env start`, then `verify-env
