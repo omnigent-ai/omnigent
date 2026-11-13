@@ -415,7 +415,7 @@ async def test_executor_error_terminates_with_response_failed(
 
 
 @pytest.mark.parametrize(
-    ("policy", "message", "error_code", "preparation_harness"),
+    ("policy", "message", "error_code", "failure_stage"),
     [
         (
             '{"fork": "/private/host/scan"}',
@@ -433,29 +433,29 @@ async def test_executor_error_terminates_with_response_failed(
             '{"sandbox": {"type": "linux_bwrap"}}',
             "The requested sandbox could not be prepared.",
             "HarnessSandboxPreparationError",
-            "claude-sdk",
+            "factory",
         ),
         (
             '{"sandbox": {"type": "linux_bwrap"}}',
             "The requested sandbox could not be prepared.",
             "HarnessSandboxPreparationError",
-            "qwen",
+            "turn",
         ),
     ],
     ids=[
         "invalid-schema",
         "unsupported-policy",
-        "backend-error",
-        "non-claude-launcher-error",
+        "factory-preparation-error",
+        "turn-preparation-error",
     ],
 )
-async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry(
+async def test_executor_policy_failure_releases_turn_for_corrected_retry(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     policy: str,
     message: str,
     error_code: str,
-    preparation_harness: str | None,
+    failure_stage: str | None,
 ) -> None:
     """Policy failures settle the turn and permit a same-session corrected retry."""
     import asyncio
@@ -463,7 +463,8 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
     from unittest.mock import AsyncMock, Mock
 
     from omnigent.inner import antigravity_harness
-    from omnigent.inner.executor import MockExecutor, TextChunk, TurnComplete
+    from omnigent.inner.executor import ExecutorEvent, MockExecutor, TextChunk, TurnComplete
+    from omnigent.inner.sandbox import HarnessSandboxPreparationError
     from omnigent.runner import app as runner_app_module
     from omnigent.runner import create_runner_app
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -479,79 +480,24 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
     policy_env = "HARNESS_ANTIGRAVITY_OS_ENV"
     builder = antigravity_harness._build_antigravity_executor
     private_diagnostic = "/private/host/scan"
-    if preparation_harness == "claude-sdk":
-        from omnigent.inner import claude_sdk_executor
-        from omnigent.inner.os_env_serialization import resolve_harness_os_env
-        from omnigent.inner.sandbox import SandboxPolicy
-
-        policy_env = "HARNESS_CLAUDE_SDK_OS_ENV"
-        monkeypatch.delenv("OMNIGENT_CLAUDE_SDK_NO_SANDBOX", raising=False)
-        monkeypatch.setattr(claude_sdk_executor, "_claude_internal_write_roots", list)
-        monkeypatch.setattr(claude_sdk_executor, "_claude_internal_write_files", list)
-        monkeypatch.setattr(
-            claude_sdk_executor,
-            "resolve_sandbox",
-            Mock(
-                return_value=SandboxPolicy(
-                    backend_type="linux_bwrap",
-                    active=True,
-                    read_roots=[],
-                    write_roots=[],
-                    write_files=[],
-                    allow_network=True,
-                )
-            ),
-        )
-        backend = Mock()
-        backend.wrap_launcher_argv.side_effect = OSError(
-            f"Containment scan failed: {private_diagnostic}"
-        )
-        monkeypatch.setattr(claude_sdk_executor, "get_backend", Mock(return_value=backend))
-
-        def build_claude_with_mock_executor() -> Executor:
-            claude_sdk_executor.prepare_claude_cli_path(
-                "/test/claude", resolve_harness_os_env(policy_env)
-            )
-            return constructor()
-
-        builder = build_claude_with_mock_executor
-
-    elif preparation_harness == "qwen":
-        from omnigent.inner import sandbox
-        from omnigent.inner.os_env_serialization import resolve_harness_os_env
-        from omnigent.inner.qwen_executor import QwenExecutor
-
-        policy_env = "HARNESS_QWEN_OS_ENV"
-        monkeypatch.setattr(
-            sandbox,
-            "resolve_sandbox",
-            Mock(
-                return_value=sandbox.SandboxPolicy(
-                    backend_type="linux_bwrap",
-                    active=True,
-                    read_roots=[],
-                    write_roots=[],
-                    write_files=[],
-                    allow_network=True,
-                )
-            ),
-        )
-        launcher = Mock(side_effect=OSError(f"Launcher creation failed: {private_diagnostic}"))
-        monkeypatch.setattr(sandbox, "create_exec_launcher", launcher)
-
-        def build_qwen_with_scripted_recovery() -> Executor:
-            qwen = QwenExecutor(qwen_path="/test/qwen", os_env=resolve_harness_os_env(policy_env))
-            monkeypatch.setattr(qwen, "_build_spawn_env", AsyncMock(return_value={}))
-            # Exercise real startup failure; reuse scripted completion after launcher repair.
-            if launcher.side_effect is not None:
-                return qwen
-            qwen._sandbox_launch_path([])
-            return constructor()
-
-        builder = build_qwen_with_scripted_recovery
-
     monkeypatch.setenv(policy_env, policy)
     factory = Mock(wraps=builder)
+    preparation_failure = HarnessSandboxPreparationError(
+        f"Containment setup failed: {private_diagnostic}"
+    )
+    if failure_stage == "factory":
+        factory.side_effect = preparation_failure
+    elif failure_stage == "turn":
+        failed_executor = MockExecutor()
+
+        async def fail_turn(**_kwargs: object) -> AsyncIterator[ExecutorEvent]:
+            raise preparation_failure
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(failed_executor, "run_turn", fail_turn)
+        failed_executor.close = AsyncMock()
+        failed_executor.close_session = AsyncMock()
+        factory.side_effect = lambda: failed_executor
     monkeypatch.setattr(runner_app_module, "_session_event_queues_ref", {})
     monkeypatch.setattr(runner_app_module, "_session_histories_ref", {})
     session_id = "conv_factory_policy_retry"
@@ -608,9 +554,8 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
             assert adapter._active_turn_ctx is None
             assert adapter._in_flight == {}
 
-            if preparation_harness == "qwen":
-                launcher.side_effect = None
-                launcher.return_value = "/test/sandbox-launcher"
+            if failure_stage is not None:
+                factory.side_effect = constructor
             else:
                 monkeypatch.setenv(policy_env, '{"sandbox": {"type": "none"}}')
             async with runner_client.stream("POST", event_url, json=request_body) as response:
@@ -625,9 +570,11 @@ async def test_executor_factory_policy_failure_releases_turn_for_corrected_retry
                 and event.data["delta"] == "fake retry response"
                 for event in retry_events
             )
-            if preparation_harness == "qwen":
+            if failure_stage is not None:
                 assert json.loads(policy) == json.loads(os.environ[policy_env])
-                assert launcher.call_count == 2
+            if failure_stage == "turn":
+                failed_executor.close_session.assert_awaited_once_with(session_id)
+                failed_executor.close.assert_awaited_once_with()
             assert factory.call_count == 2
             constructor.assert_called_once()
             assert adapter._executor is executor
