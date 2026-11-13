@@ -120,6 +120,30 @@ def has_scheduled_task_grants(permission_store: PermissionStore | None, task_id:
     return bool(grants)
 
 
+def _retargets(fields: Mapping[str, object], task: ScheduledTask) -> bool:
+    """Whether saving *fields* changes where *task*'s runs happen."""
+
+    def changed(name: str) -> bool:
+        value = fields.get(name, getattr(task, name))
+        # The update keeps the stored target for a null one.
+        if name == "execution_target" and value is None:
+            return False
+        return value != getattr(task, name)
+
+    return any(changed(name) for name in _TARGET_FIELDS)
+
+
+def _refuse_shared_retarget(
+    fields: Mapping[str, object], task: ScheduledTask, permission_store: PermissionStore | None
+) -> None:
+    if _retargets(fields, task) and has_scheduled_task_grants(permission_store, task.id):
+        raise OmnigentError(
+            "Agents cannot change the session, host, workspace or execution target of "
+            "a shared automation",
+            code=ErrorCode.FORBIDDEN,
+        )
+
+
 async def require_agent_keeps_shared_target(
     request: Request,
     fields: Mapping[str, object],
@@ -129,32 +153,33 @@ async def require_agent_keeps_shared_target(
     """Refuse an agent's update that moves a shared automation's runs somewhere else.
 
     Its grantees would see the new session, host or workspace, and agents act on
-    untrusted input. A person can still make the change.
+    untrusted input. A person can still make the change. A fast rejection before the
+    update; :func:`agent_shared_target_guard` repeats it under the task's lock.
 
     :param fields: The fields the update writes, after the route derives them, so a
         session cleared by a mode, agent or service change counts.
     :param task: The automation before the update.
     :raises OmnigentError: ``FORBIDDEN`` for such an update.
     """
+    if request_from_agent(request):
+        await asyncio.to_thread(_refuse_shared_retarget, fields, task, permission_store)
+
+
+def agent_shared_target_guard(
+    request: Request, fields: Mapping[str, object], permission_store: PermissionStore | None
+) -> Callable[[ScheduledTask], None] | None:
+    """The same refusal as a ``ScheduledTaskStore.update`` guard, for an agent's update.
+
+    It checks the task as locked for the update. Granting locks that row too, so a
+    grant either commits before the check and is seen, or waits until the new target
+    is saved. On Databricks, grants live in WHS and take no such lock, so there it
+    only narrows the race.
+
+    :returns: The guard, or ``None`` when a person sent the update.
+    """
     if not request_from_agent(request):
-        return
-
-    def changed(name: str) -> bool:
-        value = fields.get(name, getattr(task, name))
-        # The update keeps the stored target for a null one.
-        if name == "execution_target" and value is None:
-            return False
-        return value != getattr(task, name)
-
-    retargeted = any(changed(name) for name in _TARGET_FIELDS)
-    if retargeted and await asyncio.to_thread(
-        has_scheduled_task_grants, permission_store, task.id
-    ):
-        raise OmnigentError(
-            "Agents cannot change the session, host, workspace or execution target of "
-            "a shared automation",
-            code=ErrorCode.FORBIDDEN,
-        )
+        return None
+    return lambda locked: _refuse_shared_retarget(fields, locked, permission_store)
 
 
 async def automation_managing_session(

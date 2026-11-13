@@ -59,6 +59,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
 from omnigent.server.routes.runner_tunnel import _expected_runner_id_from_headers
 from omnigent.server.routes.scheduled_task_permissions import (
+    agent_shared_target_guard,
     owns_scheduled_task,
     register_scheduled_task_permissions_routes,
     require_agent_keeps_shared_target,
@@ -1471,7 +1472,13 @@ def create_scheduled_tasks_router(
             await require_agent_keeps_shared_target(request, fields, existing, permission_store)
             if fields.get("project_id") is not None:
                 fields["project_id"] = await _owned_project_id(project_owner, fields["project_id"])
-            updated = store.update(scheduled_task_id, expected_schedule=existing, **fields)
+            updated = store.update(
+                scheduled_task_id,
+                expected_schedule=existing,
+                # Rechecked under the task's lock, so a grant made meanwhile counts.
+                guard=agent_shared_target_guard(request, fields, permission_store),
+                **fields,
+            )
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         except Exception as exc:

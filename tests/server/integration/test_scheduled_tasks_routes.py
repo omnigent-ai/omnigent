@@ -4448,6 +4448,45 @@ async def test_agents_cannot_retarget_a_shared_automation(
 
 
 @_SHARING
+async def test_a_grant_made_during_an_agents_retarget_still_refuses_it(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.auth import LEVEL_READ
+    from omnigent.server.routes.scheduled_task_permissions import has_scheduled_task_grants
+
+    task_id = await _create_task(auth_client)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob@example.com")
+
+    async def share_after_the_early_check(
+        request: object, fields: object, task: Any, permission_store: Any
+    ) -> None:
+        # The early check finds no grant; the owner shares the automation right after.
+        assert not has_scheduled_task_grants(permission_store, task.id)
+        permissions.grant_for_scheduled_task("bob@example.com", task.id, LEVEL_READ)
+
+    monkeypatch.setattr(
+        scheduled_tasks_routes, "require_agent_keeps_shared_target", share_after_the_early_check
+    )
+    transport = httpx.ASGITransport(app=auth_app, client=("192.0.2.10", 12345))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as agent:
+        refused = await agent.patch(
+            f"/v1/scheduled-tasks/{task_id}",
+            json={"workspace": "/repo/other"},
+            headers=_agent_headers(db_uri),
+        )
+    # The update's own check, under the task's lock, sees the grant.
+    assert refused.status_code == 403, refused.text
+    assert "of a shared automation" in refused.json()["error"]["message"]
+    saved = (await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())).json()
+    assert (saved["workspace"], saved["host_id"]) == ("/repo", _HOST_ID)
+    assert _task_grantees(db_uri, task_id) == ["bob@example.com"]
+
+
+@_SHARING
 async def test_agents_can_still_edit_a_shared_automation_in_place(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
