@@ -4334,7 +4334,7 @@ function ComposerImpl(
             (disabled ? "This session can't take messages right now." : null));
   const workflowBlockedReason = blockedReasonFor("run a workflow");
   taskActionRef.current = (action, taskName) => {
-    const reason = blockedReasonFor(`${action} the task`);
+    const reason = blockedReasonFor(`${action === "run" ? "run" : "continue"} the task`);
     if (reason) toast.error(reason);
     else sendWorkflowMessage(taskActionMessage(action, taskName));
   };

@@ -6804,7 +6804,7 @@ describe("Composer workflow entry point", () => {
     const error = vi.spyOn(toast, "error");
     const { rerender } = renderWithTooltips(<Composer {...composerProps({ onSend })} />);
 
-    const taskAction = (action: "run" | "continue", name: string) =>
+    const taskAction = (action: "run" | "continue" | "proceed", name: string) =>
       act(() => useSessionTasksActions.getState().taskAction.conv_test?.(action, name));
     taskAction("continue", "Run the tests");
     expect(onSend).toHaveBeenLastCalledWith(
@@ -6814,6 +6814,10 @@ describe("Composer workflow entry point", () => {
     expect(onSend).toHaveBeenLastCalledWith(
       'Run the task "Ship it", then go on with the rest of the plan.',
     );
+    taskAction("proceed", "Approve the deploy");
+    expect(onSend).toHaveBeenLastCalledWith(
+      `It's fine to continue the task "Approve the deploy". Go ahead with it, then go on with the rest of the plan.`,
+    );
 
     rerender(
       <TooltipProvider>
@@ -6822,7 +6826,11 @@ describe("Composer workflow entry point", () => {
     );
     taskAction("run", "Ship it");
     expect(error).toHaveBeenCalledWith("The session is offline. Reconnect it to run the task.");
-    expect(onSend).toHaveBeenCalledTimes(2);
+    taskAction("proceed", "Approve the deploy");
+    expect(error).toHaveBeenCalledWith(
+      "The session is offline. Reconnect it to continue the task.",
+    );
+    expect(onSend).toHaveBeenCalledTimes(3);
     error.mockRestore();
   });
 

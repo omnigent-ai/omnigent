@@ -178,7 +178,8 @@ it finished, stamped the way chat messages are ("8:56 PM" today, "Nov 11,
 background task it left running or a sub-agent is still going, and stopped once
 nothing is. A ready task's **⋯** menu has **Run**, and a stopped task's has
 **Continue**: each sends the agent a message asking it to do that, then go on
-with the rest of the plan. While the agent works, a running task's menu has
+with the rest of the plan. A task waiting for you has **Continue** too, which
+tells the agent it's fine to go ahead with that task, then the rest of the plan. While the agent works, a running task's menu has
 **Stop**, which stops the agent as the composer's Stop does. It waits for you while a question or permission prompt in the chat
 waits for your answer. A task's history marks a restart after the task was done
 or failed. Tasks waiting for you are pink, and an idle list

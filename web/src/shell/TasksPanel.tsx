@@ -337,12 +337,20 @@ function StepHistory({
   );
 }
 
-// What a task's ⋯ menu offers: Run while it's ready, Continue once it's stopped, Stop while it runs.
+// What a task's ⋯ menu offers: Run while it's ready, Continue once it's stopped or
+// while it waits for you, Stop while it runs.
 type RowAction = TaskAction | "stop";
 const ROW_ACTION_LABELS: Record<RowAction, string> = {
   run: "Run",
   continue: "Continue",
+  proceed: "Continue",
   stop: "Stop",
+};
+
+const TASK_ACTION_FOR_STATE: Partial<Record<StepState, TaskAction>> = {
+  ready: "run",
+  stopped: "continue",
+  needs_input: "proceed",
 };
 
 interface RowMenuAction {
@@ -357,9 +365,8 @@ function rowMenuAction(
   onStop: (() => void) | undefined,
 ): RowMenuAction | undefined {
   if (item.state === "running") return onStop && { action: "stop", onSelect: onStop };
-  const action: TaskAction | null =
-    item.state === "ready" ? "run" : item.state === "stopped" ? "continue" : null;
-  if (action === null || !onTaskAction) return undefined;
+  const action = TASK_ACTION_FOR_STATE[item.state];
+  if (action === undefined || !onTaskAction) return undefined;
   return { action, onSelect: () => onTaskAction(action, item.step.name) };
 }
 

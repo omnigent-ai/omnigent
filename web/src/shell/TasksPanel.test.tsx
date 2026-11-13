@@ -401,10 +401,11 @@ describe("TasksPanel", () => {
     }
   });
 
-  it("offers Run on a ready task and Continue on a stopped one once the composer can send", () => {
+  it("offers Run on a ready task, and Continue on a stopped one or one waiting for you", () => {
     showJournal([
-      journalPlan(0, ["baseline"], ["ship"], ["docs", ["ship"]]),
+      journalPlan(0, ["baseline"], ["ship"], ["docs", ["ship"]], ["approve"]),
       status(1, "baseline", "started"),
+      status(2, "approve", "needs_input", "Deploy to prod now?"),
     ]);
     renderPanel();
     expect(screen.queryByTestId("tasks-row-menu")).toBeNull();
@@ -414,7 +415,7 @@ describe("TasksPanel", () => {
     const withdraw = registerTaskAction("conv", taskAction);
     try {
       renderPanel();
-      const [stopped, ready, waiting] = screen.getAllByTestId("tasks-row");
+      const [stopped, ready, waiting, needsYou] = screen.getAllByTestId("tasks-row");
       fireEvent.pointerDown(within(stopped!).getByTestId("tasks-row-menu"), { button: 0 });
       fireEvent.click(screen.getByTestId("tasks-row-continue"));
       expect(taskAction).toHaveBeenLastCalledWith("continue", "baseline");
@@ -423,6 +424,11 @@ describe("TasksPanel", () => {
       expect(taskAction).toHaveBeenLastCalledWith("run", "ship");
       // A task still waiting on another has nothing to offer.
       expect(within(waiting!).queryByTestId("tasks-row-menu")).toBeNull();
+      // Continue on a task waiting for you lets the agent go ahead with it.
+      fireEvent.pointerDown(within(needsYou!).getByTestId("tasks-row-menu"), { button: 0 });
+      expect(screen.getByTestId("tasks-row-proceed")).toHaveTextContent("Continue");
+      fireEvent.click(screen.getByTestId("tasks-row-proceed"));
+      expect(taskAction).toHaveBeenLastCalledWith("proceed", "approve");
 
       // Once the agent works on the started task again, it has nothing to continue.
       setSession({ sessionStatus: "running" });

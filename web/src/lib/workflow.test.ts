@@ -22,6 +22,12 @@ describe("taskActionMessage", () => {
       'Continue the task "Review #6109", then go on with the rest of the plan.',
     );
   });
+
+  it("tells the agent it may go ahead with a task waiting for the user", () => {
+    expect(taskActionMessage("proceed", "Approve the deploy")).toBe(
+      `It's fine to continue the task "Approve the deploy". Go ahead with it, then go on with the rest of the plan.`,
+    );
+  });
 });
 
 describe("workflowMessage", () => {
