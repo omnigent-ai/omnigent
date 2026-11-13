@@ -156,11 +156,6 @@ describe("listReconcileTargets", () => {
     ).toEqual(new Set());
   });
 
-  it("leaves pins to the pinned list", () => {
-    const pinned = conv("s9", { labels: { "omnigent.pinned": "1" }, project_id: "proj_b" });
-    expect(targets([main, alpha, beta], [[pinned, ["pinned"]]])).toEqual(new Set());
-  });
-
   it("treats rows as the viewer's own on a server without sign-in", () => {
     // No viewer id: ownership falls back to the access level, as the sidebar's scopes do.
     const changes = new Map<string, MembershipChange>();

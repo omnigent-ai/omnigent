@@ -12,23 +12,14 @@ import type { ContextType, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  clearPinWriteTracking,
   clearSessionTombstones,
-  PINNED_CONVERSATIONS_KEY,
-  type PinnedConversationsResult,
   useArchiveConversation,
   useConversations,
-  usePinnedConversations,
   useMoveToProject,
-  useTogglePinnedConversation,
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
-import {
-  clearRecentlyCreated,
-  type ConversationsInfiniteData,
-  PINNED_LABEL_KEY,
-} from "@/lib/sessionListCache";
+import { clearRecentlyCreated, type ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 
 // Mock the socket transport so setWatched is observable and start/stop are
@@ -180,7 +171,6 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clearSessionTombstones();
-  clearPinWriteTracking();
   clearRecentlyCreated();
   vi.unstubAllGlobals();
 });
@@ -304,8 +294,7 @@ function listInvalidations(invalidate: { mock: { calls: unknown[][] } }) {
       (queryKey === undefined && predicate !== undefined) ||
       key === "conversations" ||
       key === "project-sessions" ||
-      key === "archived-project-names" ||
-      key === "pinned-conversations"
+      key === "archived-project-names"
     );
   });
 }
@@ -1297,9 +1286,9 @@ describe("SessionUpdatesProvider list invalidation", () => {
   });
 
   it.each([
-    ["an unpin the pinned list still shows", { "omnigent.pinned": "1" }, {}, true],
-    ["a pin the pinned list lacks", {}, { "omnigent.pinned": "1" }, false],
-  ])("refetches the pinned list for %s elsewhere", (_case, before, after, listed) => {
+    ["an unpin", { "omnigent.pinned": "1" }, {}],
+    ["a pin", {}, { "omnigent.pinned": "1" }],
+  ])("does not reconcile the pinned list for a remote %s", (_case, before, after) => {
     vi.useFakeTimers();
     try {
       const client = new QueryClient();
@@ -1310,7 +1299,8 @@ describe("SessionUpdatesProvider list invalidation", () => {
           : old,
       );
       client.setQueryData(["pinned-conversations"], {
-        conversations: listed ? [{ ...conv("conv_a"), labels: before }] : [],
+        conversations:
+          Object.keys(before).length > 0 ? [{ ...conv("conv_a"), labels: before }] : [],
         filterHonored: true,
       });
       renderProvider(client, ["/"]);
@@ -1320,9 +1310,9 @@ describe("SessionUpdatesProvider list invalidation", () => {
       act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), labels: after }] }));
       act(() => vi.advanceTimersByTime(300));
 
-      expect(invalidatedKeys(client, invalidate)).toEqual([
+      expect(invalidatedKeys(client, invalidate)).not.toContain(
         JSON.stringify(["pinned-conversations"]),
-      ]);
+      );
     } finally {
       vi.useRealTimers();
     }
@@ -1403,183 +1393,6 @@ describe("SessionUpdatesProvider archived snapshot", () => {
       vi.useRealTimers();
     }
   });
-});
-
-describe("SessionUpdatesProvider pin writes in flight", () => {
-  interface Deferred<T> {
-    promise: Promise<T>;
-    resolve: (value: T) => void;
-  }
-  function deferred<T>(): Deferred<T> {
-    let resolve!: (value: T) => void;
-    const promise = new Promise<T>((done) => {
-      resolve = done;
-    });
-    return { promise, resolve };
-  }
-  const okJson = (body: unknown) => ({ ok: true, status: 200, json: async () => body }) as Response;
-  const pinnedPage = (rows: Conversation[]) => okJson({ data: rows, has_more: false });
-
-  // The pin PATCH and the pinned-list reads wait on responses the test releases.
-  function stubPinFetch() {
-    const patches: Deferred<Response>[] = [];
-    const pinnedReads: { url: string; response: Deferred<Response> }[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn((url: string, init?: RequestInit) => {
-        if (init?.method === "PATCH") {
-          const response = deferred<Response>();
-          patches.push(response);
-          return response.promise;
-        }
-        if (url.includes("pinned=true")) {
-          const response = deferred<Response>();
-          pinnedReads.push({ url, response });
-          return response.promise;
-        }
-        return Promise.resolve(pinnedPage([]));
-      }),
-    );
-    return {
-      patches,
-      pinnedReads,
-      // Answers every pinned read started so far; the shared scope has no pins.
-      releasePinnedReads(rows: Conversation[]) {
-        for (const read of pinnedReads.splice(0)) {
-          const mine = !read.url.includes("visibility=shared");
-          read.response.resolve(pinnedPage(mine ? rows : []));
-        }
-      },
-    };
-  }
-
-  function renderPinHarness(client: QueryClient) {
-    const toggle: { current: ReturnType<typeof useTogglePinnedConversation> | null } = {
-      current: null,
-    };
-    function Harness() {
-      usePinnedConversations();
-      toggle.current = useTogglePinnedConversation();
-      return null;
-    }
-    render(
-      <QueryClientProvider client={client}>
-        <MemoryRouter initialEntries={["/"]}>
-          <SessionUpdatesProvider>
-            <Harness />
-          </SessionUpdatesProvider>
-        </MemoryRouter>
-      </QueryClientProvider>,
-    );
-    return toggle;
-  }
-
-  // Seeds conv_a as pinned (unpin) or unpinned (pin), with the pinned list to match.
-  function seedPinCase(client: QueryClient, pinned: boolean) {
-    const pinLabel = { [PINNED_LABEL_KEY]: "1" };
-    const before = pinned ? {} : pinLabel;
-    const after = pinned ? pinLabel : {};
-    client.setQueryData<ConversationsInfiniteData>(["conversations", "", false], {
-      pages: [
-        {
-          data: [{ ...conv("conv_a"), labels: before }],
-          first_id: "conv_a",
-          last_id: "conv_a",
-          has_more: false,
-        },
-      ],
-      pageParams: [undefined],
-    });
-    client.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
-      conversations: pinned ? [] : [{ ...conv("conv_a"), labels: pinLabel }],
-      filterHonored: true,
-    });
-    return {
-      before,
-      after,
-      membershipBefore: pinned ? [] : [{ ...conv("conv_a"), labels: pinLabel }],
-    };
-  }
-
-  const cases = [
-    ["pin", true],
-    ["unpin", false],
-  ] as const;
-
-  // Lets the provider's targeted round (250 ms debounce) run.
-  const settle = () =>
-    act(async () => {
-      await new Promise<void>((done) => {
-        setTimeout(done, 400);
-      });
-    });
-
-  it.each(cases)(
-    "does not schedule a pinned-list read for a %s while its write is in flight",
-    async (_name, pinned) => {
-      const fetch = stubPinFetch();
-      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-      const { before, after } = seedPinCase(client, pinned);
-      const toggle = renderPinHarness(client);
-      const handler = frameHandler();
-
-      act(() => toggle.current!.mutate({ id: "conv_a", pinned }));
-      // The frame predates the write, so it still shows the old label.
-      act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), labels: before }] }));
-      await settle();
-      expect(fetch.pinnedReads).toHaveLength(0);
-
-      await waitFor(() => expect(fetch.patches).toHaveLength(1));
-      await act(async () => {
-        fetch.patches[0].resolve(okJson({ ...conv("conv_a"), labels: after }));
-      });
-      await settle();
-      expect(fetch.pinnedReads).toHaveLength(0);
-      expect(
-        client
-          .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
-          ?.conversations.map((row) => row.id),
-      ).toEqual(pinned ? ["conv_a"] : []);
-    },
-  );
-
-  it.each(cases)(
-    "does not let a pinned read started before the %s restore the old membership",
-    async (_name, pinned) => {
-      const fetch = stubPinFetch();
-      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-      const { before, after, membershipBefore } = seedPinCase(client, pinned);
-      const toggle = renderPinHarness(client);
-      const handler = frameHandler();
-
-      // A pinned read already in flight when the write starts.
-      void client.refetchQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
-      await waitFor(() => expect(fetch.pinnedReads.length).toBeGreaterThan(0));
-
-      act(() => toggle.current!.mutate({ id: "conv_a", pinned }));
-      act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), labels: before }] }));
-      await waitFor(() => expect(fetch.patches).toHaveLength(1));
-      await act(async () => {
-        fetch.patches[0].resolve(okJson({ ...conv("conv_a"), labels: after }));
-      });
-      await waitFor(() =>
-        expect(
-          client
-            .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
-            ?.conversations.map((row) => row.id),
-        ).toEqual(pinned ? ["conv_a"] : []),
-      );
-
-      // The older read answers with the membership from before the write.
-      await act(async () => fetch.releasePinnedReads(membershipBefore));
-      await settle();
-      expect(
-        client
-          .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
-          ?.conversations.map((row) => row.id),
-      ).toEqual(pinned ? ["conv_a"] : []);
-    },
-  );
 });
 
 describe("SessionUpdatesProvider projects_changed frames", () => {

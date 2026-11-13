@@ -1888,20 +1888,10 @@ export async function fetchPinnedConversations(
 /** Server-authoritative list of the viewer's pinned sessions. */
 export function usePinnedConversations(sharedEnabled = true, limit = sidebarConfig.pinCap) {
   const viewerId = useViewerId();
-  const queryClient = useQueryClient();
   const query = useQuery<PinnedConversationsResult>({
     queryKey: PINNED_CONVERSATIONS_KEY,
     retry: retryListFetch,
-    queryFn: async () => {
-      const epoch = pinWriteEpoch;
-      const fetched = await fetchPinnedConversations(sharedEnabled, limit);
-      // A pin write touched the cache while this read was in flight, so the read
-      // may predate it. Keep the confirmed cache instead.
-      if (epoch === pinWriteEpoch) return fetched;
-      return (
-        queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY) ?? fetched
-      );
-    },
+    queryFn: () => fetchPinnedConversations(sharedEnabled, limit),
     select: (data) =>
       sharedEnabled
         ? data
@@ -2023,46 +2013,6 @@ function restorePinLabelInCaches(queryClient: QueryClient, id: string, pin: stri
   queryClient.setQueryData<Session>(["session", id], (old) =>
     old ? { ...old, labels: withPin(old.labels) } : old,
   );
-}
-
-// The `?pinned=true` index catches up to a pin write asynchronously, so a
-// pinned-list read that overlaps the write, or lands just after it, can be stale.
-const PIN_WRITE_SETTLE_GRACE_MS = 5_000;
-const pinWriteSettledAt = new Map<string, number>();
-// Bumped on every pin mutation's write to the pinned cache. A read that started
-// at an older epoch may predate that write.
-let pinWriteEpoch = 0;
-
-function pinWriteIds(variables: unknown): string[] {
-  if (Array.isArray(variables)) return variables.map((write: { id: string }) => write.id);
-  return [(variables as { id: string }).id];
-}
-
-/** Records a pin mutation's write to the pinned cache for `ids`. */
-function notePinWrite(ids: readonly string[], settled: boolean): void {
-  pinWriteEpoch += 1;
-  if (!settled) return;
-  const now = Date.now();
-  for (const id of ids) pinWriteSettledAt.set(id, now);
-}
-
-/**
- * Whether a pinned-list refetch for `id` could read the membership from before
- * its pin write: the write is pending, or settled within the grace window.
- */
-export function isPinWriteSettling(queryClient: QueryClient, id: string): boolean {
-  if (Date.now() - (pinWriteSettledAt.get(id) ?? -Infinity) < PIN_WRITE_SETTLE_GRACE_MS) {
-    return true;
-  }
-  return queryClient
-    .getMutationCache()
-    .findAll({ mutationKey: PIN_WRITE_MUTATION_KEY, status: "pending" })
-    .some((mutation) => pinWriteIds(mutation.state.variables).includes(id));
-}
-
-/** Clears pin-write tracking; for tests that reuse session ids. */
-export function clearPinWriteTracking(): void {
-  pinWriteSettledAt.clear();
 }
 
 // Apply a pin/unpin to every cache that renders the row. `labels` is the
@@ -2228,7 +2178,6 @@ export function useTogglePinnedConversation() {
       const labels: Record<string, string> = pinned
         ? { ...base, [PINNED_LABEL_KEY]: String(pinnedAt ?? Date.now()) }
         : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
-      notePinWrite([id], false);
       if (!existing?.family) patch(id, labels, pinned);
       return { prevPinned, prevPin: base[PINNED_LABEL_KEY] };
     },
@@ -2241,12 +2190,10 @@ export function useTogglePinnedConversation() {
       if (ctx.prevPinned !== undefined) {
         queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, ctx.prevPinned);
       }
-      notePinWrite([id], true);
       // The row snaps back, so say why (e.g. an Undo re-pin that didn't save).
       showToast(pinned ? "Couldn't pin the session." : "Couldn't unpin the session.");
     },
     onSuccess: (updated, { pinned }) => {
-      notePinWrite([updated.id], true);
       if (updated.family || findRow(updated.id)?.family) {
         invalidateFamilyLists(queryClient);
         return;
@@ -2308,18 +2255,10 @@ export function useReorderPinnedConversations() {
       const previous = writes.map(
         (w) => findCachedConversationRow(queryClient, w.id)?.labels?.[PINNED_LABEL_KEY],
       );
-      notePinWrite(
-        writes.map((w) => w.id),
-        false,
-      );
       for (const w of writes) apply(w.id, String(w.pinnedAt));
       return { previous };
     },
     onSuccess: (results, writes, ctx) => {
-      notePinWrite(
-        writes.map((w) => w.id),
-        true,
-      );
       results.forEach((result, index) => {
         const { id } = writes[index];
         if (result.status === "fulfilled") {

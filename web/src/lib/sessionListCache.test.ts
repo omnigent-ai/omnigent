@@ -373,7 +373,8 @@ describe("mergeItemsIntoPages project-filtered membership", () => {
     expect(fieldsFor({ archived: true })).toEqual(new Set(["archived"]));
     expect(fieldsFor({ title: "renamed" })).toEqual(new Set(["title"]));
     expect(fieldsFor({ project_id: "proj_1" })).toEqual(new Set(["project"]));
-    expect(fieldsFor({ labels: { "omnigent.pinned": "1" } })).toEqual(new Set(["pinned"]));
+    // A pin label no cached list filters on names no membership field.
+    expect(fieldsFor({ labels: { "omnigent.pinned": "1" } })).toBeUndefined();
     expect(fieldsFor({ labels: { "omnigent.archived_at": "1" } })).toEqual(new Set(["archived"]));
     expect(fieldsFor({ labels: { "omnigent.side_chat": "1" } })).toEqual(new Set(["hidden"]));
   });

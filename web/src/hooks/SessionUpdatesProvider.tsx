@@ -29,7 +29,6 @@ import { getCurrentUserId } from "@/lib/identity";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import {
-  isPinWriteSettling,
   isSessionArchiving,
   isSessionDeleting,
   markRecentlyCreated,
@@ -46,7 +45,6 @@ import {
   mergeItemsIntoPages,
   nullsToUndefined,
   parseProjectSessionsQueryKey,
-  PINNED_LABEL_KEY,
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
   settleOpenSessionRow,
@@ -70,9 +68,6 @@ const DEBOUNCE_MS = 250;
 
 /** Query hash of the Archived view's project-picker scan. */
 const ARCHIVED_PROJECT_NAMES_HASH = hashKey(ARCHIVED_PROJECT_NAMES_KEY);
-
-/** Query hash of the pinned-sessions list. */
-const PINNED_CONVERSATIONS_HASH = hashKey(PINNED_CONVERSATIONS_KEY);
 
 /** Ids every page of a list holds. */
 function listIds(data: ConversationsInfiniteData | undefined): Set<string> {
@@ -223,7 +218,6 @@ function applyItemsToCache(
       needsRefetch,
     });
   }
-  const pinnedIds = new Set<string>();
   queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (previous) => {
     if (!previous) return previous;
     let changed = false;
@@ -242,14 +236,13 @@ function applyItemsToCache(
               ? (item.labels ?? row.labels)
               : {
                   ...(item.labels ?? row.labels),
-                  [PINNED_LABEL_KEY]: row.labels[PINNED_LABEL_KEY],
+                  ["omnigent.pinned"]: row.labels["omnigent.pinned"],
                 },
         };
       })
       .filter(
-        (row) => !row.archived && (row.family?.pinned || row.labels[PINNED_LABEL_KEY] != null),
+        (row) => !row.archived && (row.family?.pinned || row.labels["omnigent.pinned"] != null),
       );
-    for (const row of conversations) pinnedIds.add(row.id);
     return changed ? { ...previous, conversations } : previous;
   });
   // The open session's fetched sidebar row sits outside every list, so a remote
@@ -291,18 +284,6 @@ function applyItemsToCache(
     // or remove a project from the Archived view's picker.
     if (fields.has("archived") || (fields.has("project") && row.archived === true)) {
       targets.add(ARCHIVED_PROJECT_NAMES_HASH);
-    }
-    // A pin made elsewhere that the pinned list lacks, or an unpin it still
-    // shows (its patch keeps the cached pin so local pins aren't dropped). A
-    // session with a local pin write in flight is skipped: the pinned list may
-    // still predate that write.
-    const pinned = row.labels?.[PINNED_LABEL_KEY] != null;
-    if (
-      fields.has("pinned") &&
-      !isPinWriteSettling(queryClient, row.id) &&
-      (pinned ? row.archived !== true && !pinnedIds.has(row.id) : pinnedIds.has(row.id))
-    ) {
-      targets.add(PINNED_CONVERSATIONS_HASH);
     }
   }
   return targets;

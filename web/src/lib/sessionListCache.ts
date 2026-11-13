@@ -235,14 +235,13 @@ export const SIDE_CHAT_LABEL_KEY = "omnigent.side_chat";
  * - `title`: search lists match on it.
  * - `project`: `project_id` or the legacy `omni_project` label.
  * - `hidden`: the side-chat label, which removes a row from every list.
- * - `pinned`: the pin label, read by the pinned-sessions list.
  *
  * Any other change (status, error labels, an `updated_at` bump) is patched in
  * place: every list sorts its loaded rows itself, so it can't move a row in or
  * out of a list. The exception is the row the next page's cursor names; see
  * {@link mergeItemsIntoPages}.
  */
-export type MembershipField = "archived" | "title" | "project" | "hidden" | "pinned";
+export type MembershipField = "archived" | "title" | "project" | "hidden";
 
 /** Every membership field; a row no list holds yet may match on any of them. */
 export const ALL_MEMBERSHIP_FIELDS: ReadonlySet<MembershipField> = new Set<MembershipField>([
@@ -250,14 +249,12 @@ export const ALL_MEMBERSHIP_FIELDS: ReadonlySet<MembershipField> = new Set<Membe
   "title",
   "project",
   "hidden",
-  "pinned",
 ]);
 
 const MEMBERSHIP_LABELS: readonly (readonly [string, MembershipField])[] = [
   [PROJECT_LABEL_KEY, "project"],
   [ARCHIVED_AT_LABEL_KEY, "archived"],
   [SIDE_CHAT_LABEL_KEY, "hidden"],
-  [PINNED_LABEL_KEY, "pinned"],
 ];
 
 /**
