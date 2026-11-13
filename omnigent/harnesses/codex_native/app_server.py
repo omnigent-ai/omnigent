@@ -165,11 +165,8 @@ _STDERR_CHUNK_LIMIT = 65536
 _CODEX_STATE_DB_GLOB = "state_*.sqlite"
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
-# The app-server is always local, so a dead process already closes the socket.
-# Keepalive only adds a failure mode: a host stall longer than the pong timeout
-# drops the connection, and the forwarder tears the app-server down with it.
-# Tradeoff: a live but deadlocked app-server now keeps the socket open
-# indefinitely instead of being detected by a missed pong.
+# Disable local keepalive so host stalls do not tear down Codex. A live but
+# deadlocked app-server will no longer time out.
 _APP_SERVER_PING_INTERVAL_SECONDS: float | None = None
 # hooks.json filename written into the private CODEX_HOME registering the
 # Omnigent policy hook. Codex discovers it as a ``user``-layer hook

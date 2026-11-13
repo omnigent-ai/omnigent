@@ -30,7 +30,8 @@ async def _serve_probe_scenario(websocket: ServerConnection) -> None:
             await websocket.close()
             return
         elif method == "probe/disconnect_with_reason":
-            await websocket.close(code=1011, reason="probe stalled")
+            params = message["params"]
+            await websocket.close(code=params["code"], reason=params["reason"])
             return
         elif method == "probe/malformed":
             await websocket.send("not json")
@@ -117,7 +118,17 @@ def _connection_closed_records(caplog: pytest.LogCaptureFixture) -> list[logging
     return _records_named(caplog, "codex_app_server_connection_closed")
 
 
-async def test_server_side_close_logs_code_and_reason(caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.parametrize(
+    ("code", "reason"),
+    [
+        # Normal closure ends iteration cleanly instead of raising ConnectionClosed.
+        (1000, "probe done"),
+        (1011, "probe stalled"),
+    ],
+)
+async def test_server_side_close_logs_code_and_reason(
+    caplog: pytest.LogCaptureFixture, code: int, reason: str
+) -> None:
     """A socket the app-server closes is logged with why; our own close() is not."""
     caplog.set_level(logging.WARNING, logger="omnigent.harnesses.codex_native.app_server")
     async with serve(_serve_probe_scenario, "127.0.0.1", 0) as server:
@@ -126,13 +137,13 @@ async def test_server_side_close_logs_code_and_reason(caplog: pytest.LogCaptureF
         await client.connect()
         stream = client.iter_events()
         try:
-            await client.notify("probe/disconnect_with_reason")
+            await client.notify("probe/disconnect_with_reason", {"code": code, "reason": reason})
             with contextlib.suppress(StopAsyncIteration):
                 await asyncio.wait_for(anext(stream), timeout=_SETTLE_DEADLINE)
             closed = _connection_closed_records(caplog)
             assert [
                 (r.attributes["close_code"], r.attributes["close_reason"]) for r in closed
-            ] == [(1011, "probe stalled")]
+            ] == [(code, reason)]
         finally:
             await stream.aclose()
             await client.close()

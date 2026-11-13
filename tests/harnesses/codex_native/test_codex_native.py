@@ -2611,9 +2611,7 @@ def test_supervise_forwarder_fails_pending_mcp_startup_when_stream_ends(
     """
     An app-server connection that ends mid-startup fails the pending servers.
 
-    The forwarder owns every signal that resolves the round, and the runner
-    stops the app-server after it returns, so without this the web band kept
-    reading "Starting MCP servers" until the user relaunched the session.
+    Nothing else resolves the startup round once the forwarder exits.
     """
     from omnigent.harnesses.codex_native.bridge import read_mcp_startup
 
@@ -2666,9 +2664,10 @@ def test_supervise_forwarder_cleans_up_when_the_mcp_failure_post_fails(
         "status": "failed",
         "error": "Codex app-server stopped before MCP startup finished",
     }
-    assert [(servers["jira"], kwargs["max_attempts"]) for servers, kwargs in attempted] == [
-        (failed_jira, 1)
-    ]
+    assert [
+        (servers["jira"], kwargs["max_attempts"], kwargs["timeout"])
+        for servers, kwargs in attempted
+    ] == [(failed_jira, 1, 5.0)]
     assert read_mcp_startup(tmp_path)["jira"] == failed_jira
     assert "Codex forwarder could not fail the pending MCP startup round" in caplog.text
     assert client.closed
