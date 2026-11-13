@@ -1742,8 +1742,8 @@ def _platform_safe_api_key_helper(
     if "\x00" in secret:
         logger.warning("claude-sdk: static API key helper cannot use a NUL-containing key")
         return command, None
-    # This environment variable is reserved for the rewritten helper. Never
-    # replace a pre-existing, different value (including an empty string).
+    # Preserve exact-name conflicts supplied in the child-env dictionary.
+    # Inherited process values are overridden only for this invocation.
     existing = env.get(_STATIC_API_KEY_HELPER_SECRET_ENV)
     if existing is not None and existing != secret:
         logger.warning(

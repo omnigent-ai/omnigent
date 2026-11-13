@@ -2203,8 +2203,25 @@ class TestEmptyPrompt(unittest.TestCase):
 
 class TestSystemMessages(unittest.TestCase):
     def test_databricks_auth_uses_api_key_helper_settings(self):
-        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        for windows_static in (False, True):
+            with self.subTest(windows_static=windows_static):
+                self._assert_api_key_helper_settings(windows_static)
 
+    def _assert_api_key_helper_settings(self, windows_static):
+        import shlex
+
+        from omnigent.inner import claude_sdk_executor as ex
+        from omnigent.models.model_catalog import ModelListing
+
+        ClaudeSDKExecutor = ex.ClaudeSDKExecutor
+        token = "dummy-static-'quoted-key"
+        command = (
+            f"printf %s {shlex.quote(token)}"
+            if windows_static
+            else "databricks auth token --host https://host"
+        )
+        listing = ModelListing(source="openai-compatible", verified=True, models=(), note="")
+        discovered = []
         captured_options = []
 
         class _ResultMessage:
@@ -2232,7 +2249,7 @@ class TestSystemMessages(unittest.TestCase):
         ):
             return {
                 "ANTHROPIC_BASE_URL": base_url_override or "https://host/ai-gateway/anthropic",
-                "OMNIGENT_CLAUDE_API_KEY_HELPER": "databricks auth token --host https://host",
+                "OMNIGENT_CLAUDE_API_KEY_HELPER": command,
                 "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
                 "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
             }
@@ -2246,6 +2263,10 @@ class TestSystemMessages(unittest.TestCase):
                     _resolve_gateway_env,
                 ),
                 patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
+                patch.object(ex, "IS_WINDOWS", windows_static),
+                patch.object(
+                    ex.model_catalog, "listing_for_provider", return_value=listing
+                ) as lister,
             ):
                 executor = ClaudeSDKExecutor(
                     gateway=True,
@@ -2262,6 +2283,8 @@ class TestSystemMessages(unittest.TestCase):
                     )
                 ]
             self.assertEqual(len(events), 1)
+            lister.assert_called_once()
+            discovered.append(lister.call_args.args[0])
             # The gateway path routes the CLI through the local shim
             # (which restores thinking.display); record its target and
             # shut it down inside the loop that started it.
@@ -2274,10 +2297,19 @@ class TestSystemMessages(unittest.TestCase):
 
         self.assertEqual(len(captured_options), 1)
         settings = json.loads(captured_options[0].settings)
-        self.assertEqual(
-            settings["apiKeyHelper"],
-            "databricks auth token --host https://host",
-        )
+        if windows_static:
+            self.assertEqual(
+                settings["apiKeyHelper"], ex._windows_static_key_helper_command(sys.executable)
+            )
+            self.assertEqual(captured_options[0].env[ex._STATIC_API_KEY_HELPER_SECRET_ENV], token)
+            self.assertNotIn("dummy-static", captured_options[0].settings)
+            self.assertEqual(discovered[0].api_key, token)
+            self.assertIsNone(discovered[0].auth_command)
+        else:
+            self.assertEqual(settings["apiKeyHelper"], command)
+            self.assertNotIn(ex._STATIC_API_KEY_HELPER_SECRET_ENV, captured_options[0].env)
+            self.assertEqual(discovered[0].auth_command, command)
+            self.assertIsNone(discovered[0].api_key)
         # The CLI talks to the loopback shim; the shim forwards to the
         # real gateway. A direct gateway URL here would mean the shim was
         # bypassed and opus thinking.display stays stripped.
