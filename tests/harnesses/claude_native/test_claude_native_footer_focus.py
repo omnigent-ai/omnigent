@@ -323,11 +323,19 @@ def test_a_message_reaches_main_while_the_terminal_shows_a_subagent(
     assert "x" not in tui.keys
 
 
+@pytest.mark.parametrize(
+    "panel_less_captures", [0, 2], ids=["whole-frames-after", "input-box-without-panel-after"]
+)
 def test_an_empty_first_capture_does_not_skip_the_switch_to_main(
-    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+    panel_less_captures: int, bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The readiness gate finds the subagent's view the torn first capture hid."""
-    tui = _FakeClaudeFooter(viewed=1, queued_captures=[""])
+    """
+    The readiness gate finds the subagent's view the torn first capture hid, and
+    frames that then drop the agent panel are not taken for main.
+    """
+    tui = _FakeClaudeFooter(viewed=1)
+    panel_less = "\n".join(tui.pane().splitlines()[:5])
+    tui.queued_captures = ["", tui.pane(), *[panel_less] * panel_less_captures]
     _drive(monkeypatch, tui)
 
     inject_user_message(bridge_dir, content="what did the explorer find?")
@@ -335,6 +343,7 @@ def test_an_empty_first_capture_does_not_skip_the_switch_to_main(
     assert tui.submitted == ["what did the explorer find?"]
     assert tui.subagent_inbox == []
     assert tui.viewed == 0
+    assert "Escape" not in tui.keys
 
 
 def test_a_slash_command_reaches_main_while_the_terminal_shows_a_subagent(
@@ -395,4 +404,29 @@ def test_a_subagent_view_that_will_not_close_is_refused_before_typing(
         inject_user_message(bridge_dir, content="what did the explorer find?")
 
     assert tui.subagent_inbox == []
+    assert tui.draft == ""
+
+
+def test_a_subagent_view_seen_at_the_readiness_deadline_holds_the_message(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prompt timeout would reap a healthy terminal; an occupied box holds the message."""
+    clock = _Clock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    tui = _FakeClaudeFooter(viewed=1, queued_captures=[""])
+    _drive(monkeypatch, tui)
+    render = tui.capture
+
+    def capture_returning_after_the_deadline() -> str:
+        frame = render()
+        clock.now += claude_native_bridge._TMUX_READY_SLOW_BOOT_TIMEOUT_S
+        return frame
+
+    monkeypatch.setattr(tui, "capture", capture_returning_after_the_deadline)
+
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied, match="a subagent's view"):
+        inject_user_message(bridge_dir, content="what did the explorer find?")
+
+    assert tui.subagent_inbox == []
+    assert tui.submitted == []
     assert tui.draft == ""

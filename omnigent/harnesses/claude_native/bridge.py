@@ -7064,6 +7064,7 @@ def _restore_occupied_input(
     *,
     bridge_dir: Path | None = None,
     timeout_s: float | None = None,
+    subagent_view_seen: bool = False,
 ) -> str | None:
     """
     Dismiss a terminal-opened surface occupying Claude's input box.
@@ -7091,13 +7092,11 @@ def _restore_occupied_input(
     once after two matching captures; repeating it could reopen the view.
 
     A subagent's view, opened from the agent panel, sends a typed message to
-    that subagent. It is walked back to main through the panel one key at a
-    time (:func:`_step_toward_main_view`), each on a focus two captures agree
-    on, so a stale frame cannot move the selection past main. Once the view
-    was seen, main counts as shown only when two frames in a row mark it shown
-    in the agent panel, so a torn capture that drops the panel or input box is
-    neither taken for main nor dismissed with Escape. A panel that closes with
-    its last subagent leaves the view returned, and the caller holds the message.
+    that subagent, so it is walked back to main (:func:`_step_toward_main_view`)
+    on a focus two captures agree on. Once the view was seen, here or by the
+    caller, the box is free only after two frames in a row mark main shown in
+    the agent panel; no frame draws an Escape, and a view main never replaces
+    is returned for the caller to hold the message.
 
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
@@ -7132,6 +7131,8 @@ def _restore_occupied_input(
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
     :param timeout_s: Seconds to keep dismissing, e.g. ``1.5``. ``None`` uses
         :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S`.
+    :param subagent_view_seen: ``True`` when the caller already saw a subagent's
+        view, so main must be confirmed before the box counts as free.
     :returns: ``None`` once the input box is free (or the capture is torn
         before any subagent's view was seen); otherwise the
         :func:`_occupying_surface` description of what is still on screen,
@@ -7148,7 +7149,6 @@ def _restore_occupied_input(
     previous_focus: _AgentPanelFocus | None = None
     focus_stepped: _AgentPanelFocus | None = None
     last_focus_step: float | None = None
-    subagent_view_seen = False
     main_frame_seen = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
@@ -8091,8 +8091,9 @@ def _wait_for_claude_prompt_ready(
         process exited, carrying its wait-status so a clean quit is
         distinguishable from a crash, or tmux no longer reports the pane
         (no wait-status, so ``exit_status`` is ``None``).
-    :raises ClaudeInputBoxOccupied: If the terminal still shows a subagent
-        after the restore; nothing was typed.
+    :raises ClaudeInputBoxOccupied: If a subagent's view seen during the wait is
+        not confirmed closed, including when it is seen at the deadline; nothing
+        was typed.
     :raises ClaudeTerminalDialog: If a consent or selection dialog is holding
         the terminal (see :func:`_terminal_dialog_headline`) on two
         consecutive polls. Raised within a poll interval instead of waiting
@@ -8140,6 +8141,7 @@ def _wait_for_claude_prompt_ready(
     waited_on_sign_in = False
     waited_on_password = False
     waited_on_install = False
+    subagent_view_seen = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -8157,30 +8159,40 @@ def _wait_for_claude_prompt_ready(
         else:
             empty_polls += 1
         occupying_surface = _occupying_surface(pane)
-        if _claude_prompt_rendered(pane) and (
-            bridge_dir is None or occupying_surface != _SUBAGENT_VIEW_SURFACE
-        ):
+        subagent_view_seen = subagent_view_seen or occupying_surface == _SUBAGENT_VIEW_SURFACE
+        if _claude_prompt_rendered(pane) and (bridge_dir is None or not subagent_view_seen):
             return
         remaining = hard_deadline - time.monotonic()
         if (
             bridge_dir is not None
-            and remaining > 0
             and (
-                occupying_surface in (_DETAILED_TRANSCRIPT_SURFACE, _SUBAGENT_VIEW_SURFACE)
+                subagent_view_seen
                 or (
-                    occupying_surface == _OVERLAY_SURFACE
-                    and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
+                    remaining > 0
+                    and (
+                        occupying_surface == _DETAILED_TRANSCRIPT_SURFACE
+                        or (
+                            occupying_surface == _OVERLAY_SURFACE
+                            and (_ESCAPE_DISMISS_HINT.search(pane) or _btw_overlay_present(pane))
+                        )
+                    )
                 )
             )
             and _terminal_dialog_headline(pane) is None
             and not _escape_quits_claude(pane)
         ):
             # A panel or subagent's view can appear after preflight or an empty startup capture.
-            surface = _restore_occupied_input(
-                socket_path,
-                tmux_target,
-                bridge_dir=bridge_dir,
-                timeout_s=min(_OCCUPIED_INPUT_DISMISS_TIMEOUT_S, remaining),
+            # Past the deadline, a seen subagent's view holds the message instead of timing out.
+            surface = (
+                _restore_occupied_input(
+                    socket_path,
+                    tmux_target,
+                    bridge_dir=bridge_dir,
+                    timeout_s=min(_OCCUPIED_INPUT_DISMISS_TIMEOUT_S, remaining),
+                    subagent_view_seen=subagent_view_seen,
+                )
+                if remaining > 0
+                else _SUBAGENT_VIEW_SURFACE
             )
             if surface == _SUBAGENT_VIEW_SURFACE:
                 raise ClaudeInputBoxOccupied(
@@ -8193,6 +8205,7 @@ def _wait_for_claude_prompt_ready(
                     "A panel is covering Claude Code's input box, so nothing was sent. "
                     "Open the terminal, dismiss the panel, then retry."
                 )
+            subagent_view_seen = False
             continue
         billing_notice = auto_mode_billing_notice_visible(pane)
         if billing_notice:
