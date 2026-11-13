@@ -10,6 +10,7 @@ import uuid
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -206,6 +207,43 @@ async def test_a_share_made_after_the_sessions_grants_were_read_is_not_lowered(
         "bob@example.com": LEVEL_READ,
     }
     assert announced == [("bob@example.com", session.id)]
+
+
+async def test_a_sync_keeps_a_grant_the_database_matches_to_a_grantee(
+    permissions, task, db_uri
+) -> None:
+    """MySQL's collation matches ``Bob@`` to the listed ``bob@``; other engines don't."""
+    session = _session(
+        permissions, **{RESERVED_USER_LOCAL: LEVEL_OWNER, "Bob@example.com": LEVEL_EDIT}
+    )
+
+    await _sync(permissions, task, session)
+
+    variant = (
+        {"Bob@example.com": LEVEL_EDIT}
+        if permissions._engine.dialect.name == "mysql"
+        # An unlisted ID is revoked, and the listed one is added.
+        else {"bob@example.com": LEVEL_READ}
+    )
+    assert _levels(permissions, session.id) == {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        "alice@example.com": LEVEL_READ,
+        **variant,
+    }
+
+
+async def test_a_failed_grantee_check_keeps_the_share(permissions, task, monkeypatch) -> None:
+    grants = {RESERVED_USER_LOCAL: LEVEL_OWNER, "carol@example.com": LEVEL_READ}
+    session = _session(permissions, **grants)
+    monkeypatch.setattr(
+        permissions,
+        "resolve_scheduled_task_access",
+        Mock(side_effect=RuntimeError("check failed")),
+    )
+
+    await _sync(permissions, task, session)
+
+    assert _levels(permissions, session.id) == grants
 
 
 async def test_a_sync_never_revokes_an_owner_grant_or_the_automation_owner(
