@@ -1936,7 +1936,7 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
     if mode == "wrapped":
         monkeypatch.setattr(
             "omnigent.harnesses.claude_native.main.resolve_claude_launch",
-            lambda command, args: ("isaac", ["claude", "--", *args]),
+            lambda command, args: ("claude-wrapper", ["claude", "--", *args]),
         )
     caller_args = ("--settings", str(settings_file), '--settings={"env":{"ORDER":"inline"}}')
     if mode == "delimiter":

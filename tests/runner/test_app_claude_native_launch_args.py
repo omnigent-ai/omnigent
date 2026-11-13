@@ -1388,9 +1388,12 @@ async def _auto_create_claude_terminal_for_test(
 @pytest.mark.parametrize(
     "command,prefix",
     [
-        ("isaac", ["--"]),
-        ("isaac", ["claude", "--"]),
-        ("isaac", ["--", "--settings", '{"env":{"ORDER":"configured","CONFIG_ONLY":"yes"}}']),
+        ("claude-wrapper", ["--"]),
+        ("claude-wrapper", ["claude", "--"]),
+        (
+            "claude-wrapper",
+            ["--", "--settings", '{"env":{"ORDER":"configured","CONFIG_ONLY":"yes"}}'],
+        ),
         ("claude", ["--settings", '{"env":{"ORDER":"configured","CONFIG_ONLY":"yes"}}']),
     ],
     ids=[
@@ -1440,7 +1443,7 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
             )
             assert settings["env"]["ORDER"] == "caller"
             assert settings["hooks"]["UserPromptSubmit"]
-            if command == "isaac":
+            if command == "claude-wrapper":
                 boundary = prefix.index("--") + 1
                 assert created.instance.args[:boundary] == prefix[:boundary]
             if "--settings" in prefix:
