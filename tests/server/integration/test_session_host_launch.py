@@ -4966,7 +4966,11 @@ async def test_unbinding_child_before_archive_does_not_stop_parents_shared_runne
     )
 
 
-@pytest.mark.parametrize("host_placement", ["local", "remote", "hostless"])
+@pytest.mark.parametrize(
+    ("host_placement", "cleanup_status"),
+    [("local", 204), ("remote", 204), ("hostless", 204), ("local", 503)],
+    ids=["local", "remote", "hostless", "cleanup-rejected"],
+)
 async def test_stopping_child_does_not_stop_parents_shared_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -4975,6 +4979,7 @@ async def test_stopping_child_does_not_stop_parents_shared_runner(
     monkeypatch: pytest.MonkeyPatch,
     _shared_runner_family: dict[str, str],
     host_placement: str,
+    cleanup_status: int,
 ) -> None:
     """Child control follows its runner even when the host reconnects elsewhere."""
     from omnigent.runner.routing import RunnerRouter
@@ -5002,7 +5007,7 @@ async def test_stopping_child_does_not_stop_parents_shared_runner(
 
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append((request.method, request.url.path))
-        return httpx.Response(204)
+        return httpx.Response(cleanup_status if request.method == "DELETE" else 204)
 
     async with (
         _HostFrameResponder(comm) as host,
@@ -5028,7 +5033,12 @@ async def test_stopping_child_does_not_stop_parents_shared_runner(
         stop = await client.post(
             f"/v1/sessions/{child['id']}/events", json={"type": "stop_session"}
         )
-        assert stop.status_code in (200, 202), stop.text
+        if cleanup_status >= 400:
+            assert stop.status_code == 503, stop.text
+            assert stop.json()["error"]["code"] == "runner_unavailable"
+            assert store.get_conversation(child["id"]).runner_id == parent["runner_id"]
+        else:
+            assert stop.status_code in (200, 202), stop.text
         expected_requests = [("POST", f"/v1/sessions/{child['id']}/events")]
         if host_placement != "hostless":
             expected_requests.append(("DELETE", f"/v1/sessions/{child['id']}"))
