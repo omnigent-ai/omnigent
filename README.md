@@ -386,7 +386,7 @@ inference config: Omnigent then writes a session-private Jcode config and
 forwards the agent's `model`. Jcode's ACP server ignores session-scoped MCP
 servers, so Omnigent's MCP tools are not offered to it.
 
-Use the vendor login rather than an API key. A builtin ACP row has no
+Use the vendor login rather than an API key. A built-in ACP row has no
 `env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
 credential allowlist, so exporting it in your shell does not reach the agent.
 If you need the key route, pass it explicitly with
