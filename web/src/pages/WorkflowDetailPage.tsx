@@ -323,6 +323,7 @@ function WorkflowRunRow({
   const control = run.archived
     ? null
     : planRunControl(progress, run.statuses, run.sessionStatus === "running");
+  const refreshKeys = [["workflow-runs", workflowId]];
   const [graphOpen, setGraphOpen] = useState(false);
   const sessionPath = `/c/${encodeURIComponent(run.sessionId)}`;
   const title = run.title || "Untitled session";
@@ -359,7 +360,13 @@ function WorkflowRunRow({
             {run.archived && <span>Archived</span>}
           </p>
           {progress.length > 0 && (
-            <RunTimeline sessionId={run.sessionId} progress={progress} className="mt-3 pr-1" />
+            <RunTimeline
+              sessionId={run.sessionId}
+              progress={progress}
+              refreshKeys={refreshKeys}
+              actionable={!run.archived}
+              className="mt-3 pr-1"
+            />
           )}
         </div>
         {control && (
@@ -367,7 +374,7 @@ function WorkflowRunRow({
             sessionId={run.sessionId}
             planName={workflowName}
             control={control}
-            refreshKeys={[["workflow-runs", workflowId]]}
+            refreshKeys={refreshKeys}
             className="relative -my-1"
           />
         )}

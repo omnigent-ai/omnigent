@@ -10,25 +10,67 @@ import type { StepProgress } from "@/lib/sessionJournal";
 import { interrupt, sendUserMessage } from "@/lib/sessionsApi";
 import { Link, useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
-import { continuePlanMessage } from "@/lib/workflow";
+import { continuePlanMessage, taskActionMessage } from "@/lib/workflow";
 import { PlanRunButton, type PlanRunControl } from "@/shell/PlanRunButton";
-import { ProgressStrip } from "@/shell/TasksPanel";
+import { ProgressStrip, taskMenuAction } from "@/shell/TasksPanel";
 import { openTasksTab } from "@/store/sessionTasksActions";
+
+/** The queries that list a run, e.g. `["workflow-runs", workflowId]`. */
+type RunRefreshKeys = readonly (readonly unknown[])[];
+
+/**
+ * Messages or stops a run's session from a page other than its chat, then
+ * refreshes the lists that show the run.
+ */
+function useRunSession(sessionId: string, refreshKeys: RunRefreshKeys) {
+  const queryClient = useQueryClient();
+  const [pending, setPending] = useState(false);
+  const act = async (request: () => Promise<void>) => {
+    setPending(true);
+    try {
+      await request();
+      for (const queryKey of refreshKeys) void queryClient.invalidateQueries({ queryKey });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Couldn't reach the session.");
+    } finally {
+      setPending(false);
+    }
+  };
+  return {
+    pending,
+    send: (text: string) =>
+      void act(async () => {
+        const result = await sendUserMessage(sessionId, text);
+        if (result.denied) toast.error("A policy blocked the message.");
+      }),
+    stop: () =>
+      void act(async () => {
+        await interrupt(sessionId);
+      }),
+  };
+}
 
 /**
  * A run's tasks as the Tasks tab's timeline, above the row's link. A segment
- * opens that task in the run's session.
+ * opens that task in the run's session, and its card's ⋯ menu runs, continues,
+ * retries or stops the task there.
  */
 export function RunTimeline({
   sessionId,
   progress,
+  refreshKeys,
+  actionable = true,
   className,
 }: {
   sessionId: string;
   progress: readonly StepProgress[];
+  refreshKeys: RunRefreshKeys;
+  /** False when the run takes no actions, e.g. an archived one. */
+  actionable?: boolean;
   className?: string;
 }) {
   const navigate = useNavigate();
+  const session = useRunSession(sessionId, refreshKeys);
   return (
     <div className={cn("relative z-10", className)}>
       <ProgressStrip
@@ -38,6 +80,16 @@ export function RunTimeline({
           openTasksTab(sessionId, stepId);
           navigate(`/c/${encodeURIComponent(sessionId)}`);
         }}
+        menuActionFor={
+          actionable
+            ? (item) =>
+                taskMenuAction(
+                  item,
+                  (action, taskName) => session.send(taskActionMessage(action, taskName)),
+                  session.stop,
+                )
+            : undefined
+        }
       />
     </div>
   );
@@ -59,34 +111,18 @@ export function RunPlanButton({
   /** The plan's name for the play message, e.g. the workflow's. */
   planName: string | null;
   control: PlanRunControl;
-  /** The queries that list the run, e.g. `["workflow-runs", workflowId]`. */
-  refreshKeys: readonly (readonly unknown[])[];
+  refreshKeys: RunRefreshKeys;
   className?: string;
 }) {
-  const queryClient = useQueryClient();
-  const [pending, setPending] = useState(false);
-  const act = async () => {
-    setPending(true);
-    try {
-      if (control === "stop") {
-        await interrupt(sessionId);
-      } else {
-        const result = await sendUserMessage(sessionId, continuePlanMessage(planName));
-        if (result.denied) toast.error("A policy blocked the message.");
-      }
-      for (const queryKey of refreshKeys) void queryClient.invalidateQueries({ queryKey });
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Couldn't reach the session.");
-    } finally {
-      setPending(false);
-    }
-  };
+  const session = useRunSession(sessionId, refreshKeys);
   return (
     <PlanRunButton
       control={control}
-      disabled={pending}
+      disabled={session.pending}
       className={cn("z-10", className)}
-      onClick={() => void act()}
+      onClick={() =>
+        control === "stop" ? session.stop() : session.send(continuePlanMessage(planName))
+      }
     />
   );
 }

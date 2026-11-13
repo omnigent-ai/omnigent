@@ -181,7 +181,9 @@ nothing is. A ready task's **⋯** menu has **Run**, and a stopped task's has
 **Continue**: each sends the agent a message asking it to do that, then go on
 with the rest of the plan. A task waiting for you has **Continue** too, which
 tells the agent it's fine to go ahead with that task, marking it started (or
-done, if its work is already done), then the rest of the plan. While the agent works, a running task's menu has
+done, if its work is already done), then the rest of the plan. A failed task's
+menu has **Retry**, which asks the agent to run it again, then go on with the
+rest of the plan. While the agent works, a running task's menu has
 **Stop**, which stops the agent as the composer's Stop does. It waits for you while a question or permission prompt in the chat
 waits for your answer. A task's history marks a restart after the task was done
 or failed. Tasks waiting for you are pink, and an idle list
@@ -189,9 +191,11 @@ with tasks the agent could still run says "Stopped" ("Run ended" after an
 automation run), so it never looks about to run. Then a play button at the top,
 beside "Updated …", asks the agent to continue the plan from where it left off,
 and while the agent works a stop button there stops it. A run's row on a
-workflow's or an automation's page has the same buttons. A summary line and a strip
+workflow's or an automation's page has the same buttons, and its strip the same
+task menus, which message the run's session. A summary line and a strip
 count the tasks in each state, and stay at the top as you scroll: hover a
-segment of the strip for that task's status, or click it to jump to the task. In
+segment of the strip for a card with that task's status and its **⋯** menu, or
+click it to jump to the task. In
 a plan, the strip links two neighboring tasks when one waits on the other, so a
 gap between them means they can run at the same time; hovering a task's segment
 arcs it to the tasks it waits on and the tasks that wait on it. When the agent replans, the new

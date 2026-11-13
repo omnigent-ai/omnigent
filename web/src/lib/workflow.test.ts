@@ -26,12 +26,15 @@ describe("continuePlanMessage", () => {
 });
 
 describe("taskActionMessage", () => {
-  it("asks to run or continue the task by name, then the rest of the plan", () => {
+  it("asks to run, continue or retry the task by name, then the rest of the plan", () => {
     expect(taskActionMessage("run", "Share the files")).toBe(
       'Run the task "Share the files", then go on with the rest of the plan.',
     );
     expect(taskActionMessage("continue", "Review #6109")).toBe(
       'Continue the task "Review #6109", then go on with the rest of the plan.',
+    );
+    expect(taskActionMessage("retry", "Run the tests")).toBe(
+      'Retry the task "Run the tests", then go on with the rest of the plan.',
     );
   });
 

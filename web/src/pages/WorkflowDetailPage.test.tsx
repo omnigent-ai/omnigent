@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -16,6 +16,8 @@ import {
 import type * as WorkflowHooks from "@/hooks/useWorkflow";
 import type * as RoutingModule from "@/lib/routing";
 import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
+import { sendUserMessage } from "@/lib/sessionsApi";
+import type * as SessionsApi from "@/lib/sessionsApi";
 import { openTasksTab } from "@/store/sessionTasksActions";
 import type * as TasksActions from "@/store/sessionTasksActions";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
@@ -34,6 +36,10 @@ vi.mock("@/hooks/useSavedWorkflows", () => ({
 vi.mock("@/store/sessionTasksActions", async (importOriginal) => {
   const actual = await importOriginal<typeof TasksActions>();
   return { ...actual, openTasksTab: vi.fn() };
+});
+vi.mock("@/lib/sessionsApi", async (importOriginal) => {
+  const actual = await importOriginal<typeof SessionsApi>();
+  return { ...actual, interrupt: vi.fn(), sendUserMessage: vi.fn() };
 });
 vi.mock("@/hooks/useNow", () => ({ useNow: () => new Date("2026-11-12T18:00:00Z") }));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => "loading" }));
@@ -257,6 +263,42 @@ describe("WorkflowDetailPage", () => {
     expect(within(running!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
     expect(within(finished!).queryByTestId("plan-continue")).toBeNull();
     expect(within(finished!).queryByTestId("plan-stop")).toBeNull();
+  });
+
+  it("sends a task's ⋯ action on a run's timeline card to the run's session", async () => {
+    vi.mocked(sendUserMessage).mockResolvedValue({ queued: true });
+    mockWorkflow({});
+    const session = "a".repeat(32);
+    mockRuns([
+      run(session, "Fix the upload test", { done: 1, failed: 1 }, [
+        status("explore", "done"),
+        status("fix", "failed"),
+      ]),
+      {
+        ...run("b".repeat(32), "Archived run", { failed: 1 }, [status("explore", "failed")]),
+        archived: true,
+      },
+    ]);
+    renderPage();
+
+    const [live, archived] = screen.getAllByTestId("workflow-run");
+    fireEvent.focus(within(live!).getAllByTestId("tasks-progress-segment")[1]!);
+    fireEvent.pointerDown(await screen.findByTestId("tasks-progress-menu"), { button: 0 });
+    fireEvent.click(screen.getByTestId("tasks-progress-retry"));
+    await waitFor(() =>
+      expect(sendUserMessage).toHaveBeenCalledWith(
+        session,
+        'Retry the task "Fix the test", then go on with the rest of the plan.',
+      ),
+    );
+    await waitFor(() => expect(screen.queryByTestId("tasks-progress-card")).toBeNull());
+
+    // An archived run's cards offer nothing.
+    fireEvent.focus(within(archived!).getAllByTestId("tasks-progress-segment")[0]!);
+    expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent(
+      "Explore the failures",
+    );
+    expect(screen.queryByTestId("tasks-progress-menu")).toBeNull();
   });
 
   it("shows a run on the workflow's graph, where each task stands", () => {

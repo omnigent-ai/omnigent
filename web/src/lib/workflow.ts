@@ -63,14 +63,20 @@ export function savedWorkflowMessage(
 }
 
 /**
- * What a task's ⋯ menu in the Tasks tab asks of the agent: run a ready task,
- * continue a stopped one, or go ahead with one waiting for you (`proceed`).
+ * What a task's ⋯ menu asks of the agent: run a ready task, continue a stopped
+ * one, go ahead with one waiting for you (`proceed`), or retry a failed one.
  */
-export type TaskAction = "run" | "continue" | "proceed";
+export type TaskAction = "run" | "continue" | "proceed" | "retry";
+
+const TASK_ACTION_VERBS: Record<Exclude<TaskAction, "proceed">, string> = {
+  run: "Run",
+  continue: "Continue",
+  retry: "Retry",
+};
 
 /**
- * The message that asks the agent to run, continue or go ahead with a task,
- * then go on with the rest of the plan rather than stop after that task.
+ * The message that asks the agent to run, continue, go ahead with or retry a
+ * task, then go on with the rest of the plan rather than stop after that task.
  *
  * @param taskName The task's name, e.g. `"Review #6109"`.
  * @returns e.g. `Run the task "Share the review files", then go on with the rest of the plan.`
@@ -79,8 +85,7 @@ export function taskActionMessage(action: TaskAction, taskName: string): string 
   if (action === "proceed") {
     return `It's fine to continue the task "${taskName}". Mark it started and go ahead with it (or mark it done if its work is already done), then go on with the rest of the plan.`;
   }
-  const verb = action === "run" ? "Run" : "Continue";
-  return `${verb} the task "${taskName}", then go on with the rest of the plan.`;
+  return `${TASK_ACTION_VERBS[action]} the task "${taskName}", then go on with the rest of the plan.`;
 }
 
 /**
