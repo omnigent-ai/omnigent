@@ -32,23 +32,24 @@ def require_sharing_mode_allows_grant(
     *,
     level: int,
     load_workspace: Callable[[], str | None],
+    allow_unknown_workspace: bool = True,
 ) -> None:
     """Raise unless the sharing mode allows a new grant at *level*.
 
     Only new grants are gated; revoking, listing and owner grants never call this.
     The mode is read once. Checks run in this order: ``OFF`` refuses everything;
-    ``RESTRICTED_READ_ONLY`` refuses a home or root workspace, even for read; read-only
-    modes refuse any level outside :data:`READ_ONLY_MODE_LEVELS`.
-
-    An unknown workspace (``None``) is allowed under ``RESTRICTED_READ_ONLY``, matching
-    the session share route. Callers that must fail closed without a workspace, such as
-    automation runs, check that themselves.
+    ``RESTRICTED_READ_ONLY`` refuses a home or root workspace, even for read, and an
+    unknown one unless *allow_unknown_workspace*; read-only modes refuse any level
+    outside :data:`READ_ONLY_MODE_LEVELS`.
 
     :param state: ``app.state``, which carries the live policy callables.
     :param level: The level to grant, e.g. ``LEVEL_READ``.
     :param load_workspace: Returns the session's working directory, or ``None`` when
         unknown. Called only under ``RESTRICTED_READ_ONLY``, so a store read happens
         only when the policy needs it.
+    :param allow_unknown_workspace: Whether ``RESTRICTED_READ_ONLY`` allows a grant
+        without a known workspace. The session share route allows it; automation
+        runs fail closed instead.
     :raises OmnigentError: ``FORBIDDEN`` naming the refused policy.
     """
     mode = _sharing_mode(state)
@@ -57,13 +58,21 @@ def require_sharing_mode_allows_grant(
             "Sharing has been disabled for this Omnigent server.",
             code=ErrorCode.FORBIDDEN,
         )
-    # A home or root directory is too broad to expose, even read-only.
-    if mode == SharingMode.RESTRICTED_READ_ONLY and workspace_sharing_blocked(load_workspace()):
-        raise OmnigentError(
-            "This session's working directory (a home or root directory) "
-            "cannot be shared on this Omnigent server.",
-            code=ErrorCode.FORBIDDEN,
-        )
+    if mode == SharingMode.RESTRICTED_READ_ONLY:
+        workspace = load_workspace()
+        # A home or root directory is too broad to expose, even read-only.
+        if workspace_sharing_blocked(workspace):
+            raise OmnigentError(
+                "This session's working directory (a home or root directory) "
+                "cannot be shared on this Omnigent server.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if not workspace and not allow_unknown_workspace:
+            raise OmnigentError(
+                "This session has no known working directory, so it cannot be shared "
+                "on this Omnigent server.",
+                code=ErrorCode.FORBIDDEN,
+            )
     read_only = mode in (SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY)
     if read_only and level not in READ_ONLY_MODE_LEVELS:
         raise OmnigentError(

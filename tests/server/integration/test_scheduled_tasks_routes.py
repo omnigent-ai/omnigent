@@ -1679,6 +1679,7 @@ async def test_delete_removes_task(
     auth_client: httpx.AsyncClient, db_uri: str, claimed: bool, shared: bool
 ) -> None:
     from omnigent.db.db_models import current_workspace_id
+    from omnigent.server.auth import LEVEL_READ
     from omnigent.server.scheduled.schedule import continued_sandbox_host_id
     from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
     from omnigent.stores.host_store import HostStore
@@ -1689,6 +1690,9 @@ async def test_delete_removes_task(
     ).json()
     task_id = created["id"]
     store = SqlAlchemyScheduledTaskStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    _make_user(db_uri, "bob@example.com")
+    permissions.grant_for_scheduled_task("bob@example.com", task_id, LEVEL_READ)
     if claimed:
         task = store.get(task_id)
         from omnigent.server.scheduled.schedule import next_scheduled_time
@@ -1731,6 +1735,7 @@ async def test_delete_removes_task(
 
     deleted = await auth_client.delete(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert deleted.status_code == 200, deleted.text
+    assert permissions.list_for_scheduled_task(task_id) == ([], None)
     retained_host = hosts.get_host(host_id, include_deleted=True)
     assert retained_host is not None
     assert (retained_host.deleted_at is None) is shared
