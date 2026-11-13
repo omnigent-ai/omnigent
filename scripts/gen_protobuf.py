@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import filecmp
+import importlib.util
 import shutil
 import subprocess
 import sys
@@ -50,9 +51,9 @@ def _protos() -> list[Path]:
 
 def _run_protoc(out_dir: Path) -> None:
     """Compile every API schema into ``out_dir`` (rooted like the repo)."""
-    if not _CONNECT_PLUGIN.exists():
+    if importlib.util.find_spec("grpc_tools") is None or not _CONNECT_PLUGIN.exists():
         raise SystemExit(
-            f"{_CONNECT_PLUGIN} not found. Install the dev dependencies first:\n"
+            "grpc_tools or protoc-gen-connectrpc not found. Install the dev dependencies first:\n"
             "  uv sync --group lint"
         )
     cmd = [
@@ -68,18 +69,19 @@ def _run_protoc(out_dir: Path) -> None:
         "--connectrpc_opt=protobuf=google",
         *(str(p) for p in _protos()),
     ]
-    try:
-        subprocess.run(cmd, check=True, cwd=_REPO_ROOT)
-    except FileNotFoundError:
-        raise SystemExit(
-            "grpc_tools.protoc not found. Install the dev dependencies first:\n"
-            "  uv sync --group lint"
-        ) from None
+    subprocess.run(cmd, check=True, cwd=_REPO_ROOT)
 
 
 def _generated(root: Path) -> list[Path]:
     """Generated files under ``root``, relative to it."""
     return sorted(p.relative_to(root) for p in root.rglob("*") if p.is_file())
+
+
+def _committed() -> set[Path]:
+    """Generated-looking files in the repo's API tree, relative to the repo root."""
+    api = _REPO_ROOT / _API_ROOT
+    patterns = ("*_pb2.py", "*_pb2.pyi", "*_connect.py")
+    return {p.relative_to(_REPO_ROOT) for pattern in patterns for p in api.rglob(pattern)}
 
 
 def _generate() -> int:
@@ -97,12 +99,22 @@ def _check() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
         _run_protoc(tmp_dir)
+        generated = _generated(tmp_dir)
         stale = [
             p
-            for p in _generated(tmp_dir)
+            for p in generated
             if not (_REPO_ROOT / p).exists()
             or not filecmp.cmp(tmp_dir / p, _REPO_ROOT / p, shallow=False)
         ]
+    # A binding whose schema or service was removed would still import.
+    orphaned = sorted(_committed() - set(generated))
+    if orphaned:
+        print(
+            f"Protobuf bindings without a schema: {', '.join(str(p) for p in orphaned)}\n"
+            "Delete them, or restore their .proto.",
+            file=sys.stderr,
+        )
+        return 1
     if stale:
         names = ", ".join(str(p) for p in stale)
         print(
@@ -123,8 +135,6 @@ def main() -> int:
         help="verify the committed bindings match the schemas without writing",
     )
     args = parser.parse_args()
-    if shutil.which(sys.executable) is None:  # pragma: no cover - defensive
-        raise SystemExit(f"python interpreter not found: {sys.executable}")
     return _check() if args.check else _generate()
 
 

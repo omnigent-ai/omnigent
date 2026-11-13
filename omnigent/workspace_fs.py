@@ -33,6 +33,7 @@ search, and file content work identically in both modes.
 from __future__ import annotations
 
 import base64
+import bisect
 import mimetypes
 import os
 import re
@@ -162,13 +163,8 @@ def _cap_file_bytes(rel: str, raw: bytes) -> FileBytes:
     try:
         capped.decode("utf-8")
     except UnicodeDecodeError as exc:
-        # A byte-cap truncation can split a multi-byte codepoint at the very
-        # end, which would otherwise flip an oversize *text* file to base64.
-        # When the only invalid bytes are a partial trailing codepoint (the
-        # error starts within the last 3 bytes of the truncated buffer),
-        # drop them — matching the runner's boundary-safe truncation so the
-        # same file serves as text from either side. A genuinely binary file
-        # has invalid bytes earlier in the buffer, so it stays binary.
+        # The cap may split a trailing codepoint: drop that partial tail so oversize
+        # text stays text, as the runner does. Earlier invalid bytes mean binary.
         if not (truncated and exc.start >= len(capped) - 3):
             return FileBytes(capped, truncated, is_text=False, content_type=content_type)
         capped = capped[: exc.start]
@@ -273,11 +269,21 @@ class WorkspaceReader:
 
         :param path: Relative directory path (``""`` for the workspace root).
         :param limit: Max entries to return.
-        :param after: Return entries after this entry id.
+        :param after: Return entries after this entry id. An id whose entry
+            was removed since still resumes at its place in name order.
         :returns: The page of entries.
         :raises WorkspaceReaderError: 404 when ``path`` is not a readable directory.
         """
-        return self._list_page(path, self._resolve(path), limit, after, None, "asc")
+        entries = self._list_entries(path, self._resolve(path))
+        # Ids sort like names (one shared parent), so the cursor needn't still exist.
+        start = bisect.bisect_right([e["id"] for e in entries], after) if after else 0
+        page = entries[start : start + limit]
+        return PagedList(
+            data=page,
+            first_id=page[0]["id"] if page else None,
+            last_id=page[-1]["id"] if page else None,
+            has_more=start + limit < len(entries),
+        )
 
     def read_file_bytes(self, path: str) -> FileBytes:
         """Read a file's capped bytes, exactly as ``list_or_read`` would serve them.
@@ -299,7 +305,14 @@ class WorkspaceReader:
         order: str,
     ) -> _WorkspacePayload:
         """Build the directory-listing payload for a resolved directory."""
-        page = self._list_page(rel, resolved, limit, after, before, order)
+        page = paginate_in_memory(
+            self._list_entries(rel, resolved),
+            id_fn=lambda entry: entry["id"],
+            limit=limit,
+            after=after,
+            before=before,
+            order=order,
+        )
         return {
             "object": "list",
             "data": page.data,
@@ -308,16 +321,8 @@ class WorkspaceReader:
             "has_more": page.has_more,
         }
 
-    def _list_page(
-        self,
-        rel: str,
-        resolved: Path,
-        limit: int,
-        after: str | None,
-        before: str | None,
-        order: str,
-    ) -> PagedList[ListedEntry]:
-        """List one page of a resolved directory's entries.
+    def _list_entries(self, rel: str, resolved: Path) -> list[ListedEntry]:
+        """List a resolved directory's entries in name order.
 
         Classifies entries by target type (follows symlinks) and skips
         per-entry ``OSError`` (e.g. a broken symlink) so one bad entry
@@ -362,14 +367,7 @@ class WorkspaceReader:
                     "modified_at": mtime,
                 }
             )
-        return paginate_in_memory(
-            entries,
-            id_fn=lambda entry: entry["id"],
-            limit=limit,
-            after=after,
-            before=before,
-            order=order,
-        )
+        return entries
 
     def _read_file(
         self,

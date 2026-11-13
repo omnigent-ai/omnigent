@@ -344,14 +344,8 @@ lint = [
     "ruff>=0.6",
     "pyrefly==1.1.1",
     "pre-commit>=3.5",
-    # protoc + the well-known-type protos, for regenerating the API bindings
-    # (omnigent/api/**/*_pb2.*; see scripts/gen_protobuf.py). Bundles its own compiler so no
-    # system protoc is needed. Capped below 1.83 so the bundled libprotoc emits
-    # protobuf 6.x gencode; routing_pb2 must stay at gencode 6.x because
-    # cwsandbox/modal installs are pinned to a protobuf 6.x runtime and the
-    # protobuf runtime cannot be older than the gencode version. A 7.x runtime
-    # (antigravity) also loads 6.x gencode under the forward-compat guarantee,
-    # so 6.x gencode satisfies all install forks.
+    # Bundled protoc for scripts/gen_protobuf.py. Capped <=1.81.1 so gencode stays
+    # protobuf 6.x: cwsandbox/modal pin a 6.x runtime, and a 7.x runtime still loads it.
     "grpcio-tools>=1.68,<=1.81.1",
     # protoc plugin for the Connect RPC stubs (omnigent/api/**/*_connect.py).
     # Keep in step with the connectrpc runtime pin.

@@ -73,6 +73,7 @@ async def test_list_directory_matches_rest_listing_across_pages(
     token = ""
     while True:
         page = await client.list_directory(ListDirectoryRequest(page_size=2, page_token=token))
+        assert len(page.entries) <= 2
         listed += [
             (
                 e.name,
@@ -104,6 +105,8 @@ async def test_read_file_matches_rest_file_content(tmp_path: Path, protocol: Pro
         messages = [m async for m in client.read_file(ReadFileRequest(path=path))]
         metadata = messages[0].metadata
         data = b"".join(m.data for m in messages)
+        assert not any(m.HasField("metadata") for m in messages[1:]), path
+        assert all(len(m.data) <= 64 * 1024 for m in messages), path
 
         rest = reader.list_or_read(path)
         text = rest["encoding"] == "utf-8"
@@ -113,6 +116,41 @@ async def test_read_file_matches_rest_file_content(tmp_path: Path, protocol: Pro
         assert metadata.size == rest["bytes"] == len(data), path
         assert metadata.truncated is rest["truncated"], path
         assert metadata.content_type == (rest["content_type"] or ""), path
+
+
+@PROTOCOLS
+async def test_list_directory_resumes_after_the_cursor_entry_is_removed(
+    tmp_path: Path, protocol: ProtocolType
+) -> None:
+    """An agent may delete files while a client pages; the listing must not restart."""
+    client = _client(WorkspaceReader(_workspace(tmp_path)), protocol)
+    first = await client.list_directory(ListDirectoryRequest(page_size=2))
+    (tmp_path / first.entries[-1].path).unlink()
+
+    rest = await client.list_directory(
+        ListDirectoryRequest(page_size=1000, page_token=first.next_page_token)
+    )
+
+    names = [e.name for e in first.entries] + [e.name for e in rest.entries]
+    assert len(names) == len(set(names))
+    assert sorted(names) == sorted({e.name for e in first.entries} | set(os.listdir(tmp_path)))
+
+
+async def test_read_file_flags_a_truncated_stream_like_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cap that splits "é" keeps the text prefix, marked truncated, on both routes."""
+    monkeypatch.setattr("omnigent.workspace_fs._MAX_READ_BYTES", 2)
+    reader = WorkspaceReader(_workspace(tmp_path))
+    client = _client(reader, ProtocolType.CONNECT)
+
+    messages = [m async for m in client.read_file(ReadFileRequest(path="café.txt"))]
+
+    metadata = messages[0].metadata
+    rest = reader.list_or_read("café.txt")
+    assert metadata.truncated is rest["truncated"] is True
+    assert metadata.encoding == CONTENT_ENCODING_UTF8
+    assert b"".join(m.data for m in messages) == str(rest["content"]).encode() == b"h"
 
 
 @PROTOCOLS
