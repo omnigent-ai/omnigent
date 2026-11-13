@@ -1357,6 +1357,7 @@ function setupLandingMocks() {
   vi.mocked(useInstallingHarnesses).mockReturnValue(new Set<string>());
   setOmnigentHostConfig({});
   resetLandingDraft();
+  sessionStorage.clear();
   clearSessionDrafts();
   localStorage.clear();
   // host_1's most-recent workspace seeds the field (so submit can enable
@@ -3562,7 +3563,6 @@ describe("desktop Arclet credential preflight", () => {
       });
       await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
       vi.mocked(getDesktopFeatures).mockReturnValueOnce(pendingFeatures);
-      sessionStorage.clear();
       fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
       // A prompt link arrives while the check is pending; its fallback must outlive this create.
       fireEvent.click(screen.getByRole("button", { name: "Open another prompt link" }));

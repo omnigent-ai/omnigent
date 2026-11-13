@@ -86,7 +86,10 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   getSessionSlim: vi.fn(async (id: string) => ({ id, hostId: "host_1", workspace: "" })),
 }));
 
-vi.mock("@/store/chatStore", () => ({ setPendingInitialPrompt: vi.fn() }));
+vi.mock("@/store/chatStore", () => ({
+  setPendingInitialPrompt: vi.fn(),
+  beginLocalConversation: vi.fn(() => null),
+}));
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
   getCurrentUserId: vi.fn(() => null),
@@ -338,6 +341,18 @@ describe("embedded prompt link", () => {
     reloadPage();
     expect(composer()).toHaveValue("");
     expect(window.sessionStorage.length).toBe(0);
+  });
+
+  it.each([
+    ["clearing the composer", ""],
+    ["editing the composer", "Edited"],
+  ])("keeps the parked snapshot in step after %s", (_case, text) => {
+    const { rerender } = renderLanding();
+    fireEvent.change(composer(), { target: { value: text } });
+    rerender(<Landing visit={2} />);
+    expect(composer()).toHaveValue(text);
+    reloadPage();
+    expect(composer()).toHaveValue("");
   });
 
   it("drops the kept prompt when dictation changes the text", () => {

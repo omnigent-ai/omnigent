@@ -2668,7 +2668,10 @@ function NewChatLandingContent({
     if (kept === null || message === kept.text) return;
     keptLinkedRef.current = null;
     forgetKeptLinkedPrompt(siblingSourceId, kept);
-  }, [message, siblingSourceId]);
+    // Keep the snapshot parked at consume time in step with the edit; a submitted
+    // draft stays spent.
+    if (!submittedRef.current) writeLandingDraft(draftState, draftRef.current);
+  }, [message, siblingSourceId, draftState]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
