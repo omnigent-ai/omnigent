@@ -21,7 +21,7 @@ the header menu), and each place is a separate entry point.
   replaces it; leaving the composer without submitting removes the draft. Existing
   sessions cannot join a family; ordinary forks remain standalone and may reuse the source host.
 
-- `session-grid`: behind `grid_sessions_display_ui`, drag sidebar sessions into a
+- `session-grid`: with `grid_sessions_display_ui` (on by default), drag sidebar sessions into a
   conversation to split left/right or top/bottom with a hover preview. Up to four
   independent chats fit in two rows and two columns. Grids live at `/grid/<id>`
   and are saved only in this browser, scoped to server and user.
@@ -266,7 +266,7 @@ the header menu), and each place is a separate entry point.
   Server admins configure the available targets under Settings → Admin → General →
   **Nested agent destinations**.
 
-**Session grids (desktop only):** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
+**Session grids (desktop only):** with `grid_sessions_display_ui` on (the default), open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
 to preview, then drop. Split a remaining full-width or full-height pane again
 to reach three or four panes. Alternatively, use a row's menu or right-click
@@ -726,8 +726,8 @@ plain `uv run pytest`, which starts a private server for the test.
   ordinary session routes retain native link dragging and expose no grid menus,
   drop targets, or saved-grid sidebar entries. Run with `--browser-ui-skip-build --video=on` after building.
   Layout combinations and malformed local storage have unit coverage in
-  `web/src/grid/gridLayout.test.ts`. For a real-server drive, enable
-  `grid_sessions_display_ui` on the isolated server. Also check a collapsed sidebar manually.
+  `web/src/grid/gridLayout.test.ts`. For a real-server drive, the
+  isolated server enables `grid_sessions_display_ui` by default. Also check a collapsed sidebar manually.
   Per-view render recovery, preserved neighboring drafts, usable cell controls
   and independent chat/terminal retry have component coverage in
   `web/src/grid/GridSessionPane.test.tsx`. To check manually, inject a render
