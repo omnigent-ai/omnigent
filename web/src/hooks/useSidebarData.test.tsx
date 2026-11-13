@@ -120,7 +120,11 @@ it("watches rendered rows plus rows that can still notify once sections report",
         ? [row("shared", 1)]
         : params.get("pinned") === "true"
           ? []
-          : [idleRow("mine"), idleRow("hidden-idle"), { ...idleRow("busy"), status: "running" }];
+          : [
+              idleRow("mine"),
+              idleRow("hidden-idle"),
+              { ...idleRow("busy"), status: "running" as const },
+            ];
     return Promise.resolve({ ok: true, json: async () => sessionRowsPage(rows) });
   });
   const { result, show } = renderWatchedIds();
