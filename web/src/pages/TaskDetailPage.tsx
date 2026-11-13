@@ -37,12 +37,19 @@ import {
   SESSION_LINK_ID_PLACEHOLDER,
   splitTriggerPrompt,
 } from "@/components/scheduled/triggerTemplates";
-import { RunGraphButton, RunTimeline, RunWorkflowButton } from "@/components/workflows/RunTasks";
+import {
+  RunGraphButton,
+  RunPlanButton,
+  RunTimeline,
+  RunWorkflowButton,
+} from "@/components/workflows/RunTasks";
+import { planRunControl } from "@/shell/PlanRunButton";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
 import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTask,
+  scheduledTaskRunsKey,
   useScheduledTaskRuns,
   useScheduledTaskRunSteps,
   useUpdateScheduledTask,
@@ -726,6 +733,13 @@ function RunRow({
   const workflowId = isFeatureEnabled(useServerInfo(), "workflows_page")
     ? (steps?.workflowId ?? null)
     : null;
+  // Stop while the run's session works; play once it stopped with tasks left.
+  const control =
+    showTasks && steps ? planRunControl(progress, steps.statuses, sessionWorking) : null;
+  // Room on the row's link for the buttons over its right end.
+  const buttonPadding = ["", "pr-11", "pr-18", "pr-25"][
+    1 + (workflowId ? 1 : 0) + (control ? 1 : 0)
+  ];
   const duration = formatRunDuration(run.firedAt, run.finishedAt);
   // Unread only applies to a succeeded run that produced a conversation.
   const unread = useRunUnread(run);
@@ -816,7 +830,7 @@ function RunRow({
           className={cn(
             commonClassName,
             "cursor-pointer transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none",
-            showTasks && (workflowId ? "pr-18" : "pr-11"),
+            showTasks && buttonPadding,
           )}
         >
           {body}
@@ -828,6 +842,17 @@ function RunRow({
         <>
           <RunTimeline sessionId={sessionId} progress={progress} className="pr-3 pb-2.5 pl-10" />
           <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
+            {control && (
+              <RunPlanButton
+                sessionId={sessionId}
+                planName={workflowName ?? null}
+                control={control}
+                refreshKeys={[
+                  scheduledTaskRunsKey(run.scheduledTaskId),
+                  ["scheduled-task-run-steps", run.scheduledTaskId],
+                ]}
+              />
+            )}
             {workflowId && <RunWorkflowButton workflowId={workflowId} />}
             <RunGraphButton
               runName={`the ${timestamp ?? ""} run`}

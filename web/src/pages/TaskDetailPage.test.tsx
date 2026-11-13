@@ -51,6 +51,7 @@ vi.mock("@/lib/routing", async (importOriginal) => {
 });
 
 vi.mock("@/hooks/useScheduledTasks", () => ({
+  scheduledTaskRunsKey: (id: string) => ["scheduled-task-runs", id],
   useScheduledTask: vi.fn(),
   useScheduledTaskRuns: vi.fn(),
   useScheduledTaskRunSteps: vi.fn(() => new Map()),
@@ -1422,6 +1423,8 @@ describe("runs of a saved workflow", () => {
       "Task 1, Explore: Done",
       "Task 2, Fix: Ready",
     ]);
+    // Its session went idle with Fix still to do, so the row can continue the plan.
+    expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
 
     fireEvent.click(within(row).getByTestId("run-graph-button"));
     const overlay = screen.getByTestId("workflow-graph-overlay");

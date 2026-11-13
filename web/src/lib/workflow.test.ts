@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   REVIEW_PLAN_FIRST,
+  continuePlanMessage,
   createWorkflowPrompt,
   runSavedWorkflowPrompt,
   offersSaveWorkflow,
@@ -12,6 +13,17 @@ import {
   taskActionMessage,
   workflowMessage,
 } from "./workflow";
+
+describe("continuePlanMessage", () => {
+  it("asks the agent to pick the plan back up, by name when it has one", () => {
+    expect(continuePlanMessage("Triage flaky tests")).toBe(
+      'Continue the plan "Triage flaky tests" from where you left off, and work through the tasks that are left.',
+    );
+    expect(continuePlanMessage(null)).toBe(
+      "Continue the plan from where you left off, and work through the tasks that are left.",
+    );
+  });
+});
 
 describe("taskActionMessage", () => {
   it("asks to run or continue the task by name, then the rest of the plan", () => {

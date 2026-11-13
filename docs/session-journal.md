@@ -186,7 +186,10 @@ done, if its work is already done), then the rest of the plan. While the agent w
 waits for your answer. A task's history marks a restart after the task was done
 or failed. Tasks waiting for you are pink, and an idle list
 with tasks the agent could still run says "Stopped" ("Run ended" after an
-automation run), so it never looks about to run. A summary line and a strip
+automation run), so it never looks about to run. Then a play button at the top,
+beside "Updated …", asks the agent to continue the plan from where it left off,
+and while the agent works a stop button there stops it. A run's row on a
+workflow's or an automation's page has the same buttons. A summary line and a strip
 count the tasks in each state, and stay at the top as you scroll: hover a
 segment of the strip for that task's status, or click it to jump to the task. In
 a plan, the strip links two neighboring tasks when one waits on the other, so a
