@@ -632,6 +632,9 @@ while the request still waits. Clicking elsewhere leaves it open. Once the user
 closes it or presses Escape, it stays closed until the page makes a new request.
 Only requests from the top-level page are observed; requests inside iframes
 do not open the notice. Conditional (autofill) requests do not open it.
+Options with accessor-backed `publicKey` or `mediation` properties also bypass
+observation so the preload does not evaluate page getters a second time. Those
+requests still run through Chromium, but they do not open the notice.
 Windows already shows its own WebAuthn dialog, so the shell skips this notice
 there.
 
