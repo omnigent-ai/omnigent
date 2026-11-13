@@ -14,6 +14,8 @@ from omnigent.host.frames import (
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     SERVER_CAP_TMUX_READINESS,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -2285,6 +2287,55 @@ def test_list_worktrees_result_frame_rejects_non_list() -> None:
     )
     with pytest.raises(ValueError, match="worktrees"):
         decode_host_frame(bad)
+
+
+# ── host.clone_repository frames ────────────────────────
+
+
+def test_clone_repository_frame_round_trip() -> None:
+    """Request frames keep the URL, destination and optional branch verbatim."""
+    original = HostCloneRepositoryFrame(
+        request_id="req_clone_1",
+        url="https://git.example.com/team/app.git",
+        path="~/code/app",
+        branch="release",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCloneRepositoryFrame)
+    assert decoded == original
+
+
+def test_clone_repository_frame_defaults_branch_to_none() -> None:
+    """A request without a branch decodes to the remote default (``None``)."""
+    decoded = decode_host_frame(
+        '{"kind": "host.clone_repository", "request_id": "r", '
+        '"url": "https://git.example.com/team/app.git", "path": "/tmp/app"}'
+    )
+    assert isinstance(decoded, HostCloneRepositoryFrame)
+    assert decoded.branch is None
+
+
+def test_clone_repository_result_round_trip_keeps_error_code() -> None:
+    """The error class survives the wire so the route can pick the HTTP status."""
+    original = HostCloneRepositoryResultFrame(
+        request_id="req_clone_2",
+        status="failed",
+        error="The clone took too long and was stopped",
+        error_code="clone_timeout",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCloneRepositoryResultFrame)
+    assert decoded == original
+
+
+def test_clone_repository_result_success_round_trip() -> None:
+    """A successful result carries the checkout path and no error."""
+    original = HostCloneRepositoryResultFrame(
+        request_id="req_clone_3", status="ok", path="/home/alice/code/app"
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostCloneRepositoryResultFrame)
+    assert decoded == original
 
 
 # ── host.create_dir frames ──────────────────────────────

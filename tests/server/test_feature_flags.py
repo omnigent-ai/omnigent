@@ -46,6 +46,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
         "session_overview": False,
+        "project_repository_creation": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,

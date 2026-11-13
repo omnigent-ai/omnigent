@@ -69,6 +69,7 @@ export type FeatureKey =
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
   | "session_overview"
+  | "project_repository_creation"
   | "session_orchestration";
 
 /** Deployment-wide release-feature values advertised by the server. */

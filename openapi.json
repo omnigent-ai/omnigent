@@ -1358,6 +1358,39 @@
         "title": "ClientTaskCancelEvent",
         "type": "object"
       },
+      "CloneRepositoryRequest": {
+        "description": "Request body for `POST /v1/hosts/{host_id}/repositories/clone`.",
+        "properties": {
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional branch to check out, e.g. `\"main\"`; `None` clones the remote default.",
+            "title": "Branch"
+          },
+          "path": {
+            "description": "Absolute or tilde-prefixed destination that must not exist yet, e.g. `\"~/code/app\"`. Its parent folder must already exist.",
+            "title": "Path",
+            "type": "string"
+          },
+          "url": {
+            "description": "Clone URL, e.g. `\"https://git.example.com/team/app.git\"`. Must not embed credentials.",
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "path"
+        ],
+        "title": "CloneRepositoryRequest",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -15938,6 +15971,62 @@
           }
         },
         "summary": "Get Plugins",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/repositories/clone": {
+      "post": {
+        "description": "Clone a git repository into a new directory on a host.\n\nUsed by the New project dialog to check out the project's repository\nbefore the project is saved. Owner-scoped like the directory routes.\nThe host refuses to clone into an existing path.\n\n**Parameters**\n\n- `body` \u2014 The clone URL, optional branch, and destination path.\n\n**Returns:** `{\"object\": \"repository\", \"path\": \"<checkout abs path>\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by the caller, 400 on invalid input, 409 when the destination exists or the host predates clone support, 504 on clone timeout, 502 on clone failure or lost contact.",
+        "operationId": "clone_host_repository_v1_hosts__host_id__repositories_clone_post",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloneRepositoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Clone Host Repository V1 Hosts  Host Id  Repositories Clone Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clone Host Repository",
         "tags": [
           "hosts"
         ]
