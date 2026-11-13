@@ -410,6 +410,7 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
                 "project_id": "proj_alpha",
                 "workspace": None,
                 "git": None,
+                "native_clear_source_id": "conv_old",
             },
         ),
         ("PATCH", "http://127.0.0.1:8787/v1/sessions/conv_new", {"runner_id": "runner_one"}),

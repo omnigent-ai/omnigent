@@ -1785,6 +1785,8 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     sibling_source_id: str | None = None
+    # Native rotations name the bound source to inherit filing without placement.
+    native_clear_source_id: SkipJsonSchema[str | None] = None
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"

@@ -3886,6 +3886,7 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
         "agent_id": "agent_xyz",
         "runner_id": "runner_abc",
         "labels": {ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "bridge-123"},
+        "id": _SESSION_ID,
         "title": "Fix login flow",
         "project_id": "proj_alpha" if filed else None,
     }
@@ -3937,6 +3938,7 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
     assert create_body["labels"][ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] == "bridge-123"
     assert create_body.get("title") == "Fix login flow"
     assert create_body.get("project_id") == ("proj_alpha" if filed else None)
+    assert create_body.get("native_clear_source_id") == (_SESSION_ID if filed else None)
     if filed:
         assert create_body.get("workspace", "missing") is None
         assert create_body.get("git", "missing") is None

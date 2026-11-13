@@ -18,7 +18,7 @@ from omnigent.entities.conversation import USER_SESSION_TITLE_MAX_CHARS
 
 _logger = logging.getLogger(__name__)
 
-_PROJECT_CREATE_FIELDS = ("project_id", "workspace", "git")
+_PROJECT_CREATE_FIELDS = ("project_id", "workspace", "git", "native_clear_source_id")
 
 
 def clear_replacement_create_body(
@@ -48,6 +48,9 @@ def clear_replacement_create_body(
     project_id = old_session.get("project_id")
     if isinstance(project_id, str) and project_id:
         body |= {"project_id": project_id, "workspace": None, "git": None}
+        source_id = old_session.get("id")
+        if isinstance(source_id, str) and source_id:
+            body["native_clear_source_id"] = source_id
     return body
 
 

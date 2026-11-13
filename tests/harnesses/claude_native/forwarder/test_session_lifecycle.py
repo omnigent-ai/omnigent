@@ -140,7 +140,13 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
         "labels": {"omnigent.ui": "terminal", BRIDGE_ID_LABEL_KEY: "bridge_shared"},
         "title": "Fix login flow",
     }
-    filed_body = {**unfiled_body, "project_id": "proj_alpha", "workspace": None, "git": None}
+    filed_body = {
+        **unfiled_body,
+        "project_id": "proj_alpha",
+        "workspace": None,
+        "git": None,
+        "native_clear_source_id": "conv_old",
+    }
     creates = [("POST", "/v1/sessions", filed_body)]
     if not project_available:
         creates.append(("POST", "/v1/sessions", unfiled_body))

@@ -1130,6 +1130,79 @@ def _runner_for_session(owner_client, stores, owner, *, legacy=False):
     return runner, bound, runner_id
 
 
+def test_runner_native_clear_keeps_source_project_without_placement(setup_app):
+    from omnigent.native._native_supersession import (
+        clear_replacement_create_body,
+        unfiled_clear_replacement_body,
+    )
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    _, _, stores, create_app = setup_app
+    projects = SqlAlchemyProjectStore(str(stores["account_store"]._engine.url))
+    app = create_app(**stores, project_store=projects)
+    with TestClient(app) as client:
+        alice = _login(client, "alice", "alice-pw-1234")
+        project = alice.post(
+            "/v1/projects",
+            json={
+                "name": "Native work",
+                "config": {"workspace": "/tmp/project-default", "git": {"branch": "main"}},
+            },
+        )
+        assert project.status_code == 200, project.text
+        project_id = project.json()["id"]
+        runner, bound, _ = _runner_for_session(alice, stores, "alice")
+        filed = alice.patch(f"/v1/sessions/{bound}", json={"project_id": project_id})
+        assert filed.status_code == 200, filed.text
+        snapshot = runner.get(f"/v1/sessions/{bound}").json()
+        body = clear_replacement_create_body(
+            snapshot, agent_id=snapshot["agent_id"], labels=snapshot["labels"]
+        )
+        created = runner.post("/v1/sessions", json=body)
+        assert created.status_code == 201, created.text
+        replacement_id = created.json()["id"]
+        replacement = stores["conversation_store"].get_conversation(replacement_id)
+        assert replacement.project_id == project_id
+        assert replacement.host_id is None
+        assert replacement.workspace is None
+        assert replacement.parent_conversation_id is None
+        assert runner.get(f"/v1/sessions/{replacement_id}").status_code == 200
+
+        unbound = create_session(alice).json()["session_id"]
+        for overrides in (
+            {"native_clear_source_id": None},
+            {"native_clear_source_id": unbound},
+            {"project_id": "other-project"},
+            {"agent_id": "other-agent"},
+            {"host_id": snapshot["host_id"]},
+            {"parent_session_id": bound},
+            {"sibling_source_id": bound},
+            {"workspace": "/tmp/new-workspace"},
+        ):
+            denied = runner.post("/v1/sessions", json={**body, **overrides})
+            assert denied.status_code == 403, denied.text
+        from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+
+        orchestrated = runner.post(
+            "/v1/sessions", json=body, headers={ORCHESTRATION_SOURCE_HEADER: bound}
+        )
+        assert orchestrated.status_code == 403, orchestrated.text
+        implicit_workspace = {key: value for key, value in body.items() if key != "workspace"}
+        assert runner.post("/v1/sessions", json=implicit_workspace).status_code == 403
+
+        assert alice.delete(f"/v1/projects/{project_id}").status_code == 200
+        # A concurrently deleted project still uses the existing unfiled fallback.
+        missing = runner.post("/v1/sessions", json=body)
+        assert missing.status_code == 404, missing.text
+        fallback = unfiled_clear_replacement_body(body, missing)
+        assert fallback is not None
+        unfiled = runner.post("/v1/sessions", json=fallback)
+        assert unfiled.status_code == 201, unfiled.text
+        assert (
+            stores["conversation_store"].get_conversation(unfiled.json()["id"]).project_id is None
+        )
+
+
 async def test_runner_session_tools_keep_capability_discovery(setup_app, monkeypatch):
     import httpx
 

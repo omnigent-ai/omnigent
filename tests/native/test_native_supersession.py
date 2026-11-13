@@ -43,9 +43,14 @@ def test_clear_replacement_retries_unfiled_only_after_project_not_found(
     status_code: int, old_session: dict[str, object], retries: bool
 ) -> None:
     create_body = clear_replacement_create_body(
-        {**old_session, "title": "Fix login flow"}, agent_id="ag", labels={"k": "v"}
+        {**old_session, "id": "conv_old", "title": "Fix login flow"},
+        agent_id="ag",
+        labels={"k": "v"},
     )
 
+    assert create_body.get("native_clear_source_id") == (
+        "conv_old" if "project_id" in old_session else None
+    )
     retry_body = unfiled_clear_replacement_body(create_body, httpx.Response(status_code))
 
     if retries:

@@ -358,19 +358,65 @@ def _require_runner_confined_placement(
     host_type: str,
     sandbox_provider: str | None,
     project_id: str | None,
+    inherited_project_id: str | None = None,
 ) -> None:
     """Keep a runner bearer's new sessions off every host but its own runner.
 
-    Sub-agents and rotations inherit or later bind the creating runner; a
-    host, managed sandbox, or project placement would launch elsewhere.
+    Sub-agents and rotations inherit or later bind the creating runner.
+    Only a validated native rotation may retain its source's project filing.
     """
     if runner_token_confinement(request) is None:
         return
-    if host_id is not None or host_type != "external" or sandbox_provider or project_id:
+    if (
+        host_id is not None
+        or host_type != "external"
+        or sandbox_provider
+        or (project_id is not None and project_id != inherited_project_id)
+    ):
         raise OmnigentError(
             "runner credential cannot place a session on a host",
             code=ErrorCode.RUNNER_SCOPE_DENIED,
         )
+
+
+async def _runner_clear_project_id(
+    request: Request,
+    body: SessionCreateRequest | ProjectSessionCreateRequest,
+    conversation_store: ConversationStore,
+) -> str | None:
+    """Allow filing a native replacement only in its bound source's project."""
+    confinement = runner_token_confinement(request)
+    if confinement is None or body.native_clear_source_id is None:
+        return None
+    require_runner_session_scope(request, body.native_clear_source_id)
+    source = await asyncio.to_thread(
+        conversation_store.get_conversation, body.native_clear_source_id
+    )
+    if (
+        source is None
+        or source.runner_id != confinement.runner_id
+        or body.project_id is None
+        or body.agent_id != source.agent_id
+        or body.parent_session_id is not None
+        or body.sibling_source_id is not None
+        or ORCHESTRATION_SOURCE_HEADER in request.headers
+        or not {"workspace", "git"} <= body.model_fields_set
+        or body.workspace is not None
+        or body.git is not None
+        or body.workspaces is not None
+    ):
+        raise OmnigentError(
+            "native replacement must retain its bound source's project and runner",
+            code=ErrorCode.RUNNER_SCOPE_DENIED,
+        )
+    if source.project_id is None:
+        raise OmnigentError("Source project is no longer available", code=ErrorCode.NOT_FOUND)
+    if body.project_id != source.project_id:
+        raise OmnigentError(
+            "native replacement must retain its bound source's project",
+            code=ErrorCode.RUNNER_SCOPE_DENIED,
+        )
+    return source.project_id
 
 
 async def _require_runner_scoped_agent(
@@ -1566,12 +1612,14 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        inherited_project_id = await _runner_clear_project_id(request, body, conversation_store)
         _require_runner_confined_placement(
             request,
             host_id=body.host_id,
             host_type=body.host_type,
             sandbox_provider=body.sandbox_provider,
             project_id=body.project_id,
+            inherited_project_id=inherited_project_id,
         )
         if body.parent_session_id is not None:
             require_runner_session_scope(request, body.parent_session_id)
