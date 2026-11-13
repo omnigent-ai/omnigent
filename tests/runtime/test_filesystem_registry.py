@@ -32,6 +32,7 @@ from omnigent.runtime.filesystem_registry import (
     _git_timeout_seconds,
     _normalize_path,
     _parse_git_porcelain_line,
+    _read_regular_file,
     _unquote_git_path,
     create_filesystem_registry,
 )
@@ -1875,6 +1876,61 @@ def test_git_line_counts_untracked_is_none(tmp_path: Path) -> None:
     assert rec["status"] == "created"
     assert rec["lines_added"] is None, rec
     assert rec["lines_removed"] is None, rec
+
+
+def test_git_untracked_lines_count_text_files_only(tmp_path: Path) -> None:
+    """Untracked text files report their own lines, counted as numstat would.
+
+    Tracked files keep ``lines_added``; binaries, links and FIFOs get ``None``.
+    """
+    _init_git_with_commit(tmp_path, "tracked.py", "x\n")
+    (tmp_path / "tracked.py").write_text("x\ny\n")
+    (tmp_path / "text.py").write_text("one\ntwo\nthree")
+    (tmp_path / "empty.txt").write_text("")
+    (tmp_path / "blob.bin").write_bytes(b"a\0b\n")
+    os.symlink("text.py", tmp_path / "link.py")
+    os.mkfifo(tmp_path / "pipe")
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    records = {r["path"]: r for r in reg.list_changed_files("any-conv", limit=100)}
+    assert {path: r.get("untracked_lines") for path, r in records.items()} == {
+        "tracked.py": None,
+        "text.py": 3,
+        "empty.txt": 0,
+        "blob.bin": None,
+        "link.py": None,
+    }
+    assert "untracked_lines" not in records["tracked.py"]
+    assert records["text.py"]["lines_added"] is None
+    assert _read_regular_file(tmp_path / "pipe", 10) is None
+
+
+def test_git_untracked_lines_stop_at_the_caps(tmp_path: Path, monkeypatch) -> None:
+    """Newest files are read first; per-file, total and file-count caps yield ``None``."""
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_FILE_BYTES", 10)
+    monkeypatch.setattr(
+        "omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_TOTAL_BYTES", 15
+    )
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_FILES", 2)
+    _init_git_with_commit(tmp_path, "committed.py", "x\n")
+    # (name, content) newest first: the second file no longer fits the budget
+    # left by the first, the third exceeds the per-file cap, the fourth still
+    # fits, and the fifth is past the file-count cap.
+    files = [("a.txt", "1\n2\n3\n4\n"), ("b.txt", "1\n2\n3\n4\n"), ("c.txt", "x" * 11)]
+    files += [("d.txt", "1\n"), ("e.txt", "1\n")]
+    for age, (name, content) in enumerate(files):
+        (tmp_path / name).write_text(content)
+        os.utime(tmp_path / name, (1_000_000 - age, 1_000_000 - age))
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    records = reg.list_changed_files("any-conv", limit=100)
+    assert [(r["path"], r["untracked_lines"]) for r in records] == [
+        ("a.txt", 4),
+        ("b.txt", None),
+        ("c.txt", None),
+        ("d.txt", 1),
+        ("e.txt", None),
+    ]
 
 
 def test_git_line_counts_staged_new_file_added_only(tmp_path: Path) -> None:

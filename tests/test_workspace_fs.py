@@ -418,11 +418,14 @@ def test_changes_lists_git_working_tree_modifications(tmp_path: Path) -> None:
     assert by_path["new.txt"]["status"] == "created"
     # Line counts come from numstat (git diff HEAD), so the host-served
     # list surfaces them just like the runner endpoint. The tracked edit
-    # rewrote one line; the untracked file isn't in numstat → no counts.
+    # rewrote one line; the untracked file isn't in numstat → no counts,
+    # but its own lines are reported separately.
     assert by_path["committed.txt"]["lines_added"] == 1
     assert by_path["committed.txt"]["lines_removed"] == 1
+    assert by_path["committed.txt"]["untracked_lines"] is None
     assert by_path["new.txt"]["lines_added"] is None
     assert by_path["new.txt"]["lines_removed"] is None
+    assert by_path["new.txt"]["untracked_lines"] == 1
 
 
 def test_diff_returns_before_and_after_for_modified_file(tmp_path: Path) -> None:
