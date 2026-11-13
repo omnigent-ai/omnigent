@@ -34,13 +34,14 @@ owner JWT fully expires must re-resolve a local credential instead of raising
 ``httpx.RequestError`` on every callback forever.
 
 The third test covers a runner whose first real mint precedes its session
-binding: the server's 401 must neither fail callbacks closed nor latch a
-decline that outlives the binding.
+binding: scoped callbacks fail closed while unbound, then recover after binding
+and the admission retry interval without falling back to an owner credential.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import subprocess
@@ -49,6 +50,7 @@ import time
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -275,7 +277,7 @@ def _enter_managed_sandbox_posture(monkeypatch: pytest.MonkeyPatch, base_url: st
 
 
 def _start_apps_edge_proxy(
-    upstream: str,
+    upstream: str, *, advertised_protocols: tuple[str, ...] | None = None
 ) -> tuple[str, threading.Event, Callable[[], None]]:
     """Run a reverse proxy that can start 403ing the managed-mint endpoint.
 
@@ -286,6 +288,7 @@ def _start_apps_edge_proxy(
     on the mint request has expired.
 
     :param upstream: Base URL of the real server to forward to.
+    :param advertised_protocols: Optional mock capability response; minting still reaches upstream.
     :returns: ``(proxy_base_url, forbid_mint, shutdown)``.
     """
     forbid_mint = threading.Event()
@@ -315,6 +318,19 @@ def _start_apps_edge_proxy(
                 self.send_error(404)
                 return
             target = urlunsplit(("", "", parts.path, parts.query, ""))
+            if (
+                advertised_protocols is not None
+                and self.command == "GET"
+                and parts.path.startswith("/v1/runners/")
+                and parts.path.endswith("/token")
+            ):
+                body = json.dumps({"protocols": advertised_protocols}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if (
                 forbid_mint.is_set()
                 and self.command == "POST"
@@ -455,7 +471,9 @@ def test_legacy_bootstrap_recovers_after_mint_proxy_rejection(
     """
     base_url, db_uri = accounts_server
     session_id = _seed_owned_session_with_managed_runner(base_url, db_uri)
-    proxy_url, forbid_mint, shutdown_proxy = _start_apps_edge_proxy(base_url)
+    proxy_url, forbid_mint, shutdown_proxy = _start_apps_edge_proxy(
+        base_url, advertised_protocols=("legacy",)
+    )
     try:
         # Host-launched posture: the runner starts with an injected bearer and
         # the delegated-mint marker, and everything it sends goes through the
@@ -488,6 +506,8 @@ def test_legacy_bootstrap_recovers_after_mint_proxy_rejection(
         mint_factory = factory._fallback_factory
         assert isinstance(mint_factory, _ManagedMintTokenFactory)
         assert mint_factory._cached_token, "a real owner JWT should have been minted"
+        assert mint_factory._negotiation.selected
+        assert not mint_factory.uses_scoped_credentials
 
         # The session outlives the JWT: the cache is fully expired and the
         # edge now 403s every re-mint (the presented bearer is dead).
@@ -513,8 +533,8 @@ def test_managed_runner_recovers_when_session_binds_after_mint_401(
     """A mint 401 before the session is bound must not outlive the binding.
 
     The construction probe cannot connect, so the factory installs with no
-    proxy bearer and its first real mint gets 401. That callback must return
-    the server's 401 instead of raising, and must authenticate once bound.
+    proxy bearer and its first real mint gets 401 after scoped negotiation.
+    The callback fails closed until binding exists and recovery backoff expires.
 
     :param accounts_server: ``(base_url, db_uri)`` from the live-server fixture.
     :param monkeypatch: Puts this process into the managed-sandbox posture and
@@ -528,6 +548,10 @@ def test_managed_runner_recovers_when_session_binds_after_mint_401(
     from omnigent.runner import _entry
 
     real_mint = _entry._mint_managed_owner_token
+    clock = [time.monotonic()]
+    monkeypatch.setattr(
+        _entry, "time", SimpleNamespace(time=time.time, monotonic=lambda: clock[0])
+    )
     mint_attempts: list[int] = []
 
     def _boot_race_then_real_mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
@@ -544,11 +568,13 @@ def test_managed_runner_recovers_when_session_binds_after_mint_401(
     auth = _RunnerDatabricksAuth(factory)
     contents_path = f"/v1/sessions/{session_id}/agent/contents"
 
-    unbound = asyncio.run(_get_agent_contents(base_url, contents_path, auth))
-    assert unbound.status_code == 401, (unbound.status_code, unbound.text)
-    assert factory.declined_without_proxy_bearer is True
+    with pytest.raises(httpx.RequestError, match="token refresh returned no token"):
+        asyncio.run(_get_agent_contents(base_url, contents_path, auth))
+    assert factory.uses_scoped_credentials
+    assert not factory.declined_without_proxy_bearer
 
     _bind_managed_runner(db_uri, session_id)
+    clock[0] += _entry._AUTH_DISCOVERY_RETRY_INTERVAL_S + 1
     bound = asyncio.run(_get_agent_contents(base_url, contents_path, auth))
     assert bound.status_code == 200, (bound.status_code, bound.text)
     assert bound.content[:2] == b"\x1f\x8b", "expected a gzip agent bundle body"

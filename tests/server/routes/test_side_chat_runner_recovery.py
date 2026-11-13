@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+from starlette.requests import Request
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation
@@ -410,7 +411,7 @@ async def test_resume_single_flight_is_shared_only_within_one_caller(
     def _resume(user_id: str) -> asyncio.Task[dict[str, bool | str]]:
         return asyncio.create_task(
             routes_events._retry_session_single_flight(
-                request=None,
+                request=Request({"type": "http"}),
                 session_id=side.id,
                 conversation=side,
                 conversation_store=store,
