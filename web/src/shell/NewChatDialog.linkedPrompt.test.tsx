@@ -336,13 +336,13 @@ describe("embedded prompt link", () => {
     expect(window.sessionStorage.length).toBe(0);
   });
 
+  const allStores = ["stored", "no server identity", "failed write"] as const;
   it.each([
-    ["clearing the composer", [""]],
-    ["editing the composer", ["Edited"]],
-    ["editing then clearing", ["Edited", ""]],
-    ["editing repeatedly", ["Edited", "Edited again"]],
-  ])("keeps the parked snapshot in step after %s", (_case, edits) => {
-    const stores = ["stored", "no server identity", "failed write"] as const;
+    ["clearing the composer", [""], allStores],
+    ["editing the composer", ["Edited"], allStores],
+    ["editing then clearing", ["Edited", ""], ["stored"] as const],
+    ["editing repeatedly", ["Edited", "Edited again"], ["stored"] as const],
+  ])("keeps the parked snapshot in step after %s", (_case, edits, stores) => {
     for (const store of stores) {
       cleanup();
       resetLandingDraft();
@@ -363,6 +363,21 @@ describe("embedded prompt link", () => {
       reloadPage();
       expect(composer()).toHaveValue("");
     }
+  });
+
+  it.each([
+    ["after the stored record expires", undefined],
+    ["after an edit", "Edited"],
+  ])("keeps a reload-restored prompt across a same-commit remount %s", (_case, edit) => {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    renderLanding();
+    const { rerender } = reloadPage();
+    expect(composer()).toHaveValue("hello_world");
+    if (edit === undefined) vi.spyOn(Date, "now").mockReturnValue(now + 61_000);
+    else fireEvent.change(composer(), { target: { value: edit } });
+    rerender(<Landing visit={2} />);
+    expect(composer()).toHaveValue(edit ?? "hello_world");
   });
 
   it("drops the kept prompt when dictation changes the text", () => {

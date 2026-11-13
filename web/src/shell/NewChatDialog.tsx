@@ -2614,7 +2614,8 @@ function NewChatLandingContent({
     ownsKeptLinkedPrompt ? keptLinkedPrompt : null,
   );
   const submittedLinkedPromptRef = useRef<KeptLinkedPrompt | null>(null);
-  const syncsParkedDraftRef = useRef(landingDraft?.fromLink === true);
+  // A prompt restored from storage joins the same lifecycle as a consumed link.
+  const syncsParkedDraftRef = useRef(landingDraft?.fromLink === true || restoresKeptLinkedPrompt);
   useEffect(() => {
     if (keptLinkedPrompt !== null && !ownsKeptLinkedPrompt) {
       forgetKeptLinkedPrompt(siblingSourceId, keptLinkedPrompt);
