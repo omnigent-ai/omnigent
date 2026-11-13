@@ -233,32 +233,48 @@ describe("useCommandHoldTracking on macOS", () => {
     expect(result.current).toBe(true);
   });
 
-  it("never counts Shift as part of the hold", () => {
-    const { result } = renderTracking(true);
-    key("keydown", "Meta", { metaKey: true, shiftKey: true });
+  it.each([
+    ["Shift in a browser tab", "Shift", { metaKey: true, shiftKey: true }, true],
+    ["Shift in the desktop app", "Shift", { metaKey: true, shiftKey: true }, false],
+    ["Control", "Control", { metaKey: true, ctrlKey: true }, true],
+  ])(
+    "keeps the hint while %s joins the hold and when it is released",
+    (_case, joining, modifiers, altJoinsHold) => {
+      const { result } = renderTracking(true, altJoinsHold);
+      key("keydown", "Meta", MAC_COMMAND);
+      elapseRevealDelay();
 
-    act(() => {
-      vi.advanceTimersByTime(1000);
-    });
-    expect(result.current).toBe(false);
+      key("keydown", joining, modifiers);
+      expect(result.current).toBe(true);
+
+      key("keyup", joining, MAC_COMMAND);
+      expect(result.current).toBe(true);
+
+      key("keyup", "Meta");
+      expect(result.current).toBe(false);
+    },
+  );
+
+  it.each([
+    ["Shift", "Shift", { shiftKey: true }],
+    ["Control", "Control", { ctrlKey: true }],
+  ])("reveals when %s was already down before ⌘", (_case, joining, modifiers) => {
+    const { result } = renderTracking(true, false);
+    key("keydown", joining, modifiers);
+    key("keydown", "Meta", { metaKey: true, ...modifiers });
+
+    elapseRevealDelay();
+    expect(result.current).toBe(true);
   });
 
-  it("hides when Shift is pressed during a hold", () => {
+  it("hides when a key completes the ⇧⌘ chord", () => {
     const { result } = renderTracking(true);
     key("keydown", "Meta", MAC_COMMAND);
-    elapseRevealDelay();
-
     key("keydown", "Shift", { metaKey: true, shiftKey: true });
-    expect(result.current).toBe(false);
-  });
+    elapseRevealDelay();
+    expect(result.current).toBe(true);
 
-  it("ignores Ctrl alongside ⌘, which is a text-editing chord on macOS", () => {
-    const { result } = renderTracking(true);
-    key("keydown", "Meta", { metaKey: true, ctrlKey: true });
-
-    act(() => {
-      vi.advanceTimersByTime(1000);
-    });
+    key("keydown", "O", { metaKey: true, shiftKey: true });
     expect(result.current).toBe(false);
   });
 
@@ -325,6 +341,26 @@ describe("useCommandHoldTracking off macOS", () => {
     act(() => {
       vi.advanceTimersByTime(1000);
     });
+    expect(result.current).toBe(false);
+  });
+
+  it("keeps the hint while Shift joins Ctrl, as in Ctrl+Shift+O", () => {
+    const { result } = renderTracking(false);
+    key("keydown", "Control", OTHER_COMMAND);
+    elapseRevealDelay();
+
+    key("keydown", "Shift", { ctrlKey: true, shiftKey: true });
+    expect(result.current).toBe(true);
+    key("keyup", "Shift", OTHER_COMMAND);
+    expect(result.current).toBe(true);
+  });
+
+  it("hides when Meta joins Ctrl, since it is not a joining key there", () => {
+    const { result } = renderTracking(false);
+    key("keydown", "Control", OTHER_COMMAND);
+    elapseRevealDelay();
+
+    key("keydown", "Meta", { ctrlKey: true, metaKey: true });
     expect(result.current).toBe(false);
   });
 

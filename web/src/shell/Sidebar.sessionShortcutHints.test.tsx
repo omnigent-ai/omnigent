@@ -210,6 +210,21 @@ describe("Sidebar numbered-row shortcut hints", () => {
     expect(chord).not.toHaveClass("opacity-100");
   });
 
+  it("keeps the hints and New session chord while Shift joins the hold", async () => {
+    renderSidebar();
+    const chord = screen
+      .getByTestId("new-chat-button")
+      .querySelector<HTMLElement>('[data-slot="shortcut-keys"]');
+    pressCommand();
+    await waitForHints(5);
+
+    fireEvent.keyDown(window, { key: "Shift", ...COMMAND_MODIFIER, shiftKey: true });
+    expect(hints()).toHaveLength(5);
+    expect(chord).toHaveClass("opacity-100");
+    releaseCommand();
+    expect(hints()).toHaveLength(0);
+  });
+
   it("shows no hints on touch layouts", async () => {
     mocks.mobile = true;
     renderSidebar();
