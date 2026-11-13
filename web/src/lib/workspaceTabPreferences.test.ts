@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY,
   DEFAULT_WORKSPACE_TAB,
   defaultWorkspaceTabs,
   normalizeDefaultWorkspaceTab,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
+  readAlwaysOpenFilesInTab,
   readDefaultWorkspaceTab,
   readInitialWorkspaceTab,
   readPinnedWorkspaceTabs,
+  writeAlwaysOpenFilesInTab,
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
 } from "./workspaceTabPreferences";
@@ -157,4 +160,20 @@ describe("normalizeDefaultWorkspaceTab", () => {
       expect(normalizeDefaultWorkspaceTab(value)).toBe("files");
     },
   );
+});
+
+describe("always-open-files-in-tab preference", () => {
+  it("defaults to off, persists a true value, and treats any other stored value as off", () => {
+    expect(readAlwaysOpenFilesInTab()).toBe(false);
+
+    writeAlwaysOpenFilesInTab(true);
+    expect(readAlwaysOpenFilesInTab()).toBe(true);
+    expect(localStorage.getItem(ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY)).toBe("true");
+
+    writeAlwaysOpenFilesInTab(false);
+    expect(localStorage.getItem(ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY)).toBeNull();
+
+    localStorage.setItem(ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY, "yes");
+    expect(readAlwaysOpenFilesInTab()).toBe(false);
+  });
 });

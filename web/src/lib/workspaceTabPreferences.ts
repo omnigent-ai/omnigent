@@ -5,9 +5,11 @@ import {
   resetSessionWorkspaceTabSelections,
   unpinSessionWorkspaceTabs,
 } from "./sessionWorkspaceState";
+import { createStoredPreference } from "./storedChoicePreference";
 
 const STORAGE_KEY = "omnigent:default-workspace-tab";
 export const PINNED_WORKSPACE_TABS_STORAGE_KEY = "omnigent:pinned-workspace-tabs";
+export const ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY = "omnigent:always-open-files-in-tab";
 
 export const defaultWorkspaceTabs = ["files", "changes", "github", "subagents"] as const;
 export type DefaultWorkspaceTab = (typeof defaultWorkspaceTabs)[number];
@@ -92,4 +94,24 @@ export function readInitialWorkspaceTab(): DefaultWorkspaceTab | null {
   const pinned = readPinnedWorkspaceTabs();
   const preferred = readDefaultWorkspaceTab();
   return pinned.includes(preferred) ? preferred : (pinned[0] ?? null);
+}
+
+const alwaysOpenFilesInTabPreference = createStoredPreference(
+  ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY,
+  (stored) => stored === "true",
+  false,
+);
+
+/** Read whether file clicks open standalone tabs; storage errors and unknown values mean off. */
+export const readAlwaysOpenFilesInTab = alwaysOpenFilesInTabPreference.read;
+
+/** Persist the preference and notify Workspace panels already on screen. */
+export const writeAlwaysOpenFilesInTab = alwaysOpenFilesInTabPreference.write;
+
+/** Re-read after a same-tab write that bypassed `writeAlwaysOpenFilesInTab` (settings import). */
+export const notifyAlwaysOpenFilesInTabChanged = alwaysOpenFilesInTabPreference.notifyChanged;
+
+/** Live value of the preference, including changes made in other windows. */
+export function useAlwaysOpenFilesInTab(): boolean {
+  return alwaysOpenFilesInTabPreference.use();
 }

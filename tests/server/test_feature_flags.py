@@ -43,6 +43,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "custom_agents_settings_ui": True,
         "sidebar_grouping_ui": True,
         "workspace_content_search": False,
+        "workspace_file_tree_split_ui": False,
         "grid_sessions_display_ui": False,
         "automations_v2": True,
         "splittable_terminal_view_ui": False,

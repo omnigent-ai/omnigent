@@ -368,6 +368,8 @@ interface FileViewerProps {
   onCloseTab?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
   onCommentsOpenChange?: (open: boolean) => void;
+  /** Called when the editor gains or loses edits that aren't saved yet. */
+  onDirtyChange?: (dirty: boolean) => void;
   /**
    * Sort order for the prev/next navigation. Must match the order the
    * Changes list (`FilesPanel` → `FlatFileList`) is sorted by, or the
@@ -413,6 +415,7 @@ function FileViewerBody({
   mobileOverlay = false,
   viewport,
   onCommentsOpenChange,
+  onDirtyChange,
   sort = "recent",
 }: FileViewerProps) {
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
@@ -516,9 +519,13 @@ function FileViewerBody({
   const [isEditorDirty, setIsEditorDirty] = useState(false);
   // Acceptance clears this synchronously before entering another navigation guard.
   const isEditorDirtyRef = useRef(false);
+  // A ref, so a new callback doesn't re-run the effects that reset the dirty state.
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  onDirtyChangeRef.current = onDirtyChange;
   const handleDirtyChange = useCallback((dirty: boolean) => {
     isEditorDirtyRef.current = dirty;
     setIsEditorDirty(dirty);
+    onDirtyChangeRef.current?.(dirty);
   }, []);
   // Auto-save lifecycle reported up from the Monaco editor, shown as a status
   // chip in the toolbar (the editor itself no longer has a Save button).
@@ -530,6 +537,8 @@ function FileViewerBody({
     apply: () => void;
     cancel?: () => void;
   } | null>(null);
+  // Discarding remounts the editor, so a viewer that keeps this file can't show the old draft.
+  const [discardCount, setDiscardCount] = useState(0);
   // TOC panel state (for markdown preview)
   const [tocOpen, setTocOpen] = useState(false);
   // Reset selection state whenever the file changes.
@@ -566,9 +575,9 @@ function FileViewerBody({
   // refreshes, so a comment arriving while the panel is open is
   // marked seen too.
   useEffect(() => {
-    if (!open || !commentsOpen || commentsQuery.data === undefined) return;
+    if (!onScreen || !commentsOpen || commentsQuery.data === undefined) return;
     markCommentsSeen(commentsQuery.data.filter(isFileComment).map((c) => c.id));
-  }, [open, commentsOpen, commentsQuery.data]);
+  }, [onScreen, commentsOpen, commentsQuery.data]);
   // Notify parent when comments panel opens or closes (e.g. so the parent
   // can widen the inline panel to fit both the code viewer and comments).
   useEffect(() => {
@@ -617,14 +626,23 @@ function FileViewerBody({
     }
   }, [fileQuery.data, path]);
 
-  const copyFileLink = useCallback(() => {
-    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
+  // The page URL may not name this file, e.g. one shown again beside the Files tree.
+  const fileLinkUrl = useCallback(() => {
     const url = new URL(window.location.href);
     if (!syncUrl) {
       url.pathname = rebasePath(`/c/${conversationId}`);
       url.search = "";
-      url.searchParams.set("file", path);
     }
+    if (url.searchParams.get("file") !== path) {
+      url.searchParams.set("file", path);
+      for (const key of ["line", "column", "endLine", "comment"]) url.searchParams.delete(key);
+    }
+    return url;
+  }, [syncUrl, rebasePath, conversationId, path]);
+
+  const copyFileLink = useCallback(() => {
+    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
+    const url = fileLinkUrl();
     if (!activeSelection) url.searchParams.delete("comment");
     navigator.clipboard.writeText(url.toString()).then(
       () => {
@@ -634,23 +652,18 @@ function FileViewerBody({
       },
       (err) => console.warn("Failed to copy file link", err),
     );
-  }, [activeSelection, syncUrl, rebasePath, conversationId, path]);
+  }, [activeSelection, fileLinkUrl]);
 
   const copyCommentLink = useCallback(
     (commentId: string) => {
       if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
-      const url = new URL(window.location.href);
-      if (!syncUrl) {
-        url.pathname = rebasePath(`/c/${conversationId}`);
-        url.search = "";
-        url.searchParams.set("file", path);
-      }
+      const url = fileLinkUrl();
       url.searchParams.set("comment", commentId);
       navigator.clipboard
         .writeText(url.toString())
         .then(undefined, (err) => console.warn("Failed to copy comment link", err));
     },
-    [syncUrl, rebasePath, conversationId, path],
+    [fileLinkUrl],
   );
 
   const sender = useOptionalCommentSender();
@@ -780,9 +793,9 @@ function FileViewerBody({
     return () => window.removeEventListener("keydown", handler);
   }, [syncUrl, open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
 
-  // Escape closes the active file tab (when search is not open).
+  // Escape closes the active file tab (when search is not open) while it is on screen.
   useEffect(() => {
-    if (!open || !onCloseTab) return;
+    if (!onScreen || !onCloseTab) return;
     const handler = (e: KeyboardEvent) => {
       if (!syncUrl && !viewerIsActiveSurfaceRef.current) return;
       if (e.key !== "Escape" || e.defaultPrevented) return;
@@ -799,7 +812,7 @@ function FileViewerBody({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [syncUrl, open, onCloseTab, searchOpen, guardDirty]);
+  }, [syncUrl, onScreen, onCloseTab, searchOpen, guardDirty]);
 
   // View mode toggle — markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
@@ -1019,18 +1032,17 @@ function FileViewerBody({
     const next = { conversationId, path, position };
     lastNavigationRef.current = next;
     const apply = () => setAppliedNavigation(next);
+    const samePath = last.path === path && last.conversationId === conversationId;
     // Switching out of the rich-text editor must preserve its unsaved-edit guard.
-    if (
-      position &&
-      viewMode === "editor" &&
-      last.path === path &&
-      last.conversationId === conversationId
-    ) {
+    if (position && viewMode === "editor" && samePath) {
       guardDirty(apply, () => dismissFilePosition(position));
+    } else if (!position && samePath && viewMode === "source" && fileViewMode !== "source") {
+      // A cleared citation would switch edited source to the preview, so confirm first.
+      guardDirty(apply);
     } else {
       apply();
     }
-  }, [position, path, conversationId, viewMode, guardDirty]);
+  }, [position, path, conversationId, viewMode, fileViewMode, guardDirty]);
 
   useEffect(() => {
     const el = contentAreaRef.current;
@@ -1102,7 +1114,7 @@ function FileViewerBody({
     };
   }, [open]);
   useEffect(() => {
-    if (!open || !isMonacoFindSurface) return;
+    if (!onScreen || !isMonacoFindSurface) return;
     const handler = (e: KeyboardEvent) => {
       if (!(hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "f")) return;
       if (!viewerIsActiveSurfaceRef.current) return;
@@ -1116,7 +1128,7 @@ function FileViewerBody({
     // host page, not the file).
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
-  }, [open, isMonacoFindSurface, setSearchOpen]);
+  }, [onScreen, isMonacoFindSurface, setSearchOpen]);
 
   // Reset the toggle when find is closed from inside Monaco (Escape or the
   // widget's ✕) so the next Cmd+F re-opens it instead of no-opping. Shared by
@@ -1963,6 +1975,7 @@ function FileViewerBody({
             )
           ) : (
             <CodeViewer
+              key={discardCount}
               position={filePosition}
               conversationId={conversationId}
               path={path}
@@ -1974,7 +1987,8 @@ function FileViewerBody({
               activeSelection={activeSelection}
               onSetActiveSelection={handleSetActiveSelection}
               pendingBodyRef={pendingBodyRef}
-              panelOpen={open}
+              // Find and select-all shortcuts belong to the viewer on screen.
+              panelOpen={onScreen}
               mediaActive={onScreen}
               searchOpen={searchOpen}
               setSearchOpen={setSearchOpen}
@@ -2068,7 +2082,8 @@ function FileViewerBody({
           <DialogHeader>
             <DialogTitle>Unsaved changes</DialogTitle>
             <DialogDescription>
-              Your edits will be lost if you leave without saving.
+              Your edits to {path.split("/").pop() || path} will be lost if you leave without
+              saving.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -2085,6 +2100,7 @@ function FileViewerBody({
               variant="destructive"
               onClick={() => {
                 handleDirtyChange(false);
+                setDiscardCount((count) => count + 1);
                 pendingAction?.apply();
                 setPendingAction(null);
               }}
@@ -2099,7 +2115,7 @@ function FileViewerBody({
 
   // While the viewer is the surface last used, Escape closes its Find bar, or else its
   // tab (see above), so page-wide Escape shortcuts leave it alone.
-  const ownsEscape = open && viewerIsActiveSurface && (searchOpen || onCloseTab !== undefined);
+  const ownsEscape = onScreen && viewerIsActiveSurface && (searchOpen || onCloseTab !== undefined);
 
   if (frameless) {
     return (

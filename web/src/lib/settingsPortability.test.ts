@@ -29,9 +29,11 @@ import {
   writeSessionWorkspaceState,
 } from "./sessionWorkspaceState";
 import {
+  ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readInitialWorkspaceTab,
   readPinnedWorkspaceTabs,
+  useAlwaysOpenFilesInTab,
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
 } from "./workspaceTabPreferences";
@@ -130,6 +132,7 @@ it.each([
 describe.each([
   ["composer shortcut", COMPOSER_SEND_SHORTCUT_STORAGE_KEY],
   ["final-answer fold", FOLD_ASSISTANT_NARRATION_STORAGE_KEY],
+  ["always-open file tab", ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY],
 ])("%s portability", (_label, storageKey) => {
   it("exports, imports, and clears the device-local preference", () => {
     localStorage.setItem(storageKey, "true");
@@ -146,17 +149,29 @@ describe.each([
   });
 });
 
-it("updates a mounted final-answer fold reader on import", () => {
-  const { result } = renderHook(() => useFoldAssistantNarration());
+it.each([
+  {
+    reader: "final-answer fold",
+    key: FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+    use: useFoldAssistantNarration,
+  },
+  {
+    reader: "always-open-files",
+    key: ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY,
+    use: useAlwaysOpenFilesInTab,
+  },
+])("updates a mounted $reader reader on import", ({ key, use }) => {
+  const { result } = renderHook(() => use());
   expect(result.current).toBe(false);
 
   act(() => {
-    applyImportedSettings({
-      version: 1,
-      settings: { [FOLD_ASSISTANT_NARRATION_STORAGE_KEY]: "true" },
-    });
+    applyImportedSettings({ version: 1, settings: { [key]: "true" } });
   });
   expect(result.current).toBe(true);
+  act(() => {
+    applyImportedSettings({ version: 1, settings: {} });
+  });
+  expect(result.current).toBe(false);
 });
 
 it("carries hidden picker entries through export and import and tells an open picker", () => {

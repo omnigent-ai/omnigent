@@ -211,7 +211,7 @@ export function TerminalsPanel({
           {activeTerminal && isDesktop && (
             <div
               {...columnHandleProps}
-              className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
+              className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 focus-visible:bg-primary/50 focus-visible:outline-none active:bg-primary/50 transition-colors"
             />
           )}
           {terminals.map((t) => {

@@ -217,9 +217,20 @@ describe("sessionWorkspaceState", () => {
     // proving one bad field can't poison the whole entry.
     localStorage.setItem(
       STORAGE_KEY,
-      JSON.stringify([{ id: "conv_b", state: { open: true, widthPx: -5, rightRailTab: "bogus" } }]),
+      JSON.stringify([
+        { id: "conv_b", state: { open: true, widthPx: -5, rightRailTab: "bogus" } },
+        { id: "conv_preview", state: { treePreviewPath: "docs/a.md", selectedFilePath: null } },
+        { id: "conv_no_preview", state: { treePreviewPath: null } },
+        { id: "conv_bad_preview", state: { treePreviewPath: 7 } },
+      ]),
     );
     expect(readSessionWorkspaceState("conv_b")).toEqual({ open: true });
+    expect(readSessionWorkspaceState("conv_preview")).toEqual({
+      treePreviewPath: "docs/a.md",
+      selectedFilePath: null,
+    });
+    expect(readSessionWorkspaceState("conv_no_preview")).toEqual({ treePreviewPath: null });
+    expect(readSessionWorkspaceState("conv_bad_preview")).toEqual({});
 
     // Tab id lists keep each non-empty string once, in order.
     localStorage.setItem(

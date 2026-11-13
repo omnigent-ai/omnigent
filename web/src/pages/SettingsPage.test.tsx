@@ -58,6 +58,7 @@ const mocks = vi.hoisted(() => ({
   adminViewSupported: true as boolean | undefined,
   bootFallback: false,
   sessionTitleInstructions: false,
+  features: {} as Record<string, boolean>,
   nestedAgents: false,
   // Identity from the mode-agnostic `/v1/me` probe (resolveIdentity returns
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
@@ -95,6 +96,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           sibling_sessions: mocks.nestedAgents,
           enabled_connections: mocks.enabledConnections,
           session_title_instructions: mocks.sessionTitleInstructions,
+          features: mocks.features,
         },
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
@@ -293,6 +295,7 @@ beforeEach(() => {
   mocks.adminViewSupported = true;
   mocks.bootFallback = false;
   mocks.sessionTitleInstructions = false;
+  mocks.features = {};
   mocks.nestedAgents = false;
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
@@ -1248,8 +1251,32 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-font-family")).toBeNull();
   });
 
+  it.each<Record<string, boolean>>([{}, { workspace_file_tree_split_ui: false }])(
+    "hides the always-open-files row when the server reports %j",
+    (features) => {
+      mocks.features = features;
+      renderPage("/settings/appearance");
+      expect(screen.queryByTestId("always-open-files-in-tab-toggle")).toBeNull();
+    },
+  );
+
+  it("shows the always-open-files switch when the file tree split is enabled and persists toggles", () => {
+    mocks.features = { workspace_file_tree_split_ui: true };
+    renderPage("/settings/appearance");
+
+    const toggle = screen.getByRole("switch", { name: "Always open files in a new tab" });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(toggle);
+    expect(localStorage.getItem("omnigent:always-open-files-in-tab")).toBe("true");
+    expect(screen.getByTestId("always-open-files-in-tab-toggle")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
   it("resets every appearance preference back to product defaults", () => {
     localStorage.clear();
+    mocks.features = { workspace_file_tree_split_ui: true };
     renderPage("/settings/appearance");
 
     // Tweak a representative set of appearance preferences.
@@ -1270,6 +1297,7 @@ describe("SettingsPage", () => {
     });
     fireEvent.click(screen.getByTestId("project-folder-collapse-toggle"));
     fireEvent.click(screen.getByTestId("session-row-quick-actions-toggle"));
+    fireEvent.click(screen.getByTestId("always-open-files-in-tab-toggle"));
     const folderPagination = renderHook(() => [
       useProjectFolderCollapse(),
       useProjectFolderPageSize(),
@@ -1307,6 +1335,7 @@ describe("SettingsPage", () => {
       "aria-checked",
       "false",
     );
+    expect(localStorage.getItem("omnigent:always-open-files-in-tab")).toBe("true");
 
     // Open the confirmation dialog and confirm the reset.
     fireEvent.click(screen.getByTestId("reset-appearance-button"));
@@ -1325,6 +1354,13 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
     expect(localStorage.getItem("omnigent:code-font-weight")).toBeNull();
+
+    // Files open beside the tree again.
+    expect(localStorage.getItem("omnigent:always-open-files-in-tab")).toBeNull();
+    expect(screen.getByTestId("always-open-files-in-tab-toggle")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
 
     // Color theme is back to Omnigent.
     expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");

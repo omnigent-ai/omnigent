@@ -688,3 +688,62 @@ describe("FolderTree truncated search", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("FolderTree file opening", () => {
+  const files = [file("README.md"), file("docs/guide.md")];
+  beforeEach(() => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("opens a tab on Ctrl-click, middle-click or the row menu, and inline on a plain click", async () => {
+    const onFileSelect = vi.fn();
+    const onFileOpenInTab = vi.fn();
+    renderTree({ files, onFileSelect, onFileOpenInTab });
+    const row = screen.getByText("README.md").closest("button")!;
+
+    fireEvent.click(row);
+    expect(onFileSelect).toHaveBeenLastCalledWith("README.md");
+    fireEvent.click(row, { ctrlKey: true });
+    expect(onFileOpenInTab).toHaveBeenLastCalledWith("README.md");
+    // Middle-click must not start the browser's autoscroll or paste.
+    expect(fireEvent.mouseDown(row, { button: 1 })).toBe(false);
+    fireEvent(row, new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }));
+    expect(onFileOpenInTab).toHaveBeenCalledTimes(2);
+
+    fireEvent.contextMenu(screen.getByText("README.md"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Open in new tab" }));
+    expect(onFileOpenInTab).toHaveBeenCalledTimes(3);
+    expect(onFileSelect).toHaveBeenCalledOnce();
+  });
+
+  it("keeps today's single route, and the native menu, without a tab action", () => {
+    const onFileSelect = vi.fn();
+    renderTree({ files, onFileSelect });
+    const row = screen.getByText("README.md").closest("button")!;
+    fireEvent.click(row, { ctrlKey: true });
+    expect(onFileSelect).toHaveBeenCalledWith("README.md");
+    expect(fireEvent.mouseDown(row, { button: 1 })).toBe(true);
+    expect(fireEvent.contextMenu(screen.getByText("README.md"))).toBe(true);
+  });
+
+  it("marks the file shown beside the tree as current, in the tree and in search results", () => {
+    const view = renderTree({ files, selectedPath: "README.md", onFileOpenInTab: vi.fn() });
+    expect(screen.getByText("README.md").closest("button")!).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+    view.unmount();
+    renderTree({
+      files,
+      browseLocation: "/srv/other",
+      searchQuery: "guide",
+      searchResults: [file("docs/guide.md")],
+      selectedPath: "/srv/other/docs/guide.md",
+    });
+    expect(screen.getByText("docs/guide.md").closest("button")!).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+  });
+});

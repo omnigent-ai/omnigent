@@ -35,11 +35,13 @@ import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import {
   type DefaultWorkspaceTab,
+  writeAlwaysOpenFilesInTab,
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
 } from "@/lib/workspaceTabPreferences";
 import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
 import { WorkspacePanel } from "./WorkspacePanel";
+import type { FilesPanelPreview } from "./FilesPanel";
 
 // The rail's content children are exercised by their own suites; stub them so
 // these tests focus on WorkspacePanel's own logic (the open-file/shell tab
@@ -47,30 +49,106 @@ import { WorkspacePanel } from "./WorkspacePanel";
 // Each stub renders a testid (plus, for FileViewer, the path it was asked to
 // show) so we can prove which child mounted without dragging in Monaco / hook
 // stacks / xterm.
-vi.mock("./FileViewer", () => ({
-  FileViewer: ({
-    path,
-    open,
-    mediaActive,
-  }: {
-    path: string;
-    open: boolean;
-    mediaActive: boolean;
-  }) => (
-    <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
-      {path}
-    </div>
-  ),
-}));
+vi.mock("./FileViewer", async () => {
+  const { useState } = await import("react");
+  return {
+    // Holds a draft like the real editor, so losing the instance loses the text.
+    FileViewer: function FileViewerStub({
+      path,
+      open,
+      mediaActive,
+      permissionLevel,
+      syncUrl,
+      onCloseTab,
+      position,
+      onCommentsOpenChange,
+      onDirtyChange,
+    }: {
+      path: string;
+      open: boolean;
+      mediaActive: boolean;
+      permissionLevel?: number | null;
+      syncUrl?: boolean;
+      onCloseTab?: () => void;
+      position?: { line: number };
+      onCommentsOpenChange?: (open: boolean) => void;
+      onDirtyChange?: (dirty: boolean) => void;
+    }) {
+      const [draft, setDraft] = useState("");
+      return (
+        <div
+          data-testid="file-viewer-stub"
+          data-open={open}
+          data-media-active={mediaActive}
+          data-permission-level={String(permissionLevel)}
+          data-sync-url={String(syncUrl)}
+          data-closable={String(onCloseTab !== undefined)}
+          data-line={position?.line}
+        >
+          {path}
+          <textarea
+            aria-label="Unsaved draft"
+            value={draft}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              onDirtyChange?.(event.target.value !== "");
+            }}
+          />
+          <button type="button" onClick={() => onCommentsOpenChange?.(true)}>
+            open comments
+          </button>
+        </div>
+      );
+    },
+  };
+});
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
   // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => (
+  // Tree rows and the beside-the-tree layout are exposed as plain controls.
+  FilesPanel: ({
+    flatView,
+    conversationId,
+    onFileSelect,
+    onFileOpenInTab,
+    selectedFilePath,
+    preview,
+  }: {
+    flatView: boolean;
+    conversationId: string;
+    onFileSelect: (path: string) => void;
+    onFileOpenInTab?: (path: string) => void;
+    selectedFilePath?: string | null;
+    preview?: FilesPanelPreview;
+  }) => (
     <div
       data-testid="files-panel-stub"
       data-session={conversationId}
       data-flat-view={String(flatView)}
-    />
+      data-selected-file={selectedFilePath ?? ""}
+    >
+      <button type="button" onClick={() => onFileSelect("docs/a.md")}>
+        tree: a.md
+      </button>
+      <button type="button" onClick={() => onFileSelect("docs/b.md")}>
+        tree: b.md
+      </button>
+      {onFileOpenInTab && (
+        <button type="button" onClick={() => onFileOpenInTab("docs/b.md")}>
+          tree: b.md in new tab
+        </button>
+      )}
+      {preview && (
+        <>
+          <button type="button" onClick={preview.onClose}>
+            Close file
+          </button>
+          <div data-testid="tree-column" style={{ width: preview.treeWidth }} />
+          {preview.separator}
+          <div data-testid="preview-pane" ref={preview.viewerRef} />
+        </>
+      )}
+    </div>
   ),
 }));
 vi.mock("./SubagentsPanel", () => ({
@@ -208,6 +286,47 @@ function fileViewerContextWithGuard(guardFileNavigation: FileNavigationGuard) {
   };
 }
 
+/** Gives the rail's content slot `width`; the returned function reports a resize. */
+function measureRail(width: number) {
+  let current = width;
+  const railObservers: ResizeObserverCallback[] = [];
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      private callback: ResizeObserverCallback;
+      constructor(callback: ResizeObserverCallback) {
+        this.callback = callback;
+      }
+      observe(target: Element) {
+        if (target.hasAttribute("data-workspace-panel-content")) railObservers.push(this.callback);
+      }
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  const measure = HTMLElement.prototype.getBoundingClientRect;
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: HTMLElement,
+  ) {
+    if (!this.hasAttribute("data-workspace-panel-content")) return measure.call(this);
+    return {
+      x: 0,
+      y: 0,
+      top: 0,
+      left: 0,
+      width: current,
+      height: 600,
+      right: current,
+      bottom: 600,
+    } as DOMRect;
+  });
+  return (next: number) =>
+    act(() => {
+      current = next;
+      for (const callback of railObservers) callback([], {} as ResizeObserver);
+    });
+}
+
 /**
  * Render WorkspacePanel with a complete prop set, overridable per test. Returns
  * the spied callbacks the tests assert against (openFileViewer / onCloseFile /
@@ -244,10 +363,17 @@ function renderWorkspace(
     permissionLevel?: number | null;
     /** Stands in for the mounted viewer's unsaved-edits check. */
     fileGuard?: FileNavigationGuard;
+    fileTreeSplitEnabled?: boolean;
+    treePreviewPath?: string | null;
+    canBrowseWorkspace?: boolean;
+    filePosition?: { line: number };
   } = {},
 ) {
   let overrides = initialOverrides;
   const openFileViewer = vi.fn();
+  const openFileInTree = vi.fn();
+  const onCloseTreePreview = vi.fn();
+  const onCommentsOpenChange = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
   const onClosePanel = vi.fn();
@@ -283,6 +409,11 @@ function renderWorkspace(
         openPanels={overrides.openPanels ?? []}
         onClosePanel={onClosePanel}
         showFilesPanel={overrides.showFilesPanel ?? true}
+        canBrowseWorkspace={overrides.canBrowseWorkspace}
+        fileTreeSplitEnabled={overrides.fileTreeSplitEnabled}
+        treePreviewPath={overrides.treePreviewPath}
+        openFileInTree={openFileInTree}
+        onCloseTreePreview={onCloseTreePreview}
         showContentSearch={overrides.showContentSearch}
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
@@ -293,11 +424,12 @@ function renderWorkspace(
         agentCount={1}
         rootSessionId={null}
         selectedFilePath={overrides.selectedFilePath ?? null}
+        filePosition={overrides.filePosition}
         openFiles={overrides.openFiles ?? []}
         openFileViewer={openFileViewer}
         onCloseFile={onCloseFile}
         onShowScopeView={vi.fn()}
-        onCommentsOpenChange={vi.fn()}
+        onCommentsOpenChange={onCommentsOpenChange}
         openTerminalTab={openTerminalTab}
         openTerminals={overrides.openTerminals ?? []}
         selectedTerminalKey={overrides.selectedTerminalKey ?? null}
@@ -340,6 +472,9 @@ function renderWorkspace(
       view.rerender(tree());
     },
     openFileViewer,
+    openFileInTree,
+    onCloseTreePreview,
+    onCommentsOpenChange,
     onCloseFile,
     onRightRailTabChange,
     onClosePanel,
@@ -2102,6 +2237,473 @@ it("keeps a contained workspace inline on narrow viewports and scopes its file b
   expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-session", "conv_ws");
 });
 
+describe("WorkspacePanel file tree split", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const split = { fileTreeSplitEnabled: true, rightRailTab: "files" as const };
+  const viewer = () => screen.getByTestId("file-viewer-stub");
+  const draftIn = (element: HTMLElement) => within(element).getByLabelText("Unsaved draft");
+  const typeDraft = (text: string) =>
+    fireEvent.change(draftIn(viewer()), { target: { value: text } });
+
+  it("keeps the open file's editor and draft while workspace access is lost and restored", () => {
+    const { rerender } = renderWorkspace({
+      ...split,
+      openFiles: ["docs/guide.md"],
+      selectedFilePath: "docs/guide.md",
+      permissionLevel: 2,
+    });
+    const editor = viewer();
+    typeDraft("Keep this draft");
+
+    // Losing edit access hides the tree; the editor stays, with the new access applied.
+    rerender({ showFilesPanel: false, permissionLevel: 1 });
+    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+    expect(viewer()).toBe(editor);
+    expect(editor).toHaveAttribute("data-permission-level", "1");
+    expect(draftIn(editor)).toHaveValue("Keep this draft");
+
+    rerender({ showFilesPanel: true, permissionLevel: 2 });
+    expect(viewer()).toBe(editor);
+    expect(editor).toHaveAttribute("data-permission-level", "2");
+    expect(draftIn(editor)).toHaveValue("Keep this draft");
+  });
+
+  it("hides a grid cell's file from a viewer without file access, keeping its draft", () => {
+    const { rerender } = renderWorkspace({
+      ...split,
+      contained: true,
+      openFiles: ["docs/guide.md"],
+      selectedFilePath: "docs/guide.md",
+    });
+    const editor = viewer();
+    typeDraft("Keep this draft");
+
+    rerender({ canBrowseWorkspace: false, showFilesPanel: false });
+    expect(screen.queryByTitle("docs/guide.md")).toBeNull();
+    expect(viewer()).toBe(editor);
+    expect(editor.closest("[inert]")).not.toBeNull();
+    expect(editor).toHaveAttribute("data-media-active", "false");
+
+    rerender({ canBrowseWorkspace: true, showFilesPanel: true });
+    expect(screen.getByTitle("docs/guide.md")).toBeInTheDocument();
+    expect(viewer()).toBe(editor);
+    expect(editor.closest("[inert]")).toBeNull();
+    expect(draftIn(editor)).toHaveValue("Keep this draft");
+  });
+
+  it("keeps a hidden tab's citation, and asks before a new browser tab replaces its file", async () => {
+    const allow: (() => void)[] = [];
+    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+      allow.push(commit);
+    });
+    const { rerender, onRightRailTabChange } = renderWorkspace({
+      ...split,
+      contained: true,
+      showBrowserTab: true,
+      openFiles: ["docs/page.html"],
+      selectedFilePath: "docs/page.html",
+      filePosition: { line: 3 },
+      fileGuard,
+    });
+    const editor = viewer();
+    rerender({ canBrowseWorkspace: false, showFilesPanel: false });
+    // The cited line decides the editable source view, so hiding must not drop it.
+    expect(viewer()).toBe(editor);
+    expect(editor).toHaveAttribute("data-line", "3");
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+    expect(fileGuard).toHaveBeenCalledWith(null, undefined, expect.any(Function));
+    // Keeping the edits creates nothing.
+    expect(screen.queryByRole("tab", { name: /^Browser \d/ })).toBeNull();
+    expect(onRightRailTabChange).not.toHaveBeenCalled();
+    act(() => allow[0]!());
+    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+  });
+
+  it("shows a clicked tree file beside the tree, with no empty pane before the first", () => {
+    measureRail(800);
+    const { rerender, openFileInTree, openFileViewer, onCloseTreePreview } = renderWorkspace(split);
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+    expect(screen.queryByTestId("preview-pane")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Close file" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "tree: a.md" }));
+    expect(openFileInTree).toHaveBeenCalledWith("docs/a.md");
+    expect(openFileViewer).not.toHaveBeenCalled();
+
+    rerender({ treePreviewPath: "docs/a.md" });
+    expect(
+      within(screen.getByTestId("preview-pane")).getByTestId("file-viewer-stub"),
+    ).toHaveTextContent("docs/a.md");
+    expect(viewer()).toHaveAttribute("data-sync-url", "true");
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute(
+      "data-selected-file",
+      "docs/a.md",
+    );
+    expect(screen.getByTestId("tree-column")).toHaveStyle({ width: "260px" });
+    expect(screen.getByRole("separator", { name: "Resize file tree" })).toHaveAttribute(
+      "aria-valuemax",
+      "400",
+    );
+    // A preview is not a file tab.
+    expect(screen.queryByTitle("docs/a.md")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "tree: b.md in new tab" }));
+    expect(openFileViewer).toHaveBeenCalledWith("docs/b.md");
+    fireEvent.click(screen.getByRole("button", { name: "Close file" }));
+    expect(onCloseTreePreview).toHaveBeenCalledOnce();
+  });
+
+  it("opens tree files in tabs below the split width, keeping a preview's draft meanwhile", () => {
+    const resize = measureRail(523);
+    const { rerender, openFileInTree, openFileViewer } = renderWorkspace(split);
+    fireEvent.click(screen.getByRole("button", { name: "tree: a.md" }));
+    expect(openFileViewer).toHaveBeenCalledWith("docs/a.md");
+    expect(openFileInTree).not.toHaveBeenCalled();
+
+    resize(524);
+    fireEvent.click(screen.getByRole("button", { name: "tree: a.md" }));
+    expect(openFileInTree).toHaveBeenCalledWith("docs/a.md");
+    rerender({ treePreviewPath: "docs/a.md" });
+    const editor = viewer();
+    typeDraft("Keep this draft");
+
+    resize(400);
+    expect(screen.queryByTestId("preview-pane")).toBeNull();
+    expect(viewer()).toBe(editor);
+    // A hidden viewer neither writes the URL nor answers Escape.
+    expect(editor).toHaveAttribute("data-sync-url", "false");
+    expect(editor).toHaveAttribute("data-media-active", "false");
+    expect(editor).toHaveAttribute("data-closable", "false");
+
+    resize(900);
+    expect(within(screen.getByTestId("preview-pane")).getByTestId("file-viewer-stub")).toBe(editor);
+    expect(draftIn(editor)).toHaveValue("Keep this draft");
+  });
+
+  it("follows the Always open files in a new tab setting without a reload", () => {
+    measureRail(800);
+    const { openFileInTree, openFileViewer } = renderWorkspace({
+      ...split,
+      treePreviewPath: "docs/a.md",
+    });
+    const editor = viewer();
+    typeDraft("Keep this draft");
+
+    act(() => writeAlwaysOpenFilesInTab(true));
+    expect(screen.queryByTestId("preview-pane")).toBeNull();
+    expect(viewer()).toBe(editor);
+    fireEvent.click(screen.getByRole("button", { name: "tree: b.md" }));
+    expect(openFileViewer).toHaveBeenCalledWith("docs/b.md");
+    expect(openFileInTree).not.toHaveBeenCalled();
+
+    act(() => writeAlwaysOpenFilesInTab(false));
+    expect(within(screen.getByTestId("preview-pane")).getByTestId("file-viewer-stub")).toBe(editor);
+    expect(draftIn(editor)).toHaveValue("Keep this draft");
+  });
+
+  it("keeps one tree and one editor when the previewed file moves to its own tab and back", () => {
+    measureRail(800);
+    const { rerender } = renderWorkspace({ ...split, treePreviewPath: "docs/a.md" });
+    const editor = viewer();
+    const tree = screen.getByTestId("files-panel-stub");
+    typeDraft("Keep this draft");
+
+    rerender({ openFiles: ["docs/a.md"], selectedFilePath: "docs/a.md" });
+    expect(screen.queryByTestId("preview-pane")).toBeNull();
+    expect(viewer()).toBe(editor);
+    expect(editor.closest("[inert]")).toBeNull();
+    expect(screen.getAllByTestId("files-panel-stub")).toEqual([tree]);
+    expect(tree.parentElement).toHaveClass("invisible");
+
+    rerender({ selectedFilePath: null });
+    expect(within(screen.getByTestId("preview-pane")).getByTestId("file-viewer-stub")).toBe(editor);
+    expect(screen.getAllByTestId("files-panel-stub")).toEqual([tree]);
+    expect(draftIn(editor)).toHaveValue("Keep this draft");
+  });
+
+  it("keeps the preview loaded behind another tab", () => {
+    measureRail(800);
+    const { rerender } = renderWorkspace({
+      ...split,
+      treePreviewPath: "docs/a.md",
+      showGithubTab: true,
+    });
+    const editor = viewer();
+    typeDraft("Keep this draft");
+    rerender({ rightRailTab: "github" });
+    expect(viewer()).toBe(editor);
+    expect(editor.closest("[inert]")).not.toBeNull();
+    rerender({ rightRailTab: "files" });
+    expect(within(screen.getByTestId("preview-pane")).getByTestId("file-viewer-stub")).toBe(editor);
+    expect(draftIn(editor)).toHaveValue("Keep this draft");
+  });
+
+  it("leaves phones and the Changes list on standalone files", () => {
+    measureRail(800);
+    isMobileMock.mockReturnValue(true);
+    const { openFileInTree, openFileViewer, rerender } = renderWorkspace({
+      ...split,
+      treePreviewPath: "docs/a.md",
+    });
+    expect(screen.queryByTestId("preview-pane")).toBeNull();
+    expect(screen.queryByRole("button", { name: "tree: b.md in new tab" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "tree: b.md" }));
+    expect(openFileViewer).toHaveBeenLastCalledWith("docs/b.md");
+
+    isMobileMock.mockReturnValue(false);
+    rerender({ rightRailTab: "changes" });
+    expect(screen.queryByTestId("preview-pane")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "tree: a.md" }));
+    expect(openFileViewer).toHaveBeenLastCalledWith("docs/a.md");
+    expect(openFileInTree).not.toHaveBeenCalled();
+  });
+
+  it("keeps the editor when a tab that is also the never-shown preview is left", async () => {
+    // No room for the split: the saved preview has never been shown beside the tree.
+    const fileGuard = vi.fn<FileNavigationGuard>((destination, _options, commit) => {
+      // Like the real viewer of docs/a.md, it asks only when another file replaces it.
+      if (destination === "docs/a.md") commit();
+    });
+    const { rerender, onRightRailTabChange } = renderWorkspace({
+      ...split,
+      showBrowserTab: true,
+      treePreviewPath: "docs/a.md",
+      openFiles: ["docs/a.md"],
+      selectedFilePath: "docs/a.md",
+      fileGuard,
+    });
+    const editor = viewer();
+    typeDraft("Keep this draft");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+    expect(fileGuard).toHaveBeenCalledWith("docs/a.md", undefined, expect.any(Function));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+
+    rerender({ selectedFilePath: null, rightRailTab: "browser" });
+    expect(viewer()).toBe(editor);
+    expect(draftIn(editor)).toHaveValue("Keep this draft");
+  });
+
+  // Changes that skip the viewer's guard, e.g. a background arrival or a missed call site.
+  it.each([
+    { change: "the Files tree shows", props: { selectedFilePath: null }, then: "docs/a.md" },
+    {
+      change: "another tab shows",
+      props: { selectedFilePath: null, rightRailTab: "changes" as const },
+      then: null,
+    },
+    {
+      change: "a shell shows",
+      props: { selectedFilePath: null, selectedTerminalKey: "terminal:zsh" },
+      then: null,
+    },
+    {
+      change: "its tab closes",
+      props: { selectedFilePath: null, openFiles: [] },
+      then: "docs/a.md",
+    },
+    {
+      change: "another file goes beside the tree",
+      props: { selectedFilePath: null, treePreviewPath: "docs/c.md" },
+      then: "docs/c.md",
+    },
+  ])(
+    "keeps an edited file loaded when $change unasked, until its edits are gone",
+    ({ props, then }) => {
+      measureRail(800);
+      const fileGuard = vi.fn<FileNavigationGuard>();
+      const { rerender } = renderWorkspace({
+        ...split,
+        treePreviewPath: "docs/a.md",
+        openFiles: ["docs/b.md"],
+        selectedFilePath: "docs/b.md",
+        openTerminals: ["terminal:zsh"],
+        fileGuard,
+      });
+      const editor = viewer();
+      typeDraft("Keep this draft");
+
+      rerender(props);
+      expect(viewer()).toBe(editor);
+      expect(editor).toHaveTextContent("docs/b.md");
+      expect(editor.closest("[inert]")).not.toBeNull();
+      expect(draftIn(editor)).toHaveValue("Keep this draft");
+      // The tree gets no pane for a file the editor can't take yet.
+      expect(screen.queryByTestId("preview-pane")).toBeNull();
+      expect(fileGuard).not.toHaveBeenCalled();
+
+      // Saved or discarded edits let the editor follow the rail.
+      typeDraft("");
+      if (then === null) expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+      else expect(viewer()).toHaveTextContent(then);
+    },
+  );
+
+  it.each([
+    {
+      gesture: "the Files tab",
+      pick: () => fireEvent.mouseDown(screen.getByRole("tab", { name: "Files" }), { button: 0 }),
+    },
+    {
+      gesture: "the Changes tab",
+      pick: () => fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }), { button: 0 }),
+    },
+    { gesture: "a tab number", pick: () => pressTabNumber(1) },
+    { gesture: "a shell tab", pick: () => fireEvent.click(screen.getByTitle("zsh")) },
+    {
+      gesture: "a browser tab",
+      pick: () => fireEvent.click(screen.getByRole("tab", { name: "Browser 1" })),
+    },
+    {
+      gesture: "a side-chat tab",
+      pick: () => fireEvent.click(screen.getByRole("tab", { name: "Side chat 1" })),
+    },
+    {
+      gesture: "the panel menu",
+      pick: () => {
+        fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+        fireEvent.click(screen.getByRole("menuitem", { name: "Changes" }));
+      },
+    },
+  ])("asks the viewer before $gesture leaves a file tab, then switches once", ({ pick }) => {
+    measureRail(800);
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-one"],
+      openSideChats: ["pending:one"],
+    });
+    const allow: (() => void)[] = [];
+    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+      allow.push(commit);
+    });
+    const { onRightRailTabChange, openTerminalTab } = renderWorkspace({
+      ...split,
+      keyboardTarget: true,
+      showBrowserTab: true,
+      treePreviewPath: "docs/a.md",
+      openFiles: ["docs/b.md"],
+      selectedFilePath: "docs/b.md",
+      openTerminals: ["terminal:zsh"],
+      fileGuard,
+    });
+    pick();
+    // The file beside the tree would replace the tab's file, so the viewer decides first.
+    expect(fileGuard).toHaveBeenLastCalledWith("docs/a.md", undefined, expect.any(Function));
+    expect(onRightRailTabChange).not.toHaveBeenCalled();
+    expect(openTerminalTab).not.toHaveBeenCalled();
+
+    // A Radix tab asks on focus and on mouse-down; the viewer keeps only the latest request.
+    act(() => allow.at(-1)!());
+    expect(onRightRailTabChange.mock.calls.length + openTerminalTab.mock.calls.length).toBe(1);
+  });
+
+  it("keeps a tab's citation while its file stays beside the tree, until opened there again", async () => {
+    measureRail(800);
+    const fileGuard = vi.fn<FileNavigationGuard>((destination, _options, commit) => {
+      if (destination === "docs/a.md") commit();
+    });
+    const { rerender, openFileInTree } = renderWorkspace({
+      ...split,
+      showBrowserTab: true,
+      treePreviewPath: "docs/a.md",
+      openFiles: ["docs/a.md"],
+      selectedFilePath: "docs/a.md",
+      filePosition: { line: 3 },
+      fileGuard,
+    });
+    const editor = viewer();
+    expect(editor).toHaveAttribute("data-line", "3");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+    expect(fileGuard).toHaveBeenCalledWith("docs/a.md", undefined, expect.any(Function));
+
+    // Hiding keeps the citation, so the viewer has no view change to confirm afterwards.
+    rerender({ selectedFilePath: null, rightRailTab: "browser" });
+    expect(viewer()).toBe(editor);
+    expect(editor).toHaveAttribute("data-line", "3");
+    rerender({ rightRailTab: "files" });
+    expect(within(screen.getByTestId("preview-pane")).getByTestId("file-viewer-stub")).toBe(editor);
+    expect(editor).toHaveAttribute("data-line", "3");
+
+    fireEvent.click(screen.getByRole("button", { name: "tree: a.md" }));
+    expect(openFileInTree).toHaveBeenCalledWith("docs/a.md");
+    expect(editor).not.toHaveAttribute("data-line");
+  });
+
+  it("drops a tab's citation once another file is beside the tree", () => {
+    measureRail(800);
+    const { rerender } = renderWorkspace({
+      ...split,
+      treePreviewPath: "docs/b.md",
+      openFiles: ["docs/a.md"],
+      selectedFilePath: "docs/a.md",
+      filePosition: { line: 3 },
+    });
+    rerender({ selectedFilePath: null });
+    expect(viewer()).toHaveTextContent("docs/b.md");
+    expect(viewer()).not.toHaveAttribute("data-line");
+    rerender({ treePreviewPath: "docs/a.md" });
+    expect(viewer()).not.toHaveAttribute("data-line");
+  });
+
+  it("loads no file for a grid cell that has never had file access", () => {
+    const { rerender } = renderWorkspace({
+      ...split,
+      contained: true,
+      canBrowseWorkspace: false,
+      showFilesPanel: false,
+      openFiles: ["docs/guide.md"],
+      selectedFilePath: "docs/guide.md",
+    });
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+    rerender({ canBrowseWorkspace: true, showFilesPanel: true });
+    expect(viewer()).toHaveTextContent("docs/guide.md");
+  });
+
+  it("widens the rail for the preview's comments only while the preview is on screen", () => {
+    measureRail(800);
+    const { rerender, onCommentsOpenChange } = renderWorkspace({
+      ...split,
+      treePreviewPath: "docs/a.md",
+    });
+    fireEvent.click(within(viewer()).getByRole("button", { name: "open comments" }));
+    expect(onCommentsOpenChange).toHaveBeenLastCalledWith(true);
+    rerender({ rightRailTab: "changes" });
+    expect(onCommentsOpenChange).toHaveBeenLastCalledWith(false);
+    rerender({ rightRailTab: "files" });
+    expect(onCommentsOpenChange).toHaveBeenLastCalledWith(true);
+  });
+
+  it("loads a saved preview only once it is shown", () => {
+    const resize = measureRail(400);
+    renderWorkspace({ ...split, treePreviewPath: "docs/a.md" });
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+    resize(800);
+    const editor = viewer();
+    resize(400);
+    expect(viewer()).toBe(editor);
+  });
+
+  it("ignores a saved preview while the flag is off", () => {
+    measureRail(800);
+    const { openFileViewer } = renderWorkspace({ treePreviewPath: "docs/a.md" });
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+    expect(screen.queryByRole("button", { name: "tree: b.md in new tab" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "tree: a.md" }));
+    expect(openFileViewer).toHaveBeenCalledWith("docs/a.md");
+  });
+});
+
 describe("WorkspacePanel desktop menu commands", () => {
   type CommandListener = (event: { command: string; browserViewId: string | null }) => void;
   let sendCommand: CommandListener = () => {};
@@ -2130,6 +2732,7 @@ describe("WorkspacePanel desktop menu commands", () => {
 
   afterEach(() => {
     resetDesktopCommandsForTests();
+    vi.unstubAllGlobals();
   });
 
   /** Put keyboard focus on the rail's tab strip, as a click inside the rail would. */
@@ -2141,6 +2744,18 @@ describe("WorkspacePanel desktop menu commands", () => {
 
   const close = (focusedViewId: string | null = null) =>
     sendCommand({ command: "close", browserViewId: focusedViewId });
+
+  it("closes the file beside the tree when the rail has focus", () => {
+    measureRail(800);
+    const { onCloseTreePreview, onHide } = renderWorkspace({
+      fileTreeSplitEnabled: true,
+      treePreviewPath: "docs/a.md",
+    });
+    focusRail();
+    close();
+    expect(onCloseTreePreview).toHaveBeenCalledOnce();
+    expect(onHide).not.toHaveBeenCalled();
+  });
 
   it("closes the shell on screen when the rail has focus", () => {
     const { onCloseTerminal } = renderWorkspace({
@@ -2866,14 +3481,25 @@ describe("WorkspacePanel desktop menu commands", () => {
     }
     const reopen = () => sendCommand({ command: "reopen-closed-tab", browserViewId: null });
 
-    it("keeps a closed file in the history while the open file's edits are kept", () => {
+    it.each([
+      {
+        holder: "an open file tab",
+        session: "conv_keep_file",
+        state: { openFiles: ["src/a.ts", "src/b.ts"], selectedFilePath: "src/b.ts" },
+      },
+      {
+        holder: "the file beside the tree",
+        session: "conv_keep_preview",
+        state: {
+          fileTreeSplitEnabled: true,
+          treePreviewPath: "docs/a.md",
+          openFiles: ["src/a.ts"],
+        },
+      },
+    ])("keeps a closed file in the history while $holder keeps its edits", ({ session, state }) => {
+      measureRail(800);
       const { allow, fileGuard } = guardedFile();
-      const { openFileViewer } = renderWorkspace({
-        conversationId: "conv_keep_file",
-        openFiles: ["src/a.ts", "src/b.ts"],
-        selectedFilePath: "src/b.ts",
-        fileGuard,
-      });
+      const { openFileViewer } = renderWorkspace({ conversationId: session, ...state, fileGuard });
       fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
 
       reopen();

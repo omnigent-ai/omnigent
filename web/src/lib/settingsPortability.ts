@@ -34,6 +34,8 @@ import {
   unpinSessionWorkspaceTabs,
 } from "./sessionWorkspaceState";
 import {
+  ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY,
+  notifyAlwaysOpenFilesInTabChanged,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
   readPinnedWorkspaceTabs,
@@ -52,6 +54,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-workspace-panel",
   "omnigent:default-workspace-tab",
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
+  ALWAYS_OPEN_FILES_IN_TAB_STORAGE_KEY,
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
@@ -187,6 +190,7 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   notifyFoldAssistantNarrationChanged();
   notifyPeerSessionMessageDisplayChanged();
   notifySessionRowQuickActionsChanged();
+  notifyAlwaysOpenFilesInTabChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);

@@ -76,7 +76,8 @@ with their own terminal retain the switcher.
 - In the desktop app, Control+` or File → New Terminal does the same, also
   while an embedded browser tab has focus. The menu item is disabled whenever
   the chord would be inert.
-- Select an open shell from the rail's shell list; close it from its tab.
+- Select an open shell from the rail's shell list; close it from its tab. Drag
+  the divider beside the shell list, or focus it and use the arrow keys, to resize it.
   In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
   workspace tab, using the same terminal confirmation. A read-only viewer's
   terminal stays open. Cmd/Ctrl+Shift+W closes the window.

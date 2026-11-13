@@ -1,18 +1,29 @@
 import { type ReactNode, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useInertRef } from "@/hooks/useInertRef";
+import { cn } from "@/lib/utils";
 
 /** Move one portal host between layouts without remounting its editor or drafts. */
 export function ResponsiveViewerSlot({
   mobile,
   mobileTarget,
+  target = null,
+  hidden = false,
   children,
 }: {
   mobile: boolean;
   mobileTarget: HTMLElement | null;
+  /** Desktop mount point elsewhere in the layout; the slot's own place is the fallback. */
+  target?: HTMLElement | null;
+  /** Keeps the viewer laid out but out of sight and reach, e.g. while another tab shows. */
+  hidden?: boolean;
   children: ReactNode;
 }) {
   const desktopTarget = useRef<HTMLDivElement>(null);
+  const setDesktopTarget = useInertRef(hidden, desktopTarget);
   const focusedElement = useRef<HTMLElement | null>(null);
+  // Scroll offsets inside the viewer, recorded as they change: a detached node reads 0.
+  const scrollOffsets = useRef(new Map<Element, { top: number; left: number }>());
   const [host] = useState(() => {
     const element = document.createElement("div");
     element.className = "flex min-h-0 flex-1 flex-col overflow-hidden";
@@ -34,17 +45,29 @@ export function ResponsiveViewerSlot({
         focusedElement.current = null;
       }
     };
+    const rememberScroll = (event: Event) => {
+      // Forget elements a file switch removed, so the map never holds detached editors.
+      for (const element of scrollOffsets.current.keys()) {
+        if (!host.contains(element)) scrollOffsets.current.delete(element);
+      }
+      if (event.target instanceof Element && event.target.getClientRects().length > 0) {
+        const { scrollTop: top, scrollLeft: left } = event.target;
+        scrollOffsets.current.set(event.target, { top, left });
+      }
+    };
     document.addEventListener("focusin", rememberFocus, true);
     host.addEventListener("focusout", forgetFocus, true);
+    host.addEventListener("scroll", rememberScroll, true);
     return () => {
       document.removeEventListener("focusin", rememberFocus, true);
       host.removeEventListener("focusout", forgetFocus, true);
+      host.removeEventListener("scroll", rememberScroll, true);
     };
   }, [host]);
 
   useLayoutEffect(() => {
-    const target = mobile && mobileTarget ? mobileTarget : desktopTarget.current;
-    if (!target || host.parentElement === target) return;
+    const destination = mobile && mobileTarget ? mobileTarget : (target ?? desktopTarget.current);
+    if (!destination || host.parentElement === destination) return;
     // Reparenting can clear focus and the native selection even though React
     // keeps the editor instance. Preserve both once for the layout transition.
     const activeElement = document.activeElement;
@@ -76,7 +99,16 @@ export function ResponsiveViewerSlot({
             focusOffset: selection.focusOffset,
           }
         : null;
-    target.appendChild(host);
+    destination.appendChild(host);
+    // Moving a node resets its scroll; put back where the reader was.
+    for (const [element, offset] of scrollOffsets.current) {
+      if (!host.contains(element)) {
+        scrollOffsets.current.delete(element);
+      } else {
+        element.scrollTop = offset.top;
+        element.scrollLeft = offset.left;
+      }
+    }
     active?.focus({ preventScroll: true });
     if (input && inputSelection) {
       input.setSelectionRange(inputSelection.start, inputSelection.end, inputSelection.direction);
@@ -89,13 +121,20 @@ export function ResponsiveViewerSlot({
         savedSelection.focusOffset,
       );
     }
-  }, [host, mobile, mobileTarget]);
+  }, [host, mobile, mobileTarget, target]);
 
   useLayoutEffect(() => () => host.remove(), [host]);
 
   return (
     <>
-      <div ref={desktopTarget} className="flex min-h-0 flex-1 flex-col" />
+      {/* Not display:none: a hidden editor keeps its size, so it returns without relayout. */}
+      <div
+        ref={setDesktopTarget}
+        className={cn(
+          "flex min-h-0 flex-col",
+          hidden ? "pointer-events-none invisible absolute inset-0" : "flex-1",
+        )}
+      />
       {createPortal(children, host)}
     </>
   );

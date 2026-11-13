@@ -14,6 +14,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { toast } from "sonner";
+import { flushSync } from "react-dom";
 import {
   type CSSProperties,
   type ReactElement,
@@ -24,6 +25,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -44,6 +46,7 @@ import {
   defaultWorkspaceTabs,
   readDefaultWorkspaceTab,
   readPinnedWorkspaceTabs,
+  useAlwaysOpenFilesInTab,
 } from "@/lib/workspaceTabPreferences";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -63,6 +66,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
+import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { requestSandboxWake } from "@/hooks/useSandboxAutoWake";
 import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
 import { useSideChats } from "@/hooks/useSideChats";
@@ -105,6 +109,17 @@ import {
   workspacePanelTabPresentation,
 } from "./workspacePanelTabs";
 import { Button } from "../components/ui/button";
+
+// The Files tree beside an open file: column bounds, and the narrowest file pane, which
+// FileViewer's toolbar fits by folding actions into its overflow menu.
+const FILE_TREE_MIN_PX = 200;
+const FILE_TREE_DEFAULT_PX = 260;
+const FILE_PREVIEW_MIN_PX = 320;
+const FILE_TREE_DIVIDER_PX = 4;
+/** Below this Files width the tree stays full width and clicked files open in tabs. */
+const FILE_TREE_SPLIT_MIN_PX = FILE_TREE_MIN_PX + FILE_PREVIEW_MIN_PX + FILE_TREE_DIVIDER_PX;
+const FILE_TREE_WIDTH_STORAGE_KEY = "omnigent:workspace-file-tree-width";
+const NO_FILES: string[] = [];
 
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
@@ -713,6 +728,11 @@ interface WorkspacePanelProps {
   onClosePanel: (tab: DefaultWorkspaceTab) => void;
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
+  /**
+   * Whether this viewer may see workspace files. Without it file tabs and the open file are
+   * hidden, but the file's editor stays mounted so an unsaved draft survives a restore.
+   */
+  canBrowseWorkspace?: boolean;
   showContentSearch?: boolean;
   /** Whether the Pull Requests tab is available (same on-disk-workspace gate as Files). */
   showGithubTab: boolean;
@@ -744,6 +764,14 @@ interface WorkspacePanelProps {
   onMobileFileClose?: () => void;
   /** Ordered list of open file tabs, shown as a strip in the Files panel. */
   openFiles: string[];
+  /** Desktop Files shows a plainly clicked tree file beside the tree when there is room. */
+  fileTreeSplitEnabled?: boolean;
+  /** The file shown beside the Files tree; it is not a file tab. */
+  treePreviewPath?: string | null;
+  /** Show a tree file beside the tree (confirms unsaved edits first). */
+  openFileInTree?: (path: string) => void;
+  /** Close the file beside the tree (confirms unsaved edits first). */
+  onCloseTreePreview?: () => void;
   /** Open a file in the inline viewer (adds/activates its tab). */
   openFileViewer: (path: string, options?: OpenFileOptions) => void;
   /** Close a single open file tab by path. */
@@ -891,6 +919,7 @@ function WorkspacePanelImpl({
   openPanels,
   onClosePanel,
   showFilesPanel,
+  canBrowseWorkspace = true,
   showContentSearch = false,
   showGithubTab,
   showBrowserTab,
@@ -900,11 +929,15 @@ function WorkspacePanelImpl({
   subagentsWorking,
   agentCount,
   rootSessionId,
-  selectedFilePath,
+  selectedFilePath: selectedFileRequest,
   filePosition,
   mobileFileTarget = null,
   onMobileFileClose,
-  openFiles,
+  openFiles: openFileRequests,
+  fileTreeSplitEnabled = false,
+  treePreviewPath = null,
+  openFileInTree,
+  onCloseTreePreview,
   openFileViewer,
   onCloseFile,
   onShowScopeView,
@@ -930,6 +963,9 @@ function WorkspacePanelImpl({
   onHasSideChatTabsChange,
   subagentPanelOpener,
 }: WorkspacePanelProps) {
+  // What this viewer may see; the editor below keeps the requested file regardless.
+  const selectedFilePath = canBrowseWorkspace ? selectedFileRequest : null;
+  const openFiles = canBrowseWorkspace ? openFileRequests : NO_FILES;
   const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
   const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
@@ -1079,8 +1115,9 @@ function WorkspacePanelImpl({
       onReveal?.();
     };
     // A new browser tab replaces the file on screen, so its viewer confirms unsaved edits first.
-    if (selectedFilePath !== null && guardFileNavigation) {
-      guardFileNavigation(null, undefined, openBrowser);
+    // The file beside the tree stays loaded, so it is the viewer's destination.
+    if (fileLoaded && guardFileNavigation) {
+      guardFileNavigation(previewPath, undefined, openBrowser);
     } else {
       openBrowser();
     }
@@ -1243,6 +1280,52 @@ function WorkspacePanelImpl({
   // `pending:` tab has no child yet; its first send creates the fork.
   const mobileViewport = useIsMobileViewport();
   const isMobile = mobileViewport && !contained;
+  // The split follows the rail's measured width, docked, full screen, or in a grid cell.
+  const [contentWidth, setContentWidth] = useState(0);
+  useLayoutEffect(() => {
+    const content = railContentRef.current;
+    if (!fileTreeSplitEnabled || !content) return;
+    const measure = () => setContentWidth(content.getBoundingClientRect().width);
+    measure();
+    // Render a resize before paint, so the layout never flashes the other arrangement.
+    const observer = new ResizeObserver(() => flushSync(measure));
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [fileTreeSplitEnabled]);
+  const alwaysOpenFilesInTab = useAlwaysOpenFilesInTab();
+  const treeSplitEnabled = fileTreeSplitEnabled && !isMobile && !alwaysOpenFilesInTab;
+  const treeSplitFits = contentWidth >= FILE_TREE_SPLIT_MIN_PX;
+  const fileTree = useResizableColumn(
+    FILE_TREE_DEFAULT_PX,
+    FILE_TREE_MIN_PX,
+    Math.floor(
+      Math.min(contentWidth / 2, contentWidth - FILE_PREVIEW_MIN_PX - FILE_TREE_DIVIDER_PX),
+    ),
+    FILE_TREE_WIDTH_STORAGE_KEY,
+  );
+  const [previewTarget, setPreviewTarget] = useState<HTMLDivElement | null>(null);
+  const previewPath = fileTreeSplitEnabled && !pending ? treePreviewPath : null;
+  // What the rail's one editor holds: a file, the citation it was opened at, and whether it
+  // has unsaved edits. It stays loaded while hidden (another tab, a narrow rail, lost access).
+  const [held, setHeld] = useState<{
+    session: string;
+    path: string;
+    position?: FilePosition;
+    dirty: boolean;
+  } | null>(null);
+  const heldPath = held?.session === conversationId ? held.path : null;
+  const heldDirty = heldPath !== null && held?.dirty === true;
+  const reportViewerDirty = useCallback(
+    (dirty: boolean) =>
+      setHeld((current) => (current && current.dirty !== dirty ? { ...current, dirty } : current)),
+    [],
+  );
+  // Without file access, a tab's file loads only if the editor already holds it.
+  const standalonePath =
+    !pending && !terminalShown && (canBrowseWorkspace || heldPath === selectedFileRequest)
+      ? selectedFileRequest
+      : null;
+  const closeTreePreview = useCallback(() => onCloseTreePreview?.(), [onCloseTreePreview]);
   useEffect(() => {
     if (!showContentSearch || !showFilesPanel || pending || isMobile) return;
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -1355,28 +1438,6 @@ function WorkspacePanelImpl({
     sideChats.close(childId);
   };
 
-  // Closing the file on screen asks its viewer first, which confirms before
-  // dropping edits it hasn't saved. Other file tabs have no mounted editor.
-  // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
-  // window keydown listener on every render — an inline arrow would change
-  // identity each render and thrash the effect's add/remove cycle.
-  const closeFile = useCallback(
-    (path: string) => {
-      const close = () => {
-        rememberClosedTab(conversationId, { kind: "file", path });
-        onCloseFile(path);
-      };
-      if (path === selectedFilePath && guardFileNavigation) {
-        guardFileNavigation(null, undefined, close);
-      } else {
-        close();
-      }
-    },
-    [conversationId, guardFileNavigation, onCloseFile, selectedFilePath],
-  );
-  const handleCloseTab = useCallback(() => {
-    if (selectedFilePath !== null) closeFile(selectedFilePath);
-  }, [closeFile, selectedFilePath]);
   const closePanel = (tab: DefaultWorkspaceTab) => {
     rememberClosedTab(conversationId, { kind: "panel", tab });
     onClosePanel(tab);
@@ -1445,7 +1506,7 @@ function WorkspacePanelImpl({
     const index = visiblePermanentTabs.findIndex((candidate) => candidate === tab);
     return index === -1 ? undefined : String(index + 1);
   };
-  const selectPermanentTab = (tab: RightRailTab) => {
+  const showPermanentTab = (tab: RightRailTab) => {
     // Files, Changes and Pull Requests need the session's host, so picking one wakes
     // an asleep sandbox.
     if ((tab === "files" || tab === "changes" || tab === "github") && conversationId) {
@@ -1453,6 +1514,9 @@ function WorkspacePanelImpl({
     }
     onRightRailTabChange(tab);
   };
+  // Picking another tab leaves the file on screen once its viewer allows it.
+  const pickTab = (show: () => void) => leaveFileRef.current(null, show);
+  const selectPermanentTab = (tab: RightRailTab) => pickTab(() => showPermanentTab(tab));
   const tabAriaShortcut = (tab: RightRailTab) => {
     const digit = shortcutFor(tab);
     return digit === undefined ? undefined : workspaceTabAriaShortcut(digit);
@@ -1462,8 +1526,10 @@ function WorkspacePanelImpl({
   workspaceTabHotkeyRef.current = (index) => {
     const tab = visiblePermanentTabs[index];
     if (!tab || pending || !keyboardTarget) return false;
-    selectPermanentTab(tab);
-    onReveal?.();
+    pickTab(() => {
+      showPermanentTab(tab);
+      onReveal?.();
+    });
     return true;
   };
   useWorkspaceTabHotkeys(workspaceTabHotkeyRef);
@@ -1505,7 +1571,7 @@ function WorkspacePanelImpl({
         !browserSelected &&
         !sideChatSelected &&
         rightRailTab === tab,
-      select: () => selectPermanentTab(tab),
+      select: () => showPermanentTab(tab),
       disabled: false,
     })),
     ...openFiles.map((path) => ({
@@ -1592,6 +1658,67 @@ function WorkspacePanelImpl({
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
   const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
+  const treeShown = filesPanelActive && rightRailTab !== "changes";
+  const previewFits = treeSplitEnabled && treeSplitFits && treeShown && previewPath !== null;
+  // The selected tab's file, else the file beside the tree once shown or already held. Guards
+  // rely on it: leaving a tab whose file is the one beside the tree keeps that file loaded.
+  const previewHeld = previewPath !== null && (previewFits || heldPath === previewPath);
+  const requestedPath = standalonePath ?? (previewHeld ? previewPath : null);
+  // Unsaved edits keep their file loaded, hidden if need be, until the user lets them go.
+  const documentPath = heldDirty ? heldPath : requestedPath;
+  const standaloneShown =
+    !pending && !terminalShown && selectedFilePath !== null && selectedFilePath === documentPath;
+  const previewShown = previewFits && previewPath === documentPath;
+  const viewerShown = standaloneShown || previewShown;
+  // The held file keeps its tab's citation, and the source view it implies, while hidden.
+  const keptPosition = heldPath !== null && heldPath === documentPath ? held?.position : undefined;
+  const viewerPosition =
+    standalonePath !== null && standalonePath === documentPath ? filePosition : keptPosition;
+  const heldChanged =
+    documentPath === null
+      ? held !== null
+      : heldPath !== documentPath || held?.position !== viewerPosition;
+  if (heldChanged) {
+    setHeld(
+      documentPath === null
+        ? null
+        : {
+            session: conversationId,
+            path: documentPath,
+            position: viewerPosition,
+            dirty: heldPath === documentPath && heldDirty,
+          },
+    );
+  }
+  // Whether the editor holds a file, on screen or not; leaving it may need its consent.
+  const fileLoaded = documentPath !== null;
+  // Opening the held file beside the tree again starts it afresh, without a kept citation.
+  const showFileInTree = (path: string) => {
+    if (path === documentPath && held?.position) setHeld({ ...held, position: undefined });
+    openFileInTree?.(path);
+  };
+  // Closing the editor's file, on screen or not, asks its viewer first, which confirms
+  // before dropping edits it hasn't saved. Other file tabs have no mounted editor.
+  // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
+  // window keydown listener on every render — an inline arrow would change
+  // identity each render and thrash the effect's add/remove cycle.
+  const closeFile = useCallback(
+    (path: string) => {
+      const close = () => {
+        rememberClosedTab(conversationId, { kind: "file", path });
+        onCloseFile(path);
+      };
+      if ((path === selectedFilePath || path === documentPath) && guardFileNavigation) {
+        guardFileNavigation(null, undefined, close);
+      } else {
+        close();
+      }
+    },
+    [conversationId, guardFileNavigation, onCloseFile, selectedFilePath, documentPath],
+  );
+  const handleCloseTab = useCallback(() => {
+    if (selectedFilePath !== null) closeFile(selectedFilePath);
+  }, [closeFile, selectedFilePath]);
   // Desktop Close (⌘W / Ctrl+W) while the rail, or its embedded browser view,
   // has focus: close the tab on screen, or hide the rail on a fixed page.
   // Otherwise AppShell's handler leaves the session.
@@ -1614,6 +1741,8 @@ function WorkspacePanelImpl({
         if (closingTerminalKey !== selectedTerminalKey) onCloseTerminal(selectedTerminalKey);
       } else if (selectedFilePath !== null) {
         handleCloseTab();
+      } else if (previewShown) {
+        closeTreePreview();
       } else if (scopeView === "sidechat" && sideChats.selected !== null) {
         void closeSideChat(sideChats.selected);
       } else if (scopeView === "browser" && browsers.selected !== null) {
@@ -1664,25 +1793,27 @@ function WorkspacePanelImpl({
     commit(),
   );
   leaveFileRef.current = (path, commit) => {
-    if (selectedFilePath !== null && guardFileNavigation) {
-      guardFileNavigation(path, undefined, commit);
+    if (fileLoaded && guardFileNavigation) {
+      guardFileNavigation(path ?? previewPath, undefined, commit);
     } else {
       commit();
     }
+  };
+  // Opening a file asks about the one on screen itself; any other tab replaces it here.
+  const selectOption = (option: (typeof panelOptions)[number], then?: () => void) => {
+    const show = () => {
+      option.select();
+      then?.();
+    };
+    if (option.key.startsWith("file:")) show();
+    else pickTab(show);
   };
   const showAdjacentTab = (step: -1 | 1) => {
     const options = panelOptions.filter((option) => !option.disabled);
     const index = options.findIndex((option) => option.active);
     const target =
       index === -1 && step === -1 ? options.at(-1) : options.at((index + step) % options.length);
-    if (!target) return;
-    const show = () => {
-      target.select();
-      onReveal?.();
-    };
-    // Opening a file asks about the one on screen itself; any other tab replaces it here.
-    if (target.key.startsWith("file:")) show();
-    else leaveFileRef.current(null, show);
+    if (target) selectOption(target, onReveal);
   };
   // The session and what its rail shows, apart from the browser tab a reopen selects itself.
   const railView = [
@@ -1759,7 +1890,7 @@ function WorkspacePanelImpl({
       // This reopen is shown now, so an earlier browser reopen still loading stays behind it.
       shownReopenRef.current = reopenId;
       if (closed.kind === "file") openFileViewer(closed.path);
-      else if (closed.kind === "panel") selectPermanentTab(closed.tab);
+      else if (closed.kind === "panel") showPermanentTab(closed.tab);
       else {
         browsers.add();
         onRightRailTabChange("browser");
@@ -1771,6 +1902,16 @@ function WorkspacePanelImpl({
   useDesktopCommand("previous-tab", tabCommandsActive ? () => showAdjacentTab(-1) : null);
   useDesktopCommand("next-tab", tabCommandsActive ? () => showAdjacentTab(1) : null);
   useDesktopCommand("reopen-closed-tab", tabCommandsActive ? reopenClosedTab : null);
+  // The rail widens for an open comments panel only while its viewer is on screen.
+  const [viewerCommentsOpen, setViewerCommentsOpen] = useState(false);
+  useEffect(
+    () => onCommentsOpenChange(viewerShown && viewerCommentsOpen),
+    [viewerShown, viewerCommentsOpen, onCommentsOpenChange],
+  );
+  // A phone's full-screen viewer closes back to its drawer; the file beside the tree just closes.
+  const mobileFileClose = isMobile ? onMobileFileClose : undefined;
+  const viewerClose = standaloneShown ? (mobileFileClose ?? onShowScopeView) : closeTreePreview;
+  const viewerCloseTab = standaloneShown ? (mobileFileClose ?? handleCloseTab) : closeTreePreview;
   const rail = (
     <aside
       aria-label="Workspace"
@@ -1935,7 +2076,7 @@ function WorkspacePanelImpl({
                   closingKey={closingTerminalKey ?? null}
                   canClose={isEditorLevel(permissionLevel)}
                   labelFor={terminalLabelFor}
-                  onSelect={openTerminalTab}
+                  onSelect={(key) => pickTab(() => openTerminalTab(key))}
                   onClose={onCloseTerminal}
                 />
                 {showBrowserTab &&
@@ -1962,10 +2103,12 @@ function WorkspacePanelImpl({
                             void closeBrowserTab(tabId);
                           }
                         }}
-                        onClick={() => {
-                          browsers.select(tabId);
-                          onRightRailTabChange("browser");
-                        }}
+                        onClick={() =>
+                          pickTab(() => {
+                            browsers.select(tabId);
+                            onRightRailTabChange("browser");
+                          })
+                        }
                       >
                         <GlobeIcon className="size-4 shrink-0" />
                         <span className="max-w-44 truncate">{browsers.labelFor(tabId, index)}</span>
@@ -2007,10 +2150,12 @@ function WorkspacePanelImpl({
                             closeSideChat(childId);
                           }
                         }}
-                        onClick={() => {
-                          sideChats.select(childId);
-                          onRightRailTabChange("sidechat");
-                        }}
+                        onClick={() =>
+                          pickTab(() => {
+                            sideChats.select(childId);
+                            onRightRailTabChange("sidechat");
+                          })
+                        }
                       >
                         <TabIcon className="size-4 shrink-0" />
                         <span className="max-w-[16ch] truncate">{label}</span>
@@ -2075,7 +2220,7 @@ function WorkspacePanelImpl({
                   {panelOptions.map((option) => (
                     <DropdownMenuItem
                       key={option.key}
-                      onSelect={option.select}
+                      onSelect={() => selectOption(option)}
                       disabled={option.disabled}
                       title={option.label}
                       aria-current={option.active ? "true" : undefined}
@@ -2145,7 +2290,31 @@ function WorkspacePanelImpl({
               <FilesPanel
                 conversationId={contained ? conversationId : undefined}
                 frameless
-                onFileSelect={openFileViewer}
+                onFileSelect={
+                  treeSplitEnabled && treeSplitFits && openFileInTree && rightRailTab !== "changes"
+                    ? showFileInTree
+                    : openFileViewer
+                }
+                onFileOpenInTab={treeSplitEnabled ? openFileViewer : undefined}
+                selectedFilePath={previewShown ? previewPath : null}
+                compactTreeControls={fileTreeSplitEnabled}
+                preview={
+                  previewShown
+                    ? {
+                        treeWidth: fileTree.width,
+                        rowRef: fileTree.containerRef as RefObject<HTMLDivElement>,
+                        viewerRef: setPreviewTarget,
+                        separator: (
+                          <div
+                            {...fileTree.handleProps}
+                            aria-label="Resize file tree"
+                            className="w-1 shrink-0 cursor-col-resize bg-border transition-colors hover:bg-primary/30 focus-visible:bg-primary/50 focus-visible:outline-none active:bg-primary/50"
+                          />
+                        ),
+                        onClose: closeTreePreview,
+                      }
+                    : undefined
+                }
                 flatView={rightRailTab === "changes"}
                 showHidden={filesPanelShowHidden}
                 onShowHiddenChange={onShowHiddenChange}
@@ -2170,27 +2339,7 @@ function WorkspacePanelImpl({
               readOnly={!isOwnerLevel(permissionLevel)}
               autoFocus={autoFocusSelectedTerminal}
             />
-          ) : selectedFilePath !== null ? (
-            <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
-              <FileViewer
-                syncUrl={!contained}
-                agentId={agentId}
-                mobileOverlay={isMobile}
-                frameless
-                open
-                mediaActive={isMobile ? mobileFileTarget != null : open}
-                conversationId={conversationId}
-                path={selectedFilePath}
-                position={filePosition}
-                onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
-                onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
-                onNavigateTo={openFileViewer}
-                permissionLevel={permissionLevel}
-                onCommentsOpenChange={onCommentsOpenChange}
-                sort={filesPanelSort}
-              />
-            </ResponsiveViewerSlot>
-          ) : scopeView === "sidechat" ? (
+          ) : standaloneShown ? null : scopeView === "sidechat" ? (
             // A side chat: a forked child conversation streamed here in its own
             // scoped surface, beside the still-active main chat. Phones show it
             // in the side-chats drawer instead, so it never mounts twice.
@@ -2221,6 +2370,34 @@ function WorkspacePanelImpl({
               <p className="text-sm">Open a Workspace tab from the + menu.</p>
             </div>
           ) : null}
+          {/* Outside every tab, tree, width and access branch, so none of them remounts it. */}
+          {documentPath !== null && (
+            <ResponsiveViewerSlot
+              mobile={isMobile && standaloneShown}
+              mobileTarget={mobileFileTarget}
+              target={previewShown ? previewTarget : null}
+              hidden={!standaloneShown}
+            >
+              <FileViewer
+                syncUrl={!contained && viewerShown}
+                agentId={agentId}
+                mobileOverlay={isMobile && standaloneShown}
+                frameless
+                open
+                mediaActive={viewerShown && (isMobile ? mobileFileTarget != null : open)}
+                conversationId={conversationId}
+                path={documentPath}
+                position={viewerPosition}
+                onClose={viewerClose}
+                onCloseTab={viewerShown ? viewerCloseTab : undefined}
+                onNavigateTo={viewerShown ? openFileViewer : undefined}
+                permissionLevel={permissionLevel}
+                onCommentsOpenChange={setViewerCommentsOpen}
+                onDirtyChange={reportViewerDirty}
+                sort={filesPanelSort}
+              />
+            </ResponsiveViewerSlot>
+          )}
         </div>
       </div>
     </aside>

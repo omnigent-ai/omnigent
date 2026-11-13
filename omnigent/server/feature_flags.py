@@ -41,6 +41,7 @@ class Feature(StrEnum):
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
     CLAUDE_OSC_STATUS = "claude_osc_status"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
+    WORKSPACE_FILE_TREE_SPLIT_UI = "workspace_file_tree_split_ui"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
@@ -208,6 +209,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Search workspace file contents through the session runner",
         owner="web",
         review_by_release="0.20.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_FILE_TREE_SPLIT_UI,
+        description="Show the Workspace file tree beside the open file",
+        owner="web",
+        review_by_release="0.23.0",
     ),
     FeatureDefinition(
         feature=Feature.SIDEBAR_WINDOWED_ROWS,
