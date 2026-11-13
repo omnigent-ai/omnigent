@@ -2634,12 +2634,6 @@ function NewChatLandingContent({
   // Once the user acts on the prompt, a reload must not bring the link's text
   // back over their work. Any change to the text counts (typing, dictation,
   // slash completion, clearing).
-  function releaseKeptLinkedPrompt(): void {
-    const owned = keptLinkedRef.current;
-    if (owned === null) return;
-    keptLinkedRef.current = null;
-    forgetKeptLinkedPrompt(siblingSourceId, owned);
-  }
   useEffect(() => {
     const kept = keptLinkedRef.current;
     if (kept === null || message === kept.text) return;
@@ -6138,6 +6132,8 @@ function NewChatLandingContent({
       // Spend the draft only once provisioning starts, after the laptop credential check.
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
+      // A newer prompt link may replace the kept prompt while this create runs.
+      const submittedLinkedPrompt = keptLinkedRef.current;
       if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
@@ -6724,7 +6720,10 @@ function NewChatLandingContent({
       appendPromptHistoryEntry(initialPrompt, data.id);
       // The session was created — drop any draft a detour back to this
       // screen stashed, so the next visit starts clean.
-      releaseKeptLinkedPrompt();
+      if (submittedLinkedPrompt !== null) {
+        if (keptLinkedRef.current === submittedLinkedPrompt) keptLinkedRef.current = null;
+        forgetKeptLinkedPrompt(siblingSourceId, submittedLinkedPrompt);
+      }
       if (submittedDraftRevisionRef.current === draftState.revision) {
         writeLandingDraft(draftState, null);
       }

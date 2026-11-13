@@ -363,7 +363,10 @@ describe("embedded prompt link", () => {
     expect(composer()).toHaveValue("hello_world");
   });
 
-  it("does not let an older create forget a newer prompt", async () => {
+  it.each([
+    ["a remounted composer", true],
+    ["the same composer", false],
+  ])("does not let an older create forget a newer prompt in %s", async (_case, remount) => {
     allowSessionStart({ ok: true, body: { id: "conv_a" } });
     let finishCreate: (response: Response) => void = () => {};
     vi.mocked(authenticatedFetch).mockImplementation((url, init) =>
@@ -373,11 +376,15 @@ describe("embedded prompt link", () => {
           })
         : Promise.resolve({ ok: true, json: async () => ({}) } as unknown as Response),
     );
-    renderLanding();
+    const { rerender } = renderLanding();
     await submitWhenReady();
-    cleanup();
     searchParams = new URLSearchParams("o=123&prompt=Second+request");
-    renderLanding();
+    if (remount) {
+      cleanup();
+      renderLanding();
+    } else {
+      rerender(<Landing visit={1} />);
+    }
     expect(composer()).toHaveValue("Second request");
     await act(async () => {
       finishCreate({ ok: true, json: async () => ({ id: "conv_a" }) } as unknown as Response);
