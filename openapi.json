@@ -212,6 +212,81 @@
         "title": "AgentConfigPatch",
         "type": "object"
       },
+      "AgentCost": {
+        "description": "Display cost of one agent in a session tree.",
+        "properties": {
+          "cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Priced USD cost of this agent including its sub-agents (the same total its own session reports), or `None` when nothing in that subtree is priced.",
+            "title": "Cost Usd"
+          },
+          "id": {
+            "description": "Session id, e.g. `\"conv_child123\"`.",
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "AgentCost",
+        "type": "object"
+      },
+      "AgentCostList": {
+        "description": "A page of costs for a session and its descendants; `data` lists `AgentCost`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/AgentCost"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "AgentCostList",
+        "type": "object"
+      },
       "AgentDetailObject": {
         "description": "Agent summary with caller ownership for management actions.",
         "properties": {
@@ -1358,6 +1433,39 @@
         "title": "ClientTaskCancelEvent",
         "type": "object"
       },
+      "CloneRepositoryRequest": {
+        "description": "Request body for `POST /v1/hosts/{host_id}/repositories/clone`.",
+        "properties": {
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional branch to check out, e.g. `\"main\"`; `None` clones the remote default.",
+            "title": "Branch"
+          },
+          "path": {
+            "description": "Absolute or tilde-prefixed destination that must not exist yet, e.g. `\"~/code/app\"`. Its parent folder must already exist.",
+            "title": "Path",
+            "type": "string"
+          },
+          "url": {
+            "description": "Clone URL, e.g. `\"https://git.example.com/team/app.git\"`. Must not embed credentials.",
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "path"
+        ],
+        "title": "CloneRepositoryRequest",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -2143,6 +2251,14 @@
               }
             ],
             "title": "Max Cost Usd"
+          },
+          "mcp_services": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 40,
+            "title": "Mcp Services",
+            "type": "array"
           },
           "model_override": {
             "anyOf": [
@@ -3467,6 +3583,12 @@
       "GrantPermissionRequest": {
         "description": "Request body for `PUT /v1/sessions/{id}/permissions`.",
         "properties": {
+          "ensure_minimum": {
+            "default": false,
+            "description": "Preserve a stronger existing grant atomically.",
+            "title": "Ensure Minimum",
+            "type": "boolean"
+          },
           "level": {
             "description": "Numeric permission level: `1` = read, `2` = edit, `3` = manage.",
             "format": "int64",
@@ -6855,6 +6977,11 @@
             "title": "Scheduled Task Inbox",
             "type": "boolean"
           },
+          "scheduled_task_mcp_services": {
+            "default": true,
+            "title": "Scheduled Task Mcp Services",
+            "type": "boolean"
+          },
           "scheduled_task_projects": {
             "default": false,
             "title": "Scheduled Task Projects",
@@ -6878,6 +7005,11 @@
           "scheduled_task_subhour": {
             "default": true,
             "title": "Scheduled Task Subhour",
+            "type": "boolean"
+          },
+          "scheduled_task_trigger_headers": {
+            "default": true,
+            "title": "Scheduled Task Trigger Headers",
             "type": "boolean"
           },
           "scheduled_task_worktrees": {
@@ -9153,7 +9285,7 @@
                 "type": "null"
               }
             ],
-            "description": "Id for the new sandbox host, 32 lowercase hex characters, sent only when `GET /v1/info` reports `request_managed_sandbox_host_id`; `None` lets the server mint one.",
+            "description": "Id for the new sandbox host, 32 lowercase hex characters; `None` lets the server mint one.",
             "title": "Host Id"
           },
           "sandbox_provider": {
@@ -13130,6 +13262,21 @@
             ],
             "title": "Max Cost Usd"
           },
+          "mcp_services": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 40,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Services"
+          },
           "model_override": {
             "anyOf": [
               {
@@ -15904,6 +16051,62 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/repositories/clone": {
+      "post": {
+        "description": "Clone a git repository into a new directory on a host.\n\nUsed by the New project dialog to check out the project's repository\nbefore the project is saved. Owner-scoped like the directory routes.\nThe host refuses to clone into an existing path.\n\n**Parameters**\n\n- `body` \u2014 The clone URL, optional branch, and destination path.\n\n**Returns:** `{\"object\": \"repository\", \"path\": \"<checkout abs path>\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by the caller, 400 on invalid input, 409 when the destination exists or the host predates clone support, 504 on clone timeout, 502 on clone failure or lost contact.",
+        "operationId": "clone_host_repository_v1_hosts__host_id__repositories_clone_post",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloneRepositoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Clone Host Repository V1 Hosts  Host Id  Repositories Clone Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clone Host Repository",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/runners": {
       "post": {
         "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline, 403 if caller doesn't own the host, 400 if session already has a runner.",
@@ -18413,6 +18616,90 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/agent_costs": {
+      "get": {
+        "description": "List display costs for a session and the sub-agents beneath it.\n\nSubtree totals come from one spawn-tree read (ids, parents and usage\nonly) bounded like `child_sessions?descendants=true`; a tree past\nthat cap reports no costs. READ on the session covers its\ndescendants, as for `child_sessions`.\n\n**Returns:** A page of `AgentCostList` in spawn-tree order.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 without READ; 404 when no session exists.\n- `StaleCursorError` \u2014 If *after* is not an agent of the subtree, or the tree outgrew the read cap since the page it came from.",
+        "operationId": "list_agent_costs_v1_sessions__session_id__agent_costs_get",
+        "parameters": [
+          {
+            "description": "Session whose subtree to report, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum agents in the page (1-1000, default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Id of the last agent of the previous page, or `None`.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentCostList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The `after`/`before` cursor names an item that no longer exists (it was deleted, or archived out of the filtered set) so the keyset bound cannot be resolved. The `error.code` is `stale_cursor`. Enumeration cannot continue from this cursor: restart from the first page, without a cursor."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Agent Costs",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/auto-title": {
       "post": {
         "description": "Replace the deterministic first-message title when still current.",
@@ -19667,7 +19954,7 @@
         ]
       },
       "put": {
-        "description": "Grant or update a permission on a session.\n\nRequires manage-level access. Upserts the grant \u2014 can\nupgrade or downgrade an existing level. Auto-creates the\ngrantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting `PermissionObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 401 if unauthenticated.",
+        "description": "Grant or update a permission on a session.\n\nRequires manage-level access. Upserts the grant \u2014 can\nupgrade or downgrade an existing level unless `ensure_minimum`\npreserves stronger access. Auto-creates the\ngrantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting `PermissionObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access, 401 if unauthenticated.",
         "operationId": "grant_permission_v1_sessions__session_id__permissions_put",
         "parameters": [
           {
@@ -23283,6 +23570,47 @@
           }
         },
         "summary": "Open File",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/workspace/direct-access": {
+      "post": {
+        "description": "Give the session owner a short-lived token for its host's workspace socket.\n\nThe owner's desktop app, on the same machine as the host, uses it to call\nthe workspace API without a server round trip. Unconfined sessions only:\nthe host reads the workspace itself and applies no sandbox's hidden paths.\nAny refusal leaves the client on the server route.",
+        "operationId": "create_workspace_direct_access_v1_sessions__session_id__workspace_direct_access_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Workspace Direct Access",
         "tags": [
           "sessions"
         ]

@@ -31,6 +31,7 @@ import {
   type Host,
 } from "@/hooks/useHosts";
 import { ApiError } from "@/lib/sessionsApi";
+import { useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
 import { INVENTORY_HARNESS_IDS, INVENTORY_HARNESSES } from "@/hooks/useHarnessInventory";
 import {
   HARNESS_CREDENTIAL_COPY,
@@ -97,14 +98,20 @@ function hostHarnessKey(hostId: string, harness: string): string {
 
 /**
  * Settings → Harnesses: the harness grid at /settings/harnesses, or one
- * harness's details at /settings/harnesses/<harness>. An unknown slug shows the
- * grid. Host selection lives here so it survives grid ↔ details navigation.
+ * harness's details at /settings/harnesses/<harness>. An unknown slug, or one
+ * the deployment curated out, shows the grid. Host selection lives here so it
+ * survives grid ↔ details navigation.
  */
 export const SettingsHarnessesSection = () => {
   const { harness } = useSettingsRoute();
   const [query, setQuery] = useState("");
   const [installedOnly, setInstalledOnly] = useState(false);
   const info = useServerInfo();
+  const curatedOut = useCuratedOutHarnesses();
+  const offered = useMemo(
+    () => HARNESS_ENTRIES.filter((entry) => !curatedOut.has(entry.harness)),
+    [curatedOut],
+  );
   const queryClient = useQueryClient();
   const [searchParams] = useSearchParams();
   const requestedHostId = searchParams.get("host");
@@ -166,14 +173,14 @@ export const SettingsHarnessesSection = () => {
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return HARNESS_ENTRIES.filter(
+    return offered.filter(
       (h) =>
         (!installedOnly || harnessStatus(h.harness, selectedHost).ready) &&
         (!q || h.name.toLowerCase().includes(q) || h.description.toLowerCase().includes(q)),
     );
-  }, [query, installedOnly, selectedHost]);
+  }, [offered, query, installedOnly, selectedHost]);
 
-  const detail = HARNESS_ENTRIES.find((entry) => entry.harness === harness);
+  const detail = offered.find((entry) => entry.harness === harness);
 
   return (
     <div className="@container">
@@ -233,7 +240,11 @@ export const SettingsHarnessesSection = () => {
           {!selectedHost && <NoHostNotice loading={hostsLoading} />}
           {filtered.length === 0 && (
             <p className="text-ui text-muted-foreground">
-              {query.trim() ? `No harnesses match “${query}”.` : "No installed harnesses."}
+              {offered.length === 0
+                ? "This server offers no harnesses to set up."
+                : query.trim()
+                  ? `No harnesses match “${query}”.`
+                  : "No installed harnesses."}
             </p>
           )}
           <div

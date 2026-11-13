@@ -7,6 +7,7 @@ import {
   RECONCILE_MIN_GAP_MS,
   RECONCILE_ROUND_TIMEOUT_MS,
   RECONCILE_WHILE_ACTIVE_MS,
+  type ReconcileScope,
 } from "./listReconcileScheduler";
 
 /** A round whose completion the test controls. */
@@ -192,5 +193,65 @@ describe("createListReconcileScheduler", () => {
     scheduler.schedule();
     await vi.advanceTimersByTimeAsync(RECONCILE_MAX_GAP_MS);
     expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs one round over the union of the lists requested before it", async () => {
+    const run = vi.fn(async (_scope: ReconcileScope) => {});
+    const scheduler = createListReconcileScheduler(run);
+
+    scheduler.schedule(new Set(["a"]));
+    scheduler.schedule(new Set(["b"]));
+    scheduler.schedule(new Set());
+    await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenLastCalledWith(new Set(["a", "b"]));
+  });
+
+  it("widens a round to every list when any request asks for every list", async () => {
+    const run = vi.fn(async (_scope: ReconcileScope) => {});
+    const scheduler = createListReconcileScheduler(run);
+
+    scheduler.schedule(new Set(["a"]));
+    scheduler.schedule();
+    scheduler.schedule(new Set(["b"]));
+    await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS);
+    expect(run).toHaveBeenLastCalledWith("all");
+  });
+
+  it("ignores a request that names no lists", async () => {
+    const run = vi.fn(async () => {});
+    const scheduler = createListReconcileScheduler(run);
+
+    scheduler.schedule(new Set());
+    await vi.advanceTimersByTimeAsync(RECONCILE_MAX_GAP_MS);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("gives the trailing round only the lists requested mid-round", async () => {
+    const { run, finish } = controllableRun();
+    const scheduler = createListReconcileScheduler(run);
+
+    scheduler.schedule(new Set(["a"]));
+    await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS);
+    scheduler.schedule(new Set(["b"]));
+    scheduler.schedule(new Set(["c"]));
+    finish();
+    await vi.advanceTimersByTimeAsync(RECONCILE_MIN_GAP_MS);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run).toHaveBeenNthCalledWith(1, new Set(["a"]));
+    expect(run).toHaveBeenNthCalledWith(2, new Set(["b", "c"]));
+  });
+
+  it("still runs the activity round over every list after rounds over named lists", async () => {
+    const run = vi.fn(async (_scope: ReconcileScope) => {});
+    const scheduler = createListReconcileScheduler(run);
+
+    await vi.advanceTimersByTimeAsync(RECONCILE_WHILE_ACTIVE_MS / 2);
+    scheduler.schedule(new Set(["a"]));
+    await vi.advanceTimersByTimeAsync(RECONCILE_WHILE_ACTIVE_MS / 2);
+    scheduler.noteActivity();
+    await vi.advanceTimersByTimeAsync(RECONCILE_MIN_GAP_MS);
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run).toHaveBeenLastCalledWith("all");
   });
 });

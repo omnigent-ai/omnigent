@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,17 +37,30 @@ class ProjectCreateResolution:
     project_id: str | None = None
 
 
+def server_sandbox_providers(request: Any) -> tuple[str, ...]:
+    """The sandbox providers this server can launch, to check a saved provider against.
+
+    :param request: The create request, whose app carries ``sandbox_config``.
+    :returns: Launchable provider names; empty when managed sandboxes are off.
+    """
+    sandbox_config = getattr(request.app.state, "sandbox_config", None)
+    return sandbox_config.launchable_providers() if sandbox_config is not None else ()
+
+
 async def resolve_project_session_create(
     *,
     body: Any,
     user_id: str | None,
     project_store: ProjectStore | None,
+    launchable_sandbox_providers: Collection[str] = (),
 ) -> ProjectCreateResolution:
     """Apply opt-in project defaults before any create-side validation.
 
     Field presence, rather than value, controls defaulting.  Consequently an
     explicit JSON ``null`` remains explicit and is never replaced by a project
     hint.  Unknown and foreign projects deliberately share one 404 response.
+    A saved sandbox provider is inherited only when it is in
+    ``launchable_sandbox_providers``; an unconfigured one is ignored.
     """
     fields_set = set(body.model_fields_set)
     project_id = getattr(body, "project_id", None)
@@ -65,10 +79,28 @@ async def resolve_project_session_create(
 
     # Nested agents inherit filing, while the composer or MCP chooses their placement.
     config = {} if getattr(body, "sibling_source_id", None) else project.config
+    # A child runs on its parent's host, so the project's new-target defaults don't apply.
+    managed = (
+        getattr(body, "host_type", None) == "managed"
+        and getattr(body, "parent_session_id", None) is None
+    )
+    repository = _saved_managed_repository(config) if managed else None
     updates: dict[str, Any] = {}
     for field in ("agent_id", "workspace", "git"):
+        if repository is not None and field in ("workspace", "git"):
+            continue
         if field not in fields_set and field in config and field in body.__class__.model_fields:
             updates[field] = config[field]
+    if repository is not None and not {"workspace", "workspaces"} & fields_set:
+        updates["workspaces"] = [repository]
+    saved_provider = config.get("sandbox_provider")
+    if (
+        managed
+        and "sandbox_provider" not in fields_set
+        and isinstance(saved_provider, str)
+        and saved_provider in launchable_sandbox_providers
+    ):
+        updates["sandbox_provider"] = saved_provider
     resolved_data = body.model_dump()
     resolved_data.update(updates)
     # Re-validate project hints because config is intentionally stored as
@@ -92,6 +124,26 @@ async def resolve_project_session_create(
         )
 
     return ProjectCreateResolution(body=resolved, project_id=project_id)
+
+
+def _saved_managed_repository(config: dict[str, Any]) -> str | None:
+    """The project's saved repository as a managed workspace, or ``None``.
+
+    A malformed saved value is ignored rather than failing the create, since
+    config is opaque client JSON.
+
+    :param config: The project's opaque config object.
+    :returns: ``url`` or ``url#branch``, e.g. ``"https://git.example.com/team/app.git#main"``.
+    """
+    from omnigent.server.managed_hosts import parse_project_repository
+
+    if "repository" not in config:
+        return None
+    try:
+        parsed = parse_project_repository(config["repository"])
+    except ValueError:
+        return None
+    return parsed.url if parsed.branch is None else f"{parsed.url}#{parsed.branch}"
 
 
 def validate_session_model_metadata(

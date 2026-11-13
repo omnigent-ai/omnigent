@@ -24,8 +24,9 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
+from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.server.auth import LEVEL_OWNER
@@ -172,6 +173,22 @@ def configure_host_sharding(enabled: bool) -> None:
 def _deployment_is_sharded() -> bool:
     """Return whether this deployment shards host traffic by host_id."""
     return _host_sharded
+
+
+def routed_slice_key(request: Request) -> str | None:
+    """Return the slice key that routed *request*, or ``None`` when unkeyed.
+
+    Ingress reads the slice-key header and falls back to the ``omnigent_slice_key``
+    query parameter when the header is empty.
+
+    :param request: The inbound request.
+    :returns: The key, e.g. ``"a1b2c3d4..."``, or ``None``.
+    """
+    return (
+        request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        or request.query_params.get("omnigent_slice_key")
+        or None
+    )
 
 
 def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentError:

@@ -37,12 +37,13 @@ from omnigent.entities import (
     StoredFile,
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
+from omnigent.host.workspace_tokens import mint_token
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
 )
-from omnigent.runner.routing import RunnerRouter, routing_host_id
+from omnigent.runner.routing import RunnerRouter, routing_host_id, routing_host_session
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
@@ -60,7 +61,7 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
-from omnigent.server.host_registry import HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -73,7 +74,7 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._gzip_route import GZipFileContentRoute, skip_gzip
-from omnigent.server.routes._host_launch import resolve_host_owner
+from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _logger,
@@ -300,6 +301,7 @@ def register_resources_routes(
                 session_id=conv.id,
                 conv=conv,
                 app_state=request.app.state,
+                request=request,
                 conversation_store=conversation_store,
                 runner_router=runner_router,
             )
@@ -494,6 +496,7 @@ def register_resources_routes(
                 session_id=session_id,
                 conv=conversation,
                 app_state=request.app.state,
+                request=request,
                 conversation_store=conversation_store,
                 runner_router=runner_router or get_server_runner_router(),
                 raise_host_refusal=True,
@@ -562,6 +565,8 @@ def register_resources_routes(
         params: dict[str, str] | None = None,
         timeout: float = 10.0,
         unsupported_endpoint_message: str | None = None,
+        *,
+        for_control: bool = False,
     ) -> dict[str, Any]:
         """Proxy a GET request to the runner and return parsed JSON.
 
@@ -572,6 +577,7 @@ def register_resources_routes(
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
         :param timeout: Seconds to wait for the runner response.
         :param unsupported_endpoint_message: Upgrade guidance for an unregistered runner route.
+        :param for_control: Read registry metadata without admitting execution.
         :returns: Parsed JSON response body.
         :raises OmnigentError: ``runner_unavailable`` (503) for an unsupported endpoint;
             typed ``not_found`` (404) or
@@ -579,10 +585,14 @@ def register_resources_routes(
         :raises HTTPException: The runner's 400 with its detail when it rejects the request;
             502 on any other runner failure.
         """
-        runner_client = await _get_runner_client_for_resource_access(
-            session_id,
-            conversation=conversation,
-        )
+        if for_control:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation, for_control=True
+            )
+        else:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation
+            )
         if runner_client is None:
             raise HTTPException(
                 status_code=502,
@@ -716,8 +726,34 @@ def register_resources_routes(
             raise runner_offline
         return payload
 
+    async def _session_host(
+        conv: Conversation, request: Request
+    ) -> tuple[str | None, HostConnection | None, str | None]:
+        """Return the host a session runs on, its tunnel here, and the session's workspace.
+
+        Side chats and sub-agents run on the host of the session that owns them,
+        but keep their own workspace; like the runner, fall back to the owner's
+        workspace only when the session has none. The tunnel is ``None`` when the
+        host isn't connected here; a host live on another replica raises
+        :class:`WrongReplicaError`, so the client re-addresses.
+
+        :param conv: The authorized session.
+        :param request: The incoming request, for the app's host store.
+        :returns: ``(host id, local host connection or None, workspace)``.
+        """
+        owner = await asyncio.to_thread(routing_host_session, conv, conversation_store) or conv
+        host_id = owner.host_id
+        host = host_registry.get(host_id) if host_registry is not None and host_id else None
+        host_store = getattr(request.app.state, "host_store", None)
+        if host is None and host_id and host_store is not None:
+            record = await asyncio.to_thread(host_store.get_host, host_id)
+            absent = host_absent_error(record) if record is not None else None
+            if isinstance(absent, WrongReplicaError):
+                raise absent
+        return host_id, host, conv.workspace or owner.workspace
+
     async def _environment_reach_for_session(
-        conversation: Conversation,
+        conversation: Conversation, workspace: str | None = None
     ) -> tuple[list[Any], bool, str] | None:
         """Compute a session's browse reach without consulting the runner.
 
@@ -728,12 +764,15 @@ def register_resources_routes(
         the decision has to be made here.
 
         :param conversation: Conversation loaded during authorization.
+        :param workspace: The workspace to resolve against, when it isn't the
+            conversation's own (a sub-agent inheriting its runner's).
         :returns: ``(roots, unconfined, workspace)``, or ``None`` when the
             session has no workspace or spec to resolve.
         """
         from omnigent.inner.sandbox import declared_filesystem_reach
 
-        if not conversation.workspace:
+        workspace = workspace or conversation.workspace
+        if not workspace:
             return None
         spec = await asyncio.to_thread(
             _load_agent_spec_for_session,
@@ -743,13 +782,8 @@ def register_resources_routes(
         spec_os_env = getattr(spec, "os_env", None) if spec is not None else None
         if spec_os_env is None:
             return None
-        root = Path(conversation.workspace)
-        roots, unconfined = declared_filesystem_reach(root, spec_os_env)
-        return (
-            roots,
-            unconfined,
-            conversation.workspace,
-        )
+        roots, unconfined = declared_filesystem_reach(Path(workspace), spec_os_env)
+        return roots, unconfined, workspace
 
     def _runner_environment_segment(environment_id: str) -> str:
         """Preserve an environment identifier as one runner URL segment."""
@@ -1215,6 +1249,8 @@ def register_resources_routes(
         session_id: str,
         path: str,
         conversation: Conversation,
+        *,
+        for_control: bool = False,
     ) -> tuple[int, dict[str, Any]]:
         """Proxy a DELETE request to the runner and return status + JSON.
 
@@ -1224,10 +1260,14 @@ def register_resources_routes(
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: On transport failure or an unreadable runner reply.
         """
-        runner_client = await _get_runner_client_for_resource_access(
-            session_id,
-            conversation=conversation,
-        )
+        if for_control:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation, for_control=True
+            )
+        else:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conversation
+            )
         if runner_client is None:
             raise HTTPException(
                 status_code=502,
@@ -1458,6 +1498,7 @@ def register_resources_routes(
             path,
             conv,
             params=forwarded or None,
+            for_control=True,
         )
         await _annotate_direct_attach(page, session_id, request)
         return page
@@ -1518,7 +1559,7 @@ def register_resources_routes(
         resolver = get_runner_direct_attach_resolver()
         if resolver is None:
             return
-        endpoint = resolver(session_id)
+        endpoint = await asyncio.to_thread(resolver, session_id)
         if endpoint is None:
             return
         if not await _caller_owns_session(session_id, request):
@@ -1629,6 +1670,7 @@ def register_resources_routes(
             session_id=session_id,
             conv=conv,
             app_state=request.app.state,
+            request=request,
             conversation_store=conversation_store,
             runner_router=runner_router or get_server_runner_router(),
         )
@@ -1636,7 +1678,7 @@ def register_resources_routes(
         path = f"/v1/sessions/{session_id}/resources/terminals"
         router = runner_router or get_server_runner_router()
         if router is not None:
-            await asyncio.to_thread(router.require_mcp_registry_support, conv)
+            await asyncio.to_thread(router.require_runtime_support, conv)
         status, payload = await _proxy_post_to_runner(
             session_id,
             path,
@@ -1691,7 +1733,7 @@ def register_resources_routes(
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}"
-        return await _proxy_get_to_runner(session_id, path, conv)
+        return await _proxy_get_to_runner(session_id, path, conv, for_control=True)
 
     @router.get("/sessions/{session_id}/sign-in-link", response_model=None)
     async def get_session_sign_in_link(request: Request, session_id: str) -> dict[str, Any]:
@@ -1852,6 +1894,7 @@ def register_resources_routes(
             session_id,
             path,
             conv,
+            for_control=True,
         )
         if status == 404:
             error = payload.get("error", {})
@@ -2529,6 +2572,7 @@ def register_resources_routes(
                     session_id=session_id,
                     conv=conv,
                     app_state=request.app.state,
+                    request=request,
                     conversation_store=conversation_store,
                     runner_router=runner_router or get_server_runner_router(),
                     raise_host_refusal=True,
@@ -2720,6 +2764,52 @@ def register_resources_routes(
                 "Session runner does not support content search; update the host and restart the session"
             ),
         )
+
+    @router.post(
+        "/sessions/{session_id}/workspace/direct-access",
+        response_model=None,
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def create_workspace_direct_access(request: Request, session_id: str) -> dict[str, Any]:
+        """Give the session owner a short-lived token for its host's workspace socket.
+
+        The owner's desktop app, on the same machine as the host, uses it to call
+        the workspace API without a server round trip. Unconfined sessions only:
+        the host reads the workspace itself and applies no sandbox's hidden paths.
+        Any refusal leaves the client on the server route.
+        """
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_DIRECT_ACCESS):
+            raise HTTPException(status_code=404, detail="Workspace direct access is disabled")
+        conv, is_owner = await _authorize_browse_read_with_owner(session_id, request)
+        if not is_owner:
+            raise HTTPException(
+                status_code=403, detail="Only the session owner can read its workspace directly"
+            )
+        host_id, host, workspace = await _session_host(conv, request)
+        if host_id is None or host is None:
+            raise HTTPException(status_code=404, detail="The session's host is not connected")
+        socket_path = host.hello.workspace_socket
+        key = host.hello.workspace_token_key
+        if not socket_path or not key:
+            raise HTTPException(
+                status_code=404, detail="The session's host offers no direct access"
+            )
+        # The session's own spec decides confinement, even on an inherited host.
+        reach = await _environment_reach_for_session(conv, workspace)
+        if reach is None or not reach[1]:
+            raise HTTPException(
+                status_code=404, detail="Direct access serves unconfined sessions only"
+            )
+        token, expires_at = mint_token(
+            key, host_id=host_id, session_id=session_id, workspace=reach[2]
+        )
+        return {
+            "host_id": host_id,
+            "socket_path": socket_path,
+            "token": token,
+            "expires_at": expires_at,
+        }
 
     @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/search",

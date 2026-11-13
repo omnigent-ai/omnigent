@@ -794,10 +794,13 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().blocks).toHaveLength(1);
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+    // Unknown while the read runs is loading, not unavailable.
+    expect(useChatStore.getState().sessionUsageLoading).toBe(true);
 
     finishUsage(usage("conv_usage", 3.5));
     await tick();
 
+    expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
     expect(useChatStore.getState().sessionUsageByModel).toEqual({
       "model-a": {
@@ -866,6 +869,7 @@ describe("chatStore — lazy subtree usage", () => {
     expect(useChatStore.getState().conversationLoadError).toBeNull();
     expect(useChatStore.getState().sessionCostUsd).toBeNull();
     expect(useChatStore.getState().sessionUsageByModel).toBeNull();
+    expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     expect(readUsage).toHaveBeenCalledOnce();
   });
 
@@ -1068,12 +1072,20 @@ describe("chatStore — lazy subtree usage", () => {
       await useChatStore.getState().switchTo("conv_usage");
       await drainAsync();
       expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+      await vi.advanceTimersByTimeAsync(2_000);
+      client.setQueryData(["agent_costs", "conv_usage"], new Map());
+      client.setQueryData(["agent_costs", "conv_unsupported"], null);
 
       await advanceReconcileInterval();
+      await vi.advanceTimersByTimeAsync(2_000);
 
       expect(streamOpenCount()).toBe(1);
       expect(readUsage).toHaveBeenCalledTimes(2);
       expect(useChatStore.getState().sessionCostUsd).toBe(8);
+      // A total recovered outside the live stream still refreshes per-agent costs,
+      // except from a server that has no breakdown.
+      expect(client.getQueryState(["agent_costs", "conv_usage"])?.isInvalidated).toBe(true);
+      expect(client.getQueryState(["agent_costs", "conv_unsupported"])?.isInvalidated).toBe(false);
       expect(useChatStore.getState().sessionUsageByModel?.["model-a"]).toMatchObject({
         inputTokens: 500,
         totalCostUsd: 8,
@@ -1096,6 +1108,8 @@ describe("chatStore — lazy subtree usage", () => {
 
       await advanceReconcileInterval();
       expect(readUsage).toHaveBeenCalledTimes(2);
+      // A background re-read keeps the settled answer instead of loading again.
+      expect(useChatStore.getState().sessionUsageLoading).toBe(false);
       handleSessionEvent({
         type: "session_status",
         conversationId: "conv_usage",

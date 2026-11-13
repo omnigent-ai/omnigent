@@ -9429,6 +9429,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
             assert request.url.params["include_items"] == "false"
             assert request.url.params["include_liveness"] == "false"
+            # Usage feeds no projected field, so the costly aggregate is skipped.
+            assert request.url.params["include_usage"] == "false"
             return httpx.Response(
                 200,
                 json={
@@ -9449,6 +9451,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "workspace": "/repo",
                     "git_branch": "feature/x",
                     "project_id": "proj_1",
+                    "total_cost_usd": 1.25,
+                    "usage_by_model": {"example-model": {"input_tokens": 12, "output_tokens": 4}},
                     "pending_elicitations": [{"id": "el_1"}, {"id": "el_2"}],
                 },
             )
@@ -9503,8 +9507,10 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     # blocked session is waiting on.
     assert info["pending_elicitation_count"] == 2
     assert info["pending_elicitations"] == [{"id": "el_1"}, {"id": "el_2"}]
-    # Metadata-only: the full transcript is never embedded.
+    # Metadata-only: the full transcript and usage totals are never embedded.
     assert "items" not in info
+    assert "total_cost_usd" not in info
+    assert "usage_by_model" not in info
 
 
 @pytest.mark.asyncio

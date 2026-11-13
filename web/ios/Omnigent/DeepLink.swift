@@ -47,9 +47,9 @@ struct DeepLink: Equatable {
   /// links still produce a valid `http://[::1]:<port>` origin.
   let origin: String
 
-  /// The basename-less SPA conversation path, e.g. `"/c/conv_abc"`. Foundation
-  /// strips a trailing slash from `URL.path`, so this is always `/c/<id>` with
-  /// no trailing slash — the shape the SPA's react-router matches.
+  /// The basename-less SPA conversation path with optional file-view parameters.
+  /// Foundation strips a trailing slash from `URL.path`, so the route is always
+  /// `/c/<id>` — the shape the SPA's react-router matches.
   let path: String
 
   /// Characters/sequences that must NEVER appear in a conversation id segment
@@ -129,7 +129,21 @@ struct DeepLink: Equatable {
 
     let scheme = defaultScheme(for: host)
     guard let origin = makeOrigin(scheme: scheme, host: host, port: raw.port) else { return nil }
-    return DeepLink(origin: origin, path: "/c/\(id)")
+    let route = "/c/\(id)"
+    let query = sharedFileQuery(raw)
+    return DeepLink(origin: origin, path: query.isEmpty ? route : "\(route)?\(query)")
+  }
+
+  private static func sharedFileQuery(_ url: URL) -> String {
+    guard let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedQuery
+    else { return "" }
+    // Keep encoded values intact: the SPA decodes form-style `+` as a space.
+    return query.split(separator: "&").filter { item in
+      let encodedName = item.prefix { $0 != "=" }
+      let name = String(encodedName).replacingOccurrences(of: "+", with: " ")
+        .removingPercentEncoding
+      return name == "file" || name == "fullscreen"
+    }.joined(separator: "&")
   }
 
   /// Infer `http` for loopback hosts, `https` otherwise — matching the setup

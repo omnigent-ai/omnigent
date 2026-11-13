@@ -84,7 +84,11 @@ from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
 )
-from omnigent.server._runner_ws_tunnel import RunnerUnavailableWSError, WrongReplicaWSError
+from omnigent.server._runner_ws_tunnel import (
+    RunnerRuntimeSupportWSError,
+    RunnerUnavailableWSError,
+    WrongReplicaWSError,
+)
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
@@ -202,7 +206,7 @@ def create_terminal_attach_router(
                 runner_cm = (
                     await _wait_for_runner_ws(ws_factory, runner_path)
                     if await_launch
-                    else ws_factory(runner_path)
+                    else await asyncio.to_thread(ws_factory, runner_path)
                 )
             except WrongReplicaWSError:
                 # Wrong-replica routing miss: the runner tunnel is bound but not
@@ -221,6 +225,12 @@ def create_terminal_attach_router(
                 await websocket.close(
                     code=_WS_CLOSE_TRY_AGAIN_LATER,
                     reason="session runner is not connected",
+                )
+                return
+            except RunnerRuntimeSupportWSError as exc:
+                await websocket.close(
+                    code=_WS_CLOSE_INTERNAL_ERROR,
+                    reason=f"{exc.code}: upgrade host/runner or restore the session agent bundle",
                 )
                 return
             except Exception:  # noqa: BLE001
@@ -425,7 +435,7 @@ async def _wait_for_runner_ws(ws_factory: Callable[[str], Any], runner_path: str
     deadline = loop.time() + session_resources.TERMINAL_LAUNCH_ATTACH_WAIT_S
     while True:
         try:
-            return ws_factory(runner_path)
+            return await asyncio.to_thread(ws_factory, runner_path)
         except RunnerUnavailableWSError:
             if loop.time() >= deadline:
                 raise

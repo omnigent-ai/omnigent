@@ -929,6 +929,104 @@ describe("Composer Claude goal control", () => {
   });
 });
 
+describe("Composer goal slash command", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_goal", sessionHarness: "codex-native", skills: [] });
+    vi.mocked(getGoal).mockResolvedValue({ goal: null });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.mocked(getGoal).mockReset();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["codex-native", { showGoalControl: true }],
+    ["codex", { showPollyCodexGoalControl: true }],
+    ["claude-sdk", { showClaudeGoalControl: true }],
+  ] as const)(
+    "opens the existing Goal dialog for bare /goal in %s",
+    async (sessionHarness, controls) => {
+      const onSend = vi.fn();
+      const onSendSlashCommand = vi.fn();
+      useChatStore.setState({ sessionHarness });
+      renderWithTooltips(
+        <Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />,
+      );
+      fireEvent.change(textarea(), { target: { value: "/goal" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      expect(await screen.findByRole("dialog", { name: "Goal" })).toBeInTheDocument();
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onSendSlashCommand).not.toHaveBeenCalled();
+      expect(textarea().value).toBe("");
+    },
+  );
+
+  it.each([
+    ["codex-native", { showGoalControl: true }],
+    ["codex", { showPollyCodexGoalControl: true }],
+    ["claude-sdk", { showClaudeGoalControl: true }],
+  ] as const)(
+    "opens Goal from the %s slash menu with a same-named skill",
+    async (sessionHarness, controls) => {
+      const onSend = vi.fn();
+      const onSendSlashCommand = vi.fn();
+      setComposerState({
+        sessionHarness,
+        skills: [{ name: "goal", description: "Project goal skill", display_name: "Project goal" }],
+      });
+      renderWithTooltips(
+        <Composer {...composerProps({ onSend, onSendSlashCommand, ...controls })} />,
+      );
+      fireEvent.change(textarea(), { target: { value: "/go" } });
+      if (sessionHarness === "codex-native") {
+        expect(screen.getByRole("button", { name: /^\$goal/ })).toBeInTheDocument();
+      }
+      fireEvent.click(
+        screen.getByRole("button", { name: /^\/goal\s*View or set the goal for this session$/ }),
+      );
+      expect(await screen.findByRole("dialog", { name: "Goal" })).toBeInTheDocument();
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onSendSlashCommand).not.toHaveBeenCalled();
+      expect(textarea().value).toBe("");
+    },
+  );
+
+  it("sends the full goal objective as a message rather than a skill invocation", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    useChatStore.setState({ sessionHarness: "codex" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({ onSend, onSendSlashCommand, showPollyCodexGoalControl: true })}
+      />,
+    );
+    fireEvent.change(textarea(), {
+      target: { value: "/goal Finish the implementation and pass all tests" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(onSend.mock.calls[0]?.[0]).toBe("/goal Finish the implementation and pass all tests");
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Goal" })).toBeNull();
+  });
+
+  it("preserves a same-named skill when no Goal control is supported", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    setComposerState({
+      sessionHarness: "claude-sdk",
+      skills: [{ name: "goal", description: "Project goal skill" }],
+    });
+    renderWithTooltips(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    fireEvent.change(textarea(), { target: { value: "/goal" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(onSendSlashCommand).toHaveBeenCalledWith("goal", "");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Goal" })).toBeNull();
+  });
+});
+
 describe("Composer Codex goal control", () => {
   afterEach(() => {
     cleanup();
