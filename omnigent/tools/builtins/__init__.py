@@ -44,6 +44,13 @@ from omnigent.tools.builtins.load_skill import (
     format_skill_meta_text,
     list_skill_resources,
 )
+from omnigent.tools.builtins.memory import (
+    MemoryDeleteTool,
+    MemoryGetTool,
+    MemoryListTool,
+    MemorySearchTool,
+    MemoryWriteTool,
+)
 from omnigent.tools.builtins.nimble_extract import NimbleExtractTool
 from omnigent.tools.builtins.nimble_research import NimbleResearchTool
 from omnigent.tools.builtins.read_skill_file import (
@@ -84,6 +91,11 @@ __all__ = [
     "INSTANTIABLE_BUILTINS",
     "ListCommentsTool",
     "LoadSkillTool",
+    "MemoryDeleteTool",
+    "MemoryGetTool",
+    "MemoryListTool",
+    "MemorySearchTool",
+    "MemoryWriteTool",
     "NimbleExtractTool",
     "NimbleResearchTool",
     "ReadSkillFileTool",

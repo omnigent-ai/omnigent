@@ -1143,6 +1143,7 @@ tool_groups:
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
   projects: false         # sys_project_* / sys_session_update
+  memory: false           # memory_search / _get / _list / _write / _delete
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values
@@ -1150,6 +1151,20 @@ must be booleans and group names must match exactly; a typo fails the load
 rather than silently leaving the group registered. Disabling `browser` also
 drops the embedded-browser guidance from the composed system prompt. The block
 is read the same way from a `config.yaml` bundle and a single-file agent YAML.
+
+The `memory` group is the long-term memory tools. It applies only when the server
+has memory turned on (`OMNIGENT_FEATURES=memory`); otherwise no agent gets them,
+whatever the spec says. The tools persist across sessions, harnesses, models and
+forks, and belong to the signed-in user: the server decides whose memory it is,
+never the agent. They are refused in a session shared with anyone who can add
+input. Two kinds of spec get `memory: false` by default, and setting `memory: true`
+on them is an error:
+
+- Specs that still declare the deprecated `hindsight_*` builtins, with a warning.
+  Configure Hindsight as the server's memory backend instead with
+  `omnigent server --memory-backend hindsight`.
+- Specs with their own local tool or MCP server named like a memory tool, which
+  keep that tool. See [MEMORY.md](MEMORY.md).
 
 `agent_discovery: false` is rejected while `spawn: true` or the
 `scheduled_tasks` group is on: `sys_session_create` and

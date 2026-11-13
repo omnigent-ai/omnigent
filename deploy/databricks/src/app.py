@@ -192,6 +192,7 @@ try:
     )
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
     from omnigent.stores.permission_store.sqlalchemy_store import (
         SqlAlchemyPermissionStore,
     )
@@ -239,6 +240,7 @@ try:
     permission_store = SqlAlchemyPermissionStore(DB_URI)
     policy_store = SqlAlchemyPolicyStore(DB_URI)
     project_store = SqlAlchemyProjectStore(DB_URI)
+    memory_store = SqlAlchemyMemoryStore(DB_URI)
     host_store = HostStore(DB_URI)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(DB_URI)
 
@@ -312,6 +314,7 @@ try:
         permission_store=permission_store,
         policy_store=policy_store,
         project_store=project_store,
+        memory_store=memory_store,
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,

@@ -354,7 +354,9 @@ def test_researcher_drops_every_framework_tool_group() -> None:
     }
 
     assert not {
-        n for n in names if n.startswith(("browser_", "sys_scheduled_task_", "sys_agent_"))
+        n
+        for n in names
+        if n.startswith(("browser_", "sys_scheduled_task_", "sys_agent_", "memory_"))
     }
     assert not names & {"list_comments", "update_comment", "sys_add_policy", "sys_policy_registry"}
     assert not names & {

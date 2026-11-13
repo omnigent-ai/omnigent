@@ -263,3 +263,9 @@ def test_mcp_harness_feature_mapping_is_complete():
     from omnigent.server.feature_flags import MCP_DISABLED_SERVERS_HARNESS_FEATURES
 
     assert MCP_DISABLED_SERVERS_HARNESS_FEATURES.keys() == HARNESS_EXECUTORS.keys()
+
+
+def test_memory_is_opt_in_and_backend_only() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.MEMORY)
+    assert resolve_feature_flags({FEATURES_ENV_VAR: "memory"}).enabled(Feature.MEMORY)
+    assert "memory" not in resolve_feature_flags({FEATURES_ENV_VAR: "memory"}).frontend_dict()

@@ -1483,6 +1483,12 @@ def _load_agent_spec_bundle(
     """Hash, load and publish a validated bundle while its cache lock is held."""
     from omnigent.automations_availability import AUTOMATIONS_HEADER, without_scheduled_task_tools
     from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
+    from omnigent.memory_availability import (
+        MEMORY_HEADER,
+        MEMORY_SEARCH_HEADER,
+        without_memory_search,
+        without_memory_tools,
+    )
     from omnigent.runner.native import ResolvedSpec
     from omnigent.spec import load
 
@@ -1517,6 +1523,10 @@ def _load_agent_spec_bundle(
     # Older servers send no header; keep the tools there, as before.
     if resp.headers.get(AUTOMATIONS_HEADER) == "0":
         spec = without_scheduled_task_tools(spec)
+    if resp.headers.get(MEMORY_HEADER) != "1":
+        spec = without_memory_tools(spec)
+    elif resp.headers.get(MEMORY_SEARCH_HEADER) != "1":
+        spec = without_memory_search(spec)
     _apply_host_interactive_shells(spec)
     return ResolvedSpec(spec=spec, workdir=dest)
 

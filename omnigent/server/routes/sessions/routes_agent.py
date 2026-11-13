@@ -20,6 +20,7 @@ from omnigent.automations_availability import AUTOMATIONS_HEADER
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
+from omnigent.memory_availability import MEMORY_HEADER, MEMORY_SEARCH_HEADER
 from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
@@ -288,6 +289,14 @@ def register_agent_routes(
         automations_available = getattr(request.app.state, "automations_available", None)
         if automations_available is not None:
             selection_headers[AUTOMATIONS_HEADER] = "1" if automations_available() else "0"
+        memory_available = getattr(request.app.state, "memory_available", None)
+        selection_headers[MEMORY_HEADER] = (
+            "1" if memory_available is not None and memory_available() else "0"
+        )
+        memory_search_available = getattr(request.app.state, "memory_search_available", None)
+        selection_headers[MEMORY_SEARCH_HEADER] = (
+            "1" if memory_search_available is not None and memory_search_available() else "0"
+        )
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",

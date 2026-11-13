@@ -66,3 +66,70 @@ def test_native_startup_instructions_from_spec_never_returns_stripped_form() -> 
     assert _native_startup_instructions_from_spec(_spec(padded)) == (
         f"{padded}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
     )
+
+
+# ─── Composed startup instructions (stable text, notes, memory guidance) ─
+
+
+@pytest.fixture
+def memory_guidance(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, ...]]:
+    """Stub the memory index fetch and record each call."""
+    calls: list[tuple[object, ...]] = []
+
+    async def _guidance(*args: object) -> str:
+        calls.append(args)
+        return "MEMORY GUIDANCE"
+
+    monkeypatch.setattr("omnigent.runner.native.orchestration.memory_startup_guidance", _guidance)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_startup_instructions_join_stable_text_notes_and_memory_in_order(
+    memory_guidance: list[tuple[object, ...]],
+) -> None:
+    from omnigent.runner.native.orchestration import _native_startup_instructions
+
+    spec = _spec("Be a concise assistant.")
+    client = object()
+
+    text = await _native_startup_instructions(spec, client, "sess", "ROUTING NOTE", None)
+
+    assert text == (
+        f"Be a concise assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+        "\n\nROUTING NOTE\n\nMEMORY GUIDANCE"
+    )
+    assert memory_guidance == [(client, "sess", spec)]
+
+
+@pytest.mark.asyncio
+async def test_startup_instructions_without_a_spec_ask_the_server_nothing() -> None:
+    """With no spec there are no memory tools, so the launch makes no memory request."""
+    from omnigent.runner.native.orchestration import _native_startup_instructions
+
+    class _NoCalls:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"unexpected server call: {name}")
+
+    assert await _native_startup_instructions(
+        None, _NoCalls(), "sess"
+    ) == _native_startup_instructions_from_spec(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("instructions", ["  Keep this whitespace.  ", None])
+async def test_startup_instructions_without_memory_are_unchanged(
+    monkeypatch: pytest.MonkeyPatch, instructions: str | None
+) -> None:
+    """With memory unavailable the result is the pre-memory value, byte for byte."""
+    from omnigent.runner.native.orchestration import _native_startup_instructions
+
+    async def _no_memory(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr("omnigent.runner.native.orchestration.memory_startup_guidance", _no_memory)
+    spec = _spec(instructions)
+
+    assert await _native_startup_instructions(
+        spec, None, "sess"
+    ) == _native_startup_instructions_from_spec(spec)

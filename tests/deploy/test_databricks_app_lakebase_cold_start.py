@@ -56,6 +56,7 @@ _BOOT_STORE_CLASSES = (
     "omnigent.stores.conversation_store.sqlalchemy_store.SqlAlchemyConversationStore",
     "omnigent.stores.file_store.sqlalchemy_store.SqlAlchemyFileStore",
     "omnigent.stores.host_store.HostStore",
+    "omnigent.stores.memory_store.sqlalchemy_store.SqlAlchemyMemoryStore",
     "omnigent.stores.permission_store.sqlalchemy_store.SqlAlchemyPermissionStore",
     "omnigent.stores.policy_store.sqlalchemy_store.SqlAlchemyPolicyStore",
     "omnigent.stores.project_store.sqlalchemy_store.SqlAlchemyProjectStore",

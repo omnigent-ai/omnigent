@@ -89,6 +89,7 @@ from omnigent.native.native_dispatch import resolve_hook
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
+from omnigent.runner.memory_guidance import memory_startup_guidance
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -2973,7 +2974,9 @@ async def _auto_create_pi_terminal(
         system_prompt_mode = pi_spec.executor.config.get("system_prompt_mode", "append")
         if system_prompt_mode == "replace" and raw_author_instructions(pi_spec) is None:
             raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
-    startup_instructions = _native_startup_instructions_from_spec(agent_spec)
+    startup_instructions = await _native_startup_instructions(
+        agent_spec, server_client, session_id
+    )
     instructions_path = write_agent_instructions(bridge_dir, startup_instructions)
     provider_args: list[str] = []
     pi_env_unset = pi_native_env_unset(os.environ)
@@ -5863,13 +5866,8 @@ async def _auto_create_codex_terminal(
         from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
 
         _codex_routing_note = smart_routing_spawn_note("codex-native")
-    _codex_developer_instructions = "\n\n".join(
-        x
-        for x in [
-            _native_startup_instructions_from_spec(agent_spec),
-            _codex_routing_note,
-        ]
-        if x
+    _codex_developer_instructions = await _native_startup_instructions(
+        agent_spec, server_client, session_id, _codex_routing_note
     )
     # SDK initialization can block on DNS/auth before model discovery times out.
     # Keep it off the runner loop so heartbeats and other sessions can progress.
@@ -7840,6 +7838,33 @@ def _native_startup_instructions_from_spec(
 
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     return build_native_startup_instructions(spec)
+
+
+async def _native_startup_instructions(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    *launch_notes: str | None,
+) -> str:
+    """
+    Compose a native harness's startup instructions, including long-term memory.
+
+    Joins :func:`_native_startup_instructions_from_spec`, any launch notes (e.g.
+    the routed spawn note), and the memory guidance, skipping empty parts.
+
+    :param agent_spec: The session's agent spec, or ``None``.
+    :param server_client: The runner's client for the Omnigent server, used to
+        fetch the memory index.
+    :param session_id: The session being launched.
+    :param launch_notes: Additional framework notes, in order; ``None`` skipped.
+    :returns: The joined text.
+    """
+    parts = [
+        _native_startup_instructions_from_spec(agent_spec),
+        *launch_notes,
+        await memory_startup_guidance(server_client, session_id, agent_spec),
+    ]
+    return "\n\n".join(part for part in parts if part)
 
 
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
@@ -9894,8 +9919,8 @@ async def _auto_create_claude_terminal(
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
-        append_system_prompt="\n\n".join(
-            x for x in [_native_startup_instructions_from_spec(agent_spec), routed_spawn_note] if x
+        append_system_prompt=await _native_startup_instructions(
+            agent_spec, server_client, session_id, routed_spawn_note
         ),
         allowed_tools=routed_spawn_tools,
         # The route-turn hook is registered only when this session can
