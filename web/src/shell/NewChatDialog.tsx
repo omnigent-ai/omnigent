@@ -2211,7 +2211,13 @@ function keepLinkedPrompt(siblingSourceId: string | null, text: string): KeptLin
   try {
     sessionStorage.setItem(key, JSON.stringify({ ...kept, user: getCurrentUserId() }));
   } catch {
-    // Without storage only the reload case is lost.
+    // Nothing was kept for this prompt, and an older one must not outlive it.
+    try {
+      sessionStorage.removeItem(key);
+    } catch {
+      // Storage is unusable; only the reload case is lost.
+    }
+    return null;
   }
   return kept;
 }

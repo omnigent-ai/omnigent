@@ -447,4 +447,19 @@ describe("embedded prompt link", () => {
     reloadPage();
     expect(composer()).toHaveValue("");
   });
+
+  it("forgets an older kept prompt when storing its replacement fails", () => {
+    renderLanding();
+    cleanup();
+    searchParams = new URLSearchParams("o=123&prompt=Second+request");
+    const quota = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("full", "QuotaExceededError");
+    });
+    renderLanding();
+    expect(composer()).toHaveValue("Second request");
+    quota.mockRestore();
+    fireEvent.change(composer(), { target: { value: "" } });
+    reloadPage();
+    expect(composer()).toHaveValue("");
+  });
 });
