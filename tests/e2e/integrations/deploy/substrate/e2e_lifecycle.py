@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import ssl
+import sys
 import uuid
 from pathlib import Path
 from urllib.parse import quote
@@ -27,6 +28,29 @@ from omnigent.server.managed_hosts import parse_sandbox_config
 from omnigent.stores.host_store import HostStore
 from tests._helpers.polling import poll_until
 from tests._helpers.session import send_user_text
+
+
+def cleanup(
+    client: httpx.Client,
+    session_id: str | None,
+    host_id: str | None,
+    original_error: BaseException | None,
+) -> None:
+    errors = []
+    for resource, identifier in (("sessions", session_id), ("hosts", host_id)):
+        if identifier is None:
+            continue
+        try:
+            response = client.delete(f"/v1/{resource}/{identifier}")
+            if resource == "hosts" and response.status_code == 404:
+                continue
+            response.raise_for_status()
+        except Exception as error:
+            if original_error is not None:
+                original_error.add_note(f"Cleanup of {resource}/{identifier} failed: {error}")
+            errors.append(error)
+    if errors and original_error is None:
+        raise ExceptionGroup("Lifecycle cleanup failed", errors)
 
 
 def main() -> None:
@@ -138,11 +162,7 @@ def main() -> None:
                 flush=True,
             )
         finally:
-            if session_id:
-                client.delete(f"/v1/sessions/{session_id}").raise_for_status()
-            if host_id:
-                response = client.delete(f"/v1/hosts/{host_id}")
-                assert response.status_code in {200, 204, 404}
+            cleanup(client, session_id, host_id, sys.exception())
         if handle is not None:
 
             def removed() -> bool:
