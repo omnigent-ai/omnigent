@@ -394,6 +394,7 @@ async def _wake_runner_for_model_change(
         conversation_store=conversation_store,
         runner_router=runner_router,
         raise_host_refusal=True,
+        request=request,
     )
     if runner_client is None:
         raise OmnigentError(

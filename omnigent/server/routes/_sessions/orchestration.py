@@ -5325,6 +5325,7 @@ async def _maybe_relaunch_managed_sandbox(
     conv: Conversation,
     app_state: Any,
     conversation_store: ConversationStore,
+    request: Any = None,
 ) -> bool:
     """
     Relaunch a dead managed sandbox for a session, if it has one.
@@ -5380,6 +5381,9 @@ async def _maybe_relaunch_managed_sandbox(
             return False
     launch = tracker.get(session_id)
     if launch is None or launch.settled.is_set():
+        _raise_if_managed_wake_misses_host_tunnel(
+            conv=conv, host=host, request=request, app_state=app_state
+        )
         # A resumable managed host whose sandbox merely idle-stopped is WOKEN
         # in place (resume: same sandbox + workspace volume) rather than
         # relaunched onto a fresh empty sandbox — same gate the wake itself
@@ -5440,12 +5444,65 @@ async def _maybe_relaunch_managed_sandbox(
     return True
 
 
+def _raise_if_managed_wake_misses_host_tunnel(
+    *,
+    conv: Conversation,
+    host: Host,
+    request: Any,
+    app_state: Any,
+) -> None:
+    """
+    Re-address a client request that would wake a managed host off its tunnel's replica.
+
+    A managed host dials the replica that owns its slice key: its own id when
+    the create keyed it, otherwise the default route. A wake run from any other
+    replica lands its tunnel elsewhere, so the request parks for the whole wake.
+    Answer ``WRONG_REPLICA`` first so the client re-addresses to the key that
+    starts the wake where the tunnel lands. Only a fastapi ``Request`` names a
+    routing key; internal callers pass nothing and skip this check.
+
+    :param conv: Session row whose host may need a wake.
+    :param host: The session's managed host row, already loaded by the caller.
+    :param request: The inbound request, or ``None``/a non-HTTP context to skip.
+    :param app_state: ``request.app.state`` — supplies the host registry.
+    :raises WrongReplicaError: For a keyed host whose key the request does not carry.
+    :raises OmnigentError: ``WRONG_REPLICA`` (no key to resend) for an unkeyed host
+        reached through a keyed request.
+    """
+    from fastapi import Request
+
+    from omnigent.server.managed_hosts import host_slice_key_enabled
+    from omnigent.server.routes._host_launch import _deployment_is_sharded, routed_slice_key
+
+    if not isinstance(request, Request):
+        return
+    host_registry = getattr(app_state, "host_registry", None)
+    if conv.host_id is None or host_registry is None or not _deployment_is_sharded():
+        return
+    keyed = host_slice_key_enabled(conv.labels, conv.host_id)
+    expected_key = conv.host_id if keyed else None
+    if routed_slice_key(request) == expected_key or host_registry.get(conv.host_id) is not None:
+        return
+    if host.sandbox_provider is None:
+        return
+    if keyed:
+        raise WrongReplicaError(
+            f"managed host {conv.host_id} wakes on the replica its slice key names",
+            host_id=conv.host_id,
+        )
+    raise OmnigentError(
+        f"managed host {conv.host_id} wakes on the default replica; retry without its slice key",
+        code=ErrorCode.WRONG_REPLICA,
+    )
+
+
 async def _maybe_wake_stale_resumable_managed_sandbox(
     *,
     session_id: str,
     conv: Conversation,
     app_state: Any,
     conversation_store: ConversationStore,
+    request: Any = None,
 ) -> bool:
     """
     Wake a resumable managed host whose persisted liveness has gone stale.
@@ -5470,6 +5527,9 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or not host_resume_supported(host, sandbox_config):
         return False
+    _raise_if_managed_wake_misses_host_tunnel(
+        conv=conv, host=host, request=request, app_state=app_state
+    )
     host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
     tunnel_registry = cast(TunnelRegistry | None, getattr(app_state, "tunnel_registry", None))
     host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
@@ -5518,6 +5578,8 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         runner_tunnel_stale,
         extra={"session_id": session_id},
     )
+    # The guard above ran before stale tunnels were torn down; the relaunch must not
+    # re-check against the post-teardown registry.
     return await _maybe_relaunch_managed_sandbox(
         session_id=session_id,
         conv=conv,
@@ -5534,6 +5596,7 @@ async def ensure_runner_connected(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     raise_host_refusal: bool = False,
+    request: Any = None,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Bring a wakeable session's runner online for out-of-band resource access.
@@ -5572,6 +5635,9 @@ async def ensure_runner_connected(
         host rejects launch because the harness is unavailable or the
         workspace is gone. Resource callers keep the legacy ``False``
         behavior; retry recovery opts in because it has no message to persist.
+    :param request: The client's HTTP request, or ``None`` for server-internal
+        callers. A request's routing key guards any wake (see
+        :func:`_raise_if_managed_wake_misses_host_tunnel`).
     :returns: ``(runner_client, conv)`` — the client is ``None`` when no
         runner is reachable and none is wakeable; ``conv`` is re-read after
         any wake/relaunch so the caller sees the rebound row.
@@ -5605,6 +5671,7 @@ async def ensure_runner_connected(
         conv=conv,
         app_state=app_state,
         conversation_store=conversation_store,
+        request=request,
     ):
         conv = await _reread()
         runner_client = await _get_runner_client(
@@ -5700,6 +5767,7 @@ async def ensure_runner_connected(
             conv=conv,
             app_state=app_state,
             conversation_store=conversation_store,
+            request=request,
         ):
             conv = await _reread()
             runner_client = await _get_runner_client(
@@ -14799,6 +14867,7 @@ __all__ = [
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",
     "_publish_subtree_cost_to_ancestors",
+    "_raise_if_managed_wake_misses_host_tunnel",
     "_read_session_snapshot_inputs",
     "_recover_subagent_status_forward_via_parent",
     "_register_policy_elicitation",
