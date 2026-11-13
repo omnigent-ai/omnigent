@@ -1,5 +1,7 @@
 """Session-scoped runner requests are keyed by the target session's host."""
 
+import asyncio
+import time
 from uuid import uuid4
 
 import httpx
@@ -10,7 +12,6 @@ from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, UNKEYED_REQUEST_EXTENSI
 from omnigent.runner.session_requests import post_on_host, remember_session_host
 from omnigent.session_host import (
     REQUEST_HOST_EXTENSION,
-    SESSION_HOST_LOOKUP_TIMEOUT_S,
     SessionRoutingTransport,
     get_session_host,
     set_session_host,
@@ -230,24 +231,35 @@ async def test_failed_lookup_sends_keyless_once_and_keeps_the_cache():
 
 
 @pytest.mark.asyncio
-async def test_timed_out_lookup_sends_keyless_once_with_a_bounded_wait():
+async def test_timed_out_lookup_sends_keyless_once_with_a_bounded_wait(monkeypatch):
+    monkeypatch.setattr(session_host, "SESSION_HOST_LOOKUP_TIMEOUT_S", 0.08)
     set_session_host(CHILD, TARGET_HOST)
-    lookup_timeouts: list[float] = []
-    sends: list[str | None] = []
+    lookups = []
+    sends = []
+    cancelled = False
 
-    def slow_lookup(request: httpx.Request) -> httpx.Response:
+    async def slow_lookup(request: httpx.Request) -> httpx.Response:
+        nonlocal cancelled
         if request.method == "GET":
-            lookup_timeouts.append(request.extensions["timeout"]["read"])
-            raise httpx.ReadTimeout("lookup")
+            lookups.append(request.url.path)
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            return httpx.Response(200, json=snapshot(parent_session_id=PARENT))
         key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
         sends.append(key)
         return httpx.Response(202, json={"queued": True}) if key is None else wrong_replica()
 
+    start = time.monotonic()
     async with make_client(slow_lookup) as client:
         response = await client.post(EVENTS, json=PAYLOAD)
     assert response.status_code == 202
     assert sends == [TARGET_HOST, None]
-    assert lookup_timeouts == [SESSION_HOST_LOOKUP_TIMEOUT_S]
+    assert len(lookups) == 2
+    assert cancelled
+    assert time.monotonic() - start < 0.5
 
 
 @pytest.mark.asyncio
@@ -323,7 +335,7 @@ async def test_timeouts_are_never_retried():
 
 
 @pytest.mark.asyncio
-async def test_streams_are_keyed_up_front_but_never_retried():
+async def test_established_streams_are_keyed_but_never_inspected():
     set_session_host(CHILD, TARGET_HOST)
     sends = []
 
@@ -338,7 +350,7 @@ async def test_streams_are_keyed_up_front_but_never_retried():
         )
 
     async with make_client(stream) as client:
-        async with client.stream("GET", f"/v1/sessions/{CHILD}/events/stream") as response:
+        async with client.stream("GET", f"/v1/sessions/{CHILD}/stream") as response:
             assert response.status_code == 400
     assert sends == [TARGET_HOST]
 
@@ -458,3 +470,25 @@ async def test_runner_own_session_is_prefilled_so_its_first_request_needs_no_loo
     assert response.status_code == 202
     assert replicas.sends == [TARGET_HOST]
     assert replicas.lookups == []
+
+
+@pytest.mark.asyncio
+async def test_json_refusal_before_stream_establishment_can_recover():
+    set_session_host(CHILD, TARGET_HOST)
+    sends = []
+
+    def stream(request: httpx.Request) -> httpx.Response:
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        sends.append(key)
+        if len(sends) == 1:
+            return httpx.Response(
+                400, json={"error": {"code": "wrong_replica", "slice_key": MOVED_HOST}}
+            )
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=b"data: ok\n\n"
+        )
+
+    async with make_client(stream) as client:
+        async with client.stream("GET", f"/v1/sessions/{CHILD}/stream") as response:
+            assert await response.aread() == b"data: ok\n\n"
+    assert sends == [TARGET_HOST, MOVED_HOST]

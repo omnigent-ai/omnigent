@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from urllib.parse import unquote, urlsplit
 
@@ -195,7 +196,8 @@ class SessionRoutingTransport(httpx.AsyncBaseTransport):
 
     A create whose JSON body names a ``host_id`` is keyed by it and never retried.
     Timeouts and other failures propagate unchanged, because delivery is uncertain.
-    Event streams are keyed but not retried.
+    Established event streams are never inspected or replayed; JSON routing
+    refusals before stream establishment may recover like other requests.
 
     Wraps the network transport, so clients stay plain ``httpx.AsyncClient``.
     """
@@ -273,8 +275,9 @@ class SessionRoutingTransport(httpx.AsyncBaseTransport):
     ) -> tuple[bool, str | None]:
         """Look up and cache the host; (False, None) when the lookup fails."""
         try:
-            host_id = await self._lookup_host(base_url, caller_headers, session_id)
-        except (httpx.HTTPError, ValueError):
+            async with asyncio.timeout(SESSION_HOST_LOOKUP_TIMEOUT_S):
+                host_id = await self._lookup_host(base_url, caller_headers, session_id)
+        except (httpx.HTTPError, ValueError, TimeoutError):
             return False, None
         set_session_host(session_id, host_id)
         return True, host_id
