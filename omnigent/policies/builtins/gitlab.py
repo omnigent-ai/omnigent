@@ -39,12 +39,13 @@ YAML usage::
 
 from __future__ import annotations
 
+import itertools
 import re
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from omnigent.git_providers import host_of, providers
 from omnigent.git_providers.gitlab import _valid_project, instance_authority
@@ -79,6 +80,11 @@ _Project = tuple[str | None, str]
 _SCP_REMOTE = re.compile(r"^[\w.-]+@([^:/]+):(.+)$")
 # ``projects/<url-encoded path>`` in a ``glab api`` endpoint; numeric IDs don't match.
 _API_PROJECT_PATH = re.compile(r"(?:^|/)projects/([^/?#]*%2[Ff][^/?#]*)")
+# ``url.<base>.insteadOf`` / ``pushInsteadOf`` rewrite a remote URL after it is parsed.
+_URL_REWRITE_KEY = re.compile(r"url\..+\.(?:push)?insteadof", re.IGNORECASE)
+# API routes that write branch content; the destination is the ``branch`` parameter.
+_API_BRANCH_WRITE = re.compile(r"/repository/(?:files|commits|branches)(?:[/?]|$)")
+_GLAB_API_FIELD_FLAGS: frozenset[str] = frozenset({"-f", "--raw-field", "-F", "--field", "--form"})
 # Variables that point glab at another host or config (see ``glab config --help``).
 _HOST_ENV_VARS: frozenset[str] = frozenset(
     {"GITLAB_HOST", "GITLAB_URI", "GL_HOST", "GITLAB_API_HOST", "GLAB_CONFIG_DIR"}
@@ -276,6 +282,7 @@ _GLAB_REPO_FLAGS: frozenset[str] = frozenset({"-R", "--repo"})
 _GLAB_TARGET_BRANCH_FLAGS: frozenset[str] = frozenset({"-b", "--target-branch"})
 # Flags whose value is a separate token, so it is not mistaken for an action.
 _GLAB_VALUE_FLAGS: frozenset[str] = _GLAB_REPO_FLAGS | frozenset({"--hostname", "-g", "--group"})
+_GLAB_HELP_FLAGS: frozenset[str] = frozenset({"-h", "--help", "-v", "--version"})
 # ``glab api --help``: every flag that takes a value.
 _GLAB_API_VALUE_FLAGS: frozenset[str] = frozenset(
     [
@@ -339,6 +346,9 @@ def _project_path(path: str) -> str | None:
     :param path: e.g. ``"/group/sub/proj.git"`` or ``"/group/proj/-/merge_requests/1"``.
     :returns: ``"group/sub/proj"``, or ``None`` when the path is not a project.
     """
+    # Dot segments anywhere (even after ``/-/``) can resolve to another project.
+    if {".", ".."} & set(unquote(path).split("/")):
+        return None
     path = path.split("/-/", 1)[0].strip("/").removesuffix(".git")
     return path.lower() if _valid_project(path) else None
 
@@ -475,6 +485,8 @@ def _classify_git_command(
     :param other_forge_hosts: Hosts of other git providers, left to their policies.
     :returns: An op, or ``None`` for local commands and other forges' remotes.
     """
+    if _rewrites_remote_urls(tokens):
+        return _unparseable("git config rewriting remote URLs")
     op = _classify_git(tokens)
     if op is None:
         return None
@@ -511,6 +523,24 @@ def _classify_git_command(
     )
 
 
+def _rewrites_remote_urls(tokens: list[str]) -> bool:
+    """
+    Whether a ``git`` call sets URL rewriting, which changes the remote it reaches.
+
+    Covers ``-c`` / ``--config-env`` before the subcommand and ``git config``
+    writing the key for later commands.
+    """
+    try:
+        index = _git_subcommand_index(tokens)
+    except ValueError:
+        return False  # _classify_git reports these as unparseable.
+    end = len(tokens) if index is not None and tokens[index] == "config" else index
+    return any(
+        _URL_REWRITE_KEY.match(token.removeprefix("-c").removeprefix("--config-env="))
+        for token in tokens[1:end]
+    )
+
+
 def _glab_positionals(args: list[str], value_flags: frozenset[str]) -> list[str]:
     """Return non-flag tokens, skipping the values of *value_flags*."""
     positionals: list[str] = []
@@ -525,6 +555,42 @@ def _glab_positionals(args: list[str], value_flags: frozenset[str]) -> list[str]
         if not token.startswith("-"):
             positionals.append(token)
     return positionals
+
+
+def _expand_short_flags(args: list[str], value_letters: str) -> list[str]:
+    """
+    Split short-flag bundles the way glab's flag parser reads them.
+
+    ``-XDELETE`` and ``-X=DELETE`` become ``-X DELETE``; ``-iXDELETE`` becomes
+    ``-i -X DELETE``. A value letter takes the rest of its token as its value.
+    """
+    expanded: list[str] = []
+    for token in args:
+        if not token.startswith("-") or token.startswith("--") or len(token) <= 2:
+            expanded.append(token)
+            continue
+        for position, letter in enumerate(token[1:], start=1):
+            expanded.append(f"-{letter}")
+            if letter in value_letters:
+                if rest := token[position + 1 :]:
+                    expanded.append(rest.removeprefix("="))
+                break
+    return expanded
+
+
+def _flag_values(args: list[str], names: frozenset[str]) -> list[str]:
+    """Return every value of *names*, given as ``--flag value`` or ``--flag=value``."""
+    values: list[str] = []
+    index = 0
+    while index < len(args):
+        name, has_value, value = args[index].partition("=")
+        if has_value and name in names:
+            values.append(value)
+        elif args[index] in names and index + 1 < len(args):
+            values.append(args[index + 1])
+            index += 1
+        index += 1
+    return values
 
 
 def _glab_host_override(
@@ -568,8 +634,11 @@ def _classify_glab(
     :param hosts: Configured GitLab authorities.
     :returns: An op, or ``None`` for ignored groups (auth), help, and bare ``glab``.
     """
-    if len(tokens) < 2 or tokens[1] in _GLAB_IGNORE_GROUPS or tokens[1].startswith("-"):
+    if len(tokens) < 2 or tokens[1] in _GLAB_IGNORE_GROUPS or tokens[1] in _GLAB_HELP_FLAGS:
         return None
+    if tokens[1].startswith("-"):
+        # glab's only root flags are help and version; anything else hides the group.
+        return _unparseable(f"glab {tokens[1]}")
     group, args = _GLAB_GROUP_ALIASES.get(tokens[1], tokens[1]), tokens[2:]
     override = _glab_host_override(env_tokens, args, hosts)
     if override == "":
@@ -583,9 +652,13 @@ def _classify_glab(
         )
         return _unparseable("glab config changing the GitLab host") if changes_host else None
     if group == "api":
-        return _classify_glab_api(args, override)
+        return _classify_glab_api(_expand_short_flags(args, "XHfF"), override)
 
-    repo_flag = _flag_value(args, _GLAB_REPO_FLAGS)
+    args = _expand_short_flags(args, "Rbg")
+    repo_flags = _flag_values(args, _GLAB_REPO_FLAGS)
+    if len(set(repo_flags)) > 1:
+        return _unparseable(f"glab {group} with several -R values")
+    repo_flag = repo_flags[0] if repo_flags else None
     positionals = _glab_positionals(args, _GLAB_VALUE_FLAGS)
     if repo_flag:
         project = _parse_project_ref(repo_flag, hosts)
@@ -598,14 +671,18 @@ def _classify_glab(
     if project is not None and override and project[0] is None:
         project = (override, project[1])
 
-    if not positionals:
+    if not args or args[0] in _GLAB_HELP_FLAGS:
         return None  # ``glab <group>`` with no action prints help.
     actions = _GLAB_ACTIONS.get(group)
     if actions is None:
         return _unparseable(f"glab {group}")
-    action = " ".join(positionals[:2])
+    # The action words come first; a flag before them may take one of them as its value.
+    leading = list(itertools.takewhile(lambda token: not token.startswith("-"), args))
+    if not leading:
+        return _unparseable(f"glab {group} {args[0]}")
+    action = " ".join(leading[:2])
     if action not in actions:
-        action = positionals[0]
+        action = leading[0]
     kind = actions.get(action)
     detail = f"glab {group} {action}"
     if kind is None:
@@ -634,17 +711,18 @@ def _classify_glab_api(args: list[str], override: str | None) -> _GitLabOp:
     """
     Classify ``glab api``: GET by default, POST once any field flag is given.
 
-    :param args: Tokens after ``glab api``; the first positional is the endpoint.
+    :param args: Tokens after ``glab api``, short-flag bundles already split;
+        the first positional is the endpoint.
     :param override: Host from ``--hostname`` / ``GITLAB_HOST``, if any.
     :returns: A read or write op; ``DELETE`` requests are destructive.
     """
-    method = (_flag_value(args, frozenset({"-X", "--method"})) or "").upper()
-    has_fields = any(
-        token in {"-f", "--raw-field", "-F", "--field", "--form", "--input"}
-        or token.startswith(("-f=", "--raw-field=", "-F=", "--field=", "--form=", "--input="))
-        for token in args
-    )
-    is_write = method not in {"", "GET", "HEAD"} or (not method and has_fields)
+    methods = {value.upper() for value in _flag_values(args, frozenset({"-X", "--method"}))}
+    if len(methods) > 1:
+        return _unparseable("glab api with several methods")
+    method = methods.pop() if methods else ""
+    fields = _flag_values(args, _GLAB_API_FIELD_FLAGS)
+    has_input = bool(_flag_values(args, frozenset({"--input"})))
+    is_write = method not in {"", "GET", "HEAD"} or (not method and bool(fields or has_input))
     positionals = _glab_positionals(args, _GLAB_API_VALUE_FLAGS)
     endpoint = positionals[0] if positionals else ""
     if "://" in endpoint:
@@ -655,19 +733,48 @@ def _classify_glab_api(args: list[str], override: str | None) -> _GitLabOp:
     if len(matches) == 1 and ".." not in unquote(endpoint).split("/"):
         path = _project_path(unquote(matches[0]))
         project = (override or None, path) if path else None
+    branch_targeted = is_write and bool(_API_BRANCH_WRITE.search(endpoint))
     return _GitLabOp(
         kind="write" if is_write else "read",
         project=project,
+        branches=_api_branches(endpoint, fields, has_input) if branch_targeted else frozenset(),
+        branch_targeted=branch_targeted,
         detail="glab api",
         destructive=method == "DELETE",
     )
 
 
+def _api_branches(endpoint: str, fields: list[str], has_input: bool) -> frozenset[str]:
+    """
+    Return the ``branch`` a ``glab api`` write targets, or none when it can't be known.
+
+    :param endpoint: The API endpoint, which may carry a query string.
+    :param fields: ``key=value`` values of the field flags.
+    :param has_input: Whether ``--input`` supplies a request body.
+    """
+    if has_input:
+        return frozenset()
+    query = parse_qsl(urlsplit(endpoint).query)
+    values = [value for key, value in query if key == "branch"]
+    values += [
+        value for key, _, value in (field.partition("=") for field in fields) if key == "branch"
+    ]
+    # ``@file`` reads the value from a file; ``:name`` is a placeholder glab fills in.
+    if any(value.startswith(("@", ":")) for value in values):
+        return frozenset()
+    return frozenset(_normalize_branches(values))
+
+
 def _sets_unowned_host(raw_tokens: list[str], hosts: frozenset[str]) -> str | None:
-    """Return a variable that ``export``/``env``/prefix assignments point at an unowned host."""
+    """
+    Return a variable that ``export``/``env``/prefix assignments point at an unowned
+    host, or one that injects git config (``GIT_CONFIG_COUNT`` …), which can rewrite URLs.
+    """
     for token in raw_tokens:
         name, has_value, value = token.partition("=")
         if has_value and name in _HOST_ENV_VARS and instance_authority(value) not in hosts:
+            return name
+        if has_value and name.startswith("GIT_CONFIG"):
             return name
     return None
 

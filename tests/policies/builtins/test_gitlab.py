@@ -139,6 +139,15 @@ def test_write_branches(command: str, expected: str) -> None:
         # --mirror force-updates and deletes refs; --prune deletes them.
         (f"git push --mirror {_URL}", "DENY"),
         (f"git push --prune {_URL} main", "DENY"),
+        # Dot segments after ``/-/`` would resolve to another project.
+        (f"git push {_URL}/-/../../../../grp/other.git main", "ASK"),
+        # URL rewriting config changes the remote after the URL is parsed.
+        (f"git -c url.file:///tmp/sink.git.insteadOf={_URL} push {_URL} HEAD:main", "ASK"),
+        (f"git -curl.file:///tmp/sink.git.pushInsteadOf={_URL} push {_URL} main", "ASK"),
+        (f"git --config-env=url.file:///tmp/sink.git.insteadOf=VAR push {_URL} main", "ASK"),
+        (f"git config url.file:///tmp/sink.git.insteadOf {_URL}", "ASK"),
+        (f"GIT_CONFIG_COUNT=1 git push {_URL} main", "ASK"),
+        (f"git -c user.name=bot push {_URL} main", "ALLOW"),
     ],
 )
 def test_git_push_remote_and_flag_parsing(command: str, expected: str) -> None:
@@ -187,9 +196,9 @@ def test_url_entry_pins_project_to_its_host() -> None:
 @pytest.mark.parametrize(
     "command",
     [
-        "git push https://evil-gitlab.com/grp/sub/app main",
+        "git push https://evil-gitlab.example/grp/sub/app main",
         "git push https://gitlab.com.example.net/grp/sub/app main",
-        "git push git@gl:grp/sub/app.git main",
+        "git push git@gitlab.invalid:grp/sub/app.git main",
     ],
 )
 def test_git_to_unknown_hosts_asks(command: str) -> None:
@@ -286,6 +295,41 @@ _GLAB_ACTIONS_BY_KIND = {
 }
 
 
+# Written from glab's help, not from the table, so a wrong table row fails here.
+_EXPECTED_GLAB_DECISIONS = {"read": ("ALLOW", "ALLOW"), "write": ("ALLOW", "DENY")}
+_EXPECTED_GLAB_DECISIONS["destructive"] = ("DENY", "DENY")
+
+
+@pytest.mark.parametrize(
+    ("command", "kind"),
+    [
+        ("glab mr list", "read"),
+        ("glab mr view 1", "read"),
+        ("glab mr approve 1", "write"),
+        ("glab mr note create 1", "write"),
+        ("glab mr delete 1", "destructive"),
+        ("glab issue create", "write"),
+        ("glab issue delete 1", "destructive"),
+        ("glab ci status", "read"),
+        ("glab ci retry 1", "write"),
+        ("glab ci delete 1", "destructive"),
+        ("glab variable get TOKEN", "read"),
+        ("glab variable set TOKEN x", "write"),
+        ("glab release create v1", "write"),
+        ("glab token revoke bot", "destructive"),
+        ("glab label delete bug", "destructive"),
+    ],
+)
+def test_glab_actions_match_expected_kind(command: str, kind: str) -> None:
+    """Each action has the kind glab's help gives it: (allowed project, other project)."""
+    policy = gitlab_policy(write_repos=[_PROJECT])
+    decisions = (
+        _result(policy(_sh(f"{command} -R {_PROJECT}"))),
+        _result(policy(_sh(f"{command} -R grp/other"))),
+    )
+    assert decisions == _EXPECTED_GLAB_DECISIONS[kind]
+
+
 @pytest.mark.parametrize("command", _GLAB_ACTIONS_BY_KIND["write"])
 def test_every_glab_write_is_project_gated(command: str) -> None:
     """Each listed write passes on an allowed project and is denied on another."""
@@ -323,6 +367,14 @@ def test_every_glab_delete_needs_allow_destructive(command: str) -> None:
         ("glab mcp serve", "ASK"),
         ("glab duo cli", "ASK"),
         ("glab mr", "ALLOW"),
+        # A flag before the group or action could hide what runs, so it asks.
+        ("glab --repo=grp/other mr create --fill", "ASK"),
+        ("glab mr --sha list merge 12 -R grp/other", "ASK"),
+        ("glab --help", "ALLOW"),
+        # Repeated or attached -R values cannot pass for an allowed project.
+        (f"glab mr create -R {_PROJECT} -R grp/other", "ASK"),
+        (f"glab mr create -R {_PROJECT} -Rgrp/other", "ASK"),
+        ("glab mr create -Rgrp/other", "DENY"),
     ],
 )
 def test_glab_dispatch(command: str, expected: str) -> None:
@@ -344,11 +396,43 @@ def test_glab_dispatch(command: str, expected: str) -> None:
         ("glab api -X POST projects/grp%2Fsub%2Fapp/../grp%2Fother/issues", "ASK"),
         ("glab api -X POST projects/grp%2Fsub%2Fapp/x/projects/grp%2Fother", "ASK"),
         ("glab api -X POST https://gitlab.example.com/api/v4/projects/1", "ASK"),
+        # Attached values (-XDELETE, -ftitle=x) parse like separate ones.
+        ("glab api -XDELETE projects/grp%2Fsub%2Fapp/issues/1", "DENY"),
+        ("glab api -iXPOST projects/grp%2Fother/issues", "DENY"),
+        ("glab api projects/grp%2Fother/issues -ftitle=x", "DENY"),
+        ("glab api projects/grp%2Fother/issues -Fconfidential=true", "DENY"),
+        ("glab api projects/grp%2Fsub%2Fapp/issues -ftitle=x", "ALLOW"),
+        ("glab api -X GET -X DELETE projects/grp%2Fsub%2Fapp/issues/1", "ASK"),
     ],
 )
 def test_glab_api_method(command: str, expected: str) -> None:
     """glab api is a read unless it sets a write method or field flags."""
     policy = gitlab_policy(write_repos=[_PROJECT])
+    assert _result(policy(_sh(command))) == expected
+
+
+_FILES_API = "glab api -X PUT projects/grp%2Fsub%2Fapp/repository/files/a.txt -f content=x"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (f"{_FILES_API} -f branch=main", "ALLOW"),
+        (f"{_FILES_API} -f branch=release", "DENY"),
+        ("glab api projects/grp%2Fsub%2Fapp/repository/commits?branch=release -f x=y", "DENY"),
+        ("glab api -X POST projects/grp%2Fsub%2Fapp/repository/branches -f branch=main", "ALLOW"),
+        # The destination cannot be known from a body file or a placeholder.
+        (f"{_FILES_API} --input body.json", "ASK"),
+        (f"{_FILES_API} -f branch=:branch", "ASK"),
+        (_FILES_API, "ASK"),
+        # Reads and non-branch writes are not branch-gated.
+        ("glab api projects/grp%2Fsub%2Fapp/repository/files/a.txt?ref=release", "ALLOW"),
+        ("glab api projects/grp%2Fsub%2Fapp/issues -f title=x", "ALLOW"),
+    ],
+)
+def test_glab_api_branch_writes(command: str, expected: str) -> None:
+    """API routes that write branch content are held to write_branches."""
+    policy = gitlab_policy(write_repos=[_PROJECT], write_branches=["main"])
     assert _result(policy(_sh(command))) == expected
 
 
