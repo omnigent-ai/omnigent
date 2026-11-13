@@ -260,6 +260,9 @@ async def test_stream_setup_errors_are_sanitized_before_spawn(
     environment = Mock(sandbox=object())
     environment.prepare_sandbox.side_effect = ValueError("private diagnostic sentinel")
     monkeypatch.setattr(registry, "_create_primary_env", Mock(return_value=environment))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._build_openai_agents_sdk_spawn_env", lambda spec: {}
+    )
     manager = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=manager,
@@ -279,10 +282,13 @@ async def test_stream_setup_errors_are_sanitized_before_spawn(
             },
         )
     assert response.status_code == 400, response.text
-    assert "openai-agents" in response.text
-    assert response.json()["error"] == "copy_on_write_setup_failed"
+    assert response.json()["error"]["code"] == "invalid_input"
     assert "private diagnostic sentinel" not in response.text
     assert not manager.get_client_calls
+    if harness == "openai-agents":
+        environment.prepare_sandbox.assert_called_once()
+    else:
+        environment.prepare_sandbox.assert_not_called()
 
 
 @pytest.mark.asyncio

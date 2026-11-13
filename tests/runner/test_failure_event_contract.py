@@ -118,8 +118,9 @@ async def test_spec_resolution_error_has_a_valid_queued_failure(eager: bool) -> 
             ),
         ]
     )
+    manager = _FakeProcessManager(harness)
     app = create_runner_app(
-        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        process_manager=manager,  # type: ignore[arg-type]
         spec_resolver=fail_resolution,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
@@ -128,13 +129,17 @@ async def test_spec_resolution_error_has_a_valid_queued_failure(eager: bool) -> 
         source="execution",
         agent_id="22222222222222222222222222222222",
         has_mcp_servers=eager,
+        pending_id="pending_" + "a" * 32,
+        delivery_attempt_id="b" * 32,
     )
     assert error == {
         "code": "RuntimeError",
         "message": "Failed to resolve the agent spec for this turn.",
         "type": "RuntimeError",
-        **({"undelivered": True} if eager else {}),
+        "undelivered": True,
     }
+    assert not manager.get_client_calls
+    assert not harness.posted_bodies
 
 
 @pytest.mark.asyncio
