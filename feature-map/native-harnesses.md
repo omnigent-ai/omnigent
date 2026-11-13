@@ -807,7 +807,10 @@ Cross-harness journeys:
 - **`model-and-effort`, Codex runtime settings:**
   A model/effort update before message delivery has a 30-second RPC budget.
   If its reply is rejected or lost, the message remains unsent even if the
-  settings already changed; no request is replayed automatically. The real
+  settings already changed; no request is replayed automatically. A local
+  failure to save applied settings also keeps the message unsent and preserves
+  concurrent native work, including a replacement session. Explicit Stop still
+  interrupts that work. The real
   loopback cases in
   `tests/inner/test_codex_native_executor.py::test_transport_failure_keeps_native_work_running`
   cover failed settings, concurrent native work and replacement ownership.
