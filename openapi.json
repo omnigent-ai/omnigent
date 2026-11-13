@@ -247,7 +247,7 @@
         "type": "object"
       },
       "AgentCostList": {
-        "description": "Costs for a session and every descendant; `data` lists `AgentCost`.",
+        "description": "A page of costs for a session and its descendants; `data` lists `AgentCost`.",
         "properties": {
           "data": {
             "items": {
@@ -255,6 +255,33 @@
             },
             "title": "Data",
             "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
           },
           "object": {
             "const": "list",
@@ -18508,7 +18535,7 @@
     },
     "/v1/sessions/{session_id}/agent_costs": {
       "get": {
-        "description": "List display costs for a session and every sub-agent beneath it.\n\nOne spawn-tree read serves the whole response. READ on the session\ncovers its descendants, as for `child_sessions`.\n\n**Returns:** An `AgentCostList`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 without READ; 404 when no session exists.",
+        "description": "List display costs for a session and the sub-agents beneath it.\n\nSubtree totals come from one spawn-tree read bounded like\n`child_sessions?descendants=true`; a tree past that cap reports no\ncosts. READ on the session covers its descendants, as for\n`child_sessions`.\n\n**Returns:** A page of `AgentCostList` in spawn-tree order.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 without READ; 404 when no session exists.\n- `StaleCursorError` \u2014 If *after* is not an agent of the subtree.",
         "operationId": "list_agent_costs_v1_sessions__session_id__agent_costs_get",
         "parameters": [
           {
@@ -18519,6 +18546,36 @@
             "schema": {
               "title": "Session Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "Maximum agents in the page (1-1000, default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Id of the last agent of the previous page, or `None`.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
             }
           }
         ],
@@ -18532,6 +18589,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The `after`/`before` cursor names an item that no longer exists (it was deleted, or archived out of the filtered set) so the keyset bound cannot be resolved. The `error.code` is `stale_cursor`. Enumeration cannot continue from this cursor: restart from the first page, without a cursor."
           },
           "422": {
             "content": {

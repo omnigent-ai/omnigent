@@ -113,7 +113,7 @@ import {
 } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
-import { AGENT_COSTS_QUERY_PREFIX } from "@/hooks/useAgentCosts";
+import { invalidateAgentCosts } from "@/hooks/useAgentCosts";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
@@ -4671,6 +4671,17 @@ function scheduleEntryFlush(id: string): void {
   });
 }
 conversationRegistry.subscribe(scheduleEntryFlush);
+// A moved total (live event, usage read or reconnect) means some agent's cost moved.
+useChatStore.subscribe((state, previous) => {
+  if (
+    queryClient === null ||
+    state.conversationId !== previous.conversationId ||
+    state.sessionCostUsd === previous.sessionCostUsd
+  ) {
+    return;
+  }
+  invalidateAgentCosts(queryClient);
+});
 // Queue edits (release, delete, reorder, a failed send's return) land on the root, not the entry.
 useChatStore.subscribe((state, previous) => {
   if (state.queuedMessages === previous.queuedMessages) return;
@@ -8832,13 +8843,6 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             cost: (revisions?.cost ?? 0) + (event.totalCostUsd !== undefined ? 1 : 0),
             models: (revisions?.models ?? 0) + (event.usageByModel !== undefined ? 1 : 0),
           });
-          // A moved subtree total means some agent's cost moved; refetch mounted breakdowns.
-          if (
-            event.totalCostUsd !== undefined &&
-            event.totalCostUsd !== entry.getState().sessionCostUsd
-          ) {
-            void queryClient?.invalidateQueries({ queryKey: AGENT_COSTS_QUERY_PREFIX });
-          }
         }
       }
       if (Object.keys(patch).length > 0) {

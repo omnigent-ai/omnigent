@@ -385,12 +385,19 @@ def test_session_cost_estimate_takes_max_of_status_and_transcript_sum(
         return per_path_cost.get(path)
 
     monkeypatch.setattr(forwarder, "compute_transcript_cumulative_cost", fake_compute)
-    entries = [forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child")]
+    entries = [
+        forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child"),
+        # No transcript on disk yet: unpriceable, so it has no estimate.
+        forwarder.SubagentEntry(subagent_id="bbb", child_conversation_id="conv_pending"),
+    ]
+    subagent_costs = forwarder._subagent_cost_estimates(parent, entries, {})
+    # Estimates are keyed by the child conversation, not the Claude agent id.
+    assert subagent_costs == {"conv_child": pytest.approx(0.55)}
 
     # S stale ($0.005) < C (0.10 + 0.55 = 0.65) → C wins (mid-run).
     assert forwarder._session_cost_estimate(
         parent_transcript_path=parent,
-        active_subagents=entries,
+        subagent_costs=subagent_costs,
         status_cost=0.005,
         cost_cache={},
     ) == pytest.approx(0.65)
@@ -398,7 +405,7 @@ def test_session_cost_estimate_takes_max_of_status_and_transcript_sum(
     # S settled ($2.00) > C → S wins (no double-count after settle).
     assert forwarder._session_cost_estimate(
         parent_transcript_path=parent,
-        active_subagents=entries,
+        subagent_costs=subagent_costs,
         status_cost=2.0,
         cost_cache={},
     ) == pytest.approx(2.0)

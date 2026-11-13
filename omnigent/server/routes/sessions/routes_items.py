@@ -15,7 +15,6 @@ from omnigent.entities import Conversation
 from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
 from omnigent.errors import StaleCursorError
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
-from omnigent.runtime.policies.builder import load_session_tree
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -234,18 +233,32 @@ def register_items_routes(
 
     # ── GET /sessions/{session_id}/agent_costs ───────────────────
 
-    @router.get("/sessions/{session_id}/agent_costs", response_model=AgentCostList)
-    async def list_agent_costs(request: Request, session_id: str) -> AgentCostList:
+    @router.get(
+        "/sessions/{session_id}/agent_costs",
+        response_model=AgentCostList,
+        responses={**STALE_CURSOR_RESPONSE},
+    )
+    async def list_agent_costs(
+        request: Request,
+        session_id: str,
+        limit: int = Query(default=100, ge=1, le=1000),
+        after: str | None = Query(default=None),
+    ) -> AgentCostList:
         """
-        List display costs for a session and every sub-agent beneath it.
+        List display costs for a session and the sub-agents beneath it.
 
-        One spawn-tree read serves the whole response. READ on the session
-        covers its descendants, as for ``child_sessions``.
+        Subtree totals come from one spawn-tree read bounded like
+        ``child_sessions?descendants=true``; a tree past that cap reports no
+        costs. READ on the session covers its descendants, as for
+        ``child_sessions``.
 
         :param request: Inbound HTTP request carrying the caller identity.
         :param session_id: Session whose subtree to report, e.g. ``"conv_abc123"``.
-        :returns: An :class:`AgentCostList`.
+        :param limit: Maximum agents in the page (1-1000, default 100).
+        :param after: Id of the last agent of the previous page, or ``None``.
+        :returns: A page of :class:`AgentCostList` in spawn-tree order.
         :raises OmnigentError: 403 without READ; 404 when no session exists.
+        :raises StaleCursorError: If *after* is not an agent of the subtree.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -257,9 +270,28 @@ def register_items_routes(
         if conv is None:
             raise _session_not_found()
         tree = await asyncio.to_thread(
-            load_session_tree, session_id, conversation_store, conv.root_conversation_id
+            conversation_store.list_spawn_tree,
+            conv.root_conversation_id or conv.id,
+            # The tree's root row plus up to the cap of sub-agents.
+            limit=_SPAWN_TREE_READ_CAP + 1,
         )
-        return AgentCostList(data=_agent_costs(tree, session_id))
+        if tree.has_more:
+            # Subtree totals need the whole tree, so an oversized one reports none.
+            return AgentCostList()
+        costs = _agent_costs(tree.data, session_id)
+        start = 0
+        if after is not None:
+            position = next((i for i, cost in enumerate(costs) if cost.id == after), None)
+            if position is None:
+                raise StaleCursorError(after)
+            start = position + 1
+        window = costs[start : start + limit]
+        return AgentCostList(
+            data=window,
+            first_id=window[0].id if window else None,
+            last_id=window[-1].id if window else None,
+            has_more=start + limit < len(costs),
+        )
 
     # ── GET /sessions/{session_id}/child_sessions ────────────────
 

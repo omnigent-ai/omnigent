@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, type QueryClient } from "@tanstack/react-query";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { formatSessionCostUsd } from "@/lib/formatCost";
@@ -13,34 +13,58 @@ export interface AgentCost {
   estimated: boolean;
 }
 
-interface AgentCostWire {
-  id: string;
-  cost_usd?: number | null;
-  estimated?: boolean;
+interface AgentCostPageWire {
+  data: { id: string; cost_usd?: number | null; estimated?: boolean }[];
+  last_id?: string | null;
+  has_more?: boolean;
 }
 
-/** Prefix shared by every agent-cost query; the chat store invalidates it on cost changes. */
-export const AGENT_COSTS_QUERY_PREFIX = ["agent_costs"] as const;
-
+const AGENT_COSTS_QUERY_PREFIX = ["agent_costs"] as const;
 const AGENT_COSTS_POLL_MS = 15_000;
+const AGENT_COSTS_PAGE_SIZE = "1000";
 
-/** Fetch costs for a session and every sub-agent beneath it, keyed by session id. */
-export async function fetchAgentCosts(sessionId: string): Promise<Map<string, AgentCost>> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/agent_costs`);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as { data: AgentCostWire[] };
-  return new Map(
-    json.data.map((row) => [
-      row.id,
-      { costUsd: row.cost_usd ?? null, estimated: row.estimated === true },
-    ]),
+async function fetchAgentCostPages(
+  sessionId: string,
+  after: string | null,
+  costs: Map<string, AgentCost>,
+): Promise<Map<string, AgentCost> | null> {
+  const params = new URLSearchParams({ limit: AGENT_COSTS_PAGE_SIZE });
+  if (after !== null) params.set("after", after);
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/agent_costs?${params.toString()}`,
   );
+  // A server without the route (older, or a rolled-back backend) has no breakdown.
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const page = (await res.json()) as AgentCostPageWire;
+  for (const row of page.data) {
+    costs.set(row.id, { costUsd: row.cost_usd ?? null, estimated: row.estimated === true });
+  }
+  return page.has_more && page.last_id
+    ? fetchAgentCostPages(sessionId, page.last_id, costs)
+    : costs;
+}
+
+/**
+ * Fetch costs for a session and every sub-agent beneath it, keyed by session id.
+ * Resolves `null` when the server does not serve the breakdown.
+ */
+export function fetchAgentCosts(sessionId: string): Promise<Map<string, AgentCost> | null> {
+  return fetchAgentCostPages(sessionId, null, new Map());
+}
+
+/** Refetch mounted breakdowns after a cost moved, skipping unsupported servers. */
+export function invalidateAgentCosts(queryClient: QueryClient): void {
+  void queryClient.invalidateQueries({
+    queryKey: AGENT_COSTS_QUERY_PREFIX,
+    predicate: (query) => query.state.data !== null,
+  });
 }
 
 /**
  * Agent costs for `sessionId`'s tree when the session overview feature is on.
- * Polls while a direct child works; cost changes on the bound session also
- * invalidate it.
+ * Polls while a direct child works; the chat store invalidates it whenever the
+ * shown session total changes.
  */
 export function useAgentCosts(sessionId: string | null) {
   const enabled = isFeatureEnabled(useServerInfo(), "session_overview");
@@ -52,13 +76,14 @@ export function useAgentCosts(sessionId: string | null) {
     queryFn: () => fetchAgentCosts(id as string),
     enabled: id !== null,
     retry: false,
-    refetchInterval: working ? AGENT_COSTS_POLL_MS : false,
+    refetchInterval: (query) =>
+      working && query.state.data !== null ? AGENT_COSTS_POLL_MS : false,
   });
 }
 
 /** Short cost label, e.g. `"$0.42"`, `"~$0.10"` for an estimate, `null` when unknown. */
 export function agentCostLabel(cost: AgentCost | undefined): string | null {
-  if (cost?.costUsd == null) return null;
+  if (typeof cost?.costUsd !== "number") return null;
   return `${cost.estimated ? "~" : ""}${formatSessionCostUsd(cost.costUsd)}`;
 }
 

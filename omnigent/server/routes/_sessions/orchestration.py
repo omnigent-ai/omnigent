@@ -2003,37 +2003,30 @@ async def _persist_relay_reported_model(
 _MAX_SUBAGENT_COSTS = 1000
 
 
-def _subagent_costs_from_report(data: dict[str, Any]) -> dict[str, float] | None:
+def _subagent_costs_from_report(data: dict[str, Any]) -> dict[str, float]:
     """
-    Validate an optional ``subagent_costs_usd`` map from event data.
+    Read the well-formed entries of an optional ``subagent_costs_usd`` map.
+
+    The estimates are display-only, so a malformed map or entry is dropped
+    rather than failing the report whose authoritative costs it rides along.
 
     :param data: The ``external_session_usage`` event ``data`` dict.
-    :returns: ``{child_id: usd}``, or ``None`` when the key is absent.
-    :raises OmnigentError: When it is not an object of at most
-        :data:`_MAX_SUBAGENT_COSTS` non-empty ids to finite non-negative numbers.
+    :returns: ``{child_id: usd}`` for non-empty ids with finite non-negative
+        numbers; empty when the key is absent or holds no such entry.
     """
     raw = data.get("subagent_costs_usd")
-    if raw is None:
-        return None
-    if (
-        not isinstance(raw, dict)
-        or len(raw) > _MAX_SUBAGENT_COSTS
-        or not all(
-            isinstance(child_id, str)
-            and child_id
-            and isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and math.isfinite(value)
-            and value >= 0
-            for child_id, value in raw.items()
-        )
-    ):
-        raise OmnigentError(
-            "external_session_usage data.subagent_costs_usd must map child ids "
-            "to finite non-negative numbers",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    return {child_id: float(value) for child_id, value in raw.items()}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        child_id: float(value)
+        for child_id, value in raw.items()
+        if isinstance(child_id, str)
+        and child_id
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    }
 
 
 def _persist_native_cumulative_usage(
@@ -2084,8 +2077,9 @@ def _persist_native_cumulative_usage(
       falls back to the agent spec's model when absent.
     - ``subagent_costs_usd`` — display-only per-child estimates, e.g.
       claude-native's ``{"conv_child": 0.55}``. This session's own cost already
-      includes them, so they are stored apart (each child's maximum kept) and
-      never summed into totals, policy or the daily rollup.
+      includes them, so they are stored apart (each child's maximum, for at most
+      :data:`_MAX_SUBAGENT_COSTS` children) and never summed into totals,
+      policy or the daily rollup. Malformed entries are dropped, never rejected.
 
     The ``total_cost_usd`` key is written only on the priced branches
     below (exact billing, or token-priced when the model is in the
@@ -2264,9 +2258,9 @@ def _persist_native_cumulative_usage(
         stored = current.get("subagent_costs_usd")
         merged: dict[str, float] = dict(stored) if isinstance(stored, dict) else {}
         for child_id, child_cost in subagent_costs.items():
-            merged[child_id] = max(float(merged.get(child_id, 0.0)), child_cost)
-        if len(merged) > _MAX_SUBAGENT_COSTS:
-            raise OmnigentError("Too many sub-agent cost estimates", code=ErrorCode.INVALID_INPUT)
+            # Past the cap, new children stay unestimated; known ones keep updating.
+            if child_id in merged or len(merged) < _MAX_SUBAGENT_COSTS:
+                merged[child_id] = max(float(merged.get(child_id, 0.0)), child_cost)
         current["subagent_costs_usd"] = merged
 
     conversation_store.set_session_usage(session_id, current)

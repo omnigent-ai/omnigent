@@ -1095,7 +1095,7 @@ function AppShellImpl() {
   // SubagentsPanel mounts its own polling usage of the hook against
   // the same rootSessionId, so the cache is shared.
   const { children: childSessions } = useChildSessions(rootSessionId);
-  const { data: agentCosts } = useAgentCosts(rootSessionId);
+  const agentCosts = useAgentCosts(rootSessionId).data ?? undefined;
   // Remember the resolved root so a later click into one of its tree
   // members can hold it steady (see ``rootSessionId`` above).
   useEffect(() => {
@@ -2928,7 +2928,12 @@ function AppShellImpl() {
     ? serverConversationId
     : undefined;
   const overviewDockable =
-    overviewSessionId !== undefined && !workspacePanelVisible && !panelOpen && !canvasMode;
+    overviewSessionId !== undefined &&
+    !workspacePanelVisible &&
+    !panelOpen &&
+    !executionLogsOpen &&
+    !filesPanelOpen &&
+    !canvasMode;
   const [overviewOpen, setOverviewOpen] = useState(readSessionOverviewOpen);
   const toggleOverview = useCallback(() => {
     writeSessionOverviewOpen(!overviewOpen);

@@ -103,24 +103,52 @@ def test_subagent_cost_estimates_stay_display_only(db_uri: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "estimates",
+    ("estimates", "kept"),
     [
-        [0.1],
-        {"conv_x": -1},
-        {"conv_x": float("nan")},
-        {"conv_x": True},
-        {"": 0.1},
-        {f"conv_{index}": 0.1 for index in range(1001)},
+        ([0.1], {}),
+        ({"conv_x": -1, "conv_ok": 0.1}, {"conv_ok": 0.1}),
+        ({"conv_x": float("nan")}, {}),
+        ({"conv_x": True}, {}),
+        ({"": 0.1}, {}),
     ],
 )
-def test_invalid_subagent_cost_estimates_reject_the_report(db_uri: str, estimates: object) -> None:
+def test_malformed_subagent_estimates_never_block_authoritative_costs(
+    db_uri: str, estimates: object, kept: dict[str, float]
+) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="claude", agent_id=_AGENT_ID)
-    with pytest.raises(OmnigentError, match="subagent_costs_usd"):
-        _persist_native_cumulative_usage(
-            conv.id, {"cumulative_cost_usd": 1.0, "subagent_costs_usd": estimates}, store
-        )
-    assert "total_cost_usd" not in _usage(store, conv.id)
+    _persist_native_cumulative_usage(
+        conv.id,
+        {"cumulative_cost_usd": 1.0, "policy_cost_usd": 1.5, "subagent_costs_usd": estimates},
+        store,
+    )
+    usage = _usage(store, conv.id)
+    assert (usage["total_cost_usd"], usage["policy_cost_usd"]) == (1.0, 1.5)
+    assert usage.get("subagent_costs_usd", {}) == kept
+
+
+def test_subagent_estimates_past_the_cap_keep_costs_advancing(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="claude", agent_id=_AGENT_ID)
+    full = {f"conv_{index}": 0.1 for index in range(1000)}
+    _persist_native_cumulative_usage(
+        conv.id, {"cumulative_cost_usd": 1.0, "subagent_costs_usd": full}, store
+    )
+    # One more child than the cap: oversized in the request, and new to a full map.
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "cumulative_cost_usd": 2.0,
+            "policy_cost_usd": 2.0,
+            "subagent_costs_usd": {**full, "conv_0": 0.5, "conv_new": 0.2},
+        },
+        store,
+    )
+    usage = _usage(store, conv.id)
+    assert (usage["total_cost_usd"], usage["policy_cost_usd"]) == (2.0, 2.0)
+    assert len(usage["subagent_costs_usd"]) == 1000
+    assert usage["subagent_costs_usd"]["conv_0"] == 0.5
+    assert "conv_new" not in usage["subagent_costs_usd"]
 
 
 def test_per_model_cost_sums_across_model_switch(db_uri: str) -> None:

@@ -3114,8 +3114,14 @@ describe("Session overview", () => {
     expect(screen.queryByTestId("session-overview") !== null).toBe(enabled);
     if (!enabled) return;
     // The header cost hides and reopens the docked overview, remembering the choice.
-    fireEvent.click(screen.getByTestId("header-session-overview-toggle"));
+    const toggle = screen.getByTestId("header-session-overview-toggle");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(toggle);
     expect(screen.queryByTestId("session-overview")).toBeNull();
+    expect(screen.getByTestId("header-session-overview-toggle")).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
     expect(localStorage.getItem("omnigent:session-overview-open")).toBe("false");
     fireEvent.click(screen.getByTestId("header-session-overview-toggle"));
     expect(screen.getByTestId("session-overview")).toBeInTheDocument();

@@ -107,9 +107,10 @@ function Row({
 }
 
 function SubagentCosts({ sessionId }: { sessionId: string }) {
-  const { children, isLoading } = useChildSessions(sessionId);
+  const { children, isLoading, error } = useChildSessions(sessionId);
   const costs = useAgentCosts(sessionId);
   if (isLoading) return <Spinner aria-label="Loading sub-agents" className="size-3.5" />;
+  if (error) return <p className="text-muted-foreground">{UNAVAILABLE}</p>;
   if (children.length === 0) return <p className="text-muted-foreground">No sub-agents</p>;
   return (
     <ul className="flex flex-col gap-1" data-testid="session-overview-subagents">

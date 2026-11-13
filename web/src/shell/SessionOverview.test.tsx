@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   useWorkspaceChangedFiles,
@@ -9,7 +9,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
-import { SessionCostButton, SessionOverview } from "./SessionOverview";
+import { SessionOverview } from "./SessionOverview";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -25,10 +25,14 @@ function child(id: string, tool: string) {
   return { id, title: `${tool}:run`, tool, session_name: "run", current_task_status: null };
 }
 
-function routeFetch(costs: unknown[] | Promise<never>) {
+function routeFetch(
+  costs: unknown[] | Promise<never> | Response,
+  children: Response | null = null,
+) {
   vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
     const url = String(input);
     if (url.endsWith("/child_sessions")) {
+      if (children !== null) return children;
       return json({
         object: "list",
         data: [
@@ -38,7 +42,9 @@ function routeFetch(costs: unknown[] | Promise<never>) {
         ],
       });
     }
-    if (url.endsWith("/agent_costs")) return json({ object: "list", data: await costs });
+    if (url.includes("/agent_costs?")) {
+      return costs instanceof Response ? costs : json({ object: "list", data: await costs });
+    }
     throw new Error(`unexpected fetch ${url}`);
   });
 }
@@ -156,6 +162,23 @@ describe("SessionOverview", () => {
     expect(within(list).getAllByLabelText("Loading cost")).toHaveLength(3);
   });
 
+  it("tells a failed sub-agent list apart from an empty one", async () => {
+    routeFetch([], new Response("", { status: 500 }));
+    renderOverview();
+
+    const section = screen.getByText("Sub-agents").closest("section") as HTMLElement;
+    await within(section).findByText("Unavailable");
+    expect(within(section).queryByText("No sub-agents")).toBeNull();
+  });
+
+  it("leaves costs unknown when the server has no breakdown", async () => {
+    routeFetch(new Response("", { status: 404 }));
+    renderOverview();
+
+    const list = await screen.findByTestId("session-overview-subagents");
+    await vi.waitFor(() => expect(within(list).getAllByText("—")).toHaveLength(3));
+  });
+
   it("counts changed lines across files, including ones without line counts", () => {
     routeFetch([]);
     vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
@@ -171,24 +194,6 @@ describe("SessionOverview", () => {
     renderOverview(true);
 
     expect(row("Changed lines").textContent).toContain("+10 −2 · 2 files");
-  });
-});
-
-describe("SessionCostButton", () => {
-  it("toggles the overview only where it can dock", () => {
-    useChatStore.setState({ sessionCostUsd: 1.25, loadingConversation: false });
-    const onToggle = vi.fn();
-    const { rerender } = render(
-      <SessionCostButton expanded={false} canToggle={false} onToggle={onToggle} />,
-    );
-    expect(screen.getByTestId("header-session-cost").textContent).toBe("$1.25");
-    expect(screen.queryByTestId("header-session-overview-toggle")).toBeNull();
-
-    rerender(<SessionCostButton expanded canToggle onToggle={onToggle} />);
-    const toggle = screen.getByTestId("header-session-overview-toggle");
-    expect(toggle.getAttribute("aria-pressed")).toBe("true");
-    fireEvent.click(toggle);
-    expect(onToggle).toHaveBeenCalledOnce();
   });
 });
 

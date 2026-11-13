@@ -3552,10 +3552,13 @@ class AgentCost(BaseModel):
 
 
 class AgentCostList(BaseModel):
-    """Costs for a session and every descendant; ``data`` lists ``AgentCost``."""
+    """A page of costs for a session and its descendants; ``data`` lists ``AgentCost``."""
 
     object: Literal["list"] = "list"
     data: list[AgentCost] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
 
 
 class ChildSessionList(BaseModel):

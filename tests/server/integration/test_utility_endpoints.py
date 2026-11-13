@@ -101,6 +101,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
+        "session_overview": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,

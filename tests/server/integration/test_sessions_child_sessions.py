@@ -170,6 +170,36 @@ async def test_agent_costs_report_subtree_totals_and_parent_estimates(
     assert missing.status_code == 404
 
 
+async def test_agent_costs_paginate_and_bound_the_tree_read(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes.sessions import routes_items
+
+    session = await _create_parent_session(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    for name in ("a", "b"):
+        _seed_child(conv_store=store, parent_id=session["id"], title=f"worker:{name}")
+    url = f"/v1/sessions/{session['id']}/agent_costs"
+
+    pages: list[dict[str, Any]] = []
+    after: str | None = None
+    while not pages or pages[-1]["has_more"]:
+        params = {"limit": 2, **({"after": after} if after else {})}
+        pages.append((await client.get(url, params=params)).json())
+        after = pages[-1]["last_id"]
+    assert [len(page["data"]) for page in pages] == [2, 1]
+    assert len({row["id"] for page in pages for row in page["data"]}) == 3
+    stale = await client.get(url, params={"after": "ad563e906854634c49e1a6fd2fbb31d4"})
+    assert (stale.status_code, stale.json()["error"]["code"]) == (400, "stale_cursor")
+
+    # A tree past the read cap reports no costs rather than reading it all.
+    monkeypatch.setattr(routes_items, "_SPAWN_TREE_READ_CAP", 1)
+    capped = (await client.get(url)).json()
+    assert (capped["data"], capped["has_more"]) == ([], False)
+
+
 # ── Empty ────────────────────────────────────────────────
 
 

@@ -3142,7 +3142,7 @@ def _subagent_cost_estimates(
 def _session_cost_estimate(
     *,
     parent_transcript_path: Path,
-    active_subagents: list[SubagentEntry],
+    subagent_costs: Mapping[str, float],
     status_cost: float | None,
     cost_cache: dict[Path, _TranscriptCostCacheEntry],
 ) -> float | None:
@@ -3162,8 +3162,8 @@ def _session_cost_estimate(
 
     :param parent_transcript_path: Parent transcript JSONL path; its
         sibling ``subagents/`` directory holds the sub-agent transcripts.
-    :param active_subagents: Sub-agents with a minted child conversation
-        (only these have an ``agent-<id>.jsonl`` on disk to price).
+    :param subagent_costs: Each tracked sub-agent's own transcript cost, from
+        :func:`_subagent_cost_estimates`.
     :param status_cost: ``S`` — the statusLine total, or ``None`` when
         not captured yet.
     :param cost_cache: Per-session size-keyed transcript cost cache,
@@ -3174,11 +3174,10 @@ def _session_cost_estimate(
     estimate: float | None = _transcript_cost_size_cached(
         parent_transcript_path, include_sidechains=False, cache=cost_cache
     )
-    sub_costs = _subagent_cost_estimates(parent_transcript_path, active_subagents, cost_cache)
-    if sub_costs:
+    if subagent_costs:
         # Seed the accumulator from the parent cost, or 0.0 when the parent
         # had nothing priceable — so sub-agent cost still contributes to C.
-        estimate = (estimate or 0.0) + sum(sub_costs.values())
+        estimate = (estimate or 0.0) + sum(subagent_costs.values())
     candidates = [cost for cost in (status_cost, estimate) if cost is not None]
     if not candidates:
         return None
@@ -3262,17 +3261,18 @@ async def _forward_session_cost(
     if not active_subagents:
         policy_cost = status_cost
     else:
-        policy_cost = await asyncio.to_thread(
-            _session_cost_estimate,
-            parent_transcript_path=parent_transcript_path,
-            active_subagents=active_subagents,
-            status_cost=status_cost,
-            cost_cache=cost_cache,
-        )
-        # Cache hits: the estimate above already priced these transcripts.
-        subagent_costs = await asyncio.to_thread(
-            _subagent_cost_estimates, parent_transcript_path, active_subagents, cost_cache
-        )
+
+        def estimate() -> tuple[dict[str, float], float | None]:
+            # One pricing pass feeds both the policy estimate and the display estimates.
+            costs = _subagent_cost_estimates(parent_transcript_path, active_subagents, cost_cache)
+            return costs, _session_cost_estimate(
+                parent_transcript_path=parent_transcript_path,
+                subagent_costs=costs,
+                status_cost=status_cost,
+                cost_cache=cost_cache,
+            )
+
+        subagent_costs, policy_cost = await asyncio.to_thread(estimate)
     # Build the payload from whichever values are present AND have advanced.
     # Monotonic per field: never walk a total backwards — guards a transient
     # lower transcript read (e.g. just after a rotation) and suppresses
@@ -3300,9 +3300,8 @@ async def _forward_session_cost(
         model = status_state.get("model")
         if isinstance(model, str) and model:
             payload["model"] = model
-    # Display-only estimates, sent beside a cost field so an older server ignores
-    # the key; S already includes this spend, so the server never sums them.
-    # ponytail: an estimate that moves while neither cost advances waits for the next post.
+    # Display-only estimates ride a cost post (never alone) so an older server ignores
+    # them; one that moves while neither cost advances waits for the next post.
     if subagent_costs and subagent_costs != dedupe.posted_subagent_costs:
         payload["subagent_costs_usd"] = subagent_costs
     try:

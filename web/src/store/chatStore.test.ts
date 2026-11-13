@@ -781,6 +781,8 @@ describe("chatStore — lazy subtree usage", () => {
 
   it("finishes binding before usage, then hydrates the full cost and model map", async () => {
     seedSession("conv_usage", [userMessage("resp_1", "hello")]);
+    client.setQueryData(["agent_costs", "conv_usage"], new Map());
+    client.setQueryData(["agent_costs", "conv_unsupported"], null);
     let finishUsage!: (response: Response) => void;
     const pending = new Promise<Response>((resolve) => {
       finishUsage = resolve;
@@ -802,6 +804,10 @@ describe("chatStore — lazy subtree usage", () => {
 
     expect(useChatStore.getState().sessionUsageLoading).toBe(false);
     expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+    // A total recovered outside the live stream still refreshes per-agent costs,
+    // except from a server that has no breakdown.
+    expect(client.getQueryState(["agent_costs", "conv_usage"])?.isInvalidated).toBe(true);
+    expect(client.getQueryState(["agent_costs", "conv_unsupported"])?.isInvalidated).toBe(false);
     expect(useChatStore.getState().sessionUsageByModel).toEqual({
       "model-a": {
         inputTokens: 100,
