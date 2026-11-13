@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ComposerPrLink } from "./ComposerPrLink";
@@ -180,7 +181,7 @@ describe("ComposerPrLink", () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
-  it("links each previewed PR to a new tab beside its title", async () => {
+  it("opens previewed PRs in the sidebar and keeps the new-tab links separate", async () => {
     const prs: ComposerPullRequest[] = [
       {
         url: "https://github.com/example/app/pull/42",
@@ -220,15 +221,18 @@ describe("ComposerPrLink", () => {
     ];
     const onOpen = vi.fn();
     render(
-      <ComposerPrLink
-        state="ready"
-        prCount={3}
-        prNumber={42}
-        prStatus="conflict"
-        prs={prs}
-        onOpen={onOpen}
-        conversationId="conv_1"
-      />,
+      <>
+        <ComposerPrLink
+          state="ready"
+          prCount={3}
+          prNumber={42}
+          prStatus="conflict"
+          prs={prs}
+          onOpen={onOpen}
+          conversationId="conv_1"
+        />
+        <button type="button">Next composer control</button>
+      </>,
     );
     const trigger = screen.getByTestId("composer-pr-link");
     fireEvent.focus(trigger);
@@ -266,5 +270,52 @@ describe("ComposerPrLink", () => {
     );
     expect(onOpen).not.toHaveBeenCalled();
     expect(screen.getByTestId("composer-pr-preview")).toBeVisible();
+
+    const user = userEvent.setup();
+    await user.tab();
+    const firstRow = screen.getByRole("button", {
+      name: "View example/app #42 in the Pull Requests tab",
+    });
+    await user.tab();
+    expect(firstRow).toHaveFocus();
+    await user.tab({ shift: true });
+    expect(trigger).toHaveFocus();
+    await user.tab();
+    await user.tab();
+    expect(titled).toHaveFocus();
+    await user.tab();
+    expect(within(rows[1]).getByRole("button")).toHaveFocus();
+    await user.tab();
+    expect(untitled).toHaveFocus();
+    await user.tab();
+    expect(within(rows[2]).getByRole("button")).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole("button", { name: "Next composer control" })).toHaveFocus();
+    await user.tab({ shift: true });
+    await screen.findByTestId("composer-pr-preview");
+    await user.tab();
+    await user.keyboard("{Enter}");
+    expect(onOpen).toHaveBeenLastCalledWith(prs[0].url);
+    await waitFor(() => expect(screen.queryByTestId("composer-pr-preview")).toBeNull());
+    expect(trigger).toHaveFocus();
+
+    fireEvent.focus(trigger);
+    await screen.findByTestId("composer-pr-preview");
+    const secondRow = screen.getByRole("button", {
+      name: "View example/app !7 in the Pull Requests tab",
+    });
+    // Safari can blur the focused control before clicking without focusing the target.
+    if (fireEvent.mouseDown(secondRow)) fireEvent.blur(trigger, { relatedTarget: null });
+    fireEvent.click(secondRow);
+    expect(onOpen).toHaveBeenLastCalledWith(prs[1].url);
+    expect(onOpen).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(screen.queryByTestId("composer-pr-preview")).toBeNull());
+
+    fireEvent.focus(trigger);
+    await screen.findByTestId("composer-pr-preview");
+    await user.tab();
+    fireEvent.scroll(document.body);
+    await waitFor(() => expect(screen.queryByTestId("composer-pr-preview")).toBeNull());
+    expect(trigger).toHaveFocus();
   });
 });
