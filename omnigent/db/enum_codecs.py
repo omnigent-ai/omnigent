@@ -5,7 +5,7 @@ Several low-cardinality closed-set columns (``conversations.kind``,
 ``account_tokens.kind``, ``policies.type``, ``policies.scope``,
 ``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
 ``scheduled_tasks.execution_target``,
-``scheduled_task_runs.status``) are stored as
+``scheduled_task_runs.status``, ``session_journal_entries.kind``) are stored as
 integer codes rather
 than their string names — smaller rows and a tighter ``CHECK`` than a
 free ``VARCHAR``. The string names remain the
@@ -132,6 +132,16 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "failed": 4,
     "skipped": 5,
     "starting": 6,
+}
+
+# Journal entry kinds. The column has no CHECK, so a new kind needs no migration.
+JOURNAL_ENTRY_KIND: dict[str, int] = {
+    "status": 1,
+    "note": 2,
+    "dispatch": 3,
+    "dispatch_result": 4,
+    "plan": 5,
+    "plan_status": 6,
 }
 
 
@@ -355,3 +365,13 @@ def encode_scheduled_task_run_status(name: str) -> int:
 def decode_scheduled_task_run_status(code: int) -> str:
     """Decode a ``scheduled_task_runs.status`` int code to its name."""
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
+
+
+def encode_journal_entry_kind(name: str) -> int:
+    """Encode a ``session_journal_entries.kind`` name to its int code."""
+    return _encode(JOURNAL_ENTRY_KIND, name, field="session_journal_entries.kind")
+
+
+def decode_journal_entry_kind(code: int) -> str:
+    """Decode a ``session_journal_entries.kind`` int code to its name."""
+    return _decode(JOURNAL_ENTRY_KIND, code, field="session_journal_entries.kind")

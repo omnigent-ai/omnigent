@@ -562,9 +562,12 @@ function postEventResponseFromWire(wire: {
  * created by passing `parentSessionId` (and optionally a `title`). Leave
  * `subAgentName` unset (or null) for a user-added agent so the runner
  * resolves the child's own bound agent_id rather than walking the
- * parent's declared sub-agent tree. Optional fields are only sent when
- * provided, so a plain `createSession(agentId)` posts the same minimal
- * body as before.
+ * parent's declared sub-agent tree. It also covers a session started on a
+ * connected host: `hostId` + `workspace` make the server launch its runner
+ * there, with the labels and launch settings the new-session page sends.
+ * `sandbox` instead asks the server to provision a sandbox for it.
+ * Optional fields are only sent when provided, so a plain
+ * `createSession(agentId)` posts the same minimal body as before.
  *
  * @param agentId - Durable id of the agent to bind, e.g. "ag_abc123".
  * @param initialItems - Optional history seed (e.g. a first user message).
@@ -572,7 +575,20 @@ function postEventResponseFromWire(wire: {
  *   session under as a child, e.g. "conv_parent987".
  * @param options.subAgentName - Sub-agent name for parent-spec-tree
  *   resolution; null/omitted for user-added agents.
- * @param options.title - Child title, e.g. "ui:claude-native-ui:1".
+ * @param options.title - The session's title, e.g. "Create workflow: Triage flaky
+ *   tests", or a child's, e.g. "ui:claude-native-ui:1".
+ * @param options.hostId - Connected host to run on, e.g. "host_1".
+ * @param options.workspace - Absolute directory on that host.
+ * @param options.sandbox - Run in a new sandbox instead: the provider (null
+ *   for the server's first), an optional profile, the repository workspaces
+ *   to clone (empty for an empty workspace), and the new host's id when the
+ *   server asks the client to choose it.
+ * @param options.initialInput - The first message, for a sandbox create; the
+ *   server delivers it once the sandbox is up.
+ * @param options.labels - Session labels, e.g. a native agent's wrapper labels.
+ * @param options.terminalLaunchArgs - Native CLI flags, e.g. a permission mode.
+ * @param options.modelOverride - Model to pin, e.g. "claude-opus-4-7".
+ * @param options.reasoningEffort - Effort to pin, e.g. "high".
  */
 export async function createSession(
   agentId: string,
@@ -581,6 +597,20 @@ export async function createSession(
     parentSessionId?: string;
     subAgentName?: string | null;
     title?: string;
+    hostId?: string;
+    workspace?: string;
+    sandbox?: {
+      provider: string | null;
+      profileId?: string;
+      profileRevision?: string;
+      workspaces: string[];
+      hostId?: string;
+    };
+    initialInput?: SessionEventInput;
+    labels?: Record<string, string>;
+    terminalLaunchArgs?: string[];
+    modelOverride?: string;
+    reasoningEffort?: string;
   } = {},
 ): Promise<Session> {
   const body: {
@@ -589,7 +619,31 @@ export async function createSession(
     parent_session_id?: string;
     sub_agent_name?: string | null;
     title?: string;
+    host_id?: string;
+    workspace?: string;
+    host_type?: "managed";
+    sandbox_provider?: string;
+    sandbox_profile_id?: string;
+    sandbox_profile_revision?: string;
+    workspaces?: string[];
+    initial_input?: SessionEventInput;
+    labels?: Record<string, string>;
+    terminal_launch_args?: string[];
+    model_override?: string;
+    reasoning_effort?: string;
   } = { agent_id: agentId, initial_items: initialItems };
+  const { sandbox } = options;
+  if (sandbox !== undefined) {
+    body.host_type = "managed";
+    if (sandbox.provider !== null) body.sandbox_provider = sandbox.provider;
+    if (sandbox.profileId !== undefined) {
+      body.sandbox_profile_id = sandbox.profileId;
+      body.sandbox_profile_revision = sandbox.profileRevision;
+    }
+    body.workspaces = sandbox.workspaces;
+    if (sandbox.hostId !== undefined) body.host_id = sandbox.hostId;
+  }
+  if (options.initialInput !== undefined) body.initial_input = options.initialInput;
   if (options.parentSessionId !== undefined) {
     body.parent_session_id = options.parentSessionId;
   }
@@ -599,6 +653,14 @@ export async function createSession(
   if (options.title !== undefined) {
     body.title = options.title;
   }
+  if (options.hostId !== undefined) body.host_id = options.hostId;
+  if (options.workspace !== undefined) body.workspace = options.workspace;
+  if (options.labels !== undefined) body.labels = options.labels;
+  if (options.terminalLaunchArgs !== undefined) {
+    body.terminal_launch_args = options.terminalLaunchArgs;
+  }
+  if (options.modelOverride !== undefined) body.model_override = options.modelOverride;
+  if (options.reasoningEffort !== undefined) body.reasoning_effort = options.reasoningEffort;
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
     headers: {

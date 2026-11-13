@@ -1828,6 +1828,30 @@ describe("session.presence (FLAT envelope)", () => {
   });
 });
 
+describe("session.journal.appended (FLAT envelope)", () => {
+  it("carries the session and the new entry", () => {
+    const entry = { id: "e1", position: 1, kind: "note", payload: { body: "hi" } };
+    const out = parse("session.journal.appended", {
+      type: "session.journal.appended",
+      conversation_id: "conv_abc",
+      entry,
+    });
+    expect(out).toEqual([{ type: "session_journal_appended", conversationId: "conv_abc", entry }]);
+  });
+
+  it("rejects an event without a usable entry", () => {
+    for (const entry of [undefined, [], { id: "e1" }, { position: 1 }]) {
+      expect(
+        parse("session.journal.appended", {
+          type: "session.journal.appended",
+          conversation_id: "conv_abc",
+          entry,
+        }),
+      ).toEqual([]);
+    }
+  });
+});
+
 describe("session.changed_files.invalidated (FLAT envelope)", () => {
   it("lifts session id and defaults environment", () => {
     const out = parse("session.changed_files.invalidated", {

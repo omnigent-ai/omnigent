@@ -35,6 +35,12 @@ from omnigent.tools.builtins.async_inbox import (
     SysCancelAsyncTool,
     SysReadInboxTool,
 )
+from omnigent.tools.builtins.journal import (
+    SysJournalReadTool,
+    SysJournalWriteNoteTool,
+    SysJournalWritePlanTool,
+    SysJournalWriteStatusTool,
+)
 from omnigent.tools.builtins.list_comments import ListCommentsTool
 from omnigent.tools.builtins.list_models import SysListModelsTool
 from omnigent.tools.builtins.load_skill import (
@@ -93,6 +99,10 @@ __all__ = [
     "SysAgentListTool",
     "SysCallAsyncTool",
     "SysCancelAsyncTool",
+    "SysJournalReadTool",
+    "SysJournalWriteNoteTool",
+    "SysJournalWritePlanTool",
+    "SysJournalWriteStatusTool",
     "SysListModelsTool",
     "SysProjectListTool",
     "SysProjectUpdateTool",

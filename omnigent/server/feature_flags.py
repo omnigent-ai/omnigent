@@ -45,6 +45,7 @@ class Feature(StrEnum):
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
+    WORKFLOWS_PAGE = "workflows_page"
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.20.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,
@@ -211,6 +213,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(
         feature=Feature.SIDEBAR_WINDOWED_ROWS,
         description="Mount only the sidebar session rows near the viewport",
+        owner="web",
+        review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKFLOWS_PAGE,
+        description="Web Workflows page that lists saved workflows and creates new ones",
         owner="web",
         review_by_release="0.24.0",
     ),

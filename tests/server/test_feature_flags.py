@@ -23,6 +23,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
 
     assert flags.enabled_features == frozenset(
         {
+            Feature.AUTOMATIONS_V2,
             Feature.CLAUDE_OSC_STATUS,
             Feature.CODEX_PLAN_AT_LAUNCH,
             Feature.CUSTOM_AGENTS_SETTINGS_UI,
@@ -43,9 +44,10 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "sidebar_grouping_ui": True,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
-        "automations_v2": False,
+        "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
+        "workflows_page": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
@@ -58,6 +60,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
     assert flags.enabled(Feature.USAGE_PAGE)
     assert flags.enabled(Feature.HARNESS_INSTALL)
     assert flags.enabled_names() == (
+        "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
         "custom_agents_settings_ui",
@@ -81,6 +84,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
 @pytest.mark.parametrize(
     "feature",
     [
+        "automations_v2",
         "claude_osc_status",
         "custom_agents_settings_ui",
         "peer_session_messaging",
@@ -94,6 +98,7 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
     flags = resolve_feature_flags({FEATURES_ENV_VAR: f"usage_page,{features}"})
 
     assert set(flags.enabled_names()) == {
+        "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
         "custom_agents_settings_ui",
@@ -110,6 +115,7 @@ def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> N
     flags = resolve_feature_flags({FEATURES_ENV_VAR: f"{feature},-{feature}"})
 
     assert flags.enabled_names() == (
+        "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
         "custom_agents_settings_ui",
@@ -137,6 +143,7 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
     assert flags.enabled_names() == (
+        "automations_v2",
         "canvas",
         "claude_osc_status",
         "codex_plan_at_launch",

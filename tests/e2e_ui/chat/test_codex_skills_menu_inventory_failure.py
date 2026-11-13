@@ -173,7 +173,8 @@ def test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog(
     assert plugin_rows == 0, f"{observed}: a plugin skill was listed despite the failed inventory"
     assert api.status_code == 200, observed
     body = api.json()
-    assert body["skills"] == [], observed
+    # Only Omnigent's own workflow skills remain; they don't come from Codex's inventory.
+    assert [skill["name"] for skill in body["skills"]] == ["save-workflow", "workflow"], observed
     assert [w for w in body["warnings"] if _WARNING_ROW in w and _EXIT_SUMMARY in w], (
         f"{observed}: a failed plugin inventory was answered as a successful empty catalog"
     )

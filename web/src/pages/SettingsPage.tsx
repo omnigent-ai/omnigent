@@ -54,6 +54,7 @@ import {
   FilesIcon,
   GitPullRequestIcon,
   KeyRoundIcon,
+  ListChecksIcon,
   Loader2Icon,
   LogOutIcon,
   EyeIcon,
@@ -493,6 +494,7 @@ const workspaceTabCards: {
   { value: "changes", label: "Changes", icon: FileDiffIcon },
   { value: "github", label: "Pull Requests", icon: GitPullRequestIcon },
   { value: "subagents", label: "Agents", icon: BotIcon },
+  { value: "tasks", label: "Tasks", icon: ListChecksIcon },
 ];
 
 /** Inline icon and label for compact settings choices. */

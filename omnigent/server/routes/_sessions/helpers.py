@@ -133,6 +133,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     RunnerExitReports,
 )
+from omnigent.server.journal_markers import record_todo_markers
 from omnigent.server.managed_hosts import (
     MANAGED_SANDBOX_LABEL_NAMESPACE,
     ManagedHostLaunch,
@@ -3220,11 +3221,14 @@ async def _handle_external_session_todos(
         validated = validate_session_todos(todos)
     except ValueError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    previous = list(conversation.session_todos) if conversation is not None else []
     persisted = await asyncio.to_thread(
         conversation_store.set_session_todos, session_id, validated
     )
     if not persisted:
         return
+    await record_todo_markers(conversation_store, session_id, previous, validated)
     event = SessionTodosEvent(
         type="session.todos",
         conversation_id=session_id,
@@ -11180,6 +11184,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         CREATED_BY_SESSION_LABEL_KEY,
         FAMILY_PIN_LABEL_PREFIX,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -11189,6 +11194,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
     for key in (
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
         # Deleting a session also deletes the automation this label names.
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,

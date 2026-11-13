@@ -93,7 +93,7 @@ def test_outside_tap_dismisses_overflow_menu(
 
         # The seeded plan renders the tracker pinned at the top of the thread —
         # the same chat-surface state as the reported session.
-        expect(page.locator('[data-testid="plan-tracker"]')).to_be_visible(timeout=30_000)
+        expect(page.locator('[data-testid="tasks-preview"]')).to_be_visible(timeout=30_000)
         kebab = page.locator(_KEBAB)
         expect(kebab).to_be_visible()
         page.wait_for_timeout(500)

@@ -37,11 +37,14 @@ import {
   SESSION_LINK_ID_PLACEHOLDER,
   splitTriggerPrompt,
 } from "@/components/scheduled/triggerTemplates";
+import { RunGraphButton, RunTimeline, RunWorkflowButton } from "@/components/workflows/RunTasks";
+import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
 import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTask,
   useScheduledTaskRuns,
+  useScheduledTaskRunSteps,
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
 import {
@@ -67,9 +70,11 @@ import {
   formatRunTimestamp,
 } from "@/lib/scheduleText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
-import type { ScheduledTaskRun } from "@/lib/scheduledTasksApi";
+import type { ScheduledTaskRun, ScheduledTaskRunSteps } from "@/lib/scheduledTasksApi";
+import { stepProgress } from "@/lib/sessionJournal";
+import { parseSavedWorkflowMessage } from "@/lib/workflow";
 import { cn } from "@/lib/utils";
 
 const RUN_HIGHLIGHT_DURATION_MS = 3_000;
@@ -109,6 +114,11 @@ function TaskDetail({ taskId }: { taskId: string }) {
     isError: runsError,
     isFetchedAfterMount: runsFetchedAfterMount,
   } = useScheduledTaskRuns(taskId, taskId !== "", awaitingRunRow);
+  // An automation that runs a saved workflow shows each run's tasks.
+  const savedWorkflow = task
+    ? parseSavedWorkflowMessage(splitTriggerPrompt(task.prompt).userPrompt)
+    : null;
+  const runSteps = useScheduledTaskRunSteps(taskId, runs, savedWorkflow !== null);
 
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
@@ -559,8 +569,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
 
       <hr className="my-6 border-border" />
 
-      {/* Run history. */}
-      <h2 className="mb-2 text-sm font-medium text-muted-foreground">Run history</h2>
+      {/* Runs. */}
+      <h2 className="mb-2 text-sm font-medium text-muted-foreground">Runs</h2>
       {runs?.some((run) => run.sessionCostUsd != null) && (
         <p className="mb-2 text-xs text-muted-foreground">
           Session cost is each session’s current recorded total. Runs sharing a session show the
@@ -583,7 +593,14 @@ function TaskDetail({ taskId }: { taskId: string }) {
       ) : (
         <ul className="flex flex-col gap-1" data-testid="task-detail-runs">
           {(runs ?? []).map((run) => (
-            <RunRow key={run.id} run={run} now={now} highlighted={run.id === highlightedRunId} />
+            <RunRow
+              key={run.id}
+              run={run}
+              now={now}
+              highlighted={run.id === highlightedRunId}
+              steps={runSteps.get(run.id)}
+              workflowName={savedWorkflow?.name}
+            />
           ))}
         </ul>
       )}
@@ -685,12 +702,30 @@ function RunRow({
   run,
   now,
   highlighted,
+  steps,
+  workflowName,
 }: {
   run: ScheduledTaskRun;
   now: Date;
   highlighted: boolean;
+  /** The plan the run started with, when the automation runs a saved workflow. */
+  steps?: ScheduledTaskRunSteps;
+  workflowName?: string;
 }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
+  // A workflow run's tasks, as the workflow's page shows them.
+  const sessionWorking = run.status === "running" || run.conversationStatus === "running";
+  const progress = useMemo(
+    () => (steps ? stepProgress(steps.steps, steps.statuses, sessionWorking) : []),
+    [steps, sessionWorking],
+  );
+  const sessionId = run.conversationId;
+  const showTasks = progress.length > 0 && sessionId != null;
+  const [graphOpen, setGraphOpen] = useState(false);
+  // The saved workflow the run's plan follows, when the Workflows page can open it.
+  const workflowId = isFeatureEnabled(useServerInfo(), "workflows_page")
+    ? (steps?.workflowId ?? null)
+    : null;
   const duration = formatRunDuration(run.firedAt, run.finishedAt);
   // Unread only applies to a succeeded run that produced a conversation.
   const unread = useRunUnread(run);
@@ -766,7 +801,12 @@ function RunRow({
       data-testid="task-detail-run"
       data-run-status={run.status}
       data-run-unread={run.status === "succeeded" ? unread : undefined}
-      className={cn("rounded-lg", highlighted && "animate-message-highlight")}
+      className={cn(
+        "relative rounded-lg",
+        highlighted && "animate-message-highlight",
+        // The row's timeline sits under its link, so the whole row lights up.
+        showTasks && "transition-colors hover:bg-muted",
+      )}
       style={highlighted ? { animationDuration: `${RUN_HIGHLIGHT_DURATION_MS}ms` } : undefined}
     >
       {run.conversationId ? (
@@ -776,12 +816,42 @@ function RunRow({
           className={cn(
             commonClassName,
             "cursor-pointer transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none",
+            showTasks && (workflowId ? "pr-18" : "pr-11"),
           )}
         >
           {body}
         </Link>
       ) : (
         <div className={commonClassName}>{body}</div>
+      )}
+      {showTasks && (
+        <>
+          <RunTimeline sessionId={sessionId} progress={progress} className="pr-3 pb-2.5 pl-10" />
+          <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
+            {workflowId && <RunWorkflowButton workflowId={workflowId} />}
+            <RunGraphButton
+              runName={`the ${timestamp ?? ""} run`}
+              onClick={() => setGraphOpen(true)}
+            />
+          </div>
+        </>
+      )}
+      {graphOpen && showTasks && steps && (
+        <WorkflowGraphOverlay
+          title={workflowName ?? "Workflow"}
+          subtitle={
+            <>
+              <span>{timestamp ?? "—"}</span>
+              <span aria-hidden>·</span>
+              <Link to={`/c/${sessionId}`} className="text-foreground hover:underline">
+                Open session
+              </Link>
+            </>
+          }
+          steps={steps.steps}
+          progress={progress}
+          onClose={() => setGraphOpen(false)}
+        />
       )}
     </li>
   );

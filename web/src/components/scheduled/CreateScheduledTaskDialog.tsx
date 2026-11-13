@@ -36,6 +36,10 @@ import {
 } from "./useScheduledHarnessSettings";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
+import { WorkflowField } from "@/components/scheduled/WorkflowField";
+import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import { skillInvocationPrefix } from "@/lib/harnessSetup";
+import { parseSavedWorkflowMessage, savedWorkflowMessage } from "@/lib/workflow";
 import {
   TriggerWorkerHarnessField,
   TriggerWorkerSettingsFields,
@@ -235,6 +239,7 @@ export function CreateScheduledTaskDialog({
   sessionLink = "",
   editingTask = null,
   sourceSession = null,
+  lockedWorkflow = null,
   onCreated,
 }: {
   open: boolean;
@@ -250,6 +255,8 @@ export function CreateScheduledTaskDialog({
   editingTask?: ScheduledTask | null;
   /** Create the automation from this session: every run starts from a copy of it. */
   sourceSession?: AutomationSourceSession | null;
+  /** Create the automation from this saved workflow: runs follow it, and it can't be changed. */
+  lockedWorkflow?: SavedWorkflow | null;
   /** Called once with the new automation after it is created (not after an edit). */
   onCreated?: (task: ScheduledTask) => void;
 }) {
@@ -318,6 +325,9 @@ export function CreateScheduledTaskDialog({
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
+  // A saved workflow for each run to follow; the instructions then hold the run's details.
+  const [workflowChoice, setWorkflowChoice] = useState<SavedWorkflow | null>(null);
+  const savedWorkflows = useSavedWorkflows({ enabled: open });
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
   const [systemPromptOpen, setSystemPromptOpen] = useState(false);
   const [editingSystemPrompt, setEditingSystemPrompt] = useState(false);
@@ -560,7 +570,11 @@ export function CreateScheduledTaskDialog({
       setSystemPromptOpen(false);
       setEditingSystemPrompt(false);
       const parts = splitTriggerPrompt(editingTask?.prompt ?? initialPrompt ?? "");
-      setPrompt(parts.userPrompt);
+      const savedRun = parseSavedWorkflowMessage(parts.userPrompt);
+      setWorkflowChoice(
+        lockedWorkflow ?? (savedRun && { id: savedRun.id, name: savedRun.name, description: "" }),
+      );
+      setPrompt(savedRun ? savedRun.details : parts.userPrompt);
       setSystemPrompt(parts.systemPrompt);
       setTimezone(editingTask?.timezone ?? localTimezone());
       if (editingTask) {
@@ -622,6 +636,7 @@ export function CreateScheduledTaskDialog({
     savedSchedule,
     savedWorkspace,
     sourceSession,
+    lockedWorkflow,
   ]);
 
   // A new task starts on a server sandbox when one is offered, so it doesn't
@@ -726,7 +741,7 @@ export function CreateScheduledTaskDialog({
     const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
     if (updated === null) return;
     const parts = splitTriggerPrompt(updated);
-    setPrompt(parts.userPrompt);
+    setPrompt(withoutWorkflow(parts.userPrompt));
     setSystemPrompt(parts.systemPrompt);
   }
 
@@ -920,9 +935,35 @@ export function CreateScheduledTaskDialog({
     unsupportedByScheduler ||
     validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
       null;
+  const workflowPrefix = skillInvocationPrefix(harnessSettings.harness);
+  const withWorkflow = (text: string) =>
+    workflowChoice ? savedWorkflowMessage(workflowPrefix, workflowChoice, text, false) : text;
+  // When editing, the saved list's copy, once loaded, has the workflow's current name.
+  const workflowShown =
+    workflowChoice &&
+    (savedWorkflows.workflows.find((workflow) => workflow.id === workflowChoice.id) ??
+      workflowChoice);
+  // Text that came back with the workflow's message in it, e.g. after Edit as prompt.
+  const withoutWorkflow = (text: string) =>
+    (workflowChoice && parseSavedWorkflowMessage(text)?.details) ?? text;
+  // Offered once the user has a saved workflow, or when the prompt already runs one.
+  const workflowField =
+    savedWorkflows.workflows.length > 0 || workflowChoice ? (
+      <WorkflowField
+        workflows={savedWorkflows.workflows}
+        value={workflowShown}
+        onChange={setWorkflowChoice}
+        onOpenChange={handleSelectOpenChange}
+        locked={lockedWorkflow !== null}
+      />
+    ) : null;
+  const promptTriggerFields = {
+    ...triggerFields,
+    instructions: withWorkflow(triggerFields.instructions),
+  };
   const renderedTemplatePrompt =
-    trigger !== null && triggerFieldsComplete(triggerFields, trigger)
-      ? renderTriggerPrompt(trigger, triggerFields, {
+    trigger !== null && triggerFieldsComplete(promptTriggerFields, trigger)
+      ? renderTriggerPrompt(trigger, promptTriggerFields, {
           // Workers run where the manager runs: beside it on a connected host,
           // or each in its own sandbox. A switched edit keeps the saved placement.
           placement: workerPlacement ?? (sandboxMode ? "managed" : "same_host"),
@@ -949,7 +990,9 @@ export function CreateScheduledTaskDialog({
         })
       : "";
   const effectivePrompt =
-    trigger !== null ? renderedTemplatePrompt : combineTriggerPrompt(prompt, systemPrompt);
+    trigger !== null
+      ? renderedTemplatePrompt
+      : combineTriggerPrompt(withWorkflow(prompt), systemPrompt);
   const triggerMode =
     trigger !== null ||
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
@@ -1006,7 +1049,8 @@ export function CreateScheduledTaskDialog({
     !curationPending &&
     name.trim() !== "" &&
     (startsFromSession ||
-      (effectivePrompt.trim() !== "" && (trigger !== null || prompt.trim() !== ""))) &&
+      (effectivePrompt.trim() !== "" &&
+        (trigger !== null || withWorkflow(prompt).trim() !== ""))) &&
     (trigger !== null || systemPrompt === null || systemPrompt.trim() !== "") &&
     (isEdit || effectiveAgentId !== null) &&
     (isEdit || sandboxMode || hostId !== "") &&
@@ -1389,9 +1433,11 @@ export function CreateScheduledTaskDialog({
                     }
                     taskSessionMode={triggerTaskSessionMode}
                     renderedPrompt={renderedTemplatePrompt}
+                    workflowField={workflowField}
+                    instructionsAreDetails={workflowChoice !== null}
                     onEditAsPrompt={() => {
                       const parts = splitTriggerPrompt(renderedTemplatePrompt);
-                      setPrompt(parts.userPrompt);
+                      setPrompt(withoutWorkflow(parts.userPrompt));
                       setSystemPrompt(parts.systemPrompt);
                       setSystemPromptOpen(false);
                       setEditingSystemPrompt(false);
@@ -1400,8 +1446,9 @@ export function CreateScheduledTaskDialog({
                   />
                 ) : (
                   <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
+                    {workflowField && <div className="mb-3.5">{workflowField}</div>}
                     <Label htmlFor="task-prompt">
-                      {startsFromSession
+                      {startsFromSession || workflowChoice
                         ? "Additional instructions"
                         : systemPrompt === null
                           ? "Instructions"
@@ -1412,9 +1459,11 @@ export function CreateScheduledTaskDialog({
                       value={prompt}
                       rows={5}
                       placeholder={
-                        startsFromSession
-                          ? "Optional. For example: Use this week's data."
-                          : "What should the agent do each run?"
+                        workflowChoice
+                          ? "Optional. Instructions to customize the workflow."
+                          : startsFromSession
+                            ? "Optional. For example: Use this week's data."
+                            : "What should the agent do each run?"
                       }
                       data-testid="task-prompt-input"
                       componentId="tasks.scheduled.prompt"

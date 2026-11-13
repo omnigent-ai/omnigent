@@ -10,7 +10,9 @@ import { parseNativePermissionDelivery } from "./nativePermissionDelivery";
 // catch — please add an SSE-parser test when you touch this.
 
 import { assistantMessagePhase } from "./conversationItems";
+import type { JournalEntry } from "./sessionJournal";
 import { readSubagentActivity } from "./subagentActivity";
+import { readTaskActivity } from "./taskActivity";
 import type {
   BrowserActionRequestEvent,
   ClientTaskCancel,
@@ -39,6 +41,7 @@ import type {
   SessionBtwSidechatEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
+  SessionJournalAppendedEvent,
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
@@ -958,6 +961,19 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       child: child as Record<string, unknown>,
     } satisfies SessionChildSessionUpdatedEvent;
   }
+  if (eventType === "session.journal.appended") {
+    const conversationId = data.conversation_id;
+    const entry = data.entry;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+    const { id, position } = entry as Record<string, unknown>;
+    if (typeof id !== "string" || typeof position !== "number") return null;
+    return {
+      type: "session_journal_appended",
+      conversationId,
+      entry: entry as JournalEntry,
+    } satisfies SessionJournalAppendedEvent;
+  }
   if (eventType === "session.changed_files.invalidated") {
     const sessionId = data.session_id;
     if (typeof sessionId !== "string" || !sessionId) return null;
@@ -1367,7 +1383,8 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     } satisfies TerminalCommandEvent;
   }
 
-  if (readSubagentActivity(rec)) {
+  // Task markers place and fold like sub-agent markers, so they share the notice kind.
+  if (readSubagentActivity(rec) || readTaskActivity(rec)) {
     return {
       type: "native_tool_call",
       toolType: "subagent_activity",

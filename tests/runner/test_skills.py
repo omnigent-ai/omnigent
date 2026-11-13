@@ -12,7 +12,7 @@ import pytest
 
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
-from omnigent.spec.types import SkillSpec
+from omnigent.spec.types import SkillSpec, ToolGroupsConfig
 
 
 @pytest.fixture(autouse=True)
@@ -48,9 +48,10 @@ class _ExecutorStub:
 class _SpecStub:
     """
     Minimal stand-in for an ``AgentSpec`` exposing only what skill
-    discovery reads: the bundled ``skills`` list, ``skills_filter``, and
+    discovery reads: the bundled ``skills`` list, ``skills_filter``,
     ``executor.harness_kind`` (so the runner can dispatch to the right
-    per-harness skill source).
+    per-harness skill source), and ``tool_groups``, with the journal group
+    off so Omnigent's own skills stay out of these lists.
 
     :param skills: Bundled skills the agent ships.
     :param skills_filter: Host-skill filter (``"all"`` / ``"none"`` /
@@ -72,6 +73,7 @@ class _SpecStub:
         self.skills = skills
         self.skills_filter = skills_filter
         self.executor = _ExecutorStub(harness)
+        self.tool_groups = ToolGroupsConfig(journal=False)
 
 
 class _ServerClient:
