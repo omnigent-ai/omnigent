@@ -1,3 +1,5 @@
+# Configuration reference: whole-process network denial blocks network model providers.
+# See README.md before running this Claude SDK example.
 name: tcp-egress-local-http
 executor:
   harness: claude-sdk
