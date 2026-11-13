@@ -13411,6 +13411,38 @@ describe("chatStore — session configuration scope", () => {
     );
   });
 
+  it("switches a background session's approval mode without touching the active one", async () => {
+    for (const id of ["conv_approval_cell", "conv_approval_active"]) {
+      seedSession(id, []);
+      withSnapshot(id, { labels: { "omnigent.wrapper": "codex-native-ui" } });
+    }
+    await useChatStore.getState().switchTo("conv_approval_cell");
+    await useChatStore.getState().switchTo("conv_approval_active");
+    const cell = () => conversationRegistry.peek("conv_approval_cell")!.getState();
+    fetchMock.mockClear();
+
+    await useChatStore.getState().setCodexApprovalMode("approve-for-me", "conv_approval_cell");
+
+    expect(patchCallsFor("conv_approval_cell")).toEqual([{ approval_mode: "approve-for-me" }]);
+    expect(patchCallsFor("conv_approval_active")).toEqual([]);
+    expect(cell().codexApprovalMode).toBe("approve-for-me");
+    expect(useChatStore.getState().codexApprovalMode).toBe("");
+
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = (typeof input === "string" ? input : input.toString()).split("?")[0]!;
+      if (path === "/v1/sessions/conv_approval_cell" && init?.method === "PATCH")
+        return mockResponse({ error: { code: "runner_unavailable" } }, { ok: false, status: 503 });
+      return defaultFetchHandler(input, init);
+    });
+    await expect(
+      useChatStore.getState().setCodexApprovalMode("read-only", "conv_approval_cell"),
+    ).rejects.toThrow();
+
+    // The rejected switch rolls back only the targeted session.
+    expect(cell().codexApprovalMode).toBe("approve-for-me");
+    expect(useChatStore.getState().codexApprovalMode).toBe("");
+  });
+
   it("hydrates server-side model and effort without PATCHing", async () => {
     seedSession("conv_existing", []);
     withSnapshot("conv_existing", {

@@ -3,13 +3,17 @@
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeLabel,
+  isClaudeNativeSession,
 } from "@/lib/claudePermissionMode";
 import {
   CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
   codexApprovalModeLabel,
 } from "@/lib/codexApprovalMode";
+import { isCodexNativeSession } from "@/lib/codexPlanMode";
+import { modelPickerKindForConv } from "@/lib/composerCapabilities";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
+import type { Session } from "@/lib/types";
 
 /** The key fields the cycle check reads from a React keyboard event. */
 export interface PermissionModeCycleKeyEvent {
@@ -54,6 +58,16 @@ export function nextCycledPermissionMode(
 
 /** Which vocabulary a session's permission chip uses. */
 export type PermissionChipKind = "claude" | "devin" | "codex";
+
+/** The vocabulary of a session's permission chip, or null when its harness has none. */
+export function permissionChipKind(
+  session: Pick<Session, "labels" | "harness" | "parentSessionId" | "inferenceConfigured">,
+): PermissionChipKind | null {
+  if (isCodexNativeSession(session)) return "codex";
+  if (modelPickerKindForConv(session) === "devin") return "devin";
+  if (isClaudeNativeSession(session)) return "claude";
+  return null;
+}
 
 /** The chip's menu options, selected value and label for a session's current modes. */
 export function permissionChip(

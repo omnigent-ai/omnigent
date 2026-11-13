@@ -13,6 +13,7 @@ import * as filesApi from "@/lib/filesApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import type * as ChatStoreModule from "@/store/chatStore";
@@ -1463,6 +1464,27 @@ describe("unsent composer state survives the pane moving", () => {
       expect(useChatStore.getState().sideChatComposers["other-pane"].text).toBe("keep me");
     },
   );
+
+  it("sends a shared draft's tagged file and session as their markers", async () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    useChatStore.getState().updateSideChatComposer(childId, () => ({
+      text: "Ask @auth about @src/a.ts",
+      files: [],
+      mentions: {
+        files: [{ path: "src/a.ts", isDir: false }],
+        sessions: [{ id: "s_child", title: "auth", isSubagent: true, token: "@auth" }],
+      },
+    }));
+    renderPane(<SideChatPane childId={childId} fullSession />);
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    const [message] = send.mock.calls[0]!;
+    expect(message).toContain(
+      'Ask [Session: "auth" id=s_child subagent=yes] about [Attached file: src/a.ts]',
+    );
+    expect(message).toContain(SESSION_MENTION_HINT);
+  });
 });
 
 describe("history a side chat copied from its parent", () => {

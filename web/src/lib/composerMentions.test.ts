@@ -6,6 +6,7 @@ import {
   recallSessionMentions,
   composerInlineMentions,
   expandMentionTokens,
+  expandTaggedDraft,
   findMentionTokens,
   harnessSupportsFileMentions,
   mentionTokenAtCaret,
@@ -148,6 +149,32 @@ describe("expanding composer text", () => {
       `${restored} and more\n\n${SESSION_MENTION_HINT}`,
     );
     expect(withSessionMentionHint(restored, true)).toBe(restored);
+  });
+
+  it("expands a restored draft's present tags in its text and quote preambles", () => {
+    const tagged = {
+      files: [{ path: "src/a.ts", isDir: false }],
+      sessions: [{ ...alpha, token: "@Alpha planning" }],
+    };
+    const draft = {
+      text: "then @src/a.ts",
+      quotes: [{ id: "q", before: "per @Alpha planning", text: "quoted @src/a.ts" }],
+    };
+    expect(expandTaggedDraft(draft, tagged, "codex-native")).toEqual({
+      text: `then [Attached file: src/a.ts]\n\n${SESSION_MENTION_HINT}`,
+      quotes: [
+        {
+          id: "q",
+          before: 'per [Session: "Alpha planning" id=s_alpha subagent=no]',
+          // Quoted assistant text is left as written.
+          text: "quoted @src/a.ts",
+        },
+      ],
+    });
+    // Without tags, or once every token is deleted, the draft is unchanged.
+    expect(expandTaggedDraft(draft, undefined, "codex-native")).toBe(draft);
+    const untouched = { text: "plain", quotes: [] };
+    expect(expandTaggedDraft(untouched, tagged, "codex-native")).toBe(untouched);
   });
 });
 

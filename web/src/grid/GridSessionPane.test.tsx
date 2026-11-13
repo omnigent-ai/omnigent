@@ -242,9 +242,10 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-it("keeps each cell's single-session draft and switches that session's permission mode", async () => {
+it("keeps each cell's single-session draft and tags, and switches that session's permission mode", async () => {
   fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
-  setSessionDraft("second", { text: "Unsent idea", files: [] });
+  const mentions = { files: [{ path: "notes.md", isDir: false }], sessions: [] };
+  setSessionDraft("second", { text: "Unsent idea", files: [], mentions });
   render(
     <MemoryRouter>
       <TooltipProvider>
@@ -254,15 +255,21 @@ it("keeps each cell's single-session draft and switches that session's permissio
       </TooltipProvider>
     </MemoryRouter>,
   );
-  expect(useChatStore.getState().sideChatComposers.second?.text).toBe("Unsent idea");
+  expect(useChatStore.getState().sideChatComposers.second).toMatchObject({
+    text: "Unsent idea",
+    mentions,
+  });
   act(() =>
     useChatStore
       .getState()
       .updateSideChatComposer("second", (draft) => ({ ...draft, text: "Edited in the grid" })),
   );
-  expect(getSessionDraft("second")?.text).toBe("Edited in the grid");
+  expect(getSessionDraft("second")).toMatchObject({ text: "Edited in the grid", mentions });
 
   const second = within(screen.getByRole("region", { name: "second" }));
+  // An inactive cell keeps the toggle's slot, so activating it never shifts the titlebar.
+  expect(second.queryByRole("button", { name: /grid workspace$/ })).toBeNull();
+  expect(second.getByLabelText(/grid workspace$/)).toHaveStyle({ visibility: "hidden" });
   expect(second.getByText("Host for second")).toBeInTheDocument();
   expect(second.getByText("Model for second")).toBeInTheDocument();
   fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {

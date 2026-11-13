@@ -276,8 +276,9 @@ def test_session_grid_drag_persist_live_updates_and_close(
         other_area = other_cell.evaluate("node => node.style.gridArea")
         first_cell.evaluate("node => node.dataset.instance = 'preserved'")
         assert first_cell.locator("header").bounding_box()["height"] == 32
-        # The active cell also carries the grid workspace toggle.
-        expect(first_cell.locator('header [data-size="icon-xs"]')).to_have_count(5)
+        # Only the active cell shows the grid workspace toggle; others keep its slot hidden.
+        expect(first_cell.get_by_role("button", name="Collapse grid workspace")).to_be_visible()
+        expect(other_cell.get_by_role("button", name="Collapse grid workspace")).to_be_hidden()
         # Both cells use real xterm attaches, with independent input and view selection.
         first_cell.get_by_test_id("side-chat-input").fill("Keep this chat draft")
         for cell in (first_cell, other_cell):

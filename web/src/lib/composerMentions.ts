@@ -329,6 +329,30 @@ export function withSessionMentionHint(text: string, tagsSessions: boolean): str
   return `${stripTrailingHint(text) ?? text.trimEnd()}\n\n${SESSION_MENTION_HINT}`;
 }
 
+/**
+ * A restored draft with its still-present "@" tags expanded as the session
+ * composer sends them: each token becomes its marker, and a tagged session adds the hint.
+ */
+export function expandTaggedDraft<T extends { text: string; quotes: { before: string }[] }>(
+  draft: T,
+  mentions: TaggedMentions | undefined,
+  harness: string | null,
+): T {
+  if (!mentions) return draft;
+  const live = presentMentions(composerInlineMentions(mentions.files, mentions.sessions, harness), [
+    draft.text,
+    ...draft.quotes.map((quote) => quote.before),
+  ]);
+  if (live.length === 0) return draft;
+  const expand = (text: string) => expandMentionTokens(text, live);
+  const tagsSessions = live.some((mention) => mention.marker.startsWith("[Session: "));
+  return {
+    ...draft,
+    text: withSessionMentionHint(expand(draft.text), tagsSessions),
+    quotes: draft.quotes.map((quote) => ({ ...quote, before: expand(quote.before) })),
+  };
+}
+
 /** A mention found in a sent message. */
 export type SentMention =
   | { kind: "session"; id: string; title: string; isSubagent: boolean }

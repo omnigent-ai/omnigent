@@ -346,6 +346,7 @@ import {
   isPermissionModeCycleKey,
   nextCycledPermissionMode,
   permissionChip,
+  type PermissionChipKind,
 } from "@/lib/permissionModeCycle";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
@@ -2852,15 +2853,13 @@ function ComposerImpl(
   const openComposerGithubTab = useOpenGithubTab();
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
+  let permissionKind: PermissionChipKind = "codex";
+  if (showClaudePermissionMode) permissionKind = modelPickerKind === "devin" ? "devin" : "claude";
   const {
     options: permissionOptions,
     label: permissionLabel,
     value: selectedPermissionMode,
-  } = permissionChip(
-    !showClaudePermissionMode ? "codex" : modelPickerKind === "devin" ? "devin" : "claude",
-    claudePermissionMode,
-    codexApprovalMode,
-  );
+  } = permissionChip(permissionKind, claudePermissionMode, codexApprovalMode);
   const permissionControlInteractive =
     (showClaudePermissionMode || showCodexApprovalMode) &&
     !isReadOnly &&

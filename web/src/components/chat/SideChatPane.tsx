@@ -91,6 +91,7 @@ import {
   serializeReplyDraft,
   snapshotReplyDraft,
 } from "@/lib/replyDraft";
+import { expandTaggedDraft } from "@/lib/composerMentions";
 import { interrupt } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
@@ -978,7 +979,12 @@ function SideChatComposer({
       return;
     }
     const outgoing = files.length > 0 ? files : undefined;
-    const message = serializeReplyDraft({ quotes, text: trimmed });
+    const outgoingDraft = expandTaggedDraft(
+      { quotes, text: trimmed },
+      composer?.mentions,
+      harness ?? null,
+    );
+    const message = serializeReplyDraft(outgoingDraft);
     const child = conversationRegistry.peek(childId)?.getState();
     if (
       queues &&
@@ -995,7 +1001,7 @@ function SideChatComposer({
     ) {
       clearComposer(childId);
       onSend();
-      enqueueMessage(message, outgoing, snapshotReplyDraft({ quotes, text: trimmed }), childId);
+      enqueueMessage(message, outgoing, snapshotReplyDraft(outgoingDraft), childId);
       return;
     }
     // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.

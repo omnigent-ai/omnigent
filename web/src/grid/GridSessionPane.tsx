@@ -37,10 +37,7 @@ import { terminalTabKey, useDeleteTerminal } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { isNativeWrapper, nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
-import { isClaudeNativeSession } from "@/lib/claudePermissionMode";
-import { isCodexNativeSession } from "@/lib/codexPlanMode";
-import { modelPickerKindForConv } from "@/lib/composerCapabilities";
-import { permissionChip } from "@/lib/permissionModeCycle";
+import { permissionChip, permissionChipKind } from "@/lib/permissionModeCycle";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { restoreReplyDraft, serializeReplyDraft, snapshotReplyDraft } from "@/lib/replyDraft";
 import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
@@ -435,20 +432,20 @@ export function GridSessionPane({
               {title}
             </button>
             <ViewModeToggle hotkeyEnabled={selected && !workspacePanel.maximized} alwaysVisible />
-            {selected && (
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-label={`${workspacePanel.open ? "Collapse" : "Expand"} grid workspace`}
-                onClick={onToggleWorkspace}
-              >
-                {workspacePanel.open ? (
-                  <PanelRightCloseIcon className="size-3.5" />
-                ) : (
-                  <PanelRightIcon className="size-3.5" />
-                )}
-              </Button>
-            )}
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label={`${workspacePanel.open ? "Collapse" : "Expand"} grid workspace`}
+              onClick={onToggleWorkspace}
+              // Hidden, not removed: activating a cell must not shift its titlebar mid-click.
+              style={selected ? undefined : { visibility: "hidden" }}
+            >
+              {workspacePanel.open ? (
+                <PanelRightCloseIcon className="size-3.5" />
+              ) : (
+                <PanelRightIcon className="size-3.5" />
+              )}
+            </Button>
             <Button asChild variant="ghost" size="icon-xs">
               <Link
                 draggable={false}
@@ -479,7 +476,8 @@ export function GridSessionPane({
                       ? {
                           leading: (
                             <>
-                              <HostBadge sessionId={sessionId} appearance="composer" />
+                              {/* Status only; switching hosts stays in the full-screen view. */}
+                              <HostBadge sessionId={sessionId} appearance="composer" readOnly />
                               <GridPermissionPicker
                                 session={session}
                                 permissionLevel={permissionLevel}
@@ -629,6 +627,7 @@ function useSharedSessionDraft(sessionId: string) {
       text,
       quotes,
       files: saved?.files ?? [],
+      mentions: saved?.mentions,
     }));
     let synced = useChatStore.getState().sideChatComposers[sessionId];
     return useChatStore.subscribe((state) => {
@@ -640,7 +639,7 @@ function useSharedSessionDraft(sessionId: string) {
         text: serializeReplyDraft(draft),
         files: composer?.files ?? [],
         replyDraft: snapshotReplyDraft(draft),
-        mentions: getSessionDraft(sessionId)?.mentions,
+        mentions: composer?.mentions,
       });
     });
   }, [sessionId]);
@@ -656,13 +655,7 @@ function GridPermissionPicker({
 }) {
   const state = useConversationEntryState(session.id);
   const [busy, setBusy] = useState(false);
-  const kind = isCodexNativeSession(session)
-    ? "codex"
-    : modelPickerKindForConv(session) === "devin"
-      ? "devin"
-      : isClaudeNativeSession(session)
-        ? "claude"
-        : null;
+  const kind = permissionChipKind(session);
   if (kind === null) return null;
   const chip = permissionChip(kind, state.claudePermissionMode, state.codexApprovalMode);
   const owner = isOwnerLevel(permissionLevel);

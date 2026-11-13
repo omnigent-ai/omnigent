@@ -39,6 +39,8 @@ import { parentIdFromLabels } from "@/lib/sessionHost";
 import { sideChatSettingsMutationKey, type SideChatModelSettings } from "@/lib/sideChat";
 import type { Session } from "@/lib/types";
 
+type SettingsUpdate = SideChatModelSettings & Pick<Session, "costControlModeOverride">;
+
 /** Model controls always address this pane's session, independent of the active main chat. */
 export function SideChatSettings({
   session,
@@ -88,7 +90,7 @@ export function SideChatSettings({
   const [error, setError] = useState<string | null>(null);
   const mutation = useMutation({
     mutationKey,
-    mutationFn: (updates: SideChatModelSettings) => updateSession(session.id, updates),
+    mutationFn: (updates: SettingsUpdate) => updateSession(session.id, updates),
     onSuccess: (updated) => {
       queryClient.setQueryData<Session>(["session", session.id], (previous) => ({
         ...previous,
@@ -97,7 +99,9 @@ export function SideChatSettings({
     },
     onError: (cause) => {
       const message =
-        cause instanceof Error ? cause.message : "Couldn't update side chat settings.";
+        cause instanceof Error
+          ? cause.message
+          : `Couldn't update ${fullSession ? "session" : "side chat"} settings.`;
       setError(message);
       toast.error(message);
     },
@@ -157,7 +161,7 @@ export function SideChatSettings({
     !isEditorLevel(session.permissionLevel) ||
     session.labels?.["omnigent.closed"] === "true";
 
-  function save(updates: SideChatModelSettings) {
+  function save(updates: SettingsUpdate) {
     if (disabled || queryClient.isMutating({ mutationKey }) > 0) return;
     if (draft) {
       draft.onChange(updates);
@@ -200,6 +204,10 @@ export function SideChatSettings({
                       modelOverride: nextModel,
                       ...(supportsEffort && nextEffort !== effort
                         ? { reasoningEffort: nextEffort }
+                        : {}),
+                      // A pinned model replaces Smart Routing, as in the main composer.
+                      ...(fullSession && session.costControlModeOverride === "on"
+                        ? { costControlModeOverride: "off" as const }
                         : {}),
                     });
                   },

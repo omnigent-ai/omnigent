@@ -587,6 +587,36 @@ it.each([false, true])(
   },
 );
 
+it("shows a grid session's native Codex model and pins it instead of Smart Routing", async () => {
+  const session = {
+    ...child,
+    harness: "codex-native",
+    costControlModeOverride: "on",
+    labels: { "omnigent.wrapper": "codex-native-ui" },
+  } as Session;
+  const tree = (fullSession: boolean) => (
+    <QueryClientProvider client={cache}>
+      <SideChatSettings session={session} fullSession={fullSession} />
+    </QueryClientProvider>
+  );
+  const view = render(tree(false));
+  // As a side chat, an unsupported native session keeps its settings hidden.
+  expect(
+    screen.queryByRole("button", { name: "Side chat model and effort" }),
+  ).not.toBeInTheDocument();
+  view.rerender(tree(true));
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Model and effort" }));
+  await user.click(screen.getByTestId("side-chat-model-edit"));
+  await user.click(screen.getByRole("menuitemcheckbox", { name: "Model B" }));
+  await waitFor(() =>
+    expect(sessionsApi.updateSession).toHaveBeenCalledWith(
+      "side",
+      expect.objectContaining({ modelOverride: "model-b", costControlModeOverride: "off" }),
+    ),
+  );
+});
+
 it("hides unsupported custom native effort", () => {
   render(
     <QueryClientProvider client={cache}>

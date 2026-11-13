@@ -132,6 +132,7 @@ import {
   setSessionDraft,
   type SessionDraft,
 } from "@/lib/sessionDrafts";
+import type { TaggedMentions } from "@/lib/composerMentions";
 import {
   forgetUnsentSend,
   peekQueuedSends,
@@ -1187,6 +1188,8 @@ export interface SideChatComposerDraft {
   quotes?: ReplyQuote[];
   text: string;
   files: File[];
+  /** "@" tags of a single-session draft shown in a grid cell; expanded on send. */
+  mentions?: TaggedMentions;
 }
 
 /** The empty composer, shared so an absent entry keeps a stable identity (a
