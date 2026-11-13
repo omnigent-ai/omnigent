@@ -18,6 +18,8 @@ _logger = logging.getLogger(__name__)
 
 FEATURES_ENV_VAR = "OMNIGENT_FEATURES"
 _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
+# Features made unconditional; leftover names or ``-name`` kill switches are ignored.
+_RETIRED_FEATURES = frozenset({"custom_agents_settings_ui"})
 
 
 class Feature(StrEnum):
@@ -37,7 +39,6 @@ class Feature(StrEnum):
     CANVAS = "canvas"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     IMPORT_REVIEW = "import_review"
-    CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
     CLAUDE_OSC_STATUS = "claude_osc_status"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
@@ -182,13 +183,6 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.18.0",
     ),
     FeatureDefinition(
-        feature=Feature.CUSTOM_AGENTS_SETTINGS_UI,
-        description="Manage reusable custom agents from Settings",
-        owner="web",
-        review_by_release="0.24.0",
-        default_enabled=True,
-    ),
-    FeatureDefinition(
         feature=Feature.SIDEBAR_GROUPING_UI,
         description="Sidebar grouping, ordering and row metadata options, Shared section",
         owner="web",
@@ -297,7 +291,8 @@ def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFl
 
     Comma-separated names enable features; ``-name`` disables them, for example
     ``usage_page,-claude_osc_status``. Unset or empty uses feature defaults.
-    Explicit disables win regardless of order. Unknown names fail startup.
+    Explicit disables win regardless of order. Retired names are ignored with
+    a warning; other unknown names fail startup.
 
     :param environ: Environment mapping; defaults to :data:`os.environ`.
     :returns: Resolved immutable feature values.
@@ -320,6 +315,9 @@ def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFl
     disabled: set[Feature] = set()
     unknown: list[str] = []
     for name in names:
+        if name.removeprefix("-") in _RETIRED_FEATURES:
+            _logger.warning("%s: %s has been retired; ignoring it", FEATURES_ENV_VAR, name)
+            continue
         try:
             if name.startswith("-"):
                 disabled.add(Feature(name[1:]))
