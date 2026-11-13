@@ -168,6 +168,8 @@ _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
 # The app-server is always local, so a dead process already closes the socket.
 # Keepalive only adds a failure mode: a host stall longer than the pong timeout
 # drops the connection, and the forwarder tears the app-server down with it.
+# Tradeoff: a live but deadlocked app-server now keeps the socket open
+# indefinitely instead of being detected by a missed pong.
 _APP_SERVER_PING_INTERVAL_SECONDS: float | None = None
 # hooks.json filename written into the private CODEX_HOME registering the
 # Omnigent policy hook. Codex discovers it as a ``user``-layer hook
@@ -1547,6 +1549,7 @@ class CodexAppServerClient:
         ws = self._ws
         assert ws is not None
         cancelled = False
+        failure: Exception | None = None
         try:
             async for raw in ws:
                 if not isinstance(raw, str):
@@ -1580,10 +1583,21 @@ class CodexAppServerClient:
         except asyncio.CancelledError:
             cancelled = True
             raise
+        except ConnectionClosed:
+            raise
+        except Exception as exc:
+            failure = exc
+            raise
         finally:
-            if not cancelled:
-                # Cancellation is our own close(); anything else ends the
-                # forwarder, so record why the socket went away.
+            # Cancellation is our own close(); anything else ends the forwarder,
+            # so record why the stream stopped.
+            if failure is not None:
+                _logger.warning(
+                    "Codex app-server reader failed with the socket still open",
+                    exc_info=(type(failure), failure, failure.__traceback__),
+                    extra=debug_event("codex_app_server_reader_failed"),
+                )
+            elif not cancelled:
                 _logger.warning(
                     "Codex app-server connection closed: code=%s reason=%r",
                     ws.close_code,

@@ -2965,17 +2965,6 @@ async def supervise_forwarder(
                 if isinstance(result, BaseException)
                 and not isinstance(result, asyncio.CancelledError)
             ]
-            # Skip on cancellation: the session is being torn down, not stranded.
-            if not isinstance(stream_error, asyncio.CancelledError):
-                try:
-                    await _fail_mcp_startup_on_forwarder_exit(
-                        ap_client, session_id=target.session_id, bridge_dir=bridge_dir
-                    )
-                except Exception:  # best effort; finish the remaining cleanup.
-                    _logger.warning(
-                        "Codex forwarder could not fail the pending MCP startup round",
-                        exc_info=True,
-                    )
             # Child lanes run first: their queued handlers use the shared tracker.
             for close in (
                 forwarder_state.close_child_streams,
@@ -2988,6 +2977,21 @@ async def supervise_forwarder(
                     await close()
                 except BaseException as exc:  # noqa: BLE001 - finish all closers, even on cancellation.
                     cleanup_errors.append(exc)
+            # After the closers, so a cancellation here cannot skip them; the HTTP
+            # client is still open. Skipped when the stream itself was cancelled:
+            # the session is being torn down, not stranded.
+            if not isinstance(stream_error, asyncio.CancelledError):
+                try:
+                    await _fail_mcp_startup_on_forwarder_exit(
+                        ap_client, session_id=target.session_id, bridge_dir=bridge_dir
+                    )
+                except asyncio.CancelledError as exc:
+                    cleanup_errors.append(exc)
+                except Exception:  # best effort, like the closers above.
+                    _logger.warning(
+                        "Codex forwarder could not fail the pending MCP startup round",
+                        exc_info=True,
+                    )
             for error in cleanup_errors[1 if stream_error is None else 0 :]:
                 _logger.warning(
                     "Codex forwarder cleanup failed",

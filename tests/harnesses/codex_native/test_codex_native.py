@@ -2595,6 +2595,120 @@ def test_supervise_forwarder_fails_pending_mcp_startup_when_stream_ends(
     ]
 
 
+class _BlockingEventsCodexAppServerClient(_FakeCodexAppServerClient):
+    """Fake app-server client whose event stream stays open until cancelled."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.streaming = asyncio.Event()
+
+    async def iter_events(self) -> Any:
+        """
+        Block like a live connection with no traffic.
+
+        :returns: Async iterator that never yields.
+        """
+        self.streaming.set()
+        await asyncio.Event().wait()
+        yield {}
+
+
+def _seed_pending_mcp_startup(bridge_dir: Path) -> None:
+    """Record a startup round with one server still starting."""
+    from omnigent.harnesses.codex_native.bridge import update_mcp_server_startup
+
+    update_mcp_server_startup(bridge_dir, "omnigent", "ready")
+    update_mcp_server_startup(bridge_dir, "jira", "starting")
+
+
+async def _supervise_test_forwarder(tmp_path: Path, client: _FakeCodexAppServerClient) -> None:
+    """Run the forwarder against *client* with a server that accepts every post."""
+    await codex_native_forwarder.supervise_forwarder(
+        base_url="http://127.0.0.1:1",
+        headers={},
+        session_id="conv_123",
+        bridge_dir=tmp_path,
+        app_server_url=str(tmp_path / "app-server.sock"),
+        thread_id="thread_123",
+        client=client,  # type: ignore[arg-type]
+        ap_transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+    )
+
+
+def test_supervise_forwarder_cleans_up_when_the_mcp_failure_post_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failing MCP-startup post is logged; the forwarder still closes and returns."""
+    _seed_pending_mcp_startup(tmp_path)
+
+    async def failing_post(*_args: Any, **_kwargs: Any) -> None:
+        """Stand in for the HTTP post so the test controls when it fails."""
+        raise RuntimeError("server unreachable")
+
+    monkeypatch.setattr(codex_native_forwarder, "_post_mcp_startup", failing_post)
+    client = _FakeCodexAppServerClient()
+
+    asyncio.run(_supervise_test_forwarder(tmp_path, client))
+
+    assert client.closed
+
+
+def test_supervise_forwarder_cancelled_during_mcp_failure_post_still_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Teardown that lands mid-post propagates only after every closer ran."""
+    _seed_pending_mcp_startup(tmp_path)
+    client = _FakeCodexAppServerClient()
+    closed_before_post: list[bool] = []
+
+    async def run() -> None:
+        """Cancel the forwarder while its MCP-startup post is in flight."""
+        posting = asyncio.Event()
+
+        async def hanging_post(*_args: Any, **_kwargs: Any) -> None:
+            """Stand in for a slow HTTP post so the test can cancel during it."""
+            closed_before_post.append(client.closed)
+            posting.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(codex_native_forwarder, "_post_mcp_startup", hanging_post)
+        task = asyncio.create_task(_supervise_test_forwarder(tmp_path, client))
+        await posting.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+    assert closed_before_post == [True]
+    assert client.closed
+
+
+def test_supervise_forwarder_cancelled_stream_leaves_mcp_startup_pending(
+    tmp_path: Path,
+) -> None:
+    """Session teardown is not a stranded startup: the round is left as it was."""
+    from omnigent.harnesses.codex_native.bridge import read_mcp_startup
+
+    _seed_pending_mcp_startup(tmp_path)
+    client = _BlockingEventsCodexAppServerClient()
+
+    async def run() -> None:
+        """Cancel the forwarder while it waits for app-server events."""
+        task = asyncio.create_task(_supervise_test_forwarder(tmp_path, client))
+        await client.streaming.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+    assert read_mcp_startup(tmp_path)["jira"] == {"status": "starting", "error": None}
+    assert client.closed
+
+
 @pytest.mark.parametrize(
     ("message", "expected"),
     [

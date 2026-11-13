@@ -32,6 +32,8 @@ async def _serve_probe_scenario(websocket: ServerConnection) -> None:
         elif method == "probe/disconnect_with_reason":
             await websocket.close(code=1011, reason="probe stalled")
             return
+        elif method == "probe/malformed":
+            await websocket.send("not json")
 
 
 async def test_concurrent_event_consumers_all_settle_on_disconnect() -> None:
@@ -103,13 +105,16 @@ async def test_reconnected_client_streams_live_events() -> None:
                 await client.close()
 
 
+def _records_named(caplog: pytest.LogCaptureFixture, event_name: str) -> list[logging.LogRecord]:
+    """Return the captured log records carrying *event_name*."""
+    return [
+        record for record in caplog.records if getattr(record, "event_name", None) == event_name
+    ]
+
+
 def _connection_closed_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     """Return the captured app-server connection-closed log records."""
-    return [
-        record
-        for record in caplog.records
-        if getattr(record, "event_name", None) == "codex_app_server_connection_closed"
-    ]
+    return _records_named(caplog, "codex_app_server_connection_closed")
 
 
 async def test_server_side_close_logs_code_and_reason(caplog: pytest.LogCaptureFixture) -> None:
@@ -149,3 +154,26 @@ async def test_app_server_connection_disables_keepalive() -> None:
             assert client._ws.ping_interval is None
         finally:
             await client.close()
+
+
+async def test_reader_failure_is_not_logged_as_a_socket_close(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A malformed message ends the stream with its real cause, not "closed code=None"."""
+    caplog.set_level(logging.WARNING, logger="omnigent.harnesses.codex_native.app_server")
+    async with serve(_serve_probe_scenario, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        client = CodexAppServerClient(ws_url=f"ws://127.0.0.1:{port}")
+        await client.connect()
+        stream = client.iter_events()
+        try:
+            await client.notify("probe/malformed")
+            with contextlib.suppress(StopAsyncIteration):
+                await asyncio.wait_for(anext(stream), timeout=_SETTLE_DEADLINE)
+            failed = _records_named(caplog, "codex_app_server_reader_failed")
+            assert [type(r.exc_info[1]) for r in failed if r.exc_info] == [json.JSONDecodeError]
+            assert _connection_closed_records(caplog) == []
+        finally:
+            await stream.aclose()
+            with contextlib.suppress(Exception):
+                await client.close()
