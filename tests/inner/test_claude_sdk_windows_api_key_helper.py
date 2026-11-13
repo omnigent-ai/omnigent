@@ -299,12 +299,14 @@ def test_windows_helper_uses_interpreter_path_with_spaces(tmp_path: Path) -> Non
 
 
 @pytest.mark.skipif(os.name != "nt", reason="cmd.exe execution test (Windows only)")
-def test_original_printf_helper_is_not_cmd_exe_safe() -> None:
-    """Documents the pre-fix hazard: cmd.exe cannot reproduce the key from printf."""
+def test_original_printf_helper_requires_external_printf(tmp_path: Path) -> None:
+    """A stock cmd.exe environment has no printf built-in."""
     token = "dummy'quoted token"
     comspec = os.environ.get("COMSPEC", "cmd.exe")
     result = subprocess.run(
         f'"{comspec}" /d /s /c "{_static_cmd(token)}"',
+        env={**os.environ, "PATH": ""},
+        cwd=tmp_path,
         capture_output=True,
         timeout=30,
         check=False,
