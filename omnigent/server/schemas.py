@@ -3542,10 +3542,14 @@ class AgentCost(BaseModel):
     :param cost_usd: Priced USD cost of this agent including its sub-agents
         (the same total its own session reports), or ``None`` when nothing
         in that subtree is priced.
+    :param estimated_cost_usd: When ``cost_usd`` is ``None``, an ancestor
+        harness's transcript estimate for this agent, which that ancestor's
+        total already includes; otherwise ``None``.
     """
 
     id: str
     cost_usd: float | None = None
+    estimated_cost_usd: float | None = None
 
 
 class AgentCostList(BaseModel):

@@ -228,6 +228,19 @@
             "description": "Priced USD cost of this agent including its sub-agents (the same total its own session reports), or `None` when nothing in that subtree is priced.",
             "title": "Cost Usd"
           },
+          "estimated_cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When `cost_usd` is `None`, an ancestor harness's transcript estimate for this agent, which that ancestor's total already includes; otherwise `None`.",
+            "title": "Estimated Cost Usd"
+          },
           "id": {
             "description": "Session id, e.g. `\"conv_child123\"`.",
             "title": "Id",
