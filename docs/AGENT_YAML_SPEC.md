@@ -648,6 +648,11 @@ sandbox type selects the platform default, which these adapters also reject.
 Choose a sandbox-capable harness for confinement. Use an explicit
 `sandbox.type: none` only when unrestricted execution is intended.
 
+The framework-created `web_fetch` researcher inherits its parent's harness and
+requests the platform-default sandbox when the parent has no `os_env`.
+On Copilot, Cursor, and Antigravity, that researcher therefore refuses to start.
+Use a sandbox-capable harness for this confined research path.
+
 ACP, Claude SDK, Codex, Goose, Kimi, Pi, and Qwen worker containment supports
 `os_env.type: caller_process` and rejects `fork`, `start_in_scratch`, and
 `sandbox.git_ssh`. Worker `egress_rules` are supported only by Codex, and worker
