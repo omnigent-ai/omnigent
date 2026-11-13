@@ -5019,7 +5019,9 @@ def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> Non
     assert disallowed == ["Bash", "Edit"]
 
 
-async def _finalize_test_claude_args(args, *, bridge_dir, os_env_spec, active_harnesses=None):
+async def _finalize_test_claude_args(
+    args, *, bridge_dir, os_env_spec, active_harnesses=None, generation=None
+):
     from omnigent.inner.datamodel import TerminalEnvSpec
     from omnigent.inner.terminal import create_terminal_instance
 
@@ -5030,8 +5032,12 @@ async def _finalize_test_claude_args(args, *, bridge_dir, os_env_spec, active_ha
         await claude_native_bridge.finalize_claude_caller_settings(
             created.instance,
             bridge_dir=bridge_dir,
-            generation=claude_native_bridge.record_claude_settings_boundary(
-                bridge_dir, args, claude_args_start=0
+            generation=(
+                generation
+                if generation is not None
+                else claude_native_bridge.record_claude_settings_boundary(
+                    bridge_dir, args, claude_args_start=0
+                )
             ),
             active_harnesses=active_harnesses,
         )
@@ -5041,9 +5047,8 @@ async def _finalize_test_claude_args(args, *, bridge_dir, os_env_spec, active_ha
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("retention", [42, 42.0, 0, -1, "x", False, None, 1.5])
 async def test_augment_claude_args_merges_caller_settings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retention: object
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
     A caller ``--settings`` is merged into the invocation settings, not dropped.
@@ -5086,7 +5091,7 @@ async def test_augment_claude_args_merges_caller_settings(
         "permissions": {"allow": ["Read(first.txt)", "Read(second.txt)"]},
         "deniedMcpServers": [{"serverName": "later-denial"}],
         "enabledPlugins": {"other@market": False},
-        "cleanupPeriodDays": retention,
+        "cleanupPeriodDays": 42,
         "customOptions": {"nested": {"later": True}},
     }
     args = augment_claude_args(
@@ -5103,27 +5108,6 @@ async def test_augment_claude_args_merges_caller_settings(
         ap_server_url="https://example.test",
     )
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-
-    if retention != 42:
-        baseline_path = Path(args[max(i for i, arg in enumerate(args) if arg == "--settings") + 1])
-        baseline_bytes = baseline_path.read_bytes()
-        original_args = list(args)
-        with pytest.raises(
-            ValueError, match="cleanupPeriodDays must be a positive integer"
-        ) as error:
-            await _finalize_test_claude_args(
-                args,
-                bridge_dir=bridge_dir,
-                os_env_spec=OSEnvSpec(
-                    type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
-                ),
-            )
-        assert str(retention) not in str(error.value)
-        assert args == original_args
-        assert baseline_path.read_bytes() == baseline_bytes
-        assert json.loads(baseline_bytes)["hooks"]["UserPromptSubmit"]
-        assert not list(bridge_dir.glob("claude-settings-*-*.json"))
-        return
 
     args = await _finalize_test_claude_args(
         args,
@@ -5159,6 +5143,144 @@ async def test_augment_claude_args_merges_caller_settings(
     assert settings["statusLine"]["padding"] == 3
     for event, entries in baseline["hooks"].items():
         assert all(entry in settings["hooks"][event] for entry in entries)
+
+
+@pytest.mark.parametrize("retention", [42, 42.0, 0, -1, "x", False, None, 1.5])
+def test_merge_caller_settings_validates_retention(tmp_path: Path, retention: object) -> None:
+    if retention == 42:
+        settings = claude_native_bridge._merge_caller_settings(
+            {}, [{"cleanupPeriodDays": retention}], tmp_path
+        )
+        assert settings["cleanupPeriodDays"] == retention
+    else:
+        with pytest.raises(
+            ValueError, match="cleanupPeriodDays must be a positive integer"
+        ) as error:
+            claude_native_bridge._merge_caller_settings(
+                {}, [{"cleanupPeriodDays": retention}], tmp_path
+            )
+        assert str(retention) not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_caller_settings_validation_preserves_baseline_and_arguments(tmp_path: Path) -> None:
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    args = augment_claude_args(
+        ('--settings={"cleanupPeriodDays":0}',),
+        bridge_dir=tmp_path,
+        defer_caller_settings=True,
+    )
+    baseline_path = Path(args[max(i for i, arg in enumerate(args) if arg == "--settings") + 1])
+    baseline_bytes = baseline_path.read_bytes()
+    original_args = list(args)
+    with pytest.raises(ValueError, match="cleanupPeriodDays must be a positive integer"):
+        await _finalize_test_claude_args(
+            args,
+            bridge_dir=tmp_path,
+            os_env_spec=OSEnvSpec(
+                type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+            ),
+        )
+    assert args == original_args
+    assert baseline_path.read_bytes() == baseline_bytes
+    assert json.loads(baseline_bytes)["hooks"]["UserPromptSubmit"]
+    assert not list(tmp_path.glob("claude-settings-*-*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    ["no-caller", "delimiter", "unreadable", "mismatch", "invalid-generation", "missing-boundary"],
+)
+async def test_caller_settings_finalize_parsing_and_generation(tmp_path: Path, mode: str) -> None:
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    caller_file = tmp_path / "caller.json"
+    caller_file.write_text("{" if mode == "unreadable" else '{"env":{"FROM_FILE":"yes"}}')
+    caller_args = ("--settings", str(caller_file), '--settings={"env":{"ORDER":"inline"}}')
+    if mode == "no-caller":
+        caller_args = ()
+    elif mode == "delimiter":
+        caller_args = ("--", *caller_args)
+    args = augment_claude_args(caller_args, bridge_dir=tmp_path, defer_caller_settings=True)
+    generation = claude_native_bridge.record_claude_settings_boundary(
+        tmp_path, args, claude_args_start=0
+    )
+    baseline_path = tmp_path / f"claude-settings-{generation}.json"
+    baseline_bytes = baseline_path.read_bytes()
+    if mode == "mismatch":
+        args.append("changed-after-preparation")
+    elif mode == "invalid-generation":
+        generation = "../previous-launch"
+    elif mode == "missing-boundary":
+        baseline_path.with_suffix(".boundary.json").unlink()
+    original_args = list(args)
+    environment = OSEnvSpec(
+        type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+    )
+    if mode in {"mismatch", "invalid-generation", "missing-boundary"}:
+        error = FileNotFoundError if mode == "missing-boundary" else ValueError
+        with pytest.raises(error):
+            await _finalize_test_claude_args(
+                args, bridge_dir=tmp_path, os_env_spec=environment, generation=generation
+            )
+        assert args == original_args
+        assert not list(tmp_path.glob("claude-settings-*-*.json"))
+    else:
+        finalized = await _finalize_test_claude_args(
+            args, bridge_dir=tmp_path, os_env_spec=environment, generation=generation
+        )
+        if mode == "unreadable":
+            assert str(caller_file) in finalized
+            settings = _load_invocation_settings(finalized)
+            assert "FROM_FILE" not in settings.get("env", {})
+            assert settings["env"]["ORDER"] == "inline"
+            assert settings["hooks"] == json.loads(baseline_bytes)["hooks"]
+        else:
+            assert finalized == original_args
+            assert not list(tmp_path.glob("claude-settings-*-*.json"))
+    assert baseline_path.read_bytes() == baseline_bytes
+
+
+@pytest.mark.asyncio
+async def test_overlapping_caller_settings_finalizers_keep_immutable_baseline(
+    tmp_path: Path,
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    caller_hooks = [{"hooks": [{"type": "command", "command": "printf synthetic"}]}] * 2
+    args = augment_claude_args(
+        ("--settings", json.dumps({"hooks": {"UserPromptSubmit": caller_hooks}})),
+        bridge_dir=tmp_path,
+        defer_caller_settings=True,
+    )
+    generation = claude_native_bridge.record_claude_settings_boundary(
+        tmp_path, args, claude_args_start=0
+    )
+    original_args = list(args)
+    baseline_path = tmp_path / f"claude-settings-{generation}.json"
+    baseline_bytes = baseline_path.read_bytes()
+    environment = OSEnvSpec(
+        type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+    )
+    finalized = await asyncio.gather(
+        *(
+            _finalize_test_claude_args(
+                list(args), bridge_dir=tmp_path, os_env_spec=environment, generation=generation
+            )
+            for _ in range(2)
+        )
+    )
+    outputs = [Path(values[values.index("--settings") + 1]) for values in finalized]
+    assert len(set(outputs)) == 2
+    assert args == original_args
+    assert baseline_path.read_bytes() == baseline_bytes
+    for path in outputs:
+        settings = json.loads(path.read_text())
+        assert settings["hooks"]["UserPromptSubmit"] == (
+            caller_hooks + json.loads(baseline_bytes)["hooks"]["UserPromptSubmit"]
+        )
 
 
 @pytest.mark.asyncio
@@ -5216,6 +5338,7 @@ def test_augment_claude_args_preserves_settings_like_option_values(tmp_path: Pat
         "--agent-name",
         "--append-subagent-system-prompt",
         "--plan-mode-instructions",
+        "--prefill",
     ],
 )
 def test_pop_caller_settings_preserves_option_values(flag: str, tmp_path: Path) -> None:

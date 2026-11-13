@@ -1910,15 +1910,9 @@ async def test_failed_launch_rolls_back_only_new_relay(
     "mode",
     [
         "plain",
-        "no-caller",
         "disable-hooks",
         "wrapped",
-        "delimiter",
-        "mismatch",
-        "unreadable",
         "legacy",
-        "invalid-generation",
-        "missing-boundary",
         "declared-replacement",
         "declared-identical",
         "declared-identical-invalid",
@@ -1945,8 +1939,6 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
             {"env": {"ORDER": "file", "FROM_FILE": "yes"}, "disableAllHooks": disable_hooks}
         )
     )
-    if mode == "unreadable":
-        settings_file.write_text("{")
     monkeypatch.chdir(tmp_path)
     if mode in {"wrapped", "legacy"}:
         monkeypatch.setattr(
@@ -1954,10 +1946,6 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
             lambda command, args: ("claude-wrapper", ["claude", "--", *args]),
         )
     caller_args = ("--settings", str(settings_file), '--settings={"env":{"ORDER":"inline"}}')
-    if mode == "no-caller":
-        caller_args = ()
-    if mode == "delimiter":
-        caller_args = ("--", *caller_args)
     body = _claude_terminal_request(
         caller_args,
         command="claude",
@@ -1976,14 +1964,10 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
     boundary = baseline_path.with_suffix(".boundary.json").read_text()
     assert str(settings_file) not in boundary
     assert "ORDER" not in boundary
-    if mode == "mismatch":
-        body["spec"]["args"].append("changed-after-preparation")
-    if mode in {"invalid-generation", "declared-identical-invalid"}:
+    if mode == "declared-identical-invalid":
         body["claude_settings_generation"] = "../previous-launch"
-    if mode == "missing-boundary":
-        baseline_path.with_suffix(".boundary.json").unlink()
     # The CLI has not consumed files before the runner selects its policy.
-    assert (str(settings_file) in body["spec"]["args"]) == (mode != "no-caller")
+    assert str(settings_file) in body["spec"]["args"]
     baseline = json.loads(baseline_path.read_text())
     assert "FROM_FILE" not in baseline.get("env", {})
     if mode == "legacy":
@@ -2034,9 +2018,6 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
             )
             if mode in {
                 "disable-hooks",
-                "mismatch",
-                "invalid-generation",
-                "missing-boundary",
                 "declared-identical-invalid",
             }:
                 assert response.status_code == 500, response.text
@@ -2055,16 +2036,12 @@ async def test_cli_caller_settings_finalize_under_terminal_policy(
                 settings_index = max(i for i, arg in enumerate(final_args) if arg == "--settings")
                 settings = json.loads(Path(final_args[settings_index + 1]).read_text())
                 assert json.loads(baseline_path.read_text()) == baseline
-                if mode in {"delimiter", "legacy", "no-caller"}:
+                if mode == "legacy":
                     assert finalized[0] == body["spec"]["args"]
                     assert settings == baseline
                 else:
-                    if mode == "unreadable":
-                        assert str(settings_file) in finalized[0]
-                        assert "FROM_FILE" not in settings["env"]
-                    else:
-                        assert str(settings_file) not in finalized[0]
-                        assert settings["env"]["FROM_FILE"] == "yes"
+                    assert str(settings_file) not in finalized[0]
+                    assert settings["env"]["FROM_FILE"] == "yes"
                     assert settings["env"]["ORDER"] == "inline"
                     assert settings["hooks"] == baseline["hooks"]
                 if mode == "wrapped":

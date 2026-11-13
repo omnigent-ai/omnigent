@@ -149,18 +149,6 @@ def env_wrapper_chdir(
     return parsed.chdir if parsed is not None else None
 
 
-def env_wrapper_args_start(
-    command: str, args: list[str], environ: Mapping[str, str] | None = None
-) -> int | None:
-    """Locate wrapped arguments when they remain an unchanged suffix of the original argv."""
-    parsed = env_wrapper_launch(command, args, environ)
-    if parsed is None:
-        return None
-    wrapped_args = parsed.args
-    start = len(args) - len(wrapped_args)
-    return start if start >= 0 and args[start:] == wrapped_args else None
-
-
 def env_wrapper_launch(
     command: str, args: list[str], environ: Mapping[str, str] | None = None
 ) -> EnvWrapperLaunch | None:

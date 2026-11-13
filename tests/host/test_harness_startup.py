@@ -237,23 +237,6 @@ def test_env_wrapper_chdir_matches_real_env(tmp_path, args):
 
 
 @pytest.mark.parametrize(
-    ("args", "expected"),
-    [
-        (["-C", "sub", "--", "claude", "--settings", "caller.json"], 4),
-        (["--", "claude", "--", "--settings", "literal"], 2),
-        (["-S", "-C sub claude", "--settings", "caller.json"], 2),
-        (["-S", "claude --name embedded", "--settings", "caller.json"], None),
-        (["-C", "sub", "claude"], 3),
-        (["-u", "EXAMPLE_UNUSED", "env", "-C", "sub", "claude", "--settings", "caller.json"], 6),
-        (["env", "-v", "claude", "--settings", "caller.json"], None),
-        ([*(["env"] * 33), "claude"], None),
-    ],
-)
-def test_env_wrapper_argument_boundary_preserves_original_suffix(args, expected):
-    assert startup.env_wrapper_args_start("env", args) == expected
-
-
-@pytest.mark.parametrize(
     "args",
     [
         ["-S", "tool --api-key SECRET"],

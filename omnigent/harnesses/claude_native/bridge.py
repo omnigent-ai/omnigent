@@ -3437,6 +3437,7 @@ _CLAUDE_REQUIRED_VALUE_FLAGS = frozenset(
         "--plan-mode-instructions",
         "--plugin-dir",
         "--plugin-url",
+        "--prefill",
         "--remote-control-session-name-prefix",
         "--session-id",
         "--setting-sources",

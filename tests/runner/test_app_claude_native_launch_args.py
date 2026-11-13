@@ -1391,6 +1391,29 @@ async def _auto_create_claude_terminal_for_test(
 
 
 @pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["-C", "sub", "--", "claude", "--settings", "caller.json"], 4),
+        (["--", "claude", "--", "--settings", "literal"], 2),
+        (["-S", "-C sub claude", "--settings", "caller.json"], 2),
+        (["-S", "claude --name embedded", "--settings", "caller.json"], None),
+        (["-C", "sub", "claude"], 3),
+        (["-u", "EXAMPLE_UNUSED", "env", "-C", "sub", "claude", "--settings", "caller.json"], 6),
+        (["env", "-v", "claude", "--settings", "caller.json"], None),
+        ([*(["env"] * 33), "claude"], None),
+    ],
+)
+def test_claude_terminal_env_boundary_preserves_original_suffix(args, expected):
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.runner.native.orchestration import _claude_terminal_args_start
+
+    spec = TerminalEnvSpec(command="env", args=args, inherit_env=False)
+    assert _claude_terminal_args_start(spec, len(args)) == (
+        expected if expected is not None else len(args)
+    )
+
+
+@pytest.mark.parametrize(
     "command,prefix",
     [
         ("claude-wrapper", ["--"]),
