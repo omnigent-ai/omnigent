@@ -49,6 +49,8 @@ const tracked = file("edited.py", "modified", 2, 1);
 const deleted = file("gone.py", "deleted", 0, 3);
 const untracked = file("new.py", "created", null, null);
 const countedUntracked = { ...untracked, untracked_lines: 5 };
+// A tracked zero must win over any untracked count.
+const trackedZero = { ...file("mode.sh", "modified", 0, 0), untracked_lines: 9 };
 
 function rowText(label: string): string | null {
   return screen.queryByText(label)?.parentElement?.textContent ?? null;
@@ -60,8 +62,8 @@ describe("SessionOverviewChanges", () => {
     [
       "adds counted untracked lines",
       GIT,
-      [tracked, countedUntracked],
-      "Files changed2",
+      [tracked, countedUntracked, trackedZero],
+      "Files changed3",
       "Lines+7 −1",
     ],
     ["hides unknown lines", GIT, [untracked], "Files changed1", null],
