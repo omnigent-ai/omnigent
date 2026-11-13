@@ -7191,6 +7191,10 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         "unconfirmed",
         "enter timed out",
         "enter failed",
+        "paste failed",
+        "paste timed out",
+        "clear failed",
+        "capture cancelled",
         "guard unavailable",
         "settings unreadable",
         "pending settings unreadable",
@@ -7205,7 +7209,7 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
 ) -> None:
     """
     A typed ``/model`` save is put back, even one that lands after submit
-    verification gave up; a switch whose Enter failed leaves nothing pending.
+    verification gave up; a possibly pasted draft stays protected for a later Enter.
 
     The fake pane writes the save the way Claude Code does in an interactive
     session, so the settle afterwards sees exactly what a real pane leaves.
@@ -7244,6 +7248,17 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
 
     monkeypatch.setattr(Path, "read_text", read_record_with_failure)
     entered: list[bool] = []
+    typed: list[str] = []
+    cleared: list[bool] = []
+    real_clear = claude_native_bridge._clear_composer
+
+    def clear_composer(*args: object, **kwargs: object) -> None:
+        cleared.append(True)
+        if outcome == "clear failed":
+            raise RuntimeError("composer unavailable")
+        real_clear(*args, **kwargs)
+
+    monkeypatch.setattr(claude_native_bridge, "_clear_composer", clear_composer)
     if outcome == "guard unavailable":
         state_dir.write_text("not a directory", encoding="utf-8")
 
@@ -7256,8 +7271,16 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
         del kwargs
         result = _FakeCompleted()
         if "capture-pane" in cmd:
+            if typed and outcome == "capture cancelled":
+                raise RuntimeError("injection cancelled during capture")
             # A stalled pane keeps showing the typed command after Enter.
             result.stdout = _composer_pane("/model sonnet" if outcome == "unconfirmed" else "")
+        elif "-l" in cmd and cmd[-1] == "/model sonnet":
+            typed.append(cmd[-1])
+            if outcome == "paste failed":
+                result.returncode = 1
+            if outcome == "paste timed out":
+                raise subprocess.TimeoutExpired(cmd, 1)
         elif cmd[-1] == "Enter":
             entered.append(True)
             if outcome == "enter timed out":
@@ -7276,8 +7299,15 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     else:
         with pytest.raises(RuntimeError):
             claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
-    if outcome in ("unconfirmed", "enter timed out"):
-        # The Enter may have reached the pane; its save can land afterwards.
+    if outcome in (
+        "unconfirmed",
+        "enter timed out",
+        "enter failed",
+        "paste failed",
+        "paste timed out",
+        "capture cancelled",
+    ):
+        # A queued Enter or later user Enter may submit a possibly pasted draft.
         settings_path.write_text('{"model": "sonnet"}', encoding="utf-8")
     if outcome in (
         "guard unavailable",
@@ -7285,6 +7315,8 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
         "pending settings unreadable",
     ) or outcome.startswith("record "):
         assert entered == []
+        assert typed == []
+        assert cleared == []
         assert settings_path.read_text(encoding="utf-8") == initial_settings
         if record_path is not None:
             assert record_path.read_bytes() == record_before

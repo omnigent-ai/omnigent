@@ -5722,8 +5722,6 @@ def inject_slash_command(
         if a ``tmux send-keys`` invocation fails, if the typed
         command verifiably never left the input box (submit swallowed).
     """
-    import subprocess
-
     if not command or not command.startswith("/"):
         raise ValueError(f"slash command must start with '/'; got {command!r}")
     if "\n" in command:
@@ -5751,40 +5749,40 @@ def inject_slash_command(
             "Answer the pending Claude question or permission request before changing settings.",
             nothing_typed=True,
         )
-    # Clear any draft the user is mid-typing; otherwise the command below
-    # concatenates with their text and Enter submits
-    # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
-    _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
-    # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
-    # Same delivery hazards as inject_user_message: a coalesced or dropped
-    # Enter leaves the command drafted while the persisted session value
-    # claims it applied. Wait for the command to render, submit, verify it
-    # left the box; an unidentifiable draft falls through to a blind submit.
-    needle = _submit_needle(command)
-    draft_seen = False
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-    while time.monotonic() < deadline:
-        pane = _capture_pane(socket_path, tmux_target)
-        _raise_if_user_prompt_pending(bridge_dir, pane)
-        if _draft_in_input_box(pane, needle):
-            draft_seen = True
-            break
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    time.sleep(_PASTE_SETTLE_S)
-    if has_pending_user_prompt(bridge_dir):
-        raise ClaudeUserPromptPending(
-            "Claude is waiting for an explicit answer; settings command not sent."
-        )
-    # Claude saves an interactive ``/model`` as the user's default; the guard
-    # undoes that save so the switch stays in this session.
     switch = _begin_model_switch(bridge_dir, command)
+    paste_attempted = False
     try:
+        # Clear any draft the user is mid-typing; otherwise the command below
+        # concatenates with their text and Enter submits
+        # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
+        # not interrupt an in-flight generation.
+        _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+        # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
+        paste_attempted = True
+        _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
+        # Same delivery hazards as inject_user_message: a coalesced or dropped
+        # Enter leaves the command drafted while the persisted session value
+        # claims it applied. Wait for the command to render, submit, verify it
+        # left the box; an unidentifiable draft falls through to a blind submit.
+        needle = _submit_needle(command)
+        draft_seen = False
+        deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+        while time.monotonic() < deadline:
+            pane = _capture_pane(socket_path, tmux_target)
+            _raise_if_user_prompt_pending(bridge_dir, pane)
+            if _draft_in_input_box(pane, needle):
+                draft_seen = True
+                break
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        time.sleep(_PASTE_SETTLE_S)
+        if has_pending_user_prompt(bridge_dir):
+            raise ClaudeUserPromptPending(
+                "Claude is waiting for an explicit answer; settings command not sent."
+            )
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    except BaseException as exc:
-        # A timed-out send may still have delivered the Enter, so it stays pending.
-        if switch is not None and not isinstance(exc.__cause__, subprocess.TimeoutExpired):
+    except BaseException:
+        # A pasted draft can still be submitted later, even if this injection failed.
+        if switch is not None and not paste_attempted:
             switch.cancel()
         raise
     if draft_seen:

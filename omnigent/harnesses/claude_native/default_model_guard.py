@@ -54,6 +54,7 @@ _MISSING = object()
 _UNREADABLE = object()
 
 _watchers: dict[tuple[Path, Path], threading.Thread] = {}
+_watcher_registrations: dict[tuple[Path, Path], object] = {}
 _watchers_lock = threading.Lock()
 
 
@@ -195,6 +196,7 @@ def _ensure_watcher(settings_path: Path, state_dir: Path) -> None:
     """Start this process's watcher for *settings_path* unless one is running."""
     key = (settings_path, state_dir)
     with _watchers_lock:
+        _watcher_registrations[key] = object()
         running = _watchers.get(key)
         if running is not None and running.is_alive():
             return
@@ -211,18 +213,28 @@ def _ensure_watcher(settings_path: Path, state_dir: Path) -> None:
 def _watch(settings_path: Path, state_dir: Path) -> None:
     """Settle *settings_path* until no switch is pending."""
     failures = 0
+    key = (settings_path, state_dir)
     while True:
+        with _watchers_lock:
+            registration = _watcher_registrations.get(key)
         try:
             if not settle_default_model(settings_path, state_dir=state_dir):
-                # Re-check under the lock _ensure_watcher takes, so a switch
-                # registered while this thread winds down is still watched.
+                # Registration during the settle pass keeps this watcher alive.
                 with _watchers_lock:
-                    if not settle_default_model(settings_path, state_dir=state_dir):
-                        _watchers.pop((settings_path, state_dir), None)
+                    if _watcher_registrations.get(key) is registration:
+                        _watchers.pop(key, None)
+                        _watcher_registrations.pop(key, None)
                         return
             failures = 0
         except (OSError, ValueError, FileLockTimeout):
             failures += 1
+            if failures > _WATCH_MAX_FAILURES:
+                with _watchers_lock:
+                    if _watcher_registrations.get(key) is not registration:
+                        failures = 0
+                        continue
+                    _watchers.pop(key, None)
+                    _watcher_registrations.pop(key, None)
             if failures == 1 or failures > _WATCH_MAX_FAILURES:
                 _logger.warning(
                     "claude-native: could not settle the default model in %s (%s)",
@@ -231,8 +243,6 @@ def _watch(settings_path: Path, state_dir: Path) -> None:
                     exc_info=True,
                 )
             if failures > _WATCH_MAX_FAILURES:
-                with _watchers_lock:
-                    _watchers.pop((settings_path, state_dir), None)
                 return
             time.sleep(min(_WATCH_POLL_S * 2**failures, _WATCH_MAX_BACKOFF_S))
             continue

@@ -296,22 +296,37 @@ def test_an_expired_switch_leaves_a_later_save_alone(
 
 
 @pytest.mark.parametrize("failure", [OSError, ValueError])
+@pytest.mark.parametrize("at_give_up", [False, True])
 def test_the_watcher_restores_the_default_on_its_own(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _isolate_claude_default_model_guard: Callable[[Path, Path], None],
     failure: type[Exception],
+    at_give_up: bool,
 ) -> None:
     settings, state = tmp_path / "settings.json", tmp_path / "state"
     _write(settings, {"model": "opus"})
     real_settle = default_model_guard.settle_default_model
     calls: list[Path] = []
+    registered_during_settle = False
+    if at_give_up:
+        monkeypatch.setattr(default_model_guard, "_WATCH_MAX_FAILURES", 0)
 
     def settle_failing_once(path: Path, *, state_dir: Path) -> bool:
+        nonlocal registered_during_settle
+        assert default_model_guard._watchers_lock.acquire(blocking=False)
+        default_model_guard._watchers_lock.release()
         calls.append(path)
         if len(calls) == 1:
+            if at_give_up:
+                default_model_guard._ensure_watcher(path, state_dir)
             raise failure("record briefly unreadable")
-        return real_settle(path, state_dir=state_dir)
+        pending = real_settle(path, state_dir=state_dir)
+        if not pending and not registered_during_settle:
+            registered_during_settle = True
+            default_model_guard.begin_model_switch(path, "haiku", state_dir=state_dir)
+            _write(path, {"model": "haiku"})
+        return pending
 
     monkeypatch.setattr(default_model_guard, "settle_default_model", settle_failing_once)
     monkeypatch.setattr(
@@ -330,6 +345,10 @@ def test_the_watcher_restores_the_default_on_its_own(
     if watcher is not None:
         watcher.join(timeout=5)
         assert not watcher.is_alive()
+
+    assert registered_during_settle
+    assert _read(settings) == {"model": "opus"}
+    assert not list(state.glob("*.json"))
 
 
 @pytest.mark.parametrize(
