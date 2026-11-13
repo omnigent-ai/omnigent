@@ -3860,6 +3860,7 @@ class ClaudeSDKExecutor(Executor):
         # avoid double-emitting (the SDK sends both StreamEvents AND
         # the complete AssistantMessage for the same content).
         got_stream_events = False
+        got_unstreamed_reply = False
 
         # Per-API-call prompt usage from the most recent ``message_start``
         # stream event. A single user turn can drive MANY internal API
@@ -4198,6 +4199,7 @@ class ClaudeSDKExecutor(Executor):
                                     )
                         else:
                             # No streaming — emit events from the full message.
+                            got_unstreamed_reply = True
                             for block in assistant_msg.content:
                                 if isinstance(block, sdk.TextBlock):
                                     text_block = cast(_TextBlockObj, block)
@@ -4503,7 +4505,11 @@ class ClaudeSDKExecutor(Executor):
 
         if terminal_error:
             retry_budget = None
-            if replay_budget is not None and replay_budget_cap is None and not got_stream_events:
+            if (
+                replay_budget is not None
+                and replay_budget_cap is None
+                and not (got_stream_events or got_unstreamed_reply)
+            ):
                 retry_budget = _rejected_replay_retry_budget(replay_budget, terminal_error)
             if retry_budget is not None:
                 # No model call succeeded, so the retry cannot repeat output or tool calls.

@@ -7325,11 +7325,13 @@ def _make_recovery_fake_sdk(responses=()):
     :param responses: Message lists answering the first queries in order;
         later queries get a successful result.
     """
+    from claude_agent_sdk.types import AssistantMessage as SDKAssistantMessage
     from claude_agent_sdk.types import (
         ClaudeAgentOptions as SDKClaudeAgentOptions,
     )
     from claude_agent_sdk.types import ResultMessage as SDKResultMessage
     from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+    from claude_agent_sdk.types import TextBlock as SDKTextBlock
 
     class _Sentinel:
         pass
@@ -7348,7 +7350,10 @@ def _make_recovery_fake_sdk(responses=()):
     pending_responses = list(responses)
 
     class _FakeSDK:
-        AssistantMessage = _Sentinel
+        AssistantMessage = SDKAssistantMessage
+        TextBlock = SDKTextBlock
+        ThinkingBlock = _Sentinel
+        ToolUseBlock = _Sentinel
         UserMessage = _Sentinel
         SystemMessage = _Sentinel
         StreamEvent = SDKStreamEvent
@@ -7614,7 +7619,7 @@ async def test_rebuilt_executor_replays_within_the_window_claude_code_reported()
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
         first = ClaudeSDKExecutor(model=model, context_window=1_000_000)
         [event async for event in first.run_turn([{"role": "user", "content": "hi"}], [], "")]
-        # A failed turn drops its executor, so the next turn restarts the client.
+        # A fresh executor simulates a restarted runner launching a new client.
         rebuilt = ClaudeSDKExecutor(model=model, context_window=1_000_000)
         events = [event async for event in rebuilt.run_turn(messages, [], "")]
 
@@ -7661,10 +7666,14 @@ async def test_rejected_history_replay_is_retried_once_with_less_history(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["no-history", "model-responded", "retry-rejected"])
+@pytest.mark.parametrize(
+    "case", ["no-history", "model-responded", "unstreamed-reply", "retry-rejected"]
+)
 async def test_prompt_too_long_fails_the_turn_without_another_replay(case) -> None:
     """Only a first replay that drew no model response is retried, and only once."""
+    from claude_agent_sdk.types import AssistantMessage as SDKAssistantMessage
     from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+    from claude_agent_sdk.types import TextBlock as SDKTextBlock
 
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
@@ -7680,6 +7689,9 @@ async def test_prompt_too_long_fails_the_turn_without_another_replay(case) -> No
         messages = [{"role": "user", "content": "What next?"}]
     elif case == "model-responded":
         responses = [[message_start, too_long]]
+    elif case == "unstreamed-reply":
+        reply = SDKAssistantMessage(content=[SDKTextBlock(text="Partial.")], model="m")
+        responses = [[reply, too_long]]
     fake_sdk = _make_recovery_fake_sdk(responses)
     executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=16_800)
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
