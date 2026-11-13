@@ -2205,6 +2205,25 @@ def register_events_routes(
                     conversation_store.get_session_connectivity, [session_id]
                 )
                 stop_conn = stop_connectivity.get(session_id)
+                # A child cannot stop the shared host process as fallback.
+                # A live shared runner must acknowledge its session cleanup.
+                if (
+                    stop_conn is not None
+                    and stop_conn.runner_id is not None
+                    and runner_seen_is_fresh(stop_conn.runner_last_seen)
+                    and not owns_runner
+                    and (
+                        conv.parent_conversation_id is not None
+                        or (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY)
+                    )
+                    and await asyncio.to_thread(routing_host_id, conv, conversation_store)
+                    is not None
+                ):
+                    raise OmnigentError(
+                        "Couldn't reach the shared session's runner to confirm it stopped. "
+                        "Please try again.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
                 if (
                     stop_conn is not None
                     and stop_conn.runner_id is not None

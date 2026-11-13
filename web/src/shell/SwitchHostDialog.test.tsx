@@ -374,7 +374,8 @@ describe("SwitchHostDialog", () => {
           rejectHosts = reject;
         }),
       );
-      renderDialog();
+      const client = renderDialog();
+      const invalidate = vi.spyOn(client, "invalidateQueries");
       const button = await screen.findByTestId("switch-host-button");
       await waitFor(() => expect(button).not.toBeDisabled());
       fireEvent.click(button);
@@ -391,10 +392,11 @@ describe("SwitchHostDialog", () => {
               : [{ host_id: "host_old", name: "laptop", owner: "alice", status: freshStatus }],
           );
       });
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["hosts"] });
       if (freshStatus === "error") {
-        expect(await screen.findByTestId("switch-host-error")).toHaveTextContent(
-          "Host refresh failed",
-        );
+        const error = await screen.findByTestId("switch-host-error");
+        expect(error).toHaveTextContent("Host refresh failed");
+        expect(error).toHaveTextContent("Check your connection and try again.");
         expect(updateSessionMock).not.toHaveBeenCalled();
         expect(launchRunnerMock).not.toHaveBeenCalled();
       } else {
@@ -463,8 +465,19 @@ describe("SwitchHostDialog", () => {
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", "conv_1"] });
       expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
 
+      let finishStop!: () => void;
+      stopSessionMock.mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishStop = () => resolve({ queued: false });
+        }),
+      );
       fireEvent.change(screen.getByTestId("mock-host-select"), { target: { value: "host_old" } });
       fireEvent.click(button);
+      await waitFor(() => expect(stopSessionMock).toHaveBeenCalledTimes(2));
+      expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
+      expect(screen.getByTestId("mock-host-select")).toHaveValue("host_old");
+      expect(updateSessionMock).toHaveBeenCalledTimes(1);
+      await act(async () => finishStop());
       await waitFor(() =>
         expect(launchRunnerMock).toHaveBeenLastCalledWith(
           "host_old",
@@ -482,6 +495,43 @@ describe("SwitchHostDialog", () => {
       );
     },
   );
+
+  it("requires Stop on recovery while the session refresh still shows an offline origin", async () => {
+    const hosts = [
+      { host_id: "host_old", name: "laptop", owner: "alice", status: "offline" as const },
+      { host_id: "host_new", name: "workstation", owner: "alice", status: "online" as const },
+    ];
+    useHostsMock.mockReturnValue({ data: hosts } as unknown as ReturnType<typeof useHosts>);
+    fetchHostsMock.mockResolvedValue(hosts);
+    launchRunnerMock.mockRejectedValueOnce(new Error("launch response lost"));
+    const client = renderDialog();
+    vi.spyOn(client, "invalidateQueries").mockImplementation(() => new Promise<void>(() => {}));
+    const button = await screen.findByTestId("switch-host-button");
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    await screen.findByText(/launch response lost/);
+    expect(stopSessionMock).not.toHaveBeenCalled();
+    expect(updateSessionMock).toHaveBeenCalledTimes(1);
+
+    let rejectStop!: (reason: Error) => void;
+    stopSessionMock.mockReturnValueOnce(
+      new Promise((_resolve, reject) => {
+        rejectStop = reject;
+      }),
+    );
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    await waitFor(() => expect(stopSessionMock).toHaveBeenCalledTimes(1));
+    expect(updateSessionMock).toHaveBeenCalledTimes(1);
+    expect(launchRunnerMock).toHaveBeenCalledTimes(1);
+    await act(async () => rejectStop(new Error("Current runner unreachable")));
+    expect(await screen.findByTestId("switch-host-error")).toHaveTextContent(
+      "Current runner unreachable",
+    );
+    expect(updateSessionMock).toHaveBeenCalledTimes(1);
+    expect(launchRunnerMock).toHaveBeenCalledTimes(1);
+    expect(fetchHostsMock).toHaveBeenCalledTimes(1);
+  });
 
   it.each(["stop", "release"] as const)(
     "stops the refreshed binding and reports a retry %s failure",
@@ -526,6 +576,10 @@ describe("SwitchHostDialog", () => {
       );
       expect(error).not.toHaveTextContent("The old session stopped");
       expect(error).not.toHaveTextContent("Check the original host");
+      if (failure === "stop") {
+        expect(error).not.toHaveTextContent("The session left its old host");
+        expect(error).not.toHaveTextContent("Pick a host");
+      }
       expect(stopSessionMock).toHaveBeenCalledTimes(2);
       expect(updateSessionMock).toHaveBeenCalledTimes(failure === "stop" ? 1 : 2);
       expect(launchRunnerMock).toHaveBeenCalledTimes(1);

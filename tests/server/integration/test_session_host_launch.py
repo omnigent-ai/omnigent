@@ -5015,6 +5015,16 @@ async def test_stopping_child_does_not_stop_parents_shared_runner(
     ):
         # Keep the real replica-local routing; only replace its HTTP transport.
         monkeypatch.setattr(RunnerRouter, "_client_for_runner", lambda self, runner_id: runner)
+        if host_placement == "remote":
+            store.touch_runner_liveness([parent["runner_id"]], int(time.time()))
+            misplaced = await host_client.post(
+                f"/v1/sessions/{child['id']}/events", json={"type": "stop_session"}
+            )
+            assert misplaced.status_code == 503, misplaced.text
+            assert misplaced.json()["error"]["code"] == "runner_unavailable"
+            assert requests == []
+            assert host.stopped_runner_ids == []
+            assert store.get_conversation(child["id"]).runner_id == parent["runner_id"]
         stop = await client.post(
             f"/v1/sessions/{child['id']}/events", json={"type": "stop_session"}
         )

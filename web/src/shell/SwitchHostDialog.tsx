@@ -138,6 +138,7 @@ function SupportedSwitchHostDialog({
   const [browsing, setBrowsing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [originAvailable, setOriginAvailable] = useState(false);
   const [moveState, setMoveState] = useState<"initial" | "stopped" | "released">("initial");
   const stranded = moveState !== "initial";
 
@@ -174,9 +175,9 @@ function SupportedSwitchHostDialog({
   const targetHosts = useMemo(
     () =>
       (hosts ?? []).filter(
-        (h) => h.status === "online" && (stranded || h.host_id !== originHostId),
+        (h) => h.status === "online" && (originAvailable || h.host_id !== originHostId),
       ),
-    [hosts, originHostId, stranded],
+    [hosts, originHostId, originAvailable],
   );
 
   // Land on a usable selection instead of an empty form: take the first
@@ -245,6 +246,7 @@ function SupportedSwitchHostDialog({
       setWorkspace("");
       setBrowsing(false);
       setError(null);
+      setOriginAvailable(false);
       setMoveState("initial");
       setSubmitting(false);
       prevHostId.current = null;
@@ -291,18 +293,31 @@ function SupportedSwitchHostDialog({
     if (!canSwitch) return;
     setSubmitting(true);
     setError(null);
+    setMoveState("initial");
     let stopped = false;
     let released = false;
     try {
       // A lost launch response can leave a new runner bound. Each retry stops
       // the current binding before releasing it, even after an earlier release.
       const currentHost = hosts?.find((host) => host.host_id === currentHostId);
-      // A stale offline badge must not skip Stop after the host reconnects.
-      const confirmedOffline =
-        currentHost?.status === "offline" &&
-        (await fetchHosts(true)).some(
-          (host) => host.host_id === currentHostId && host.status === "offline",
-        );
+      // Recovery must Stop even if a delayed session refresh still names the
+      // offline origin. Only the initial move can use the offline exception.
+      let confirmedOffline = false;
+      if (!originAvailable && currentHost?.status === "offline") {
+        try {
+          confirmedOffline = (await fetchHosts(true)).some(
+            (host) => host.host_id === currentHostId && host.status === "offline",
+          );
+        } catch (e) {
+          const detail = e instanceof Error ? e.message : "Host lookup failed.";
+          throw new Error(
+            `Couldn't refresh the current host's status. Check your connection and try again. ${detail}`,
+            { cause: e },
+          );
+        } finally {
+          void queryClient.invalidateQueries({ queryKey: ["hosts"] });
+        }
+      }
       if (!confirmedOffline) {
         try {
           await stopSession(sessionId);
@@ -314,6 +329,7 @@ function SupportedSwitchHostDialog({
           );
         }
         stopped = true;
+        setOriginAvailable(true);
         setMoveState("stopped");
       }
       // Drop the model override alongside the runner binding. A model id is
@@ -325,6 +341,7 @@ function SupportedSwitchHostDialog({
       await updateSession(sessionId, { runnerId: "", modelOverride: null, silent: true });
       // From here the session is unbound until the launch lands.
       released = true;
+      setOriginAvailable(true);
       setMoveState("released");
       if (sandboxSelected) {
         // The launch's own events report progress from here, but its first ones
