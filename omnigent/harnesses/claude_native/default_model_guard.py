@@ -56,6 +56,15 @@ _watchers: dict[tuple[Path, Path], threading.Thread] = {}
 _watchers_lock = threading.Lock()
 
 
+class ModelSwitchProtectionError(RuntimeError):
+    """The user's default could not be protected before submitting a switch."""
+
+
+def state_directory(settings_path: Path) -> Path:
+    """Keep coordination beside the real settings file, independent of runner temp roots."""
+    return _canonical(settings_path).parent / ".omnigent-default-model"
+
+
 @dataclass(frozen=True)
 class PendingModelSwitch:
     """A ``/model`` switch Omnigent registered before typing it."""
@@ -95,8 +104,8 @@ def begin_model_switch(
     :param settings_path: The user ``settings.json`` the pane's Claude saves to.
     :param model_arg: The ``/model`` argument, e.g. ``"claude-sonnet-5-5"``.
     :param state_dir: Directory for the shared records, private to the OS user.
-    :returns: The pending switch, or ``None`` when nothing needs undoing (the
-        default is already *model_arg*) or the record could not be written.
+    :returns: The pending switch, or ``None`` when the default is already *model_arg*.
+    :raises ModelSwitchProtectionError: If the default cannot be read or protected.
     """
     model = _normalized(model_arg)
     settings_path = _canonical(settings_path)
@@ -107,19 +116,19 @@ def begin_model_switch(
             if record is None or not pending:
                 current = _read_settings_model(settings_path)
                 if current is _UNREADABLE:
-                    return None
+                    raise ModelSwitchProtectionError(
+                        "Cannot read Claude settings to protect the default model; "
+                        "retry the switch."
+                    )
                 record = {"settings_path": str(settings_path), "default": _encode(current)}
             if _normalized_value(_decode(record["default"])) == model:
                 return None
             pending.append({"model": model, "expires_at": time.time() + PENDING_SWITCH_TTL_S})
             _save_record(record_path, record, pending)
-    except (OSError, FileLockTimeout):
-        _logger.warning(
-            "claude-native: could not record the default model before /model; "
-            "this switch may change the user's default",
-            exc_info=True,
-        )
-        return None
+    except (OSError, FileLockTimeout) as exc:
+        raise ModelSwitchProtectionError(
+            "Cannot record Claude's default model; the model switch was not submitted. Retry it."
+        ) from exc
     _ensure_watcher(settings_path, state_dir)
     return PendingModelSwitch(settings_path=settings_path, state_dir=state_dir, model=model)
 
@@ -151,7 +160,9 @@ def settle_default_model(settings_path: Path, *, state_dir: Path) -> bool:
                 record["default"] = _encode(current)
             else:
                 try:
-                    _write_settings_model(settings_path, default)
+                    observed = _write_settings_model(
+                        settings_path, default, expected_model=saved["model"]
+                    )
                 except (OSError, ValueError):
                     # Kept pending, so the next pass retries; warn only once per switch.
                     if not saved.get("restore_failed"):
@@ -163,6 +174,10 @@ def settle_default_model(settings_path: Path, *, state_dir: Path) -> bool:
                         )
                 else:
                     pending.remove(saved)
+                    if observed != default and not any(
+                        p["model"] == _normalized_value(observed) for p in pending
+                    ):
+                        record["default"] = _encode(observed)
         # An idle poll leaves the record as it is rather than rewriting it.
         if not pending or json.dumps({**record, "pending": pending}, sort_keys=True) != loaded:
             _save_record(record_path, record, pending)
@@ -298,10 +313,11 @@ def _read_settings_model(path: Path) -> object:
     return payload.get("model", _MISSING)
 
 
-def _write_settings_model(path: Path, value: object) -> None:
+def _write_settings_model(path: Path, value: object, *, expected_model: str) -> object:
     """
-    Set the ``model`` key of a Claude settings file, or remove it for ``_MISSING``.
+    Restore a still-matching pending model, preserving any different user selection.
 
+    :returns: The restored value, or the different model found on a fresh read.
     :raises OSError: If the file cannot be rewritten.
     :raises ValueError: If the file is not a JSON object.
     """
@@ -311,6 +327,9 @@ def _write_settings_model(path: Path, value: object) -> None:
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             raise ValueError(f"{target} is not a JSON object")
+        current = payload.get("model", _MISSING)
+        if _normalized_value(current) != expected_model:
+            return current
         if value is _MISSING:
             payload.pop("model", None)
         else:
@@ -325,7 +344,7 @@ def _write_settings_model(path: Path, value: object) -> None:
             unchanged=lambda raw=raw: target.read_text(encoding="utf-8") == raw,
         ):
             _logger.info("claude-native: kept the default model in %s", path)
-            return
+            return value
     raise OSError(f"{target} kept changing while its default model was restored")
 
 

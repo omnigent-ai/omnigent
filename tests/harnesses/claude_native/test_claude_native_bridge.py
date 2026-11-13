@@ -7185,7 +7185,7 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
 
 
 @pytest.mark.parametrize(
-    "outcome", ["submitted", "unconfirmed", "enter timed out", "enter failed"]
+    "outcome", ["submitted", "unconfirmed", "enter timed out", "enter failed", "guard unavailable"]
 )
 def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
@@ -7202,8 +7202,11 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
         bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
     )
     settings_path = claude_native_bridge.read_user_settings_path(bridge_dir)
-    state_dir = claude_native_bridge._DEFAULT_MODEL_STATE_DIR
+    state_dir = default_model_guard.state_directory(settings_path)
     settings_path.write_text('{"model": "opus"}', encoding="utf-8")
+    entered: list[bool] = []
+    if outcome == "guard unavailable":
+        state_dir.write_text("not a directory", encoding="utf-8")
 
     class _FakeCompleted:
         returncode = 0
@@ -7217,6 +7220,7 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
             # A stalled pane keeps showing the typed command after Enter.
             result.stdout = _composer_pane("/model sonnet" if outcome == "unconfirmed" else "")
         elif cmd[-1] == "Enter":
+            entered.append(True)
             if outcome == "enter timed out":
                 raise subprocess.TimeoutExpired(cmd, 1)
             if outcome == "enter failed":
@@ -7237,6 +7241,10 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     if outcome in ("unconfirmed", "enter timed out"):
         # The Enter may have reached the pane; its save can land afterwards.
         settings_path.write_text('{"model": "sonnet"}', encoding="utf-8")
+    if outcome == "guard unavailable":
+        assert entered == []
+        assert json.loads(settings_path.read_text(encoding="utf-8")) == {"model": "opus"}
+        return
     default_model_guard.settle_default_model(settings_path, state_dir=state_dir)
 
     assert json.loads(settings_path.read_text(encoding="utf-8")) == {"model": "opus"}

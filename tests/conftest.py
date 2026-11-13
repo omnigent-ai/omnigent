@@ -420,7 +420,7 @@ def _isolate_claude_native_state(
 def _isolate_claude_default_model_guard(
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+) -> Callable[[Path, Path], None]:
     """
     Keep the ``/model`` default-model guard away from the real ``~/.claude``.
 
@@ -429,16 +429,18 @@ def _isolate_claude_default_model_guard(
 
     :param tmp_path_factory: Pytest's session-scoped temp factory.
     :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
+    :returns: The real watcher starter, for the dedicated thread test to opt in.
     """
-    from omnigent.harnesses.claude_native import bridge
+    from omnigent.harnesses.claude_native import bridge, default_model_guard
 
     root = tmp_path_factory.mktemp("claude-default-model")
     settings_path = root / "settings.json"
-    monkeypatch.setattr(bridge, "_DEFAULT_MODEL_STATE_DIR", root / "state")
+    ensure_watcher = default_model_guard._ensure_watcher
+    monkeypatch.setattr(default_model_guard, "_ensure_watcher", lambda *_args: None)
     monkeypatch.setattr(
         bridge, "claude_user_settings_path", lambda *_args, **_kwargs: settings_path
     )
+    return ensure_watcher
 
 
 @pytest.fixture(autouse=True)

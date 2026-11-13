@@ -6,11 +6,10 @@ covered in ``tests/harnesses/claude_native/test_claude_native_bridge.py`` (the i
 
 A routed switch is typed as ``/model <id>``. Claude Code answers it with "Set
 model to X **and saved as your default for new sessions**" and rewrites the
-``model`` key in the person's own ``~/.claude/settings.json`` — an accepted
-trade-off, since the alternative (driving the interactive picker over tmux)
-cost ~530 lines of fragile screen-scraping automation. What still has to hold
-is that Omnigent itself never writes that file, and that the switch path polls
-the TUI rather than guessing at its render latency.
+``model`` key in the person's own ``~/.claude/settings.json``. The dedicated
+default-model guard restores that key after an Omnigent switch; its behavior
+is covered in ``test_default_model_guard.py``. The bridge itself only reads
+settings, and the switch path polls the TUI rather than guessing its latency.
 """
 
 from __future__ import annotations
@@ -43,14 +42,12 @@ def _tree(relative: str) -> ast.Module:
     return ast.parse((_OMNIGENT / relative).read_text(encoding="utf-8"))
 
 
-def test_the_users_claude_settings_file_is_only_ever_read() -> None:
+def test_the_bridge_only_reads_the_users_claude_settings_file() -> None:
     """
-    Guard #18: omnigent reads the user's settings file and never writes it.
+    Settings restoration belongs to the dedicated default-model guard.
 
-    Claude Code rewriting its own ``model`` key on ``/model <id>`` is the
-    accepted trade-off. A write from *our* side is not: it would clobber hook
-    wiring, permissions and everything else in the file, so every reference
-    here must be a read.
+    Direct settings access from the bridge must remain read-only; the guard's
+    behavioral tests cover preserving other keys during restoration.
     """
     tree = _tree("harnesses/claude_native/bridge.py")
     reads: list[str] = []

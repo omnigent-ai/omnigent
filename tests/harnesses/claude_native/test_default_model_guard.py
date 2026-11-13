@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import stat
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -76,25 +77,46 @@ def test_a_failed_restore_stays_pending_and_is_retried(
     assert _read(settings) == {"model": "opus"}
 
 
+@pytest.mark.parametrize("edit_at", ["first read", "retry"])
+@pytest.mark.parametrize("edited_model", ["sonnet", "haiku"])
 def test_an_edit_landing_mid_restore_is_kept(
-    paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    paths: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    edit_at: str,
+    edited_model: str,
 ) -> None:
     settings, state = paths
     _write(settings, {"model": "opus"})
     default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+    default_model_guard.begin_model_switch(settings, "later-model", state_dir=state)
     _write(settings, {"model": "sonnet"})
     real_chmod = default_model_guard.os.chmod
+    real_restore = default_model_guard._write_settings_model
+
+    def edit_settings() -> None:
+        if _read(settings) == {"model": "sonnet"}:
+            _write(settings, {"model": edited_model, "theme": "dark"})
+
+    def edit_then_restore(path: Path, value: object, *, expected_model: str) -> object:
+        if edit_at == "first read":
+            edit_settings()
+        return real_restore(path, value, expected_model=expected_model)
 
     def chmod_then_edit(path: object, mode: int) -> None:
         real_chmod(path, mode)
-        if _read(settings) == {"model": "sonnet"}:  # another writer, once
-            _write(settings, {"model": "sonnet", "theme": "dark"})
+        if edit_at == "retry":
+            edit_settings()
 
     monkeypatch.setattr(default_model_guard.os, "chmod", chmod_then_edit)
+    monkeypatch.setattr(default_model_guard, "_write_settings_model", edit_then_restore)
 
     default_model_guard.settle_default_model(settings, state_dir=state)
 
-    assert _read(settings) == {"model": "opus", "theme": "dark"}
+    expected_model = "opus" if edited_model == "sonnet" else edited_model
+    assert _read(settings) == {"model": expected_model, "theme": "dark"}
+    _write(settings, {"model": "later-model", "theme": "dark"})
+    assert not default_model_guard.settle_default_model(settings, state_dir=state)
+    assert _read(settings) == {"model": expected_model, "theme": "dark"}
 
 
 def test_keeps_a_users_own_change_and_restores_to_it(paths: tuple[Path, Path]) -> None:
@@ -113,13 +135,24 @@ def test_keeps_a_users_own_change_and_restores_to_it(paths: tuple[Path, Path]) -
 
 def test_a_second_session_does_not_take_an_unsettled_save_for_the_default(
     paths: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings, state = paths
     _write(settings, {"model": "opus"})
-    default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+    first_root, second_root = settings.parent / "temp-one", settings.parent / "temp-two"
+    monkeypatch.setattr(bridge, "read_user_settings_path", lambda _bridge: settings)
+    monkeypatch.setenv("TMPDIR", str(first_root))
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT_PARENT", first_root)
+    first = bridge._begin_model_switch(first_root / "bridge", "/model sonnet")
+    assert first is not None
     _write(settings, {"model": "sonnet"})  # the first session's save, not settled yet
 
-    default_model_guard.begin_model_switch(settings, "haiku", state_dir=state)
+    monkeypatch.setenv("TMPDIR", str(second_root))
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT_PARENT", second_root)
+    second = bridge._begin_model_switch(second_root / "bridge", "/model haiku")
+    assert second is not None
+    assert first.state_dir == second.state_dir == default_model_guard.state_directory(settings)
+    state = first.state_dir
     _write(settings, {"model": "haiku"})
     default_model_guard.settle_default_model(settings, state_dir=state)
 
@@ -209,7 +242,9 @@ def test_an_expired_switch_leaves_a_later_save_alone(
 
 
 def test_the_watcher_restores_the_default_on_its_own(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_claude_default_model_guard: Callable[[Path, Path], None],
 ) -> None:
     settings, state = tmp_path / "settings.json", tmp_path / "state"
     _write(settings, {"model": "opus"})
@@ -223,6 +258,9 @@ def test_the_watcher_restores_the_default_on_its_own(
         return real_settle(path, state_dir=state_dir)
 
     monkeypatch.setattr(default_model_guard, "settle_default_model", settle_failing_once)
+    monkeypatch.setattr(
+        default_model_guard, "_ensure_watcher", _isolate_claude_default_model_guard
+    )
     default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
 
     _write(settings, {"model": "sonnet"})
@@ -231,6 +269,11 @@ def test_the_watcher_restores_the_default_on_its_own(
         time.sleep(0.05)
 
     assert _read(settings) == {"model": "opus"}
+    with default_model_guard._watchers_lock:
+        watcher = default_model_guard._watchers.get((settings, state))
+    if watcher is not None:
+        watcher.join(timeout=5)
+        assert not watcher.is_alive()
 
 
 @pytest.mark.parametrize(
