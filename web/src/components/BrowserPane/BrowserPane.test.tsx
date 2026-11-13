@@ -278,7 +278,9 @@ describe("BrowserPane retained-view lifecycle", () => {
   it("does not reattach a view closed while the pane is hidden", async () => {
     let fireClosed: ((p: { conversationId: string; reason: string | null }) => void) | undefined;
     const bridge = installBridge({
-      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "http://localhost:5173" }),
+      browserHasView: vi
+        .fn()
+        .mockResolvedValue({ exists: true, url: "http://localhost:5173", isLoading: true }),
       onBrowserViewClosed: vi.fn((cb) => {
         fireClosed = cb;
         return () => {};
@@ -286,12 +288,15 @@ describe("BrowserPane retained-view lifecycle", () => {
     });
     const { rerender } = render(<BrowserPane conversationId="conv_closed" />);
     await waitFor(() => expect(bridge.browserSetActive).toHaveBeenCalledWith("conv_closed"));
+    const reload = screen.getByRole("button", { name: "Reload" });
+    expect(reload.querySelector("svg")).toHaveClass("animate-spin");
     rerender(<BrowserPane conversationId="conv_closed" active={false} />);
     act(() => fireClosed?.({ conversationId: "conv_closed", reason: "user" }));
     bridge.browserSetActive.mockClear();
 
     rerender(<BrowserPane conversationId="conv_closed" />);
-    expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
+    expect(reload).toBeDisabled();
+    expect(reload.querySelector("svg")).not.toHaveClass("animate-spin");
     expect(bridge.browserSetActive).not.toHaveBeenCalled();
     expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
   });
@@ -600,23 +605,6 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
     render(<BrowserPane conversationId="conv_slow" />);
     const reload = screen.getByRole("button", { name: /reload/i });
     await waitFor(() => expect(reload.querySelector("svg")).toHaveClass("animate-spin"));
-  });
-
-  it("stops spinning when the loading view is closed", async () => {
-    let fireClosed: ((p: { conversationId: string; reason: string | null }) => void) | undefined;
-    installBridge({
-      browserHasView: vi.fn().mockResolvedValue({ exists: true, isLoading: true }),
-      onBrowserViewClosed: vi.fn((cb: typeof fireClosed) => {
-        fireClosed = cb;
-        return () => {};
-      }),
-    });
-    render(<BrowserPane conversationId="conv_close" />);
-    const reload = screen.getByRole("button", { name: /reload/i });
-    await waitFor(() => expect(reload.querySelector("svg")).toHaveClass("animate-spin"));
-    act(() => fireClosed?.({ conversationId: "conv_close", reason: null }));
-    expect(reload).toBeDisabled();
-    expect(reload.querySelector("svg")).not.toHaveClass("animate-spin");
   });
 
   it("devtools button calls the open-devtools IPC", async () => {
