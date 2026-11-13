@@ -3,6 +3,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 let embedded = false;
 vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => embedded }));
+let nativeShell = false;
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/nativeBridge")>()),
+  isNativeShell: () => nativeShell,
+}));
 
 import { setEmbedRoot } from "@/lib/host";
 import { typesIntoComposer, useTypeToComposer } from "./useTypeToComposer";
@@ -10,6 +15,7 @@ import { typesIntoComposer, useTypeToComposer } from "./useTypeToComposer";
 afterEach(() => {
   cleanup();
   embedded = false;
+  nativeShell = false;
   setEmbedRoot(null);
   document.body.innerHTML = "";
 });
@@ -116,6 +122,22 @@ describe("useTypeToComposer embedded", () => {
     document.getElementById("host")!.dispatchEvent(key({ key: "h" }));
     expect(focusComposer).not.toHaveBeenCalled();
     document.getElementById("conversation")!.dispatchEvent(key({ key: "h" }));
+    expect(focusComposer).toHaveBeenCalledTimes(1);
+  });
+
+  it("takes typing with focus on the body in a native shell, whose root isn't focusable", () => {
+    document.body.innerHTML = `<div id="app"><div id="conversation"><p>reply</p></div></div>`;
+    embedded = true;
+    setEmbedRoot(document.getElementById("app"));
+    const focusComposer = vi.fn();
+    renderHook(() =>
+      useTypeToComposer(focusComposer, { current: document.getElementById("conversation") }),
+    );
+
+    document.body.dispatchEvent(key({ key: "h" }));
+    expect(focusComposer).not.toHaveBeenCalled();
+    nativeShell = true;
+    document.body.dispatchEvent(key({ key: "h" }));
     expect(focusComposer).toHaveBeenCalledTimes(1);
   });
 
