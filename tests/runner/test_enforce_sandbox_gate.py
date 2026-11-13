@@ -425,10 +425,13 @@ async def test_agent_revision_with_unevaluable_start_policy_blocks_dispatch(
                 ),
             },
         )
-        assert response.status_code == (503 if stream else 202), response.text
+        assert response.status_code == (403 if stream else 202), response.text
         if stream:
-            assert response.json()["error"] == "spec_resolver_failed"
-            assert "AgentStartPolicyError" in response.json()["detail"]
+            assert response.json()["error"] == "agent_start_policy_unevaluable"
+            assert response.json()["detail"] == (
+                "Request failed on the runner; "
+                f"see the runner log for details: {pinned_runner_log}"
+            )
         else:
             turn_task = app.state.active_turns.get(session_id)
             if turn_task is not None:
@@ -447,7 +450,7 @@ async def test_agent_revision_with_unevaluable_start_policy_blocks_dispatch(
         )
         assert failure_message.endswith(safe_detail)
         if stream:
-            assert "AgentStartPolicyError" in failure_message
+            assert failure_message == f"agent_start_policy_unevaluable: {safe_detail}"
         else:
             assert failure_message == f"turn setup failed: {safe_detail}"
             terminal = [event for event in events if event.get("type") == "response.failed"]
