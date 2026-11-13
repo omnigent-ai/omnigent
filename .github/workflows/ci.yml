@@ -191,6 +191,38 @@ jobs:
           retention-days: 14
           include-hidden-files: true  # the per-shard .coverage.<group> dotfile
 
+  # Native Windows smoke test: every module imports, the CLI starts, and the
+  # cross-platform process shims (omnigent/_platform.py) behave. Not part of the
+  # Linux matrix: most of the suite assumes POSIX (tmux, bwrap, AF_UNIX).
+  windows-smoke:
+    name: Windows smoke
+    needs: gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra all --extra dev
+
+      - name: CLI starts
+        run: uv run omnigent --help
+
+      - name: Run pytest
+        run: uv run pytest tests/test_platform.py -p no:cacheprovider -v --tb=long
+
   coverage-report:
     name: Coverage report
     # Combines per-shard coverage into a coverage-summary artifact. Runs in the

@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib import error, request
 
+from omnigent._platform import IS_WINDOWS, current_user_tag
 from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
 
 if TYPE_CHECKING:
@@ -72,9 +73,10 @@ BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
 # pre-create the parent as a symlink to redirect the bridge tree. The
 # trusted parent (`/tmp`) is shared; everything under
 # `_BRIDGE_ROOT_PARENT` must be owned by the current uid and not be a
-# symlink — see :func:`_ensure_secure_dir`.
-_TRUSTED_PARENT = Path("/tmp")
-_BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{os.getuid()}"
+# symlink — see :func:`_ensure_secure_dir`. Windows has no shared
+# ``/tmp``; its temp dir is already per-user.
+_TRUSTED_PARENT = Path(tempfile.gettempdir()) if IS_WINDOWS else Path("/tmp")
+_BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{current_user_tag()}"
 _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
 _CONFIG_FILE = "bridge.json"
 _SERVER_FILE = "server.json"
@@ -598,7 +600,9 @@ def _ensure_secure_dir(target: Path) -> None:
     if cur != trusted_parent:
         raise RuntimeError(f"bridge dir {target!s} is not under trusted parent {trusted_parent!s}")
     ancestors.reverse()
-    my_uid = os.getuid()
+    # Windows reports ``st_uid == 0`` for every file, so the owner check
+    # only applies where uids exist.
+    my_uid = os.getuid() if hasattr(os, "getuid") else None
     for ancestor in ancestors:
         try:
             os.mkdir(ancestor, mode=0o700)
@@ -610,7 +614,7 @@ def _ensure_secure_dir(target: Path) -> None:
             raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: is a symlink")
         if not stat.S_ISDIR(st.st_mode):
             raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: not a directory")
-        if st.st_uid != my_uid:
+        if my_uid is not None and st.st_uid != my_uid:
             raise RuntimeError(
                 f"refusing to use bridge ancestor {ancestor!s}: owned by uid "
                 f"{st.st_uid}, not current user ({my_uid})"

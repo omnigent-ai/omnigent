@@ -35,6 +35,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -5364,12 +5365,14 @@ def create_runner_app(
         # — the SDK mirror of the claude-/codex-native terminals above.
         # Sub-agent sessions are skipped (their I/O surfaces through the
         # parent's transcript), as are the spec-less test scaffold and
-        # runners wired without a terminal registry (nothing to host on).
+        # runners wired without a terminal registry (nothing to host on),
+        # and native Windows, which has no tmux to host the pane.
         if (
             spec is not None
             and not is_native_harness(harness_name)
             and not _sa_name
             and resource_registry.terminal_registry is not None
+            and not IS_WINDOWS
         ):
             # Same double-launch hazard as the native branches: serialize
             # the check-and-create per session.

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent._platform import SIGKILL, kill_process_tree
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
@@ -277,7 +278,7 @@ def _terminate_process_tree(process: _Process | None) -> None:
     pid = process.pid
     if pid is not None:
         with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGTERM)
+            kill_process_tree(pid, signal.SIGTERM)
             return
     with suppress(ProcessLookupError, Exception):
         process.terminate()
@@ -289,7 +290,7 @@ def _kill_process_tree(process: _Process | None) -> None:
     pid = process.pid
     if pid is not None:
         with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGKILL)
+            kill_process_tree(pid, SIGKILL)
             return
     with suppress(ProcessLookupError, Exception):
         process.kill()

@@ -21,6 +21,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias
 
+from omnigent._platform import pid_exists
 from omnigent.runner.identity import strip_runner_auth_secrets
 
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
@@ -501,15 +502,7 @@ def _process_alive(pid: int) -> bool:
         e.g. ``48213``.
     :returns: ``True`` when a process with that pid exists.
     """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return pid_exists(pid)
 
 
 def _terminals_tmp_root() -> Path:

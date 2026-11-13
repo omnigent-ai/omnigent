@@ -6,7 +6,6 @@ import asyncio
 import contextvars
 import logging
 import os
-import resource
 import sys
 import time
 from collections import deque
@@ -1009,8 +1008,8 @@ def _current_rss_bytes() -> int:
     """
     Return process resident memory in bytes.
 
-    Linux exposes current RSS in ``/proc/self/status``. Other
-    supported platforms fall back to ``resource.getrusage``; that
+    Linux exposes current RSS in ``/proc/self/status``. Windows uses
+    :mod:`psutil`. Other platforms fall back to ``resource.getrusage``; that
     value is maximum resident set size, which is the best stdlib-only
     option available on macOS.
 
@@ -1026,6 +1025,13 @@ def _current_rss_bytes() -> int:
                         return int(parts[1]) * 1024
     except (FileNotFoundError, OSError, ValueError):
         pass
+
+    if sys.platform == "win32":
+        import psutil
+
+        return int(psutil.Process().memory_info().rss)
+
+    import resource
 
     usage = resource.getrusage(resource.RUSAGE_SELF)
     if sys.platform == "darwin":

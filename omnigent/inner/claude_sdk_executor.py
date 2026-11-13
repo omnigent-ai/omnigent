@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
+from omnigent._platform import SIGKILL, current_user_tag, kill_process_tree
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
@@ -490,7 +491,7 @@ def _terminate_process_tree(process: _Process | None) -> None:
     pid = process.pid
     if pid is not None:
         with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGTERM)
+            kill_process_tree(pid, signal.SIGTERM)
             return
     with suppress(ProcessLookupError, Exception):
         process.terminate()
@@ -502,7 +503,7 @@ def _kill_process_tree(process: _Process | None) -> None:
     pid = process.pid
     if pid is not None:
         with suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(pid, signal.SIGKILL)
+            kill_process_tree(pid, SIGKILL)
             return
     with suppress(ProcessLookupError, Exception):
         process.kill()
@@ -833,7 +834,7 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
         pathlib.Path.home() / ".claude" / "session-env",
         pathlib.Path.home() / ".claude" / "sessions",
         pathlib.Path.home() / ".npm" / "_logs",
-        pathlib.Path(tempfile.gettempdir()) / f"claude-{os.getuid()}",
+        pathlib.Path(tempfile.gettempdir()) / f"claude-{current_user_tag()}",
     ]
     for root in roots:
         root.mkdir(parents=True, exist_ok=True)

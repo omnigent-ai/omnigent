@@ -47,6 +47,7 @@ from omnigent_client._events import (
 )
 from rich.console import Console
 
+from omnigent._platform import SIGKILL, kill_process_tree
 from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE as _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
 )
@@ -3479,12 +3480,12 @@ def _stop_server(proc: subprocess.Popen[bytes]) -> None:
     """
     if proc.poll() is None:
         with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            kill_process_tree(proc.pid, signal.SIGTERM)
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                kill_process_tree(proc.pid, SIGKILL)
             proc.wait(timeout=5)
 
 

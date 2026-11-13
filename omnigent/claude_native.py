@@ -19,8 +19,6 @@ import shlex
 import shutil
 import signal
 import sys
-import termios
-import tty
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -41,6 +39,7 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSo
 from websockets.frames import Close
 
 from omnigent._native_resume_hint import echo_native_resume_hint
+from omnigent._platform import tmux_missing_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import (
@@ -3591,7 +3590,7 @@ def _preflight_local_tools(command: str) -> None:
     if shutil.which("tmux") is None:
         raise click.ClickException(
             "tmux was not found on local PATH. The native Claude wrapper "
-            "launches Claude through the local runner's tmux terminal."
+            "launches Claude through the local runner's tmux terminal." + tmux_missing_hint()
         )
 
 
@@ -4188,6 +4187,9 @@ def _enter_raw_mode(fd: int) -> list[Any] | None:
     """
     if not os.isatty(fd):
         return None
+    import termios
+    import tty
+
     old_attrs = termios.tcgetattr(fd)
     tty.setraw(fd)
     return old_attrs
@@ -4204,6 +4206,8 @@ def _restore_terminal(fd: int, old_attrs: list[Any] | None) -> None:
     """
     if old_attrs is None:
         return
+    import termios
+
     with contextlib.suppress(termios.error, OSError):
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
 
@@ -4248,11 +4252,15 @@ def _install_attach_signal_handlers(ws: Any, stdin_fd: int) -> _SignalRestore:
         resize_tasks.add(task)
         task.add_done_callback(resize_tasks.discard)
 
-    for sig, handler in {
-        signal.SIGWINCH: _resize,
+    handlers: dict[signal.Signals, Callable[[], None]] = {
         signal.SIGTERM: lambda: _request_stop(signal.SIGTERM),
-        signal.SIGHUP: lambda: _request_stop(signal.SIGHUP),
-    }.items():
+    }
+    # SIGWINCH and SIGHUP do not exist on native Windows.
+    if (sigwinch := getattr(signal, "SIGWINCH", None)) is not None:
+        handlers[sigwinch] = _resize
+    if (sighup := getattr(signal, "SIGHUP", None)) is not None:
+        handlers[sighup] = lambda: _request_stop(sighup)
+    for sig, handler in handlers.items():
         previous[sig] = signal.getsignal(sig)
         try:
             loop.add_signal_handler(sig, handler)

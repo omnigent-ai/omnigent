@@ -28,6 +28,8 @@ from pathlib import Path
 import click
 import psutil
 
+from omnigent._platform import SIGKILL
+
 _LOCAL_SERVER_READY_TIMEOUT_SECONDS = 45.0
 
 # Max seconds to wait for a bind-race-doomed server child's natural
@@ -321,7 +323,7 @@ def _terminate_pid(pid: int) -> None:
         time.sleep(_STOP_POLL_INTERVAL_S)
     # Grace period expired — force-kill so the port is freed.
     with contextlib.suppress(ProcessLookupError, OSError):
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, SIGKILL)
     # Brief wait for the kernel to reap after SIGKILL.
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:

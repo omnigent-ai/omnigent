@@ -22,6 +22,7 @@ import websockets
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
 
+from omnigent._platform import SIGKILL, kill_process_tree
 from omnigent.codex_native_bridge import write_policy_hook_config
 from omnigent.inner.codex_executor import (
     _clean_codex_env,
@@ -1574,10 +1575,9 @@ def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
     """
     if process.returncode is not None:
         return
-    if os.name == "posix":
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(process.pid, signal.SIGTERM)
-            return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        kill_process_tree(process.pid, signal.SIGTERM)
+        return
     with contextlib.suppress(ProcessLookupError, Exception):
         process.terminate()
 
@@ -1591,9 +1591,8 @@ def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
     """
     if process.returncode is not None:
         return
-    if os.name == "posix":
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(process.pid, signal.SIGKILL)
-            return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        kill_process_tree(process.pid, SIGKILL)
+        return
     with contextlib.suppress(ProcessLookupError, Exception):
         process.kill()

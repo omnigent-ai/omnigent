@@ -29,6 +29,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from omnigent._platform import SIGKILL, tmux_missing_hint
 from omnigent._startup_profile import StartupProfiler
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
@@ -6199,7 +6200,7 @@ def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> None:
         time.sleep(0.1)
     if force:
         with contextlib.suppress(ProcessLookupError):
-            os.kill(record.pid, signal.SIGKILL)
+            os.kill(record.pid, SIGKILL)
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if not _pid_alive(record.pid):
@@ -6813,7 +6814,7 @@ def _warn_missing_harness_dependencies() -> None:
         problems.append(
             "tmux not found on PATH — `omnigent claude` and `omnigent codex` launch "
             "the agent through a local tmux terminal and refuse to start without it "
-            "(macOS: `brew install tmux`)."
+            "(macOS: `brew install tmux`)." + tmux_missing_hint()
         )
     if not problems:
         return

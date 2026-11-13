@@ -23,6 +23,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from omnigent._platform import SIGKILL, kill_process_tree
+
 
 def _is_tcp_listening(host: str, port: int) -> bool:
     """Connect-test on a TCP host:port. Returns True iff something accepts."""
@@ -137,12 +139,12 @@ class RunnerTCPSubprocess:
             return
         if self._process.poll() is None:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)
+                kill_process_tree(self._process.pid, signal.SIGTERM)
             try:
                 self._process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
-                    os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
+                    kill_process_tree(self._process.pid, SIGKILL)
                 self._process.wait(timeout=2)
 
 

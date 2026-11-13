@@ -35,6 +35,8 @@ from pathlib import Path
 
 import httpx
 
+from omnigent._platform import SIGKILL, kill_process_tree
+
 
 def _is_socket_listening(socket_path: str) -> bool:
     """Connect-test on a UDS path to detect whether uvicorn is up.
@@ -150,12 +152,12 @@ class RunnerSubprocess:
             return
         if self._process.poll() is None:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)
+                kill_process_tree(self._process.pid, signal.SIGTERM)
             try:
                 self._process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
-                    os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
+                    kill_process_tree(self._process.pid, SIGKILL)
                 self._process.wait(timeout=2)
 
 

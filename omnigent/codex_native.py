@@ -24,6 +24,7 @@ import httpx
 import yaml
 
 from omnigent._native_resume_hint import echo_native_resume_hint
+from omnigent._platform import tmux_missing_hint
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
@@ -2505,5 +2506,5 @@ def _preflight_local_tools() -> None:
     if shutil.which("tmux") is None:
         raise click.ClickException(
             "tmux was not found on local PATH. The native Codex wrapper "
-            "attaches to the runner-owned Codex tmux terminal."
+            "attaches to the runner-owned Codex tmux terminal." + tmux_missing_hint()
         )

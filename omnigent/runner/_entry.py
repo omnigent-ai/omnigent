@@ -424,13 +424,9 @@ def _parent_process_is_alive(parent_pid: int) -> bool:
     :returns: ``True`` when the process exists or is not visible due
         to permissions, otherwise ``False``.
     """
-    try:
-        os.kill(parent_pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    from omnigent._platform import pid_exists
+
+    return pid_exists(parent_pid)
 
 
 def _parent_is_orphaned(parent_pid: int) -> bool:

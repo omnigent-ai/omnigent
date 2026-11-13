@@ -30,15 +30,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 import json
 import logging
 import os
-import pty
 import shutil
 import signal
 import struct
-import termios
+import sys
 import time
 import weakref
 from collections.abc import Callable
@@ -46,6 +44,13 @@ from dataclasses import dataclass
 from typing import Final
 
 from fastapi import WebSocket, WebSocketDisconnect
+
+# tmux attach needs a POSIX PTY; native Windows has neither, so the
+# bridge refuses there (see ``bridge_tmux_pty_to_websocket``).
+if sys.platform != "win32":
+    import fcntl
+    import pty
+    import termios
 
 _logger = logging.getLogger(__name__)
 
@@ -478,6 +483,13 @@ async def bridge_tmux_pty_to_websocket(
         argv.append("-r")
     argv += ["-t", tmux_target]
 
+    if sys.platform == "win32":
+        _logger.error("tmux attach is not supported on native Windows target=%s", tmux_target)
+        with contextlib.suppress(RuntimeError):
+            await websocket.close(
+                code=WS_CLOSE_INTERNAL_ERROR, reason="terminal attach unsupported on Windows"
+            )
+        return
     # Resolve the absolute path in the parent so the forked child can
     # ``execv`` without a Python-level PATH search (see _fork_exec_pty).
     # tmux missing is a fail-loud condition, not a silent terminal-gone.
