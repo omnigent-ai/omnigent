@@ -204,7 +204,11 @@ class SessionTokenBindingTest {
         ServerStore(context).connect(pinned)
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
-        repeat(3) { webViewOf(activity).let { it.webViewClient.onRenderProcessGone(it, rendererGone(crashed = true)) } }
+        repeat(3) {
+            webViewOf(
+                activity,
+            ).let { it.webViewClient.onRenderProcessGone(it, rendererGone(crashed = true)) }
+        }
         val pending = mutableListOf<(Boolean) -> Unit>()
         activity.installSessionCookie = { _, _, callback -> pending += callback }
         activity.readCookies = { null }
@@ -213,14 +217,18 @@ class SessionTokenBindingTest {
         ServerStore(context).connect(otherPort)
         controller.newIntent(Intent(activity, MainActivity::class.java))
         fetched.clear()
-        webViewOf(activity).let { it.webViewClient.onRenderProcessGone(it, rendererGone(crashed = true)) }
+        webViewOf(
+            activity,
+        ).let { it.webViewClient.onRenderProcessGone(it, rendererGone(crashed = true)) }
 
         // No Reload link (which would reach the new server) until the old session is gone.
         val replacement = shadowOf(webViewOf(activity))
         assertTrue(replacement.lastLoadDataWithBaseURL == null && replacement.lastLoadedUrl == null)
         while (pending.isNotEmpty()) pending.removeAt(0)(true)
 
-        assertTrue(shadowOf(webViewOf(activity)).lastLoadDataWithBaseURL?.data?.contains("Reload") == true)
+        assertTrue(
+            shadowOf(webViewOf(activity)).lastLoadDataWithBaseURL?.data?.contains("Reload") == true,
+        )
         assertFalse(shadowOf(webViewOf(activity)).lastLoadedUrl?.startsWith(otherPort) == true)
         assertTrue(fetched.isEmpty())
     }
