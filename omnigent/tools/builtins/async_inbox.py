@@ -34,6 +34,10 @@ from typing import Any
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.tools.base import Tool
 
+# Cap on ``sys_read_inbox`` ``wait_s``: below Codex's 60s default MCP tool
+# timeout and the ~300s fetch/relay timeouts of the other native bridges.
+INBOX_WAIT_MAX_S = 45.0
+
 
 class SysCancelTaskTool(Tool):
     """
@@ -299,7 +303,10 @@ class SysReadInboxTool(Tool):
             "string. It is also the expected response to the runtime's "
             f"sub-agent wake notice `{SUBAGENT_WAKE_NOTICE_SHAPE}`, which "
             "Omnigent posts into your session when a dispatched child "
-            "finishes; that notice comes from the runtime, not from a person."
+            "finishes; that notice comes from the runtime, not from a person. "
+            "Pass wait_s to block until a result arrives instead of sleeping; "
+            "a waiting call only reports results, so call again without wait_s "
+            "to collect them."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -307,7 +314,7 @@ class SysReadInboxTool(Tool):
         Return the OpenAI-format tool schema.
 
         :returns: Dict with ``"type": "function"`` and a
-            ``"function"`` sub-dict. The tool takes no arguments.
+            ``"function"`` sub-dict with the optional ``wait_s``.
         """
         return {
             "type": "function",
@@ -316,7 +323,20 @@ class SysReadInboxTool(Tool):
                 "description": SysReadInboxTool.description(),
                 "parameters": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "wait_s": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": INBOX_WAIT_MAX_S,
+                            "description": (
+                                "Seconds to wait while the inbox is empty. A "
+                                "waiting call returns as soon as results arrive "
+                                "or an interrupt ends it, and reports how many "
+                                "are waiting without collecting them. Default 0 "
+                                "collects immediately."
+                            ),
+                        },
+                    },
                     "additionalProperties": False,
                 },
             },
@@ -339,8 +359,7 @@ class SysReadInboxTool(Tool):
         ``_execute_tools`` accepts both shapes (see the
         ``isinstance(dispatched, _AsyncToolHandle)`` branch).
 
-        :param arguments: Ignored — the drain has no per-call
-            knobs.
+        :param arguments: Ignored.
         :returns: Always ``True``.
         """
         return True

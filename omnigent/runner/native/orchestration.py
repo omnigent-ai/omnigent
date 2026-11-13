@@ -4298,7 +4298,8 @@ async def _auto_create_devin_terminal(
     authored = raw_author_instructions(spec) if spec is not None else None
     rule_is_live = write_devin_agent_rule(workspace_path, authored, session_id=session_id)
     write_agent_instructions_preamble(
-        bridge_dir, build_native_startup_instructions(None if rule_is_live else spec)
+        bridge_dir,
+        build_native_startup_instructions(spec, include_author_text=not rule_is_live),
     )
     if rule_is_live:
         # Record the workspace so the SessionEnd hook can remove this rule when

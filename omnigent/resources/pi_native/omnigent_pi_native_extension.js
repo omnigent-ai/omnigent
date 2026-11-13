@@ -708,6 +708,36 @@ async function callOmnigentTool(config, toolName, args) {
   return piResultFromMcpResponse(retry.json);
 }
 
+// Pace for re-reporting an abort until the waiting sys_read_inbox call returns.
+const _INBOX_WAIT_RELEASE_RETRY_MS = 1_000;
+
+/**
+ * Pi awaits execute() even after Esc, so report the interrupt to end the runner
+ * wait now. Repeat until the call settles (a report can beat the wait's
+ * registration), bounded by ``waitS``.
+ */
+function releaseInboxWaitOnAbort(config, call, signal, waitS) {
+  if (!signal) return;
+  let settled = false;
+  const release = async () => {
+    const deadline = Date.now() + waitS * 1000;
+    while (!settled && Date.now() <= deadline) {
+      await postEvent(config, {
+        type: "external_session_interrupted",
+        data: {},
+      });
+      await sleep(_INBOX_WAIT_RELEASE_RETRY_MS);
+    }
+  };
+  const settle = () => {
+    settled = true;
+    signal.removeEventListener("abort", release);
+  };
+  call.then(settle, settle);
+  if (signal.aborted) release();
+  else signal.addEventListener("abort", release, { once: true });
+}
+
 function textFromContent(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -1814,8 +1844,12 @@ module.exports = function (pi) {
           description,
           promptSnippet: description ? description.slice(0, 120) : name,
           parameters,
-          async execute(_toolCallId, params) {
-            return callOmnigentTool(config, name, params || {});
+          async execute(_toolCallId, params, signal) {
+            const call = callOmnigentTool(config, name, params || {});
+            if (name === "sys_read_inbox" && params?.wait_s > 0) {
+              releaseInboxWaitOnAbort(config, call, signal, params.wait_s);
+            }
+            return call;
           },
         });
       }

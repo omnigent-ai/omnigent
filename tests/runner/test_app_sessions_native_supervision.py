@@ -1018,6 +1018,85 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
     assert "sys_read_inbox" in wake_text
 
 
+# Parent ``/events`` interrupts that must release a waiting read.
+_PARENT_INTERRUPTS = {
+    "omnigent_interrupt": {"type": "interrupt"},
+    "harness_interrupt": {"type": "external_session_interrupted", "data": {}},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["child_finishes", *_PARENT_INTERRUPTS])
+async def test_waiting_inbox_read_never_consumes_or_hides_a_result(ending: str) -> None:
+    """
+    A parent's ``sys_read_inbox`` waiting via ``/mcp/execute`` ends on its child's result.
+
+    The read only reports the result: it stays queued and its wake notice still
+    posts, so a wait whose harness dropped the call loses nothing. An interrupt
+    of the parent instead releases the wait at once.
+    """
+    parent_id = "3f1e2d4c5b6a47988a9b0c1d2e3f4a5b"
+    child_id = "6a5b4c3d2e1f40718293a4b5c6d7e8f9"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server_client = _PolicyAllowingWakeRecordingServerClient(parent_id)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude_code", title="auth"
+    )
+
+    try:
+        async with _runner_client(app) as client:
+            read = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{parent_id}/mcp/execute",
+                    json={
+                        "method": "tools/call",
+                        "params": {"name": "sys_read_inbox", "arguments": {"wait_s": 30}},
+                    },
+                )
+            )
+            await poll_until_async(
+                lambda: parent_id in tool_dispatch._inbox_wait_releases, timeout_s=5.0
+            )
+            if ending == "child_finishes":
+                resp = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={
+                        "type": "external_session_status",
+                        "data": {"status": "idle", "output": "WORKER_DONE"},
+                    },
+                )
+            else:
+                resp = await client.post(
+                    f"/v1/sessions/{parent_id}/events", json=_PARENT_INTERRUPTS[ending]
+                )
+            assert resp.status_code == 204, resp.text
+            output = (await asyncio.wait_for(read, timeout=5.0)).json()["result"]["output"]
+            if ending == "child_finishes":
+                assert output == (
+                    "1 result waiting in inbox; call sys_read_inbox without wait_s to collect."
+                )
+                await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+                assert session_inbox.qsize() == 1
+                collected = await client.post(
+                    f"/v1/sessions/{parent_id}/mcp/execute",
+                    json={"method": "tools/call", "params": {"name": "sys_read_inbox"}},
+                )
+                assert "WORKER_DONE" in collected.json()["result"]["output"]
+            else:
+                assert output == "Inbox is empty — no completed tasks."
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+    assert session_inbox.empty()
+    assert len(server_client.wake_posts) == (1 if ending == "child_finishes" else 0)
+
+
 @pytest.mark.asyncio
 async def test_external_status_for_untracked_session_does_not_wake() -> None:
     """

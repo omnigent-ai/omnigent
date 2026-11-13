@@ -208,6 +208,7 @@ from omnigent.runner.subagent_work import (
     unregister_subagent_work_for_session,
     wrapper_label_from_labels,
 )
+from omnigent.runner.tool_dispatch import release_inbox_waits
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     build_instructions,
@@ -8039,12 +8040,18 @@ def create_runner_app(
 
         if body_type == "interrupt":
             _cancel_claude_prompt_waiter(conversation_id)
+            release_inbox_waits(conversation_id)
             _harness = _session_harness_name(conversation_id)
             resource_registry.note_terminal_control_request(conversation_id, "interrupt")
             _interrupt_resp = await _native_interrupt_runner.interrupt(_harness, conversation_id)
             if _interrupt_resp is not None:
                 return _interrupt_resp
             await _cancel_inprocess_turn(conversation_id)
+            return Response(status_code=204)
+
+        if body_type == "external_session_interrupted":
+            # The harness interrupted its own turn (e.g. Esc in its terminal UI).
+            release_inbox_waits(conversation_id)
             return Response(status_code=204)
 
         if body_type == "external_session_status":
