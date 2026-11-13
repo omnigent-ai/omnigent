@@ -39,6 +39,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -3155,6 +3156,7 @@ def augment_claude_args(
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
     active_harnesses: Collection[str] | None = None,
+    defer_caller_settings: bool = False,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -3208,6 +3210,8 @@ def augment_claude_args(
         Routing on, threaded to :func:`build_hook_settings` so the
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
+    :param defer_caller_settings: Preserve caller settings until the runner can
+        read their files under the terminal's resolved sandbox.
     :returns: Augmented argument list for the terminal resource.
     """
     hook_settings = build_hook_settings(
@@ -3228,9 +3232,10 @@ def augment_claude_args(
 
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
-    args, caller_settings = _pop_caller_settings(args, workspace=workspace)
-    if caller_settings:
-        hook_settings = _merge_caller_settings(hook_settings, caller_settings, bridge_dir)
+    if not defer_caller_settings:
+        args, caller_settings = _pop_caller_settings(args, workspace=workspace)
+        if caller_settings:
+            hook_settings = _merge_caller_settings(hook_settings, caller_settings, bridge_dir)
     hook_settings = apply_claude_settings(
         hook_settings, executor="claude-native", active_harnesses=active_harnesses
     )
@@ -3426,9 +3431,12 @@ _CLAUDE_REQUIRED_VALUE_FLAGS = frozenset(
 )
 
 
-def _read_caller_settings(path: Path) -> str:
+def _read_caller_settings(path: Path, *, nofollow: bool = False) -> str:
     """Read at most 1 MiB from a regular file without blocking on a FIFO."""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    if nofollow:
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > _CALLER_SETTINGS_MAX_BYTES:
@@ -3446,8 +3454,18 @@ def _read_caller_settings(path: Path) -> str:
         os.close(fd)
 
 
+def _finite_settings_number(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("caller settings require finite JSON numbers")
+    return number
+
+
 def _pop_caller_settings(
-    args: list[str], *, workspace: Path | None
+    args: list[str],
+    *,
+    workspace: Path | None,
+    read_file: Callable[[Path], str] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """
     Remove caller ``--settings`` flags from ``args`` and return their parsed values.
@@ -3459,6 +3477,8 @@ def _pop_caller_settings(
 
     :param args: Claude CLI argument list.
     :param workspace: Terminal workspace for relative settings paths.
+    :param read_file: Reader authorized by the terminal's resolved policy.
+        Without one, file flags remain untouched.
     :returns: ``(args without the merged flags, parsed settings in flag order)``.
     """
     kept: list[str] = []
@@ -3487,7 +3507,17 @@ def _pop_caller_settings(
             settings_path = Path(value)
             if not inline and not settings_path.is_absolute() and workspace is not None:
                 settings_path = workspace / settings_path
-            parsed = json.loads(value if inline else _read_caller_settings(settings_path))
+            if inline:
+                payload = value
+            else:
+                if read_file is None:
+                    raise ValueError("caller settings files require the terminal read policy")
+                payload = read_file(settings_path)
+            parsed = json.loads(
+                payload,
+                parse_float=_finite_settings_number,
+                parse_constant=_finite_settings_number,
+            )
         except (OSError, ValueError, RecursionError):
             parsed = None
         if isinstance(parsed, dict):
@@ -3496,6 +3526,83 @@ def _pop_caller_settings(
             kept.extend(args[i : i + step])
         i += step
     return kept, found
+
+
+async def finalize_claude_caller_settings(
+    instance: TerminalInstance,
+    *,
+    bridge_dir: Path,
+    active_harnesses: Collection[str] | None = None,
+) -> None:
+    """Merge deferred settings using the new terminal's actual filesystem view.
+
+    ``bridge_dir`` must be framework-derived. Caller files use the instance's
+    existing helper under an active sandbox; unsandboxed panes use bounded reads.
+    The separate framework baseline is opened without following a symlink.
+    """
+    from omnigent.mcp_disabled_servers import apply_claude_settings
+
+    args = instance.args
+    environment = instance.os_env
+    if environment is None:
+        raise ValueError("caller settings require the terminal filesystem environment")
+    settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
+    workspace = environment.cwd
+    paths: set[Path] = set()
+    has_bridge_settings = False
+
+    def collect(path: Path) -> str:
+        nonlocal has_bridge_settings
+        if path == settings_path:
+            has_bridge_settings = True
+        else:
+            paths.add(path)
+        raise ValueError("settings read is deferred")
+
+    _, inline_callers = _pop_caller_settings(args, workspace=workspace, read_file=collect)
+    if not has_bridge_settings or not (paths or inline_callers):
+        return
+    contents: dict[Path, str] = {}
+    for path in paths:
+        try:
+            if instance.sandbox_policy is None or not instance.sandbox_policy.active:
+                contents[path] = await asyncio.to_thread(_read_caller_settings, path)
+            else:
+                result = await environment.read(
+                    str(path), max_bytes=_CALLER_SETTINGS_MAX_BYTES, regular_only=True
+                )
+                content = result.get("content")
+                if (
+                    not result.get("error")
+                    and not result.get("truncated")
+                    and result.get("encoding") == "utf-8"
+                    and isinstance(content, str)
+                ):
+                    contents[path] = content
+        except (OSError, ValueError):
+            pass
+
+    def read_file(path: Path) -> str:
+        if path == settings_path or path not in contents:
+            raise ValueError("settings file is unavailable under the terminal policy")
+        return contents[path]
+
+    kept, callers = _pop_caller_settings(args, workspace=workspace, read_file=read_file)
+    if callers:
+        _ensure_secure_dir(bridge_dir)
+        baseline = json.loads(
+            await asyncio.to_thread(_read_caller_settings, settings_path, nofollow=True),
+            parse_float=_finite_settings_number,
+            parse_constant=_finite_settings_number,
+        )
+        if not isinstance(baseline, dict):
+            raise ValueError("required bridge settings are unavailable under the terminal policy")
+        settings = _merge_caller_settings(baseline, callers, bridge_dir)
+        settings = apply_claude_settings(
+            settings, executor="claude-native", active_harnesses=active_harnesses
+        )
+        _write_json_file(settings_path, settings)
+    instance.args = kept
 
 
 def _merge_caller_settings(

@@ -39,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -256,6 +256,7 @@ class TerminalRegistry:
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
+        prepare_terminal: Callable[[TerminalInstance], Awaitable[None]] | None = None,
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
 
@@ -268,6 +269,8 @@ class TerminalRegistry:
         was created.
 
         :param program_status_app: Opt-in runtime PTY relay application identity.
+        :param prepare_terminal: Framework preparation after filesystem creation,
+            once per new instance, before its process starts.
         :param conversation_id: The owning conversation id, e.g.
             ``"conv_abc123"``.
         :param terminal_name: The terminal's spec name from
@@ -337,6 +340,10 @@ class TerminalRegistry:
         try:
             created.instance.program_status_app = program_status_app
             created.instance.lifecycle_trace.transfer_session(conversation_id)
+            if prepare_terminal is not None:
+                stage = "terminal_prepare"
+                await prepare_terminal(created.instance)
+            stage = "terminal_spawn"
             await created.instance.launch(cwd=created.cwd)
             stage = "terminal_liveness"
             if not await created.instance.is_alive():

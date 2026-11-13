@@ -19,12 +19,12 @@ import re
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict
 
 from cachetools import TTLCache
 
@@ -57,6 +57,12 @@ if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.spec.types import AgentSpec
     from omnigent.terminals.registry import TerminalRegistry
+
+
+class _TerminalLaunchOptions(TypedDict, total=False):
+    program_status_app: str
+    prepare_terminal: Callable[[TerminalInstance], Awaitable[None]]
+
 
 _logger = logging.getLogger(__name__)
 
@@ -1474,6 +1480,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        prepare_terminal: Callable[[TerminalInstance], Awaitable[None]] | None = None,
     ) -> SessionResourceView:
         """Launch a terminal required for the owning session to execute.
 
@@ -1494,6 +1501,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            prepare_terminal=prepare_terminal,
         )
 
     async def launch_auxiliary_terminal(
@@ -1507,6 +1515,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        prepare_terminal: Callable[[TerminalInstance], Awaitable[None]] | None = None,
     ) -> SessionResourceView:
         """Launch a terminal resource attached to the owning session.
 
@@ -1527,6 +1536,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            prepare_terminal=prepare_terminal,
         )
 
     async def _launch_terminal_with_lifecycle(
@@ -1541,6 +1551,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        prepare_terminal: Callable[[TerminalInstance], Awaitable[None]] | None = None,
     ) -> SessionResourceView:
         """Launch a terminal, then observe it with the requested lifecycle."""
         if self._terminal_registry is None:
@@ -1549,12 +1560,13 @@ class SessionResourceRegistry:
         from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
         spec = replace(spec, env={**spec.env, **self.client_surface_env(session_id)})
-        program_status_args = (
-            {"program_status_app": "claude-code"}
-            if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
-            and self._feature_flags.enabled(Feature.CLAUDE_OSC_STATUS)
-            else {}
-        )
+        launch_options: _TerminalLaunchOptions = {}
+        if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE and self._feature_flags.enabled(
+            Feature.CLAUDE_OSC_STATUS
+        ):
+            launch_options["program_status_app"] = "claude-code"
+        if prepare_terminal is not None:
+            launch_options["prepare_terminal"] = prepare_terminal
         try:
             instance = await self._terminal_registry.launch(
                 conversation_id=session_id,
@@ -1564,7 +1576,7 @@ class SessionResourceRegistry:
                 parent_os_env=parent_os_env,
                 cwd_override=cwd_override,
                 sandbox_override=sandbox_override,
-                **program_status_args,
+                **launch_options,
             )
         except TerminalExitedDuringLaunch as exc:
             await self._finalize_terminal_exit(

@@ -1541,7 +1541,8 @@ async def test_auto_create_claude_terminal_cleans_routers_when_preparation_fails
         shutdowns.append(("turn", router))
 
     def failing_seed(_workspace: Path, env: dict[str, str] | None = None) -> None:
-        raise ValueError("config is not a JSON object")
+        if failure == "trust":
+            raise ValueError("config is not a JSON object")
 
     monkeypatch.setattr(
         orchestration,
@@ -1565,6 +1566,25 @@ async def test_auto_create_claude_terminal_cleans_routers_when_preparation_fails
             "_build_claude_native_base_args",
             lambda **_kwargs: ("--settings", json.dumps({failure: True})),
         )
+
+        async def prepare_before_launch(**kwargs):
+            from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+            from omnigent.inner.terminal import create_terminal_instance
+
+            created = create_terminal_instance(
+                "claude",
+                "main",
+                TerminalEnvSpec(
+                    args=kwargs["spec"].args,
+                    os_env=OSEnvSpec(cwd=str(bridge_dir), sandbox=OSEnvSandboxSpec(type="none")),
+                ),
+            )
+            try:
+                await kwargs["prepare_terminal"](created.instance)
+            finally:
+                await created.instance.close()
+
+        registry.launch_required_terminal.side_effect = prepare_before_launch
     expected_error = "config is not a JSON object" if failure == "trust" else failure
     with pytest.raises(ValueError, match=expected_error):
         await _auto_create_claude_terminal_for_test(
@@ -1580,7 +1600,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_preparation_fails
     if turn_started:
         expected.append(("turn", turn_router))
     assert shutdowns == expected
-    registry.launch_required_terminal.assert_not_called()
+    assert registry.launch_required_terminal.call_count == (failure != "trust")
 
 
 @pytest.mark.parametrize(

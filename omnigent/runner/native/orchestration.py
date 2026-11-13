@@ -9868,6 +9868,32 @@ async def _auto_create_claude_terminal(
         auto_harness=launch_metadata.auto_harness,
     )
     _claude_turn_router = None
+
+    async def cleanup_owned_routers(error: BaseException) -> None:
+        # No forwarder owns the routers yet, so release the ones this launch started.
+        # A ``None`` handle would shut down whichever router is registered now.
+        cleanups: list[Coroutine[Any, Any, None]] = []
+        if _subagent_router is not None:
+            cleanups.append(_shutdown_session_router_async(session_id, _subagent_router))
+        if _claude_turn_router is not None:
+            cleanups.append(_shutdown_session_turn_router_async(session_id, _claude_turn_router))
+        cancelled: asyncio.CancelledError | None = None
+        for cleanup in cleanups:
+            try:
+                await cleanup
+            except asyncio.CancelledError as exc:
+                # Release the other router before honoring the cancellation.
+                cancelled = exc
+            except Exception:  # keep the preparation failure as the error.
+                _logger.warning(
+                    "Router cleanup failed after Claude preparation failed: session=%s",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+        if cancelled is not None:
+            raise cancelled from error
+
     try:
         # First-message model routing. Advertised in the same bridge dir the
         # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of its
@@ -9898,6 +9924,7 @@ async def _auto_create_claude_terminal(
             _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
         claude_args = augment_claude_args(
             base_claude_args,
+            defer_caller_settings=True,
             active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
             bridge_dir=bridge_dir,
             workspace=Path(workspace),
@@ -9920,8 +9947,8 @@ async def _auto_create_claude_terminal(
             turn_routing=_claude_turn_router is not None,
         )
 
-        # Share startup overrides with the local CLI path. Wrapper arguments
-        # prepend the augmented Claude arguments; their settings bypass the caller merge.
+        # Share startup overrides with the local CLI path. Prepending configured
+        # arguments preserves their precedence in terminal settings finalization.
         from omnigent.config import load_effective_config  # noqa: FlagLocalImports
         from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
             resolve_harness_args,
@@ -9987,35 +10014,22 @@ async def _auto_create_claude_terminal(
             # the watcher reports the exit deterministically via `#{pane_dead}`.
             keep_alive_after_exit=True,
         )
+        from omnigent.harnesses.claude_native.bridge import finalize_claude_caller_settings
+
+        async def prepare_claude(instance: TerminalInstance) -> None:
+            await finalize_claude_caller_settings(
+                instance,
+                bridge_dir=bridge_dir,
+                active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+            )
+
         # Seed trust and onboarding in the config selected by the terminal's launch environment.
         ensure_claude_workspace_trusted(
             _claude_terminal_launch_cwd(env_spec, agent_os_env),
             env=_claude_terminal_launch_env(env_spec),
         )
     except BaseException as prepare_error:
-        # No forwarder owns the routers yet, so release the ones this launch started.
-        # A ``None`` handle would shut down whichever router is registered now.
-        cleanups: list[Coroutine[Any, Any, None]] = []
-        if _subagent_router is not None:
-            cleanups.append(_shutdown_session_router_async(session_id, _subagent_router))
-        if _claude_turn_router is not None:
-            cleanups.append(_shutdown_session_turn_router_async(session_id, _claude_turn_router))
-        cancelled: asyncio.CancelledError | None = None
-        for cleanup in cleanups:
-            try:
-                await cleanup
-            except asyncio.CancelledError as exc:
-                # Release the other router before honoring the cancellation.
-                cancelled = exc
-            except Exception:  # keep the preparation failure as the error.
-                _logger.warning(
-                    "Router cleanup failed after Claude preparation failed: session=%s",
-                    session_id,
-                    exc_info=True,
-                    extra={"session_id": session_id},
-                )
-        if cancelled is not None:
-            raise cancelled from prepare_error
+        await cleanup_owned_routers(prepare_error)
         raise
     _logger.info(
         "Claude terminal tmux launch requested: session=%s command=%s args_count=%d "
@@ -10039,8 +10053,10 @@ async def _auto_create_claude_terminal(
             # Mark this as the claude-native agent terminal so its pane
             # activity drives the session's PTY-derived working status.
             resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+            prepare_terminal=prepare_claude,
         )
     except (Exception, asyncio.CancelledError) as launch_error:
+        await cleanup_owned_routers(launch_error)
         # Preserve the original failure even if diagnostic cleanup is cancelled.
         if not isinstance(launch_error, asyncio.CancelledError):
             _logger.exception(

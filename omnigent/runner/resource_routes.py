@@ -604,7 +604,24 @@ def register_resource_routes(
             ):
                 launched_relay = relay_after.relay
 
+        prepare_claude: Callable[[TerminalInstance], Awaitable[None]] | None = None
         try:
+            if bridge_inject:
+                from omnigent.harnesses.claude_native.bridge import (
+                    bridge_dir_for_bridge_id,
+                    finalize_claude_caller_settings,
+                )
+                from omnigent.runner.identity import (
+                    runner_mcp_disabled_servers_active_harnesses,
+                )
+
+                async def prepare_claude(instance: TerminalInstance) -> None:
+                    await finalize_claude_caller_settings(
+                        instance,
+                        bridge_dir=bridge_dir_for_bridge_id(bridge_id),
+                        active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
+                    )
+
             launch_method = (
                 resource_registry.launch_required_terminal
                 if bridge_inject
@@ -619,8 +636,9 @@ def register_resource_routes(
                 sandbox_override=sandbox_override,
                 parent_os_env=agent_os_env,
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
+                **({"prepare_terminal": prepare_claude} if bridge_inject else {}),
             )
-        except RuntimeError as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)
             return JSONResponse(
@@ -632,6 +650,11 @@ def register_resource_routes(
                     }
                 },
             )
+
+        except BaseException:
+            if launched_relay is not None:
+                _discard_comment_relay(session_id, launched_relay)
+            raise
 
         if bridge_inject:
             _publish_tmux_target_for_bridge(

@@ -5018,9 +5018,30 @@ def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> Non
     assert disallowed == ["Bash", "Edit"]
 
 
-@pytest.mark.parametrize("relative_path", [False, True], ids=["absolute", "workspace-relative"])
-def test_augment_claude_args_merges_caller_settings(
-    tmp_path: Path, relative_path: bool, monkeypatch: pytest.MonkeyPatch
+async def _finalize_test_claude_args(args, *, bridge_dir, os_env_spec):
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.inner.terminal import create_terminal_instance
+
+    created = create_terminal_instance(
+        "claude", "settings", TerminalEnvSpec(args=args, os_env=os_env_spec)
+    )
+    try:
+        await claude_native_bridge.finalize_claude_caller_settings(
+            created.instance, bridge_dir=bridge_dir
+        )
+        return created.instance.args
+    finally:
+        await created.instance.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "relative_path,filesystem_mode",
+    [(False, "none"), (True, "none"), (True, "default"), (True, "fork")],
+    ids=["absolute", "workspace-relative", "default-policy", "forked-workspace"],
+)
+async def test_augment_claude_args_merges_caller_settings(
+    tmp_path: Path, relative_path: bool, filesystem_mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
     A caller ``--settings`` is merged into the invocation settings, not dropped.
@@ -5076,7 +5097,20 @@ def test_augment_claude_args_merges_caller_settings(
         ),
         bridge_dir=bridge_dir,
         workspace=tmp_path,
+        defer_caller_settings=True,
         ap_server_url="https://example.test",
+    )
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    args = await _finalize_test_claude_args(
+        args,
+        bridge_dir=bridge_dir,
+        os_env_spec=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=None if filesystem_mode == "default" else OSEnvSandboxSpec(type="none"),
+            fork=filesystem_mode == "fork",
+        ),
     )
 
     assert args.count("--settings") == 1
@@ -5105,11 +5139,9 @@ def test_augment_claude_args_merges_caller_settings(
         assert all(entry in settings["hooks"][event] for entry in entries)
 
 
-@pytest.mark.parametrize("flag", ["--append-system-prompt", "--system-prompt", "--name"])
-def test_augment_claude_args_preserves_settings_like_option_values(
-    tmp_path: Path, flag: str
-) -> None:
+def test_augment_claude_args_preserves_settings_like_option_values(tmp_path: Path) -> None:
     """A settings-looking operand remains prompt text or an option value."""
+    flag = "--append-system-prompt"
     literal = '--settings={"env":{"EXAMPLE_KEY":"value"}}'
     args = augment_claude_args(
         (flag, literal),
@@ -5120,6 +5152,13 @@ def test_augment_claude_args_preserves_settings_like_option_values(
     settings = _load_invocation_settings(args)
     assert "EXAMPLE_KEY" not in settings.get("env", {})
     assert settings["hooks"]["PreToolUse"]
+
+
+@pytest.mark.parametrize("flag", ["--system-prompt", "--name"])
+def test_pop_caller_settings_preserves_option_values(flag: str) -> None:
+    literal = '--settings={"env":{"EXAMPLE_KEY":"value"}}'
+    args = [flag, literal]
+    assert claude_native_bridge._pop_caller_settings(args, workspace=None) == (args, [])
 
 
 @pytest.mark.parametrize("flag", ["disableAllHooks", "allowManagedHooksOnly"])
@@ -5142,6 +5181,7 @@ def test_augment_claude_args_rejects_settings_that_disable_bridge_hooks(
         assert settings["hooks"]["UserPromptSubmit"]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("contents", "inline"),
     [
@@ -5151,6 +5191,15 @@ def test_augment_claude_args_rejects_settings_that_disable_bridge_hooks(
         (b"\xff", False),
         (b'{"x":' + b"[" * 10000 + b"0", False),
         (b'{"x":' + b"[" * 10000 + b"0", True),
+        *[
+            pytest.param(
+                ('{"nested":[{"value":' + value + "}]}").encode(),
+                inline,
+                id=f"non-finite-{value}-{'inline' if inline else 'file'}",
+            )
+            for value in ("NaN", "Infinity", "-Infinity", "1e999")
+            for inline in (False, True)
+        ],
         (b" " * claude_native_bridge._CALLER_SETTINGS_MAX_BYTES + b"{}", False),
         pytest.param(
             "fifo",
@@ -5168,11 +5217,12 @@ def test_augment_claude_args_rejects_settings_that_disable_bridge_hooks(
         "invalid-utf8",
         "deep-file",
         "deep-inline",
+        *([None] * 8),
         "oversized",
         "fifo",
     ],
 )
-def test_augment_claude_args_passes_unreadable_caller_settings_through(
+async def test_augment_claude_args_passes_unreadable_caller_settings_through(
     tmp_path: Path, contents: bytes | str | None, inline: bool
 ) -> None:
     """A ``--settings`` value that is not a readable JSON object is left to Claude."""
@@ -5183,10 +5233,141 @@ def test_augment_claude_args_passes_unreadable_caller_settings_through(
         Path(missing).write_bytes(contents)
 
     value = contents.decode() if inline and isinstance(contents, bytes) else missing
-    args = augment_claude_args(("--settings", value), bridge_dir=tmp_path)
+    args = augment_claude_args(
+        ("--settings", value), bridge_dir=tmp_path, defer_caller_settings=True
+    )
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    args = await _finalize_test_claude_args(
+        args,
+        bridge_dir=tmp_path,
+        os_env_spec=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
 
     assert args[:2] == ["--settings", value]
     assert args.count("--settings") == 2
+    settings = _load_invocation_settings(args[2:])
+    assert "nested" not in settings
+    json.dumps(settings, allow_nan=False)
+
+
+@pytest.mark.asyncio
+async def test_caller_settings_reuses_existing_terminal_filesystem_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.terminal import TerminalInstance
+
+    path = tmp_path / "settings.json"
+    path.write_text('{"env":{"SETTINGS_VIEW":"host"}}')
+    environment = Mock(spec=OSEnvironment, cwd=tmp_path)
+    environment.read = AsyncMock(
+        return_value={"content": '{"env":{"SETTINGS_VIEW":"overlay"}}', "encoding": "utf-8"}
+    )
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "socket",
+        private_dir=tmp_path,
+        os_env=environment,
+        sandbox_policy=Mock(active=True),
+        args=augment_claude_args(
+            ("--settings", "settings.json"), bridge_dir=tmp_path, defer_caller_settings=True
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.os_env.create_os_environment",
+        Mock(side_effect=AssertionError("must reuse the terminal environment")),
+    )
+    await claude_native_bridge.finalize_claude_caller_settings(instance, bridge_dir=tmp_path)
+    settings = _load_invocation_settings(instance.args)
+    assert settings["env"]["SETTINGS_VIEW"] == "overlay"
+    environment.read.assert_awaited_once_with(
+        str(path), max_bytes=claude_native_bridge._CALLER_SETTINGS_MAX_BYTES, regular_only=True
+    )
+    environment.close.assert_not_called()
+    assert json.loads(path.read_text())["env"]["SETTINGS_VIEW"] == "host"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("bwrap") is None, reason="requires Linux and bwrap"
+)
+async def test_caller_settings_follow_terminal_filesystem_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    allowed = tmp_path / "permitted"
+    allowed.mkdir()
+    allowed_file = allowed / "settings.json"
+    allowed_file.write_text('{"env":{"PERMITTED":"yes","ORDER":"file"}}')
+    denied_file = tmp_path / "private.json"
+    denied_file.write_text('{"env":{"DENIED":"outside"}}')
+    hidden_file = workspace / ".private.json"
+    hidden_file.write_text('{"env":{"DENIED":"hidden"}}')
+    (workspace / "escape.json").symlink_to(denied_file)
+    args = augment_claude_args(
+        (
+            "--settings",
+            str(denied_file),
+            "--settings",
+            "../private.json",
+            "--settings",
+            "escape.json",
+            "--settings",
+            ".private.json",
+            "--settings",
+            str(allowed_file),
+            '--settings={"env":{"ORDER":"inline"}}',
+        ),
+        bridge_dir=bridge_dir,
+        workspace=workspace,
+        defer_caller_settings=True,
+        ap_server_url="https://example.test",
+    )
+
+    original_read = claude_native_bridge._read_caller_settings
+
+    def unexpected_runner_read(path: Path, *, nofollow: bool = False) -> str:
+        assert path == bridge_dir / "claude-settings.json" and nofollow
+        return original_read(path, nofollow=nofollow)
+
+    monkeypatch.setattr(claude_native_bridge, "_read_caller_settings", unexpected_runner_read)
+    args = await _finalize_test_claude_args(
+        args,
+        bridge_dir=bridge_dir,
+        os_env_spec=OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap",
+                read_paths=[
+                    str(Path(__file__).resolve().parents[3]),
+                    str(Path(sys.prefix).resolve()),
+                    str(allowed),
+                ],
+            ),
+        ),
+    )
+    settings = json.loads((bridge_dir / "claude-settings.json").read_text())
+    assert settings["env"]["PERMITTED"] == "yes"
+    assert settings["env"]["ORDER"] == "inline"
+    assert "DENIED" not in settings["env"]
+    assert settings["hooks"]["PreToolUse"]
+    assert str(allowed_file) not in args
+    assert str(denied_file) in args
+    assert "../private.json" in args
+    assert "escape.json" in args
+    assert ".private.json" in args
 
 
 def test_augment_claude_args_injects_plugin_dir_for_bundle_with_skills(

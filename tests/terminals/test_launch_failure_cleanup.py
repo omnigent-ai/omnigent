@@ -361,3 +361,51 @@ async def test_cancelled_launch_reaps_real_tmux(
             await task
         for instance in created:
             await instance.close()
+
+
+@requires_tmux
+@pytest.mark.parametrize("outcome", ["success", "error", "cancelled"])
+async def test_preparation_uses_new_instance_once_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    created = _capture_instances(monkeypatch)
+    calls = []
+
+    async def launch(instance, *, cwd=None):
+        assert calls == [instance]
+        instance.running = True
+
+    async def prepare(instance):
+        assert instance is created[0]
+        assert instance.os_env is created[0].os_env
+        assert not instance.running
+        calls.append(instance)
+        if outcome == "error":
+            raise ValueError("settings rejected")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(TerminalInstance, "launch", launch)
+    monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+    terminal_registry = TerminalRegistry()
+    try:
+        if outcome == "success":
+            first = await terminal_registry.launch(
+                "settings", "shell", "main", _spec(tmp_path), prepare_terminal=prepare
+            )
+            second = await terminal_registry.launch(
+                "settings", "shell", "main", _spec(tmp_path), prepare_terminal=prepare
+            )
+            assert first is second
+            assert calls == [first]
+        else:
+            error = ValueError if outcome == "error" else asyncio.CancelledError
+            with pytest.raises(error):
+                await terminal_registry.launch(
+                    "settings", "shell", "main", _spec(tmp_path), prepare_terminal=prepare
+                )
+            assert len(calls) == 1
+            assert not created[0].private_dir.exists()
+            assert terminal_registry.list_for_conversation("settings") == []
+    finally:
+        await terminal_registry.shutdown()

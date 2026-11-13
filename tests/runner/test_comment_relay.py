@@ -178,6 +178,7 @@ class _StubResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: object | None = None,
         resource_role: str | None = None,
+        prepare_terminal: Any = None,
     ) -> SessionResourceView:
         """Return a required terminal resource view for a fake instance."""
         return await self._launch(
@@ -1902,3 +1903,90 @@ async def test_failed_launch_rolls_back_only_new_relay(
                 await c.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
         shutil.rmtree(next_bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disable_hooks", [False, True])
+async def test_cli_caller_settings_finalize_under_terminal_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, disable_hooks: bool
+) -> None:
+    from omnigent.harnesses.claude_native.main import _claude_terminal_request
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    agent_id = "settings-agent"
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    spec = _spec_without_terminals()
+    spec.os_env = OSEnvSpec(
+        type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+    )
+    app = _switch_app(tmp_path, _SwitchableServerClient(agent_id), {agent_id: spec})
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    settings_file = tmp_path / "caller.json"
+    settings_file.write_text(
+        json.dumps(
+            {"env": {"ORDER": "file", "FROM_FILE": "yes"}, "disableAllHooks": disable_hooks}
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+    body = _claude_terminal_request(
+        ("--settings", str(settings_file), '--settings={"env":{"ORDER":"inline"}}'),
+        command="claude",
+        bridge_dir=bridge_dir,
+    )
+    # The CLI has not consumed files before the runner selects its policy.
+    assert str(settings_file) in body["spec"]["args"]
+    baseline = json.loads((bridge_dir / "claude-settings.json").read_text())
+    assert "FROM_FILE" not in baseline.get("env", {})
+    finalized = []
+    original = bridge.finalize_claude_caller_settings
+
+    async def record(instance, **kwargs):
+        assert instance.sandbox_policy is None
+        assert instance.os_env.cwd == tmp_path
+        await original(instance, **kwargs)
+        finalized.append(instance.args)
+
+    original_launch = _StubResourceRegistry.launch_required_terminal
+
+    async def launch(self, **kwargs):
+        from omnigent.inner.terminal import create_terminal_instance
+
+        created = create_terminal_instance(
+            kwargs["terminal_name"],
+            kwargs["session_key"],
+            kwargs["spec"],
+            parent_os_env_spec=kwargs["parent_os_env"],
+        )
+        try:
+            await kwargs["prepare_terminal"](created.instance)
+            kwargs["spec"].args = created.instance.args
+            return await original_launch(self, **kwargs)
+        finally:
+            await created.instance.close()
+
+    monkeypatch.setattr(_StubResourceRegistry, "launch_required_terminal", launch)
+
+    monkeypatch.setattr(bridge, "finalize_claude_caller_settings", record)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            response = await client.post(
+                f"/v1/sessions/{session_id}/resources/terminals", json=body
+            )
+            if disable_hooks:
+                assert response.status_code == 500, response.text
+                assert response.json()["error"]["code"] == "terminal_launch_failed"
+                assert not finalized
+                assert not (bridge_dir / _TOOL_RELAY_FILE).exists()
+            else:
+                assert response.status_code == 200, response.text
+                assert len(finalized) == 1
+                assert str(settings_file) not in finalized[0]
+                settings = json.loads((bridge_dir / "claude-settings.json").read_text())
+                assert settings["env"]["FROM_FILE"] == "yes"
+                assert settings["env"]["ORDER"] == "inline"
+                assert settings["hooks"] == baseline["hooks"]
+            await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)

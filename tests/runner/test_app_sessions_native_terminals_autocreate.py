@@ -118,6 +118,7 @@ class _RecordingClaudeRegistry(SessionResourceRegistry):
         spec: Any,
         resource_role: str | None = None,
         parent_os_env: Any = None,
+        prepare_terminal: Any = None,
     ) -> SessionResourceView:
         """Record the spec and return a terminal resource view."""
         del terminal_name, session_key
@@ -299,6 +300,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Record the launch and return a terminal resource view."""
             captured["terminal_name"] = terminal_name
@@ -1179,6 +1181,7 @@ async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolate
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             del parent_os_env
             captured["terminal_name"] = terminal_name
@@ -1401,6 +1404,7 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Record the spec + parent_os_env and return a resource view."""
             del terminal_name, session_key
@@ -1856,6 +1860,7 @@ async def test_auto_create_native_terminal_inherits_agent_sandbox(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Record the spec + parent_os_env and end the builder here."""
             del session_id, session_key, resource_role
@@ -2434,6 +2439,7 @@ async def test_auto_create_claude_terminal_passes_startup_instructions(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             del terminal_name, session_key
             captured["spec"] = spec
@@ -2529,6 +2535,7 @@ async def test_auto_create_claude_terminal_inherits_agent_sandbox(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Record the spec + parent_os_env and return a resource view."""
             del terminal_name, session_key
@@ -2841,6 +2848,7 @@ async def test_auto_create_claude_terminal_does_not_cache_transient_resolver_fai
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             del terminal_name, session_key, spec, resource_role, parent_os_env
             return SessionResourceView(
@@ -2974,6 +2982,7 @@ async def _run_auto_create_cursor_terminal(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Record the spec and return a terminal resource view."""
             del terminal_name, session_key, resource_role
@@ -3289,6 +3298,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Return a terminal resource view without spawning a TTY."""
             del terminal_name, session_key
@@ -3719,6 +3729,7 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             del terminal_name, session_key, spec
             return SessionResourceView(
@@ -3803,6 +3814,7 @@ async def test_auto_create_claude_terminal_emits_resource_created_event(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Return the terminal resource view the runner would launch."""
             del spec
@@ -4085,6 +4097,7 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Return a minimal terminal view so the launch doesn't error."""
             del spec
@@ -4209,6 +4222,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Return a minimal terminal view so the launch doesn't error."""
             del spec, resource_role
@@ -4310,6 +4324,7 @@ class _LiveClaudeResourceRegistry(SessionResourceRegistry):
         spec: Any,
         resource_role: str | None = None,
         parent_os_env: Any = None,
+        prepare_terminal: Any = None,
     ) -> SessionResourceView:
         """Return a running terminal view."""
         del spec, resource_role, parent_os_env
@@ -6011,6 +6026,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Record the spec and return a terminal resource view."""
             del terminal_name, session_key
@@ -6144,6 +6160,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             del terminal_name, session_key
             captured["spec"] = spec

@@ -279,3 +279,63 @@ async def test_session_cleanup_leaves_other_session_independent(cow_spec, tmp_pa
     finally:
         await registry.cleanup_session("first")
         await registry.cleanup_session("second")
+
+
+@pytest.mark.asyncio
+async def test_claude_settings_prepare_reads_shared_terminal_overlay(
+    cow_spec, tmp_path, monkeypatch
+):
+    import json
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner.terminal import TerminalInstance
+    from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
+
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    cow_spec.sandbox.read_paths.append(str(Path(sys.prefix).resolve()))
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    settings_file = tmp_path / "dependencies/settings.json"
+    settings_file.write_text('{"env":{"SETTINGS_VIEW":"host"}}')
+    args = bridge.augment_claude_args(
+        ("--settings", "dependencies/settings.json"),
+        bridge_dir=bridge_dir,
+        defer_caller_settings=True,
+    )
+    terminals = TerminalRegistry()
+    resources = SessionResourceRegistry(terminal_registry=terminals, runner_workspace=tmp_path)
+    environment = resources._resolve_primary("settings", None, os_env_spec=cow_spec)
+    assert "error" not in await environment.write(
+        "dependencies/settings.json", '{"env":{"SETTINGS_VIEW":"overlay"}}'
+    )
+    prepared = []
+
+    async def prepare(instance):
+        assert instance.os_env.copy_on_write_environment is environment.copy_on_write_environment
+        assert not instance.running
+        await bridge.finalize_claude_caller_settings(instance, bridge_dir=bridge_dir)
+        prepared.append(instance)
+
+    async def launch(instance, *, cwd=None):
+        assert prepared == [instance]
+        instance.running = True
+
+    monkeypatch.setattr(TerminalInstance, "launch", launch)
+    monkeypatch.setattr(TerminalInstance, "is_alive", AsyncMock(return_value=True))
+    try:
+        await resources.launch_required_terminal(
+            "settings",
+            "claude",
+            "main",
+            TerminalEnvSpec(command="claude", args=args, os_env="inherit"),
+            parent_os_env=cow_spec,
+            resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+            prepare_terminal=prepare,
+        )
+        settings = json.loads((bridge_dir / "claude-settings.json").read_text())
+        assert settings["env"]["SETTINGS_VIEW"] == "overlay"
+        assert json.loads(settings_file.read_text())["env"]["SETTINGS_VIEW"] == "host"
+    finally:
+        await resources.cleanup_session("settings")
