@@ -16,7 +16,7 @@ from enum import IntEnum
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -30,7 +30,6 @@ from omnigent.db.db_models import (
     SqlSessionSpawn,
     SqlSessionSpawnEpoch,
     SqlSessionSpawnPayload,
-    Uuid16,
     current_workspace_id,
     uuid_to_bytes,
     workspace_scope,
@@ -631,19 +630,30 @@ class SessionSpawnStore:
                 SqlFile.id.in_(mapping.values()),
             )
         )
-        orphaned = [
-            key
-            for key in sorted(blob_keys)
-            if session.scalar(
+        orphaned = []
+        for key in sorted(blob_keys):
+            blob_reference = (
                 select(SqlFile.id)
                 .where(
                     SqlFile.workspace_id == current_workspace_id(),
-                    func.coalesce(SqlFile.blob_key, SqlFile.id, type_=Uuid16()) == key,
+                    SqlFile.blob_key == key,
                 )
                 .limit(1)
+                .exists()
             )
-            is None
-        ]
+            legacy_reference = (
+                select(SqlFile.id)
+                .where(
+                    SqlFile.workspace_id == current_workspace_id(),
+                    SqlFile.id == key,
+                    SqlFile.blob_key.is_(None),
+                )
+                .limit(1)
+                .exists()
+            )
+            # Both reference forms must be observed in the same statement snapshot.
+            if not session.scalar(select(or_(blob_reference, legacy_reference))):
+                orphaned.append(key)
         row.state = SpawnState.ABORTING if orphaned else SpawnState.ABORTED
         row.phase = SpawnPhase.CLEANUP
         row.cleanup_blob_keys = json.dumps(orphaned).encode()

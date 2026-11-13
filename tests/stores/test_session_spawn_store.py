@@ -12,11 +12,12 @@ from threading import Barrier, Event
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import inspect, select
+from sqlalchemy import event, inspect, select, update
 
 from omnigent.db.db_models import (
     SqlConversation,
     SqlConversationMetadata,
+    SqlFile,
     SqlSessionSpawn,
     SqlSessionSpawnMaterialization,
     SqlSessionSpawnPayload,
@@ -273,13 +274,57 @@ def test_admission_payload_survives_restart_and_each_phase_is_idempotent(spawn_c
     )
 
 
-def test_orphan_blob_cleanup_receipt_is_durable_and_shared_parent_blob_survives(spawn_context):
+@pytest.mark.parametrize("legacy_reference", [False, True])
+def test_orphan_blob_cleanup_receipt_is_durable_and_shared_parent_blob_survives(
+    spawn_context, legacy_reference
+):
     conversations, spawns, files, identity = spawn_context
     shared = files.create("shared.txt", 4, session_id=identity.parent_id)
+    if legacy_reference:
+        with spawns._session("prepare_legacy_file_reference") as session:
+            session.execute(
+                update(SqlFile)
+                .where(
+                    SqlFile.workspace_id == current_workspace_id(),
+                    SqlFile.id == shared.id,
+                )
+                .values(blob_key=None)
+            )
     orphan = files.create("orphan.txt", 4, session_id=identity.parent_id)
     receipt = _reserve(spawns, identity, files=(shared.id, orphan.id))
     files.delete(orphan.id, session_id=identity.parent_id)
-    aborted = spawns.abort(identity, receipt.nonce, epoch=receipt.epoch)
+    reference_statements = []
+    reference_plans = []
+
+    def observe_reference_query(connection, cursor, statement, parameters, context, many):
+        if (
+            not statement.lstrip().startswith("SELECT")
+            or "FROM files" not in statement
+            or "files.session_id" in statement
+        ):
+            return
+        reference_statements.append(statement)
+        if connection.dialect.name == "sqlite":
+            reference_plans.append(
+                " ".join(
+                    row[3]
+                    for row in connection.exec_driver_sql(
+                        "EXPLAIN QUERY PLAN " + statement, parameters
+                    )
+                )
+            )
+
+    event.listen(spawns._engine, "before_cursor_execute", observe_reference_query)
+    try:
+        aborted = spawns.abort(identity, receipt.nonce, epoch=receipt.epoch)
+    finally:
+        event.remove(spawns._engine, "before_cursor_execute", observe_reference_query)
+    # Each blob's modern and legacy references share one statement snapshot.
+    assert len(reference_statements) == len(receipt.file_mapping)
+    for plan in reference_plans:
+        assert "ix_files_blob_reference (workspace_id=? AND blob_key=?)" in plan, plan
+        assert "sqlite_autoindex_files_1 (workspace_id=? AND id=?)" in plan, plan
+        assert "SCAN files" not in plan, plan
     assert aborted.state == SpawnState.ABORTING
     assert aborted.cleanup_blob_keys == (orphan.blob_key,)
     assert files.get(shared.id) is not None
