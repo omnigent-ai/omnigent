@@ -94,6 +94,8 @@ def test_context_window_is_scoped_to_the_agent(monkeypatch, context_window) -> N
     assert env["HARNESS_CLAUDE_SDK_CONTEXT_WINDOW"] == (
         "" if context_window is None else str(context_window)
     )
+
+
 def test_session_persistence_is_off_unless_the_spec_opts_in() -> None:
     """
     Claude Code writes no transcript unless the agent asks for one.
