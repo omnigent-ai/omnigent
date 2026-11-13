@@ -66,6 +66,14 @@ so nothing in the run may wait for a person:
    each step a short, stable ID (`profile`, `opt-pool`), a name, and its
    dependencies. A new step needs an ID the journal hasn't used yet, since a
    step's status is the newest one written under its ID.
+
+   List the steps in the order you'll work on them. The Tasks tab numbers
+   them in that order, so the user should see the work move steadily down the
+   list. Put each step right after the steps it depends on: a step that needs
+   only the exploration, such as a check, goes right after the exploration,
+   and steps that can run at the same time go next to each other. Steps that
+   would change the same files, or measure on the same machine, can't run at
+   the same time: make the later one depend on the earlier.
 3. Make the first step exploring the work: ID `explore` (`explore-2`,
    `explore-3` and on when an earlier workflow in this session used it), and a
    name that starts with "Explore" ("Explore the open PRs and pick 3"), so the
@@ -93,9 +101,10 @@ tests" (ID …)", or "run my triage workflow" in chat):
   the user which they meant, or whether to describe the work instead.
 - Its steps are your plan: write them with `sys_journal_write_plan`, named
   after the workflow, keeping their IDs and dependencies, and with
-  `workflow_id` set to its ID, so the workflow's page lists this run. Rename an
-  ID only if this session's journal already used it. Fill the run's details
-  into the step names and goals.
+  `workflow_id` set to its ID, so the workflow's page lists this run. Put
+  them in the order you'll work on them (see Plan), even if the saved order
+  differs. Rename an ID only if this session's journal already used it. Fill
+  the run's details into the step names and goals.
 - Its description says what a run needs. If the details the user gave leave
   something out, ask with `sys_workflow_request_input` on the first step.
 - The saved steps are a starting point: replan as the work needs, as with any
@@ -126,6 +135,9 @@ When the user asks to review the plan before the work starts:
   `started` or `done` otherwise (`step_not_ready`). If another step's work
   covered one, write `done` on it and say which step covered it. If one turned
   out unnecessary, replan without it.
+- Run ready steps that don't depend on each other at the same time when you
+  can, such as on sub-agents if you have them, and work on other ready steps
+  while one waits on something slow, such as CI or another session.
 - Write `done` when the step achieved its goal. Only `done` lets later steps
   start.
 - Keep going while any step is ready or started. Don't end your turn until
@@ -162,7 +174,9 @@ When the user asks to review the plan before the work starts:
 - Replan with `sys_journal_write_plan` whenever the goal grows or changes. Keep
   step IDs stable across replans, so finished steps keep their status; give a
   step a new ID only when its work changes. Keep the plan's name while the
-  goal stays the same, and change it when the goal changes.
+  goal stays the same, and change it when the goal changes. Put a new step
+  where it belongs in the order of the work (see Plan), even if that's above
+  steps already in the plan.
 - Write a note with `sys_journal_write_note` before any external side effect
   (push, merge, tag, deploy), and look for those notes when you resume.
 - Make an approval a step of its own, and ask for it with

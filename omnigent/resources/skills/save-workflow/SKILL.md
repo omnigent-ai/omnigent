@@ -28,6 +28,9 @@ does ("Triage flaky tests") in your reply, and save once they agree.
   failing tests"). Leave out the review step: a run adds one when the user asks
   to review its plan.
 - Keep step IDs short and stable, and the dependencies as they ran.
+- List the steps in the order a run works on them: each right after the steps
+  it depends on, so a step that needs only the exploration comes right after
+  the exploration.
 
 ## Make it generic
 

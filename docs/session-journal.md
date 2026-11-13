@@ -168,7 +168,8 @@ with one failure reads "Tasks 9/9 · Finished, 1 failed".
 The tasks are the current plan's steps when the session has a plan. Otherwise
 they're the agent's own to-do list, which Claude and Codex keep as they work,
 so a session shows its tasks without a workflow. Once a session has a plan, the
-plan replaces the agent's own list in both places.
+plan replaces the agent's own list in both places. The agent lists a plan's
+steps in the order it works on them.
 
 In the Tasks tab, the plan's name heads the list (the chat preview shows it on
 hover), and each task appears once, in order, with its state (not started,
