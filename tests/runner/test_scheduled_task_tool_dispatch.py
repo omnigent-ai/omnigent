@@ -244,6 +244,64 @@ async def test_session_args_are_refused_before_an_older_server_sees_them(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info",
+    [_Resp(body={"scheduled_task_session_modes": True}), _Resp(status_code=500)],
+    ids=["missing", "info-fails"],
+)
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        (
+            "sys_scheduled_task_create",
+            {
+                "name": "n",
+                "prompt": "p",
+                "rrule": "FREQ=DAILY",
+                "agent_id": "ag_1",
+                "mcp_services": ["github"],
+            },
+        ),
+        ("sys_scheduled_task_update", {"scheduled_task_id": _TASK_ID, "mcp_services": []}),
+    ],
+)
+async def test_mcp_services_are_refused_before_an_older_server_sees_them(
+    tool_name: str, arguments: dict[str, object], info: _Resp
+) -> None:
+    """A server without task MCP services would reject the field with a bare 422."""
+    client = _RecordingClient(info=info)
+    out = await _execute_scheduled_task_tool(
+        tool_name, json.dumps({**_REVIEW_FIELDS, **arguments}), server_client=client
+    )
+
+    assert [url for _, url, _ in client.calls] == ["/v1/info"]
+    assert "does not support mcp_services" in json.loads(out)["error"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_services_reach_a_server_that_supports_them() -> None:
+    client = _RecordingClient(
+        _Resp(body={"id": "t1"}), info=_Resp(body={"scheduled_task_mcp_services": True})
+    )
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps(
+            {
+                **_REVIEW_FIELDS,
+                "name": "n",
+                "rrule": "FREQ=DAILY",
+                "agent_id": "ag_1",
+                "mcp_services": ["github"],
+            }
+        ),
+        server_client=client,
+    )
+    verb, url, body = client.calls[-1]
+    assert (verb, url) == ("POST", "/v1/scheduled-tasks")
+    assert body["mcp_services"] == ["github"]
+
+
+@pytest.mark.asyncio
 async def test_list_gets() -> None:
     client = _RecordingClient(_Resp(body={"scheduled_tasks": []}))
     out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=client)
