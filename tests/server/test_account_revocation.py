@@ -1436,7 +1436,11 @@ async def test_runner_clear_finalizes_before_detaching(setup_app, monkeypatch, l
                 await client.post(f"/v1/sessions/{old_id}/events", json=event)
         else:
             await _post_clear_supersession(
-                client, old_session_id=old_id, new_session_id=new_id, agent_name="review-agent"
+                client,
+                old_session_id=old_id,
+                new_session_id=new_id,
+                agent_name="review-agent",
+                detach_runner=True,
             )
     posts = [("POST", 202)] * 3
     assert responses == ([("PATCH", 200), *posts] if legacy else [*posts, ("PATCH", 200)])
@@ -1478,9 +1482,13 @@ def test_runner_events_check_parent_scope(setup_app, monkeypatch):
     conversations.replace_runner_id(child_id, runner_id)
     conversations.replace_runner_id(parent_id, "other-runner")
     published = []
-    monkeypatch.setattr(
-        session_stream, "publish", lambda sid, event: published.append((sid, event))
-    )
+    publish = session_stream.publish
+
+    def record_publish(session_id, event):
+        published.append((session_id, event))
+        return publish(session_id, event)
+
+    monkeypatch.setattr(session_stream, "publish", record_publish)
     # The runner transport is external to the event-route authorization boundary.
     transport = AsyncMock()
     transport.post.return_value = httpx.Response(204)

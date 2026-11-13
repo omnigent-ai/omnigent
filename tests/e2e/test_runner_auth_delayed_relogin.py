@@ -64,6 +64,7 @@ from omnigent.runner._entry import (
     _RunnerDatabricksAuth,
 )
 from omnigent.runner.identity import (
+    RUNNER_CREDENTIAL_PROTOCOL,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
 )
@@ -616,6 +617,14 @@ class _MintAndResourceHandler(BaseHTTPRequestHandler):
 
         :returns: None.
         """
+        if self.path.endswith("/token"):
+            body = json.dumps({"protocols": [RUNNER_CREDENTIAL_PROTOCOL]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         bearer = self.headers.get("Authorization", "")
         revoked = {f"Bearer {_BOOTSTRAP_BEARER}", "Bearer minted-1"}
         if bearer in revoked or not bearer.startswith("Bearer minted-"):

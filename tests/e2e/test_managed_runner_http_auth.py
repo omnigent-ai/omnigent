@@ -444,29 +444,14 @@ def test_managed_runner_callback_authenticates_end_to_end(
     assert recovered.content == authed.content
 
 
-def test_managed_runner_survives_mint_403_after_token_expiry(
+def test_legacy_bootstrap_recovers_after_mint_proxy_rejection(
     accounts_server: tuple[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A mint 403 after the owner JWT expires must not brick the runner (OMNI-2529).
+    """The legacy bootstrap wrapper can recover its proxy bearer from stored login.
 
-    Replays the production deadlock end-to-end over real sockets: a
-    host-launched runner bootstraps on the injected bearer, falls back to
-    managed mint when that bearer is rejected (a real mint through the Apps
-    edge stand-in), then the session outlives the minted JWT while idle. The
-    re-mint presents the expired JWT as its own proxy bearer, so the edge
-    answers 403 without reaching the server. Before the fix neither
-    ``declined`` nor ``proxy_auth_failed`` latched in that state, and every
-    subsequent callback raised ``httpx.RequestError("Databricks token refresh
-    returned no token")`` for the remaining life of the process. With the fix
-    the chain re-resolves the machine's stored login credential in the same
-    call, so the callback that hits the 403 still authenticates.
-
-    :param accounts_server: ``(base_url, db_uri)`` from the live-server fixture.
-    :param monkeypatch: Puts this process into the host-launched-runner posture
-        (injected initial bearer, delegated-mint marker, binding token) with a
-        stored login credential available for recovery.
-    :returns: None.
+    Explicitly exercise the compatibility wrapper: new delegated runners use
+    their confined mint factory directly and do not fall back to owner auth.
     """
     base_url, db_uri = accounts_server
     session_id = _seed_owned_session_with_managed_runner(base_url, db_uri)
@@ -483,8 +468,7 @@ def test_managed_runner_survives_mint_403_after_token_expiry(
         monkeypatch.setenv(RUNNER_DELEGATED_AUTH_ENV_VAR, "1")
         monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: owner_cookie)
 
-        factory = _make_auth_token_factory()
-        assert isinstance(factory, _InitialAuthTokenFactory)
+        factory = _InitialAuthTokenFactory(owner_cookie, proxy_url)
         contents_path = f"/v1/sessions/{session_id}/agent/contents"
 
         # The injected host bearer authenticates the first callback.
