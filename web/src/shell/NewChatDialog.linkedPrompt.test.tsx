@@ -3,6 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 import type * as HostModule from "@/lib/host";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type * as DictationInsertModule from "@/hooks/useDictationInsert";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -47,6 +48,7 @@ import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { newSessionLocation } from "@/lib/newSessionHandoff";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 
 let searchParams = new URLSearchParams();
@@ -76,6 +78,11 @@ vi.mock("@/hooks/useDictationInsert", async (importOriginal) => {
     },
   };
 });
+
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  getSessionSlim: vi.fn(async (id: string) => ({ id, hostId: "host_1", workspace: "" })),
+}));
 
 vi.mock("@/store/chatStore", () => ({ setPendingInitialPrompt: vi.fn() }));
 vi.mock("@/lib/identity", () => ({
@@ -140,6 +147,7 @@ const serverInfo: Partial<ServerInfo> = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  sibling_sessions: true,
 };
 
 function renderLanding() {
@@ -324,6 +332,30 @@ describe("embedded prompt link", () => {
     rerender(<Landing visit={2} />);
     expect(composer()).toHaveValue("hello_world");
     fireEvent.change(composer(), { target: { value: "Edited after remount" } });
+    reloadPage();
+    expect(composer()).toHaveValue("");
+  });
+
+  it.each([
+    ["a nested-agent composer", "o=123&prompt=hello_world", "sibling=source"],
+    ["the standalone composer", "sibling=source&prompt=hello_world", "o=123"],
+  ])("does not show the prompt in %s", async (_target, linked, next) => {
+    searchParams = new URLSearchParams(linked);
+    renderLanding();
+    expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue("hello_world");
+    cleanup();
+    searchParams = new URLSearchParams(next);
+    renderLanding();
+    expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue("");
+  });
+
+  it("forgets the kept prompt when a handoff replaces the draft", () => {
+    renderLanding();
+    cleanup();
+    searchParams = new URLSearchParams(newSessionLocation("Handed off", []).split("?")[1]);
+    renderLanding();
+    expect(composer()).toHaveValue("Handed off");
+    fireEvent.change(composer(), { target: { value: "" } });
     reloadPage();
     expect(composer()).toHaveValue("");
   });

@@ -2180,17 +2180,20 @@ export function resetLandingDraft(): void {
 const LINKED_PROMPT_TTL_MS = 60_000;
 
 // One origin can front many workspaces, and sessionStorage outlives reloads and
-// sign-in changes, so the kept prompt is scoped to the server and nothing is
+// sign-in changes, so the kept prompt is scoped to the server and to the
+// composer (the same sibling partition as the parked drafts), and nothing is
 // kept without a server identity. It is also dropped when the viewer differs,
 // but only when both viewers are known: the embed resolves identity after
 // first render, so a prompt kept or read before then is not tied to a viewer.
-function linkedPromptStorageKey(): string | null {
+function linkedPromptStorageKey(siblingSourceId: string | null): string | null {
   const server = getOmnigentServerIdentity();
-  return server === null ? null : `omnigent:linked-prompt:${JSON.stringify([server])}`;
+  return server === null
+    ? null
+    : `omnigent:linked-prompt:${JSON.stringify([server, siblingSourceId])}`;
 }
 
-function keepLinkedPrompt(text: string): void {
-  const key = linkedPromptStorageKey();
+function keepLinkedPrompt(siblingSourceId: string | null, text: string): void {
+  const key = linkedPromptStorageKey(siblingSourceId);
   if (key === null) return;
   try {
     sessionStorage.setItem(key, JSON.stringify({ text, at: Date.now(), user: getCurrentUserId() }));
@@ -2199,8 +2202,8 @@ function keepLinkedPrompt(text: string): void {
   }
 }
 
-function readKeptLinkedPrompt(): string | null {
-  const key = linkedPromptStorageKey();
+function readKeptLinkedPrompt(siblingSourceId: string | null): string | null {
+  const key = linkedPromptStorageKey(siblingSourceId);
   if (key === null) return null;
   try {
     const raw = sessionStorage.getItem(key);
@@ -2227,8 +2230,8 @@ function readKeptLinkedPrompt(): string | null {
   return null;
 }
 
-function forgetKeptLinkedPrompt(): void {
-  const key = linkedPromptStorageKey();
+function forgetKeptLinkedPrompt(siblingSourceId: string | null): void {
+  const key = linkedPromptStorageKey(siblingSourceId);
   if (key === null) return;
   try {
     sessionStorage.removeItem(key);
@@ -2561,7 +2564,7 @@ function NewChatLandingContent({
   // instead, but still takes over the kept copy so its edits and session start
   // forget it.
   const [keptLinkedPrompt] = useState(() =>
-    handoff === null && !linkedPrompt?.trim() ? readKeptLinkedPrompt() : null,
+    handoff === null && !linkedPrompt?.trim() ? readKeptLinkedPrompt(siblingSourceId) : null,
   );
   const restoresKeptLinkedPrompt = keptLinkedPrompt !== null && landingDraft === null;
   const keptLinkedTextRef = useRef<string | null>(
@@ -2586,8 +2589,12 @@ function NewChatLandingContent({
       setMessage(linkedPrompt);
       clearTaggedMentionsRef.current();
       writeLandingDraft(draftState, { ...draftRef.current, message: linkedPrompt });
-      keepLinkedPrompt(linkedPrompt);
+      keepLinkedPrompt(siblingSourceId, linkedPrompt);
       keptLinkedTextRef.current = linkedPrompt;
+    } else if (handoff !== null) {
+      // The handoff replaced the draft, so a prompt kept for this composer is stale.
+      keptLinkedTextRef.current = null;
+      forgetKeptLinkedPrompt(siblingSourceId);
     }
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
@@ -2595,21 +2602,29 @@ function NewChatLandingContent({
     remaining.delete(NEW_SESSION_HANDOFF_PARAM);
     forgetNewSessionHandoff(handoffToken);
     replaceSearchParams(remaining);
-  }, [linkedPrompt, handoffToken, searchParams, replaceSearchParams, draftState]);
+  }, [
+    linkedPrompt,
+    handoffToken,
+    handoff,
+    searchParams,
+    replaceSearchParams,
+    draftState,
+    siblingSourceId,
+  ]);
   // Once the user acts on the prompt, a reload must not bring the link's text
   // back over their work. Any change to the text counts (typing, dictation,
   // slash completion, clearing).
   function releaseKeptLinkedPrompt(): void {
     if (keptLinkedTextRef.current === null) return;
     keptLinkedTextRef.current = null;
-    forgetKeptLinkedPrompt();
+    forgetKeptLinkedPrompt(siblingSourceId);
   }
   useEffect(() => {
     const kept = keptLinkedTextRef.current;
     if (kept === null || message === kept) return;
     keptLinkedTextRef.current = null;
-    forgetKeptLinkedPrompt();
-  }, [message]);
+    forgetKeptLinkedPrompt(siblingSourceId);
+  }, [message, siblingSourceId]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
