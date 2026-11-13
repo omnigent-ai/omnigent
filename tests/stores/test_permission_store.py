@@ -253,7 +253,9 @@ def test_grant_if_absent_keeps_a_grant_committed_after_its_check(
     monkeypatch.setattr(permission_module, "_upsert_grant", grant_by_hand_first)
     # Without account checks, as under external auth, no account lock orders the writers.
     with account_checks_scope(False):
-        store.grant_if_absent("erin@example.com", conv_id, requested)
+        written = store.grant_if_absent("erin@example.com", conv_id, requested)
+
+    assert written is False
 
     assert store.get("erin@example.com", conv_id) == SessionPermission(
         "erin@example.com", conv_id, committed
