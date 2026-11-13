@@ -1931,6 +1931,8 @@ def register_core_routes(
         )
         parsed_metadata = project_resolution.body
         await _check_initial_input(request, parsed_metadata.initial_input)
+        if parsed_metadata.requested_host_id is not None:
+            await _check_requested_host_id(request, parsed_metadata.requested_host_id, user_id)
         creation_metadata(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
@@ -2203,6 +2205,7 @@ def register_core_routes(
                 user_id=user_id,
                 sandbox_provider=parsed_metadata.sandbox_provider,
                 workspaces=parsed_metadata.managed_repo_workspaces(),
+                requested_host_id=parsed_metadata.requested_host_id,
             )
         # Caller-supplied external host: bind + launch a runner on it,
         # exactly like the JSON create form (same authorization, atomic

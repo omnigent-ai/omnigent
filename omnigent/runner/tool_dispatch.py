@@ -3823,8 +3823,11 @@ async def _execute_session_create(
                             "no session was created."
                         }
                     )
+            # Sent only when /v1/info reports the server accepts host_id; older servers reject it.
             host_id = (
-                uuid.uuid4().hex if info_data.get("request_managed_sandbox_host_id") else None
+                uuid.uuid4().hex
+                if info_data.get("request_managed_sandbox_host_id") is True
+                else None
             )
             if host_id is not None:
                 body["host_id"] = host_id
