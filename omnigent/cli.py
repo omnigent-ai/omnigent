@@ -4759,6 +4759,10 @@ def server(
         # below is the server path for the bare ``server`` group.
         return
 
+    # Socket binds use bare IPv6 addresses; URLs use brackets.
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+
     # --base-path is sugar for OMNIGENT_WEB_BASE_PATH, which create_app reads.
     # An env var (not a create_app kwarg) so the same toggle reaches every
     # startup path (Docker entrypoint, canonical local server, e2e harness)
@@ -5111,7 +5115,11 @@ def server(
             "OMNIGENT_ACCOUNTS_COOKIE_SECRET",
             load_or_generate_cookie_secret(art_loc),
         )
-        os.environ.setdefault("OMNIGENT_ACCOUNTS_BASE_URL", f"http://{host}:{port}")
+        from omnigent.util.server_url import format_host_port
+
+        os.environ.setdefault(
+            "OMNIGENT_ACCOUNTS_BASE_URL", f"http://{format_host_port(host, port)}"
+        )
 
     auth_provider = create_auth_provider()
 
