@@ -3475,22 +3475,53 @@ class TestStreamEventStreaming(unittest.TestCase):
 
     def test_close_disconnects_all_live_clients(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+        from omnigent.inner.claude_sdk_key_file import PrivateStaticKeyFile
 
-        disconnect_a = AsyncMock()
-        disconnect_b = AsyncMock()
-        client_a = type("Client", (), {"disconnect": disconnect_a})()
-        client_b = type("Client", (), {"disconnect": disconnect_b})()
-
-        async def _t():
+        async def _t(cleanup_failure):
+            disconnect_a = AsyncMock()
+            disconnect_b = AsyncMock()
+            client_a = type("Client", (), {"disconnect": disconnect_a})()
+            client_b = type("Client", (), {"disconnect": disconnect_b})()
+            key_file = PrivateStaticKeyFile("dummy-shutdown-key")
+            relay = SimpleNamespace(close=Mock())
+            shim = SimpleNamespace(aclose=AsyncMock())
             executor = ClaudeSDKExecutor()
-            executor._clients["session-a"] = _ClaudeClientState(client=client_a, model=None)
+            executor._gateway_shim = shim
+            executor._clients["session-a"] = _ClaudeClientState(
+                client=client_a, model=None, static_key_file=key_file, mcp_relay=relay
+            )
             executor._clients["session-b"] = _ClaudeClientState(client=client_b, model=None)
-            await executor.close()
-            disconnect_a.assert_awaited_once_with()
-            disconnect_b.assert_awaited_once_with()
-            self.assertEqual(executor._clients, {})
+            operation = cleanup_failure or "unlink"
+            remove = getattr(Path, operation)
 
-        _run(_t())
+            def refuse(path, *args, **kwargs):
+                target = key_file.path if operation == "unlink" else key_file.directory
+                if cleanup_failure and path == target:
+                    raise PermissionError("locked dummy-shutdown-key")
+                return remove(path, *args, **kwargs)
+
+            try:
+                with (
+                    patch.object(Path, operation, autospec=True, side_effect=refuse),
+                    patch("omnigent.inner.claude_sdk_key_file.logger.warning") as warning,
+                ):
+                    await executor.close()
+                    disconnect_a.assert_awaited_once_with()
+                    disconnect_b.assert_awaited_once_with()
+                    relay.close.assert_called_once_with()
+                    shim.aclose.assert_awaited_once_with()
+                    self.assertIsNone(executor._gateway_shim)
+                    self.assertEqual(executor._clients, {})
+                    self.assertEqual(warning.call_count, int(cleanup_failure is not None))
+                    self.assertNotIn("dummy-shutdown-key", repr(warning.call_args_list))
+                    self.assertEqual(key_file.directory.exists(), cleanup_failure is not None)
+            finally:
+                key_file.close()
+            self.assertFalse(key_file.directory.exists())
+
+        for cleanup_failure in (None, "unlink", "rmdir"):
+            with self.subTest(cleanup_failure=cleanup_failure):
+                _run(_t(cleanup_failure))
 
     def test_close_session_force_closes_on_loop_mismatch(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState

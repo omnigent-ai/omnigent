@@ -162,13 +162,26 @@ async def test_windows_unsafe_python_path_fails_before_settings_or_client_creati
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["constructor", "connect", "timeout", "cancel"])
+@pytest.mark.parametrize("cleanup_failure", [None, "unlink", "rmdir"])
 async def test_failed_client_creation_removes_its_static_key_file(
-    outcome: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    outcome: str,
+    cleanup_failure: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setattr(key_files.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(ex, "_CONNECT_TIMEOUT_SECONDS", 0.1)
     paths: list[Path] = []
+    key_files_created: list[PrivateStaticKeyFile] = []
     connecting = asyncio.Event()
+
+    def make_key_file(secret: str) -> PrivateStaticKeyFile:
+        key_file = PrivateStaticKeyFile(secret)
+        key_files_created.append(key_file)
+        return key_file
+
+    monkeypatch.setattr(ex, "PrivateStaticKeyFile", make_key_file)
 
     class Client:
         def __init__(self, options: SimpleNamespace) -> None:
@@ -193,32 +206,49 @@ async def test_failed_client_creation_removes_its_static_key_file(
     close = AsyncMock(side_effect=force_close)
     monkeypatch.setattr(executor, "_force_close_client", close)
     options = SimpleNamespace(stderr=None, settings=None)
-    create = asyncio.create_task(
-        executor._get_or_create_client(
-            SimpleNamespace(ClaudeSDKClient=Client),
-            session_key="failed",
-            options=options,
-            model=None,
-            static_api_key="dummy-lifecycle-key",
+    with monkeypatch.context() as cleanup_fault:
+        if cleanup_failure is not None:
+            remove = getattr(Path, cleanup_failure)
+
+            def refuse(path: Path, *args, **kwargs) -> None:
+                target = paths[0] if cleanup_failure == "unlink" else paths[0].parent
+                if path == target:
+                    raise PermissionError("locked dummy-lifecycle-key")
+                return remove(path, *args, **kwargs)
+
+            cleanup_fault.setattr(Path, cleanup_failure, refuse)
+        create = asyncio.create_task(
+            executor._get_or_create_client(
+                SimpleNamespace(ClaudeSDKClient=Client),
+                session_key="failed",
+                options=options,
+                model=None,
+                static_api_key="dummy-lifecycle-key",
+            )
         )
-    )
-    if outcome == "cancel":
-        await asyncio.wait_for(connecting.wait(), timeout=5)
-        create.cancel()
-    expected = (
-        asyncio.CancelledError
-        if outcome == "cancel"
-        else TimeoutError
-        if outcome == "timeout"
-        else RuntimeError
-    )
-    with pytest.raises(expected):
-        await create
+        if outcome == "cancel":
+            await asyncio.wait_for(connecting.wait(), timeout=5)
+            create.cancel()
+        expected = (
+            asyncio.CancelledError
+            if outcome == "cancel"
+            else TimeoutError
+            if outcome == "timeout"
+            else RuntimeError
+        )
+        with pytest.raises(expected) as failure:
+            await create
+        assert "dummy-lifecycle-key" not in str(failure.value)
+        assert not executor._clients
+        assert options.stderr is None
+        assert close.await_count == int(outcome != "constructor")
+        assert paths and paths[0].parent.exists() == (cleanup_failure is not None)
+        if cleanup_failure is not None:
+            assert "Could not remove private Claude SDK credential storage" in caplog.text
+            assert "dummy-lifecycle-key" not in caplog.text
+    key_files_created[0].close()
     assert paths and not paths[0].parent.exists()
     assert not list(tmp_path.glob("omnigent-claude-key-*"))
-    assert not executor._clients
-    assert options.stderr is None
-    assert close.await_count == int(outcome != "constructor")
 
 
 @pytest.mark.asyncio

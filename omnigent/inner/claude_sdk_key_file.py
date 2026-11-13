@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import secrets
 import tempfile
@@ -11,6 +12,8 @@ from contextlib import suppress
 from ctypes import wintypes
 from pathlib import Path
 from typing import cast
+
+logger = logging.getLogger(__name__)
 
 _TOKEN_QUERY = 0x0008
 _TOKEN_USER = 1
@@ -300,7 +303,13 @@ class PrivateStaticKeyFile:
             raise
 
     def close(self) -> None:
-        """Remove the credential and its private directory after the CLI exits."""
-        self.path.unlink(missing_ok=True)
-        with suppress(FileNotFoundError):
-            self.directory.rmdir()
+        """Try removal after CLI exit without interrupting independent cleanup."""
+        try:
+            self.path.unlink(missing_ok=True)
+            with suppress(FileNotFoundError):
+                self.directory.rmdir()
+        except OSError:
+            logger.warning(
+                "Could not remove private Claude SDK credential storage at %s; storage may remain",
+                self.directory,
+            )

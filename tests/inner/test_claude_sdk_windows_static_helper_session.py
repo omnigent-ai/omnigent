@@ -96,6 +96,13 @@ async def test_windows_static_key_gateway_completes_real_sdk_turns(
             print("Deployment: OSS; transport: real SDK and Claude CLI subprocess")
             client = None
             for turn in range(2):
+                if turn:
+                    assert key_file is not None
+                    token = "dummy-native-static-helper-refreshed-key"
+                    key_file.path.write_bytes(token.encode("utf-8"))
+                    await asyncio.sleep(0.05)
+                    print("Updated dummy credential in the same private file for helper refresh.")
+                requests_before_turn = len(authenticated)
                 prompt = f"Return exactly {marker}. Turn {turn + 1}."
                 print(f"Prompt: {prompt}")
                 messages.append(
@@ -106,6 +113,8 @@ async def test_windows_static_key_gateway_completes_real_sdk_turns(
                 assert not errors, (errors, authenticated)
                 completed = [event for event in events if isinstance(event, TurnComplete)]
                 assert completed and completed[-1].response == marker
+                assert len(authenticated) > requests_before_turn
+                assert all(authenticated[requests_before_turn:])
                 print(f"Reply: {completed[-1].response}")
                 messages.append({"role": "assistant", "content": marker})
                 state = executor._clients["windows-helper"]
@@ -128,4 +137,5 @@ async def test_windows_static_key_gateway_completes_real_sdk_turns(
                 assert not worker.is_alive()
     assert process is not None and process.returncode is not None
     assert key_file is not None and not key_file.directory.exists()
-    print("Two real SDK turns authenticated; CLI exited and private key file was removed.")
+    print("Two real SDK turns authenticated with different dummy keys; helper refresh verified.")
+    print("CLI exited and private key file was removed.")
