@@ -122,7 +122,7 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
         stream: bool,
         extra: dict[str, Any],
         *,
-        connection_params: dict[str, str] | None = None,
+        connection_params: dict[str, Any] | None = None,
         timeout: int | None = None,
     ) -> dict[str, Any] | AsyncIterator[dict[str, Any]]:
         """
@@ -181,6 +181,13 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
                     )
             connection_params["base_url"] = base_url or resolved["base_url"]
             connection_params["api_key"] = connection_params.get("api_key") or resolved["api_key"]
+            if not has_auth_header and isinstance(extra_headers, dict):
+                # Blank headers must not overwrite the selected bearer.
+                connection_params["extra_headers"] = {
+                    key: value
+                    for key, value in extra_headers.items()
+                    if not isinstance(key, str) or key.lower() != "authorization"
+                }
         return await super().chat_completions(
             messages,
             model,

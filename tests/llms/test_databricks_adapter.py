@@ -97,6 +97,39 @@ def test_profile_auth_refreshes_with_default_or_gateway_url(
     )
 
 
+@pytest.mark.parametrize("header", ["Authorization", "authorization"])
+@pytest.mark.parametrize("value", ["", " \t"])
+def test_profile_auth_ignores_blank_authorization_headers(
+    monkeypatch: pytest.MonkeyPatch,
+    databricks_requests: list[httpx.Request],
+    header: str,
+    value: str,
+) -> None:
+    adapter = DatabricksAdapter()
+    monkeypatch.setattr(
+        adapter,
+        "_resolve_via_sdk",
+        lambda profile: {
+            "base_url": "https://workspace.example.test/serving-endpoints",
+            "api_key": "profile-token",
+        },
+    )
+    headers = {header: value, "X-Request-ID": "test-request"}
+    connection: dict[str, Any] = {
+        "profile": "gateway-profile",
+        "base_url": "https://workspace.example.test/ai-gateway/mlflow/v1",
+        "extra_headers": headers,
+    }
+    asyncio.run(
+        adapter.chat_completions([], "test-model", None, False, {}, connection_params=connection)
+    )
+    assert databricks_requests[0].headers.get_list("Authorization") == ["Bearer profile-token"]
+    assert databricks_requests[0].headers["X-Request-ID"] == "test-request"
+    assert connection["extra_headers"] is headers
+    assert headers == {header: value, "X-Request-ID": "test-request"}
+    assert "api_key" not in connection
+
+
 def test_gateway_url_fallback_keeps_selected_profile(
     monkeypatch: pytest.MonkeyPatch, databricks_requests: list[httpx.Request]
 ) -> None:
