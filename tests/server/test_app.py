@@ -2756,7 +2756,7 @@ def _attach_live_connection(
     async def _noop_async(*_a: object, **_k: object) -> None:
         return None
 
-    connection = types.SimpleNamespace(generation=1)
+    connection = types.SimpleNamespace(generation=1, confinement=None)
     monkeypatch.setattr(app.state.tunnel_registry, "get", lambda _rid: connection)
     monkeypatch.setattr(sessions_routes, "_ensure_runner_relay", lambda *a, **k: None)
     monkeypatch.setattr(sessions_routes, "prefetch_session_routing_catalogs", lambda *a, **k: None)
@@ -2861,14 +2861,17 @@ async def _reconnect_with_initialize(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scoped", [False, True], ids=["owner", "runner"])
 async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    scoped: bool,
 ) -> None:
     """Idle trees attach on reconnect without starting runner runtimes."""
     from omnigent.entities import Conversation
     from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.auth import RunnerTokenConfinement, runner_session_in_scope
     from omnigent.server.routes import sessions as sessions_routes
     from omnigent.server.routes._sessions.orchestration import (
         _ensure_runner_session_initialized,
@@ -2913,6 +2916,11 @@ async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
     )
     store.set_session_live_status(orphan.id, "running")
     connection = _attach_live_connection(app, monkeypatch, runner_id)
+    if scoped:
+        connection.confinement = RunnerTokenConfinement(  # type: ignore[attr-defined]
+            runner_id,
+            lambda runner, sid: runner_session_in_scope(runner, sid, store.get_conversation),
+        )
     monkeypatch.setattr(
         app.state.tunnel_registry, "get", lambda rid: connection if rid == runner_id else None
     )
@@ -2941,13 +2949,15 @@ async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
         (orphan_parent.id, False),
         (active_child.id, False),
         (idle_child.id, True),
-        (orphan.id, False),
-    }
+    } | (set() if scoped else {(orphan.id, False)})
     initialized_ids = [session_id for session_id, _ in initialized]
     assert initialized_ids.index(active_parent.id) < initialized_ids.index(active_child.id)
     assert initialized_ids.index(orphan_parent.id) < initialized_ids.index(idle_child.id)
-    assert initialized_ids.index(idle_child.id) < initialized_ids.index(orphan.id)
-    assert store.get_conversation(orphan.id).runner_id == runner_id  # type: ignore[union-attr]
+    if not scoped:
+        assert initialized_ids.index(idle_child.id) < initialized_ids.index(orphan.id)
+    assert store.get_conversation(orphan.id).runner_id == (  # type: ignore[union-attr]
+        "offline_runner" if scoped else runner_id
+    )
 
     refreshed_idle = store.get_conversation(idle.id)
     assert refreshed_idle is not None

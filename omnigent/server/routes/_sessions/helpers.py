@@ -7966,6 +7966,8 @@ async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:
 async def _stop_session_via_runner_impl(
     session_id: str,
     runner_router: Any,
+    *,
+    conversation: Conversation | None = None,
 ) -> bool:
     """
     Forward a ``stop_session`` request to the bound runner, surfacing
@@ -8004,8 +8006,12 @@ async def _stop_session_via_runner_impl(
     """
     from omnigent.runtime import get_runner_client
 
-    runner_client = await _get_runner_client(session_id, runner_router, for_control=True)
-    if runner_client is None:
+    if conversation is not None and runner_router is None:
+        return False
+    runner_client = await _get_runner_client(
+        session_id, runner_router, for_control=True, conversation=conversation
+    )
+    if runner_client is None and conversation is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
         return False

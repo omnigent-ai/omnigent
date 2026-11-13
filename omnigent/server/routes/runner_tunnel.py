@@ -65,6 +65,7 @@ from omnigent.server.auth import (
     AuthProvider,
     UnifiedAuthProvider,
     env_var_is_truthy,
+    runner_token_confinement,
 )
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
@@ -696,7 +697,9 @@ def create_runner_tunnel_router(
             # Durable before the tunnel takes work, so another replica cannot settle
             # this runner's running sessions as orphaned once it is accepted here.
             await session_live_state.stamp_runner_liveness(runner_id)
-            session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
+            session = registry.register(
+                runner_id, ws, frame, owner=tunnel_owner, confinement=runner_token_confinement(ws)
+            )
             session.diagnostics.settings.update(
                 tunnel_side="server",
                 app_ping_interval_s=PING_INTERVAL_S,

@@ -511,6 +511,7 @@ async def _wake_runner_for_model_change(
         initializer=getattr(request.app.state, "runner_session_initializer", None),
         suppress_recovery_turn=True,
         require_success=True,
+        confinement=runner_token_confinement(request),
     )
     if not terminal_ready:
         outcome = await _ensure_native_terminal_ready(
@@ -4367,6 +4368,7 @@ def register_core_routes(
                         _runner_client,
                         conversation_store,
                         request.app.state.runner_session_initializer,
+                        confinement=confinement,
                     )
         else:
             conv = conv_for_collaboration_mode
@@ -4782,6 +4784,7 @@ def register_core_routes(
                 conversation_store,
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
+                confinement=confinement,
                 delete_worktree=body.delete_worktree,
                 host_store=getattr(request.app.state, "host_store", None),
                 sandbox_config=getattr(request.app.state, "sandbox_config", None),

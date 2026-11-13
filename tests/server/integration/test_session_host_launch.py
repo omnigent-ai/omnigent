@@ -4185,6 +4185,8 @@ async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A settled recovery is not reused after its only waiter is cancelled."""
+    from starlette.requests import Request
+
     from omnigent.server.routes.sessions import routes_events
 
     session_id = "cancelled-retry-waiter"
@@ -4207,12 +4209,12 @@ async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(
         return second_result
 
     monkeypatch.setattr(routes_events, "_recover_retry_session", _recover)
-    flight = (session_id, None)
+    flight = (session_id, None, None)
     routes_events._retry_recovery_tasks.pop(flight, None)
 
     waiter = asyncio.create_task(
         routes_events._retry_session_single_flight(
-            request=None,
+            request=Request({"type": "http"}),
             session_id=session_id,
             conversation=None,
             conversation_store=None,
@@ -4236,7 +4238,7 @@ async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(
     assert flight not in routes_events._retry_recovery_tasks
     assert (
         await routes_events._retry_session_single_flight(
-            request=None,
+            request=Request({"type": "http"}),
             session_id=session_id,
             conversation=None,
             conversation_store=None,
@@ -5332,3 +5334,48 @@ async def test_side_chat_message_rebinds_to_already_relaunched_source_runner(
     side_chat_after = store.get_conversation(side_chat_id)
     assert side_chat_after is not None and side_chat_after.runner_id == replacement
     assert f"/v1/sessions/{side_chat_id}/events" in [path for path, _ in runners.posts]
+
+
+async def test_retry_single_flight_keeps_scoped_and_owner_recovery_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from starlette.requests import Request
+
+    from omnigent.server.auth import (
+        _RUNNER_CONFINEMENT_KEY,
+        RunnerTokenConfinement,
+        runner_token_confinement,
+    )
+    from omnigent.server.routes.sessions import routes_events
+
+    confinement = RunnerTokenConfinement("runner", lambda _runner, _sid: True)
+    started: asyncio.Queue[Any] = asyncio.Queue()
+    release = asyncio.Event()
+
+    async def recover(*, request: Request, **_: Any) -> dict[str, bool | str]:
+        started.put_nowait(runner_token_confinement(request))
+        await release.wait()
+        return {"recovered": True}
+
+    monkeypatch.setattr(routes_events, "_recover_retry_session", recover)
+    tasks = []
+    try:
+        for scope in (confinement, None):
+            request = Request({"type": "http", _RUNNER_CONFINEMENT_KEY: scope})
+            tasks.append(
+                asyncio.create_task(
+                    routes_events._retry_session_single_flight(
+                        request=request,
+                        session_id="separate-retry-scope",
+                        conversation=None,
+                        conversation_store=None,
+                        runner_router=None,
+                        user_id="owner",
+                        permission_store=None,
+                    )
+                )
+            )
+            assert await asyncio.wait_for(started.get(), 5) is scope
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), 5)

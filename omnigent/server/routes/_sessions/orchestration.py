@@ -749,6 +749,8 @@ async def _best_effort_stop(
     session_id: str,
     conversation_store: ConversationStore,
     runner_router: Any,
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> list[str]:
     """Stop a running session before a destructive lifecycle action.
 
@@ -795,7 +797,16 @@ async def _best_effort_stop(
 
     async def _stop(target_id: str) -> None:
         try:
-            await _stop_session_via_runner(target_id, runner_router)
+            if confinement is None:
+                await _stop_session_via_runner(target_id, runner_router)
+            else:
+                target = await asyncio.to_thread(conversation_store.get_conversation, target_id)
+                if (
+                    target is not None
+                    and target.runner_id in (None, confinement.runner_id)
+                    and await asyncio.to_thread(confinement.allows_session, target_id)
+                ):
+                    await _stop_session_via_runner(target_id, runner_router, conversation=target)
         except Exception:  # noqa: BLE001
             _logger.debug(
                 "Best-effort stop failed for %s; proceeding anyway",
@@ -851,12 +862,48 @@ _SELF_ARCHIVE_TURN_WAIT_S = 60 * 60
 _RUNNER_STOP_STATUS_BATCH_SIZE = 200
 
 
+async def _runner_dependents_in_scope(
+    session_ids: list[str],
+    conversation_store: ConversationStore,
+    confinement: RunnerTokenConfinement,
+) -> bool:
+    """Keep a shared runtime when any persisted dependent is outside the caller's scope."""
+    seen = set(session_ids)
+    frontier = session_ids
+    while frontier:
+        for session_id in frontier:
+            if not await asyncio.to_thread(confinement.allows_session, session_id):
+                return False
+        children = await asyncio.to_thread(
+            conversation_store.list_child_conversation_ids_by_parent, frontier
+        )
+        dependents = {child for ids in children.values() for child in ids}
+        for session_id in frontier:
+            after: str | None = None
+            while True:
+                side_chats = await asyncio.to_thread(
+                    conversation_store.list_side_chat_ids,
+                    session_id,
+                    after=after,
+                    limit=_RUNNER_STOP_STATUS_BATCH_SIZE,
+                )
+                dependents.update(side_chats)
+                if len(side_chats) < _RUNNER_STOP_STATUS_BATCH_SIZE:
+                    break
+                after = side_chats[-1]
+        frontier = list(dependents - seen)
+        seen.update(frontier)
+    return True
+
+
 async def _stop_host_runner_intentionally(
     session_id: str,
     host_id: str,
     runner_id: str,
     host_registry: Any,
     conversation_store: ConversationStore,
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> bool:
     """Carry stop intent to the active sessions sharing the terminated runner.
 
@@ -884,19 +931,37 @@ async def _stop_host_runner_intentionally(
                     break
                 after = batch[-1][0]
         except Exception:  # noqa: BLE001
-            # Keep Stop available during a store outage; only known sessions can
-            # inherit intent, so unseen cold sessions keep normal disconnect handling.
+            # Owner stops can use partial results; a scoped stop must know all occupants.
             _logger.warning(
-                "Cannot load all sessions for intentionally stopped runner %s; "
-                "using partial results and live relays",
+                "Cannot load all sessions for intentionally stopped runner %s; %s",
                 runner_id,
+                "leaving the runner up"
+                if confinement is not None
+                else "using partial results and live relays",
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+            if confinement is not None:
+                return False
         for related_id, handle in _runner_relay_tasks.items():
             if handle.runner_id == runner_id and not handle.task.done():
                 statuses.setdefault(related_id, None)
         statuses.setdefault(session_id, None)
+        if confinement is not None:
+            # Root ownership alone cannot authorize stopping every runtime on this runner.
+            if not await _runner_dependents_in_scope(
+                list(statuses), conversation_store, confinement
+            ):
+                return False
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if (
+                current is None
+                or current.runner_id != runner_id
+                or current.host_id != host_id
+                or runner_id != confinement.runner_id
+                or not await asyncio.to_thread(confinement.allows_session, session_id)
+            ):
+                return False
         marked: set[str] = set()
         stop_targets: set[str] = set()
         completed_stop_relays: dict[str, tuple[_RelayHandle, int]] = {}
@@ -974,6 +1039,7 @@ async def _archive_stop(
     runner_router: Any,
     host_registry: Any,
     *,
+    confinement: RunnerTokenConfinement | None = None,
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
@@ -1043,23 +1109,50 @@ async def _archive_stop(
     # possibly on another replica) — it's live again, so leave its runner alone.
     if conv is None or not conv.archived:
         return
+
+    async def still_authorized() -> bool:
+        if confinement is None:
+            return True
+        current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        return (
+            current is not None
+            and current.archived
+            and current.runner_id == conv.runner_id
+            and current.host_id == conv.host_id
+            and current.workspace == conv.workspace
+            and current.git_branch == conv.git_branch
+            and await asyncio.to_thread(confinement.allows_session, session_id)
+        )
+
+    if not await still_authorized():
+        return
     # Past the point of no return: unregister so a late cancel (an Undo racing
     # this teardown) can't interrupt it mid-stop and strand the intentional-
     # stop marker below, which would exclude the session from child recovery.
     _pending_archive_stops.pop(session_id, None)
 
-    await _facade._best_effort_stop(session_id, conversation_store, runner_router)
+    await _facade._best_effort_stop(
+        session_id, conversation_store, runner_router, confinement=confinement
+    )
+    if not await still_authorized():
+        return
     if conv.host_id and conv.runner_id:
         try:
             # A sub-agent riding an ancestor's runner leaves it up for the owner.
-            if await _owns_host_runner(conv, conversation_store):
-                await _stop_host_runner_intentionally(
+            owns_runner = await _owns_host_runner(conv, conversation_store)
+            if not owns_runner and confinement is not None:
+                return
+            if owns_runner and await still_authorized():
+                stopped = await _stop_host_runner_intentionally(
                     session_id,
                     conv.host_id,
                     conv.runner_id,
                     host_registry,
                     conversation_store,
+                    confinement=confinement,
                 )
+                if confinement is not None and not stopped:
+                    return
         except Exception:  # noqa: BLE001
             _logger.debug(
                 "Archive host-runner teardown failed for %s",
@@ -1067,11 +1160,30 @@ async def _archive_stop(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+            if confinement is not None:
+                return
+    if not await still_authorized():
+        return
+    if delete_worktree and confinement is not None:
+        # Descendants may inherit this directory without their own host binding.
+        dependents = await _collect_descendant_conversation_ids(conversation_store, session_id)
+        for dependent_id in [session_id, *dependents]:
+            if not await asyncio.to_thread(confinement.allows_session, dependent_id):
+                delete_worktree = False
+                break
+            side_chats = await asyncio.to_thread(
+                conversation_store.list_side_chat_ids, dependent_id, limit=1
+            )
+            if side_chats:
+                delete_worktree = False
+                break
     # Runs after the runner teardown so the agent isn't left in a deleted cwd.
     if delete_worktree and conv.git_branch and conv.workspace and conv.host_id:
         from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
 
         try:
+            if not await still_authorized():
+                return
             await _facade._remove_session_worktree_best_effort(
                 host_id=conv.host_id,
                 worktree_path=conv.workspace,
@@ -1092,7 +1204,7 @@ async def _archive_stop(
                 extra={"session_id": session_id},
             )
     # Last: the worktree cleanup above needs the sandbox's host online.
-    if host_store is not None:
+    if host_store is not None and await still_authorized():
         await stop_archived_session_sandbox(conv, host_store, conversation_store, sandbox_config)
 
 
@@ -1150,6 +1262,7 @@ def _spawn_archive_stop(
     runner_router: Any,
     host_registry: Any = None,
     *,
+    confinement: RunnerTokenConfinement | None = None,
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
@@ -1208,6 +1321,7 @@ def _spawn_archive_stop(
             conversation_store,
             runner_router,
             host_registry,
+            confinement=confinement,
             delete_worktree=delete_worktree,
             host_store=host_store,
             sandbox_config=sandbox_config,
@@ -6497,6 +6611,7 @@ async def _ensure_runner_session_initialized(
     conversation_store: ConversationStore,
     initializer: RunnerSessionInitializer | None = None,
     *,
+    confinement: RunnerTokenConfinement | None = None,
     suppress_recovery_turn: bool = False,
     require_success: bool = False,
     trigger: str = "session_ensure",
@@ -6619,12 +6734,16 @@ async def _ensure_runner_session_initialized(
     # Legacy callers leave descendant restoration to the runner-connect hook.
     if initializer is not None:
         if suppress_recovery_turn and not require_success:
-            schedule_child_restoration(conv, runner_client, conversation_store, initializer)
+            schedule_child_restoration(
+                conv, runner_client, conversation_store, initializer, confinement=confinement
+            )
         else:
             await _ensure_runner_relay_ready(
                 session_id, conv.runner_id, runner_client, conversation_store, conversation=conv
             )
-            await restore_active_children(conv, runner_client, conversation_store, initializer)
+            await restore_active_children(
+                conv, runner_client, conversation_store, initializer, confinement=confinement
+            )
     try:
         payload = resp.json()
     except ValueError:

@@ -5174,6 +5174,7 @@ def create_app(
                             runner_session_initializer,
                             generation=connection.generation,
                             store_slots=store_slots,
+                            confinement=connection.confinement,
                         )
                 except Exception as exc:
                     if tunnel_registry.get(runner_id) is not connection:

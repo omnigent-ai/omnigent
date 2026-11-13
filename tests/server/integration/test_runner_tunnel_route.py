@@ -3058,3 +3058,39 @@ async def test_scoped_mint_requires_wired_builtin_confinement(custom):
     assert response.status_code == 426
     assert response.json()["error"]["code"] == "runner_upgrade_required"
     assert issued == []
+
+
+@pytest.mark.parametrize("scoped", [False, True], ids=["owner", "runner"])
+async def test_connect_hook_retains_authenticated_confinement(scoped: bool) -> None:
+    from omnigent.server.auth import _RUNNER_CONFINEMENT_KEY, RunnerTokenConfinement
+
+    confinement = RunnerTokenConfinement(_RUNNER_ID, lambda _runner, _sid: True)
+
+    class TestAuth(_CredentialHeaderAuthProvider):
+        def get_user_id(self, request: HTTPConnection) -> str | None:
+            if scoped:
+                request.scope[_RUNNER_CONFINEMENT_KEY] = confinement
+            return "owner@example.com"
+
+    registry = TunnelRegistry()
+    connected: asyncio.Future[RunnerSession] = asyncio.get_running_loop().create_future()
+
+    async def on_connect(_runner_id: str, connection: RunnerSession) -> None:
+        connected.set_result(connection)
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(
+            registry, auth_provider=TestAuth(), on_runner_connect=on_connect
+        ),
+        prefix="/v1",
+    )
+    communicator = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, registry, connection_id="scope-context")
+        connection = await asyncio.wait_for(connected, 5)
+        assert connection.owner == "owner@example.com"
+        assert connection.confinement is (confinement if scoped else None)
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(communicator.future, 5)

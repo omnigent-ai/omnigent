@@ -14037,3 +14037,63 @@ async def test_external_error_item_model_unavailable_card_live_and_after_reload(
         assert shown["message"] == item_data["message"]
         for field, value in card.items():
             assert shown.get(field) == value, (field, shown)
+
+
+@pytest.mark.parametrize(
+    ("bound_runner", "side_chat"), [("scoped", False), ("other", False), ("scoped", True)]
+)
+async def test_scoped_stop_uses_fresh_authorized_snapshot(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    bound_runner: str,
+    side_chat: bool,
+) -> None:
+    from omnigent.server.auth import RunnerTokenConfinement, runner_session_in_scope
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_events
+    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_runner_id(session["id"], bound_runner)
+    confinement = RunnerTokenConfinement(
+        "scoped", lambda runner, sid: runner_session_in_scope(runner, sid, store.get_conversation)
+    )
+    cleanup_client = AsyncMock()
+    cleanup_client.delete.return_value = httpx.Response(
+        204, request=httpx.Request("DELETE", f"http://runner/v1/sessions/{session['id']}")
+    )
+    resolve_cleanup = AsyncMock(return_value=cleanup_client)
+    if side_chat:
+        store.set_labels(session["id"], {SIDE_CHAT_LABEL_KEY: "true"})
+        monkeypatch.setattr(sessions, "_get_runner_client", resolve_cleanup)
+
+    async def deliver_stop(*_args: Any, **_kwargs: Any) -> bool:
+        if side_chat:
+            store.replace_runner_id(session["id"], "replacement")
+        return True
+
+    stop = AsyncMock(side_effect=deliver_stop)
+    monkeypatch.setattr(routes_events, "runner_token_confinement", lambda _request: confinement)
+    monkeypatch.setattr(sessions, "_stop_session_via_runner", stop)
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events", json={"type": "stop_session", "data": {}}
+    )
+    if bound_runner == "other":
+        assert response.status_code == 403
+        stop.assert_not_awaited()
+    else:
+        assert response.status_code == 202, response.text
+        stop.assert_awaited_once()
+        snapshot = stop.await_args.kwargs["conversation"]
+        assert snapshot.id == session["id"]
+        assert snapshot.runner_id == "scoped"
+        if side_chat:
+            resolve_cleanup.assert_awaited_once()
+            assert resolve_cleanup.await_args.kwargs["conversation"] is snapshot
+            cleanup_client.delete.assert_awaited_once_with(
+                f"/v1/sessions/{session['id']}", timeout=60.0
+            )
+            assert store.get_conversation(session["id"]).runner_id == "replacement"

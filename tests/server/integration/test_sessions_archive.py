@@ -183,7 +183,7 @@ async def test_archive_does_not_block_on_slow_stop(
     release = asyncio.Event()
     stopped: list[str] = []
 
-    async def _parked_stop(sid: str, *_args: object) -> None:
+    async def _parked_stop(sid: str, *_args: object, **_kwargs: object) -> None:
         stopped.append(sid)
         await release.wait()
 
@@ -805,3 +805,219 @@ async def test_archive_passes_the_servers_sandbox_config_to_the_teardown(
     conv, passed_host_store, _conversations, passed_config = call.args
     assert conv.id == session["id"] and conv.archived is True
     assert passed_host_store is host_store and passed_config is sandbox_config
+
+
+async def test_scoped_archive_stops_authorized_grandchild_across_excluded_branch(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.auth import RunnerTokenConfinement, runner_session_in_scope
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation(runner_id="scoped")
+    excluded = store.create_conversation(
+        runner_id="other", kind="sub_agent", parent_conversation_id=parent.id
+    )
+    allowed = store.create_conversation(
+        runner_id="scoped", kind="sub_agent", parent_conversation_id=excluded.id
+    )
+    inherited = store.create_conversation(kind="sub_agent", parent_conversation_id=allowed.id)
+    confinement = RunnerTokenConfinement(
+        "scoped", lambda runner, sid: runner_session_in_scope(runner, sid, store.get_conversation)
+    )
+    stop = AsyncMock()
+    monkeypatch.setattr(_sessions_facade, "_stop_session_via_runner", stop)
+    for row in (parent, excluded, allowed, inherited):
+        _sessions_common._session_status_cache[row.id] = "running"
+    try:
+        descendants = await _sessions_orchestration._best_effort_stop(
+            parent.id, store, None, confinement=confinement
+        )
+    finally:
+        for row in (parent, excluded, allowed, inherited):
+            _sessions_common._session_status_cache.pop(row.id, None)
+
+    assert set(descendants) == {excluded.id, allowed.id, inherited.id}
+    assert [call.args[0] for call in stop.await_args_list] == [parent.id, allowed.id, inherited.id]
+    assert all(
+        call.kwargs["conversation"].runner_id in (None, "scoped") for call in stop.await_args_list
+    )
+
+
+async def test_deferred_scoped_archive_rechecks_root_authority(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.auth import RunnerTokenConfinement, runner_session_in_scope
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation(runner_id="scoped")
+    store.update_conversation(parent.id, archived=True)
+    confinement = RunnerTokenConfinement(
+        "scoped", lambda runner, sid: runner_session_in_scope(runner, sid, store.get_conversation)
+    )
+    waiting, release = asyncio.Event(), asyncio.Event()
+
+    async def wait_for_turn(*_: object) -> bool:
+        waiting.set()
+        await release.wait()
+        return True
+
+    stop, host_stop = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(_sessions_facade, "_best_effort_stop", stop)
+    monkeypatch.setattr(_sessions_orchestration, "_stop_host_runner_intentionally", host_stop)
+    monkeypatch.setattr(_sessions_orchestration, "_await_archived_turn_end", wait_for_turn)
+    _sessions_orchestration._spawn_archive_stop(
+        parent.id, store, None, confinement=confinement, after_turn=True
+    )
+    task = _sessions_orchestration._pending_archive_stops[parent.id]
+    try:
+        await asyncio.wait_for(waiting.wait(), 5)
+        store.replace_runner_id(parent.id, "other")
+    finally:
+        release.set()
+        await asyncio.wait_for(task, 5)
+    stop.assert_not_awaited()
+    host_stop.assert_not_awaited()
+
+
+@pytest.mark.parametrize("dependent", ["foreign-child", "nested-side-chat"])
+async def test_scoped_archive_preserves_worktree_for_excluded_descendant(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, dependent: str
+) -> None:
+    from omnigent.server.auth import RunnerTokenConfinement, runner_session_in_scope
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation(
+        runner_id="scoped", host_id="1" * 32, workspace="/workspace/branch", git_branch="branch"
+    )
+    store.update_conversation(parent.id, archived=True)
+    child = store.create_conversation(
+        runner_id="other" if dependent == "foreign-child" else "scoped",
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+    )
+    if dependent == "nested-side-chat":
+        store.create_conversation(runner_id="other", side_chat_parent_id=child.id)
+    confinement = RunnerTokenConfinement(
+        "scoped", lambda runner, sid: runner_session_in_scope(runner, sid, store.get_conversation)
+    )
+    cleanup = AsyncMock()
+    monkeypatch.setattr(_sessions_facade, "_remove_session_worktree_best_effort", cleanup)
+    monkeypatch.setattr(_sessions_facade, "_best_effort_stop", AsyncMock())
+    monkeypatch.setattr(_sessions_orchestration, "_stop_host_runner_intentionally", AsyncMock())
+    await _sessions_orchestration._archive_stop(
+        parent.id, store, None, None, confinement=confinement, delete_worktree=True
+    )
+    cleanup.assert_not_awaited()
+
+
+async def test_pinned_archive_stop_does_not_use_global_runner_fallback(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.server.routes._sessions.helpers import _stop_session_via_runner_impl
+
+    store = SqlAlchemyConversationStore(db_uri)
+    target = store.create_conversation(runner_id="scoped")
+    router = Mock()
+    router.client_for_session_control.side_effect = LookupError("runner offline")
+    global_client = AsyncMock()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: global_client)
+    assert await _stop_session_via_runner_impl(target.id, router, conversation=target) is False
+    router.client_for_session_control.assert_called_once_with(target.id, conversation=target)
+    global_client.post.assert_not_awaited()
+
+
+@pytest.mark.parametrize("independent_root", [False, True], ids=["archive-tree", "other-tree"])
+@pytest.mark.parametrize("kind", ["child", "side-chat"])
+async def test_scoped_archive_retains_runner_with_excluded_dependent(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, independent_root: bool, kind: str
+) -> None:
+    from omnigent.server.auth import RunnerTokenConfinement
+
+    store = SqlAlchemyConversationStore(db_uri)
+    source = store.create_conversation(
+        runner_id="scoped", host_id="1" * 32, workspace="/workspace", git_branch="branch"
+    )
+    store.update_conversation(source.id, archived=True)
+    owner = store.create_conversation(runner_id="scoped") if independent_root else source
+    if kind == "child":
+        dependent = store.create_conversation(kind="sub_agent", parent_conversation_id=owner.id)
+    else:
+        dependent = store.create_conversation(side_chat_parent_id=owner.id)
+    confinement = RunnerTokenConfinement("scoped", lambda _runner, sid: sid != dependent.id)
+    stop_session, stop_runner = AsyncMock(), AsyncMock(return_value=True)
+    cleanup, stop_sandbox = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(_sessions_facade, "_stop_session_via_runner", stop_session)
+    monkeypatch.setattr(_sessions_facade, "_stop_session_host_runner", stop_runner)
+    monkeypatch.setattr(_sessions_facade, "_remove_session_worktree_best_effort", cleanup)
+    monkeypatch.setattr(_sessions_orchestration, "stop_archived_session_sandbox", stop_sandbox)
+    _sessions_common._session_status_cache[source.id] = "running"
+    try:
+        await _sessions_orchestration._archive_stop(
+            source.id,
+            store,
+            None,
+            None,
+            confinement=confinement,
+            delete_worktree=True,
+            host_store=HostStore(db_uri),
+        )
+        assert [call.args[0] for call in stop_session.await_args_list] == [source.id]
+        stop_runner.assert_not_awaited()
+        cleanup.assert_not_awaited()
+        stop_sandbox.assert_not_awaited()
+        assert source.id not in _sessions_common._intentional_stop_sessions
+        assert owner.id not in _sessions_common._intentional_stop_sessions
+    finally:
+        _sessions_common._session_status_cache.pop(source.id, None)
+
+
+async def test_scoped_runner_stop_requires_complete_occupant_listing(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.server.auth import RunnerTokenConfinement
+
+    store = SqlAlchemyConversationStore(db_uri)
+    source = store.create_conversation(
+        runner_id="scoped", host_id="1" * 32, workspace="/workspace"
+    )
+    confinement = RunnerTokenConfinement("scoped", lambda _runner, _sid: True)
+    stop_runner = AsyncMock(return_value=True)
+    monkeypatch.setattr(_sessions_facade, "_stop_session_host_runner", stop_runner)
+    monkeypatch.setattr(store, "list_runner_session_statuses", Mock(side_effect=RuntimeError))
+    stopped = await _sessions_orchestration._stop_host_runner_intentionally(
+        source.id, source.host_id, "scoped", None, store, confinement=confinement
+    )
+    assert stopped is False
+    stop_runner.assert_not_awaited()
+    assert source.id not in _sessions_common._intentional_stop_sessions
+
+
+async def test_scoped_runner_stop_preserves_authorized_shared_runtime_cleanup(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.auth import RunnerTokenConfinement, runner_session_in_scope
+
+    store = SqlAlchemyConversationStore(db_uri)
+    source = store.create_conversation(
+        runner_id="scoped", host_id="1" * 32, workspace="/workspace"
+    )
+    shared = store.create_conversation(runner_id="scoped")
+    store.create_conversation(kind="sub_agent", parent_conversation_id=shared.id)
+    confinement = RunnerTokenConfinement(
+        "scoped", lambda runner, sid: runner_session_in_scope(runner, sid, store.get_conversation)
+    )
+    stop_runner = AsyncMock(return_value=True)
+    monkeypatch.setattr(_sessions_facade, "_stop_session_host_runner", stop_runner)
+    try:
+        stopped = await _sessions_orchestration._stop_host_runner_intentionally(
+            source.id, source.host_id, "scoped", None, store, confinement=confinement
+        )
+        assert stopped is True
+        stop_runner.assert_awaited_once()
+    finally:
+        for row in (source, shared):
+            _sessions_common._intentional_stop_sessions.pop(row.id, None)
