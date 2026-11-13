@@ -62,13 +62,14 @@ export type FeatureKey =
   | "canvas"
   | "arca_shutdown_warnings"
   | "import_review"
-  | "custom_agents_settings_ui"
   | "sidebar_grouping_ui"
   | "workspace_content_search"
   | "grid_sessions_display_ui"
   | "automations_v2"
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
+  | "session_overview"
+  | "project_repository_creation"
   | "session_orchestration";
 
 /** Deployment-wide release-feature values advertised by the server. */
@@ -285,9 +286,9 @@ export interface ServerInfo {
   /** Sandbox automations accept a repository URL as their workspace. */
   scheduled_task_sandbox_workspaces?: boolean;
   /**
-   * True when a managed create accepts ``host_id`` naming its new sandbox
-   * host. Older servers reject it, so the create omits it there. Fails to
-   * ``false``.
+   * True when a managed create, fork or move accepts ``host_id`` naming its
+   * new sandbox host. Web JSON sends a minted id only when this is true.
+   * Fails to ``false``.
    */
   request_managed_sandbox_host_id?: boolean;
   /** True when sandbox forks accept an explicit `workspaces` list; absent on older servers. */
@@ -552,11 +553,7 @@ export function adminGeneralSettingsAvailable(info: ServerInfo | "loading"): boo
 }
 
 export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
-  return (
-    isFeatureEnabled(info, "custom_agents_settings_ui") &&
-    info !== "loading" &&
-    info.agent_install === true
-  );
+  return info !== "loading" && info.agent_install === true;
 }
 
 let cachedServerInfo: ServerInfo | null = null;
@@ -625,7 +622,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
       // Route through the host transport (`hostFetch`) so the embed hits the
       // proxied omnigent API; standalone `hostFetch` falls back to plain
       // `fetch("/v1/info")`, preserving the original behavior.
-      const res = await hostFetch("/v1/info");
+      const res = await hostFetch("/v1/info", undefined, { hostless: true });
       if (res.ok) {
         const data = (await res.json()) as Partial<ServerInfo>;
         const smartRoutingEnabled = data.smart_routing_enabled === true;

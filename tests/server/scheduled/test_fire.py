@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -2351,6 +2352,14 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
 
     assert calls == ["enqueue", "launch"] * 2
     assert len({saved["session_id"] for saved in startup.enqueued}) == 2
+    # Each fresh fire picks its sandbox host id, records it on its session, and launches under it.
+    launched_host_ids = [call.kwargs["host_id"] for call in managed_launch.await_args_list]
+    assert all(re.fullmatch(r"[0-9a-f]{32}", host_id) for host_id in launched_host_ids)
+    assert len(set(launched_host_ids)) == 2
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+
+    labels = [created["labels"] for created in conversations.created]
+    assert [label[REQUESTED_HOST_ID_LABEL_KEY] for label in labels] == launched_host_ids
     for saved in startup.enqueued:
         assert saved["user_id"] == RESERVED_USER_LOCAL
         assert saved["event"].data["content"] == [
@@ -2426,9 +2435,14 @@ async def test_managed_fire_does_not_block_next_fire_while_provisioning(
     )
 
     try:
-        for _ in range(2):
+        for launched in (1, 2):
             assert await run_now(0, "task_1") is True
             await _drain()
+            # The launch task reads the host row before it calls the launcher, so poll for it.
+            for _ in range(200):
+                if managed_launch.await_count == launched:
+                    break
+                await asyncio.sleep(0.005)
         assert managed_launch.await_count == 2
         assert [run["status"] for run in store.runs] == ["running"] * 2
     finally:

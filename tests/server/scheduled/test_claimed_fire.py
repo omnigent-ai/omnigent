@@ -921,6 +921,11 @@ async def test_managed_fire_hands_off_once_the_sandbox_host_is_bound(
     if outcome == "bound":
         assert (run.status, run.conversation_id) == ("running", conversations.ids[0])
         assert startup.launch_failures == []
+        # The session routes by the host id it launched under, from its first request.
+        from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+
+        labels = conversations.existing[conversations.ids[0]].labels
+        assert labels[REQUESTED_HOST_ID_LABEL_KEY] == run.host_id
     else:
         # The failure stage: creating the sandbox, or starting its runner once bound.
         error_code, reason = {
