@@ -277,13 +277,16 @@ describe("TasksPanel", () => {
     );
     cleanup();
 
-    // With the Workflows page on, the chip opens it.
+    // With the Workflows page on, the chip opens the workflow's own page.
     vi.mocked(useServerInfo).mockReturnValue({
       session_journal: true,
       features: { workflows_page: true },
     } as never);
     renderPanel();
-    expect(screen.getByTestId("tasks-plan-workflow")).toHaveAttribute("href", "/workflows");
+    expect(screen.getByTestId("tasks-plan-workflow")).toHaveAttribute(
+      "href",
+      `/workflows/${workflowId}`,
+    );
     cleanup();
 
     showJournal([journalPlan(0, ["explore"])]);

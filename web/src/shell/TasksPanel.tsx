@@ -717,7 +717,8 @@ export function ProgressStrip({
 
 /**
  * Marks a plan that runs a saved workflow, or was saved as one, with the
- * workflow's name on hover. It opens the Workflows page when there is one.
+ * workflow's name on hover. With the Workflows page on, it opens the
+ * workflow's page.
  */
 function WorkflowChip({ workflowId }: { workflowId: string }) {
   const { workflows } = useSavedWorkflows();
@@ -737,7 +738,7 @@ function WorkflowChip({ workflowId }: { workflowId: string }) {
           {linked ? (
             <Badge asChild variant="outline" className={className}>
               <Link
-                to="/workflows"
+                to={`/workflows/${encodeURIComponent(workflowId)}`}
                 componentId="tasks.plan.workflow"
                 data-testid="tasks-plan-workflow"
               >
