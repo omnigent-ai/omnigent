@@ -3252,6 +3252,7 @@ def create_runner_app(
             )
             harness_name = canonicalize_harness(raw_harness) or raw_harness
 
+            from omnigent.inner.sandbox import HarnessSandboxValidationError
             from omnigent.runner.policy import AgentStartPolicyError
 
             try:
@@ -3301,11 +3302,26 @@ def create_runner_app(
                     model_override=_model_override,
                     resource_registry=resource_registry,
                 )
-            except OmnigentError as exc:
-                # The relay also needs the failure when init precedes the first turn.
-                _publish_turn_status(
-                    session_id, "failed", error={"code": exc.code, "message": str(exc)}
+            except (OmnigentError, HarnessSandboxValidationError) as exc:
+                policy_error = exc.__cause__ if isinstance(exc, OmnigentError) else exc
+                error_code = (
+                    exc.code if isinstance(exc, OmnigentError) else ErrorCode.INVALID_INPUT
                 )
+                error = {
+                    "code": error_code,
+                    "message": (
+                        _client_safe_error_detail(exc, context="harness sandbox validation")
+                        if isinstance(policy_error, HarnessSandboxValidationError)
+                        else str(exc)
+                    ),
+                }
+                # The relay also needs the failure when init precedes the first turn.
+                _publish_turn_status(session_id, "failed", error=error)
+                if isinstance(policy_error, HarnessSandboxValidationError):
+                    return JSONResponse(
+                        status_code=exc.http_status if isinstance(exc, OmnigentError) else 400,
+                        content={"error": error},
+                    )
                 raise
             if spawn_env is None:
                 spawn_env = await _resolve_native_spawn_env(

@@ -31,6 +31,7 @@ from omnigent.spec.types import (
     FunctionRef,
     GuardrailsSpec,
 )
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import _drain_session_event_queue
 from tests.runner.conftest import _FakeProcessManager as _TurnProcessManager
 from tests.runner.conftest import _ScriptedHarnessClient as _TurnHarnessClient
@@ -530,22 +531,42 @@ async def test_enforce_sandbox_no_policy_leaves_spec_unchanged() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["codex", "antigravity"])
 @pytest.mark.parametrize(
-    ("sandbox_type", "expected_status"),
+    ("sandbox_type", "guidance"),
     [
-        ("windows_jobobject", 400),
-        ("default", 400),
-        ("none", 201),
-        ("absent", 201),
-        ("linux_bwrap", 201),
+        ("windows_jobobject", "windows"),
+        ("default", "windows"),
+        ("unsupported-type", "type"),
+        ("none", None),
+        ("absent", None),
+        ("linux_bwrap", None),
+        ("provider-error", "provider"),
     ],
 )
-async def test_codex_session_init_checks_sandbox_before_spawn(
-    monkeypatch: pytest.MonkeyPatch, sandbox_type: str, expected_status: int
+async def test_session_init_checks_sandbox_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
+    harness: str,
+    sandbox_type: str,
+    guidance: str | None,
 ) -> None:
-    """Unsupported Windows confinement is rejected during the init handshake."""
+    """Init rejects unsupported confinement with safe guidance before acquiring a worker."""
+    from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    private_type = "private-policy-type-diagnostic"
+    if guidance == "provider":
+        # Ordinary builder errors must retain their status and public message.
+        def fail_spawn_env(*_args: object, **_kwargs: object) -> None:
+            raise OmnigentError(
+                "Provider configuration is unavailable.", code=ErrorCode.UNAUTHORIZED
+            ) from ValueError("ordinary provider diagnostic")
+
+        monkeypatch.setattr("omnigent.runner.app._build_spawn_env_from_spec", fail_spawn_env)
     monkeypatch.setattr(
         "omnigent.inner.sandbox._default_sandbox_for_platform",
         lambda: OSEnvSandboxSpec(type="windows_jobobject"),
@@ -553,11 +574,16 @@ async def test_codex_session_init_checks_sandbox_before_spawn(
     spec = AgentSpec(
         spec_version=1,
         name="review-agent",
-        executor=ExecutorSpec(config={"harness": "codex"}),
+        executor=ExecutorSpec(config={"harness": harness}),
         os_env=None
-        if sandbox_type == "absent"
+        if sandbox_type in {"absent", "provider-error"}
         else OSEnvSpec(
-            sandbox=None if sandbox_type == "default" else OSEnvSandboxSpec(type=sandbox_type),
+            type=private_type if sandbox_type == "unsupported-type" else "caller_process",
+            sandbox=None
+            if sandbox_type == "default"
+            else OSEnvSandboxSpec(
+                type="linux_bwrap" if sandbox_type == "unsupported-type" else sandbox_type
+            ),
         ),
     )
     manager = _FakeProcessManager(_ScriptedHarnessClient())
@@ -571,21 +597,55 @@ async def test_codex_session_init_checks_sandbox_before_spawn(
         spec_resolver=resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
+    session_id = f"conv_review_{harness}_{sandbox_type}"
     async with _runner_client(app) as client:
         response = await client.post(
-            "/v1/sessions", json={"session_id": "conv_review", "agent_id": "ag_test"}
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "ag_test"}
         )
 
+    if harness == "antigravity" and sandbox_type == "linux_bwrap":
+        guidance = "sandbox"
+    expected_status = 401 if guidance == "provider" else 400 if guidance is not None else 201
     assert response.status_code == expected_status, response.text
-    if expected_status == 400:
-        assert (
-            "Codex cannot enforce filesystem or network policy with windows_jobobject"
-            in response.text
-        )
+    events = _drain_session_event_queue(app.state.session_event_queues.get(session_id))
+    if guidance is not None:
+        expected_guidance = {
+            "windows": (
+                "The selected harness cannot enforce filesystem or network policy "
+                "with windows_jobobject."
+            ),
+            "type": "The selected harness supports only os_env.type=caller_process.",
+            "sandbox": (
+                "The selected harness cannot enforce os_env.sandbox. "
+                "Choose a sandbox-capable harness."
+            ),
+            "provider": "Provider configuration is unavailable.",
+        }[guidance]
+        error = response.json()["error"]
+        assert error == {
+            "code": "unauthorized" if guidance == "provider" else "invalid_input",
+            "message": (
+                expected_guidance
+                if guidance == "provider"
+                else f"{expected_guidance} Request failed on the runner; "
+                f"see the runner log for details: {pinned_runner_log}"
+            ),
+        }
+        failures = [
+            event
+            for event in events
+            if event.get("type") == "session.status" and event.get("status") == "failed"
+        ]
+        assert len(failures) == 1
+        assert failures[0]["error"] == error
+        assert private_type not in response.text
+        assert private_type not in json.dumps(events)
+        if sandbox_type == "unsupported-type":
+            assert private_type in caplog.text
         assert not manager.get_client_calls
     else:
         assert len(manager.get_client_calls) == 1
-        assert manager.get_client_calls[0][1] == "codex"
+        assert manager.get_client_calls[0][1] == harness
 
 
 class _ModelOverrideServerClient(NullServerClient):

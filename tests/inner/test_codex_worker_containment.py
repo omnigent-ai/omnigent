@@ -827,6 +827,9 @@ def test_explicit_none_sandbox_keeps_direct_worker_path(tmp_path: Path) -> None:
     [
         ("preparation", OSError, "containment failed"),
         ("cwd", HarnessSandboxPreparationError, "private cwd diagnostic"),
+        ("cwd-absent-policy", RuntimeError, "private cwd diagnostic"),
+        ("cwd-sandbox-none", RuntimeError, "private cwd diagnostic"),
+        ("cwd-default-sandbox", HarnessSandboxPreparationError, "private cwd diagnostic"),
         ("unsupported-policy", ValueError, "Codex cannot enforce filesystem or network policy"),
         ("unavailable-backend", OSError, "sandbox unavailable"),
     ],
@@ -858,27 +861,39 @@ async def test_session_containment_failure_prevents_worker_spawn(
         provider_prepare,
     )
 
+    os_env: OSEnvSpec | None = OSEnvSpec(
+        sandbox=OSEnvSandboxSpec(
+            type="windows_jobobject" if failure == "unsupported-policy" else "darwin_seatbelt"
+        )
+    )
+    if failure == "cwd-absent-policy":
+        os_env = None
+    elif failure == "cwd-sandbox-none":
+        os_env = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))
+    elif failure == "cwd-default-sandbox":
+        os_env = OSEnvSpec()
+
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
         cwd=str(tmp_path),
         env={},
         tool_executor=None,
-        os_env=OSEnvSpec(
-            sandbox=OSEnvSandboxSpec(
-                type="windows_jobobject" if failure == "unsupported-policy" else "darwin_seatbelt"
-            )
-        ),
+        os_env=os_env,
+        skills_filter="none",
     )
     session._request = AsyncMock()
     original_resolve = Path.resolve
+    cwd_error = RuntimeError("private cwd diagnostic")
 
     def resolve_cwd(path: Path, *args: object, **kwargs: object) -> Path:
         if path == tmp_path:
-            raise RuntimeError("private cwd diagnostic")
+            raise cwd_error
         return original_resolve(path, *args, **kwargs)
 
-    if failure == "cwd":
+    if failure.startswith("cwd"):
         monkeypatch.setattr(Path, "resolve", resolve_cwd)
+        prepare_worker = Mock()
+        monkeypatch.setattr("omnigent.inner.codex_executor.prepare_codex_worker", prepare_worker)
 
     with pytest.raises(error_type, match=message) as raised:
         await session.start()
@@ -888,9 +903,15 @@ async def test_session_containment_failure_prevents_worker_spawn(
     session._request.assert_not_awaited()
     assert session.cleaned
     assert session._codex_home_dir is None
-    if failure == "cwd":
-        assert isinstance(raised.value.__cause__, RuntimeError)
+    if failure.startswith("cwd"):
+        if error_type is HarnessSandboxPreparationError:
+            assert raised.value.__cause__ is cwd_error
+        else:
+            assert raised.value is cwd_error
         populate_home.assert_not_called()
+        prepare_worker.assert_not_called()
+        assert session._worker_launch is None
+        assert session._worker_prepare_task is None
     else:
         assert not populate_home.call_args.args[0].exists()
 
