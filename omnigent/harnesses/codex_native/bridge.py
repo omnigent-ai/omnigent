@@ -1929,11 +1929,22 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
         )
 
 
+def codex_binding_matches(
+    current: CodexNativeBridgeState, expected: CodexNativeBridgeState
+) -> bool:
+    """Whether both snapshots identify the same native session binding."""
+    return all(
+        getattr(current, field) == getattr(expected, field)
+        for field in ("session_id", "thread_id", "socket_path", "codex_home")
+    )
+
+
 def clear_active_turn_id_if_matches(
     bridge_dir: Path,
     completed_turn_id: str | None,
     *,
     on_cleared: Callable[[], None] | None = None,
+    expected_state: CodexNativeBridgeState | None = None,
 ) -> bool:
     """
     Clear the active Codex turn id if a terminal event matches it.
@@ -1964,6 +1975,8 @@ def clear_active_turn_id_if_matches(
         must not call any bridge-state function (doing so self-deadlocks). If it
         raises, the exception is caught and logged: the clear is already
         written, so a retry would not re-run the callback.
+    :param expected_state: Optional native binding that owns the request.
+        A missing or replacement binding is left untouched under the state lock.
     :returns: ``True`` when bridge state was cleared or did not exist,
         ``False`` when a stale or ambiguous terminal event was ignored.
     """
@@ -1980,6 +1993,10 @@ def clear_active_turn_id_if_matches(
 
     with _bridge_state_lock(bridge_dir):
         state = read_bridge_state(bridge_dir)
+        if expected_state is not None and (
+            state is None or not codex_binding_matches(state, expected_state)
+        ):
+            return False
         if state is None:
             _run_on_cleared()
             return True

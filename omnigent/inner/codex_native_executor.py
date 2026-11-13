@@ -60,6 +60,9 @@ from omnigent.harnesses.codex_native.bridge import (
     reconcile_shell_command_state,
     record_acknowledged_turn_id,
 )
+from omnigent.harnesses.codex_native.bridge import (
+    codex_binding_matches as _codex_binding_matches,
+)
 from omnigent.harnesses.codex_native.shell_input import (
     native_shell_command_is_authorized,
 )
@@ -240,20 +243,9 @@ def _bridge_state_wait_seconds(bridge_dir: Path) -> float:
     )
 
 
-# Bridge-state fields that identify one native session binding.
-_CODEX_BINDING_FIELDS = ("session_id", "thread_id", "socket_path", "codex_home")
-
-
-def _codex_binding_matches(
-    current: CodexNativeBridgeState, expected: CodexNativeBridgeState
-) -> bool:
-    """Whether *current* still names the session binding *expected* was read from."""
-    return all(
-        getattr(current, field) == getattr(expected, field) for field in _CODEX_BINDING_FIELDS
-    )
-
-
-def _require_codex_binding(bridge_dir: Path, expected: CodexNativeBridgeState) -> None:
+def _require_codex_binding(
+    bridge_dir: Path, expected: CodexNativeBridgeState
+) -> CodexNativeBridgeState:
     """Refuse unsent input when an await outlives the original session binding."""
     current = read_bridge_state(bridge_dir)
     if current is None or not _codex_binding_matches(current, expected):
@@ -264,6 +256,7 @@ def _require_codex_binding(bridge_dir: Path, expected: CodexNativeBridgeState) -
             ),
             preserve_session=True,
         )
+    return current
 
 
 async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServerClient | None:
@@ -913,10 +906,8 @@ async def _inject_codex_turn_once(
     # Codex authoritatively says A is no longer the active turn (it ended, or a
     # newer turn B replaced it). Clear A only if it is still the bridge's value;
     # a concurrent turn/started(B) must survive this recovery.
-    clear_active_turn_id_if_matches(bridge_dir, expected_turn_id)
-    recovered_state = read_bridge_state(bridge_dir)
-    if recovered_state is None or recovered_state.session_id != state.session_id:
-        raise RuntimeError("Codex native bridge changed while recovering a stale turn")
+    clear_active_turn_id_if_matches(bridge_dir, expected_turn_id, expected_state=state)
+    recovered_state = _require_codex_binding(bridge_dir, state)
     if recovered_state.active_turn_id is not None:
         _logger.info(
             "Codex native stale steer raced with a newer turn; steering turn_id=%s",
@@ -1104,7 +1095,9 @@ class CodexNativeExecutor(Executor):
                         raise
                     # Drop the stale record unless a newer turn/started already
                     # replaced it.
-                    clear_active_turn_id_if_matches(self._bridge_dir, state.active_turn_id)
+                    clear_active_turn_id_if_matches(
+                        self._bridge_dir, state.active_turn_id, expected_state=state
+                    )
                     _logger.info(
                         "Codex native interrupt skipped: recorded turn %s already superseded (%s)",
                         state.active_turn_id,

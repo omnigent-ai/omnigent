@@ -3042,6 +3042,52 @@ def test_stale_steer_recovery_preserves_and_steers_concurrent_new_turn(
     assert all(a["input_stable_id"] == "a" * 32 for a in outcomes)
 
 
+@pytest.mark.parametrize("changed_field", ["session_id", "thread_id", "socket_path", "codex_home"])
+@pytest.mark.parametrize("delivery", ["turn", "live_queue", "interrupt"])
+def test_stale_turn_refusal_preserves_replacement_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    changed_field: str,
+    delivery: str,
+) -> None:
+    """An old peer's refusal cannot clear or receive input for a replacement binding."""
+    _seed_bridge(tmp_path, active_turn_id="turn_a")
+    initial = read_bridge_state(tmp_path)
+    assert initial is not None
+    replacement = replace(initial, **{changed_field: f"replacement_{changed_field}"})
+
+    class _ReplacedBindingClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            type(self).requests.append((method, params))
+            if len(type(self).requests) == 1:
+                write_bridge_state(tmp_path, replacement)
+                raise CodexAppServerResponseError(
+                    {"code": -32600, "message": "no active turn to steer"}
+                )
+            return {"result": {"turn": {"id": "unexpected_turn"}, "turnId": "unexpected_turn"}}
+
+    _ReplacedBindingClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _ReplacedBindingClient,
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    if delivery == "turn":
+        events = _collect_turn_events(executor, "retain this follow-up")
+        assert len(events) == 1 and isinstance(events[0], ExecutorError)
+        assert events[0].undelivered is True
+        assert events[0].preserve_session is True
+    elif delivery == "live_queue":
+        assert (
+            asyncio.run(executor.enqueue_session_message("key", "retain this follow-up")) is False
+        )
+    else:
+        assert asyncio.run(executor.interrupt_session("key")) is True
+
+    assert read_bridge_state(tmp_path) == replacement
+    assert len(_ReplacedBindingClient.requests) == 1
+
+
 def test_stale_active_turn_mismatch_steer_recovers_to_newer_turn(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

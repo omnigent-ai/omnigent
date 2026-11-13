@@ -646,6 +646,42 @@ def test_clear_active_turn_id_if_matches(
 
 
 @pytest.mark.parametrize(
+    "changed_field", [None, "session_id", "thread_id", "socket_path", "codex_home", "missing"]
+)
+def test_clear_active_turn_respects_request_binding(
+    bridge_dir: Path, changed_field: str | None
+) -> None:
+    """A refused request cannot clear a replacement's turn or publish its idle callback."""
+    _seed_active_turn(bridge_dir, "turn_1")
+    expected = read_bridge_state(bridge_dir)
+    assert expected is not None
+    replacement = expected
+    if changed_field == "missing":
+        clear_bridge_state(bridge_dir)
+    elif changed_field is not None:
+        replacement = replace(expected, **{changed_field: f"replacement_{changed_field}"})
+        write_bridge_state(bridge_dir, replacement)
+    callbacks: list[str] = []
+
+    cleared = clear_active_turn_id_if_matches(
+        bridge_dir,
+        "turn_1",
+        expected_state=expected,
+        on_cleared=lambda: callbacks.append("idle"),
+    )
+
+    assert cleared is (changed_field is None)
+    assert callbacks == (["idle"] if changed_field is None else [])
+    current = read_bridge_state(bridge_dir)
+    if changed_field == "missing":
+        assert current is None
+    elif changed_field is not None:
+        assert current == replacement
+    else:
+        assert current is not None and current.active_turn_id is None
+
+
+@pytest.mark.parametrize(
     ("active_turn_id", "next_turn_id"),
     [(None, None), ("turn_a", "turn_a"), (None, "turn_a"), ("turn_a", "turn_b"), ("turn_a", None)],
 )
