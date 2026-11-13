@@ -1611,6 +1611,20 @@ def _build_codex_spawn_env(
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
+    if spec.os_env is not None:
+        from omnigent.inner.sandbox import validate_harness_sandbox
+
+        try:
+            validate_harness_sandbox(
+                spec.os_env,
+                "Codex",
+                cwd=cwd,
+                supports_egress_rules=True,
+                supports_credential_proxy=True,
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
     env: dict[str, str] = {}
     model = _resolve_bound_launch_model(spec, "codex")
     if model is not None:

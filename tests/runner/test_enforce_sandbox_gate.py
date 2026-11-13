@@ -529,6 +529,65 @@ async def test_enforce_sandbox_no_policy_leaves_spec_unchanged() -> None:
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sandbox_type", "expected_status"),
+    [
+        ("windows_jobobject", 400),
+        ("default", 400),
+        ("none", 201),
+        ("absent", 201),
+        ("linux_bwrap", 201),
+    ],
+)
+async def test_codex_session_init_checks_sandbox_before_spawn(
+    monkeypatch: pytest.MonkeyPatch, sandbox_type: str, expected_status: int
+) -> None:
+    """Unsupported Windows confinement is rejected during the init handshake."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setattr(
+        "omnigent.inner.sandbox._default_sandbox_for_platform",
+        lambda: OSEnvSandboxSpec(type="windows_jobobject"),
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="review-agent",
+        executor=ExecutorSpec(config={"harness": "codex"}),
+        os_env=None
+        if sandbox_type == "absent"
+        else OSEnvSpec(
+            sandbox=None if sandbox_type == "default" else OSEnvSandboxSpec(type=sandbox_type),
+        ),
+    )
+    manager = _FakeProcessManager(_ScriptedHarnessClient())
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions", json={"session_id": "conv_review", "agent_id": "ag_test"}
+        )
+
+    assert response.status_code == expected_status, response.text
+    if expected_status == 400:
+        assert (
+            "Codex cannot enforce filesystem or network policy with windows_jobobject"
+            in response.text
+        )
+        assert not manager.get_client_calls
+    else:
+        assert len(manager.get_client_calls) == 1
+        assert manager.get_client_calls[0][1] == "codex"
+
+
 class _ModelOverrideServerClient(NullServerClient):
     """Server client whose session GET returns a persisted model_override.
 

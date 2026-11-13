@@ -638,7 +638,8 @@ egress rules, see the `sandbox:` examples below and the sandbox source under
 Inner harness adapters reject `windows_jobobject`, including the Windows
 default, because it cannot enforce the requested filesystem and network
 boundaries. Confined harness processes require a supported Linux or macOS
-backend. Claude SDK containment also requires a system-installed Claude CLI;
+backend. Codex checks these capabilities during session initialization, before
+starting its worker. Claude SDK containment also requires a system-installed Claude CLI;
 `OMNIGENT_CLAUDE_SDK_NO_SANDBOX` cannot bypass a requested sandbox.
 
 The Copilot, Cursor, Hermes, and Antigravity inner adapters cannot install
