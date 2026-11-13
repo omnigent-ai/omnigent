@@ -140,6 +140,7 @@ import {
   type FileNavigationGuard,
 } from "./FileViewerContext";
 import { revealFolderInFilesPanel } from "./FilesPanel";
+import { selectPullRequestInPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
@@ -2444,28 +2445,33 @@ function AppShellImpl() {
 
   // Composer links open the mobile drawer or reveal the desktop Pull Requests tab.
   // Deselect files/shells so the chosen panel owns its content slot.
-  const openGithubTab = useCallback(() => {
-    if (isMobileViewport()) {
-      openGithubPanel();
-      return;
-    }
-    setSelectedFilePath(null);
-    setSelectedTerminalKey(null);
-    if (!terminalFirst) setPanelInitialKey(null);
-    setExecutionLogsKey(null);
-    setFilesPanelOpen(false);
-    setSubagentsPanelOpen(false);
-    selectRightRailTab("github");
-    setRightPanelOpenAnimated(true);
-    if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
-  }, [
-    conversationId,
-    terminalFirst,
-    setPanelInitialKey,
-    openGithubPanel,
-    selectRightRailTab,
-    setRightPanelOpenAnimated,
-  ]);
+  const openGithubTab = useCallback(
+    (prUrl?: string) => {
+      if (prUrl && conversationId) selectPullRequestInPanel(queryClient, conversationId, prUrl);
+      if (isMobileViewport()) {
+        openGithubPanel();
+        return;
+      }
+      setSelectedFilePath(null);
+      setSelectedTerminalKey(null);
+      if (!terminalFirst) setPanelInitialKey(null);
+      setExecutionLogsKey(null);
+      setFilesPanelOpen(false);
+      setSubagentsPanelOpen(false);
+      selectRightRailTab("github");
+      setRightPanelOpenAnimated(true);
+      if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+    },
+    [
+      conversationId,
+      queryClient,
+      terminalFirst,
+      setPanelInitialKey,
+      openGithubPanel,
+      selectRightRailTab,
+      setRightPanelOpenAnimated,
+    ],
+  );
 
   function openMainExecutionLog() {
     // Mobile FAB → "Execution logs" jumps straight to the main thread.

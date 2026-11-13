@@ -461,6 +461,7 @@ def test_runner_env_preserves_claude_telemetry_opt_in() -> None:
 _IDLE_TIMEOUT_KNOBS: Final = {
     "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S": "0",
     "OMNIGENT_HARNESS_IDLE_TIMEOUT_S": "0",
+    "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S": "0",
 }
 
 

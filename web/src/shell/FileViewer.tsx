@@ -102,6 +102,8 @@ import {
 import { CommentSenderProvider, useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useChatStore } from "@/store/chatStore";
+import { useFileMentionHarnesses } from "@/lib/agentLabels";
+import { harnessSupportsFileMentions } from "@/lib/composerMentions";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
@@ -416,6 +418,10 @@ function FileViewerBody({
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
   const canEdit = permissionLevel == null || permissionLevel >= 2;
+  // Same gate as the composer's "@"-mention menu, so "Attach to agent" only
+  // shows when the session's agent will open the attached path.
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const attachToAgent = harnessSupportsFileMentions(sessionHarness, useFileMentionHarnesses());
   const [searchParams, setSearchParams] = useSearchParams();
   const rebasePath = useRebasePath();
   const isMobile = useIsMobileViewport();
@@ -1947,6 +1953,7 @@ function FileViewerBody({
                     activeSelection={activeSelection}
                     onSetActiveSelection={handleSetActiveSelection}
                     pendingBodyRef={pendingBodyRef}
+                    attachToAgent={attachToAgent}
                     searchOpen={searchOpen}
                     searchFocusNonce={searchFocusNonce}
                     onSearchHandled={handleSearchHandled}
@@ -1979,6 +1986,7 @@ function FileViewerBody({
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
+              attachToAgent={attachToAgent}
             />
           )}
         </div>

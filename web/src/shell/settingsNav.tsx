@@ -97,7 +97,8 @@ interface SettingsNavGroup {
  * absent only in header single-user mode. The Admin group (Members / Policies)
  * appears for admins in ANY multi-user mode since both accounts and OIDC share
  * the `users.is_admin` flag and the server enforces admin on every route; the
- * Desktop group (Local CLI) appears only in the Electron shell.
+ * Desktop group (Local CLI) appears only in the Electron shell. Harnesses is
+ * left out when the deployment curated out every harness.
  */
 export function settingsNavGroups(
   hasAuthSession: boolean,
@@ -108,6 +109,7 @@ export function settingsNavGroups(
   customAgentsEnabled = false,
   mcpEnabled = false,
   adminGeneralEnabled = false,
+  harnessesOffered = true,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
     id: "harnesses",
@@ -121,7 +123,7 @@ export function settingsNavGroups(
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
-  if (!customAgentsEnabled) general.splice(2, 0, harnesses);
+  if (!customAgentsEnabled && harnessesOffered) general.splice(2, 0, harnesses);
   // Provider credentials and MCP accounts have separate settings pages.
   if (integrationsEnabled) {
     general.splice(2, 0, {
@@ -142,7 +144,10 @@ export function settingsNavGroups(
   if (customAgentsEnabled) {
     groups.push({
       title: "Customize",
-      items: [harnesses, { id: "custom-agents", label: "Custom agents", icon: BotIcon }],
+      items: [
+        ...(harnessesOffered ? [harnesses] : []),
+        { id: "custom-agents", label: "Custom agents", icon: BotIcon },
+      ],
     });
   }
   // Keep shell-specific settings directly after the cross-platform preferences.
@@ -249,8 +254,11 @@ export function useTrackSettingsReturn(): void {
  */
 export function SettingsSidebarBody({
   onNavClick,
+  harnessesOffered = true,
 }: {
   onNavClick: (e: React.MouseEvent<HTMLAnchorElement>) => void;
+  /** False when the deployment curated out every harness, which drops Harnesses. */
+  harnessesOffered?: boolean;
 }) {
   const info = useServerInfo();
   // Account section shows whenever there's a login session (accounts OR OIDC).
@@ -272,6 +280,7 @@ export function SettingsSidebarBody({
     customAgentsSettingsEnabled(info),
     mcpEnabled,
     adminGeneralSettingsAvailable(info),
+    harnessesOffered,
   );
 
   return (

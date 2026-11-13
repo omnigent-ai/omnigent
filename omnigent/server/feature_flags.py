@@ -115,6 +115,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         ),
         owner="server",
         review_by_release="0.20.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,

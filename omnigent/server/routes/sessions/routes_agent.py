@@ -428,13 +428,15 @@ def register_agent_routes(
             )
 
         from omnigent.runner.routing import routing_host_id
-        from omnigent.server.mcp_compatibility import (
+        from omnigent.server.runtime_compatibility import (
             registry_services,
-            require_registry_mcp_runtime,
+            require_runtime_support,
+            uses_tcp_egress,
         )
 
-        require_registry_mcp_runtime(
+        require_runtime_support(
             registry_services(selected_mcp_spec(spec, conv.labels)),
+            tcp_egress_required=uses_tcp_egress(spec),
             host_id=await asyncio.to_thread(routing_host_id, conv, conversation_store),
             runner_id=conv.runner_id,
             host_registry=getattr(request.app.state, "host_registry", None),
