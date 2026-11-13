@@ -1728,11 +1728,9 @@ def _platform_safe_api_key_helper(
         return command, None
     interpreter = sys.executable if python_executable is None else python_executable
     if _windows_static_key_helper_command(interpreter, pathlib.Path("key")) is None:
-        logger.warning(
-            "claude-sdk: static API key apiKeyHelper could not be made "
-            "Windows-safe (unusable Python interpreter path); leaving it unchanged"
+        raise RuntimeError(
+            "Claude SDK static API-key helper needs a safe Python interpreter path on Windows"
         )
-        return command, None
     return None, secret
 
 
@@ -2547,9 +2545,15 @@ class ClaudeSDKExecutor(Executor):
             key_file = None
             try:
                 if static_api_key is not None:
+                    interpreter = sys.executable
+                    if (
+                        _windows_static_key_helper_command(interpreter, pathlib.Path("key"))
+                        is None
+                    ):
+                        raise RuntimeError("Claude SDK helper interpreter is unavailable")
                     key_file = PrivateStaticKeyFile(static_api_key)
                     settings = json.loads(getattr(options, "settings", None) or "{}")
-                    helper = _windows_static_key_helper_command(sys.executable, key_file.path)
+                    helper = _windows_static_key_helper_command(interpreter, key_file.path)
                     if helper is None:
                         raise RuntimeError("Claude SDK helper interpreter is unavailable")
                     settings["apiKeyHelper"] = helper

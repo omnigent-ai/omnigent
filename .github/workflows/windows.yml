@@ -110,6 +110,12 @@ jobs:
           tests/runtime/test_process_manager.py
           -p no:cacheprovider -q
 
+      - name: Native Windows Claude SDK static-key session (mock gateway)
+        run: >-
+          uv run pytest
+          tests/inner/test_claude_sdk_windows_static_helper_session.py
+          --reruns 0 -p no:cacheprovider -q -s
+
       - name: Codex skill junction regressions (hard)
         run: >-
           uv run pytest

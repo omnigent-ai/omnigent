@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -119,6 +119,7 @@ def test_windows_dynamic_helper_unchanged(command: str) -> None:
     assert static_key is None
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "python_path",
     [
@@ -131,17 +132,31 @@ def test_windows_dynamic_helper_unchanged(command: str) -> None:
         "C:\\Users\\a`b\\python.exe",
     ],
 )
-def test_windows_unsafe_python_path_falls_back(
-    python_path: str, caplog: pytest.LogCaptureFixture
+async def test_windows_unsafe_python_path_fails_before_settings_or_client_creation(
+    python_path: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    token = "dummy-fallback-token-1234"
-    command = _static_cmd(token)
-    with caplog.at_level("WARNING"):
-        helper, static_key = ex._platform_safe_api_key_helper(
-            command, is_windows=True, python_executable=python_path
-        )
-    assert helper == command
-    assert static_key is None
+    token = "dummy-unsafe-interpreter-token"
+    executor = ex.ClaudeSDKExecutor(api_key_helper=_static_cmd(token), model="dummy-model")
+    sdk = SimpleNamespace(ClaudeAgentOptions=Mock(), ClaudeSDKClient=Mock())
+    create_key = Mock()
+    monkeypatch.setattr(ex, "_ensure_sdk", lambda: sdk)
+    monkeypatch.setattr(ex, "IS_WINDOWS", True)
+    monkeypatch.setattr(ex.sys, "executable", python_path)
+    monkeypatch.setattr(ex, "PrivateStaticKeyFile", create_key)
+    try:
+        with pytest.raises(RuntimeError, match="safe Python interpreter") as error:
+            [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "hello"}], [], ""
+                )
+            ]
+    finally:
+        await executor.close()
+    sdk.ClaudeAgentOptions.assert_not_called()
+    sdk.ClaudeSDKClient.assert_not_called()
+    create_key.assert_not_called()
+    assert token not in str(error.value)
     assert token not in caplog.text
 
 
@@ -355,7 +370,13 @@ Write-Output 'owner-only ACL verified'
 """
     try:
         result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            [
+                shutil.which("pwsh") or "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
             env={
                 **os.environ,
                 "OMNI_TEST_KEY_DIRECTORY": str(key_file.directory),
