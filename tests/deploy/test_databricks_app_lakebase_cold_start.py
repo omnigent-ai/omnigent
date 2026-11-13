@@ -28,6 +28,8 @@ import pytest
 import sqlalchemy
 from sqlalchemy.exc import OperationalError
 
+from tests._helpers.providers import isolate_provider_resolution
+
 _APP_MODULE = "deploy.databricks.src.app"
 
 # Env the module reads at import time — required vars, optional vars pinned to
@@ -72,6 +74,7 @@ def boot_exit_codes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator
     ``sys.exit``; the capture raises ``SystemExit`` so module execution
     stops exactly like a real exit.
     """
+    isolate_provider_resolution(monkeypatch, tmp_path / "providers")
     config = tmp_path / "boot-config.yaml"
     config.write_text("{}\n")
     monkeypatch.setenv("OMNIGENT_CONFIG", str(config))

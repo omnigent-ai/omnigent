@@ -46,7 +46,9 @@ def _boot_with_config(
     """
     if config is None:
         monkeypatch.delenv("OMNIGENT_CONFIG", raising=False)
-        monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "no-config"))
+        monkeypatch.setenv(
+            "OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "no-config" / "admin-credentials")
+        )
     else:
         path = tmp_path / "config.yaml"
         path.write_text(yaml.safe_dump(config))
@@ -213,6 +215,7 @@ def test_registry_catalog_is_applied_during_databricks_boot(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     catalog_kind: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Configured catalogs mount, while invalid or unencryptable catalogs stop startup."""
     from omnigent.server import mcp_registry
@@ -241,6 +244,12 @@ def test_registry_catalog_is_applied_during_databricks_boot(
         with pytest.raises(SystemExit):
             _boot_with_config(monkeypatch, tmp_path, None)
         assert exit_codes == [1]
+        boot_error = capsys.readouterr().err
+        if catalog_kind == "invalid":
+            assert "unexpected" in boot_error
+            assert "extra_forbidden" in boot_error
+        else:
+            assert "MCP account connections require the existing KMS or Vault cipher" in boot_error
     else:
         create_app = _boot_with_config(monkeypatch, tmp_path, None)
         assert exit_codes == []

@@ -19,9 +19,11 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi import FastAPI
+from pydantic import ValidationError
 
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.artifact_store.s3 import S3ArtifactStore
+from tests._helpers.providers import isolate_provider_resolution
 
 _ENTRYPOINT_MODULE = "deploy.docker.entrypoint"
 _BOOT_MODULES = (
@@ -134,8 +136,7 @@ def _entrypoint_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Minimal env for ``_resolve_config``: a DB URL and a tmp artifact dir,
     auth disabled so it doesn't mint accounts secrets, and no ambient
     artifact-store URI (each test sets it as needed)."""
-    # Point config at an empty file so the resolver doesn't read the developer's
-    # ambient ~/.omnigent/config.yaml (keeps the test hermetic; CI has none).
+    isolate_provider_resolution(monkeypatch, tmp_path / "providers")
     config_file = tmp_path / "config.yaml"
     config_file.write_text("{}\n")
     monkeypatch.setenv("OMNIGENT_CONFIG", str(config_file))
@@ -143,6 +144,7 @@ def _entrypoint_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("ARTIFACT_DIR", str(tmp_path / "artifacts"))
     monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
     monkeypatch.delenv("OMNIGENT_ARTIFACT_URI", raising=False)
+    monkeypatch.delenv("OMNIGENT_MCP_REGISTRY", raising=False)
 
 
 def test_resolve_config_captures_s3_artifact_uri(
@@ -213,6 +215,7 @@ def _build_app_from_config(
 def test_build_app_passes_configured_policy_and_debug_router_modules(
     _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    from omnigent.runtime import get_caps
     from omnigent.server import app as server_app
 
     create_app_kwargs: dict[str, object] = {}
@@ -227,12 +230,15 @@ def test_build_app_passes_configured_policy_and_debug_router_modules(
     app = _build_app_from_config(
         monkeypatch,
         tmp_path,
+        "native_hook_allow_cache_seconds: 45\n"
         "policy_modules: [acme.policies]\n"
         "debug_router_modules: [tests._helpers.runner_lifecycle_controls]\n",
     )
 
     # policy_modules feed load_registry in the lifespan, so assert the handoff.
     assert create_app_kwargs["policy_modules"] == ["acme.policies"]
+    cache_seconds = get_caps().native_hook_allow_cache_seconds
+    assert cache_seconds is not None and cache_seconds() == 45.0
     assert "/__runner_lifecycle/state/{runner_id}" in {route.path for route in app.routes}
 
 
@@ -269,26 +275,7 @@ def test_build_app_wires_both_routing_backends(
     assert isinstance(caps.routing_backends.local, LLMRoutingClient)
     assert caps.routing_client is caps.routing_backends.external
     assert caps.routing_settings.model_prefixes == ("databricks-", "system.ai.")
-
-
-@pytest.mark.parametrize(
-    ("config_yaml", "expected_cache_seconds"),
-    [("native_hook_allow_cache_seconds: 45\n", 45.0), ("{}\n", None)],
-    ids=["configured", "absent"],
-)
-def test_build_app_honours_hook_cache(
-    _entrypoint_env: None,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    config_yaml: str,
-    expected_cache_seconds: float | None,
-) -> None:
-    from omnigent.runtime import get_caps
-
-    _build_app_from_config(monkeypatch, tmp_path, config_yaml)
-
-    resolver = get_caps().native_hook_allow_cache_seconds
-    assert (resolver() if resolver is not None else None) == expected_cache_seconds
+    assert caps.native_hook_allow_cache_seconds is None
 
 
 @pytest.mark.parametrize(
@@ -330,8 +317,18 @@ def test_build_app_mounts_mcp_registry_from_env(
         registry_file.write_text("unexpected: true\n")
     monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(registry_file))
 
-    if catalog_kind != "public":
-        with pytest.raises(ValueError):
+    if catalog_kind == "invalid":
+        with pytest.raises(ValidationError) as error:
+            _build_app_from_config(monkeypatch, tmp_path, "{}\n")
+        assert any(
+            entry["loc"] == ("unexpected",) and entry["type"] == "extra_forbidden"
+            for entry in error.value.errors()
+        )
+        return
+    if catalog_kind == "missing_cipher":
+        with pytest.raises(
+            ValueError, match="MCP account connections require the existing KMS or Vault cipher"
+        ):
             _build_app_from_config(monkeypatch, tmp_path, "{}\n")
         return
 
