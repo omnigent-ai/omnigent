@@ -7092,7 +7092,10 @@ def _restore_occupied_input(
     A subagent's view, opened from the agent panel, sends a typed message to
     that subagent. It is walked back to main through the panel one key at a
     time (:func:`_step_toward_main_view`), each on a focus two captures agree
-    on, so a stale frame cannot move the selection past main.
+    on, so a stale frame cannot move the selection past main. Once the view
+    was seen, main counts as shown only after two whole frames in a row, so a
+    torn capture that drops the agent panel or input box is neither taken for
+    main nor dismissed with Escape.
 
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
@@ -7127,9 +7130,10 @@ def _restore_occupied_input(
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
     :param timeout_s: Seconds to keep dismissing, e.g. ``1.5``. ``None`` uses
         :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S`.
-    :returns: ``None`` once the input box is free (or the capture is torn);
-        otherwise the :func:`_occupying_surface` description of what is
-        still on screen, for the caller to refuse to type into.
+    :returns: ``None`` once the input box is free (or the capture is torn
+        before any subagent's view was seen); otherwise the
+        :func:`_occupying_surface` description of what is still on screen,
+        for the caller to refuse to type into.
     """
     dismiss_timeout_s = _OCCUPIED_INPUT_DISMISS_TIMEOUT_S if timeout_s is None else timeout_s
     deadline = time.monotonic() + dismiss_timeout_s
@@ -7142,6 +7146,8 @@ def _restore_occupied_input(
     previous_focus: _AgentPanelFocus | None = None
     focus_stepped: _AgentPanelFocus | None = None
     last_focus_step: float | None = None
+    subagent_view_seen = False
+    main_frame_seen = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(
@@ -7160,8 +7166,17 @@ def _restore_occupied_input(
         if transcript_toggled and not pane.strip():
             # A torn capture cannot confirm that the toggled view closed.
             surface = _DETAILED_TRANSCRIPT_SURFACE
-        delivery_diagnostics.record_restore_observation(pane=pane, surface=surface)
         box = _composer_box(pane)
+        if subagent_view_seen and surface in (None, _OVERLAY_SURFACE):
+            # A torn frame can omit the agent panel or input box, so main needs two whole frames.
+            whole_frame = box is not None and box.framed
+            if not (whole_frame and main_frame_seen):
+                surface = _SUBAGENT_VIEW_SURFACE
+            main_frame_seen = whole_frame
+        else:
+            main_frame_seen = False
+        subagent_view_seen = subagent_view_seen or surface == _SUBAGENT_VIEW_SURFACE
+        delivery_diagnostics.record_restore_observation(pane=pane, surface=surface)
         if (
             not notice_redrawn
             and box is not None
@@ -7202,11 +7217,16 @@ def _restore_occupied_input(
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-o")
                 # Repeating a toggle against a stale capture would reopen the view.
                 transcript_toggled = True
-        elif focus is not None:
-            if focus == previous_focus and (
-                focus != focus_stepped
-                or last_focus_step is None
-                or now - last_focus_step >= _AGENT_PANEL_STEP_RETRY_S
+        elif surface == _SUBAGENT_VIEW_SURFACE:
+            # An unreadable frame sends nothing; Escape here could stop the subagent.
+            if (
+                focus is not None
+                and focus == previous_focus
+                and (
+                    focus != focus_stepped
+                    or last_focus_step is None
+                    or now - last_focus_step >= _AGENT_PANEL_STEP_RETRY_S
+                )
             ):
                 _logger.info("claude-native: switching the terminal from a subagent to main")
                 delivery_diagnostics.record_restore_action("main_view_select")

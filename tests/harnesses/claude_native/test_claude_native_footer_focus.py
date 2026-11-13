@@ -14,6 +14,23 @@ from omnigent.harnesses.claude_native.bridge import inject_user_message, write_t
 _CLEAR_ONE_ROW_COMPOSER = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
 _AGENTS = ("main", "general-purpose", "general-purpose")
 _RULE = "─" * 60
+_PANEL_KEYS = ("Down", "Up", "Enter")
+
+
+class _Clock:
+    """Time that passes only while the bridge sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
 
 
 @dataclass
@@ -28,6 +45,11 @@ class _FakeClaudeFooter:
 
     Enter on an agent-list row shows that agent, and a message submitted while
     a subagent is shown goes to it (``subagent_inbox``) instead of main.
+
+    After a panel key, captures can lag (``stale_captures`` frames drawn before
+    the key) or tear (``torn``: ``"empty"``, ``"partial"`` without the agent
+    panel, or ``"spinner"`` with only a busy line), and keys in ``swallowed``
+    are dropped once.
     """
 
     focus: str = "input"
@@ -38,6 +60,20 @@ class _FakeClaudeFooter:
     subagent_inbox: list[str] = field(default_factory=list)
     keys: list[str] = field(default_factory=list)
     view_switch_ignored: bool = False
+    stale_captures: int = 0
+    torn: str = ""
+    swallowed: list[str] = field(default_factory=list)
+    clock: _Clock | None = None
+    pressed_at: list[tuple[str, float]] = field(default_factory=list)
+    queued_captures: list[str] = field(default_factory=list)
+
+    def capture(self) -> str:
+        """
+        Return the next ``capture-pane`` result: a lagging or torn frame, else the pane.
+
+        :returns: Captured pane text.
+        """
+        return self.queued_captures.pop(0) if self.queued_captures else self.pane()
 
     def pane(self) -> str:
         """
@@ -77,6 +113,24 @@ class _FakeClaudeFooter:
         :param key: A tmux key name, a CSI-u sequence, or literal typed text.
         """
         self.keys.append(key)
+        if self.clock is not None:
+            self.pressed_at.append((key, self.clock.now))
+        if key in self.swallowed:
+            self.swallowed.remove(key)
+            return
+        before = self.pane()
+        navigating = key in _PANEL_KEYS and bool(self.viewed or self.focus != "input")
+        self._apply(key)
+        if navigating:
+            self.queued_captures += [before] * self.stale_captures
+            if self.torn == "empty":
+                self.queued_captures.append("")
+            elif self.torn == "partial":
+                self.queued_captures.append("\n".join(self.pane().splitlines()[:3]))
+            elif self.torn == "spinner":
+                self.queued_captures.append("✻ Exploring… (esc to interrupt)")
+
+    def _apply(self, key: str) -> None:
         if self.focus != "input":
             if key == "Space":
                 self.focus = "input"
@@ -130,7 +184,7 @@ def _drive(monkeypatch: pytest.MonkeyPatch, tui: _FakeClaudeFooter) -> None:
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui.pane(), stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui.capture(), stderr="")
         if "load-buffer" in cmd:
             buffer["text"] = Path(cmd[-1]).read_bytes().decode().replace("\r", "\n")
         elif "paste-buffer" in cmd:
@@ -228,17 +282,32 @@ def test_a_slash_command_reaches_claude_while_the_footer_holds_focus(
         "pointer-on-main",
     ],
 )
+@pytest.mark.parametrize(
+    "torn",
+    ["", "empty", "partial", "spinner"],
+    ids=[
+        "whole-frames",
+        "empty-capture-after-keys",
+        "capture-without-panel-after-keys",
+        "capture-without-input-box-after-keys",
+    ],
+)
 def test_a_message_reaches_main_while_the_terminal_shows_a_subagent(
-    focus: str, selected: int, draft: str, bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+    focus: str,
+    selected: int,
+    draft: str,
+    torn: str,
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     A message typed while the terminal shows a subagent went to that subagent.
 
     The web UI's chat is the main conversation, so delivery walks the agent
     panel back to main first, without Escape or ``x``, which would interrupt
-    or stop the subagent.
+    or stop the subagent. A torn capture mid-walk is not taken for main.
     """
-    tui = _FakeClaudeFooter(focus=focus, selected=selected, viewed=1, draft=draft)
+    tui = _FakeClaudeFooter(focus=focus, selected=selected, viewed=1, draft=draft, torn=torn)
     _drive(monkeypatch, tui)
 
     inject_user_message(bridge_dir, content="what did the explorer find?")
@@ -261,6 +330,30 @@ def test_a_slash_command_reaches_main_while_the_terminal_shows_a_subagent(
 
     assert tui.submitted == ["/effort high"]
     assert tui.subagent_inbox == []
+
+
+def test_panel_keys_wait_for_the_screen_to_show_their_effect(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A frame drawn before a key landed does not draw another key past main, and a
+    key the TUI dropped is pressed again only after the retry interval.
+    """
+    clock = _Clock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    tui = _FakeClaudeFooter(
+        focus="list", selected=2, viewed=1, stale_captures=1, swallowed=["Up"], clock=clock
+    )
+    _drive(monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="what did the explorer find?")
+
+    assert tui.submitted == ["what did the explorer find?"]
+    assert tui.subagent_inbox == []
+    panel_keys = [(key, at) for key, at in tui.pressed_at if key in _PANEL_KEYS]
+    # The dropped Up, its retry, one more Up to main, Enter on main, then the submit.
+    assert [key for key, _ in panel_keys] == ["Up", "Up", "Up", "Enter", "Enter"]
+    assert panel_keys[1][1] - panel_keys[0][1] >= claude_native_bridge._AGENT_PANEL_STEP_RETRY_S
 
 
 def test_a_subagent_view_that_will_not_close_is_refused_before_typing(
