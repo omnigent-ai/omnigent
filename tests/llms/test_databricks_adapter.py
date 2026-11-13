@@ -98,12 +98,14 @@ def test_profile_auth_refreshes_with_default_or_gateway_url(
 
 
 @pytest.mark.parametrize("header", ["Authorization", "authorization"])
-@pytest.mark.parametrize("value", ["", " \t"])
-def test_profile_auth_ignores_blank_authorization_headers(
+@pytest.mark.parametrize("value", ["", " \t", "Bearer explicit-header"])
+@pytest.mark.parametrize("base_url", [None, "https://workspace.example.test/ai-gateway/mlflow/v1"])
+def test_profile_auth_respects_authorization_headers(
     monkeypatch: pytest.MonkeyPatch,
     databricks_requests: list[httpx.Request],
     header: str,
     value: str,
+    base_url: str | None,
 ) -> None:
     adapter = DatabricksAdapter()
     monkeypatch.setattr(
@@ -117,13 +119,18 @@ def test_profile_auth_ignores_blank_authorization_headers(
     headers = {header: value, "X-Request-ID": "test-request"}
     connection: dict[str, Any] = {
         "profile": "gateway-profile",
-        "base_url": "https://workspace.example.test/ai-gateway/mlflow/v1",
+        "base_url": base_url,
         "extra_headers": headers,
     }
     asyncio.run(
         adapter.chat_completions([], "test-model", None, False, {}, connection_params=connection)
     )
-    assert databricks_requests[0].headers.get_list("Authorization") == ["Bearer profile-token"]
+    assert databricks_requests[0].headers.get_list("Authorization") == [
+        value if value.strip() else "Bearer profile-token"
+    ]
+    assert str(databricks_requests[0].url) == (
+        (base_url or "https://workspace.example.test/serving-endpoints") + "/chat/completions"
+    )
     assert databricks_requests[0].headers["X-Request-ID"] == "test-request"
     assert connection["extra_headers"] is headers
     assert headers == {header: value, "X-Request-ID": "test-request"}

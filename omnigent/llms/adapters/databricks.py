@@ -182,7 +182,10 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
                         code=ErrorCode.INVALID_INPUT,
                     )
             connection_params["base_url"] = base_url or resolved["base_url"]
-            connection_params["api_key"] = connection_params.get("api_key") or resolved["api_key"]
+            if not has_auth_header:
+                connection_params["api_key"] = (
+                    connection_params.get("api_key") or resolved["api_key"]
+                )
             if not has_auth_header and isinstance(extra_headers, dict):
                 # Blank headers must not overwrite the selected bearer.
                 connection_params["extra_headers"] = {
