@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native.bridge import (
@@ -18,6 +19,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     write_bridge_state,
 )
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from tests._helpers.polling import poll_until_async
 from tests.harnesses.codex_native.forwarder._support import (
     _posted_cumulative_tokens,
@@ -184,6 +186,289 @@ def _child_tool_items(
         and body.get("type") == "external_conversation_item"
         and body["data"].get("item_type") in {"function_call", "function_call_output"}
     ]
+
+
+@pytest.mark.parametrize("supersede_with_new_turn", [False, True], ids=["quiet", "newer-turn"])
+@pytest.mark.parametrize("failed", [False, True], ids=["idle", "failed"])
+async def test_status_recovers_after_auth_failure_without_another_native_event(
+    tmp_path: Path, supersede_with_new_turn: bool, failed: bool
+) -> None:
+    """Credential repair delivers the latest status even when Codex stays quiet."""
+    _write_parent_bridge(tmp_path)
+    codex = _StreamingCodexClient()
+    credentials_valid = False
+    completion_rejected = asyncio.Event()
+    newer_start_rejected = asyncio.Event()
+    latest_status_received = asyncio.Event()
+    terminal_attempts = 0
+    accepted_statuses: list[dict[str, Any]] = []
+    expected_status = {
+        "status": "running" if supersede_with_new_turn else "failed" if failed else "idle",
+        "response_id": f"codex_{'turn_newer' if supersede_with_new_turn else _PARENT_TURN}",
+    }
+    if failed and not supersede_with_new_turn:
+        expected_status["output"] = "Provider temporarily unavailable"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal terminal_attempts
+        body = json.loads(request.content) if request.content else {}
+        if (
+            request.url.path == f"/v1/sessions/{_SESSION_ID}/events"
+            and body.get("type") == "external_session_status"
+        ):
+            status = body["data"]
+            if not credentials_valid:
+                if status["status"] != "running":
+                    terminal_attempts += 1
+                    if terminal_attempts == 2:
+                        completion_rejected.set()
+                else:
+                    newer_start_rejected.set()
+                raise DatabricksAuthError("credentials temporarily unavailable")
+            accepted_statuses.append(status)
+            if status == expected_status:
+                latest_status_received.set()
+        return httpx.Response(200, json={}, request=request)
+
+    forwarder = _start_forwarder(tmp_path, codex, handler)
+    try:
+        codex.emit(
+            _event(
+                "turn/completed",
+                _PARENT_THREAD,
+                _PARENT_TURN,
+                turn={
+                    "id": _PARENT_TURN,
+                    "status": "failed" if failed else "completed",
+                    "items": [],
+                    **(
+                        {"error": {"message": "Provider temporarily unavailable"}}
+                        if failed
+                        else {}
+                    ),
+                },
+            )
+        )
+        async with asyncio.timeout(5):
+            await completion_rejected.wait()
+        bridge = read_bridge_state(tmp_path)
+        assert bridge is not None and bridge.active_turn_id is None
+        if supersede_with_new_turn:
+            codex.emit(
+                _event("turn/started", _PARENT_THREAD, "turn_newer", turn={"id": "turn_newer"})
+            )
+            async with asyncio.timeout(2):
+                await newer_start_rejected.wait()
+        credentials_valid = True
+        async with asyncio.timeout(5):
+            await latest_status_received.wait()
+    finally:
+        codex.queue.put_nowait(None)
+        async with asyncio.timeout(5):
+            await forwarder
+
+    assert accepted_statuses == [expected_status]
+    bridge = read_bridge_state(tmp_path)
+    assert bridge is not None
+    assert bridge.active_turn_id == ("turn_newer" if supersede_with_new_turn else None)
+
+
+async def test_status_credential_recovery_budget_is_finite_and_new_status_can_recover(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write_parent_bridge(tmp_path)
+    codex = _StreamingCodexClient()
+    attempts = 0
+    budget_exhausted = asyncio.Event()
+    newer_status_received = asyncio.Event()
+    credentials_valid = False
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        body = json.loads(request.content) if request.content else {}
+        if body.get("type") == "external_session_status":
+            attempts += 1
+            if not credentials_valid:
+                if attempts == fwd._STATUS_AUTH_RECOVERY_MAX_ATTEMPTS:
+                    budget_exhausted.set()
+                raise DatabricksAuthError("credentials permanently revoked")
+            assert body["data"] == {"status": "running", "response_id": "codex_turn_newer"}
+            newer_status_received.set()
+        return httpx.Response(200, json={}, request=request)
+
+    forwarder = _start_forwarder(tmp_path, codex, handler)
+    try:
+        codex.emit(
+            _event(
+                "turn/completed",
+                _PARENT_THREAD,
+                _PARENT_TURN,
+                turn={"id": _PARENT_TURN, "status": "completed", "items": []},
+            )
+        )
+        async with asyncio.timeout(10):
+            await budget_exhausted.wait()
+        await poll_until_async(
+            lambda: (
+                not any(
+                    task.get_name() == "codex-native-status-delivery" and not task.done()
+                    for task in asyncio.all_tasks()
+                )
+            ),
+            timeout_s=2,
+        )
+        assert attempts == fwd._STATUS_AUTH_RECOVERY_MAX_ATTEMPTS
+        assert fwd._forward_health.consecutive_failures > 0
+        assert any("recovery_exhausted=True" in record.getMessage() for record in caplog.records)
+        credentials_valid = True
+        codex.emit(_event("turn/started", _PARENT_THREAD, "turn_newer", turn={"id": "turn_newer"}))
+        async with asyncio.timeout(2):
+            await newer_status_received.wait()
+    finally:
+        codex.queue.put_nowait(None)
+        async with asyncio.timeout(5):
+            await forwarder
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_attempts"),
+    [
+        ("response_lost", 3),
+        ("response_lost_then_auth", 2),
+        ("http_rejection", 1),
+        ("unexpected", 2),
+    ],
+)
+async def test_status_recovery_does_not_extend_ambiguous_or_permanent_failures(
+    failure: str, expected_attempts: int
+) -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if failure == "response_lost" or (failure == "response_lost_then_auth" and calls == 1):
+            raise httpx.ReadError("response lost", request=request)
+        if failure == "response_lost_then_auth":
+            raise DatabricksAuthError("credentials unavailable after an ambiguous attempt")
+        if failure == "unexpected":
+            if calls == 1:
+                raise DatabricksAuthError("credentials temporarily unavailable")
+            raise RuntimeError("unexpected client failure")
+        return httpx.Response(403, request=request)
+
+    async with httpx.AsyncClient(
+        base_url="http://omnigent.test", transport=httpx.MockTransport(handler)
+    ) as client:
+        delivery = fwd._SessionStatusDelivery(client, "conv_parent")
+        try:
+            if failure == "unexpected":
+                await delivery.post({"status": "idle"})
+                assert delivery.retry_task is not None
+                async with asyncio.timeout(2):
+                    await delivery.retry_task
+                assert delivery.pending is None
+            else:
+                await delivery.post({"status": "idle"})
+                assert delivery.pending is None
+                assert delivery.retry_task is None
+        finally:
+            await delivery.close()
+        assert calls == expected_attempts
+
+
+async def test_status_cancellation_and_close_do_not_restart_delivery() -> None:
+    entered = asyncio.Event()
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await asyncio.Event().wait()
+        return httpx.Response(200, request=request)
+
+    async with httpx.AsyncClient(
+        base_url="http://omnigent.test", transport=httpx.MockTransport(handler)
+    ) as client:
+        delivery = fwd._SessionStatusDelivery(client, "conv_parent")
+        post = asyncio.create_task(delivery.post({"status": "idle"}))
+        await entered.wait()
+        await delivery.close()
+        post.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await post
+        await delivery.post({"status": "running"})
+        assert delivery.pending is None
+        assert delivery.retry_task is None
+        assert calls == 1
+
+
+async def test_status_retry_in_flight_finishes_before_a_newer_status(tmp_path: Path) -> None:
+    """An older HTTP operation may finish, but cannot land after newer running."""
+    _write_parent_bridge(tmp_path)
+    codex = _StreamingCodexClient()
+    completion_rejected = asyncio.Event()
+    retry_entered = asyncio.Event()
+    release_retry = asyncio.Event()
+    newer_running_received = asyncio.Event()
+    accepted_statuses: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        if (
+            request.url.path == f"/v1/sessions/{_SESSION_ID}/events"
+            and body.get("type") == "external_session_status"
+        ):
+            status = body["data"]
+            if status["status"] == "idle":
+                if not completion_rejected.is_set():
+                    completion_rejected.set()
+                    raise DatabricksAuthError("credentials temporarily unavailable")
+                retry_entered.set()
+                await release_retry.wait()
+            accepted_statuses.append(status)
+            if status["status"] == "running":
+                newer_running_received.set()
+        return httpx.Response(200, json={}, request=request)
+
+    forwarder = _start_forwarder(tmp_path, codex, handler)
+    try:
+        codex.emit(
+            _event(
+                "turn/completed",
+                _PARENT_THREAD,
+                _PARENT_TURN,
+                turn={"id": _PARENT_TURN, "status": "completed", "items": []},
+            )
+        )
+        async with asyncio.timeout(2):
+            await completion_rejected.wait()
+            await retry_entered.wait()
+        codex.emit(_event("turn/started", _PARENT_THREAD, "turn_newer", turn={"id": "turn_newer"}))
+        await poll_until_async(
+            lambda: (
+                (bridge := read_bridge_state(tmp_path)) is not None
+                and bridge.active_turn_id == "turn_newer"
+            ),
+            timeout_s=2,
+        )
+        assert accepted_statuses == []
+        release_retry.set()
+        async with asyncio.timeout(2):
+            await newer_running_received.wait()
+    finally:
+        release_retry.set()
+        codex.queue.put_nowait(None)
+        async with asyncio.timeout(5):
+            await forwarder
+
+    assert accepted_statuses == [
+        {"status": "idle", "response_id": f"codex_{_PARENT_TURN}"},
+        {"status": "running", "response_id": "codex_turn_newer"},
+    ]
+    bridge = read_bridge_state(tmp_path)
+    assert bridge is not None and bridge.active_turn_id == "turn_newer"
 
 
 async def test_parent_turn_completion_is_not_delayed_by_subagent_flood(tmp_path: Path) -> None:
