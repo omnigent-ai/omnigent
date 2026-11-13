@@ -68,6 +68,9 @@ _store: ConversationStore | None = None
 # alongside ``_store`` by :func:`configure`; ``None`` disables the hook (the
 # runner process and unit tests that never configure it are unaffected).
 _scheduled_task_store: ScheduledTaskStore | None = None
+# Bulk session-liveness lookup for publishers off the request path, wired by
+# :func:`set_liveness_lookup` so they apply the same offline rule as the reads.
+_liveness_lookup: Callable[[list[str]], dict[str, Any]] | None = None
 # Single worker => writes apply in submission order (see module docstring).
 _executor: ThreadPoolExecutor | None = None
 # Last status seen per session, for dedupe — the value whose write was
@@ -119,6 +122,27 @@ def conversation_store() -> ConversationStore | None:
         persistence is disabled (tests / non-server processes).
     """
     return _store
+
+
+def set_liveness_lookup(lookup: Callable[[list[str]], dict[str, Any]] | None) -> None:
+    """
+    Wire (or clear) the bulk session-liveness lookup live publishers consult.
+
+    :param lookup: Maps session ids to ``SessionLiveness`` values (with
+        ``runner_online``), e.g. ``{"conv_abc123": SessionLiveness(...)}``.
+        ``None`` disables the offline rule for publishers.
+    """
+    global _liveness_lookup
+    _liveness_lookup = lookup
+
+
+def liveness_lookup() -> Callable[[list[str]], dict[str, Any]] | None:
+    """
+    Return the liveness lookup wired by :func:`set_liveness_lookup`.
+
+    :returns: The lookup, or ``None`` when none is wired (tests / non-server processes).
+    """
+    return _liveness_lookup
 
 
 def submit(description: str, fn, *args, on_failure=None) -> Future[Any]:  # type: ignore[no-untyped-def]

@@ -3437,6 +3437,9 @@ def create_app(
             )
         return result
 
+    # Off-request publishers (child status fan-out) apply the same offline rule as the reads.
+    session_live_state.set_liveness_lookup(_bulk_session_liveness)
+
     @app.get("/health")
     async def health(
         session_id: str | None = Query(default=None),

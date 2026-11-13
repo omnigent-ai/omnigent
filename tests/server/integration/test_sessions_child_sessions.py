@@ -24,6 +24,7 @@ import json
 import re
 import tarfile
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
@@ -31,17 +32,24 @@ import httpx
 import pytest
 import yaml
 from fastapi import FastAPI
+from starlette.testclient import TestClient
 
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import session_stream
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes._sessions.helpers import reconcile_orphaned_running_status
 from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
-from tests.server.helpers import build_agent_bundle, create_test_agent, register_test_runner
+from tests.server.helpers import (
+    build_agent_bundle,
+    create_test_agent,
+    register_test_runner,
+    start_session_stream_collector,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -803,6 +811,66 @@ async def test_child_status_edge_fans_out_to_parent_stream(
         assert updates[1]["child"]["title"] == "researcher:auth"
         await asyncio.sleep(0.2)
         assert collector.queue.empty(), "a repeated identical edge must not fan out"
+    finally:
+        await collector.stop()
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(session["id"])
+
+
+async def test_settled_offline_child_reports_zero_parked_prompts_everywhere(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    An orphan settled behind an offline runner reports zero parked prompts on every surface.
+
+    The row mirrors two parked prompts, but this replica has none and the runner
+    is gone. The settle's live parent event, the child list and the updates
+    stream must all drop the mirror, so none shows a phantom approval badge.
+
+    :param app: The real app, whose updates stream is exercised over WebSocket.
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:auth",
+        agent_id=session["agent_id"],
+    )
+    # Bound runner with no liveness stamp and no tunnel: confirmed gone.
+    assert conv_store.set_runner_id(child.id, f"runner_{child.id}")
+    conv_store.set_session_live_status(child.id, "running")
+    conv_store.set_pending_elicitation_count(child.id, 2)
+    sessions_module._session_status_cache.pop(child.id, None)
+    collector = await start_session_stream_collector(session["id"])
+    try:
+        assert reconcile_orphaned_running_status(child.id, conv_store, int(time.time()) - 90)
+
+        live: dict[str, Any] | None = None
+        while live is None:
+            event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
+            if event.get("type") == "session.child_session.updated":
+                live = event["child"]
+        assert live["busy"] is False
+        assert live["pending_elicitations_count"] == 0
+
+        listed = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+        assert listed.status_code == 200
+        row = next(c for c in listed.json()["data"] if c["id"] == child.id)
+        assert row["pending_elicitations_count"] == 0
+
+        with TestClient(app).websocket_connect("/v1/sessions/updates") as ws:
+            ws.send_json({"type": "watch", "session_ids": [child.id]})
+            while True:
+                frame = ws.receive_json()
+                if frame.get("type") == "snapshot":
+                    break
+        frames = {item["id"]: item for item in frame["items"]}
+        assert frames[child.id]["pending_elicitations_count"] == 0
     finally:
         await collector.stop()
         sessions_module._session_status_cache.pop(child.id, None)

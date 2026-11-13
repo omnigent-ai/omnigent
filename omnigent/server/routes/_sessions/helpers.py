@@ -5074,6 +5074,11 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
             _latest_message_preview(items_by_child.get(conv.id, [])),
             cached_status=status,
         )
+        # Same offline rule as the child list: a dead runner's parked prompts died with it.
+        lookup = session_live_state.liveness_lookup()
+        if summary.pending_elicitations_count and lookup is not None:
+            if not lookup([conv.id])[conv.id].runner_online:
+                summary.pending_elicitations_count = 0
         event = SessionChildSessionUpdatedEvent(
             type="session.child_session.updated",
             conversation_id=parent_id,
