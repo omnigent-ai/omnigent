@@ -3103,7 +3103,7 @@ class ClaudeSDKExecutor(Executor):
         )
         try:
             launcher = await asyncio.shield(build_task)
-        except BaseException:
+        except BaseException as exc:
             try:
                 await await_cleanup_task(build_task)
             except BaseException:  # noqa: BLE001 - cleanup must finish after cancellation
@@ -3114,6 +3114,12 @@ class ClaudeSDKExecutor(Executor):
                 asyncio.to_thread(_release_client_cli, relay, launcher)
             )
             await await_cleanup_task(cleanup_task)
+            if (
+                self._os_env_spec is not None
+                and isinstance(exc, Exception)
+                and not isinstance(exc, HarnessSandboxValidationError)
+            ):
+                raise HarnessSandboxPreparationError(str(exc)) from exc
             raise
         options.cli_path = launcher
         return relay, launcher
