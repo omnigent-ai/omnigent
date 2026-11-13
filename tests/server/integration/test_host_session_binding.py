@@ -1347,9 +1347,12 @@ async def test_concurrent_sandbox_moves_launch_one_sandbox(
         lambda: (launch := tracker.get(session_id)) is not None and launch.settled.is_set()
     )
     assert len(fake.provisioned_names) == 1
+    # Failed inputs are recorded before the launch releases its move claim.
     await poll_until_async(
         lambda: (
             [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
+            and (current := env.conv_store.get_conversation(session_id)) is not None
+            and current.runner_id is None
         )
     )
     conv = env.conv_store.get_conversation(session_id)
