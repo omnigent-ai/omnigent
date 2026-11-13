@@ -206,8 +206,21 @@ def test_inject_user_message_does_not_send_when_store_is_unready(
         db.write_text("not a database")
     before = db.read_bytes() if db.exists() else None
     monkeypatch.setattr(b, "_state_db_path", lambda _bd: db)
+    elapsed = 0.0
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        nonlocal elapsed
+        assert calls == [], "no paste while waiting for the store"
+        sleeps.append(seconds)
+        elapsed += seconds
+
+    monkeypatch.setattr(b, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance))
+    timeout = b._DELIVERY_POLL_INTERVAL_S * 2.5
     with pytest.raises(RuntimeError, match="no message was sent"):
-        b.inject_user_message(tmp_path, content="do something now", timeout_s=0.0)
+        b.inject_user_message(tmp_path, content="do something now", timeout_s=timeout)
+    assert len(sleeps) == 3
+    assert elapsed == pytest.approx(timeout)
     assert calls == []
     assert (db.read_bytes() if db.exists() else None) == before
 
