@@ -37,13 +37,13 @@ from omnigent.entities import (
     StoredFile,
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.host.workspace_tokens import mint_token
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
 )
-from omnigent.runner.routing import RunnerRouter, routing_host_id
+from omnigent.runner.routing import RunnerRouter, routing_host_id, routing_host_session
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
@@ -61,7 +61,7 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
-from omnigent.server.host_registry import HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -74,7 +74,7 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._gzip_route import GZipFileContentRoute, skip_gzip
-from omnigent.server.routes._host_launch import resolve_host_owner
+from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _logger,
@@ -725,6 +725,30 @@ def register_resources_routes(
             # error (503) so the client shows its reconnect affordance.
             raise runner_offline
         return payload
+
+    async def _session_host(
+        conv: Conversation, request: Request
+    ) -> tuple[Conversation, HostConnection | None]:
+        """Return the session that owns ``conv``'s host and workspace, and that host's tunnel.
+
+        Side chats and sub-agents resolve to the session that owns them. The tunnel
+        is ``None`` when the host isn't connected here; a host live on another
+        replica raises :class:`WrongReplicaError`, so the client re-addresses.
+
+        :param conv: The authorized session.
+        :param request: The incoming request, for the app's host store.
+        :returns: ``(owning session, local host connection or None)``.
+        """
+        owner = await asyncio.to_thread(routing_host_session, conv, conversation_store) or conv
+        host_id = owner.host_id
+        host = host_registry.get(host_id) if host_registry is not None and host_id else None
+        host_store = getattr(request.app.state, "host_store", None)
+        if host is None and host_id and host_store is not None:
+            record = await asyncio.to_thread(host_store.get_host, host_id)
+            absent = host_absent_error(record) if record is not None else None
+            if isinstance(absent, WrongReplicaError):
+                raise absent
+        return owner, host
 
     async def _environment_reach_for_session(
         conversation: Conversation,
@@ -2762,8 +2786,8 @@ def register_resources_routes(
             raise HTTPException(
                 status_code=403, detail="Only the session owner can read its workspace directly"
             )
-        host_id = conv.host_id
-        host = host_registry.get(host_id) if host_registry is not None and host_id else None
+        owner, host = await _session_host(conv, request)
+        host_id = owner.host_id
         if host_id is None or host is None:
             raise HTTPException(status_code=404, detail="The session's host is not connected")
         socket_path = host.hello.workspace_socket
@@ -2772,7 +2796,7 @@ def register_resources_routes(
             raise HTTPException(
                 status_code=404, detail="The session's host offers no direct access"
             )
-        reach = await _environment_reach_for_session(conv)
+        reach = await _environment_reach_for_session(owner)
         if reach is None or not reach[1]:
             raise HTTPException(
                 status_code=404, detail="Direct access serves unconfined sessions only"

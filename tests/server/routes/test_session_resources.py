@@ -1378,6 +1378,28 @@ async def test_direct_access_refuses_when_a_precondition_fails(
 
 
 @pytest.mark.asyncio
+async def test_direct_access_readdresses_a_host_on_another_replica(
+    app: FastAPI, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host live on another replica gets the wrong-replica retry signal, not a 404."""
+    from types import SimpleNamespace
+
+    from omnigent.errors import WrongReplicaError
+
+    _offer_direct_access(app, monkeypatch, host=False)
+    app.state.host_store = SimpleNamespace(get_host=lambda _host_id: object())
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_resources.host_absent_error",
+        lambda _host: WrongReplicaError("host is on another replica", host_id="host_direct"),
+    )
+
+    resp = await client.post(_DIRECT_ACCESS_URL)
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "wrong_replica"
+
+
+@pytest.mark.asyncio
 async def test_list_environments_rejects_unknown_session(
     client: httpx.AsyncClient,
 ) -> None:
