@@ -57,10 +57,10 @@ class SessionStreamCollector:
         """
         Await the next published event.
 
-        :param timeout: Seconds before failing the test, e.g. ``2.0``.
+        :param timeout: Unscaled seconds before failing the test, e.g. ``2.0``.
         :returns: The event dict as published.
         """
-        return await asyncio.wait_for(self.queue.get(), timeout)
+        return await asyncio.wait_for(self.queue.get(), budget(timeout))
 
     async def assert_no_event(self, within: float) -> None:
         """
@@ -105,7 +105,7 @@ async def start_session_stream_collector(conv_id: str) -> SessionStreamCollector
             queue.put_nowait(event)
 
     task = asyncio.create_task(_pump())
-    await asyncio.wait_for(registered.wait(), 2.0)
+    await asyncio.wait_for(registered.wait(), budget(2.0))
     return SessionStreamCollector(queue=queue, task=task)
 
 
