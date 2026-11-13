@@ -32,8 +32,8 @@ function observeWebAuthnRequests(report) {
       apply(target, thisArg, args) {
         let prompted = false;
         try {
-          // Dictionary members may be inherited. Page getters must run only in the native
-          // call, so accessor options go unobserved.
+          // Skip accessor options so their getters run only in the native call.
+          // Inspecting inherited descriptors can still invoke a Proxy's traps.
           const member = (key) => {
             for (let source = args[0]; source != null; source = prototypeOf(source)) {
               const property = describe(source, key);

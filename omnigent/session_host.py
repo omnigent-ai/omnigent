@@ -7,7 +7,11 @@ from urllib.parse import unquote, urlsplit
 
 import httpx
 
-from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, databricks_request_headers
+from omnigent.cli_auth import (
+    OMNIGENT_SLICE_KEY_HEADER,
+    UNKEYED_REQUEST_EXTENSION,
+    databricks_request_headers,
+)
 
 _session_hosts: dict[str, str] = {}
 
@@ -39,7 +43,8 @@ def session_routing_headers(url: str) -> dict[str, str]:
 
 async def route_known_session_request(request: httpx.Request) -> None:
     """Prefer an observed session owner over the caller's default host."""
-    request.headers.update(session_routing_headers(str(request.url)))
+    if not request.extensions.get(UNKEYED_REQUEST_EXTENSION):
+        request.headers.update(session_routing_headers(str(request.url)))
 
 
 async def route_session_request(request: httpx.Request) -> None:
@@ -47,6 +52,9 @@ async def route_session_request(request: httpx.Request) -> None:
     path = request.url.raw_path.split(b"?", 1)[0].decode("ascii")
     base_path, separator, route = path.partition("/v1/sessions")
     if not separator or (route and not route.startswith("/")):
+        return
+    if request.extensions.get(UNKEYED_REQUEST_EXTENSION):
+        request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
         return
     host_id = None
     if (

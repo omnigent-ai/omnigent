@@ -106,7 +106,7 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
         }
       };
       const onNavigation = (_event, _url, isInPlace, isMainFrame) => {
-        if (isMainFrame && !isInPlace) close();
+        if (isMainFrame && !isInPlace) hidden();
       };
       function finish(choice) {
         if (finished) return;

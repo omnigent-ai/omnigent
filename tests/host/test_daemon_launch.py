@@ -462,10 +462,38 @@ async def test_open_daemon_client_no_slice_key_off_workspace() -> None:
         assert OMNIGENT_SLICE_KEY_HEADER not in client.headers
 
 
-async def test_open_daemon_client_no_slice_key_without_host() -> None:
-    """A hostless (local) session leaves routing to the default fallback."""
+async def test_open_daemon_client_uses_machine_key_without_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hostless (local) session carries this machine's own routing key."""
+    monkeypatch.setattr("omnigent.host.identity.load_host_identity_if_present", lambda: None)
+    monkeypatch.setattr("omnigent.routing_key.client_routing_key", lambda: "client_key")
     async with open_daemon_client("https://ws.example.com/api/2.0/omnigent", {}, None) as client:
-        assert OMNIGENT_SLICE_KEY_HEADER not in client.headers
+        assert client.headers[OMNIGENT_SLICE_KEY_HEADER] == "client_key"
+
+
+async def test_open_daemon_client_keeps_an_unkeyed_resend_unkeyed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host pin doesn't restore the key on the auth's resend after wrong_replica."""
+    from omnigent.chat import _DatabricksTokenAuth
+
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    mount = "https://ws.example.com/api/2.0/omnigent"
+    keys: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        keys.append(request.headers.get(OMNIGENT_SLICE_KEY_HEADER))
+        if len(keys) == 1:
+            return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
+        return httpx.Response(200, json={})
+
+    auth = _DatabricksTokenAuth(server_url=mount)
+    async with open_daemon_client(mount, {}, "host_1", auth=auth) as client:
+        monkeypatch.setattr(client, "_transport", httpx.MockTransport(handler))
+        assert (await client.get("/v1/hosts/host_1")).status_code == 200
+
+    assert keys == ["host_1", None]
 
 
 def test_daemon_poll_intervals_open_tight_then_hold_at_the_cadence() -> None:

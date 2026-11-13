@@ -30,6 +30,7 @@ from omnigent.tools.builtins import (
     SysCancelAsyncTool,
     SysListModelsTool,
     SysProjectListTool,
+    SysProjectUpdateTool,
     SysReadInboxTool,
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
@@ -39,6 +40,7 @@ from omnigent.tools.builtins import (
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
+    SysSessionLinkPrTool,
     SysSessionListTool,
     SysSessionRenameTool,
     SysSessionSendTool,
@@ -542,7 +544,7 @@ class ToolManager:
 
     def _register_project_tools(self) -> None:
         """
-        Register ``sys_project_list`` and ``sys_session_update``.
+        Register the project and session organizing tools.
 
         They proxy the owner-gated projects and session PATCH endpoints the
         sidebar uses, so they grant no access the caller lacks;
@@ -551,7 +553,9 @@ class ToolManager:
         if not self._spec.tool_groups.projects:
             return
         self._tools[SysProjectListTool.name()] = SysProjectListTool()
+        self._tools[SysSessionLinkPrTool.name()] = SysSessionLinkPrTool()
         self._tools[SysSessionUpdateTool.name()] = SysSessionUpdateTool()
+        self._tools[SysProjectUpdateTool.name()] = SysProjectUpdateTool()
 
     def _register_task_lifecycle_tools(self) -> None:
         """

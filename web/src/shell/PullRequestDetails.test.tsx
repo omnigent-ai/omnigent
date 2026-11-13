@@ -2,7 +2,7 @@
 // fetch stubbed: edits post what the editor shows and settle to the host's answer,
 // a draft outlives the Summary tab unmounting, and pasted media upload into the draft.
 
-import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
+import { PullRequestCommentComposer, PullRequestCommentForm } from "./PullRequestCommentComposer";
 import { PullRequestReviewThread } from "./PullRequestReviewThread";
 import { PullRequestReviewBody } from "./PullRequestReviewBody";
 import { parsePatchFiles } from "@pierre/diffs";
@@ -11,12 +11,13 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import type { PullRequestAttachment, PullRequestInfo } from "@/hooks/usePullRequests";
+import { MAX_PULL_REQUEST_COMMENT_CHARACTERS } from "@/hooks/usePullRequests";
 import {
   attachmentMarkdown,
   insertOnOwnLine,
   PullRequestDescription,
   PullRequestTitle,
-  rememberUploadedImage,
+  rememberUploadedMedia,
   resetPullRequestDescriptionDrafts,
 } from "./PullRequestDetails";
 
@@ -415,18 +416,20 @@ it("shows this tab's uploads from local copies, before and after saving", async 
   expect(copies.revoked).toEqual([]);
 });
 
-it("keeps no copies of videos and drops the oldest image copies past the cap", () => {
+it("keeps no copies of other files and drops the oldest media copies past the cap", () => {
   const copies = stubObjectUrls();
-  const video = new File(["mp4"], "demo.mp4", { type: "video/mp4" });
-  rememberUploadedImage(`${ASSET_URL}-video`, video);
+  rememberUploadedMedia(`${ASSET_URL}-text`, new File(["x"], "notes.txt", { type: "text/plain" }));
   expect(copies.created).toEqual([]);
 
-  for (let index = 0; index <= 50; index += 1) {
-    rememberUploadedImage(
+  const video = new File(["mp4"], "demo.mp4", { type: "video/mp4" });
+  rememberUploadedMedia(`${ASSET_URL}-video`, video);
+  for (let index = 0; index < 50; index += 1) {
+    rememberUploadedMedia(
       `${ASSET_URL}-${index}`,
       new File(["png"], "a.png", { type: "image/png" }),
     );
   }
+  expect(copies.created[0]).toBe(video);
   expect(copies.revoked).toEqual(["blob:copy-1"]);
 });
 
@@ -449,8 +452,52 @@ it("falls back to GitHub, and says so when GitHub can't serve the image", () => 
   expect(screen.getByText("Image not available")).toBeInTheDocument();
 });
 
+it("plays a bare attachment URL as a video, and links to it when it won't play", async () => {
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <PullRequestDescription
+        conversationId="conv_1"
+        prUrl={PR_URL}
+        body={`Demo:\n\n${ASSET_URL}`}
+        editable={false}
+        attachments
+      />
+    </QueryClientProvider>,
+  );
+  await screen.findByText("Demo:");
+  const video = document.querySelector("video");
+  expect(video).toHaveAttribute("src", ASSET_URL);
+  expect(video).toHaveAttribute("controls");
+  expect(screen.queryByRole("link", { name: ASSET_URL })).not.toBeInTheDocument();
+
+  fireEvent.error(video!);
+  expect(screen.getByRole("link", { name: ASSET_URL })).toHaveAttribute("href", ASSET_URL);
+  expect(document.querySelector("video")).toBeNull();
+});
+
+it("previews an uploaded video from its local copy", async () => {
+  const { uploads } = stubFetch();
+  const copies = stubObjectUrls();
+  renderDetails();
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+  fireEvent.change(editor(), { target: { value: "" } });
+  const video = new File(["mp4"], "demo.mp4", { type: "video/mp4" });
+  fireEvent.paste(editor(), { clipboardData: { files: [video] } });
+  await waitFor(() => expect(uploads).toHaveLength(1));
+  await act(async () => uploads[0].respond(attachment("video/mp4")));
+  await waitFor(() => expect(editor()).toHaveValue(ASSET_URL));
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Preview" }));
+
+  await waitFor(() =>
+    expect(document.querySelector("video")).toHaveAttribute("src", "blob:copy-1"),
+  );
+  expect(copies.created).toEqual([video]);
+});
+
 it("puts an uploaded video on its own line and drops a failed upload", async () => {
   const { uploads } = stubFetch();
+  stubObjectUrls();
   renderDetails();
 
   fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
@@ -554,6 +601,50 @@ function mountCommentComposer(client: QueryClient, prUrl = PR_URL) {
     </QueryClientProvider>,
   );
 }
+
+it.each(["MacIntel", "Linux x86_64"])(
+  "submits a review comment with the command shortcut on %s using Submit's validation",
+  (platform) => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+    const modifier = platform === "MacIntel" ? { metaKey: true } : { ctrlKey: true };
+    const props = {
+      draft: { body: "Please check this", error: null, pending: false },
+      setBody: vi.fn(),
+      post: vi.fn(),
+      account: "reviewer",
+      inline: true,
+      newThread: true,
+    };
+    const view = render(<PullRequestCommentForm {...props} />);
+    const input = () => screen.getByRole("textbox", { name: "New review comment" });
+    for (const keys of [
+      {},
+      { ...modifier, shiftKey: true },
+      { ...modifier, altKey: true },
+      { ...modifier, isComposing: true },
+      { ...modifier, keyCode: 229 },
+      { ...modifier, repeat: true },
+    ]) {
+      fireEvent.keyDown(input(), { key: "Enter", ...keys });
+    }
+    expect(props.post).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
+    fireEvent.keyDown(input(), { key: "Enter", ...modifier });
+    expect(props.post).toHaveBeenCalledTimes(2);
+
+    for (const overrides of [
+      { draft: { ...props.draft, body: " " } },
+      { draft: { ...props.draft, body: "x".repeat(MAX_PULL_REQUEST_COMMENT_CHARACTERS + 1) } },
+      { draft: { ...props.draft, pending: true } },
+      { disabled: true },
+    ]) {
+      view.rerender(<PullRequestCommentForm {...props} {...overrides} />);
+      expect(screen.getByRole("button", { name: /^(Submit|Posting…)$/ })).toBeDisabled();
+      fireEvent.keyDown(input(), { key: "Enter", ...modifier });
+    }
+    expect(props.post).toHaveBeenCalledTimes(2);
+  },
+);
 
 function inlineReviewThread(): ReviewThread {
   return {
@@ -722,6 +813,7 @@ it("posts a comment once, keeps the draft through unmount, and updates only its 
   const textbox = screen.getByRole("textbox", { name: "New PR comment" });
   const body = "  **Thanks**\n`literal`";
   fireEvent.change(textbox, { target: { value: body } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled());
   fireEvent.submit(textbox.closest("form")!);
   fireEvent.submit(textbox.closest("form")!);
   await waitFor(() => expect(edits).toHaveLength(1));
@@ -768,8 +860,8 @@ it.each([
     const client = new QueryClient({ defaultOptions: { mutations: { retry: 3 } } });
     const composer = mountCommentComposer(client);
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "Please check this" } });
-    await waitFor(() => expect(screen.getByRole("button", { name: "Post comment" })).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "Post comment" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Submit" }));
     await waitFor(() => expect(edits).toHaveLength(1));
     await act(async () => {
       if (status === null) edits[0].reject(new TypeError(message));
@@ -798,12 +890,12 @@ it.each([
 it("blocks blank and oversized comments and previews Markdown", async () => {
   const { edits } = stubFetch();
   mountCommentComposer(new QueryClient());
-  expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
   fireEvent.change(screen.getByRole("textbox"), { target: { value: " \n" } });
-  expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
   fireEvent.change(screen.getByRole("textbox"), { target: { value: "x".repeat(65537) } });
   expect(await screen.findByRole("alert")).toHaveTextContent("65536");
-  expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
   const draft = `**Ready for review**\n![Screenshot](${ASSET_URL})`;
   fireEvent.change(screen.getByRole("textbox"), { target: { value: draft } });
   await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(draft));
@@ -819,10 +911,10 @@ it("accepts a comment at the Unicode code-point limit and blocks the next charac
   const body = "😀".repeat(65536);
   fireEvent.change(screen.getByRole("textbox"), { target: { value: body + "😀" } });
   expect(await screen.findByRole("alert")).toHaveTextContent("65536");
-  expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Submit" })).toBeDisabled();
   fireEvent.change(screen.getByRole("textbox"), { target: { value: body } });
-  await waitFor(() => expect(screen.getByRole("button", { name: "Post comment" })).toBeEnabled());
-  fireEvent.click(screen.getByRole("button", { name: "Post comment" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Submit" }));
   await waitFor(() => expect(edits).toHaveLength(1));
   expect(edits[0].body).toEqual({ pr_url: PR_URL, body });
   await act(async () => edits[0].respond(json({ detail: "Rejected by test" }, 400)));

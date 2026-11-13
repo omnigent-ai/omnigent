@@ -13,8 +13,9 @@ interrupted by a crash is still resolved instead of staying in `starting` foreve
 For what automations do from a user's point of view, with worked examples, see
 [EXAMPLES.md](EXAMPLES.md).
 
-The `automations_v2` feature flag turns this scheduler on. It is off by default,
-and the server then uses the older in-memory timers ("legacy timers").
+The `automations_v2` feature flag turns this scheduler on. It is on by default;
+with `OMNIGENT_FEATURES=-automations_v2` the server uses the older in-memory
+timers ("legacy timers") instead.
 
 Terms used below:
 
@@ -608,11 +609,14 @@ binary does not automatically resume tasks paused by an old scheduler.
 
 ## Switching schedulers
 
-**Turning it on.** Set `OMNIGENT_FEATURES=automations_v2` and restart all
-scheduler replicas together. The app needs a store that supports persistent
-dispatch. Without `scheduled_task_dispatch`, it uses the built-in executor and owns
-every host, which suits a single replica. A deployment with several replicas passes
-its own `owned_hosts`.
+**Turning it on.** It is on by default, so upgrading from a release where it was
+off switches schedulers; elsewhere, remove `-automations_v2` from
+`OMNIGENT_FEATURES` (or add `automations_v2`). Either way, restart all scheduler
+replicas together. The app needs a store that supports persistent dispatch.
+Without `scheduled_task_dispatch`, it uses the built-in executor and owns every
+host, which suits a single replica. A deployment with several replicas passes its
+own `owned_hosts`. A deployment that can't do this yet, such as one on Cloudflare
+D1 (below), sets `OMNIGENT_FEATURES=-automations_v2` before upgrading.
 
 **Turning it off.**
 

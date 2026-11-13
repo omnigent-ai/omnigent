@@ -1134,10 +1134,10 @@ def create_hosts_router(
                 host_type="external",
             )
         if agent_store is not None and agent_cache is not None:
-            from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+            from omnigent.server.runtime_compatibility import require_session_runtime_support
 
             await asyncio.to_thread(
-                require_session_registry_mcp_support,
+                require_session_runtime_support,
                 target.conv,
                 conn.hello.capabilities,
                 component="host",
@@ -1449,6 +1449,17 @@ def create_hosts_router(
                         host_id,
                         workspace,
                         git_branch,
+                    )
+                from omnigent.server.routes._sessions.helpers import (
+                    _drop_claude_launch_args_from_another_host,
+                )
+
+                bound = await asyncio.to_thread(
+                    conversation_store.get_conversation, body.session_id
+                )
+                if bound is not None:
+                    await asyncio.to_thread(
+                        _drop_claude_launch_args_from_another_host, conversation_store, bound
                     )
 
             persist_task = asyncio.create_task(persist_binding())

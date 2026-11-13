@@ -107,6 +107,37 @@ it(
       assert.equal(await requestState(), "pending", "the notice leaves the request running");
       await pause();
 
+      // Exercise enlarged content, the macOS hint and a wrapped origin in the real popup.
+      const layout = await notice.evaluate(() => {
+        const origin = document.getElementById("origin");
+        const hint = document.getElementById("cookie-hint");
+        const previous = { origin: origin.textContent, hidden: hint.hidden };
+        origin.textContent = `https://${"long-enterprise-sign-in.".repeat(4)}example.com`;
+        hint.hidden = false;
+        document.documentElement.style.zoom = "1.25";
+        const button = document.getElementById("open-in-browser").getBoundingClientRect();
+        const section = document.querySelector("section");
+        const sectionRect = section.getBoundingClientRect();
+        section.scrollTop = section.scrollHeight;
+        const hintBottom = hint.getBoundingClientRect().bottom;
+        const result = {
+          buttonBottom: button.bottom,
+          windowHeight: innerHeight,
+          hintBottom,
+          sectionBottom: sectionRect.bottom,
+        };
+        origin.textContent = previous.origin;
+        hint.hidden = previous.hidden;
+        section.scrollTop = 0;
+        document.documentElement.style.zoom = "";
+        return result;
+      });
+      assert.ok(layout.buttonBottom <= layout.windowHeight, "the browser action stays visible");
+      assert.ok(
+        layout.hintBottom <= layout.sectionBottom + 1,
+        "all notice text remains reachable by scrolling",
+      );
+
       await notice.getByRole("button", { name: "Open in browser" }).click();
       await eventually(() => notice.isClosed(), "the notice to close");
       assert.deepEqual(await electronApp.evaluate(() => [...globalThis.fakeBrowserOpened]), [

@@ -33,6 +33,8 @@ import json
 import logging
 import os
 import pathlib
+import shlex
+import shutil
 import sys
 import tempfile
 import time
@@ -49,6 +51,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
+from urllib.parse import urlsplit
 
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
@@ -87,6 +90,10 @@ from .executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    LiveMcpHarnessNotRunning,
+    LiveMcpReconnectRefused,
+    LiveMcpServerStatus,
+    LiveMcpServerUnknown,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -94,13 +101,16 @@ from .executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    is_interruption_marker,
     without_tool_history,
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
+    SandboxPolicy,
     create_exec_launcher,
     get_backend,
     resolve_sandbox,
@@ -117,6 +127,7 @@ logger = logging.getLogger(__name__)
 # producer (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
+_CLAUDE_CODE_ENABLE_CLAUDEAI_MCP_ENV = "ENABLE_CLAUDEAI_MCP_SERVERS"
 # Claude Code floors a thinking budget at this size and requires max_tokens above it.
 _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS = 1024
 
@@ -440,6 +451,8 @@ _CONNECT_TIMEOUT_SECONDS = 60.0
 _QUERY_START_TIMEOUT_SECONDS = 30.0
 _MCP_STATUS_TIMEOUT_SECONDS = 10.0
 _MCP_RECONNECT_TIMEOUT_SECONDS = 30.0
+# Leaves room under the harness adapter's 2s interrupt settle budget for the turn to end.
+_INTERRUPT_TIMEOUT_SECONDS = 1.5
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
@@ -996,6 +1009,64 @@ def _best_effort_close(resource: _Stream | _Process) -> None:
 _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 
 
+class _ManagedMcpRelay:
+    """Omnigent's tools served to one CLI through the ``omnigent`` entry in ``managed-mcp.json``.
+
+    Claude Code refuses the in-process SDK server while that file exists, so the CLI
+    launches the shared ``serve-mcp`` relay itself and finds its bridge through ``env``.
+    Its control socket gets a private directory, which a sandbox can grant on its own.
+    """
+
+    def __init__(
+        self, tools: list[ToolSpec], tool_executor: ToolExecutor, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        from omnigent.harnesses.claude_native.bridge import (
+            managed_mcp_relay_env,
+            prepare_acp_mcp_bridge_dir,
+            prepare_relay_socket_dir,
+            start_tool_relay,
+        )
+
+        self._bridge_dir = prepare_acp_mcp_bridge_dir()
+        # Windows control servers listen on loopback TCP instead of a socket file.
+        self._socket_dir: pathlib.Path | None = None
+        try:
+            if os.name != "nt":
+                self._socket_dir = prepare_relay_socket_dir()
+            self._relay = start_tool_relay(
+                bridge_dir=self._bridge_dir,
+                tools=list(tools),
+                tool_executor=tool_executor,
+                loop=loop,
+            )
+        except BaseException:
+            self._remove_dirs()
+            raise
+        self.env = managed_mcp_relay_env(self._bridge_dir, socket_dir=self._socket_dir)
+
+    @property
+    def bridge_dir(self) -> pathlib.Path:
+        """The private directory this relay's ``serve-mcp`` reads and writes."""
+        return self._bridge_dir
+
+    @property
+    def socket_dir(self) -> pathlib.Path | None:
+        """The private directory for ``serve-mcp``'s control socket, if it uses one."""
+        return self._socket_dir
+
+    def close(self) -> None:
+        """Stop the relay and remove its directories."""
+        try:
+            self._relay.close()
+        finally:
+            self._remove_dirs()
+
+    def _remove_dirs(self) -> None:
+        shutil.rmtree(self._bridge_dir, ignore_errors=True)
+        if self._socket_dir is not None:
+            shutil.rmtree(self._socket_dir, ignore_errors=True)
+
+
 @dataclass
 class _ClaudeClientState:
     client: _ClaudeClient
@@ -1005,6 +1076,54 @@ class _ClaudeClientState:
     effort: str | None = None
     # Host-reported account state of each Claude MCP server when last checked.
     mcp_auth: dict[str, str] = field(default_factory=dict)
+    # A status or reconnect request from the /mcp panel timed out, so the CLI may
+    # still be busy with it and would hold the next prompt.
+    mcp_control_timed_out: bool = False
+    # The CLI answers MCP control requests one at a time; the panel and turn-start
+    # reconnects take turns rather than queue behind each other's budgets.
+    mcp_control_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Serves Omnigent's tools to this client's CLI under an enterprise MCP config.
+    mcp_relay: _ManagedMcpRelay | None = None
+    # This client's own sandbox launcher, which exposes the managed config and its relay.
+    cli_launcher: str | None = None
+    # Set once the current query has been interrupted; cleared when the next query starts.
+    interrupted: bool = False
+    # Whether the next query must carry the runner's interruption marker.
+    interruption_marker_pending: bool = False
+
+
+def _recording_consents(
+    gate: Callable[[str, ToolArgs, object], Awaitable[object]], consents: _RelayConsents
+) -> Callable[[str, ToolArgs, object], Awaitable[object]]:
+    """Wrap the CLI's permission gate so the relay honours what it approved."""
+    from claude_agent_sdk import PermissionResultAllow
+
+    async def can_use_tool(tool_name: str, tool_input: ToolArgs, perm_ctx: object) -> object:
+        verdict = await gate(tool_name, tool_input, perm_ctx)
+        if tool_name.startswith(_OMNIGENT_MCP_PREFIX) and isinstance(
+            verdict, PermissionResultAllow
+        ):
+            consents.record(tool_name.removeprefix(_OMNIGENT_MCP_PREFIX), tool_input)
+        return verdict
+
+    return can_use_tool
+
+
+async def _close_managed_mcp_relay(state: _ClaudeClientState) -> None:
+    """Release a gone CLI's relay and launcher; the relay's shutdown blocks briefly."""
+    relay, launcher = state.mcp_relay, state.cli_launcher
+    state.mcp_relay = state.cli_launcher = None
+    await asyncio.to_thread(_release_client_cli, relay, launcher)
+
+
+def _release_client_cli(relay: _ManagedMcpRelay | None, launcher: str | None) -> None:
+    try:
+        if relay is not None:
+            relay.close()
+    finally:
+        if launcher is not None:
+            with suppress(OSError):
+                os.unlink(launcher)
 
 
 def _claude_mcp_auth_statuses() -> dict[str, str]:
@@ -1031,6 +1150,39 @@ def _inventory_mcp_server_name(live_name: str) -> str:
         if server_sep and server:
             return server
     return live_name
+
+
+# Omnigent's own tool server, which the /mcp panel does not list.
+_OMNIGENT_MCP_SERVER_NAME = "omnigent"
+
+_MCP_BUSY_COMPACT_MESSAGE = (
+    "Claude Code is still busy with an MCP request that timed out, so it can't compact now. "
+    "Send a message to restart it, then run /compact again."
+)
+
+
+def _live_mcp_statuses(response: Mapping[str, object]) -> list[LiveMcpServerStatus]:
+    """The CLI's MCP connections from a ``get_mcp_status`` response, without Omnigent's own."""
+    statuses: list[LiveMcpServerStatus] = []
+    servers = response.get("mcpServers")
+    for server in servers if isinstance(servers, list) else []:
+        if not isinstance(server, Mapping):
+            continue
+        name, status = server.get("name"), server.get("status")
+        if not isinstance(name, str) or not isinstance(status, str):
+            continue
+        if name == _OMNIGENT_MCP_SERVER_NAME:
+            continue
+        error, scope = server.get("error"), server.get("scope")
+        statuses.append(
+            LiveMcpServerStatus(
+                name=name,
+                status=status,
+                error=error if isinstance(error, str) and error else None,
+                scope=scope if isinstance(scope, str) and scope else None,
+            )
+        )
+    return statuses
 
 
 async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) -> set[str]:
@@ -1092,6 +1244,8 @@ class PreparedClaudeCli:
 
     cli_path: str | None
     enable_native_tools: bool
+    # Policy the wrapper applies; a CLI needing extra grants gets its own launcher from it.
+    sandbox: SandboxPolicy | None = None
 
 
 def _ensure_sdk() -> ModuleType:
@@ -1111,6 +1265,43 @@ def _ensure_sdk() -> ModuleType:
 # ``_stable_tool_executor``. Every other tool (Claude Code's ``Skill`` and
 # ``ToolSearch``, or a user-configured MCP server) runs inside the CLI.
 _OMNIGENT_MCP_PREFIX = "mcp__omnigent__"
+# Permission modes in which Omnigent's tools are pre-approved (``allowed_tools``), so the
+# CLI asks no consent for them.
+_OMNIGENT_TOOLS_PREAPPROVED_MODES = ("auto", "bypassPermissions")
+
+
+class _RelayConsents:
+    """Omnigent tool calls the CLI's permission gate approved, each honoured once.
+
+    The managed relay accepts any caller holding its token, which anything in the
+    CLI's sandbox can read, so it asks consent for a call the gate did not approve.
+    A call the gate approved is not asked about again. An approval unused for
+    :attr:`TTL_S` lapses.
+    """
+
+    TTL_S = 300.0
+
+    def __init__(self) -> None:
+        self._approved: list[tuple[str, str, float]] = []
+
+    @staticmethod
+    def _key(arguments: Mapping[str, object]) -> str:
+        return json.dumps(arguments, sort_keys=True, default=str)
+
+    def record(self, tool_name: str, arguments: Mapping[str, object]) -> None:
+        """Remember that the gate approved ``tool_name`` with ``arguments``."""
+        self._approved.append((tool_name, self._key(arguments), time.monotonic()))
+
+    def consume(self, tool_name: str, arguments: Mapping[str, object]) -> bool:
+        """Use up one approval for this exact call; ``False`` when there is none."""
+        now = time.monotonic()
+        self._approved = [item for item in self._approved if now - item[2] < self.TTL_S]
+        key = self._key(arguments)
+        for index, (name, approved_key, _at) in enumerate(self._approved):
+            if name == tool_name and approved_key == key:
+                del self._approved[index]
+                return True
+        return False
 
 
 def _tool_call_metadata(tool_block: _ToolUseBlockObj) -> dict[str, object]:
@@ -1224,6 +1415,8 @@ def _build_mcp_tools(
 def _augment_system_prompt_for_omnigent_mcp_tools(
     system_prompt: str,
     tool_schemas: list[ToolSpec],
+    *,
+    managed_entry: bool = False,
 ) -> str:
     """
     Add Claude SDK-specific MCP tool-name guidance to the system prompt.
@@ -1233,6 +1426,10 @@ def _augment_system_prompt_for_omnigent_mcp_tools(
     as ``mcp__omnigent__<bare_name>``. Bundled agent prompts and skills use
     bare names because other executors call those directly, so the SDK needs
     a bridge note to stop the model from trying a non-existent bare tool first.
+
+    With ``managed_entry`` the tools come from the ``omnigent`` entry in
+    ``managed-mcp.json``, which managed policy Omnigent can't read may still drop,
+    so the note says what a missing tool means.
     """
     tool_names = [
         name for schema in tool_schemas if isinstance((name := schema.get("name")), str) and name
@@ -1259,6 +1456,12 @@ def _augment_system_prompt_for_omnigent_mcp_tools(
             "Claude SDK tool naming: Omnigent tools are exposed as MCP tools. "
             "When instructions mention a bare Omnigent tool name, invoke "
             "`mcp__omnigent__<tool_name>` rather than the bare name."
+        )
+    if managed_entry:
+        note += (
+            " They come from your organization's managed `omnigent` MCP server; "
+            "if no `mcp__omnigent__` tool is available, that server did not load in "
+            "this session, so say so instead of retrying."
         )
 
     if not system_prompt:
@@ -1413,12 +1616,17 @@ def _init_mcp_server_names(data: Mapping[str, object]) -> tuple[str, ...]:
 
 
 def _claude_settings_payload(
-    api_key_helper: str | None, model_overrides: dict[str, str]
+    api_key_helper: str | None,
+    model_overrides: dict[str, str],
+    *,
+    disable_claude_ai_connectors: bool = False,
 ) -> str | None:
     """Serialize the invocation-local settings Claude Code launches with.
 
     :param api_key_helper: The gateway ``apiKeyHelper`` command, or ``None``.
     :param model_overrides: Canonical-to-served model id rewrites.
+    :param disable_claude_ai_connectors: Stop the CLI from auto-fetching the
+        logged-in account's claude.ai MCP connectors.
     :returns: Compact JSON for ``ClaudeAgentOptions.settings``, or ``None``
         when there is nothing to configure.
     """
@@ -1427,6 +1635,8 @@ def _claude_settings_payload(
         settings["apiKeyHelper"] = api_key_helper
     if model_overrides:
         settings["modelOverrides"] = model_overrides
+    if disable_claude_ai_connectors:
+        settings["disableClaudeAiConnectors"] = True
     return json.dumps(settings, separators=(",", ":")) if settings else None
 
 
@@ -1741,21 +1951,20 @@ def prepare_claude_cli_path(
     return PreparedClaudeCli(
         cli_path=create_exec_launcher(real_cli_path, sandbox),
         enable_native_tools=True,
+        sandbox=sandbox,
     )
 
 
-def prepare_tight_cli_process_path(
+def prepare_tight_cli_process(
     real_cli_path: str | None,
     *,
     cwd: str | None = None,
-) -> str | None:
+) -> PreparedClaudeCli:
     """Wrap the Claude CLI in a tight default sandbox without enabling tools."""
 
-    if real_cli_path is None:
-        return None
-
-    if _sandbox_disabled_by_env():
-        return real_cli_path
+    unwrapped = PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
+    if real_cli_path is None or _sandbox_disabled_by_env():
+        return unwrapped
 
     # Skip silently on non-Linux: the implicit default sandbox here is
     # ``linux_bwrap`` and ``resolve_sandbox`` would raise
@@ -1766,7 +1975,7 @@ def prepare_tight_cli_process_path(
     # logging a warning every run is just noise (and breaks
     # tests that assert ``stderr_is_clean``).
     if sys.platform != "linux":
-        return real_cli_path
+        return unwrapped
 
     spec = OSEnvSpec(
         type="caller_process",
@@ -1785,13 +1994,50 @@ def prepare_tight_cli_process_path(
             "Could not apply default local CLI sandbox; continuing without it: %s",
             exc,
         )
-        return real_cli_path
+        return unwrapped
     else:
         if not sandbox.active:
-            return real_cli_path
+            return unwrapped
         sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
         sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-        return create_exec_launcher(real_cli_path, sandbox)
+        return PreparedClaudeCli(
+            cli_path=create_exec_launcher(real_cli_path, sandbox),
+            enable_native_tools=False,
+            sandbox=sandbox,
+        )
+
+
+def _claude_managed_config_dirs() -> list[pathlib.Path]:
+    """Directories holding the enterprise ``managed-mcp.json`` Claude Code reads.
+
+    Claude Code reads its managed settings, drop-ins and MCP config from that one
+    directory, so a sandboxed CLI needs all of it to honour the relay entry's policy.
+    """
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_paths
+
+    return [path.parent for path in claude_code_managed_mcp_paths() if os.path.exists(path)]
+
+
+def _client_cli_sandbox(
+    base: SandboxPolicy,
+    *,
+    managed_config_dirs: Sequence[pathlib.Path],
+    bridge_dir: pathlib.Path | None,
+    socket_dir: pathlib.Path | None = None,
+) -> SandboxPolicy:
+    """The CLI sandbox for one client under an enterprise MCP config.
+
+    Bubblewrap gives the CLI a private ``/tmp`` and a fixed set of ``/etc`` paths, and
+    Seatbelt denies writes outside its grants, so the managed config is granted
+    read-only and this client's relay bridge and control-socket directory read-write.
+    Neither shared root is granted: they hold every other session's relay token and
+    socket. A bwrap bind keeps the socket on the host, where it can be reached.
+    """
+    policy = with_additional_read_roots(base, managed_config_dirs)
+    relay_dirs = [path for path in (bridge_dir, socket_dir) if path is not None]
+    if relay_dirs:
+        policy = with_additional_write_roots(policy, relay_dirs)
+    return policy
 
 
 @dataclass(frozen=True)
@@ -2060,6 +2306,9 @@ class ClaudeSDKExecutor(Executor):
         # Databricks gateway doesn't support.
         self._cli_wrapper_path: str | None = None
         self._cli_path: str | None = _find_system_claude()
+        # The unwrapped CLI and the sandbox its wrapper applies, for per-client launchers.
+        self._real_cli_path = self._cli_path
+        self._cli_sandbox: SandboxPolicy | None = None
         if self._cli_path:
             if self._os_env_spec is not None:
                 prepared = prepare_claude_cli_path(
@@ -2067,17 +2316,12 @@ class ClaudeSDKExecutor(Executor):
                     self._os_env_spec,
                 )
                 self._os_env = prepared.enable_native_tools
-                if prepared.cli_path != self._cli_path:
-                    self._cli_wrapper_path = prepared.cli_path
-                    self._cli_path = prepared.cli_path
             else:
-                wrapped_cli = prepare_tight_cli_process_path(
-                    self._cli_path,
-                    cwd=self._cwd,
-                )
-                if wrapped_cli != self._cli_path:
-                    self._cli_wrapper_path = wrapped_cli
-                    self._cli_path = wrapped_cli
+                prepared = prepare_tight_cli_process(self._cli_path, cwd=self._cwd)
+            if prepared.cli_path != self._cli_path:
+                self._cli_wrapper_path = prepared.cli_path
+                self._cli_path = prepared.cli_path
+                self._cli_sandbox = prepared.sandbox
             if self._os_env_spec is not None and self._cwd is None:
                 self._cwd = self._os_env_spec.cwd
             logger.info("Using system claude CLI: %s", self._cli_path)
@@ -2292,6 +2536,77 @@ class ClaudeSDKExecutor(Executor):
             state.model = model
         return state.client
 
+    def _consented_relay_executor(
+        self, tool_executor: ToolExecutor, consents: _RelayConsents
+    ) -> ToolExecutor:
+        """The executor a managed relay dispatches through, asking consent as the CLI would.
+
+        Outside a pre-approving permission mode a call runs only if the CLI's gate
+        approved it (see :class:`_RelayConsents`) or the same gate approves it now, so a
+        process that reads the relay's token cannot skip the consent the CLI asks for.
+        """
+        from claude_agent_sdk import PermissionResultAllow
+
+        async def dispatch(name: str, arguments: ToolArgs) -> ToolResult:
+            if self._permission_mode not in _OMNIGENT_TOOLS_PREAPPROVED_MODES and not (
+                consents.consume(name, arguments)
+            ):
+                verdict = await self._can_use_tool_gate(
+                    f"{_OMNIGENT_MCP_PREFIX}{name}", arguments, None
+                )
+                if not isinstance(verdict, PermissionResultAllow):
+                    return {"error": f"Omnigent tool {name!r} was not approved", "blocked": True}
+            return await tool_executor(name, arguments)
+
+        return dispatch
+
+    def _prepare_managed_cli(
+        self, options: SdkOptions, relay_tools: list[ToolSpec] | None
+    ) -> tuple[_ManagedMcpRelay | None, str | None]:
+        """Point a new CLI's managed relay entry at its own relay, or at nothing.
+
+        The SDK merges this process's environment into the CLI's, so relay variables
+        inherited from an enclosing session are blanked rather than left out. Under a
+        sandbox the CLI also gets its own launcher, which exposes the managed config
+        and only this client's bridge.
+
+        :returns: The started relay and launcher, each ``None`` when not needed.
+        """
+        from omnigent.harnesses.claude_native.bridge import MANAGED_MCP_RELAY_ENV_NAMES
+
+        relay = None
+        if relay_tools is not None and self._tool_executor is not None:
+            consents = _RelayConsents()
+            relay = _ManagedMcpRelay(
+                relay_tools,
+                self._consented_relay_executor(self._tool_executor, consents),
+                asyncio.get_running_loop(),
+            )
+            options.env.update(relay.env)
+            gate = getattr(options, "can_use_tool", None)
+            if gate is not None:
+                options.can_use_tool = _recording_consents(gate, consents)
+        else:
+            # Empty values make the entry's command fail instead of reaching a bridge.
+            options.env.update(dict.fromkeys(MANAGED_MCP_RELAY_ENV_NAMES, ""))
+        if self._cli_sandbox is None or self._real_cli_path is None:
+            return relay, None
+        try:
+            launcher = create_exec_launcher(
+                self._real_cli_path,
+                _client_cli_sandbox(
+                    self._cli_sandbox,
+                    managed_config_dirs=_claude_managed_config_dirs(),
+                    bridge_dir=relay.bridge_dir if relay is not None else None,
+                    socket_dir=relay.socket_dir if relay is not None else None,
+                ),
+            )
+        except BaseException:
+            _release_client_cli(relay, None)
+            raise
+        options.cli_path = launcher
+        return relay, launcher
+
     async def _reconnect_signed_in_mcp_servers(self, state: _ClaudeClientState) -> bool:
         """Reconnect servers the host reports signed in since this client last checked.
 
@@ -2308,11 +2623,15 @@ class ClaudeSDKExecutor(Executor):
             if status == "connected" and state.mcp_auth.get(name) != "connected"
         }
         try:
-            retry = (
-                await _reconnect_failed_mcp_servers(state.client, signed_in)
-                if signed_in
-                else set()
-            )
+            # Wait out a panel request in flight: if it times out, that CLI holds the prompt.
+            async with state.mcp_control_lock:
+                if state.mcp_control_timed_out:
+                    return False
+                retry = (
+                    await _reconnect_failed_mcp_servers(state.client, signed_in)
+                    if signed_in
+                    else set()
+                )
         except TimeoutError:
             logger.warning(
                 "Reconnecting MCP servers timed out; restarting the Claude CLI, "
@@ -2331,6 +2650,12 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.pop(session_key, None)
         if state is None:
             return
+        try:
+            await self._disconnect_client_state(session_key, state)
+        finally:
+            await _close_managed_mcp_relay(state)
+
+    async def _disconnect_client_state(self, session_key: str, state: _ClaudeClientState) -> None:
         try:
             current_loop = asyncio.get_running_loop()
             current_task = asyncio.current_task()
@@ -2365,15 +2690,41 @@ class ClaudeSDKExecutor(Executor):
         # the loop tears down.
         await self._force_close_client(state.client)
 
+    def _provider_auth_hint(self) -> str:
+        """Say where to fix a credential Claude Code could not authenticate with.
+
+        A Databricks profile gets the exact re-login command; other modes use
+        :func:`_claude_auth_remediation`.
+
+        :returns: One sentence, e.g. ``"Check your selected ~/.databrickscfg
+            profile; re-authenticate with `databricks auth login --profile oss`."``
+        """
+        if self._gateway_uses_databricks_profile:
+            if self._databricks_profile:
+                login = f"databricks auth login --profile {shlex.quote(self._databricks_profile)}"
+            else:
+                # No named profile: the token is minted with ``--host``, and this
+                # path's base URL is always ``<workspace host>/ai-gateway/anthropic``.
+                base_url = urlsplit(self._extra_env.get("ANTHROPIC_BASE_URL", ""))
+                login = f"databricks auth login --host {base_url.scheme}://{base_url.netloc}"
+            return f"Check your selected ~/.databrickscfg profile; re-authenticate with `{login}`."
+        return _claude_auth_remediation(databricks_profile=False, gateway=bool(self._gateway))
+
     def _evict_client_on_cancel(self, session_key: str) -> None:
         state = self._clients.pop(session_key, None)
         if state is None:
             return
         # Close in the background: an await here runs under an in-flight
         # cancellation and could itself be cancelled, leaking the CLI process.
-        task = asyncio.create_task(self._force_close_client(state.client))
+        task = asyncio.create_task(self._force_close_evicted_client(state))
         self._cancel_close_tasks.add(task)
         task.add_done_callback(self._cancel_close_tasks.discard)
+
+    async def _force_close_evicted_client(self, state: _ClaudeClientState) -> None:
+        try:
+            await self._force_close_client(state.client)
+        finally:
+            await _close_managed_mcp_relay(state)
 
     async def _evict_terminated_client(self, session_key: str) -> None:
         """Discard a cached client after its CLI child exits."""
@@ -2408,23 +2759,24 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.get(session_key)
         if state is None:
             return False
-        # Interrupt is best-effort and fast; a failure just falls through to
-        # the close below.
+        state.interruption_marker_pending = True
+        if state.interrupted:
+            return True
+        state.interrupted = True
         try:
-            await asyncio.wait_for(state.client.interrupt(), timeout=0.5)
+            await asyncio.wait_for(state.client.interrupt(), timeout=_INTERRUPT_TIMEOUT_SECONDS)
+            return True
+        except asyncio.CancelledError:
+            state.interrupted = False
+            raise
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.warning(
                 "Claude SDK interrupt failed for session %s: %s",
                 session_key,
                 exc,
             )
-        # Always drop the live session after an interrupt. Its transcript
-        # still holds the abandoned prompt, and resumed turns send only the
-        # latest user message (see _build_prompt), so the runner's
-        # "[System: interrupted]" marker would never reach the model. Closing
-        # forces the next turn to rebuild full history (marker included) in a
-        # fresh session — the abandoned request is then visible-but-superseded
-        # rather than silently continued.
+        # The turn may still be running, so drop the session; the next turn
+        # replays history, including the interruption marker, in a fresh one.
         try:
             await self.close_session(session_key)
             return True
@@ -2537,7 +2889,71 @@ class ClaudeSDKExecutor(Executor):
         # capability caused the one-turn-behind desync described in #3472.
         return False
 
+    def supports_live_mcp_control(self) -> bool:
+        return True
+
+    async def _mcp_control[T](
+        self, state: _ClaudeClientState, request: Callable[[], Awaitable[T]], timeout: float
+    ) -> T:
+        """Send one MCP control request, marking the client for replacement if it times out.
+
+        Waiting for another control request to finish counts toward *timeout*
+        but leaves the client in place: that CLI is busy, not stuck.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout
+        async with asyncio.timeout_at(deadline):
+            await state.mcp_control_lock.acquire()
+        try:
+            # A CLI still busy with a timed-out request would hold this one too.
+            if state.mcp_control_timed_out:
+                raise TimeoutError
+            async with asyncio.timeout_at(deadline):
+                return await request()
+        except TimeoutError:
+            state.mcp_control_timed_out = True
+            raise
+        finally:
+            state.mcp_control_lock.release()
+
+    async def live_mcp_statuses(self, session_key: str) -> list[LiveMcpServerStatus] | None:
+        state = self._clients.get(session_key)
+        if state is None:
+            return None
+        response = await self._mcp_control(
+            state, state.client.get_mcp_status, _MCP_STATUS_TIMEOUT_SECONDS
+        )
+        return _live_mcp_statuses(response)
+
+    async def reconnect_live_mcp_server(self, session_key: str, name: str) -> None:
+        state = self._clients.get(session_key)
+        if state is None:
+            raise LiveMcpHarnessNotRunning(session_key)
+
+        # Check and reconnect in one lock hold, so both reach the same CLI.
+        async def check_and_reconnect() -> None:
+            if self._clients.get(session_key) is not state:
+                raise LiveMcpHarnessNotRunning(session_key)
+            response = await state.client.get_mcp_status()
+            if name not in {status.name for status in _live_mcp_statuses(response)}:
+                raise LiveMcpServerUnknown(name)
+            try:
+                await state.client.reconnect_mcp_server(name)
+            except Exception as exc:
+                # The SDK raises a bare Exception carrying the CLI's own error reply.
+                if type(exc) is Exception and exc.__cause__ is None:
+                    raise LiveMcpReconnectRefused(str(exc)) from exc
+                raise
+
+        await self._mcp_control(
+            state,
+            check_and_reconnect,
+            _MCP_STATUS_TIMEOUT_SECONDS + _MCP_RECONNECT_TIMEOUT_SECONDS,
+        )
+
     def supports_tool_boundary_interrupt(self) -> bool:
+        return True
+
+    def resumes_after_interrupt(self) -> bool:
         return True
 
     def max_context_tokens(self) -> int | None:
@@ -3016,7 +3432,11 @@ class ClaudeSDKExecutor(Executor):
         await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
         prompt = (
-            self._build_prompt(messages, resume_session=True)
+            self._build_prompt(
+                messages,
+                resume_session=True,
+                after_interrupt=self._clients[session_key].interruption_marker_pending,
+            )
             if resume_session
             else await self._fresh_session_prompt(messages, cfg)
         )
@@ -3027,11 +3447,15 @@ class ClaudeSDKExecutor(Executor):
             return
 
         state = self._clients.get(session_key)
+        if state is not None and prompt == "/compact" and state.mcp_control_timed_out:
+            # The busy CLI would hold the command, and a new one has nothing to compact.
+            yield ExecutorError(message=_MCP_BUSY_COMPACT_MESSAGE)
+            return
         if state is not None and prompt != "/compact":
             # Effort is a launch option, and a CLI busy with a timed-out MCP reconnect
             # holds the prompt. Rebuild with history for conversational turns, but let
             # /compact operate on the existing client's context.
-            rebuild = state.effort != reasoning_effort
+            rebuild = state.effort != reasoning_effort or state.mcp_control_timed_out
             if not rebuild:
                 try:
                     rebuild = not await self._reconnect_signed_in_mcp_servers(state)
@@ -3043,22 +3467,39 @@ class ClaudeSDKExecutor(Executor):
                 resume_session = False
                 prompt = await self._fresh_session_prompt(messages, cfg)
 
-        # Build MCP tools from Omnigent tool schemas
-        mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []
+        from omnigent.harnesses.claude_native.bridge import (
+            MANAGED_MCP_RELAY_MISSING_WARNING,
+            managed_mcp_relay_configured,
+        )
+        from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
         # Create MCP server config for Omnigent tools. The SDK's
         # ``McpServerConfig`` union is opaque to us — we pass through
         # whatever ``create_sdk_mcp_server`` returns.
         mcp_servers: dict[str, Any] = {}  # type: ignore[explicit-any]
-        if mcp_tools:
-            mcp_servers["omnigent"] = sdk.create_sdk_mcp_server(
-                name="omnigent",
+        # Tools a new client's CLI reaches through the managed relay entry instead.
+        managed_relay_tools: list[ToolSpec] | None = None
+        omnigent_tools_reachable = bool(tools)
+        managed_mcp = claude_code_managed_mcp_present()
+        if tools and managed_mcp:
+            # Claude Code refuses --mcp-config while an enterprise MCP config exists.
+            if not managed_mcp_relay_configured():
+                if session_key not in self._clients:
+                    logger.warning(MANAGED_MCP_RELAY_MISSING_WARNING)
+            elif self._tool_executor is not None:
+                managed_relay_tools = tools
+            omnigent_tools_reachable = managed_relay_tools is not None
+        elif tools:
+            mcp_servers[_OMNIGENT_MCP_SERVER_NAME] = sdk.create_sdk_mcp_server(
+                name=_OMNIGENT_MCP_SERVER_NAME,
                 version="1.0.0",
-                tools=mcp_tools,
+                tools=_build_mcp_tools(tools, self._tool_executor),
             )
+        if omnigent_tools_reachable:
             system_prompt = _augment_system_prompt_for_omnigent_mcp_tools(
                 system_prompt,
                 tools,
+                managed_entry=managed_relay_tools is not None,
             )
 
         # Build allowed_tools list.  OS-environment operations route
@@ -3078,7 +3519,7 @@ class ClaudeSDKExecutor(Executor):
         # When ``allowed_tools`` is empty the SDK omits ``--allowedTools``
         # entirely, letting Claude's normal permission flow apply.
         allowed_tools: list[str] = []
-        if self._permission_mode in ("auto", "bypassPermissions"):
+        if self._permission_mode in _OMNIGENT_TOOLS_PREAPPROVED_MODES:
             # Allow all Omnigent MCP tools (no per-call human gate needed)
             for schema in tools:
                 raw_tname = schema.get("name")
@@ -3111,13 +3552,29 @@ class ClaudeSDKExecutor(Executor):
         # for the canonical ids the CLI names itself (the refusal-fallback).
         # No-op off the gateway transport.
         model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
+        # Translate the spec's host-skill filter into the SDK
+        # options. Falls back to ``"all"`` semantics when the
+        # field is malformed (the parser already validates, so
+        # this is belt-and-suspenders).
+        resolved = _resolve_skills_option(self._skills_filter) or _ResolvedSkills(
+            skills="all", setting_sources=None
+        )
+        # With no setting sources the CLI never reads a project's
+        # ``disableClaudeAiConnectors`` opt-out and would still auto-fetch the
+        # account's connectors; carry the opt-out in the launch settings.
+        hermetic = resolved.setting_sources == []
         from omnigent.mcp_disabled_servers import apply_claude_settings
 
         settings_payload = apply_claude_settings(
-            _claude_settings_payload(api_key_helper, model_overrides),
+            _claude_settings_payload(
+                api_key_helper, model_overrides, disable_claude_ai_connectors=hermetic
+            ),
             executor="claude-sdk",
             active_harnesses=self._mcp_active_harnesses,
         )
+        if hermetic:
+            # Claude Code builds older than that setting honor only this knob.
+            env[_CLAUDE_CODE_ENABLE_CLAUDEAI_MCP_ENV] = "false"
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []
@@ -3158,13 +3615,6 @@ class ClaudeSDKExecutor(Executor):
         # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
         # the base set so MCP definitions can be discovered on demand.
         base_tools: list[str] = self._base_tools(sdk)
-        # Translate the spec's host-skill filter into the SDK
-        # options. Falls back to ``"all"`` semantics when the
-        # field is malformed (the parser already validates, so
-        # this is belt-and-suspenders).
-        resolved = _resolve_skills_option(self._skills_filter) or _ResolvedSkills(
-            skills="all", setting_sources=None
-        )
         # Bundle skills are exposed via the SDK's plugin mechanism.
         # The bundle's ``<bundle>/skills/<dir>/SKILL.md`` files are
         # discovered as plugin skills (no ``.claude/`` prefix needed
@@ -3301,10 +3751,7 @@ class ClaudeSDKExecutor(Executor):
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
         terminal_auth_failure = False
-        auth_remediation = _claude_auth_remediation(
-            databricks_profile=self._gateway_uses_databricks_profile,
-            gateway=bool(self._gateway),
-        )
+        auth_remediation = self._provider_auth_hint()
         compaction_occurred: bool = False
         claude_session_id: str | None = None
         compaction_transcript_path: pathlib.Path | None = None
@@ -3426,12 +3873,24 @@ class ClaudeSDKExecutor(Executor):
                 compacted_messages=compacted_messages,
             )
 
-        client = await self._get_or_create_client(
-            sdk,
-            session_key=session_key,
-            options=options,
-            model=model,
-        )
+        mcp_relay = None
+        cli_launcher = None
+        # Only a new CLI reads the relay environment; a live one keeps its relay.
+        if managed_mcp and session_key not in self._clients:
+            mcp_relay, cli_launcher = self._prepare_managed_cli(options, managed_relay_tools)
+        try:
+            client = await self._get_or_create_client(
+                sdk,
+                session_key=session_key,
+                options=options,
+                model=model,
+            )
+        except BaseException:
+            await asyncio.to_thread(_release_client_cli, mcp_relay, cli_launcher)
+            raise
+        if mcp_relay is not None or cli_launcher is not None:
+            state = self._clients[session_key]
+            state.mcp_relay, state.cli_launcher = mcp_relay, cli_launcher
 
         # ── LLM_REQUEST policy evaluation ────────────────────────
         # If the executor adapter installed a ``_policy_evaluator``
@@ -3470,12 +3929,17 @@ class ClaudeSDKExecutor(Executor):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
+                if is_interruption_marker(message):
+                    break
         self._pending_framework_context[session_key] = "\n\n".join(
             notice
             for message in notice_messages
             if message.get("role") == "user"
             for notice in framework_notices(message.get("content"))
         )
+        client_state = self._clients.get(session_key)
+        if client_state is not None:
+            client_state.interrupted = False
         try:
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
@@ -3493,6 +3957,8 @@ class ClaudeSDKExecutor(Executor):
                 raise TimeoutError(
                     f"Claude SDK query start timed out after {int(_QUERY_START_TIMEOUT_SECONDS)}s"
                 ) from exc
+            if client_state is not None:
+                client_state.interruption_marker_pending = False
             message_stream = client.receive_response()
             try:
                 while True:
@@ -3601,7 +4067,13 @@ class ClaudeSDKExecutor(Executor):
                         _am_model = concrete_reported_model(getattr(assistant_msg, "model", None))
                         if _am_model is not None:
                             observed_model = _am_model
-                        if got_stream_events:
+                        if getattr(assistant_msg, "error", None):
+                            # A failed API call (e.g. an apiKeyHelper that printed no
+                            # token) arrives as a ``<synthetic>`` message whose text is
+                            # the error, not a reply. The is_error ResultMessage that
+                            # follows fails the turn.
+                            pass
+                        elif got_stream_events:
                             # StreamEvents already emitted text. Emit the
                             # ToolCallRequest here, once the full
                             # ``tool_block.input`` has assembled — see the
@@ -3716,14 +4188,26 @@ class ClaudeSDKExecutor(Executor):
                                 self._agent_name,
                                 failure_text,
                             )
-                            terminal_auth_failure = is_claude_auth_failure_text(failure_text)
+                            error_status = getattr(result_msg, "api_error_status", None)
+                            # A rejected credential can arrive with text that names no auth
+                            # failure (an apiKeyHelper that minted no token), so the status
+                            # counts too.
+                            rejected = error_status in {401, 403}
+                            terminal_auth_failure = rejected or is_claude_auth_failure_text(
+                                failure_text
+                            )
                             # Keep the next step in the message too: the REPL and
                             # SDK stream render only code/message.
-                            terminal_error = (
-                                f"{failure_text.rstrip(_TRAILING_PUNCTUATION)}. {auth_remediation}"
-                                if terminal_auth_failure
-                                else failure_text
-                            )
+                            failure_line = failure_text.rstrip(_TRAILING_PUNCTUATION)
+                            if rejected:
+                                terminal_error = (
+                                    "Claude SDK provider authentication failed"
+                                    f" (status={error_status}): {failure_line}. {auth_remediation}"
+                                )
+                            elif terminal_auth_failure:
+                                terminal_error = f"{failure_line}. {auth_remediation}"
+                            else:
+                                terminal_error = failure_text
                         elif not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
@@ -3914,6 +4398,14 @@ class ClaudeSDKExecutor(Executor):
         if turn_usage is None:
             turn_usage = _usage_from_observed_call(last_call_usage, observed_model or model)
 
+        if client_state is not None and client_state.interrupted:
+            # The CLI's result for an interrupted query is not a turn outcome. Its compaction
+            # never reaches the server, so drop the compacted client and replay history next turn.
+            if compaction_occurred:
+                self._evict_client_on_cancel(session_key)
+            yield TurnCancelled()
+            return
+
         if terminal_error:
             if compaction_occurred and claude_session_id:
                 compaction_event = _build_compaction_complete_event()
@@ -4009,6 +4501,7 @@ class ClaudeSDKExecutor(Executor):
         *,
         resume_session: bool,
         history_token_budget: int | None = None,
+        after_interrupt: bool = False,
     ) -> str | list[_JsonObject]:
         """
         Build the prompt for the SDK.
@@ -4033,13 +4526,17 @@ class ClaudeSDKExecutor(Executor):
             history may use, e.g. ``100000``. The newest prior messages
             that fit are kept behind a marker counting the omitted ones;
             ``None`` replays every prior message.
+        :param after_interrupt: ``True`` when the resumed session's
+            interruption marker has not been delivered yet.
         :returns: A plain string prompt, or a list of Anthropic
             API content block dicts when multimodal blocks are
             present in the latest user message.
         """
         if resume_session:
             # The live session already holds its tool items; only a fresh one replays them.
-            return ClaudeSDKExecutor._extract_trailing_user_content(without_tool_history(messages))
+            return ClaudeSDKExecutor._extract_trailing_user_content(
+                without_tool_history(messages), after_interrupt=after_interrupt
+            )
 
         if not _has_replayable_history(messages):
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
@@ -4127,6 +4624,8 @@ class ClaudeSDKExecutor(Executor):
     @staticmethod
     def _extract_trailing_user_content(
         messages: list[Message],
+        *,
+        after_interrupt: bool = False,
     ) -> str | list[_JsonObject]:
         """
         Extract the trailing run of consecutive user messages for the SDK.
@@ -4148,6 +4647,8 @@ class ClaudeSDKExecutor(Executor):
         survive.
 
         :param messages: Conversation history.
+        :param after_interrupt: ``True`` when an interruption marker in
+            the run has not been delivered yet, so it is sent too.
         :returns: A string prompt, or a list of Anthropic content
             block dicts when the trailing run is multimodal.
         """
@@ -4166,6 +4667,11 @@ class ClaudeSDKExecutor(Executor):
                     # Compaction may emit no assistant text; keep it out of later prompts.
                     if not trailing:
                         return "/compact"
+                    break
+                # The live session already received the user input before an interruption.
+                if is_interruption_marker(msg):
+                    if after_interrupt:
+                        trailing.append(msg)
                     break
                 trailing.append(msg)
             else:

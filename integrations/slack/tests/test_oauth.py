@@ -109,6 +109,7 @@ async def test_start_login_device_grant_not_enabled(status: int) -> None:
 
 @respx.mock
 async def test_device_poll_pending_then_success() -> None:
+    access_token, refresh_token = "AT-SECRET-login", "RT-SECRET-login"
     respx.get(_ME).mock(return_value=httpx.Response(401, json={"login_url": "/login"}))
     respx.post(_BASE + "/oauth/device/authorize").mock(
         return_value=httpx.Response(
@@ -127,7 +128,12 @@ async def test_device_poll_pending_then_success() -> None:
         side_effect=[
             httpx.Response(400, json={"error": "authorization_pending"}),
             httpx.Response(
-                200, json={"access_token": "at", "refresh_token": "rt", "expires_in": 3600}
+                200,
+                json={
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "expires_in": 3600,
+                },
             ),
         ]
     )
@@ -136,8 +142,11 @@ async def test_device_poll_pending_then_success() -> None:
         result = await pending.poll()
     finally:
         await pending.close()
-    assert result.access_token == "at"
-    assert result.refresh_token == "rt"
+    assert result.access_token == access_token
+    assert result.refresh_token == refresh_token
+    for rendered in (repr(result), str(result)):
+        assert access_token not in rendered
+        assert refresh_token not in rendered
 
 
 @respx.mock

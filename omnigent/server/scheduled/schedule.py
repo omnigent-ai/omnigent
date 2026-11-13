@@ -89,14 +89,19 @@ _TRIGGER_PROMPT_OPENINGS = tuple(
     f"This automation watches {source} and starts one Omnigent session"
     for source in ("Jira", "Slack", "GitHub", "Linear", "PagerDuty")
 )
-# A trigger form can save its state as the prompt's first line, before the opening sentence.
+# The trigger form saves its state as the prompt's first line; the model never sees it.
+# Keep in sync with TRIGGER_HEADER_PATTERN in web/src/components/scheduled/triggerTemplates.ts.
 _TRIGGER_HEADER = re.compile(r"<!-- omnigent-trigger v\d+ [^\n]* -->\n")
+
+
+def strip_trigger_header(prompt: str) -> str:
+    """Return ``prompt`` without the trigger form's header line, if it has one."""
+    match = _TRIGGER_HEADER.match(prompt)
+    return prompt[match.end() :] if match else prompt
 
 
 def is_trigger_automation(task: ScheduledTask) -> bool:
     """Whether a task was set up from a trigger template and polls for new items."""
     if task.session_mode != "continue":
         return False
-    header = _TRIGGER_HEADER.match(task.prompt)
-    body = task.prompt[header.end() :] if header else task.prompt
-    return body.startswith(_TRIGGER_PROMPT_OPENINGS)
+    return strip_trigger_header(task.prompt).startswith(_TRIGGER_PROMPT_OPENINGS)

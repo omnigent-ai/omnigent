@@ -11,6 +11,7 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast
 
@@ -110,6 +111,7 @@ _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
 _COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
 _DELIVERY_RPC_TIMEOUT_SECONDS = 30.0
 _DELIVERY_RECEIPT_TIMEOUT_SECONDS = 2.0
+_MAX_CODEX_TEXT_INPUT_CHARS = 1 << 20
 _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
     message="Codex is still compacting, so this message was not delivered.",
     code="codex_compacting",
@@ -137,6 +139,13 @@ _CODEX_DELIVERY_UNCONFIRMED_FAILURE = CodexStartupFailure(
     code="codex_delivery_unconfirmed",
     title="Codex delivery is unconfirmed",
     remediation="Check the native terminal for the message before sending it again.",
+)
+_CODEX_SETTINGS_UPDATE_FAILED = CodexStartupFailure(
+    message="Codex did not confirm the model settings, so this message was not delivered.",
+    code="codex_settings_update_failed",
+    title="Codex model settings unconfirmed",
+    remediation="Check the model settings in the native terminal, then retry this message. "
+    "The settings may already have changed.",
 )
 _CODEX_SHELL_AUTHORIZATION_REQUIRED = CodexStartupFailure(
     message="This shell command was not delivered because the server did not authorize "
@@ -170,6 +179,14 @@ class _CodexNativeInputUndelivered(RuntimeError):
         self.failure = failure
         self.preserve_session = preserve_session
         super().__init__(failure.message)
+
+
+class _CodexNativeSettingsUpdateFailed(RuntimeError):
+    """A settings request failed before any native input was submitted."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        super().__init__(str(error))
 
 
 async def _wait_for_bridge_state(
@@ -570,13 +587,17 @@ async def _start_codex_turn(
         )
     if settings_overrides:
         _require_codex_binding(bridge_dir, state)
-        await client.request(
-            "thread/settings/update",
-            {
-                "threadId": state.thread_id,
-                **settings_overrides,
-            },
-        )
+        try:
+            async with asyncio.timeout(_DELIVERY_RPC_TIMEOUT_SECONDS):
+                await client.request(
+                    "thread/settings/update",
+                    {
+                        "threadId": state.thread_id,
+                        **settings_overrides,
+                    },
+                )
+        except (CodexAppServerResponseError, OSError, WebSocketException) as exc:
+            raise _CodexNativeSettingsUpdateFailed(exc) from exc
         _require_codex_binding(bridge_dir, state)
         # The forwarder and a fresh forwarder state (thread resume / reconnect)
         # re-read config.toml, so mirror what applied; without it they would
@@ -1301,6 +1322,17 @@ class CodexNativeExecutor(Executor):
                                 settings_overrides=settings_overrides,
                             )
                     except Exception as exc:
+                        settings_update_failed = isinstance(exc, _CodexNativeSettingsUpdateFailed)
+                        if isinstance(exc, _CodexNativeSettingsUpdateFailed):
+                            exc = exc.error
+                            startup_failure = _CODEX_SETTINGS_UPDATE_FAILED
+                            if isinstance(exc, CodexAppServerResponseError) and exc.message:
+                                startup_failure = replace(
+                                    startup_failure,
+                                    message=f"{startup_failure.message}\n\n{exc.message}",
+                                )
+                            undelivered = True
+                            preserve_session = True
                         if isinstance(exc, InjectionDeliveryAmbiguous):
                             startup_failure = _CODEX_DELIVERY_UNCONFIRMED_FAILURE
                             delivery_unconfirmed = True
@@ -1350,7 +1382,9 @@ class CodexNativeExecutor(Executor):
                                         if isinstance(exc, CodexAppServerResponseError)
                                         else None
                                     ),
-                                    stage="native_rpc",
+                                    stage="settings_update"
+                                    if settings_update_failed
+                                    else "native_rpc",
                                     outcome="undelivered" if undelivered else "error",
                                 )
                             ),
@@ -1496,7 +1530,8 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     URI inline as text would blow past the app-server's 1 MiB input
     limit. Files inline their decoded text when they are textual;
     binary files are materialized and referenced by path in a text
-    item so the model can open them with its tools.
+    item so the model can open them with its tools. Text files also use
+    that path when their combined text and the prompt exceed the input limit.
 
     :param content: Message content, e.g. a string or a list of content
         blocks like ``{"type": "input_text", "text": "..."}`` and
@@ -1508,6 +1543,7 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
         return [{"type": "text", "text": content}] if content else []
     if isinstance(content, list):
         items: list[dict[str, object]] = []
+        file_blocks: list[tuple[int, dict[str, object]]] = []
         for raw_block in content:
             block = _json_object(raw_block)
             if block is None:
@@ -1539,7 +1575,17 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
             elif block_type == "input_file":
                 file_item = _file_block_to_input_item(block, bridge_dir)
                 if file_item is not None:
+                    file_data = block.get("file_data")
+                    if isinstance(file_data, str) and file_data.startswith("data:text/"):
+                        file_blocks.append((len(items), block))
                     items.append(file_item)
+        if sum(len(text) for item in items if isinstance(text := item.get("text"), str)) > (
+            _MAX_CODEX_TEXT_INPUT_CHARS
+        ):
+            for index, block in file_blocks:
+                file_item = _file_block_to_input_item(block, bridge_dir, inline_text=False)
+                if file_item is not None:
+                    items[index] = file_item
         return items
     if content is None:
         return []
@@ -1567,6 +1613,8 @@ def _apply_resize_notice_to_latest_image(
 def _file_block_to_input_item(
     block: Mapping[str, object],
     bridge_dir: Path,
+    *,
+    inline_text: bool = True,
 ) -> dict[str, object] | None:
     """
     Convert an ``input_file`` block into a Codex input item.
@@ -1581,12 +1629,13 @@ def _file_block_to_input_item(
         ``file_data`` data URI, e.g.
         ``"data:text/plain;base64,aGVsbG8="``.
     :param bridge_dir: Session bridge path identifying the attachment cache.
-    :returns: A Codex ``text`` input item; a visible could-not-load
-        marker item when the file failed to materialize; or ``None``
-        for an empty text file.
+    :param inline_text: Whether text files fit in the turn's text budget.
+    :returns: A Codex ``text`` input item; a visible could-not-load marker
+        when normal delivery fails; or ``None`` for empty text or a failed
+        optional spill, letting the caller retain its original inline item.
     """
     file_data = block.get("file_data")
-    if isinstance(file_data, str) and file_data.startswith("data:"):
+    if inline_text and isinstance(file_data, str) and file_data.startswith("data:"):
         try:
             parsed = parse_data_uri(file_data)
             if parsed.mime_type.startswith("text/"):
@@ -1601,6 +1650,8 @@ def _file_block_to_input_item(
         # matching _ATTACHMENT_MARKER_RE in
         # omnigent/entities/conversation.py. Keep in sync.
         return {"type": "text", "text": f"[Attached file: {path}]"}
+    if not inline_text:
+        return None
     return {"type": "text", "text": unresolved_attachment_marker(block)}
 
 

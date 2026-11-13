@@ -270,6 +270,9 @@ describe("browser permission popover", () => {
       });
       await hideThenReturn(() => h.parent.emit("hide"));
       await hideThenReturn(() => h.parent.emit("minimize"));
+      await hideThenReturn(() =>
+        h.parent.webContents.emit("did-start-navigation", {}, "https://app.example", false, true),
+      );
       h.windows.at(-1).emit("blur");
       await wait();
       assert.equal(h.windows.at(-1).destroyed, false, "focus leaving keeps the notice");
@@ -277,7 +280,7 @@ describe("browser permission popover", () => {
       await wait();
       await wait();
       assert.equal(h.windows.at(-1).destroyed, true);
-      assert.equal(h.windows.length, 4);
+      assert.equal(h.windows.length, 5);
     } finally {
       mock.timers.reset();
     }

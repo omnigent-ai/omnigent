@@ -443,6 +443,9 @@ def main(argv: list[str] | None = None) -> None:
         the live process arguments. Tests pass an explicit list.
     """
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+    from omnigent.telemetry.request_headers import set_client_component
+
+    set_client_component("harness", args.harness)
 
     # Attach a log handler before anything harness-specific runs. Without this
     # the child has no handler at all, so logging falls back to lastResort:
