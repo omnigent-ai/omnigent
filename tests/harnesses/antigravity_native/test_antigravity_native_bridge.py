@@ -1030,10 +1030,12 @@ def test_inject_user_message_via_tui_raises_when_paste_never_renders(
     assert not enters
 
 
+@pytest.mark.parametrize("wrapped_tail", [False, True])
 def test_inject_user_message_via_tui_raises_when_turn_never_starts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _fast_tmux_timeouts: None,
+    wrapped_tail: bool,
 ) -> None:
     """
     If no turn ever starts after the submit attempts, the delivery raises.
@@ -1044,7 +1046,21 @@ def test_inject_user_message_via_tui_raises_when_turn_never_starts(
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
-    tui = {"pane": "> \n? for shortcuts"}
+    sep = "─" * 60
+    footer = (
+        f"\n{sep}\n  ● pytest running\n{sep}\n? for shortcuts"
+        if wrapped_tail
+        else "\n? for shortcuts"
+    )
+    content = (
+        "Inspect these observations "
+        + "compare temperature and humidity " * 12
+        + "then summarize the final observations."
+        if wrapped_tail
+        else "draft message"
+    )
+    tui = {"pane": f"{sep}\n> {footer}"}
+    enters: list[str] = []
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """Pane never leaves idle — the submit never starts a turn."""
@@ -1052,12 +1068,20 @@ def test_inject_user_message_via_tui_raises_when_turn_never_starts(
         if "capture-pane" in cmd:
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
-            tui["pane"] = "> draft message\n? for shortcuts"
+            draft = (
+                "> then summarize the final\n  observations."
+                if wrapped_tail
+                else "> draft message"
+            )
+            tui["pane"] = f"{sep}\n{draft}{footer}"
+        if cmd[-1] == "Enter":
+            enters.append("Enter")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(RuntimeError, match="draft is still visible"):
-        inject_user_message_via_tui(bridge_dir, content="draft message", timeout_s=0.5)
+        inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+    assert enters
 
 
 def test_inject_user_message_via_tui_rejects_empty_content(tmp_path: Path) -> None:
@@ -2944,8 +2968,11 @@ def test_draft_detected_when_single_long_paragraph_scrolled_with_more_lines() ->
     pane = (
         f"{sep}\n"
         f"> ↑ 2 more lines\n"
-        f"  multiple chunks can be sampled across the entire prompt body.\n"
+        f"  multiple chunks can be sampled\n"
         f"{sep}\n"
         f"Gemini 3.8 Flash · high"
     )
+    region = _mod._agy_input_region(pane)
+    assert all(needle not in region for needle in needles)
     assert _mod._draft_in_input_region(pane, needles[0], baseline, tuple(needles[1:]))
+    assert not _mod._draft_in_input_region(pane, needles[0], region, tuple(needles[1:]))
