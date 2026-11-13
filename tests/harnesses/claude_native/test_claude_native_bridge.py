@@ -5035,7 +5035,7 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
             {
                 "env": {"SEAT_KEY": "seat-1", "FIRST_ONLY": "kept"},
                 "hooks": {"UserPromptSubmit": [caller_hook]},
-                "statusLine": {"type": "command", "command": "cat"},
+                "statusLine": {"type": "command", "command": "printf first", "padding": 3},
                 "enabledPlugins": {"extra@market": False},
                 "skillOverrides": {"custom-skill": "off", "auto-mode-setup": "on"},
                 "permissions": {"allow": ["Read(first.txt)"], "deny": ["Bash(blocked)"]},
@@ -5052,6 +5052,7 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
     later_hook = {"hooks": [{"type": "command", "command": "echo later"}]}
     later = {
         "env": {"SEAT_KEY": "seat-2", "B": "2"},
+        "statusLine": {"type": "command", "command": "cat"},
         "hooks": {"UserPromptSubmit": [later_hook]},
         "permissions": {"allow": ["Read(first.txt)", "Read(second.txt)"]},
         "deniedMcpServers": [{"serverName": "later-denial"}],
@@ -5090,6 +5091,7 @@ def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_pat
     assert settings["statusLine"]["command"] == claude_native_bridge._status_line_command(
         bridge_dir, "cat"
     )
+    assert settings["statusLine"]["padding"] == 3
     for event, entries in baseline["hooks"].items():
         assert all(entry in settings["hooks"][event] for entry in entries)
 

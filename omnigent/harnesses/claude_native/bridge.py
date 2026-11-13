@@ -3442,6 +3442,7 @@ def _merge_caller_settings(
     hook controls, including environment modes and plugin-only customization,
     are passed through; this validation is not exhaustive.
     Caller MCP-denial lists use the last caller value; saved denials append later.
+    Other maps merge direct members only; a later nested map replaces the earlier one.
 
     :param settings: Omnigent's invocation settings.
     :param callers: Parsed caller settings, in flag order.
@@ -3449,11 +3450,11 @@ def _merge_caller_settings(
     :returns: The merged settings.
     :raises ValueError: Either validated hook-disabling setting is true.
     """
-    caller_status = next(
-        (caller["statusLine"] for caller in reversed(callers) if "statusLine" in caller), None
-    )
+    caller_status: object = None
     merged: dict[str, Any] = {}
-    for source in [*callers, settings]:
+    for index, source in enumerate([*callers, settings]):
+        if index == len(callers):
+            caller_status = merged.get("statusLine")
         for key, value in source.items():
             previous = merged.get(key)
             if key == "hooks" and isinstance(value, dict):
