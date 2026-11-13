@@ -5274,6 +5274,58 @@ def test_pop_caller_settings_passes_unreadable_inputs_through(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["denied", "truncated", "non-utf8", "missing", "invalid-utf8"])
+async def test_unreadable_caller_settings_warn_without_contents_or_argument_changes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.terminal import TerminalInstance
+
+    secret = "private-settings-content"
+    caller = tmp_path / "caller.json"
+    if failure == "invalid-utf8":
+        caller.write_bytes(b"\xff")
+    environment = Mock(spec=OSEnvironment, cwd=tmp_path)
+    environment.read = AsyncMock(
+        return_value={
+            "content": secret,
+            "error": secret if failure == "denied" else None,
+            "truncated": failure == "truncated",
+            "encoding": "base64" if failure == "non-utf8" else "utf-8",
+        }
+    )
+    args = augment_claude_args(
+        ("--settings", str(caller)), bridge_dir=tmp_path, defer_caller_settings=True
+    )
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "socket",
+        private_dir=tmp_path,
+        os_env=environment,
+        sandbox_policy=Mock(active=failure not in {"missing", "invalid-utf8"}),
+        args=list(args),
+    )
+    await claude_native_bridge.finalize_claude_caller_settings(
+        instance,
+        bridge_dir=tmp_path,
+        generation=claude_native_bridge.record_claude_settings_boundary(
+            tmp_path, args, claude_args_start=0
+        ),
+    )
+    assert instance.args == args
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "caller settings file was not applied" in warnings[0]
+    assert "preserving its original argument" in warnings[0]
+    assert secret not in warnings[0]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("chdir", [None, "overlay-subdir"])
 async def test_caller_settings_reuses_existing_terminal_filesystem_view(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chdir: str | None

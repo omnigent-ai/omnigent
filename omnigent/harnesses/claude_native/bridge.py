@@ -3681,6 +3681,7 @@ async def finalize_claude_caller_settings(
         return
     contents: dict[Path, str] = {}
     for path in paths:
+        unavailable_reason: str | None = None
         try:
             if instance.sandbox_policy is None or not instance.sandbox_policy.active:
                 contents[path] = await asyncio.to_thread(_read_caller_settings, path)
@@ -3696,8 +3697,21 @@ async def finalize_claude_caller_settings(
                     and isinstance(content, str)
                 ):
                     contents[path] = content
-        except (OSError, ValueError):
-            pass
+                elif result.get("error"):
+                    unavailable_reason = "terminal_read_error"
+                elif result.get("truncated"):
+                    unavailable_reason = "truncated"
+                else:
+                    unavailable_reason = "unsupported_content"
+        except (OSError, ValueError) as exc:
+            unavailable_reason = type(exc).__name__
+        if unavailable_reason is not None:
+            # Settings operands and read errors can contain credential-bearing text.
+            _logger.warning(
+                "Claude caller settings file was not applied: reason=%s; "
+                "preserving its original argument, which Claude may ignore",
+                unavailable_reason,
+            )
 
     def read_file(path: Path) -> str:
         if path == settings_path or path not in contents:
