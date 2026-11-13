@@ -6606,12 +6606,14 @@ def create_runner_app(
                         "detail": SESSION_AGENT_MISSING_MESSAGE,
                     },
                 )
-            except ValueError as exc:
+            except (ValueError, OmnigentError) as exc:
                 return JSONResponse(
-                    status_code=400,
+                    status_code=exc.http_status if isinstance(exc, OmnigentError) else 400,
                     content={
                         "error": {
-                            "code": "invalid_input",
+                            "code": exc.code
+                            if isinstance(exc, OmnigentError)
+                            else "invalid_input",
                             "message": _client_safe_error_detail(exc, context="harness config"),
                         }
                     },

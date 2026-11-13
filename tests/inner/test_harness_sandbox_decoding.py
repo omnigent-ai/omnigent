@@ -194,6 +194,7 @@ def test_harness_rejects_invalid_nested_credential_policy(
         '{"cwd": []}',
         '{"fork": "false"}',
         '{"start_in_scratch": "false"}',
+        '{"sandbx": {"type": "linux_bwrap"}}',
         '{"sandbox": {"allow_network": "false"}}',
         '{"sandbox": {"cwd_hidden_scan_overflow": "erorr"}}',
         '{"sandbox": {"cwd_hidden_scan_max_entries": 0}}',

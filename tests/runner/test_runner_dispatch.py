@@ -1515,12 +1515,14 @@ def test_spec_resolve_error_detail_names_structured_cause(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "failure", ["outage", "unsupported-policy", "invalid-spec", "private-policy-detail"]
+    "failure",
+    ["outage", "unsupported-policy", "codex-policy", "invalid-spec", "private-policy-detail"],
 )
 async def test_runner_post_releases_turn_when_spec_resolution_fails(
     caplog: pytest.LogCaptureFixture,
     pinned_runner_log: Path,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     failure: str,
 ) -> None:
     """Resolver outages and policy rejection must release the turn before retry."""
@@ -1530,10 +1532,22 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.sandbox import UnsupportedHarnessSandboxError
 
+    session_id = f"conv_spec_resolver_failed_{failure}"
+    corrected = False
+    if failure == "codex-policy":
+        isolate_provider_resolution(monkeypatch, tmp_path / "config")
+
     async def _failing_spec_resolver(
         agent_id: str, session_id: str | None = None
     ) -> AgentSpec | None:
         """Return an unsupported policy or raise a resolver outage."""
+        if failure == "codex-policy":
+            return AgentSpec(
+                spec_version=1,
+                name="restricted-agent",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+                os_env=OSEnvSpec(fork=not corrected, sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+            )
         if failure == "unsupported-policy":
             return AgentSpec(
                 spec_version=1,
@@ -1559,7 +1573,7 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
         with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
             for _ in range(2):
                 response = await http.post(
-                    "/v1/sessions/conv_spec_resolver_failed/events?stream=true",
+                    f"/v1/sessions/{session_id}/events?stream=true",
                     json={
                         "type": "message",
                         "role": "user",
@@ -1569,11 +1583,11 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
                     },
                 )
                 assert response.status_code == (503 if failure == "outage" else 400)
-                assert "conv_spec_resolver_failed" not in app.state.active_turns
-                assert not app.state.session_message_buffers.get("conv_spec_resolver_failed")
+                assert session_id not in app.state.active_turns
+                assert not app.state.session_message_buffers.get(session_id)
                 events = await _drain_turn_events(
                     app.state.session_event_queues,
-                    "conv_spec_resolver_failed",
+                    session_id,
                     until_status="failed",
                     timeout=2.0,
                 )
@@ -1585,7 +1599,30 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
                     failed = next(event for event in events if event.get("status") == "failed")
                     assert failed["error"] == response.json()["error"]
 
-    get_client.assert_not_called()
+            get_client.assert_not_called()
+            if failure == "codex-policy":
+                corrected = True
+                get_client.side_effect = None
+                get_client.return_value = _FakeHarnessClient(
+                    [_SSE_RESPONSE_CREATED, _SSE_RESPONSE_COMPLETED]
+                )
+                retry = await http.post(
+                    f"/v1/sessions/{session_id}/events?stream=true",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "ag_missing",
+                        "agent_revision": "corrected",
+                        "model": "x",
+                        "content": [],
+                    },
+                )
+                assert retry.status_code == 200, retry.text
+                assert "response.completed" in retry.text
+                get_client.assert_awaited_once()
+                assert session_id not in app.state.active_turns
+                assert not app.state.session_message_buffers.get(session_id)
+
     body = response.json()
     if failure != "outage":
         assert body["error"]["code"] == "invalid_input"
@@ -1600,6 +1637,7 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
         assert body["error"]["message"] == detail
         cause = {
             "unsupported-policy": "Antigravity cannot enforce",
+            "codex-policy": "Codex does not support os_env.fork",
             "invalid-spec": "invalid spec from internal-host:6767/private/agent.yaml",
             "private-policy-detail": "private-policy-token at internal-host:6767",
         }[failure]

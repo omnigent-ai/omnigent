@@ -702,8 +702,8 @@ def test_run_launcher_rejects_noop_spawn_wrap(
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     monkeypatch.setattr(sandbox, "create_private_tmpdir", lambda: scratch)
+    monkeypatch.setattr(os, "environ", {"PATH": os.defpath})
     with (
-        mock.patch.dict(os.environ),
         mock.patch.object(os, "execvp") as execute,
         mock.patch.object(sandbox, "activate_sandbox") as activate,
         pytest.raises(OSError, match="did not wrap"),

@@ -113,6 +113,17 @@ def test_executor_factory_defaults_when_unset(
     assert captured["location"] is None
 
 
+def test_executor_factory_rejects_requested_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import Mock
+
+    constructor = Mock()
+    monkeypatch.setattr(antigravity_harness, "AntigravityExecutor", constructor)
+    monkeypatch.setenv("HARNESS_ANTIGRAVITY_OS_ENV", '{"sandbox": {"type": "linux_bwrap"}}')
+    with pytest.raises(ValueError, match="Antigravity cannot enforce"):
+        antigravity_harness._build_antigravity_executor()
+    constructor.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "value,expected",
     [

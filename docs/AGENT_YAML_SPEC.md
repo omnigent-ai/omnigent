@@ -659,6 +659,12 @@ the spawn environment, including after an agent revision changes.
 Whole-process `allow_network: false` also blocks network-based model-provider
 access, so those providers cannot run under that policy.
 
+Relative `os_env.cwd` does not override a workspace selected by the runner.
+Claude SDK additionally resolves a named relative directory such as `./project`
+against the runner base when that base is still the selected workspace; `.`
+continues to use the selected workspace. Other adapters retain the selected
+workspace rather than applying that Claude-specific directory selection.
+
 Sandbox launchers also grant read access to the installed `omnigent` Python
 package. With an editable installation, this includes that package's source
 directory even when it is outside the executable's installation roots. Existing
