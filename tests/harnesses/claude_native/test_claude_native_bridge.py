@@ -5019,13 +5019,17 @@ def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("relative_path", [False, True], ids=["absolute", "workspace-relative"])
-def test_augment_claude_args_merges_caller_settings(tmp_path: Path, relative_path: bool) -> None:
+def test_augment_claude_args_merges_caller_settings(
+    tmp_path: Path, relative_path: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     A caller ``--settings`` is merged into the invocation settings, not dropped.
 
     Caller settings must be merged into the bridge settings because Claude Code
     honours only the last settings flag.
     """
+    original_read = os.read
+    monkeypatch.setattr(os, "read", lambda fd, count: original_read(fd, min(count, 7)))
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     caller_hook = {"hooks": [{"type": "command", "command": "echo caller"}]}

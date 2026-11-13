@@ -3433,7 +3433,12 @@ def _read_caller_settings(path: Path) -> str:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > _CALLER_SETTINGS_MAX_BYTES:
             raise ValueError("caller settings require a regular file of at most 1 MiB")
-        data = os.read(fd, _CALLER_SETTINGS_MAX_BYTES + 1)
+        data = bytearray()
+        while len(data) <= _CALLER_SETTINGS_MAX_BYTES:
+            chunk = os.read(fd, _CALLER_SETTINGS_MAX_BYTES + 1 - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
         if len(data) > _CALLER_SETTINGS_MAX_BYTES:
             raise ValueError("caller settings exceed 1 MiB")
         return data.decode("utf-8")
