@@ -2449,12 +2449,12 @@ def _codex_items_with_outputs_after_their_calls(
 
     def close_exchange(position: int) -> None:
         nonlocal exchange_has_output
-        for waiting_call_id in waiting_call_ids:
+        for waiting_call_id in list(waiting_call_ids):
             output_position = first_output_positions.get((segments[position], waiting_call_id))
             if output_position is not None and output_position > position:
                 ordered.append(items[output_position])
                 moved_positions.add(output_position)
-        waiting_call_ids.clear()
+                waiting_call_ids.remove(waiting_call_id)
         exchange_has_output = False
 
     for position, item in enumerate(items):
@@ -2472,7 +2472,7 @@ def _codex_items_with_outputs_after_their_calls(
             if isinstance(call_id, str):
                 waiting_call_ids.append(call_id)
         elif item_type == "compaction":
-            waiting_call_ids.clear()
+            # Replay carries unfinished calls into the snapshot until their outputs arrive.
             exchange_has_output = False
         elif item_type not in NON_CONTENT_ITEM_TYPES:
             close_exchange(position)

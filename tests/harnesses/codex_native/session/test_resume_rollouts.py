@@ -1510,3 +1510,48 @@ def test_rollout_records_replay_displaced_tool_output_next_to_its_call(
         if record["type"] == "response_item"
     ]
     assert replayed == expected
+
+
+@pytest.mark.parametrize("compactions", [1, 2])
+def test_rollout_records_replay_open_call_output_before_post_compaction_messages(
+    compactions: int,
+) -> None:
+    """A call carried into a snapshot keeps its late output ahead of later messages."""
+    history: list[dict[str, Any]] = [
+        _tool_call("call_long"),
+        _assistant_message("still running"),
+    ]
+    for turn in range(2, compactions + 2):
+        response_id = f"codex_turn_{turn}"
+        history.extend(
+            [
+                {
+                    "type": "compaction",
+                    "summary": "compacted",
+                    "compacted_messages": [_user_message("summary", response_id)],
+                    "response_id": response_id,
+                },
+                _user_message("update?", response_id),
+            ]
+        )
+    history.append(_tool_output("call_long", f"codex_turn_{compactions + 1}"))
+    records = codex_native._codex_rollout_records_from_session_items(
+        history,
+        session_id="conv_codex",
+        external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        cwd=Path("/workspace"),
+        model_provider="test_provider",
+        cli_version="0.158.0",
+    )
+
+    compacted = next(record for record in records if record["type"] == "compacted")
+    replayed = [
+        *compacted["payload"]["replacement_history"],
+        *(record["payload"] for record in records if record["type"] == "response_item"),
+    ]
+    assert [(payload["type"], payload.get("call_id")) for payload in replayed] == [
+        ("message", None),
+        ("function_call", "call_long"),
+        ("function_call_output", "call_long"),
+        ("message", None),
+    ]
