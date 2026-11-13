@@ -462,7 +462,12 @@ _SCHEDULED_TASK_TOOLS = frozenset(
     }
 )
 
-_ACCOUNT_WIDE_TOOLS = _SCHEDULED_TASK_TOOLS | {"sys_agent_list", "sys_session_share"}
+_ACCOUNT_WIDE_TOOLS = _SCHEDULED_TASK_TOOLS | {
+    "sys_agent_list",
+    "sys_session_share",
+    "sys_project_list",
+    "sys_project_update",
+}
 
 
 def runner_uses_confined_bearer(server_client: httpx.AsyncClient | None) -> bool:

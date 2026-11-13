@@ -1130,6 +1130,83 @@ def _runner_for_session(owner_client, stores, owner, *, legacy=False):
     return runner, bound, runner_id
 
 
+async def test_runner_session_tools_keep_capability_discovery(setup_app, monkeypatch):
+    import httpx
+
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
+    from omnigent.runtime import session_stream
+    from omnigent.server.feature_flags import resolve_feature_flags
+    from omnigent.server.routes.sessions import routes_resources
+    from omnigent.spec.types import AgentSpec
+
+    _, alice, stores, _ = setup_app
+    runner, bound, _ = _runner_for_session(alice, stores, "alice")
+    alice.app.state.feature_flags = resolve_feature_flags(
+        {"OMNIGENT_FEATURES": "scripted_sessions"}
+    )
+    published = []
+
+    def publish(session_id, event):
+        published.append((session_id, event))
+        return 1
+
+    monkeypatch.setattr(session_stream, "publish", publish)
+    forwarded = []
+
+    def forward(request):
+        forwarded.append(request)
+        return httpx.Response(200, json={"object": "session.github.info", "prs": []})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(forward), base_url="http://runner"
+    ) as downstream:
+
+        async def resource_client(*args, **kwargs):
+            return downstream
+
+        monkeypatch.setattr(
+            routes_resources, "_get_runner_client_for_resource_access", resource_client
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=alice.app),
+            base_url="http://testserver",
+            headers={"Authorization": runner.headers["Authorization"]},
+        ) as client:
+            info = await client.get("/v1/info")
+            assert info.status_code == 200, info.text
+            result = await tool_dispatch.execute_tool(
+                tool_name="ui_open_file",
+                arguments=json.dumps({"path": "README.md"}),
+                agent_spec=AgentSpec(spec_version=1),
+                conversation_id=bound,
+                server_client=client,
+            )
+            assert json.loads(result) == {"subscribers": 1}
+            assert any(
+                sid == bound and event["type"] == "ui.open_file" and event["path"] == "README.md"
+                for sid, event in published
+            )
+
+            path = f"/v1/sessions/{bound}/resources/github/prs/orchestrated"
+            body = {"url": "https://github.com/example/repo/pull/1", "action": "attach"}
+            missing_source = await client.post(path, json=body)
+            assert missing_source.status_code == 403, missing_source.text
+            assert not forwarded
+            linked = await client.post(
+                path,
+                json=body,
+                headers={
+                    ORCHESTRATION_SOURCE_HEADER: bound,
+                    RUNNER_TUNNEL_TOKEN_HEADER: "confined-runner-binding",
+                },
+            )
+            assert linked.status_code == 200, linked.text
+    assert len(forwarded) == 1
+    assert forwarded[0].url.path == f"/v1/sessions/{bound}/resources/github/prs"
+    assert json.loads(forwarded[0].content)["session_id"] == bound
+
+
 @pytest.mark.parametrize("owner", ["alice", "admin"])
 def test_runner_token_is_confined_to_its_runner_sessions(setup_app, monkeypatch, owner):
     from concurrent.futures import Future

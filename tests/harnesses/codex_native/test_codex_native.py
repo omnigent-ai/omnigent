@@ -3329,6 +3329,7 @@ def test_forwarder_rotation_redirects_viewers_of_the_cleared_session(
         ),
     )
     old_session_events: list[dict[str, Any]] = []
+    old_session_writes: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
@@ -3338,6 +3339,10 @@ def test_forwarder_rotation_redirects_viewers_of_the_cleared_session(
         :returns: Fake Omnigent response.
         """
         path = request.url.path
+        if request.method == "PATCH" and path == "/v1/sessions/conv_old":
+            assert json.loads(request.content) == {"runner_id": ""}
+            old_session_writes.append("detach")
+            return httpx.Response(200, json={"id": "conv_old", "runner_id": ""})
         if request.method == "GET" and path == "/v1/sessions/conv_old":
             return httpx.Response(
                 200,
@@ -3359,6 +3364,7 @@ def test_forwarder_rotation_redirects_viewers_of_the_cleared_session(
             return httpx.Response(200, json={"id": "terminal_codex_main"})
         if request.method == "POST" and path == "/v1/sessions/conv_old/events":
             old_session_events.append(json.loads(request.content))
+            old_session_writes.append(old_session_events[-1]["type"])
             return httpx.Response(202, json={"queued": False})
         return httpx.Response(500, json={"error": f"unexpected {request.method} {path}"})
 
@@ -3402,6 +3408,12 @@ def test_forwarder_rotation_redirects_viewers_of_the_cleared_session(
     assert notice["agent"] == "codex-native-ui"
     assert "(/c/conv_new)" in notice["content"][0]["text"]
     assert old_session_events[2]["data"] == {"target_conversation_id": "conv_new"}
+    assert old_session_writes == [
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+        "detach",
+    ]
 
 
 def test_forwarder_rotation_failure_preserves_old_target(

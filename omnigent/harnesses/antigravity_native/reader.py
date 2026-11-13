@@ -3097,10 +3097,10 @@ async def _rotate_session_for_cascade(
        set-once-immutable field and looped the rotation — see the module header.)
     5. Rewrite agy bridge state in ``bridge_dir`` with the new session id + new
        conversation id (the reader re-reads this on rebind to bind the new cascade).
-    6. PATCH the old session's ``runner_id`` to ``""`` to release it (best-effort;
-       a failure is logged, not raised — the new session is already live).
-    7. POST the shared ``/clear`` supersession notice to the OLD conversation
+    6. POST the shared ``/clear`` supersession notice to the OLD conversation
        (best-effort), so its web view stops spinning and follows the new chat.
+    7. PATCH the old session's ``runner_id`` to ``""`` to release it (best-effort;
+       a failure is logged, not raised — the new session is already live).
 
     Best-effort: ANY failure (snapshot, create, bind, transfer, state write) is
     logged at WARNING and yields ``None``, and the caller keeps serving the OLD
@@ -3183,36 +3183,12 @@ async def _rotate_session_for_cascade(
         ),
     )
 
-    # Release the old session's runner binding (best-effort): the new session is
-    # already serving, so a failure here is logged, not raised.
-    try:
-        clear_resp = await client.patch(
-            f"/v1/sessions/{url_component(old_session_id)}",
-            json={"runner_id": ""},
-        )
-        if clear_resp.status_code >= 400:
-            _logger.warning(
-                "agy /clear rotation: failed to release old runner binding; "
-                "old_session=%s new_session=%s status=%s body=%s",
-                old_session_id,
-                new_session_id,
-                clear_resp.status_code,
-                clear_resp.text,
-            )
-    except httpx.HTTPError:
-        _logger.warning(
-            "agy /clear rotation: error releasing old runner binding; "
-            "old_session=%s new_session=%s",
-            old_session_id,
-            new_session_id,
-            exc_info=True,
-        )
-
     await post_clear_supersession(
         client,
         old_session_id=old_session_id,
         new_session_id=new_session_id,
         agent_name=_AGENT_NAME,
+        detach_runner=True,
     )
 
     _logger.info(

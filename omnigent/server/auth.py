@@ -136,7 +136,7 @@ def delegated_path_allowed(path: str) -> bool:
 LEGACY_RUNNER_TOKENS_ENV = "OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS"
 
 _RUNNER_CONFINEMENT_KEY = "omnigent.runner_confinement"
-_RUNNER_OPEN_PATHS = frozenset({"/health", "/api/version"})
+_RUNNER_OPEN_PATHS = frozenset({"/health", "/api/version", "/v1/info"})
 _RUNNER_SESSION_CAPABILITIES = tuple(
     (frozenset(methods.split()), compile_path("/v1/sessions/{session_id}" + suffix)[0])
     for methods, suffix in (
@@ -148,6 +148,7 @@ _RUNNER_SESSION_CAPABILITIES = tuple(
         ("GET", "/agent/mcp-servers"),
         ("POST", "/mcp"),
         ("POST", "/events"),
+        ("POST", "/ui/open-file"),
         ("GET", "/labels"),
         ("GET", "/owner"),
         ("POST", "/agent-title"),
@@ -201,6 +202,7 @@ _RUNNER_SESSION_CAPABILITIES = tuple(
         ("GET", "/resources/github/diff"),
         ("GET", "/resources/github/diff/{path:path}"),
         ("POST", "/resources/github/prs"),
+        ("POST", "/resources/github/prs/orchestrated"),
         ("POST", "/resources/github/preferences"),
         ("GET POST", "/resources/github/labels"),
         ("GET", "/resources/{resource_id}"),

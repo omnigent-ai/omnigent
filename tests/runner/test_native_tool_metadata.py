@@ -29,6 +29,8 @@ _ACCOUNT_TOOLS = {
     "sys_scheduled_task_delete",
     "sys_agent_list",
     "sys_session_share",
+    "sys_project_list",
+    "sys_project_update",
 }
 
 

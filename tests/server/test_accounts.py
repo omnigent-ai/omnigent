@@ -469,8 +469,8 @@ def test_strict_runner_issuance_disables_only_legacy_tokens(source, monkeypatch)
 
 def test_mint_runner_token_rejects_empty_and_reserved_owner() -> None:
     """No token for an empty/reserved owner or without a runner to confine it to."""
-    cfg = _make_accounts_config()
-    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+    provider = _runner_provider()
+    assert provider.mint_runner_token("alice@example.com", 1800, runner_id=_RUNNER) is not None
     assert provider.mint_runner_token("", 1800, runner_id=_RUNNER) is None
     assert provider.mint_runner_token("local", 1800, runner_id=_RUNNER) is None
     assert provider.mint_runner_token("alice@example.com", 1800, runner_id="") is None
@@ -517,6 +517,8 @@ _SESSION_HEADER = {"X-Omnigent-Session-Id": "conv_bound"}
     [
         ("GET", "/v1/sessions/conv_bound", None),
         ("POST", "/v1/sessions/conv_bound/events", None),
+        ("POST", "/v1/sessions/conv_bound/ui/open-file", None),
+        ("POST", "/v1/sessions/conv_bound/resources/github/prs/orchestrated", None),
         ("GET", "/v1/sessions/conv_bound/agent/contents", None),
         ("GET", "/v1/sessions/conv_bound/agent/mcp-servers", None),
         ("GET", "/v1/sessions/conv_bound/child_sessions", None),
@@ -536,6 +538,7 @@ _SESSION_HEADER = {"X-Omnigent-Session-Id": "conv_bound"}
         ("GET", "/v1/sessions/conv_bound/owner", None),
         ("GET", "/v1/policy-registry", None),
         ("GET", "/api/version", None),
+        ("GET", "/v1/info", None),
         ("POST", "/v1/mcp/tracker", _SESSION_HEADER),
     ],
 )
@@ -556,6 +559,9 @@ def test_runner_token_accepted_on_runner_routes(
     ("method", "path", "headers"),
     [
         ("GET", "/v1/me", None),
+        ("POST", "/v1/info", None),
+        ("POST", "/v1/sessions/conv_other/ui/open-file", None),
+        ("POST", "/v1/sessions/conv_other/resources/github/prs/orchestrated", None),
         ("GET", "/auth/users", None),
         ("POST", "/auth/invite", None),
         ("GET", "/v1/sessions", None),
