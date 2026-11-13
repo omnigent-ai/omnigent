@@ -7297,8 +7297,11 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     if outcome == "submitted":
         claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
     else:
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError) as error:
             claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
+        if outcome == "guard unavailable" or outcome.startswith("record "):
+            assert "Check permissions, free space, and coordination records" in str(error.value)
+            assert str(state_dir) in str(error.value)
     if outcome in (
         "unconfirmed",
         "enter timed out",

@@ -132,7 +132,9 @@ def begin_model_switch(
             _save_record(record_path, record, pending)
     except (OSError, ValueError, FileLockTimeout) as exc:
         raise ModelSwitchProtectionError(
-            "Cannot record Claude's default model; the model switch was not submitted. Retry it."
+            "Cannot protect Claude's default model; the model switch was not submitted. "
+            f"Check permissions, free space, and coordination records in {state_dir} "
+            "before retrying."
         ) from exc
     if pending:
         _ensure_watcher(settings_path, state_dir)
