@@ -136,6 +136,14 @@ export class RunnerOfflineError extends Error {
   }
 }
 
+/** The session has no runner bound yet (the server's 409 conflict). */
+class RunnerNotBoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RunnerNotBoundError";
+  }
+}
+
 /**
  * The requested path lies outside everything this session can browse.
  *
@@ -1022,6 +1030,7 @@ async function fetchWorkspaceEnvironment(conversationId: string): Promise<Worksp
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
+  if (res.status === 409) throw new RunnerNotBoundError(`${res.status} ${res.statusText}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as {
     metadata?: { root?: string; home?: string; reachable?: WorkspaceReach };
@@ -1037,33 +1046,34 @@ async function fetchWorkspaceEnvironment(conversationId: string): Promise<Worksp
 }
 
 /**
- * Refetch the environment when the session snapshot reports a newly bound
- * runner. A session can be opened before its runner binds; that GET fails
- * with a 409 that is not retried, and no file event follows the bind.
+ * Refetch the environment once the session snapshot reports a runner after a
+ * GET failed because none was bound. That 409 is not retried, and no file
+ * event follows the bind.
  */
-function useRefetchEnvironmentOnRunnerBind(conversationId: string | undefined) {
+function useRefetchEnvironmentOnRunnerBind(
+  conversationId: string | undefined,
+  environment: { error: Error | null; isFetching: boolean },
+) {
   const queryClient = useQueryClient();
   const { session } = useSession(conversationId);
-  // `undefined` while the snapshot is unknown.
-  const runnerId = session ? (session.runnerId ?? null) : undefined;
-  const lastKnown = useRef<{ id: string | undefined; runnerId: string | null | undefined }>({
-    id: conversationId,
-    runnerId,
-  });
+  const runnerId = session?.runnerId ?? null;
+  // Wait for an in-flight GET to settle: it may still return a pre-bind 409.
+  const notBound = !environment.isFetching && environment.error instanceof RunnerNotBoundError;
+  const refetchedFor = useRef<{ id: string; runnerId: string } | null>(null);
   useEffect(() => {
-    const previous =
-      lastKnown.current.id === conversationId ? lastKnown.current.runnerId : undefined;
-    lastKnown.current = {
-      id: conversationId,
-      runnerId: runnerId === undefined ? previous : runnerId,
-    };
-    if (!conversationId || !runnerId || runnerId === previous) return;
-    const queryKey = ["workspace-environment", conversationId];
-    // The first loaded snapshot can report a runner that bound after the GET failed.
-    if (previous === undefined && queryClient.getQueryState(queryKey)?.status !== "error") return;
+    if (!conversationId || !runnerId) {
+      refetchedFor.current = null;
+      return;
+    }
+    const done = refetchedFor.current;
+    if (!notBound || (done?.id === conversationId && done.runnerId === runnerId)) return;
+    refetchedFor.current = { id: conversationId, runnerId };
     // Several panels share this query; let them join one refetch.
-    void queryClient.invalidateQueries({ queryKey }, { cancelRefetch: false });
-  }, [conversationId, runnerId, queryClient]);
+    void queryClient.invalidateQueries(
+      { queryKey: ["workspace-environment", conversationId] },
+      { cancelRefetch: false },
+    );
+  }, [conversationId, runnerId, notBound, queryClient]);
 }
 
 /**
@@ -1083,8 +1093,7 @@ export function useWorkspaceEnvironment(
   const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
   const serveable = useWorkspaceServeable(conversationId);
   const retry = useRunnerOfflineRetry(useRunnerRecovering(conversationId));
-  useRefetchEnvironmentOnRunnerBind(conversationId);
-  return useQuery({
+  const environment = useQuery({
     queryKey: ["workspace-environment", conversationId],
     queryFn: () => fetchWorkspaceEnvironment(conversationId!),
     enabled: (options.enabled ?? true) && !!conversationId && serveable !== false,
@@ -1092,6 +1101,8 @@ export function useWorkspaceEnvironment(
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 60_000,
   });
+  useRefetchEnvironmentOnRunnerBind(conversationId, environment);
+  return environment;
 }
 
 /**

@@ -142,5 +142,3 @@ def test_changes_tab_recovers_after_runner_binds(
     ).to_be_visible(timeout=120_000)
     expect(load_error).to_have_count(0)
     expect(no_changes).to_be_visible()
-    # Hold the outcome on screen for the recording.
-    page.wait_for_timeout(3_000)

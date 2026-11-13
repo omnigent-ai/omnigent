@@ -761,6 +761,59 @@ describe("useWorkspaceEnvironment runner bind", () => {
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([environmentUrl, environmentUrl]);
   });
 
+  it.each([
+    ["unbound", () => stubSession({ runnerId: null })],
+    ["unknown", () => sessionMock.mockReturnValue({ session: null, isLoading: true, error: null })],
+  ])(
+    "refetches a 409 that settles after a %s snapshot reports the runner",
+    async (_initial, stubInitialSession) => {
+      onlineMock.mockReturnValue(true);
+      stubInitialSession();
+      let releaseNotBound: (value: Response) => void = () => {};
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            releaseNotBound = resolve;
+          }),
+        )
+        .mockResolvedValue(environmentResponse());
+
+      const { rerender, environmentStatus } = renderShared(() => (
+        <EnvironmentProbe id="conv_new" />
+      ));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      stubSession({ runnerId: "runner_1" });
+      rerender();
+      await flushMicrotasks();
+      releaseNotBound(notBound());
+
+      await waitFor(() => expect(environmentStatus()).toBe("success"));
+      await flushMicrotasks();
+      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([environmentUrl, environmentUrl]);
+    },
+  );
+
+  it("refetches a 409 only once per bound runner", async () => {
+    onlineMock.mockReturnValue(true);
+    stubSession({ runnerId: "runner_1" });
+    // A delayed response lets each refetch render as in flight before it fails.
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          setTimeout(() => resolve(notBound()), 5);
+        }),
+    );
+
+    const { environmentStatus } = renderShared(() => <EnvironmentProbe id="conv_new" />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(environmentStatus()).toBe("error"));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("does not refetch a loaded environment when the first snapshot arrives", async () => {
     onlineMock.mockReturnValue(true);
     sessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
