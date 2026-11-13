@@ -2170,12 +2170,18 @@ function writeLandingDraft(state: LandingDraftState, draft: LandingDraft | null)
 // design, which would otherwise leak between tests).
 export function resetLandingDraft(): void {
   landingDrafts.clear();
+  submittedKeptPromptIds.clear();
 }
 
 // An embedding host can remount or reload the page right after the composer
 // strips `?prompt=`, and a remount renders before the old composer parks its
 // draft, so the consumed prompt is parked at once and kept briefly here.
 const LINKED_PROMPT_TTL_MS = 60_000;
+
+// Kept prompts whose create is in flight in this document: another composer
+// must not restore them, but a failed create hands them back (and a reload
+// starts with an empty set, so recovery still works).
+const submittedKeptPromptIds = new Set<string>();
 
 interface KeptLinkedPrompt {
   /** Identifies this consumption; `at` only drives expiry. */
@@ -2239,6 +2245,7 @@ function readKeptLinkedPrompt(siblingSourceId: string | null): KeptLinkedPrompt 
       Date.now() - kept.at < LINKED_PROMPT_TTL_MS &&
       !(viewer !== null && typeof kept.user === "string" && kept.user !== viewer)
     ) {
+      if (submittedKeptPromptIds.has(kept.id)) return null;
       return { id: kept.id, text: kept.text, at: kept.at };
     }
     sessionStorage.removeItem(key);
@@ -2598,6 +2605,7 @@ function NewChatLandingContent({
   const keptLinkedRef = useRef<KeptLinkedPrompt | null>(
     ownsKeptLinkedPrompt ? keptLinkedPrompt : null,
   );
+  const submittedLinkedPromptRef = useRef<KeptLinkedPrompt | null>(null);
   useEffect(() => {
     if (keptLinkedPrompt !== null && !ownsKeptLinkedPrompt) {
       forgetKeptLinkedPrompt(siblingSourceId, keptLinkedPrompt);
@@ -6027,6 +6035,10 @@ function NewChatLandingContent({
   // dropped it on the strength of the submit.
   function returnDraftToUser(temporaryConversationId?: string) {
     submittedRef.current = false;
+    if (submittedLinkedPromptRef.current !== null) {
+      submittedKeptPromptIds.delete(submittedLinkedPromptRef.current.id);
+      submittedLinkedPromptRef.current = null;
+    }
     submittedDraftRevisionRef.current = null;
     removeNestedSessionDraft(queryClient, nestedProvisional.id);
     if (siblingSource && onScreenRef.current) {
@@ -6149,6 +6161,8 @@ function NewChatLandingContent({
       submittedRef.current = true;
       // A newer prompt link may replace the kept prompt while this create runs.
       const submittedLinkedPrompt = keptLinkedRef.current;
+      submittedLinkedPromptRef.current = submittedLinkedPrompt;
+      if (submittedLinkedPrompt !== null) submittedKeptPromptIds.add(submittedLinkedPrompt.id);
       if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
@@ -6738,6 +6752,7 @@ function NewChatLandingContent({
       if (submittedLinkedPrompt !== null) {
         if (keptLinkedRef.current === submittedLinkedPrompt) keptLinkedRef.current = null;
         forgetKeptLinkedPrompt(siblingSourceId, submittedLinkedPrompt);
+        submittedKeptPromptIds.delete(submittedLinkedPrompt.id);
       }
       if (submittedDraftRevisionRef.current === draftState.revision) {
         writeLandingDraft(draftState, null);
