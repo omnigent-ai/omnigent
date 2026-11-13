@@ -1801,7 +1801,8 @@ function ProjectFolder({
     errors.filter(isHidden),
     startingConversationId,
   );
-  // "Show more" carries the badge of the rows it hides, as a collapsed header does.
+  // "Show more" carries the badge of the rows it hides, as a collapsed header does,
+  // from cached reads only: hidden rows show an idle error once they have rendered.
   const hiddenMarker =
     expanded && visibleCount < conversations.length
       ? projectMarkerState(
@@ -4507,7 +4508,6 @@ function ConversationSection({
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
   const rows = isCollapsed ? (heldConversations ?? []) : conversations;
-  useRegisterRenderedSidebarRows(rows);
   const families = sessionFamilyGroups(rows);
   const familyRepresentative = (row: Conversation) =>
     row.family ? families.get(row.family.id)?.[0] : undefined;
@@ -4516,6 +4516,7 @@ function ConversationSection({
     return representative !== undefined && representative.id !== row.id;
   };
   const visibleFamilyRows = orderSessionFamilies(rows, collapsedFamilies);
+  useRegisterRenderedSidebarRows(visibleFamilyRows);
   const reorderRows = visibleFamilyRows.filter((row) => !isNestedFamilyRow(row));
 
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");

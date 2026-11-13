@@ -162,26 +162,30 @@ export function sessionRowsPage(rows: Conversation[], hasMore = false): Conversa
 type WatchCandidate = Pick<Conversation, "id" | "status" | "pending_elicitations_count">;
 
 /**
- * Ids the session-updates socket should watch. Rows hidden behind a collapsed
- * section, a collapsed folder or "Show more" are left to the periodic list
- * refresh, except running or input-awaiting rows, which can still notify.
+ * Ids the session-updates socket should watch. A loaded row the sidebar does not
+ * render is dropped only when the periodic list refresh keeps it current and it
+ * is neither running nor awaiting input, so notifications and the inbox stay live.
  * Until a section reports its rendered rows, every loaded row is watched.
  *
  * :param loadedRows: Every row loaded into the sidebar caches.
  * :param renderedRows: Ids each mounted sidebar section renders, keyed by section.
- * :returns: Unique ids to watch, rendered rows first.
+ * :param refreshedIds: Loaded ids the periodic list refresh re-reads.
+ * :returns: Unique loaded ids to watch, rendered rows first.
  */
 export function sidebarWatchedIds(
   loadedRows: readonly WatchCandidate[],
   renderedRows: ReadonlyMap<string, readonly string[]>,
+  refreshedIds: ReadonlySet<string>,
 ): string[] {
   if (renderedRows.size === 0) return loadedRows.map((row) => row.id);
+  const loadedIds = new Set(loadedRows.map((row) => row.id));
   const ids = new Set<string>();
   for (const sectionIds of renderedRows.values()) {
-    for (const id of sectionIds) ids.add(id);
+    for (const id of sectionIds) if (loadedIds.has(id)) ids.add(id);
   }
   for (const row of loadedRows) {
-    if (row.status === "running" || (row.pending_elicitations_count ?? 0) > 0) ids.add(row.id);
+    const live = row.status === "running" || (row.pending_elicitations_count ?? 0) > 0;
+    if (live || !refreshedIds.has(row.id)) ids.add(row.id);
   }
   return [...ids];
 }

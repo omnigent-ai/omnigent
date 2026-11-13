@@ -78,7 +78,7 @@ it("shares the two scope requests across consumers and includes old pins once", 
   expect(
     urls.every((url) => new URL(url, "http://localhost").searchParams.get("limit") === "30"),
   ).toBe(true);
-  expect(result.current.data.watchedIds.sort()).toEqual(["mine", "old-pin", "shared"]);
+  expect([...result.current.data.watchedIds].sort()).toEqual(["mine", "old-pin", "shared"]);
   expect(result.current.first.data).toBe(result.current.second.data);
   await act(async () =>
     result.current.data.registerFolder("project", [row("folder"), row("mine")]),
@@ -93,31 +93,69 @@ function RenderedSection({ ids }: { ids: string[] }) {
   return null;
 }
 
-it("watches rendered rows plus rows that can still notify once sections report", async () => {
+function renderWatchedIds(config = sidebarConfig) {
   let renderedIds: string[] | null = null;
   const wrap = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>
-      <SidebarDataProvider>
+      <SidebarDataProvider config={config}>
         {renderedIds && <RenderedSection ids={renderedIds} />}
         {children}
       </SidebarDataProvider>
     </QueryClientProvider>
   );
-  const { result, rerender } = renderHook(useSidebarData, { wrapper: wrap });
-  await waitFor(() => expect(result.current.watchedIds).toContain("mine"));
-  const hiddenIdle = { ...row("hidden-idle"), pending_elicitations_count: 0 };
-  await act(async () => result.current.registerFolder("project", [hiddenIdle]));
-  expect(result.current.watchedIds).toContain("hidden-idle");
+  const hook = renderHook(useSidebarData, { wrapper: wrap });
+  const show = (ids: string[] | null) => {
+    renderedIds = ids;
+    hook.rerender();
+  };
+  return { ...hook, show };
+}
 
-  renderedIds = ["mine"];
-  rerender();
-  await waitFor(() => expect(result.current.watchedIds).not.toContain("hidden-idle"));
-  // The fixture's other rows await input, so they stay watched while hidden.
-  expect(result.current.watchedIds.sort()).toEqual(["mine", "old-pin", "shared"]);
-
-  renderedIds = null;
-  rerender();
+it("watches rendered rows plus rows that can still notify once sections report", async () => {
+  const idleRow = (id: string) => ({ ...row(id), pending_elicitations_count: 0 });
+  fetchMock.mockImplementation((url: string) => {
+    const params = new URL(url, "http://localhost").searchParams;
+    const rows =
+      params.get("visibility") === "shared"
+        ? [row("shared", 1)]
+        : params.get("pinned") === "true"
+          ? []
+          : [idleRow("mine"), idleRow("hidden-idle"), { ...idleRow("busy"), status: "running" }];
+    return Promise.resolve({ ok: true, json: async () => sessionRowsPage(rows) });
+  });
+  const { result, show } = renderWatchedIds();
   await waitFor(() => expect(result.current.watchedIds).toContain("hidden-idle"));
+
+  show(["mine"]);
+  await waitFor(() => expect(result.current.watchedIds).not.toContain("hidden-idle"));
+  // Running and input-awaiting rows stay watched while hidden.
+  expect([...result.current.watchedIds].sort()).toEqual(["busy", "mine", "shared"]);
+
+  show([]);
+  await waitFor(() => expect(result.current.watchedIds).not.toContain("mine"));
+
+  show(null);
+  await waitFor(() => expect(result.current.watchedIds).toContain("hidden-idle"));
+  expect(result.current.watchedIds).toContain("mine");
+});
+
+it("keeps watching hidden rows beyond the periodic refresh window", async () => {
+  const idleRow = (id: string) => ({ ...row(id), pending_elicitations_count: 0 });
+  fetchMock.mockImplementation((url: string) => {
+    const params = new URL(url, "http://localhost").searchParams;
+    const rows =
+      params.get("visibility") === "shared" || params.get("pinned") === "true"
+        ? []
+        : [idleRow("refreshed"), idleRow("beyond-cap")];
+    return Promise.resolve({ ok: true, json: async () => sessionRowsPage(rows) });
+  });
+  const { result, show } = renderWatchedIds({ ...sidebarConfig, maxRefreshSessions: 1 });
+  await waitFor(() => expect(result.current.watchedIds).toContain("beyond-cap"));
+  show([]);
+  // The refresh re-reads only the first row; the other must keep its watch to
+  // learn that another client started it.
+  await waitFor(() => expect(result.current.watchedIds).not.toContain("refreshed"));
+  expect(result.current.watchedIds).toEqual(["beyond-cap"]);
 });
 
 it("excludes cached shared rows when disabled and keeps inbox policy separate", async () => {

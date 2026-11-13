@@ -283,6 +283,28 @@ describe("useSessionErrors", () => {
     expect(fetchPage).toHaveBeenCalledTimes(1);
   });
 
+  it("does not let a marker show a tail result that was invalidated", async () => {
+    fetchPage.mockResolvedValue(errorPage);
+    const { client, wrapper } = harness();
+    const reader = renderHook(() => useSessionErrorStates([session]), { wrapper });
+    await waitFor(() => expect(reader.result.current).toEqual(["error"]));
+    reader.unmount();
+    const marker = renderHook(() => useSessionErrorStates([session], { startReads: false }), {
+      wrapper,
+    });
+    expect(marker.result.current).toEqual(["error"]);
+    await act(async () => {
+      await client.invalidateQueries({
+        queryKey: ["session-latest-error", session.id],
+        refetchType: "none",
+      });
+    });
+    // Live-transcript disposal re-renders the hook alongside the invalidation.
+    marker.rerender();
+    expect(marker.result.current).toEqual([null]);
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+  });
+
   it("reads and subscribes to an already-loaded transcript without extra HTTP or streams", () => {
     const entry = conversationRegistry.acquire(session.id);
     entry.setState({

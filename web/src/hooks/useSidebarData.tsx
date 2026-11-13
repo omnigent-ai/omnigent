@@ -252,9 +252,20 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const automationInbox = useAutomationInbox(identityReady);
   const inboxCount =
     sumPendingApprovals(inboxRows) + comments.items.length + automationInbox.items.length;
+  // Mirrors useScopeCache: each refresh re-reads the first min(window, cap) rows.
+  const refreshedIds = useMemo(() => {
+    const ids = new Set<string>();
+    const addWindow = (data: ScopeCacheData | undefined, rows: Conversation[]) => {
+      const limit = Math.min(data?.windowSize ?? config.sessionPageSize, config.maxRefreshSessions);
+      for (const row of rows.slice(0, limit)) ids.add(row.id);
+    };
+    if (config.mineRefreshMs !== false) addWindow(mine.data, rawMineRows);
+    if (sharedActive && config.sharedRefreshMs !== false) addWindow(shared.data, rawSharedRows);
+    return ids;
+  }, [config, mine.data, rawMineRows, sharedActive, shared.data, rawSharedRows]);
   const watchedIds = useMemo(
-    () => sidebarWatchedIds(loadedRows, renderedRows),
-    [loadedRows, renderedRows],
+    () => sidebarWatchedIds(loadedRows, renderedRows, refreshedIds),
+    [loadedRows, renderedRows, refreshedIds],
   );
   const mineCursor = mine.data?.pages.at(-1)?.last_id;
   const sharedCursor = shared.data?.pages.at(-1)?.last_id;

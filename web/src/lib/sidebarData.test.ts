@@ -301,25 +301,39 @@ describe("sidebarWatchedIds", () => {
   const running = { ...row("running", 1), status: "running" as const };
   const awaiting = { ...row("awaiting", 1), pending_elicitations_count: 1 };
   const shown = row("shown", 1);
+  const refreshed = new Set(["idle", "running", "awaiting", "shown"]);
 
   it("watches every loaded row until a section reports what it renders", () => {
-    expect(sidebarWatchedIds([idle, running, shown], new Map())).toEqual([
+    expect(sidebarWatchedIds([idle, running, shown], new Map(), refreshed)).toEqual([
       "idle",
       "running",
       "shown",
     ]);
   });
 
-  it("drops hidden idle rows but keeps rows that can still notify", () => {
+  it("drops hidden idle rows the refresh covers but keeps rows that can still notify", () => {
     const rendered = new Map([
       ["sessions", ["shown"]],
       ["collapsed-folder", []],
     ]);
-    expect(sidebarWatchedIds([idle, running, awaiting, shown], rendered)).toEqual([
+    expect(sidebarWatchedIds([idle, running, awaiting, shown], rendered, refreshed)).toEqual([
       "shown",
       "running",
       "awaiting",
     ]);
+  });
+
+  it("keeps watching hidden rows the periodic refresh does not re-read", () => {
+    const rendered = new Map([["sessions", ["shown"]]]);
+    expect(sidebarWatchedIds([idle, shown], rendered, new Set(["shown"]))).toEqual([
+      "shown",
+      "idle",
+    ]);
+  });
+
+  it("ignores rendered rows the sidebar caches do not hold, such as archived ones", () => {
+    const rendered = new Map([["archived", ["archived-row", "shown"]]]);
+    expect(sidebarWatchedIds([shown], rendered, refreshed)).toEqual(["shown"]);
   });
 
   it("lists a row rendered by two sections once", () => {
@@ -327,6 +341,6 @@ describe("sidebarWatchedIds", () => {
       ["pinned", ["shown"]],
       ["sessions", ["shown", "idle"]],
     ]);
-    expect(sidebarWatchedIds([idle, shown], rendered)).toEqual(["shown", "idle"]);
+    expect(sidebarWatchedIds([idle, shown], rendered, refreshed)).toEqual(["shown", "idle"]);
   });
 });
