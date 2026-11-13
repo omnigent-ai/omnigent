@@ -44,19 +44,25 @@ import {
 } from "./TriggerWorkerSettingsFields";
 import {
   combineTriggerPrompt,
+  decodeTriggerPrompt,
   emptyTriggerFields,
   isTaskSessionTriggerPrompt,
+  encodeTriggerPrompt,
+  hasTriggerHeader,
   isTriggerPrompt,
   readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
-  renderTriggerPrompt,
+  renderTriggerConfigPrompt,
   splitTriggerPrompt,
   TRIGGER_SOURCES,
+  stripTriggerHeader,
   TRIGGER_TEMPLATES,
   triggerFieldsComplete,
   triggerPromptSource,
   triggerServiceName,
+  triggerWorkerSettingsOf,
   updateTriggerWorkerSettings,
+  type TriggerConfig,
   type TriggerFields,
   type TriggerTaskSessionMode,
   type TriggerWorkerSettings,
@@ -187,12 +193,6 @@ function TriggerTypeSelect<Type extends AutomationTriggerType>({
   );
 }
 
-/** A source's draft while editing a trigger: its fields, and its prompt editor once edited as a prompt. */
-interface EditSourceDraft {
-  fields: TriggerFields;
-  promptEditor: { prompt: string; systemPrompt: string | null } | null;
-}
-
 /** Restore a saved trigger prompt, applying worker settings changed while switched away. */
 function restoreSourcePrompt(
   userPrompt: string,
@@ -265,6 +265,8 @@ export function CreateScheduledTaskDialog({
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   const subhourSupported = info !== "loading" && info.scheduled_task_subhour === true;
   const triggerPollMinutes = info !== "loading" ? (info.automation_trigger_poll_minutes ?? 10) : 10;
+  const triggerHeadersSupported =
+    info !== "loading" && info.scheduled_task_trigger_headers === true;
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
   // gates on). "loading" → treat as disabled until /v1/info resolves.
@@ -309,24 +311,36 @@ export function CreateScheduledTaskDialog({
     editingTask !== null &&
     editingTask.sessionMode === "continue" &&
     isTriggerPrompt(editingTask.prompt);
+  // A trigger with a valid header reopens in its form. One edited outside the form
+  // opens as its full prompt; one saved before headers, as its instructions.
+  const editingTriggerConfig = useMemo(
+    () => (editingTemplateTrigger ? decodeTriggerPrompt(editingTask?.prompt ?? "") : null),
+    [editingTemplateTrigger, editingTask],
+  );
   // Temporary prompt edits must not expose controls that can rebind the poller.
-  const savedWorkerSettings = editingTemplateTrigger
-    ? readTriggerWorkerSettings(editingTask.prompt)
-    : null;
+  // A header's worker settings come from the form; an older trigger's, from its creation call.
+  const savedWorkerSettings: TriggerWorkerSettings | null = editingTriggerConfig
+    ? triggerWorkerSettingsOf(editingTriggerConfig.worker)
+    : editingTemplateTrigger
+      ? readTriggerWorkerSettings(editingTask.prompt)
+      : null;
   const editingWorkerSettings = savedWorkerSettings !== null;
   // A switch re-renders the workers, so it needs the saved worker settings to carry over.
   const editingTriggerSource =
-    editingTask !== null && editingWorkerSettings ? triggerPromptSource(editingTask.prompt) : null;
+    editingTriggerConfig?.source ??
+    (editingTask !== null && editingWorkerSettings
+      ? triggerPromptSource(editingTask.prompt)
+      : null);
   const savedWorkerPlacement =
-    editingTask !== null && editingWorkerSettings
+    editingTriggerConfig?.worker.placement ??
+    (editingTask !== null && editingWorkerSettings
       ? readTriggerWorkerPlacement(editingTask.prompt)
-      : null;
+      : null);
 
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
+  // The rendered template text around the instructions of an older trigger. Never shown.
   const [systemPrompt, setSystemPrompt] = useState<string | null>(null);
-  const [systemPromptOpen, setSystemPromptOpen] = useState(false);
-  const [editingSystemPrompt, setEditingSystemPrompt] = useState(false);
   const promptFieldsRef = useRef<HTMLDivElement>(null);
   const [schedule, setSchedule] = useState<ScheduleModel>(DEFAULT_SCHEDULE_MODEL);
   const [timezone, setTimezone] = useState(localTimezone);
@@ -516,14 +530,17 @@ export function CreateScheduledTaskDialog({
   // Like the model and effort overrides, this Advanced choice outlives switching trigger types.
   const [triggerTaskSessionMode, setTriggerTaskSessionMode] =
     useState<TriggerTaskSessionMode>("new");
-  // Kept while a trigger edit watches another source, so switching back restores the saved prompt.
+  // Kept while a trigger edit watches another source, so switching back restores the saved trigger.
   const [sourceSwitch, setSourceSwitch] = useState<{
     source: TriggerSource;
     savedPrompt: string;
     savedSystemPrompt: string | null;
+    /** The saved trigger's form, when it reopened from a header. */
+    savedFields: TriggerFields | null;
     savedStartNewSession: boolean;
   } | null>(null);
-  const editSourceDrafts = useRef<Partial<Record<TriggerSource, EditSourceDraft>>>({});
+  // Each other integration's form, so switching back and forth keeps its edits.
+  const editSourceDrafts = useRef<Partial<Record<TriggerSource, TriggerFields>>>({});
   const [switchedWorkerSettings, setSwitchedWorkerSettings] =
     useState<TriggerWorkerSettings | null>(null);
   const [switchedWorkerPlacement, setSwitchedWorkerPlacement] = useState<WorkerPlacement | null>(
@@ -568,11 +585,19 @@ export function CreateScheduledTaskDialog({
       setTriggerTaskSessionMode(
         editingTask && isTaskSessionTriggerPrompt(editingTask.prompt) ? "continue" : "new",
       );
-      setSystemPromptOpen(false);
-      setEditingSystemPrompt(false);
-      const parts = splitTriggerPrompt(editingTask?.prompt ?? initialPrompt ?? "");
-      setPrompt(parts.userPrompt);
-      setSystemPrompt(parts.systemPrompt);
+      const savedPrompt = editingTask?.prompt ?? initialPrompt ?? "";
+      if (editingTriggerConfig !== null) {
+        setPrompt("");
+        setSystemPrompt(null);
+      } else if (hasTriggerHeader(savedPrompt)) {
+        // The header no longer matches, so trust only the text the model runs.
+        setPrompt(stripTriggerHeader(savedPrompt));
+        setSystemPrompt(null);
+      } else {
+        const parts = splitTriggerPrompt(savedPrompt);
+        setPrompt(parts.userPrompt);
+        setSystemPrompt(parts.systemPrompt);
+      }
       setTimezone(editingTask?.timezone ?? localTimezone());
       if (editingTask) {
         const parsedSchedule = savedSchedule;
@@ -592,7 +617,20 @@ export function CreateScheduledTaskDialog({
         setPickedProjectId(null);
         setSessionMode(editingTask.sessionMode);
         setStartNewSession(false);
-        setTrigger(null);
+        if (editingTriggerConfig !== null) {
+          const {
+            source,
+            worker,
+            taskSessionMode: _taskSessionMode,
+            ...fields
+          } = editingTriggerConfig;
+          setTrigger(source);
+          setTriggerFields(fields);
+          setSwitchedWorkerSettings(triggerWorkerSettingsOf(worker));
+          setSwitchedWorkerPlacement(worker.placement);
+        } else {
+          setTrigger(null);
+        }
       } else {
         setName(
           initialTrigger
@@ -630,6 +668,7 @@ export function CreateScheduledTaskDialog({
     initialTrigger,
     defaultTriggerSchedule,
     editingTask,
+    editingTriggerConfig,
     savedSchedule,
     savedWorkspace,
     sourceSession,
@@ -952,26 +991,38 @@ export function CreateScheduledTaskDialog({
     unsupportedByScheduler ||
     validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
       null;
-  const renderedTemplatePrompt =
+  const triggerPromptContext = {
+    sessionLink,
+    pollingIntervalMinutes:
+      schedule.preset === "custom" && schedule.customFreq === "minutely" ? schedule.interval : 60,
+    taskSessionTitle: name,
+  };
+  // An edit keeps the saved workers; a new trigger's workers run where the manager
+  // runs (beside it on a connected host, or each in its own sandbox).
+  const renderedTriggerConfig: TriggerConfig | null =
     trigger !== null && triggerFieldsComplete(triggerFields, trigger)
-      ? renderTriggerPrompt(trigger, triggerFields, {
-          // Workers run where the manager runs: beside it on a connected host,
-          // or each in its own sandbox. A switched edit keeps the saved placement.
-          placement: workerPlacement ?? (sandboxMode ? "managed" : "same_host"),
-          sessionLink,
-          pollingIntervalMinutes:
-            schedule.preset === "custom" && schedule.customFreq === "minutely"
-              ? schedule.interval
-              : 60,
-          // Workers carry their own harness, model, effort, and mode.
-          agentId: workerSettings?.agentId,
-          model: workerSettings?.model || undefined,
-          effort: workerSettings?.effort || undefined,
-          permissionMode: workerSettings?.permissionMode || undefined,
-          taskSessionMode: triggerTaskSessionMode,
-          taskSessionTitle: name,
-        })
-      : "";
+      ? {
+          source: trigger,
+          ...triggerFields,
+          ...(triggerTaskSessionMode === "continue" ? { taskSessionMode: "continue" } : {}),
+          worker: {
+            placement: workerPlacement ?? (sandboxMode ? "managed" : "same_host"),
+            ...(workerSettings ?? {
+              agentId: null,
+              model: supportsModel ? pickedModel : "",
+              effort: supportsModel ? pickedEffort : "",
+              permissionMode: workerPermissionMode ?? "",
+            }),
+          },
+        }
+      : null;
+  // Only a server that strips the header before dispatch gets one.
+  let renderedTemplatePrompt = "";
+  if (renderedTriggerConfig !== null && triggerHeadersSupported) {
+    renderedTemplatePrompt = encodeTriggerPrompt(renderedTriggerConfig, triggerPromptContext);
+  } else if (renderedTriggerConfig !== null) {
+    renderedTemplatePrompt = renderTriggerConfigPrompt(renderedTriggerConfig, triggerPromptContext);
+  }
   const effectivePrompt =
     trigger !== null ? renderedTemplatePrompt : combineTriggerPrompt(prompt, systemPrompt);
   const triggerMode =
@@ -1108,8 +1159,6 @@ export function CreateScheduledTaskDialog({
     setTimezone(draft?.timezone ?? timezone);
     setSessionMode(draft?.sessionMode ?? (next === "schedule" ? "new" : "continue"));
     setScheduleUnsupported(false);
-    setSystemPromptOpen(false);
-    setEditingSystemPrompt(false);
     setError(null);
   }
 
@@ -1121,7 +1170,7 @@ export function CreateScheduledTaskDialog({
   // The polling session's state tracks the saved source's items, so a switch always resets it.
   const triggerSourceSwitched = sourceSwitch !== null;
 
-  /** Edit only: watch another integration, or restore the saved prompt for the original one. */
+  /** Edit only: watch another integration, or restore the saved trigger for the original one. */
   function handleEditTriggerSourceChange(next: TriggerSource) {
     if (editingTriggerSource === null || editedTriggerSource === null) return;
     if (next === editedTriggerSource) return;
@@ -1129,14 +1178,10 @@ export function CreateScheduledTaskDialog({
       source: editingTriggerSource,
       savedPrompt: prompt,
       savedSystemPrompt: systemPrompt,
+      savedFields: trigger !== null ? triggerFields : null,
       savedStartNewSession: startNewSession,
     };
-    if (sourceSwitch !== null) {
-      editSourceDrafts.current[editedTriggerSource] = {
-        fields: triggerFields,
-        promptEditor: trigger === null ? { prompt, systemPrompt } : null,
-      };
-    }
+    if (sourceSwitch !== null) editSourceDrafts.current[editedTriggerSource] = triggerFields;
     // A split template prompt's user part is the instructions for each session.
     let instructions = "";
     if (trigger !== null) instructions = triggerFields.instructions;
@@ -1144,17 +1189,12 @@ export function CreateScheduledTaskDialog({
     if (name === TRIGGER_TEMPLATES[editedTriggerSource].name) {
       setName(TRIGGER_TEMPLATES[next].name);
     }
-    // Restored prompts and drafts keep their text, with the current worker settings;
-    // only a new draft takes the instructions.
-    const draft = next === editingTriggerSource ? null : editSourceDrafts.current[next];
-    const promptEditor =
-      next === editingTriggerSource
-        ? { prompt: saved.savedPrompt, systemPrompt: saved.savedSystemPrompt }
-        : draft?.promptEditor;
-    if (promptEditor) {
+    // The saved trigger comes back as its form, or as its prompt when it has no header;
+    // other integrations reopen their draft, and only a new draft takes the instructions.
+    if (next === editingTriggerSource && saved.savedFields === null) {
       const restored = restoreSourcePrompt(
-        promptEditor.prompt,
-        promptEditor.systemPrompt,
+        saved.savedPrompt,
+        saved.savedSystemPrompt,
         workerSettings,
       );
       setPrompt(restored.userPrompt);
@@ -1162,6 +1202,11 @@ export function CreateScheduledTaskDialog({
       setTrigger(null);
     } else {
       setTrigger(next);
+      setTriggerFields(
+        next === editingTriggerSource
+          ? saved.savedFields!
+          : (editSourceDrafts.current[next] ?? { ...emptyTriggerFields(next), instructions }),
+      );
     }
     // Fall back to the saved workers if the prompt editor's creation call no longer parses.
     setSwitchedWorkerSettings(workerSettings ?? savedWorkerSettings);
@@ -1170,12 +1215,9 @@ export function CreateScheduledTaskDialog({
       setStartNewSession(saved.savedStartNewSession);
       setSourceSwitch(null);
     } else {
-      setTriggerFields(draft?.fields ?? { ...emptyTriggerFields(next), instructions });
       setStartNewSession(true);
       setSourceSwitch({ ...saved, source: next });
     }
-    setSystemPromptOpen(false);
-    setEditingSystemPrompt(false);
     setError(null);
   }
 
@@ -1478,24 +1520,11 @@ export function CreateScheduledTaskDialog({
                       sandboxMode && info !== "loading" && info.sandbox_provider === "arclet"
                     }
                     taskSessionMode={triggerTaskSessionMode}
-                    renderedPrompt={renderedTemplatePrompt}
-                    onEditAsPrompt={() => {
-                      const parts = splitTriggerPrompt(renderedTemplatePrompt);
-                      setPrompt(parts.userPrompt);
-                      setSystemPrompt(parts.systemPrompt);
-                      setSystemPromptOpen(false);
-                      setEditingSystemPrompt(false);
-                      setTrigger(null);
-                    }}
                   />
                 ) : (
                   <div ref={promptFieldsRef} className="flex flex-col gap-1.5">
                     <Label htmlFor="task-prompt">
-                      {startsFromSession
-                        ? "Additional instructions"
-                        : systemPrompt === null
-                          ? "Instructions"
-                          : "Your prompt"}
+                      {startsFromSession ? "Additional instructions" : "Instructions"}
                     </Label>
                     <Textarea
                       id="task-prompt"
@@ -1515,59 +1544,10 @@ export function CreateScheduledTaskDialog({
                       splitTriggerPrompt(effectivePrompt).systemPrompt === null && (
                         <p role="status" className="text-sm text-warning">
                           {prompt.trim() === ""
-                            ? "Your prompt can't be empty."
-                            : systemPrompt.trim() === ""
-                              ? "System prompt can't be empty. Expand System prompt and click Edit system prompt to restore it."
-                              : "These edits change the template structure. After saving, the full text will appear as one prompt."}
+                            ? "Instructions can't be empty."
+                            : "These edits change the template structure. After saving, the full text will appear as one prompt."}
                         </p>
                       )}
-                    {systemPrompt !== null && (
-                      <Collapsible
-                        open={systemPromptOpen}
-                        onOpenChange={(expanded) => {
-                          setSystemPromptOpen(expanded);
-                          setEditingSystemPrompt(false);
-                        }}
-                        className="mt-2 rounded-md border border-border p-3"
-                      >
-                        <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-2 rounded-sm text-ui text-muted-foreground outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
-                          <ChevronDownIcon className="size-4 transition-transform group-data-[state=closed]:-rotate-90" />
-                          System prompt
-                        </CollapsibleTrigger>
-                        <CollapsibleContent className="space-y-2 pt-3">
-                          <p className="text-sm text-muted-foreground">
-                            Instructions for how the automation runs. Your prompt is added
-                            separately.
-                          </p>
-                          {editingSystemPrompt ? (
-                            <Textarea
-                              aria-label="System prompt"
-                              autoFocus
-                              value={systemPrompt}
-                              rows={8}
-                              className="max-h-80 resize-y text-ui focus-visible:ring-0"
-                              componentId="tasks.scheduled.system_prompt"
-                              onChange={(event) => setSystemPrompt(event.target.value)}
-                            />
-                          ) : (
-                            <pre className="max-h-56 overflow-y-auto rounded-md bg-muted/40 p-2 font-sans text-sm whitespace-pre-wrap break-words">
-                              {systemPrompt}
-                            </pre>
-                          )}
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            componentId="tasks.scheduled.edit_system_prompt"
-                            onClick={() => setEditingSystemPrompt(!editingSystemPrompt)}
-                          >
-                            {editingSystemPrompt
-                              ? "Done editing system prompt"
-                              : "Edit system prompt"}
-                          </Button>
-                        </CollapsibleContent>
-                      </Collapsible>
-                    )}
                   </div>
                 )}
 
@@ -1690,9 +1670,9 @@ export function CreateScheduledTaskDialog({
                     </div>
                   )}
 
-                  {/* A trigger needs its one kept session, so its form leaves the choice out. */}
+                  {/* A trigger keeps one session: the mode switch stays hidden, but an edit can restart it. */}
                   {sessionModesSupported &&
-                    trigger === null &&
+                    (trigger === null || isEdit) &&
                     !startsFromSession &&
                     (!editingTemplateTrigger || editingTask?.sessionId) && (
                       <div
@@ -2057,7 +2037,7 @@ export function CreateScheduledTaskDialog({
                             ) : (
                               <p className="text-sm text-muted-foreground" role="status">
                                 Worker controls are unavailable for these customized instructions.
-                                Edit the prompt or system prompt above to configure matching
+                                Create this automation again from its template to configure matching
                                 sessions.
                               </p>
                             )}
@@ -2110,30 +2090,29 @@ export function CreateScheduledTaskDialog({
                                         {sendsToTaskSession
                                           ? "Trigger automations reuse a polling session, which sends each match to its task session."
                                           : "Trigger automations reuse a polling session even though each match starts a new worker."}{" "}
-                                        To change the model or harness for future workers, edit the
-                                        worker creation instructions in the{" "}
-                                        {systemPrompt === null ? "prompt" : "system prompt"}.{" "}
-                                        {sendsToTaskSession &&
-                                          "The current task session keeps its settings; archive it so the next match starts one with the new settings. "}
-                                        <button
-                                          type="button"
-                                          className="underline underline-offset-2"
-                                          onClick={() => {
-                                            if (systemPrompt !== null) {
-                                              setSystemPromptOpen(true);
-                                              setEditingSystemPrompt(true);
-                                            }
-                                            promptFieldsRef.current
-                                              ?.querySelector<HTMLTextAreaElement>(
-                                                systemPrompt === null
-                                                  ? "#task-prompt"
-                                                  : 'textarea[aria-label="System prompt"]',
-                                              )
-                                              ?.focus();
-                                          }}
-                                        >
-                                          Edit worker instructions
-                                        </button>
+                                        {systemPrompt === null ? (
+                                          <>
+                                            To change the model or harness for future workers, edit
+                                            the worker creation instructions in the prompt.{" "}
+                                            {sendsToTaskSession &&
+                                              "The current task session keeps its settings; archive it so the next match starts one with the new settings. "}
+                                            <button
+                                              type="button"
+                                              className="underline underline-offset-2"
+                                              onClick={() =>
+                                                promptFieldsRef.current
+                                                  ?.querySelector<HTMLTextAreaElement>(
+                                                    "#task-prompt",
+                                                  )
+                                                  ?.focus()
+                                              }
+                                            >
+                                              Edit worker instructions
+                                            </button>
+                                          </>
+                                        ) : (
+                                          "To change the model or harness for future workers, create this automation again from its template."
+                                        )}
                                       </>
                                     )}
                                   </p>

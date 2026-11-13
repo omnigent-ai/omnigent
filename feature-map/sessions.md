@@ -59,6 +59,11 @@ the header menu), and each place is a separate entry point.
   answer, which Settings → Git can change later. Archiving a session whose agent
   is still working, waiting on an approval, or running background work first
   asks to confirm, since archiving stops it; Cancel or Escape keeps the session.
+  When the session's sandbox provider has `stop_on_archive` on (or its launcher
+  decides so), archiving also stops the managed sandbox when no other session
+  uses it (another session on the host, or a side chat or sub-agent of the
+  session, keeps it running); the next message after an unarchive resumes it,
+  unless the managed sandbox reaper has terminated it by then.
 - `row-quick-actions`: sidebar rows show hover Pin and Archive buttons beside the
   "…" menu. Settings → Appearance → Sidebar → Show Pin and Archive buttons on
   session rows (on by default) turns them off, leaving both actions in the row
@@ -477,8 +482,10 @@ tooltip gives the state's age once that's over five minutes old. Sessions the se
 hasn't imported yet fill in as it imports them.
 On mobile, the top-left hamburger opens the sidebar from the board or a selected
 session. Back to canvas returns to the selected project. A Canvas session link
-opens the same layout directly. If a session is replaced, for example after `/clear`,
-its replacement stays beside the same board.
+opens the same layout directly. If a session is replaced, for example after `/clear` or `/rewind`,
+its replacement opens beside the same board, keeping the board's query and
+replacing the old session in history. After `/rewind` its composer holds the
+chosen prompt and attachments, as outside Canvas.
 The plus button starts a new session in the selected canvas. After sending,
 the new session opens beside that board; on narrow screens, Back to canvas
 returns to it. Reloading a temporary session before creation finishes returns to
