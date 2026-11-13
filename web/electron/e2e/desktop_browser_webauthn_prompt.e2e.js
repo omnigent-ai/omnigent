@@ -107,7 +107,7 @@ it(
       assert.equal(await requestState(), "pending", "the notice leaves the request running");
       await pause();
 
-      // Exercise enlarged content, the macOS hint and a wrapped origin in the real popup.
+      // Enlarged content and a long origin must keep the action visible and the text scrollable.
       const layout = await notice.evaluate(() => {
         const origin = document.getElementById("origin");
         const hint = document.getElementById("cookie-hint");
@@ -121,8 +121,16 @@ it(
         section.scrollTop = section.scrollHeight;
         const hintBottom = hint.getBoundingClientRect().bottom;
         const result = {
-          buttonBottom: button.bottom,
+          button: {
+            left: button.left,
+            right: button.right,
+            top: button.top,
+            bottom: button.bottom,
+            width: button.width,
+            height: button.height,
+          },
           windowHeight: innerHeight,
+          windowWidth: innerWidth,
           hintBottom,
           sectionBottom: sectionRect.bottom,
         };
@@ -132,7 +140,18 @@ it(
         document.documentElement.style.zoom = "";
         return result;
       });
-      assert.ok(layout.buttonBottom <= layout.windowHeight, "the browser action stays visible");
+      assert.ok(
+        layout.button.width > 0 && layout.button.height > 0,
+        "the action has positive dimensions",
+      );
+      assert.ok(
+        layout.button.left >= 0 && layout.button.top >= 0,
+        "the action starts inside the viewport",
+      );
+      assert.ok(
+        layout.button.right <= layout.windowWidth && layout.button.bottom <= layout.windowHeight,
+        "the complete action stays visible",
+      );
       assert.ok(
         layout.hintBottom <= layout.sectionBottom + 1,
         "all notice text remains reachable by scrolling",

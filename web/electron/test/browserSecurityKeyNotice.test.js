@@ -103,6 +103,10 @@ describe("security-key notice for embedded browser pages", () => {
     await flush();
     assert.deepEqual(h.opened, [PAGE]);
     assert.equal(h.prompts.length, 2);
+    h.report(true);
+    await h.wait();
+    assert.equal(h.prompts.length, 3);
+    assert.deepEqual(h.opened, [PAGE]);
   });
 
   for (const [name, launch] of [
@@ -152,7 +156,8 @@ describe("security-key notice for embedded browser pages", () => {
     await flush();
     checks = 0;
     await h.wait();
-    assert.equal(checks, 1, "the handoff failure replaces the already armed poll");
+    assert.equal(checks, 1, "a stale handoff failure does not add a second poll");
+    assert.equal(h.prompts.length, 1, "a stale handoff failure does not reopen the notice");
     h.report(false);
     await h.wait();
     assert.equal(checks, 1, "request completion cancels the remaining poll");

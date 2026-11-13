@@ -28,7 +28,7 @@ function loadObserver({ report } = {}) {
   vm.runInContext(
     `function track(options) {
       void [options?.mediation, options?.publicKey];
-      const call = { options };
+      const call = { options, receiver: this };
       call.promise = new Promise((resolve, reject) => Object.assign(call, { resolve, reject }));
       calls.push(call);
       return call.promise;
@@ -36,10 +36,10 @@ function loadObserver({ report } = {}) {
     globalThis.CredentialsContainer = class CredentialsContainer {
       get(options) {
         if (options?.illegal) throw new TypeError("Illegal invocation");
-        return track(options);
+        return track.call(this, options);
       }
       create(options) {
-        return track(options);
+        return track.call(this, options);
       }
     };
     globalThis.calls = [];
@@ -60,9 +60,26 @@ const settle = () =>
 describe("embedded browser WebAuthn observer", () => {
   it("reports every WebAuthn request and the last one settling", async () => {
     const { realm, pending } = loadObserver();
-    const first = vm.runInContext("credentials.get({ publicKey: {} })", realm);
+    const first = vm.runInContext(
+      "globalThis.firstOptions = { publicKey: {} }; credentials.get(firstOptions)",
+      realm,
+    );
     // A later request re-shows a notice the user dismissed while the first one waits.
-    const second = vm.runInContext("credentials.create({ publicKey: {} })", realm);
+    const second = vm.runInContext(
+      "globalThis.secondOptions = { publicKey: {} }; credentials.create(secondOptions)",
+      realm,
+    );
+    for (const [index, promise] of [first, second].entries()) {
+      assert.equal(promise, vm.runInContext(`calls[${index}].promise`, realm));
+      assert.equal(vm.runInContext(`calls[${index}].receiver === credentials`, realm), true);
+      assert.equal(
+        vm.runInContext(
+          `calls[${index}].options === ${index === 0 ? "firstOptions" : "secondOptions"}`,
+          realm,
+        ),
+        true,
+      );
+    }
     assert.deepEqual(pending(), [true, true]);
 
     vm.runInContext("calls[0].resolve('credential')", realm);
