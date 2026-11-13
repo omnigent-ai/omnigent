@@ -2182,14 +2182,15 @@ def _mint_route_app(
     return app
 
 
-async def _post_mint_token(
+async def _request_runner_token(
     app: FastAPI,
     runner_id: str,
     *,
     token: str | None,
+    method: str = "POST",
     credential_protocol: str | None = RUNNER_CREDENTIAL_PROTOCOL,
 ) -> httpx.Response:
-    """POST the mint endpoint with an optional binding-token header.
+    """Discover or mint a runner credential with an optional binding-token header.
 
     :param app: The tunnel-route app under test.
     :param runner_id: Path runner id.
@@ -2204,7 +2205,7 @@ async def _post_mint_token(
         transport=httpx.ASGITransport(app=app),
         base_url="http://server",
     ) as client:
-        return await client.post(f"/v1/runners/{runner_id}/token", headers=headers)
+        return await client.request(method, f"/v1/runners/{runner_id}/token", headers=headers)
 
 
 @pytest.mark.parametrize("legacy_enabled", [False, True])
@@ -2230,7 +2231,7 @@ async def test_mint_token_endpoint_returns_owner_bearer_for_valid_binding_token(
         ),
     )
 
-    response = await _post_mint_token(app, runner_id, token=token)
+    response = await _request_runner_token(app, runner_id, token=token)
 
     assert response.status_code == 200
     body = response.json()
@@ -2257,12 +2258,13 @@ async def test_mint_token_endpoint_rejects_unrecognized_token() -> None:
         resolve_managed_runner_owner=lambda _rid: None,
     )
 
-    response = await _post_mint_token(app, runner_id, token=attacker_token)
+    response = await _request_runner_token(app, runner_id, token=attacker_token)
 
     assert response.status_code == 401
 
 
-async def test_mint_token_endpoint_rejects_runner_id_mismatch() -> None:
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_mint_token_endpoint_rejects_runner_id_mismatch(method) -> None:
     """A token that doesn't hash to the path runner_id is refused.
 
     The SHA-256 binding gate runs before any owner lookup, so a token
@@ -2276,14 +2278,15 @@ async def test_mint_token_endpoint_rejects_runner_id_mismatch() -> None:
         resolve_managed_runner_owner=lambda _rid: "owner@example.com",
     )
 
-    response = await _post_mint_token(
-        app, "runner_token_does_not_match", token="some-binding-token"
+    response = await _request_runner_token(
+        app, "runner_token_does_not_match", token="some-binding-token", method=method
     )
 
     assert response.status_code == 401
 
 
-async def test_mint_token_endpoint_missing_binding_token_rejected() -> None:
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_mint_token_endpoint_missing_binding_token_rejected(method) -> None:
     """A request without the binding-token header is refused.
 
     :returns: None.
@@ -2294,15 +2297,16 @@ async def test_mint_token_endpoint_missing_binding_token_rejected() -> None:
         resolve_managed_runner_owner=lambda _rid: "owner@example.com",
     )
 
-    response = await _post_mint_token(app, runner_id, token=None)
+    response = await _request_runner_token(app, runner_id, token=None, method=method)
 
     assert response.status_code == 401
 
 
 @pytest.mark.parametrize("credential_protocol", [None, RUNNER_CREDENTIAL_PROTOCOL])
 @pytest.mark.parametrize("builtin", [False, True])
+@pytest.mark.parametrize("method", ["GET", "POST"])
 async def test_mint_token_endpoint_header_mode_unsupported_returns_400(
-    credential_protocol, builtin
+    credential_protocol, builtin, method
 ) -> None:
     """When the provider can't mint (header/proxy mode), the endpoint 400s.
 
@@ -2323,8 +2327,8 @@ async def test_mint_token_endpoint_header_mode_unsupported_returns_400(
         ),
     )
 
-    response = await _post_mint_token(
-        app, runner_id, token=token, credential_protocol=credential_protocol
+    response = await _request_runner_token(
+        app, runner_id, token=token, credential_protocol=credential_protocol, method=method
     )
 
     assert response.status_code == 400
@@ -2905,7 +2909,7 @@ async def test_mint_negotiates_legacy_runner_compatibility(
         auth_provider=_MintingAuthProvider(),
         resolve_managed_runner_owner=lambda _: "owner@example.com",
     )
-    response = await _post_mint_token(
+    response = await _request_runner_token(
         app,
         token_bound_runner_id(token),
         token=token,
@@ -2941,7 +2945,13 @@ async def test_mint_preserves_legacy_provider_signature(
         auth_provider=LegacyProvider(),
         resolve_managed_runner_owner=lambda _: "owner@example.com",
     )
-    response = await _post_mint_token(
+    discovery = await _request_runner_token(
+        app, token_bound_runner_id(token), token=token, method="GET", credential_protocol=None
+    )
+    assert discovery.status_code == 200
+    assert discovery.json() == {"protocols": ["legacy"] if legacy_enabled else []}
+    assert minted == []
+    response = await _request_runner_token(
         app, token_bound_runner_id(token), token=token, credential_protocol=credential_protocol
     )
     if legacy_enabled and credential_protocol is None:
@@ -2952,6 +2962,22 @@ async def test_mint_preserves_legacy_provider_signature(
         assert response.status_code == 426
         assert response.json()["error"]["code"] == "runner_upgrade_required"
         assert "auth provider" in response.json()["error"]["message"]
+        assert minted == []
+
+    from fastapi.testclient import TestClient
+
+    from omnigent.runner._entry import _make_managed_mint_factory
+
+    minted.clear()
+    monkeypatch.setattr("omnigent.runner._entry.httpx.Client", lambda **_kwargs: TestClient(app))
+    if legacy_enabled:
+        factory = await asyncio.to_thread(_make_managed_mint_factory, "http://server", token)
+        assert factory is not None
+        assert factory() == "legacy-custom-provider-token"
+        assert minted == [("owner@example.com", 1800)]
+    else:
+        with pytest.raises(RuntimeError, match="no supported runner credential protocol"):
+            await asyncio.to_thread(_make_managed_mint_factory, "http://server", token)
         assert minted == []
 
 
@@ -2982,7 +3008,16 @@ async def test_managed_issuers_follow_compatibility_negotiation(
         mint_managed_runner_token=legacy_mint,
         mint_scoped_managed_runner_token=scoped_mint if scoped_issuer else None,
     )
-    response = await _post_mint_token(
+    discovery = await _request_runner_token(
+        app, runner_id, token=token, method="GET", credential_protocol=None
+    )
+    assert discovery.status_code == 200
+    assert discovery.json() == {
+        "protocols": (["scoped-v1"] if scoped_issuer else [])
+        + (["legacy"] if legacy_enabled else [])
+    }
+    assert issued == []
+    response = await _request_runner_token(
         app, runner_id, token=token, credential_protocol=credential_protocol
     )
     confined = credential_protocol == RUNNER_CREDENTIAL_PROTOCOL and scoped_issuer
@@ -3013,7 +3048,13 @@ async def test_scoped_mint_requires_wired_builtin_confinement(custom):
         auth_provider=UnverifiedProvider() if custom else _MintingAuthProvider(wired=False),
         resolve_managed_runner_owner=lambda _: "owner@example.com",
     )
-    response = await _post_mint_token(app, token_bound_runner_id(token), token=token)
+    discovery = await _request_runner_token(
+        app, token_bound_runner_id(token), token=token, method="GET", credential_protocol=None
+    )
+    assert discovery.status_code == 200
+    assert "scoped-v1" not in discovery.json()["protocols"]
+    assert issued == []
+    response = await _request_runner_token(app, token_bound_runner_id(token), token=token)
     assert response.status_code == 426
     assert response.json()["error"]["code"] == "runner_upgrade_required"
     assert issued == []

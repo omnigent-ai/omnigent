@@ -16907,6 +16907,54 @@
       }
     },
     "/v1/runners/{runner_id}/token": {
+      "get": {
+        "description": "Advertise minting protocols without issuing a credential.\n\n`legacy` means an absent protocol header and is advertised only when\nthe operator permits legacy issuance. Prefer `scoped-v1` when offered.\nOlder servers return 404/405; callers retain their scoped request there.\nAn advertisement does not authorize minting, which rechecks runner authority.",
+        "operationId": "runner_credential_protocols_v1_runners__runner_id__token_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "runner_id",
+            "required": true,
+            "schema": {
+              "title": "Runner Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response Runner Credential Protocols V1 Runners  Runner Id  Token Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Runner Credential Protocols",
+        "tags": [
+          "runners"
+        ]
+      },
       "post": {
         "description": "Mint a short-lived runner bearer, confined when scoped-v1 is requested.\n\nLegacy owner-wide issuance remains until 0.21.0 unless\n`OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS=0`. A scoped request never downgrades.\n\n**Parameters**\n\n- `credential_protocol` \u2014 `scoped-v1` for confined credentials; absent for legacy issuance during the 0.20.x compatibility window.\n\n**Returns:** `{\"token\": <jwt>, \"expires_at\": <epoch seconds>}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 when the binding token is absent, doesn't match `runner_id`, or resolves to no managed-launch owner; 400 when the active auth mode can't mint server-side (header/proxy, or no auth provider).\n- `OmnigentError` \u2014 426 for unsupported protocols/providers or disabled legacy issuance.",
         "operationId": "mint_runner_owner_token_v1_runners__runner_id__token_post",

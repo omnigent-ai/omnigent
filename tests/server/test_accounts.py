@@ -531,6 +531,7 @@ _SESSION_HEADER = {"X-Omnigent-Session-Id": "conv_bound"}
         ("POST", "/v1/sessions/conv_bound/resources/environments/env/shell", None),
         ("POST", "/v1/sessions", None),
         ("GET", f"/v1/runners/{_RUNNER}/status", None),
+        ("GET", f"/v1/runners/{_RUNNER}/token", None),
         ("POST", f"/v1/runners/{_RUNNER}/token", None),
         ("GET", "/v1/sessions/conv_bound/owner", None),
         ("GET", "/v1/policy-registry", None),

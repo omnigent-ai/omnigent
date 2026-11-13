@@ -64,6 +64,9 @@ be able to write resources without a separate Omnigent account.
   not renew credentials, shared-agent writes and session deletion are denied,
   and strict mode gives incompatible runners upgrade guidance. Header/proxy
   providers decline minting without interrupting binding-token callbacks.
+  Credential discovery prefers advertised scoped support; legacy custom
+  providers work only when legacy issuance is advertised. A scoped selection
+  persists through renewal, and a refused scoped request never retries legacy.
 - `desktop-ssh-connect`: in the desktop app (macOS and Linux), **Connect a host**
   connects a machine the user reaches over SSH. The app runs the system `ssh`
   with the user's config, runs `omnigent login` there with the sign-in callback

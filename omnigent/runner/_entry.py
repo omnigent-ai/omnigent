@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Generator
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, cast
@@ -34,7 +35,7 @@ from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.busy_check import RunnerBusyCheck
-from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
+from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE, RUNNER_CREDENTIAL_PROTOCOL
 from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
     RUNNER_TUNNEL_REJECTION_PREFIX,
@@ -936,6 +937,39 @@ def _make_managed_mint_factory(
     return factory
 
 
+@dataclass
+class _RunnerCredentialNegotiation:
+    """Choose a protocol once; refreshes never broaden a scoped credential."""
+
+    protocol: str | None = RUNNER_CREDENTIAL_PROTOCOL
+    selected: bool = False
+
+    def select(self, client: httpx.Client, url: str, headers: dict[str, str]) -> str | None:
+        """Use explicit server capabilities, or retain scoped requests on older servers."""
+        if self.selected:
+            return self.protocol
+        response = client.get(url, headers=headers)
+        if response.status_code not in (404, 405):
+            response.raise_for_status()
+            try:
+                protocols = response.json()["protocols"]
+            except (ValueError, KeyError, TypeError) as exc:
+                raise RuntimeError("invalid runner credential protocol advertisement") from exc
+            if not isinstance(protocols, list) or not all(isinstance(p, str) for p in protocols):
+                raise RuntimeError("invalid runner credential protocol advertisement")
+            if RUNNER_CREDENTIAL_PROTOCOL in protocols:
+                self.protocol = RUNNER_CREDENTIAL_PROTOCOL
+            elif "legacy" in protocols:
+                self.protocol = None
+            else:
+                raise RuntimeError(
+                    "server advertises no supported runner credential protocol; "
+                    "update the runner or auth provider configuration"
+                )
+        self.selected = True
+        return self.protocol
+
+
 class _ManagedMintTokenFactory:
     """Callable that mints (and caches) a managed runner's owner JWT.
 
@@ -975,6 +1009,7 @@ class _ManagedMintTokenFactory:
             first successful mint so the proxy sees a valid credential on
             every subsequent refresh.
         """
+        self._negotiation = _RunnerCredentialNegotiation()
         self._mint_url = mint_url
         self._server_url = server_url
         self._binding_token = binding_token
@@ -1030,6 +1065,7 @@ class _ManagedMintTokenFactory:
                 self._server_url,
                 self._binding_token,
                 proxy_bearer=self._proxy_bearer,
+                negotiation=self._negotiation,
             )
         except httpx.HTTPStatusError as exc:
             response = exc.response
@@ -1151,6 +1187,7 @@ def _mint_managed_owner_token(
     binding_token: str,
     *,
     proxy_bearer: str | None = None,
+    negotiation: _RunnerCredentialNegotiation | None = None,
 ) -> tuple[str, float]:
     """Mint one managed-runner owner JWT from the server.
 
@@ -1163,6 +1200,7 @@ def _mint_managed_owner_token(
         in front of the Omnigent server. The proxy requires a valid
         ``Authorization`` header even on unauthenticated-to-Omnigent
         endpoints; the binding token alone is not enough to pass it.
+    :param negotiation: Protocol selection retained across this factory's refreshes.
     :returns: ``(jwt, expires_at_epoch_seconds)``.
     :raises httpx.HTTPError: On network failure or a non-2xx response.
     :raises KeyError: If the response is missing the expected fields.
@@ -1172,18 +1210,21 @@ def _mint_managed_owner_token(
     from omnigent.cli_auth import databricks_request_headers
     from omnigent.runner.identity import (
         OMNIGENT_INTERNAL_WS_ORIGIN,
-        RUNNER_CREDENTIAL_PROTOCOL,
         RUNNER_CREDENTIAL_PROTOCOL_HEADER,
         RUNNER_TUNNEL_TOKEN_HEADER,
     )
 
     headers = {
         "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
-        RUNNER_CREDENTIAL_PROTOCOL_HEADER: RUNNER_CREDENTIAL_PROTOCOL,
         RUNNER_TUNNEL_TOKEN_HEADER: binding_token,
         **databricks_request_headers(server_url, bearer_token=proxy_bearer),
     }
     with httpx.Client(timeout=10.0, trust_env=not is_loopback_url(server_url)) as client:
+        protocol = (negotiation or _RunnerCredentialNegotiation()).select(
+            client, mint_url, headers
+        )
+        if protocol is not None:
+            headers[RUNNER_CREDENTIAL_PROTOCOL_HEADER] = protocol
         response = client.post(mint_url, headers=headers)
         response.raise_for_status()
         payload = response.json()

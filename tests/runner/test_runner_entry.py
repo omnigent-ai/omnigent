@@ -556,7 +556,12 @@ def _refuse_mint(calls: list[str | None]) -> Any:
     """Build a mint stand-in that records its proxy bearer and answers HTTP 400."""
 
     def _mint(
-        mint_url: str, server_url: str, binding_token: str, *, proxy_bearer: str | None = None
+        mint_url: str,
+        server_url: str,
+        binding_token: str,
+        *,
+        proxy_bearer: str | None = None,
+        **_kw: object,
     ) -> tuple[str, float]:
         del server_url, binding_token
         calls.append(proxy_bearer)
@@ -899,6 +904,8 @@ def test_managed_mint_factory_declines_at_request_time_and_auth_sends_bare(
 
     def _boot_blip_then_refuse(request: httpx.Request) -> httpx.Response:
         """Fail the boot probe with a connection error, then refuse every mint."""
+        if request.method == "GET":
+            return httpx.Response(405)
         calls.append(1)
         assert request.headers[RUNNER_CREDENTIAL_PROTOCOL_HEADER] == RUNNER_CREDENTIAL_PROTOCOL
         if len(calls) == 1:
@@ -1529,8 +1536,19 @@ def test_initial_host_token_fallback_recovers_from_no_bearer_mint_decline(
     assert factory.declined is False
 
 
+@pytest.mark.parametrize(
+    ("advertised", "expected_protocol"),
+    [
+        (["scoped-v1", "legacy"], "scoped-v1"),
+        (["legacy"], ""),
+        (404, "scoped-v1"),
+        (405, "scoped-v1"),
+    ],
+)
 def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
     monkeypatch: pytest.MonkeyPatch,
+    advertised: list[str] | int,
+    expected_protocol: str,
 ) -> None:
     """The mint call targets the right URL with the binding-token header.
 
@@ -1545,6 +1563,14 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
 
     def _handler(request: httpx.Request) -> httpx.Response:
         """Capture the outgoing mint request and return a canned token."""
+        if request.method == "GET":
+            assert RUNNER_CREDENTIAL_PROTOCOL_HEADER not in request.headers
+            assert request.headers[RUNNER_TUNNEL_TOKEN_HEADER] == "the-binding-token"
+            return (
+                httpx.Response(advertised)
+                if isinstance(advertised, int)
+                else httpx.Response(200, json={"protocols": advertised})
+            )
         captured["url"] = str(request.url)
         captured["method"] = request.method
         captured["binding_token"] = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER, "")
@@ -1571,7 +1597,7 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
     assert expires_at == 1234567890.0
     assert captured["method"] == "POST"
     assert captured["binding_token"] == "the-binding-token"
-    assert captured["credential_protocol"] == RUNNER_CREDENTIAL_PROTOCOL
+    assert captured["credential_protocol"] == expected_protocol
     assert captured["url"].endswith("/v1/runners/runner_token_abc/token")
 
 
@@ -1584,6 +1610,8 @@ def test_mint_managed_owner_token_includes_proxy_bearer_when_provided(
     def _handler(request: httpx.Request) -> httpx.Response:
         captured["authorization"] = request.headers.get("authorization", "")
         captured["binding_token"] = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER, "")
+        if request.method == "GET":
+            return httpx.Response(200, json={"protocols": ["scoped-v1"]})
         return httpx.Response(200, json={"token": "owner-jwt", "expires_at": 1234567890})
 
     real_client = httpx.Client
@@ -1609,8 +1637,15 @@ def test_managed_mint_factory_promotes_minted_jwt_to_proxy_bearer(
 ) -> None:
     """After the first mint, the factory uses the minted JWT as proxy bearer on re-mints."""
     mint_call_bearers: list[str | None] = []
+    discoveries = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            discoveries.append(request)
+            return httpx.Response(
+                200, json={"protocols": ["scoped-v1"] if len(discoveries) == 1 else ["legacy"]}
+            )
+        assert request.headers[RUNNER_CREDENTIAL_PROTOCOL_HEADER] == "scoped-v1"
         mint_call_bearers.append(request.headers.get("authorization"))
         return httpx.Response(200, json={"token": "minted-jwt", "expires_at": time.time() + 1800})
 
@@ -1633,6 +1668,7 @@ def test_managed_mint_factory_promotes_minted_jwt_to_proxy_bearer(
     factory._cached_expires_at = 0.0  # expire
     factory()
 
+    assert len(discoveries) == 1
     assert mint_call_bearers[0] == "Bearer seed-bearer"
     assert mint_call_bearers[1] == "Bearer minted-jwt"
 
@@ -4237,3 +4273,44 @@ async def test_managed_mint_protocol_failure_never_falls_back(
             factory()
     assert not factory.declined
     assert not factory.proxy_auth_failed
+
+
+@pytest.mark.parametrize("protocols", [[], ["future-v2"], "legacy", None, [1, "legacy"]])
+def test_runner_mint_refuses_unsupported_protocol_advertisements(monkeypatch, protocols):
+    def handler(request):
+        assert request.method == "GET", "unsupported discovery must not mint a credential"
+        return httpx.Response(200, json={"protocols": protocols})
+
+    client = httpx.Client
+    monkeypatch.setattr(
+        "omnigent.runner._entry.httpx.Client",
+        lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    with pytest.raises(RuntimeError, match="runner credential protocol"):
+        _make_managed_mint_factory("https://server.example.com", "binding")
+
+
+def test_runner_scoped_mint_refusal_does_not_renegotiate_legacy(monkeypatch):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"protocols": ["scoped-v1", "legacy"]})
+        assert request.headers[RUNNER_CREDENTIAL_PROTOCOL_HEADER] == "scoped-v1"
+        return httpx.Response(426)
+
+    client = httpx.Client
+    monkeypatch.setattr(
+        "omnigent.runner._entry.httpx.Client",
+        lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    factory = _ManagedMintTokenFactory(
+        "https://server.example.com/v1/runners/runner/token",
+        "https://server.example.com",
+        "binding",
+    )
+    for _ in range(2):
+        with pytest.raises(httpx.HTTPStatusError):
+            factory()
+    assert [request.method for request in requests] == ["GET", "POST", "POST"]

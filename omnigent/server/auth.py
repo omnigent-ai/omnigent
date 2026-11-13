@@ -332,6 +332,7 @@ class RunnerTokenConfinement:
                 and (method, rest[1])
                 in {
                     ("GET", "status"),
+                    ("GET", "token"),
                     ("POST", "token"),
                     ("WEBSOCKET", "tunnel"),
                 }

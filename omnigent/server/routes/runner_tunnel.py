@@ -379,6 +379,55 @@ def create_runner_tunnel_router(
                 result["error"] = error
         return result
 
+    def _require_token_binding(request: Request, runner_id: str) -> None:
+        """Require possession of the binding token for the requested runner id."""
+        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        if not token or token_bound_runner_id(token) != runner_id:
+            raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+
+    def _require_minting_provider() -> AuthProvider:
+        """Keep proxy/header callbacks on their existing non-minting path."""
+        if auth_provider is None or (
+            auth_provider.runner_token_scope is None
+            and (
+                isinstance(auth_provider, UnifiedAuthProvider)
+                or type(auth_provider).mint_runner_token is AuthProvider.mint_runner_token
+            )
+        ):
+            raise OmnigentError(
+                "runner token minting is unsupported in this auth mode",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return auth_provider
+
+    def _supports_scoped_credentials(provider: AuthProvider) -> bool:
+        """Advertise only confinement that the issuer and validator both enforce."""
+        return (
+            isinstance(provider, UnifiedAuthProvider)
+            and provider.runner_confinement_ready
+            and (mint_managed_runner_token is None or mint_scoped_managed_runner_token is not None)
+        )
+
+    @router.get("/runners/{runner_id}/token")
+    async def runner_credential_protocols(
+        request: Request, runner_id: str
+    ) -> dict[str, list[str]]:
+        """Advertise minting protocols without issuing a credential.
+
+        ``legacy`` means an absent protocol header and is advertised only when
+        the operator permits legacy issuance. Prefer ``scoped-v1`` when offered.
+        Older servers return 404/405; callers retain their scoped request there.
+        An advertisement does not authorize minting, which rechecks runner authority.
+        """
+        _require_token_binding(request, runner_id)
+        provider = _require_minting_provider()
+        protocols = []
+        if _supports_scoped_credentials(provider):
+            protocols.append(RUNNER_CREDENTIAL_PROTOCOL)
+        if env_var_is_truthy(LEGACY_RUNNER_TOKENS_ENV, default=True):
+            protocols.append("legacy")
+        return {"protocols": protocols}
+
     @router.post("/runners/{runner_id}/token")
     async def mint_runner_owner_token(
         request: Request,
@@ -412,29 +461,15 @@ def create_runner_tunnel_router(
                 "runner token minting requires an auth provider",
                 code=ErrorCode.INVALID_INPUT,
             )
-        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
-        if not token or token_bound_runner_id(token) != runner_id:
-            raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
+        _require_token_binding(request, runner_id)
         if credential_protocol not in (None, RUNNER_CREDENTIAL_PROTOCOL):
             raise OmnigentError(
                 "upgrade the runner to a supported credential protocol (scoped-v1)",
                 code=ErrorCode.RUNNER_UPGRADE_REQUIRED,
             )
-        if auth_provider.runner_token_scope is None and (
-            isinstance(auth_provider, UnifiedAuthProvider)
-            or type(auth_provider).mint_runner_token is AuthProvider.mint_runner_token
-        ):
-            # Proxy identity cannot be minted; callbacks use the binding token.
-            raise OmnigentError(
-                "runner token minting is unsupported in this auth mode",
-                code=ErrorCode.INVALID_INPUT,
-            )
+        provider = _require_minting_provider()
         confined = credential_protocol == RUNNER_CREDENTIAL_PROTOCOL
-        if confined and not (
-            isinstance(auth_provider, UnifiedAuthProvider)
-            and auth_provider.runner_confinement_ready
-            and (mint_managed_runner_token is None or mint_scoped_managed_runner_token is not None)
-        ):
+        if confined and not _supports_scoped_credentials(provider):
             raise OmnigentError(
                 "auth provider cannot issue scoped-v1 runner credentials",
                 code=ErrorCode.RUNNER_UPGRADE_REQUIRED,
