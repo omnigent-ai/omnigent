@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import shutil
+import socket
 import tempfile
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -49,6 +50,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
 )
 from omnigent.host.workspace_tokens import new_token_key, verify_token
 from omnigent.inner.async_utils import run_sync_on_thread
+from omnigent.util.uvicorn_server import NoSignalServer
 from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
 _logger = logging.getLogger(__name__)
@@ -197,28 +199,43 @@ async def start_workspace_socket(
             raise ConnectError(Code.NOT_FOUND, "The session's workspace is not on this host")
         return reader_for_workspace(workspace)
 
-    # mkdtemp's directory is mode 0700, so no other user can reach the socket.
-    path = Path(tempfile.mkdtemp(prefix="omnigent-workspace-")) / "workspace.sock"
+    # Bind here rather than in uvicorn, whose bind failure calls sys.exit().
+    directory: Path | None = None
+    try:
+        # mkdtemp's directory is mode 0700, so no other user can reach the socket.
+        directory = Path(tempfile.mkdtemp(prefix="omnigent-workspace-"))
+        path = directory / "workspace.sock"
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(str(path))
+            path.chmod(0o600)
+        except OSError:
+            sock.close()
+            raise
+    except (OSError, AttributeError):  # AttributeError: no AF_UNIX on this platform
+        _logger.warning(
+            "Workspace socket could not be created; direct access is off", exc_info=True
+        )
+        if directory is not None:
+            shutil.rmtree(directory, ignore_errors=True)
+        return None
     app = WorkspaceServiceASGIApplication(WorkspaceService(reader_for))
     config = uvicorn.Config(
-        app,
-        uds=str(path),
-        ws="none",
-        lifespan="off",
-        log_level="warning",
-        access_log=False,
-        log_config=None,
+        app, ws="none", lifespan="off", log_level="warning", access_log=False, log_config=None
     )
-    server = uvicorn.Server(config)
-    task = asyncio.create_task(server.serve(), name="host-workspace-socket")
-    socket = WorkspaceSocket(server, task, path, token_key)
+    # The host owns SIGINT/SIGTERM; a plain uvicorn.Server would take them over.
+    server = NoSignalServer(config)
+    task = asyncio.create_task(server.serve(sockets=[sock]), name="host-workspace-socket")
+    listener = WorkspaceSocket(server, task, path, token_key)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _SOCKET_STARTUP_TIMEOUT_S
     while not server.started:
         if task.done() or loop.time() >= deadline:
-            _logger.warning("Workspace socket failed to start; direct access is off")
-            await socket.stop()
+            failure = task.exception() if task.done() and not task.cancelled() else None
+            _logger.warning(
+                "Workspace socket failed to start; direct access is off", exc_info=failure
+            )
+            await listener.stop()
             return None
         await asyncio.sleep(0.01)
-    path.chmod(0o600)
-    return socket
+    return listener

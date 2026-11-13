@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import os
+import signal
 import socket
 import stat
 import time
@@ -226,8 +227,11 @@ async def test_socket_serves_only_valid_tokens_for_this_host(tmp_path: Path) -> 
     workspace = tmp_path / "ws"
     workspace.mkdir()
     _workspace(workspace)
+    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
     listener = await start_workspace_socket(lambda ws: WorkspaceReader(Path(ws)), host_id="host_a")
     assert listener is not None
+    # The host's own shutdown handlers must stay in charge while the socket runs.
+    assert {sig: signal.getsignal(sig) for sig in handlers} == handlers
     key = listener.token_key
 
     def bearer(
@@ -278,3 +282,16 @@ async def test_socket_serves_only_valid_tokens_for_this_host(tmp_path: Path) -> 
         await listener.stop()
 
     assert not listener.path.parent.exists()
+
+
+async def test_socket_that_cannot_be_prepared_leaves_the_host_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full temp disk or a refused bind turns direct access off instead of failing startup."""
+
+    def no_space(*_args: object, **_kwargs: object) -> str:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("omnigent.host.workspace_service.tempfile.mkdtemp", no_space)
+
+    assert await start_workspace_socket(lambda ws: WorkspaceReader(Path(ws)), host_id="h") is None

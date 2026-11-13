@@ -27,6 +27,7 @@ from omnigent.harnesses.antigravity_native.credentials import databricks_token_s
 from omnigent.inner.credential_proxy import DatabricksProfileTokenProvider
 from omnigent.models.databricks_model_discovery import discover_databricks_gemini_models
 from omnigent.onboarding.gemini_gateway import GEMINI_BASE_URL_ENV
+from omnigent.util.uvicorn_server import NoSignalServer
 
 _logger = logging.getLogger(__name__)
 PROFILE_ENV = "OMNIGENT_AGY_DATABRICKS_PROFILE"
@@ -117,12 +118,6 @@ class GeminiDatabricksGateway:
         )
 
 
-class _Server(uvicorn.Server):
-    @contextlib.contextmanager
-    def capture_signals(self):
-        yield
-
-
 async def run(profile: str, argv: list[str]) -> int:
     """Keep the local gateway alive exactly as long as its agy child."""
     source = await asyncio.to_thread(databricks_token_source, profile)
@@ -141,7 +136,7 @@ async def run(profile: str, argv: list[str]) -> int:
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             port = listener.getsockname()[1]
-            server = _Server(uvicorn.Config(gateway.app, log_level="error", lifespan="off"))
+            server = NoSignalServer(uvicorn.Config(gateway.app, log_level="error", lifespan="off"))
             serving = asyncio.create_task(server.serve(sockets=[listener]))
             child: asyncio.subprocess.Process | None = None
             child_wait: asyncio.Task[int] | None = None
