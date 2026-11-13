@@ -327,6 +327,12 @@ class HostHelloFrame:
         supported" without a version check.
     :param connection_id: Host-minted identifier for this socket, shared with
         server diagnostics. Absent from older hosts.
+    :param workspace_socket: Path of the host's workspace API socket, e.g.
+        ``"/tmp/omnigent-workspace-ab12/workspace.sock"``. ``None`` when the host
+        serves no direct workspace access.
+    :param workspace_token_key: Key the server signs direct-access tokens with
+        (see :mod:`omnigent.host.workspace_tokens`). Sent with
+        ``workspace_socket``; never logged.
     """
 
     version: str
@@ -341,6 +347,8 @@ class HostHelloFrame:
     installation_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
+    workspace_socket: str | None = None
+    workspace_token_key: str | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -1752,6 +1760,8 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "installation_id": frame.installation_id,
                 "capabilities": list(frame.capabilities),
                 "connection_id": frame.connection_id,
+                "workspace_socket": frame.workspace_socket,
+                "workspace_token_key": frame.workspace_token_key,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -2901,6 +2911,8 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         installation_id=_optional_nullable_str(msg, "installation_id"),
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_nullable_str(msg, "connection_id"),
+        workspace_socket=_optional_nullable_str(msg, "workspace_socket"),
+        workspace_token_key=_optional_nullable_str(msg, "workspace_token_key"),
     )
 
 

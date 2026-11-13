@@ -251,10 +251,27 @@ from omnigent.util.tunnel_limits import (
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
+    from omnigent.host.workspace_service import WorkspaceSocket
     from omnigent.workspace_fs import WorkspaceReader
 
 # Workspaces whose fs reader (and change registry) stay warm between requests.
 _FS_READER_CACHE_SIZE = 8
+
+
+def _workspace_direct_access_enabled() -> bool:
+    """Whether ``OMNIGENT_FEATURES`` turns on the host's workspace socket.
+
+    An unreadable feature list leaves the optional socket off rather than
+    stopping the host.
+    """
+    from omnigent.server.feature_flags import Feature, resolve_feature_flags
+
+    try:
+        return resolve_feature_flags().enabled(Feature.WORKSPACE_DIRECT_ACCESS)
+    except ValueError:
+        _logger.warning("OMNIGENT_FEATURES is invalid; workspace direct access is off")
+        return False
+
 
 # Older servers omit a create's timeout_s and wait 150 s for its reply; finish inside that.
 _LEGACY_SERVER_CREATE_BUDGET_S = 140.0
@@ -1487,6 +1504,8 @@ class HostProcess:
         # instead of waiting out the ~90s keepalive timeout. See run() /
         # _on_resume_from_suspend.
         self._suspend_task: asyncio.Task[None] | None = None
+        # The owner-only workspace API socket, when workspace_direct_access is on.
+        self._workspace_socket: WorkspaceSocket | None = None
         # Set by _on_resume_from_suspend when it aborts a live tunnel after a
         # detected resume; read+cleared in run()'s reconnect handler to force a
         # prompt reconnect (skip the backoff).
@@ -3822,6 +3841,44 @@ class HostProcess:
             ],
         )
 
+    async def _start_workspace_socket(self) -> WorkspaceSocket | None:
+        """Open the direct workspace socket when enabled and installed, else ``None``."""
+        if not _workspace_direct_access_enabled():
+            return None
+        try:
+            from omnigent.host.workspace_service import start_workspace_socket
+        except ImportError:
+            _logger.warning(
+                "workspace_direct_access needs `omnigent[workspace-api]`; direct access is off"
+            )
+            return None
+        return await start_workspace_socket(self._workspace_reader, host_id=self._identity.host_id)
+
+    def _workspace_reader(self, workspace: str) -> WorkspaceReader:
+        """Return the cached reader for an existing workspace directory.
+
+        Shared by tunnel fs requests and the direct workspace socket, so both
+        reuse one reader (and its change registry) per workspace. Blocking:
+        call it from a worker thread.
+
+        :param workspace: Expanded workspace path, e.g. ``"/home/me/project"``.
+        :returns: The workspace's reader.
+        """
+        from omnigent.runtime.filesystem_registry import detect_git_root
+        from omnigent.workspace_fs import WorkspaceReader
+
+        # A workspace can gain or lose its .git while the host is running.
+        repo_root = detect_git_root(Path(workspace))
+        with self._fs_readers_lock:
+            cached = self._fs_readers.get(workspace)
+            if cached is None or cached[0] != repo_root:
+                cached = (repo_root, WorkspaceReader(Path(workspace)))
+                self._fs_readers[workspace] = cached
+                while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
+                    self._fs_readers.popitem(last=False)
+            self._fs_readers.move_to_end(workspace)
+            return cached[1]
+
     def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
         """Serve a read-only workspace filesystem request from the host.
 
@@ -3839,12 +3896,7 @@ class HostProcess:
         """
         from pathlib import Path
 
-        from omnigent.runtime.filesystem_registry import detect_git_root
-        from omnigent.workspace_fs import (
-            WorkspaceReader,
-            WorkspaceReaderError,
-            read_repository_branches,
-        )
+        from omnigent.workspace_fs import WorkspaceReaderError, read_repository_branches
 
         try:
             expanded = os.path.expanduser(frame.workspace)
@@ -3878,17 +3930,7 @@ class HostProcess:
                     Path(expanded), cast("list[dict[str, str]]", params["repositories"])
                 )
             else:
-                # A workspace can gain or lose its .git while the host is running.
-                repo_root = detect_git_root(Path(expanded))
-                with self._fs_readers_lock:
-                    cached = self._fs_readers.get(expanded)
-                    if cached is None or cached[0] != repo_root:
-                        cached = (repo_root, WorkspaceReader(Path(expanded)))
-                        self._fs_readers[expanded] = cached
-                        while len(self._fs_readers) > _FS_READER_CACHE_SIZE:
-                            self._fs_readers.popitem(last=False)
-                    self._fs_readers.move_to_end(expanded)
-                    reader = cached[1]
+                reader = self._workspace_reader(expanded)
                 with pr_resource.server_tracking(
                     params.get("server_tracked"), params.get("default_pr_url")
                 ):
@@ -5065,6 +5107,7 @@ class HostProcess:
         self._suspend_task = asyncio.create_task(
             watch_for_resume(self._on_resume_from_suspend), name="host-suspend-watch"
         )
+        self._workspace_socket = await self._start_workspace_socket()
         # Warm the runner zygote now: start() blocks on its one-time import
         # of the runner graph (~1-2s), which otherwise lands inside the first
         # session launch of the daemon's life. Best-effort — a failure
@@ -5277,6 +5320,9 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._suspend_task
                 self._suspend_task = None
+            if self._workspace_socket is not None:
+                await self._workspace_socket.stop()
+                self._workspace_socket = None
             if self._lifecycle_task is not None:
                 self._lifecycle_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -5730,6 +5776,8 @@ class HostProcess:
             installation_id=_tel_install_id,
             capabilities=list(HOST_CAPABILITIES),
             connection_id=connection_id,
+            workspace_socket=str(listener.path) if (listener := self._workspace_socket) else None,
+            workspace_token_key=listener.token_key if listener else None,
         )
         try:
             encoded_hello = self._encode_frame(hello)

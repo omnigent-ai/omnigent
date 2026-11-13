@@ -863,6 +863,8 @@ def test_hello_frame_round_trip() -> None:
         runners=["runner_token_aaa", "runner_token_bbb"],
         interactive_shells=["zsh", "bash"],
         connection_id="host-connection-1",
+        workspace_socket="/tmp/omnigent-workspace-x/workspace.sock",
+        workspace_token_key="key-abc",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -872,6 +874,10 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
     assert decoded.interactive_shells == ["zsh", "bash"]
     assert decoded.connection_id == "host-connection-1"
+    assert decoded.workspace_socket == "/tmp/omnigent-workspace-x/workspace.sock"
+    assert decoded.workspace_token_key == "key-abc"
+    # The signing key must never reach a log line through the frame's repr.
+    assert "key-abc" not in repr(decoded)
 
 
 def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None:
@@ -892,6 +898,8 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     # empty set (feature unsupported), not choke on the missing key.
     assert decoded.capabilities == []
     assert decoded.connection_id is None
+    assert decoded.workspace_socket is None
+    assert decoded.workspace_token_key is None
 
 
 def test_hello_frame_capabilities_round_trip() -> None:

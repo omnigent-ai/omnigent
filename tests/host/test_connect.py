@@ -3175,6 +3175,64 @@ async def test_fast_capability_discovery_is_included_in_hello(
     assert hello.gateway_inference == {"codex-native": True}
 
 
+@pytest.mark.parametrize("serving", [True, False])
+async def test_hello_advertises_the_workspace_socket_only_while_it_runs(
+    monkeypatch: pytest.MonkeyPatch, serving: bool
+) -> None:
+    """The server can mint direct-access tokens only for a host that serves the socket."""
+    host = _make_host_process()
+
+    async def _discover() -> None:
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    if serving:
+        host._workspace_socket = SimpleNamespace(  # type: ignore[assignment]
+            path=Path("/tmp/omnigent-workspace-x/workspace.sock"), token_key="key-abc"
+        )
+    tunnel = _BlockingTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+    finally:
+        await _cancel(serve_task)
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    if serving:
+        assert hello.workspace_socket == "/tmp/omnigent-workspace-x/workspace.sock"
+        assert hello.workspace_token_key == "key-abc"
+    else:
+        assert hello.workspace_socket is None
+        assert hello.workspace_token_key is None
+
+
+@pytest.mark.parametrize(
+    ("features", "enabled"),
+    [("workspace_direct_access", True), ("", False), ("not_a_feature", False)],
+)
+async def test_workspace_direct_access_follows_omnigent_features(
+    monkeypatch: pytest.MonkeyPatch, features: str, enabled: bool
+) -> None:
+    """The host opens its socket only when enabled, and an invalid list never stops the host."""
+    from omnigent.host.connect import _workspace_direct_access_enabled
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", features)
+
+    assert _workspace_direct_access_enabled() is enabled
+
+
+async def test_workspace_socket_without_its_extra_leaves_the_host_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enabling direct access without `omnigent[workspace-api]` turns it off, not the host."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", "workspace_direct_access")
+    # None in sys.modules makes the import fail as if connectrpc weren't installed.
+    monkeypatch.setitem(sys.modules, "omnigent.host.workspace_service", None)
+
+    assert await _make_host_process()._start_workspace_socket() is None
+
+
 async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
