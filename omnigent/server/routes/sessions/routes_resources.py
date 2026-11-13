@@ -728,16 +728,18 @@ def register_resources_routes(
 
     async def _session_host(
         conv: Conversation, request: Request
-    ) -> tuple[Conversation, HostConnection | None]:
-        """Return the session that owns ``conv``'s host and workspace, and that host's tunnel.
+    ) -> tuple[str | None, HostConnection | None, str | None]:
+        """Return the host a session runs on, its tunnel here, and the session's workspace.
 
-        Side chats and sub-agents resolve to the session that owns them. The tunnel
-        is ``None`` when the host isn't connected here; a host live on another
-        replica raises :class:`WrongReplicaError`, so the client re-addresses.
+        Side chats and sub-agents run on the host of the session that owns them,
+        but keep their own workspace; like the runner, fall back to the owner's
+        workspace only when the session has none. The tunnel is ``None`` when the
+        host isn't connected here; a host live on another replica raises
+        :class:`WrongReplicaError`, so the client re-addresses.
 
         :param conv: The authorized session.
         :param request: The incoming request, for the app's host store.
-        :returns: ``(owning session, local host connection or None)``.
+        :returns: ``(host id, local host connection or None, workspace)``.
         """
         owner = await asyncio.to_thread(routing_host_session, conv, conversation_store) or conv
         host_id = owner.host_id
@@ -748,10 +750,10 @@ def register_resources_routes(
             absent = host_absent_error(record) if record is not None else None
             if isinstance(absent, WrongReplicaError):
                 raise absent
-        return owner, host
+        return host_id, host, conv.workspace or owner.workspace
 
     async def _environment_reach_for_session(
-        conversation: Conversation,
+        conversation: Conversation, workspace: str | None = None
     ) -> tuple[list[Any], bool, str] | None:
         """Compute a session's browse reach without consulting the runner.
 
@@ -762,12 +764,15 @@ def register_resources_routes(
         the decision has to be made here.
 
         :param conversation: Conversation loaded during authorization.
+        :param workspace: The workspace to resolve against, when it isn't the
+            conversation's own (a sub-agent inheriting its runner's).
         :returns: ``(roots, unconfined, workspace)``, or ``None`` when the
             session has no workspace or spec to resolve.
         """
         from omnigent.inner.sandbox import declared_filesystem_reach
 
-        if not conversation.workspace:
+        workspace = workspace or conversation.workspace
+        if not workspace:
             return None
         spec = await asyncio.to_thread(
             _load_agent_spec_for_session,
@@ -777,13 +782,8 @@ def register_resources_routes(
         spec_os_env = getattr(spec, "os_env", None) if spec is not None else None
         if spec_os_env is None:
             return None
-        root = Path(conversation.workspace)
-        roots, unconfined = declared_filesystem_reach(root, spec_os_env)
-        return (
-            roots,
-            unconfined,
-            conversation.workspace,
-        )
+        roots, unconfined = declared_filesystem_reach(Path(workspace), spec_os_env)
+        return roots, unconfined, workspace
 
     def _runner_environment_segment(environment_id: str) -> str:
         """Preserve an environment identifier as one runner URL segment."""
@@ -2786,8 +2786,7 @@ def register_resources_routes(
             raise HTTPException(
                 status_code=403, detail="Only the session owner can read its workspace directly"
             )
-        owner, host = await _session_host(conv, request)
-        host_id = owner.host_id
+        host_id, host, workspace = await _session_host(conv, request)
         if host_id is None or host is None:
             raise HTTPException(status_code=404, detail="The session's host is not connected")
         socket_path = host.hello.workspace_socket
@@ -2796,7 +2795,8 @@ def register_resources_routes(
             raise HTTPException(
                 status_code=404, detail="The session's host offers no direct access"
             )
-        reach = await _environment_reach_for_session(owner)
+        # The session's own spec decides confinement, even on an inherited host.
+        reach = await _environment_reach_for_session(conv, workspace)
         if reach is None or not reach[1]:
             raise HTTPException(
                 status_code=404, detail="Direct access serves unconfined sessions only"

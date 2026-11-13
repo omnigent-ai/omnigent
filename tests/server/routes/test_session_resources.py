@@ -1310,9 +1310,7 @@ def _offer_direct_access(
     sandbox: str | None = "none",
 ) -> None:
     """Bind the canned session to a host; each keyword can break one precondition."""
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.spec.types import AgentSpec
 
     if flag:
         app.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_DIRECT_ACCESS}))
@@ -1332,9 +1330,59 @@ def _offer_direct_access(
             ),
             owner=None,
         )
-    os_env = OSEnvSpec(sandbox=OSEnvSandboxSpec(type=sandbox) if sandbox else None)
-    spec = AgentSpec(spec_version=1, os_env=os_env)
+    spec = _direct_access_spec(sandbox)
     monkeypatch.setattr(sessions_module, "_load_agent_spec_for_session", lambda *_: spec)
+
+
+def _direct_access_spec(sandbox: str | None) -> Any:
+    """An agent spec that is unconfined for ``"none"`` and confined for ``None``."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.spec.types import AgentSpec
+
+    os_env = OSEnvSpec(sandbox=OSEnvSandboxSpec(type=sandbox) if sandbox else None)
+    return AgentSpec(spec_version=1, os_env=os_env)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("child_sandbox", "status"), [("none", 200), (None, 404)], ids=["unconfined", "confined"]
+)
+async def test_direct_access_for_a_hostless_child_uses_its_own_workspace_and_sandbox(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    child_sandbox: str | None,
+    status: int,
+) -> None:
+    """A sub-agent runs on its parent's host but keeps its own workspace and spec."""
+    import dataclasses
+
+    from omnigent.server.routes import sessions as sessions_module
+
+    _offer_direct_access(app, monkeypatch)
+    conversations = app.state.test_conversation_store._conversations
+    parent = conversations[_DIRECT_ACCESS_SESSION]
+    child = dataclasses.replace(
+        parent,
+        id="child_session",
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        root_conversation_id=parent.id,
+        host_id=None,
+        workspace="/workspace/child",
+    )
+    conversations[child.id] = child
+    specs = {parent.id: _direct_access_spec("none"), child.id: _direct_access_spec(child_sandbox)}
+    monkeypatch.setattr(
+        sessions_module, "_load_agent_spec_for_session", lambda conv, *_: specs[conv.id]
+    )
+
+    resp = await client.post(f"/v1/sessions/{child.id}/workspace/direct-access")
+
+    assert resp.status_code == status, resp.text
+    if status == 200:
+        grant = verify_token(_DIRECT_ACCESS_KEY, resp.json()["token"], host_id="host_direct")
+        assert grant == WorkspaceGrant(session_id=child.id, workspace="/workspace/child")
 
 
 @pytest.mark.asyncio

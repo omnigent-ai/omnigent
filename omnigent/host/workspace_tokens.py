@@ -70,7 +70,9 @@ def verify_token(key: str, token: str, *, host_id: str) -> WorkspaceGrant | None
             key,
             algorithms=[_ALGORITHM],
             audience=_AUDIENCE,
-            options={"require": ["exp", "hid", "sub", "ws"]},
+            # iat is informational: a host clock behind the server's must not
+            # reject a fresh token. exp still bounds every token.
+            options={"require": ["exp", "hid", "sub", "ws"], "verify_iat": False},
         )
     except jwt.PyJWTError:
         return None
