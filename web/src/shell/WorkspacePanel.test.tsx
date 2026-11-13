@@ -2737,6 +2737,35 @@ describe("WorkspacePanel desktop menu commands", () => {
     expect(onReveal).toHaveBeenCalledTimes(2);
   });
 
+  it("steps through pinned and reordered side chats in their strip order", () => {
+    writePinnedWorkspaceTabs(["files"]);
+    // Strip: Files, pinned Side chat 3, the open file, then Side chat 2 and 1 as reordered.
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side_c", "conv_side_b", "conv_side_a"],
+      pinnedSideChats: ["conv_side_c"],
+      sideChatNumbers: { conv_side_a: 1, conv_side_b: 2, conv_side_c: 3 },
+      selectedSideChatId: "conv_side_b",
+    });
+    const { openFileViewer, onRightRailTabChange } = renderWorkspace({
+      rightRailTab: "sidechat",
+      openFiles: ["src/a.ts"],
+    });
+    const selectedSideChat = () => readSessionWorkspaceState("conv_ws").selectedSideChatId;
+    const step = (command: "next-tab" | "previous-tab") =>
+      act(() => sendCommand({ command, browserViewId: null }));
+
+    step("next-tab");
+    expect(selectedSideChat()).toBe("conv_side_a");
+    step("previous-tab");
+    expect(selectedSideChat()).toBe("conv_side_b");
+    step("previous-tab");
+    expect(openFileViewer).toHaveBeenCalledWith("src/a.ts");
+
+    fireEvent.click(screen.getByRole("tab", { name: "Side chat 3" }));
+    step("previous-tab");
+    expect(onRightRailTabChange).toHaveBeenLastCalledWith("files");
+  });
+
   it("steps from a file with unsaved edits to another tab only once its viewer allows it", () => {
     const allow: (() => void)[] = [];
     const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {

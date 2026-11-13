@@ -200,8 +200,9 @@ export function SideChatRailTab({
   );
 }
 
-// A small drag threshold keeps a plain click selecting the tab. Keyboard users
-// reorder from the tab's context menu, so Space and Enter still activate it.
+// A small drag threshold keeps a plain click selecting the tab. Mouse only: on touch,
+// a swipe scrolls the strip and a long press opens the menu, which keyboard and touch
+// users reorder from, so Space and Enter still activate the tab.
 const MOUSE_SENSOR_OPTIONS = { activationConstraint: { distance: 5 } };
 
 /** Drag context for the strip's side-chat tabs; `onMove` gets the dragged and target ids. */
