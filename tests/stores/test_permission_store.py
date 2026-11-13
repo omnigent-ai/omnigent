@@ -206,23 +206,23 @@ def test_grant_if_absent_writes_only_a_missing_grant(
     ``default`` runs the base class's read-then-grant fallback on the same store.
     """
     owner = SqlAlchemyPermissionStore if implementation == "store" else PermissionStore
-    _ensure_user(store, "erin@test.com")
+    _ensure_user(store, "erin@example.com")
     _ensure_user(store, RESERVED_USER_PUBLIC)
     conv_id = _create_conversation(db_uri)
     store.grant(RESERVED_USER_PUBLIC, conv_id, LEVEL_READ)
     if held is not None:
-        store.grant("erin@test.com", conv_id, held)
+        store.grant("erin@example.com", conv_id, held)
     # Cache Erin's access, which a written grant must evict.
-    assert store.resolve_access("erin@test.com", conv_id).user_grant_level == held
+    assert store.resolve_access("erin@example.com", conv_id).user_grant_level == held
 
-    written = owner.grant_if_absent(store, "erin@test.com", conv_id, LEVEL_READ)
+    written = owner.grant_if_absent(store, "erin@example.com", conv_id, LEVEL_READ)
 
     assert written is (held is None)
     expected = held if held is not None else LEVEL_READ
-    assert store.get("erin@test.com", conv_id) == SessionPermission(
-        "erin@test.com", conv_id, expected
+    assert store.get("erin@example.com", conv_id) == SessionPermission(
+        "erin@example.com", conv_id, expected
     )
-    assert store.resolve_access("erin@test.com", conv_id).user_grant_level == expected
+    assert store.resolve_access("erin@example.com", conv_id).user_grant_level == expected
 
 
 @pytest.mark.parametrize(

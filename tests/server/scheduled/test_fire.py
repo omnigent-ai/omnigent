@@ -474,6 +474,9 @@ class FakePermissionStore:
         grantees = self.task_grantees or []
         return [ScheduledTaskPermission(u, scheduled_task_id, LEVEL_READ) for u in grantees], None
 
+    def resolve_scheduled_task_access(self, principals: list[str], task_id: str) -> int | None:
+        return LEVEL_READ if set(principals) & set(self.task_grantees or []) else None
+
     def list_for_session(self, conversation_id: str, **_: Any) -> tuple[list[Any], None]:
         return [SessionPermission(*g) for g in self.grants if g[1] == conversation_id], None
 
