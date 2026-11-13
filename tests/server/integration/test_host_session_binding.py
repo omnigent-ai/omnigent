@@ -874,9 +874,11 @@ async def test_managed_session_create_rejects_a_taken_host_id(
     assert env.conv_store.list_conversations(limit=100) == sessions_before
 
 
+@pytest.mark.parametrize("requested_host_id", [None, "0123456789abcdef0123456789abcdef"])
 async def test_managed_multipart_bundle_create_end_to_end(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
+    requested_host_id: str | None,
 ) -> None:
     """
     Multipart ``POST /v1/sessions`` with ``host_type="managed"`` uploads
@@ -885,7 +887,8 @@ async def test_managed_multipart_bundle_create_end_to_end(
     runner runs on the sandbox, so the same background launch as the JSON
     path binds the session to a sandbox host with a runner. Also confirms
     the caller owns the session (grant happens BEFORE the managed launch
-    is scheduled, so a launch failure can't orphan an unowned row).
+    is scheduled, so a launch failure can't orphan an unowned row). A
+    metadata ``host_id`` names the sandbox host, as on the JSON create.
     """
     env = managed_session_env
     monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
@@ -909,9 +912,12 @@ async def test_managed_multipart_bundle_create_end_to_end(
     install_fake_modal_launcher(monkeypatch, fake)
 
     bundle = build_agent_bundle(name="managed-multipart-e2e-agent")
+    metadata: dict[str, object] = {"host_type": "managed"}
+    if requested_host_id is not None:
+        metadata["host_id"] = requested_host_id
     resp = await env.client.post(
         "/v1/sessions",
-        data={"metadata": json.dumps({"host_type": "managed"})},
+        data={"metadata": json.dumps(metadata)},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     assert resp.status_code == 201, resp.text
@@ -924,6 +930,9 @@ async def test_managed_multipart_bundle_create_end_to_end(
     tunnels = [await future for future in host_futures]
     assert len(tunnels) == 1
     assert conv.host_id is not None
+    if requested_host_id is not None:
+        assert conv.host_id == requested_host_id
+    assert conv.labels.get("omnigent.sandbox.requested_host_id") == requested_host_id
     assert conv.workspace == "/root/workspace"
     assert conv.runner_id is not None
     assert conv.runner_id.startswith("runner_token_")
@@ -1347,9 +1356,12 @@ async def test_concurrent_sandbox_moves_launch_one_sandbox(
         lambda: (launch := tracker.get(session_id)) is not None and launch.settled.is_set()
     )
     assert len(fake.provisioned_names) == 1
+    # Failed inputs are recorded before the launch releases its move claim.
     await poll_until_async(
         lambda: (
             [item.status for item in env.conv_store.list_pending_inputs(session_id)] == ["failed"]
+            and (current := env.conv_store.get_conversation(session_id)) is not None
+            and current.runner_id is None
         )
     )
     conv = env.conv_store.get_conversation(session_id)
@@ -3449,6 +3461,112 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     assert host_deregistered == ["055e31f38d07908f171ebad4ff5cbe9c"]
     # A stale tunnel is torn down, not handed off: its turns stay reconcilable here.
     assert runner_deregistered == [("runner_stale_tunnel", False)]
+
+
+_KEYED_HOST_ID = "5f2a9c81d4e64b0f9a7c3e1b2d8f4a60"
+_WAKE_SESSION_ID = "3b8e6f1a0c9d4e2b7f5a1c8d6e0b4f93"
+
+
+def _register_managed_wake_host(host_store: HostStore, host_id: str, *, connected: bool) -> None:
+    """Register a resumable managed host; ``connected`` marks it live in the shared DB."""
+    name = f"managed-{host_id[:8]}"
+    host_store.register_managed_host(
+        host_id=host_id,
+        name=name,
+        user_id=RESERVED_USER_LOCAL,
+        token=f"tok-{host_id[:8]}",
+        provider="islo",
+        sandbox_id=f"sb-{host_id[:8]}",
+        token_expires_at=9_999_999_999,
+    )
+    if connected:
+        host_store.upsert_on_connect(host_id=host_id, name=name, user_id=RESERVED_USER_LOCAL)
+
+
+def _managed_wake_session(host_id: str, *, keyed: bool) -> SimpleNamespace:
+    """A session bound to *host_id*; keyed hosts carry the create's requested-host label."""
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+
+    return SimpleNamespace(
+        id=_WAKE_SESSION_ID,
+        host_id=host_id,
+        labels={REQUESTED_HOST_ID_LABEL_KEY: host_id} if keyed else {},
+        workspace="/root/workspace",
+        agent_id=None,
+        sub_agent_name=None,
+        inference_snapshot=None,
+        runner_id=None,
+    )
+
+
+def _resumable_managed_wake_config() -> ManagedSandboxDeployment:
+    fake = FakeSandboxLauncher(can_resume=True)
+    fake.provider = "islo"  # type: ignore[misc]
+    return ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+            provider="islo",
+        )
+    )
+
+
+async def test_wake_on_the_owning_replica_launches_the_runner_before_ready(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When this replica holds the woken host's tunnel, the wake launches a runner, then ready."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    host_store = HostStore(db_uri)
+    _register_managed_wake_host(host_store, _KEYED_HOST_ID, connected=True)
+    conv = _managed_wake_session(_KEYED_HOST_ID, keyed=True)
+    config = _resumable_managed_wake_config()
+    tracker = ManagedLaunchTracker()
+    tracker.begin(conv.id)
+    launch = tracker.get(conv.id)
+    assert launch is not None
+    stages: list[tuple[str, str | None]] = []
+    launched: list[str] = []
+
+    async def _resume_noop(*_args: object, **_kwargs: object) -> None:
+        pass
+
+    async def _launch_runner(*_args: object, **_kwargs: object) -> object:
+        launched.append("runner")
+        return sessions_module._HostLaunchAttempt(runner_id="runner_owning_replica")
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> object:
+            del timeout_s
+            return object()
+
+    def _record_stage(
+        _session_id: str, stage: str, error: str | None = None, **_kw: object
+    ) -> None:
+        stages.append((stage, error))
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume_noop)
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(sessions_module, "_publish_sandbox_status", _record_stage)
+
+    await sessions_module._run_managed_wake(
+        session_id=conv.id,
+        conv=conv,  # type: ignore[arg-type]
+        sandbox_config=config,
+        tracker=tracker,
+        conversation_store=SimpleNamespace(get_conversation=lambda _session_id: conv),  # type: ignore[arg-type]
+        host_store=host_store,
+        host_registry=SimpleNamespace(get=lambda _host_id: object()),  # type: ignore[arg-type]
+        tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
+    )
+
+    assert launched == ["runner"]
+    assert stages[-1] == ("ready", None)
+    assert launch.settled.is_set()
+    assert launch.error is None
+    assert tracker.get(conv.id) is None
 
 
 async def test_managed_wake_fails_when_runner_never_reconnects(

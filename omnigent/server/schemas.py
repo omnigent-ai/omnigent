@@ -47,7 +47,10 @@ from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
 
 # ── Shared ──────────────────────────────────────────────────────
 
-McpRegistryServiceId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,39}$")]
+MCP_REGISTRY_SERVICE_ID_PATTERN = r"^[a-z][a-z0-9_-]{0,39}$"
+# Most registry services one session (or automation) can select.
+MAX_MCP_REGISTRY_SERVICES = 40
+McpRegistryServiceId = Annotated[str, Field(pattern=MCP_REGISTRY_SERVICE_ID_PATTERN)]
 
 
 class PaginatedList(BaseModel):
@@ -1660,7 +1663,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
         registers the host under it and records it in the
         ``omnigent.sandbox.requested_host_id`` label, since the
         session's ``host_id`` stays null until the host binds. ``None``
-        lets the server mint one. JSON creates only, and not with
+        lets the server mint one. Not with
         ``parent_session_id`` (a child runs on its parent's host). An id
         naming an existing host, or sharing its ``managed-<first 8 hex>``
         name with one of the caller's hosts, fails with ``409``.
@@ -1708,6 +1711,12 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
         non-native sessions. Mirrors the multipart create path
         (:class:`SessionCreateMetadata`). See
         designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
+    :param permission_mode: Optional native permission mode for the new
+        session's harness, e.g. ``"approve-for-me"`` for Codex, which the
+        server turns into launch args. Set by ``sys_session_create``. Modes
+        that skip approval are refused, and it can't be combined with
+        ``terminal_launch_args`` or ``sub_agent_name``. ``None`` keeps the
+        agent's default.
     :param model_override: Optional per-session LLM model override to
         persist at create time, e.g. ``"databricks-claude-sonnet-4-6"``.
         Set by ``sys_session_send``'s per-dispatch ``model`` arg so the
@@ -1768,7 +1777,9 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
     initial_input: SessionStartupInput | None = None
-    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
+    mcp_registry_services: list[McpRegistryServiceId] = Field(
+        default_factory=list, max_length=MAX_MCP_REGISTRY_SERVICES
+    )
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
     sibling_source_id: str | None = None
@@ -1784,6 +1795,7 @@ class _SessionCreateRequestBase(_SandboxProfileSelection):
     workspaces: list[str] | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
+    permission_mode: str | None = Field(default=None, min_length=1, max_length=64)
     model_override: str | None = None
     reasoning_effort: str | None = None
     cost_control_mode_override: str | None = None
@@ -1981,7 +1993,9 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         binding token, writes the expected runner_id to the session
         row, and sends a ``host.launch_runner`` frame to the host.
         ``None`` for CLI-initiated sessions where the caller
-        manages runner spawning.
+        manages runner spawning. With ``host_type: "managed"`` it
+        instead names the NEW sandbox host (32 lowercase hex, as on
+        the JSON create) and is moved to ``requested_host_id``.
     :param workspace: Absolute path on the host where the runner
         should start, e.g. ``"/Users/corey/universe/src/foo"``.
         Required when ``host_id`` is set; validated against the
@@ -2016,7 +2030,9 @@ class SessionCreateMetadata(_SandboxProfileSelection):
 
     inference_configuration_revision: str | None = None
 
-    mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
+    mcp_registry_services: list[McpRegistryServiceId] = Field(
+        default_factory=list, max_length=MAX_MCP_REGISTRY_SERVICES
+    )
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None
@@ -2024,6 +2040,8 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     reasoning_effort: str | None = None
     model_override: str | None = None
     host_id: str | None = None
+    # A managed create's ``host_id``, moved here at validation (mirrors SessionCreateRequest).
+    requested_host_id: SkipJsonSchema[str | None] = None
     workspace: str | None = None
     workspaces: list[str] | None = None
     git: SessionGitOptions | None = None
@@ -2042,6 +2060,23 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         if self.initial_input is not None and self.host_type != "managed":
             raise ValueError("initial_input requires host_type=managed")
         return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def _move_managed_host_id(cls, data: Any) -> Any:
+        """
+        Move a managed create's ``host_id`` into ``requested_host_id``.
+
+        :param data: The raw metadata object.
+        :returns: The metadata, with a managed ``host_id`` moved.
+        """
+        if (
+            isinstance(data, dict)
+            and data.get("host_type") == "managed"
+            and data.get("host_id") is not None
+        ):
+            return {**data, "host_id": None, "requested_host_id": data["host_id"]}
+        return data
 
     @model_validator(mode="after")
     def _check_managed_bundle_fields(self) -> SessionCreateMetadata:
@@ -2069,10 +2104,16 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
 
         if self.host_type == "managed":
-            if self.host_id is not None:
+            if self.requested_host_id is not None and not _MANAGED_HOST_ID_RE.fullmatch(
+                self.requested_host_id
+            ):
                 raise ValueError(
-                    "host_type 'managed' lets the server provision the host; "
-                    "host_id must not be set"
+                    "host_type 'managed' takes a host_id of 32 lowercase hex characters"
+                )
+            if self.requested_host_id is not None and self.parent_session_id is not None:
+                raise ValueError(
+                    "host_id does not apply to a managed child session; "
+                    "it runs on its parent's host"
                 )
             if self.git is not None:
                 raise ValueError("git worktrees require an existing external host")
@@ -2095,6 +2136,8 @@ class SessionCreateMetadata(_SandboxProfileSelection):
                         f"(optionally '#<branch>') in each workspace: {exc}"
                     ) from exc
             return self
+        if self.requested_host_id is not None:
+            raise ValueError("requested_host_id only applies to host_type 'managed'")
         if self.sandbox_provider is not None:
             raise ValueError(
                 "sandbox_provider only applies to host_type 'managed' — "
@@ -3113,9 +3156,7 @@ class SessionManagedHostRequest(BaseModel):
         provision (one of the server's ``sandbox_providers``); ``None``
         takes the server's first.
     :param host_id: Id for the new sandbox host, 32 lowercase hex
-        characters, sent only when ``GET /v1/info`` reports
-        ``request_managed_sandbox_host_id``; ``None`` lets the server
-        mint one.
+        characters; ``None`` lets the server mint one.
     :param workspace: Git repository URL (optionally ``#<branch>``) cloned
         into the sandbox as the session's working directory, e.g.
         ``"https://github.com/org/repo#main"``; ``None`` gives the session
@@ -3140,6 +3181,66 @@ class SessionManagedHostRequest(BaseModel):
             self.host_id, [self.workspace] if self.workspace is not None else []
         )
         return self
+
+
+class SessionRewindRequest(BaseModel):
+    """
+    Request body for ``POST /v1/sessions/{session_id}/rewind``.
+
+    :param item_id: The session's user prompt to rewind to, e.g.
+        ``"msg_abc123"``. The new session keeps only the history before it.
+    """
+
+    item_id: str = Field(min_length=1, max_length=256)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionRewindAttachment(BaseModel):
+    """
+    A file the chosen ``/rewind`` prompt attached, as the rewound session holds it.
+
+    Exactly one of *file_id*, *image_url* and *file_data* is set.
+
+    :param type: The prompt's content block type, ``"input_file"`` or
+        ``"input_image"``.
+    :param file_id: The rewound session's copy of the file, e.g. ``"file_abc"``;
+        read it from ``/v1/sessions/{session_id}/resources/files/{file_id}``.
+    :param image_url: An image the prompt carried inline instead of as a stored
+        file, as a ``data:image/...`` URI (e.g. from a session imported from
+        another harness); the client uploads it on send like any attachment.
+    :param file_data: A document the prompt carried inline instead of as a
+        stored file, as a base64 ``data:`` URI, e.g.
+        ``"data:application/pdf;base64,..."``; uploaded on send like
+        *image_url*.
+    :param filename: The attachment's name, e.g. ``"diagram.png"``.
+    """
+
+    type: Literal["input_file", "input_image"]
+    file_id: str | None = None
+    image_url: str | None = None
+    file_data: str | None = None
+    filename: str
+
+
+class SessionRewindResponse(BaseModel):
+    """
+    Result of ``POST /v1/sessions/{session_id}/rewind``.
+
+    :param session_id: The rewound session that continues the work, e.g.
+        ``"conv_new"``. The source session gets a notice linking to it.
+    :param prompt: Text of the chosen prompt, for the client to put back in
+        the composer, e.g. ``"Add a test for the parser"``.
+    :param attachments: The prompt's attachments, in prompt order, for the
+        client to put back in the composer; empty when it had none.
+    :param attachments_incomplete: Some attachments could not be restored;
+        warn the user to attach them again before sending.
+    """
+
+    session_id: str
+    prompt: str
+    attachments: list[SessionRewindAttachment] = Field(default_factory=list)
+    attachments_incomplete: bool = False
 
 
 class ReadStatePutRequest(BaseModel):
@@ -3744,10 +3845,12 @@ class GrantPermissionRequest(BaseModel):
         access subject to the server's public permission ceiling.
     :param level: Numeric permission level: ``1`` = read,
         ``2`` = edit, ``3`` = manage.
+    :param ensure_minimum: Preserve a stronger existing grant atomically.
     """
 
     user_id: str
     level: int = Field(ge=1, le=3)
+    ensure_minimum: bool = False
 
 
 class PermissionObject(BaseModel):
@@ -4515,7 +4618,7 @@ class SessionCreatedEvent(_SSEEventBase):
 
 
 # Why a session's work moved to another session (``session.superseded``).
-SupersessionReason = Literal["clear"]
+SupersessionReason = Literal["clear", "rewind"]
 
 
 class SessionSupersededEvent(_SSEEventBase):
@@ -4547,9 +4650,8 @@ class SessionSupersededEvent(_SSEEventBase):
         event rides the stream of, e.g. ``"conv_old"``.
     :param target_conversation_id: The conversation to follow to, e.g.
         ``"conv_new"``.
-    :param reason: Why the session was superseded. Currently always
-        ``"clear"`` (a Claude Code ``/clear``); kept as a field so the
-        client can branch on future supersession causes.
+    :param reason: Why the session was superseded: ``"clear"`` (a
+        ``/clear``) or ``"rewind"`` (a ``/rewind`` onto a truncated fork).
     """
 
     type: Literal["session.superseded"]

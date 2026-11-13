@@ -29,7 +29,7 @@ import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
+import { skipToken, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import {
   ArrowLeftIcon,
   CopyIcon,
@@ -187,7 +187,8 @@ function codeSpans(text: string): React.ReactNode {
  * resolves, the account is correct — surfacing the knob then would just invite a
  * misconfiguration, so it's absent from the header and the `no-pr` state. Renders
  * nothing with a single account (nothing to choose) or when the provider can't
- * switch accounts.
+ * switch accounts. The merge dialog has its own account picker, because an
+ * account that can read a PR may still be refused the merge.
  */
 function GithubAccountSelector({
   conversationId,
@@ -231,6 +232,13 @@ function GithubAccountSelector({
       )}
     </div>
   );
+}
+
+/** The accounts the merge dialog offers, when the host merges as the one it sends. */
+function mergeAccounts(info: NormalizedPullRequestInfo | undefined) {
+  return info?.capabilities.account_switching && info.capabilities.merge_as_account
+    ? info.auth
+    : undefined;
 }
 
 /** The one thing the panel should show, derived from the info query. Every
@@ -936,6 +944,7 @@ function PullRequestListRow({
             conversationId={conversationId}
             prUrl={association.url}
             pr={cachedPr}
+            accounts={mergeAccounts(data)}
           />
         )}
       </div>
@@ -990,6 +999,18 @@ interface PullRequestPanelView {
 
 const DEFAULT_PANEL_VIEW: PullRequestPanelView = { showingDetails: false, subtab: "summary" };
 
+export function selectPullRequestInPanel(
+  queryClient: QueryClient,
+  conversationId: string,
+  prUrl: string,
+) {
+  queryClient.setQueryData<PullRequestPanelView>(["pull-request-panel-view", conversationId], {
+    selected: prUrl,
+    showingDetails: true,
+    subtab: "summary",
+  });
+}
+
 export function PullRequestPanel({
   conversationId,
   active = true,
@@ -1009,11 +1030,13 @@ export function PullRequestPanel({
     gcTime: 30 * 60_000,
   });
   // Keep interactions synchronous; the shared entry restores the view on navigation.
-  const [localView, setLocalView] = useState({ conversationId, view: cachedView });
-  if (localView.conversationId !== conversationId) {
-    setLocalView({ conversationId, view: cachedView });
+  const [localView, setLocalView] = useState({ conversationId, cachedView, view: cachedView });
+  const cacheChanged =
+    localView.conversationId !== conversationId || localView.cachedView !== cachedView;
+  if (cacheChanged) {
+    setLocalView({ conversationId, cachedView, view: cachedView });
   }
-  const view = localView.conversationId === conversationId ? localView.view : cachedView;
+  const view = cacheChanged ? cachedView : localView.view;
   const selected = view.selected;
   const showingDetails = view.showingDetails;
   const activeTab = view.subtab;
@@ -1028,7 +1051,7 @@ export function PullRequestPanel({
           ...update,
         }),
       );
-      setLocalView({ conversationId, view: next! });
+      setLocalView((current) => ({ ...current, conversationId, view: next! }));
     },
     [queryClient, conversationId],
   );
@@ -1855,6 +1878,7 @@ function PullRequestPanelDetails({
                   conversationId={conversationId}
                   prUrl={data.selected_pr_url}
                   pr={pr}
+                  accounts={mergeAccounts(data)}
                 />
               )
             }

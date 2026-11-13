@@ -39,6 +39,7 @@ _CAPABILITIES = ProviderCapabilities(
     details_editing=True,
     attachment_uploads=True,
     commit_history=True,
+    merge_as_account=True,
 )
 
 
@@ -269,6 +270,26 @@ class GitHubPullRequests:
 
         return github_resource._merge_pr(
             root, reference, merge_method=merge_method, expected_head=expected_head
+        )
+
+    def merge_as(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        merge_method: str,
+        expected_head: str,
+        account: str,
+    ) -> dict[str, Any]:
+        """Merge with ``gh pr merge --match-head-commit`` as ``account``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._merge_pr(
+            root,
+            reference,
+            merge_method=merge_method,
+            expected_head=expected_head,
+            account=account,
         )
 
     def disable_auto_merge(self, root: str, reference: PullRequestRef) -> dict[str, Any]:

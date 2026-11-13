@@ -1779,9 +1779,6 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
     """
     Whether a permission hook is parked on this session's verdict right now.
 
-    Scans every hook's marker for the session; a stale one (a hook killed
-    mid-wait) is removed on the way so they never accumulate.
-
     :param session_id: Omnigent session id to check, e.g.
         ``"conv_abc123"``.
     :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
@@ -1789,20 +1786,38 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
         :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when none exists, all
         are stale, or the root is unreadable.
     """
+    return bool(fresh_approval_wait_markers(session_id, bridge_dir=bridge_dir))
+
+
+def fresh_approval_wait_markers(session_id: str, *, bridge_dir: Path | None = None) -> list[str]:
+    """
+    Name each permission hook parked on this session's verdict right now.
+
+    Scans every hook's marker for the session; a stale one (a hook killed
+    mid-wait) is removed on the way so they never accumulate. Each hook
+    process owns one marker, so a name identifies one wait.
+
+    :param session_id: Omnigent session id to check, e.g.
+        ``"conv_abc123"``.
+    :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
+    :returns: File names of markers touched within
+        :data:`APPROVAL_WAIT_MARKER_TTL_S`, e.g. ``["<digest>.4242.wait"]``;
+        empty when none exists, all are stale, or the root is unreadable.
+    """
     root = bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME if bridge_dir else _APPROVAL_WAIT_ROOT
     try:
         markers = list(root.glob(f"{_approval_wait_digest(session_id)}.*.wait"))
     except OSError:
-        return False
+        return []
     now = time.time()
-    fresh = False
+    fresh: list[str] = []
     for marker in markers:
         try:
             touched_at = marker.stat().st_mtime
         except OSError:
             continue
         if now - touched_at < APPROVAL_WAIT_MARKER_TTL_S:
-            fresh = True
+            fresh.append(marker.name)
         else:
             clear_approval_wait_marker(marker)
     return fresh
@@ -3215,7 +3230,7 @@ def augment_claude_args(
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
-    args, caller_settings = _pop_caller_settings(args)
+    args, caller_settings = _pop_caller_settings(args, workspace=workspace)
     if caller_settings:
         hook_settings = _merge_caller_settings(hook_settings, caller_settings, bridge_dir)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
@@ -3368,7 +3383,9 @@ def _merge_append_system_prompt(
     return args
 
 
-def _pop_caller_settings(args: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+def _pop_caller_settings(
+    args: list[str], *, workspace: Path | None
+) -> tuple[list[str], list[dict[str, Any]]]:
     """
     Remove caller ``--settings`` flags from ``args`` and return their parsed values.
 
@@ -3377,6 +3394,7 @@ def _pop_caller_settings(args: list[str]) -> tuple[list[str], list[dict[str, Any
     is a JSON object or a path to one; unreadable values stay in ``args`` untouched.
 
     :param args: Claude CLI argument list.
+    :param workspace: Terminal workspace for relative settings paths.
     :returns: ``(args without the merged flags, parsed settings in flag order)``.
     """
     kept: list[str] = []
@@ -3395,8 +3413,11 @@ def _pop_caller_settings(args: list[str]) -> tuple[list[str], list[dict[str, Any
         parsed: object = None
         try:
             inline = value.lstrip().startswith("{")
-            parsed = json.loads(value if inline else Path(value).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            settings_path = Path(value)
+            if not inline and not settings_path.is_absolute() and workspace is not None:
+                settings_path = workspace / settings_path
+            parsed = json.loads(value if inline else settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             parsed = None
         if isinstance(parsed, dict):
             found.append(parsed)
@@ -3412,46 +3433,64 @@ def _merge_caller_settings(
     """
     Merge caller ``--settings`` objects into Omnigent's invocation settings.
 
-    Caller hooks run before Omnigent's for the same event, ``env`` merges,
+    Caller hook entries precede Omnigent's for the same event, ``env`` merges,
     ``permissions`` lists merge, a caller ``statusLine`` command is chained after
     Omnigent's context capture (in place of the user's global one), and any other
-    key Omnigent does not set is taken from the caller. Omnigent's own values win
-    on conflict so its bridge keeps working.
+    key Omnigent does not set is taken from the caller. Later caller values win
+    before Omnigent's own values take precedence. Options that would disable
+    the required bridge hooks are rejected.
 
     :param settings: Omnigent's invocation settings.
     :param callers: Parsed caller settings, in flag order.
     :param bridge_dir: Bridge directory the statusLine capture writes into.
     :returns: The merged settings.
+    :raises ValueError: Caller settings disable the required bridge hooks.
     """
-    merged = dict(settings)
     for caller in callers:
-        for key, value in caller.items():
+        for flag in ("disableAllHooks", "allowManagedHooksOnly"):
+            if caller.get(flag) is True:
+                raise ValueError(f"Caller {flag}=true disables required Omnigent bridge hooks")
+    caller_status = next(
+        (caller["statusLine"] for caller in reversed(callers) if "statusLine" in caller), None
+    )
+    merged: dict[str, Any] = {}
+    for source in [*callers, settings]:
+        for key, value in source.items():
+            previous = merged.get(key)
             if key == "hooks" and isinstance(value, dict):
-                hooks = {k: list(v) for k, v in (merged.get("hooks") or {}).items()}
+                hooks = dict(previous) if isinstance(previous, dict) else {}
                 for event, entries in value.items():
                     if isinstance(entries, list):
-                        hooks[event] = [*entries, *hooks.get(event, [])]
-                merged["hooks"] = hooks
-            elif key == "env" and isinstance(value, dict):
-                merged["env"] = {**value, **(merged.get("env") or {})}
+                        existing = hooks.get(event)
+                        hooks[event] = [
+                            *(existing if isinstance(existing, list) else []),
+                            *entries,
+                        ]
+                merged[key] = hooks
             elif key == "permissions" and isinstance(value, dict):
-                perms = dict(merged.get("permissions") or {})
-                for pkey, pval in value.items():
-                    if isinstance(pval, list) and isinstance(perms.get(pkey), list):
-                        perms[pkey] = list(dict.fromkeys([*perms[pkey], *pval]))
+                permissions = dict(previous) if isinstance(previous, dict) else {}
+                for name, rules in value.items():
+                    existing = permissions.get(name)
+                    if isinstance(rules, list) and isinstance(existing, list):
+                        permissions[name] = [
+                            *existing,
+                            *(rule for rule in rules if rule not in existing),
+                        ]
                     else:
-                        perms.setdefault(pkey, pval)
-                merged["permissions"] = perms
-            elif key == "statusLine" and isinstance(value, dict):
-                command = value.get("command")
-                if isinstance(command, str) and command.strip():
-                    merged["statusLine"] = {
-                        **value,
-                        "type": "command",
-                        "command": _status_line_command(bridge_dir, command),
-                    }
+                        permissions[name] = rules
+                merged[key] = permissions
+            elif isinstance(value, dict) and isinstance(previous, dict):
+                merged[key] = {**previous, **value}
             else:
-                merged.setdefault(key, value)
+                merged[key] = value
+    if isinstance(caller_status, dict):
+        command = caller_status.get("command")
+        if isinstance(command, str) and command.strip():
+            merged["statusLine"] = {
+                **caller_status,
+                "type": "command",
+                "command": _status_line_command(bridge_dir, command),
+            }
     return merged
 
 

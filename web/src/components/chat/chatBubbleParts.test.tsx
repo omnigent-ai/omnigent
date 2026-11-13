@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ElicitationBlock } from "@/lib/blocks";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import { PEER_SESSION_MESSAGES_STORAGE_KEY } from "@/lib/peerSessionMessagePreferences";
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import type { Comment } from "@/hooks/useComments";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
@@ -89,6 +90,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  localStorage.removeItem(PEER_SESSION_MESSAGES_STORAGE_KEY);
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   useChatStore.setState(initialStoreState);
@@ -409,6 +411,31 @@ describe("UserBubble messages from another session", () => {
     renderOriginBubble(client, "[Message from session s_src]\n[System: build finished]");
     expect(screen.getByTestId("message-origin").textContent).toBe("From@Casual greeting");
     expect(screen.getByText("[System: build finished]")).toBeInTheDocument();
+  });
+
+  it("collapses a message from another session to its first line until expanded", () => {
+    const client = new QueryClient();
+    client.setQueryData(["session", "s_src"], { title: "Reviewer", parentSessionId: null });
+    renderOriginBubble(client, "[Message from session s_src]\n\nVerdict: approve\nDetails follow");
+    expect(screen.getByTestId("collapsed-session-message")).toBeInTheDocument();
+    expect(screen.getByTestId("message-origin").textContent).toBe("From@Reviewer");
+    expect(screen.getByTestId("expand-session-message").textContent).toBe("Verdict: approve");
+    expect(screen.queryByTestId("user-message-content")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("expand-session-message"));
+    expect(screen.queryByTestId("collapsed-session-message")).not.toBeInTheDocument();
+    expect(screen.getByTestId("user-message-content").textContent).toContain("Details follow");
+
+    fireEvent.click(screen.getByTestId("collapse-session-message"));
+    expect(screen.getByTestId("collapsed-session-message")).toBeInTheDocument();
+  });
+
+  it("shows a message from another session in full when the reader chose to", () => {
+    localStorage.setItem(PEER_SESSION_MESSAGES_STORAGE_KEY, "show");
+    renderOriginBubble(new QueryClient(), "[Message from session s_src]\nfull text");
+    expect(screen.queryByTestId("collapsed-session-message")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("collapse-session-message")).not.toBeInTheDocument();
+    expect(screen.getByTestId("user-message-content").textContent).toContain("full text");
   });
 });
 
