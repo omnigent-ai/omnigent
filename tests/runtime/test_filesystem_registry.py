@@ -1929,6 +1929,34 @@ def test_git_untracked_lines_read_past_short_reads(tmp_path: Path, monkeypatch) 
     assert [r["untracked_lines"] for r in records] == [2, None]
 
 
+def test_git_untracked_lines_reserve_reads_before_they_start(tmp_path: Path, monkeypatch) -> None:
+    """Failed and grown reads still spend their allowance, so the budget bounds every byte read."""
+    monkeypatch.setattr(
+        "omnigent.runtime.filesystem_registry._UNTRACKED_LINES_MAX_TOTAL_BYTES", 20
+    )
+    paths = ["grown.txt", *(f"fails_{index}.txt" for index in range(4))]
+    for path in paths:
+        (tmp_path / path).write_bytes(b"1\n2\n3\n4\n")
+    # grown.txt was listed before it doubled; the others fail after their first chunk.
+    records = [{"path": path, "bytes": 4 if path == "grown.txt" else 8} for path in paths]
+    consumed = 0
+    real_read = os.read
+
+    def read_one_chunk_then_fail(fd: int, size: int) -> bytes:
+        nonlocal consumed
+        if os.lseek(fd, 0, os.SEEK_CUR):
+            raise OSError("injected I/O error")
+        chunk = real_read(fd, size)
+        consumed += len(chunk)
+        return chunk
+
+    monkeypatch.setattr(os, "read", read_one_chunk_then_fail)
+
+    _count_untracked_lines(tmp_path, records, set(paths))
+    assert [r["untracked_lines"] for r in records] == [None] * len(paths)
+    assert consumed <= 20
+
+
 def test_multi_repo_untracked_lines_share_one_budget_newest_first(
     tmp_path: Path, monkeypatch
 ) -> None:

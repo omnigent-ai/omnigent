@@ -170,7 +170,7 @@ _SKIP_DIRS: frozenset[str] = frozenset(
 )
 
 # Caps on reading untracked files to count their lines, per changes listing.
-# A read may take one byte past a cap to detect a file that grew past it.
+# Each read reserves the listed size plus one byte, which detects a grown file.
 _UNTRACKED_LINES_MAX_FILES = 1_000
 _UNTRACKED_LINES_MAX_FILE_BYTES = 1024 * 1024
 _UNTRACKED_LINES_MAX_TOTAL_BYTES = 8 * 1024 * 1024
@@ -194,8 +194,8 @@ def _count_untracked_lines(root: Path, records: list[dict[str, Any]], untracked:
 
     Counts newline-terminated lines (plus an unterminated last line) in files
     that pass Git's NUL-byte content check; ``.gitattributes`` overrides are
-    not applied. Binary, oversized, unsafe, unreadable and over-budget files
-    get ``None``; one budget bounds the reads of a whole listing. Tracked
+    not applied. Binary, oversized, grown, unsafe, unreadable and over-budget
+    files get ``None``; one budget bounds the reads of a whole listing. Tracked
     records are left alone, so ``lines_added`` keeps meaning "tracked lines".
 
     :param root: Directory the record paths are relative to.
@@ -209,15 +209,19 @@ def _count_untracked_lines(root: Path, records: list[dict[str, Any]], untracked:
     for record in records:
         if record["path"] not in untracked:
             continue
-        cap = min(_UNTRACKED_LINES_MAX_FILE_BYTES, budget)
         size = record["bytes"]
         data = None
-        if files_left > 0 and size is not None and size <= cap:
+        if (
+            files_left > 0
+            and size is not None
+            and size <= _UNTRACKED_LINES_MAX_FILE_BYTES
+            and size < budget
+        ):
+            # Spend the allowance before reading, so a read that fails midway still counts.
             files_left -= 1
-            data = read_regular_file_beneath(root, record["path"], cap)
-        if data is not None:
-            budget -= len(data)
-        if data is None or len(data) > cap or b"\0" in data[:_BINARY_SNIFF_BYTES]:
+            budget -= size + 1
+            data = read_regular_file_beneath(root, record["path"], size)
+        if data is None or len(data) > size or b"\0" in data[:_BINARY_SNIFF_BYTES]:
             record["untracked_lines"] = None
         else:
             trailing = 1 if data and not data.endswith(b"\n") else 0
