@@ -673,9 +673,11 @@ async def test_release_reaps_term_resistant_process_when_graceful_wait_is_cancel
 
 
 @pytest.mark.parametrize("cancel_stage", ["force_wait", "client_close"])
-async def test_release_reaps_process_when_teardown_is_cancelled(
+@pytest.mark.parametrize("operation", ["release", "policy_replacement"])
+async def test_teardown_cancellation_reaps_process_and_releases_state(
     monkeypatch: pytest.MonkeyPatch,
     cancel_stage: str,
+    operation: str,
 ) -> None:
     """Cancellation during force wait or client close still cleans up."""
     from omnigent.runtime.harnesses import process_manager as process_manager_module
@@ -711,6 +713,8 @@ async def test_release_reaps_process_when_teardown_is_cancelled(
                 await asyncio.Event().wait()
 
     class _Endpoint:
+        socket_path = None
+
         def __init__(self) -> None:
             self.cleaned = False
 
@@ -737,21 +741,35 @@ async def test_release_reaps_process_when_teardown_is_cancelled(
         "close_subprocess_transport",
         lambda process: transport_closes.append(process),
     )
-    manager = object.__new__(HarnessProcessManager)
-    manager._entries = {}
-    manager._spawn_locks = {"conv_a": asyncio.Lock()}
-    manager._registry_lock = asyncio.Lock()
-    manager._release_generations = {}
-    manager._in_flight_response_ids = {}
+    manager = HarnessProcessManager()
+    manager._started = True
     entry = process_manager_module._SubprocessEntry(
         process,
         client,
         endpoint,
         "test",
+        os_env_config='{"sandbox":{"type":"none"}}',
     )
     manager._entries["conv_a"] = entry
+    manager._in_flight_response_ids["conv_a"] = "resp_retired"
+    notifications: list[tuple[str, str, str]] = []
 
-    closing = asyncio.create_task(manager.release("conv_a"))
+    async def notify(conv_id: str, reason: str, response_id: str) -> None:
+        async with asyncio.timeout(1):
+            with pytest.raises(NoLiveHarnessError):
+                await manager.get_client(conv_id, "any")
+        notifications.append((conv_id, reason, response_id))
+
+    manager.set_respawn_hook(notify)
+    spawn = AsyncMock()
+    monkeypatch.setattr(manager, "_spawn_entry", spawn)
+    env = {"HARNESS_TEST_OS_ENV": '{"sandbox":{"type":"linux_bwrap"}}'}
+
+    closing = asyncio.create_task(
+        manager.release("conv_a")
+        if operation == "release"
+        else manager.get_client("conv_a", "test", env=env)
+    )
     if cancel_stage == "client_close":
         await asyncio.wait_for(client.aclose_started.wait(), timeout=1.0)
     else:
@@ -769,6 +787,23 @@ async def test_release_reaps_process_when_teardown_is_cancelled(
     assert process.wait_calls == (2 if cancel_stage == "force_wait" else 1)
     assert transport_closes == [process]
     assert endpoint.cleaned
+    assert not manager.has_active_turn("conv_a")
+    assert not (await manager._get_spawn_lock("conv_a")).locked()
+    spawn.assert_not_awaited()
+    if operation == "policy_replacement":
+        assert notifications == [("conv_a", "harness_respawn_policy_change", "resp_retired")]
+        replacement = _SubprocessEntry(
+            process=Mock(returncode=None),
+            client=object(),  # type: ignore[arg-type]
+            endpoint=None,  # type: ignore[arg-type]
+            harness="test",
+            os_env_config=env["HARNESS_TEST_OS_ENV"],
+        )
+        spawn.return_value = replacement
+        assert await manager.get_client("conv_a", "test", env=env) is replacement.client
+        assert len(notifications) == 1
+    else:
+        assert notifications == []
 
 
 @pytest.mark.parametrize("response_id", [None, "resp_crashed"])
