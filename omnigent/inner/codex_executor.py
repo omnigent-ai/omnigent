@@ -32,7 +32,7 @@ from collections.abc import (
     MutableMapping,
     Sequence,
 )
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -3257,7 +3257,10 @@ class _CodexAppServerSession:
             if skip_reason is not None:
                 logger.warning("%s", skip_reason)
                 router_bridge_dir = None
-        with harness_sandbox_preparation():
+        sandbox_requested = self._os_env_spec is not None and (
+            self._os_env_spec.sandbox is None or self._os_env_spec.sandbox.type != "none"
+        )
+        with harness_sandbox_preparation() if sandbox_requested else nullcontext():
             process_cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
         # Off the loop: this copies/symlinks a home AND (on the routing path)
         # shells out to ``codex debug models`` with a 10s timeout. Run inline it
