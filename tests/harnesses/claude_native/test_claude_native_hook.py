@@ -3058,7 +3058,8 @@ def test_reattach_re_posts_a_held_poll_whose_reply_never_arrives(
         server.server_close()
     resp = result["resp"]
     assert resp is not None and resp.status_code == 200
-    assert len(elicitation_ids) == 2 and elicitation_ids[0] == elicitation_ids[1]
+    # A live reply slower than the read timeout is re-POSTed too, so count only re-parks.
+    assert len(elicitation_ids) >= 2 and set(elicitation_ids) == {elicitation_ids[0]}
 
 
 def test_reattach_holds_the_approval_wait_marker_until_the_wait_ends(
