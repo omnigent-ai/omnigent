@@ -287,6 +287,8 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
         """See base class.
 
         Several statuses are read as one bounded page per status, then merged.
+        The reads are separate statements, so an item whose status changes
+        between them can come back in two pages; it is kept once.
         """
         page_statuses: list[str | None] = [*sorted(statuses)] if statuses else [None]
         with self._session("list_inbox_items") as session:
@@ -302,7 +304,15 @@ class SqlAlchemyInboxItemStore(InboxItemStore):
                 for status in page_statuses
             ]
             merged = heapq.merge(*pages, key=lambda row: (row.created_at, row.id), reverse=True)
-            rows = [row for _, row in zip(range(limit + 1), merged, strict=False)]
+            rows: list[SqlInboxItem] = []
+            seen: set[str] = set()
+            for row in merged:
+                if row.id in seen:
+                    continue
+                seen.add(row.id)
+                rows.append(row)
+                if len(rows) > limit:
+                    break
             items = [_to_entity(row) for row in rows[:limit]]
         next_cursor = None
         if len(rows) > limit and items:
