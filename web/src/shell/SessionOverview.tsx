@@ -1,5 +1,5 @@
-// WIP(session_overview): minimal first cut showing the session cost moved out of
-// Agent info; sub-agent costs come later.
+// WIP(session_overview): first cut with the session total and per-model usage;
+// sub-agent costs come later.
 
 import { useSyncExternalStore } from "react";
 import { XIcon } from "lucide-react";

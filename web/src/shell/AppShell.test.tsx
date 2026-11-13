@@ -3132,15 +3132,29 @@ describe("Session overview", () => {
     expect(overview()).toBeNull();
   });
 
-  it("docks open in a wide window with the workspace collapsed", async () => {
+  it("docks beside chat in a wide window and keeps each placement's choice", async () => {
     setWideViewport(true);
     await renderOverviewShell(true, "collapsed");
+    const chip = () => screen.getByTestId("header-session-cost");
 
-    const toggle = screen.getByTestId("header-session-cost");
-    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(chip()).toHaveAttribute("aria-pressed", "true");
     expect(overview()).toBeInTheDocument();
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("main")).not.toContainElement(overview());
+    fireEvent.click(chip());
+    expect(chip()).toHaveAttribute("aria-pressed", "false");
+    expect(overview()).toBeNull();
+
+    // The open workspace switches to the overlay, which starts hidden.
+    fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
+    await waitFor(() => expect(railOpenState()).toBe("open"));
+    expect(overview()).toBeNull();
+    fireEvent.click(chip());
+    expect(screen.getByRole("main")).toContainElement(overview());
+
+    // Collapsing it docks again, keeping the docked card hidden.
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    await waitFor(() => expect(railOpenState()).toBe("closed"));
+    expect(chip()).toHaveAttribute("aria-pressed", "false");
     expect(overview()).toBeNull();
   });
 
