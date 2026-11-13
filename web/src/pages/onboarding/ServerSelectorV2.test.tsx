@@ -270,6 +270,7 @@ describe("ServerSelectorV2", () => {
     const getRunnerOptions = vi.fn().mockResolvedValue({ remote: false, bundledCli: false });
     const onConnect = vi.fn().mockResolvedValue({});
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
     render(
       <ServerSelectorV2
         setup={makeSetup({
@@ -278,6 +279,7 @@ describe("ServerSelectorV2", () => {
           getRunnerOptions,
           onConnect,
           onInstallCli,
+          onConnectRunner,
         })}
       />,
     );
@@ -293,6 +295,7 @@ describe("ServerSelectorV2", () => {
     expect(getRunnerOptions).toHaveBeenCalledWith("https://typed.example.com/");
     expect(screen.queryByRole("heading", { name: /where do you work today/i })).toBeNull();
     expect(onInstallCli).not.toHaveBeenCalled();
+    expect(onConnectRunner).not.toHaveBeenCalled();
   });
 
   it("a new MDM user's typed local install keeps the runner step", async () => {
