@@ -133,6 +133,7 @@ overrides:
 
 allowBuilds:
   '@anthropic-ai/claude-code': true
+  '@bufbuild/buf': false
   '@google/genai': true
   '@vscode/vsce-sign': true
   canvas: true

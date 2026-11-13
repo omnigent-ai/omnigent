@@ -4095,6 +4095,7 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
+        await _native_runtime.teardown_codex_native_app_server(session_id)
         await _cancel_auto_forwarder_task(session_id)
         # Close any OpenCode server that no forwarder adopted.
         await _native_runtime.teardown_opencode_native_server(session_id)
@@ -4262,6 +4263,10 @@ def create_runner_app(
         source_error: Mapping[str, object] | None = None,
         response_id: str | None = None,
     ) -> None:
+        if status == "running":
+            # A new turn pulls any backed-off native idle watcher back to the
+            # base cadence so session status tracks the turn, not a slow poll.
+            resource_registry.wake_session_terminal_watchers(conv_id)
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
         ):

@@ -1,6 +1,6 @@
 "use strict";
 
-const { describe, it, mock } = require("node:test");
+const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { pathToFileURL } = require("node:url");
@@ -231,116 +231,129 @@ describe("browser permission popover", () => {
     );
   });
 
-  it("brings back a security-key notice the app hid, but not one the user dismissed", async () => {
-    mock.timers.enable({ apis: ["setTimeout"] });
-    try {
-      const h = harness();
-      const contents = Object.assign(new EventEmitter(), {
-        ipc: new EventEmitter(),
-        mainFrame: {},
-        getURL: () => `${ORIGIN}/verify`,
-        isDestroyed: () => false,
-      });
-      let visible = true;
-      attachSecurityKeyNotice(contents, {
-        canPrompt: () => visible,
-        showPrompt: (options) => h.show(options),
-        openExternal: () => {},
-        cookieImport: false,
-      });
-      const wait = async () => {
-        await tick();
-        mock.timers.tick(SHOW_DELAY_MS);
-        await tick();
-      };
-      contents.ipc.emit(PENDING_CHANNEL, { senderFrame: contents.mainFrame }, true);
-      await wait();
-      assert.equal(h.windows.length, 1);
-      const hideThenReturn = async (hide) => {
-        visible = false;
-        hide();
-        await wait();
-        assert.equal(h.windows.at(-1).destroyed, true);
-        const shown = h.windows.length;
-        visible = true;
-        await wait();
-        assert.equal(h.windows.length, shown + 1, "the pane is back while the request waits");
-      };
-      // Clicking another conversation blurs the notice before the pane switch closes it.
-      await hideThenReturn(() => {
+  async function securityKeyHarness(t) {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = harness();
+    const contents = Object.assign(new EventEmitter(), {
+      ipc: new EventEmitter(),
+      mainFrame: {},
+      getURL: () => `${ORIGIN}/verify`,
+      isDestroyed: () => false,
+    });
+    const state = { visible: true };
+    attachSecurityKeyNotice(contents, {
+      canPrompt: () => state.visible,
+      showPrompt: (options) => h.show(options),
+      openExternal: () => {},
+      cookieImport: false,
+    });
+    t.after(() => contents.emit("destroyed"));
+    const wait = async () => {
+      await tick();
+      t.mock.timers.tick(SHOW_DELAY_MS);
+      await tick();
+    };
+    const pending = (value) =>
+      contents.ipc.emit(PENDING_CHANNEL, { senderFrame: contents.mainFrame }, value);
+    pending(true);
+    await wait();
+    assert.equal(h.windows.length, 1);
+    return { ...h, contents, state, wait, pending };
+  }
+
+  for (const [name, hide] of [
+    [
+      "pane switch after blur",
+      (h) => {
         h.windows.at(-1).emit("blur");
         h.controller.dismiss(h.parent);
-      });
-      await hideThenReturn(() => h.parent.emit("hide"));
-      await hideThenReturn(() => h.parent.emit("minimize"));
-      const beforeNavigation = h.windows.length;
-      h.parent.loadingMainFrame = true;
-      h.parent.webContents.emit("did-start-navigation", {}, "https://app.example", false, true);
-      await wait();
-      assert.equal(visible, true, "the shell stays visible while navigating");
-      assert.equal(h.windows.at(-1).destroyed, true);
-      assert.equal(h.windows.length, beforeNavigation, "navigation prevents immediate reopening");
-      await wait();
-      assert.equal(h.windows.length, beforeNavigation, "the notice waits for navigation to finish");
-      h.parent.loadingMainFrame = false;
-      h.parent.webContents.emit("did-stop-loading");
-      await wait();
-      assert.equal(h.windows.length, beforeNavigation + 1, "the notice returns after navigation");
-      const warning = mock.method(console, "warn", () => {});
-      const originalShow = h.controller.show;
-      const failedShow = mock.method(h.controller, "show", () => {
-        throw new Error("popup construction failed");
-      });
-      h.controller.dismiss(h.parent);
-      await wait();
-      assert.equal(warning.mock.callCount(), 1);
-      failedShow.mock.restore();
-      await wait();
-      assert.equal(h.controller.show, originalShow);
-      assert.equal(h.windows.at(-1).destroyed, false, "construction failure retries recover");
-      // A new request gets its own failure budget.
-      contents.ipc.emit(PENDING_CHANNEL, { senderFrame: contents.mainFrame }, false);
-      contents.ipc.emit(PENDING_CHANNEL, { senderFrame: contents.mainFrame }, true);
-      await wait();
-      const beforeFailure = h.windows.length;
-      const failedLoad = mock.method(Window.prototype, "loadFile", () =>
-        Promise.reject(new Error("popup failed to load")),
-      );
-      h.windows.at(-1).webContents.emit("render-process-gone");
-      await tick();
-      assert.equal(h.windows.length, beforeFailure, "renderer failure waits before retrying");
-      await wait();
-      assert.equal(h.windows.length, beforeFailure + 1);
-      assert.equal(h.windows.at(-1).destroyed, true, "failed page load closes the popup");
-      await wait();
-      assert.equal(h.windows.length, beforeFailure + 1, "repeated failures increase the delay");
-      await wait();
-      assert.equal(h.windows.length, beforeFailure + 2);
-      mock.timers.tick(SHOW_DELAY_MS * 100);
-      await tick();
-      assert.equal(h.windows.length, beforeFailure + 2, "three failures exhaust this request");
-      failedLoad.mock.restore();
-      contents.ipc.emit(PENDING_CHANNEL, { senderFrame: contents.mainFrame }, false);
-      contents.ipc.emit(PENDING_CHANNEL, { senderFrame: contents.mainFrame }, true);
-      await wait();
-      assert.equal(
-        h.windows.length,
-        beforeFailure + 3,
-        "a new request can recover after load succeeds",
-      );
-      h.windows.at(-1).emit("blur");
-      await wait();
-      assert.equal(h.windows.at(-1).destroyed, false, "focus leaving keeps the notice");
-      const beforeDismiss = h.windows.length;
-      h.choose("dismiss");
-      mock.timers.tick(SHOW_DELAY_MS * 2);
-      await tick();
-      assert.equal(h.windows.at(-1).destroyed, true);
-      assert.equal(h.windows.length, beforeDismiss, "explicit dismissal does not retry");
-    } finally {
-      mock.restoreAll();
-      mock.timers.reset();
-    }
+      },
+    ],
+    ["parent hide", (h) => h.parent.emit("hide")],
+    ["parent minimize", (h) => h.parent.emit("minimize")],
+  ]) {
+    it(`restores a pending security-key notice after ${name}`, async (t) => {
+      const h = await securityKeyHarness(t);
+      h.state.visible = false;
+      hide(h);
+      await h.wait();
+      assert.equal(h.windows[0].destroyed, true);
+      assert.equal(h.windows.length, 1);
+      h.state.visible = true;
+      await h.wait();
+      assert.equal(h.windows.length, 2, "the pane is back while the request waits");
+      assert.equal(h.windows[1].destroyed, false);
+    });
+  }
+
+  it("defers a pending security-key notice until shell navigation finishes", async (t) => {
+    const h = await securityKeyHarness(t);
+    h.parent.loadingMainFrame = true;
+    h.parent.webContents.emit("did-start-navigation", {}, "https://app.example", false, true);
+    await h.wait();
+    assert.equal(h.state.visible, true, "the shell stays visible while navigating");
+    assert.equal(h.windows[0].destroyed, true);
+    assert.equal(h.windows.length, 1, "navigation prevents immediate reopening");
+    await h.wait();
+    assert.equal(h.windows.length, 1, "the notice waits for navigation to finish");
+    h.parent.loadingMainFrame = false;
+    h.parent.webContents.emit("did-stop-loading");
+    await h.wait();
+    assert.equal(h.windows.length, 2, "the notice returns after navigation");
+  });
+
+  it("recovers a pending security-key notice after popup construction fails", async (t) => {
+    const h = await securityKeyHarness(t);
+    const warning = t.mock.method(console, "warn", () => {});
+    const originalShow = h.controller.show;
+    const failedShow = t.mock.method(h.controller, "show", () => {
+      throw new Error("popup construction failed");
+    });
+    h.controller.dismiss(h.parent);
+    await h.wait();
+    assert.equal(warning.mock.callCount(), 1);
+    failedShow.mock.restore();
+    await h.wait();
+    assert.equal(h.controller.show, originalShow);
+    assert.equal(h.windows.at(-1).destroyed, false, "construction failure retries recover");
+  });
+
+  it("backs off failed security-key popups and resets the budget for a new request", async (t) => {
+    const h = await securityKeyHarness(t);
+    t.mock.method(console, "warn", () => {});
+    const failedLoad = t.mock.method(Window.prototype, "loadFile", () =>
+      Promise.reject(new Error("popup failed to load")),
+    );
+    h.windows[0].webContents.emit("render-process-gone");
+    await tick();
+    assert.equal(h.windows.length, 1, "renderer failure waits before retrying");
+    await h.wait();
+    assert.equal(h.windows.length, 2);
+    assert.equal(h.windows[1].destroyed, true, "failed page load closes the popup");
+    await h.wait();
+    assert.equal(h.windows.length, 2, "repeated failures increase the delay");
+    await h.wait();
+    assert.equal(h.windows.length, 3);
+    t.mock.timers.tick(SHOW_DELAY_MS * 100);
+    await tick();
+    assert.equal(h.windows.length, 3, "three failures exhaust this request");
+    failedLoad.mock.restore();
+    h.pending(false);
+    h.pending(true);
+    await h.wait();
+    assert.equal(h.windows.length, 4, "a new request can recover after load succeeds");
+  });
+
+  it("keeps a pending security-key notice on blur but respects explicit dismissal", async (t) => {
+    const h = await securityKeyHarness(t);
+    h.windows[0].emit("blur");
+    await h.wait();
+    assert.equal(h.windows[0].destroyed, false, "focus leaving keeps the notice");
+    h.choose("dismiss");
+    t.mock.timers.tick(SHOW_DELAY_MS * 2);
+    await tick();
+    assert.equal(h.windows[0].destroyed, true);
+    assert.equal(h.windows.length, 1, "explicit dismissal does not retry");
   });
 
   for (const [name, close] of [
