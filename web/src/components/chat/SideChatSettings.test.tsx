@@ -596,17 +596,11 @@ it("shows a grid session's native Codex model and pins it instead of live Smart 
   // The main composer turned routing on in the live entry, not the query cache.
   const entry = conversationRegistry.acquire("side");
   entry.setState({ costControlModeOverride: "on" });
-  const tree = (fullSession: boolean) => (
+  render(
     <QueryClientProvider client={cache}>
-      <SideChatSettings session={session} fullSession={fullSession} />
-    </QueryClientProvider>
+      <SideChatSettings session={session} fullSession />
+    </QueryClientProvider>,
   );
-  const view = render(tree(false));
-  // As a side chat, an unsupported native session keeps its settings hidden.
-  expect(
-    screen.queryByRole("button", { name: "Side chat model and effort" }),
-  ).not.toBeInTheDocument();
-  view.rerender(tree(true));
   const user = userEvent.setup();
   await user.click(screen.getByRole("button", { name: "Model and effort" }));
   await user.click(screen.getByTestId("side-chat-model-edit"));

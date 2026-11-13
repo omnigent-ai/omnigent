@@ -943,10 +943,14 @@ function SideChatComposer({
       return;
     }
     if ((busy && fullSession) || !canSend || agentId === null) return;
+    const typed = { quotes, text: trimmed };
+    // Returns the typed draft itself unless a shared draft's "@" tag is still present.
+    const outgoingDraft = expandTaggedDraft(typed, composer?.mentions, harness ?? null);
     // On in-process harnesses /help and skills resolve locally; native TUIs
-    // (claude-native, codex-native) read the text themselves, and a quote or
-    // attachment is always an ordinary message.
-    const routeLocally = !nativeSession && quotes.length === 0 && files.length === 0;
+    // (claude-native, codex-native) read the text themselves, and a quote,
+    // attachment or tag is always an ordinary message, as in the main composer.
+    const routeLocally =
+      !nativeSession && quotes.length === 0 && files.length === 0 && outgoingDraft === typed;
     // A lone command token with skill discovery in flight has nothing to run
     // yet; only hold when the submission would route locally.
     if (routeLocally && slashCompletion.pendingCompletion) return;
@@ -980,11 +984,6 @@ function SideChatComposer({
       return;
     }
     const outgoing = files.length > 0 ? files : undefined;
-    const outgoingDraft = expandTaggedDraft(
-      { quotes, text: trimmed },
-      composer?.mentions,
-      harness ?? null,
-    );
     const message = serializeReplyDraft(outgoingDraft);
     const child = conversationRegistry.peek(childId)?.getState();
     if (

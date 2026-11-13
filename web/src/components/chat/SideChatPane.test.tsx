@@ -1941,6 +1941,33 @@ describe("side-chat slash commands", () => {
     expect(screen.queryByText(/Show available slash commands/)).toBeNull();
   });
 
+  it("sends a shared draft's tagged skill call as an ordinary message", async () => {
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
+    skillsFixture.current = {
+      skills: [{ name: "review", description: "Review a PR" }],
+      skillsStatus: "ready",
+    };
+    useChatStore.getState().updateSideChatComposer(childId, () => ({
+      text: "/review @auth",
+      files: [],
+      mentions: {
+        files: [],
+        sessions: [{ id: "s_child", title: "auth", isSubagent: true, token: "@auth" }],
+      },
+    }));
+    renderPane(<SideChatPane childId={childId} fullSession />);
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    // Like the main composer, a tag keeps the command off the local skill path.
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+    const [message] = send.mock.calls[0]!;
+    expect(message).toContain('/review [Session: "auth" id=s_child subagent=yes]');
+    expect(message).toContain(SESSION_MENTION_HINT);
+  });
+
   it("shows the built-in /help, not a skill that collides with its exact name", () => {
     conversationRegistry
       .acquire(childId)
