@@ -314,8 +314,14 @@ def _create_task(db_uri: str, owner: str) -> str:
 
 
 def test_deletion_removes_automation_grants_held_and_owned(db_uri: str) -> None:
+    from omnigent.db.db_models import workspace_scope
+
     accounts = SqlAlchemyAccountStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
+    with workspace_scope(202):
+        permissions.ensure_user("alice")
+        elsewhere = _create_task(db_uri, "dave")
+        permissions.grant_for_scheduled_task("alice", elsewhere, 1)
     accounts.create_user_with_password("alice", "alice-hash")
     permissions.ensure_user("carol")
     owned, owned_deleted, other = (
@@ -339,6 +345,8 @@ def test_deletion_removes_automation_grants_held_and_owned(db_uri: str) -> None:
         permissions.grant_for_scheduled_task("alice", other, 1)
     accounts.create_user_with_password("alice", "replacement-hash")
     assert permissions.resolve_scheduled_task_access(["alice"], other) is None
+    with workspace_scope(202):
+        assert permissions.resolve_scheduled_task_access(["alice"], elsewhere) == 1
 
 
 def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str) -> None:
@@ -564,7 +572,7 @@ def test_automation_grant_serializes_with_owner_deletion(db_uri, monkeypatch, de
     monkeypatch.setattr(module, name, paused_lock)
 
     def grant():
-        return permissions.grant_for_scheduled_task("carol", task_id, 2)
+        return permissions.grant_for_scheduled_task("carol", task_id, 1)
 
     def second():
         second_started.set()
@@ -588,6 +596,50 @@ def test_automation_grant_serializes_with_owner_deletion(db_uri, monkeypatch, de
         else:
             assert waiting.result(timeout=10) is True
     assert permissions.list_for_scheduled_task(task_id) == ([], None)
+
+
+def test_owner_grant_and_pause_lock_the_account_before_the_task(db_uri, monkeypatch):
+    from omnigent.stores.permission_store import sqlalchemy_store as permission_module
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    alice = accounts.create_user_with_password("alice", "alice-hash")
+    permissions.ensure_user("carol")
+    task_id = _create_task(db_uri, "alice")
+    holds_account, resume, pause_started = Event(), Event(), Event()
+    original = permission_module._lock_live_scheduled_task
+
+    def paused_before_task_lock(*args, **kwargs):
+        holds_account.set()
+        assert resume.wait(10)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(permission_module, "_lock_live_scheduled_task", paused_before_task_lock)
+
+    def as_alice(write):
+        with account_authority_scope("alice", alice.account_generation):
+            return write()
+
+    def pause():
+        pause_started.set()
+        return as_alice(lambda: tasks.update(task_id, state="paused"))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        granting = pool.submit(
+            as_alice, lambda: permissions.grant_for_scheduled_task("carol", task_id, 1)
+        )
+        try:
+            assert holds_account.wait(10)
+            pausing = pool.submit(pause)
+            assert pause_started.wait(10)
+            # Long enough for a pause that took the task row first to reach the account.
+            with pytest.raises(TimeoutError):
+                pausing.result(timeout=0.5)
+        finally:
+            resume.set()
+        assert granting.result(timeout=10).user_id == "carol"
+        assert pausing.result(timeout=10).state == "paused"
 
 
 def test_unbound_saved_authority_cannot_acquire_new_account(db_uri: str) -> None:

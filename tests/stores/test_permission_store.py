@@ -18,7 +18,14 @@ from sqlalchemy import event
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import ScheduledTaskPermission, SessionPermission
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_MANAGE, LEVEL_OWNER, LEVEL_READ, RESERVED_USER_PUBLIC
+from omnigent.server import session_sharing
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -65,12 +72,20 @@ def _create_conversation(db_uri: str) -> str:
     return conv.id
 
 
-def _create_scheduled_task(db_uri: str) -> str:
+def _create_scheduled_task(db_uri: str, owner: str = "owner@example.com") -> str:
     """Create a scheduled task and return its id; grants refuse a missing task."""
     task = SqlAlchemyScheduledTaskStore(db_uri).create(
-        uuid.uuid4().hex, "job", "hello", "FREQ=DAILY", "owner", uuid.uuid4().hex, "UTC"
+        uuid.uuid4().hex, "job", "hello", "FREQ=DAILY", owner, uuid.uuid4().hex, "UTC"
     )
     return task.id
+
+
+@pytest.fixture()
+def wider_scheduled_task_grant_levels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Allow Edit as well as Read, as a widened allowlist would, to exercise level changes."""
+    monkeypatch.setattr(
+        session_sharing, "SCHEDULED_TASK_GRANT_LEVELS", frozenset({LEVEL_READ, LEVEL_EDIT})
+    )
 
 
 # ── grant ────────────────────────────────────────────────────────────────────
@@ -1384,6 +1399,7 @@ def test_validate_grants_default_keeps_order_and_creates_no_users(
 # ── scheduled task grants ────────────────────────────────────────────────────
 
 
+@pytest.mark.usefixtures("wider_scheduled_task_grant_levels")
 def test_scheduled_task_grant_upserts_and_revoke_removes(
     store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:
@@ -1392,12 +1408,13 @@ def test_scheduled_task_grant_upserts_and_revoke_removes(
     _ensure_user(store, "alice@example.com")
 
     assert store.supports_scheduled_task_grants is True
-    granted = store.grant_for_scheduled_task("alice@example.com", task_id, 1)
-    assert granted == ScheduledTaskPermission("alice@example.com", task_id, 1)
-    store.grant_for_scheduled_task("alice@example.com", task_id, 3)
-    store.grant_for_scheduled_task("alice@example.com", task_id, 2)
+    granted = store.grant_for_scheduled_task("alice@example.com", task_id, LEVEL_READ)
+    assert granted == ScheduledTaskPermission("alice@example.com", task_id, LEVEL_READ)
+    store.grant_for_scheduled_task("alice@example.com", task_id, LEVEL_EDIT)
+    assert store.list_for_scheduled_task(task_id)[0][0].level == LEVEL_EDIT
+    store.grant_for_scheduled_task("alice@example.com", task_id, LEVEL_READ)
     assert store.list_for_scheduled_task(task_id) == (
-        [ScheduledTaskPermission("alice@example.com", task_id, 2)],
+        [ScheduledTaskPermission("alice@example.com", task_id, LEVEL_READ)],
         None,
     )
 
@@ -1430,6 +1447,7 @@ def test_list_for_scheduled_task_pages_by_user_id(
     assert cursors == [user_ids[1], user_ids[3], None]
 
 
+@pytest.mark.usefixtures("wider_scheduled_task_grant_levels")
 def test_resolve_scheduled_task_access_returns_highest_principal_level(
     store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:
@@ -1482,17 +1500,20 @@ def test_scheduled_task_grant_refuses_a_missing_or_deleted_task(
 @pytest.mark.parametrize(
     ("user_id", "level", "storable"),
     [
-        ("x" * 128, LEVEL_MANAGE, True),
+        ("x" * 128, LEVEL_READ, True),
         ("x" * 129, LEVEL_READ, False),
-        ("alice@example.com", 0, False),
+        ("alice@example.com", LEVEL_EDIT, False),
         ("alice@example.com", LEVEL_OWNER, False),
+        (RESERVED_USER_PUBLIC, LEVEL_READ, False),
+        ("__PUBLIC__", LEVEL_READ, False),
+        (RESERVED_USER_LOCAL, LEVEL_READ, False),
     ],
-    ids=["widest-id", "over-wide-id", "below-read", "owner"],
+    ids=["widest-id", "over-wide-id", "edit", "owner-level", "public", "public-variant", "local"],
 )
-def test_scheduled_task_grant_stores_only_what_the_share_table_holds(
+def test_scheduled_task_grant_refuses_what_the_store_must_not_hold(
     store: SqlAlchemyPermissionStore, db_uri: str, user_id: str, level: int, storable: bool
 ) -> None:
-    """IDs fit the 128-character column on every engine; the owner is implicit, never granted."""
+    """IDs fit the column on every engine; grants are Read only and never public or local."""
     task_id = _create_scheduled_task(db_uri)
     if storable:
         _ensure_user(store, user_id)
@@ -1506,20 +1527,33 @@ def test_scheduled_task_grant_stores_only_what_the_share_table_holds(
     )
 
 
-def test_scheduled_task_grant_to_a_case_variant_follows_the_collation(
+def test_scheduled_task_grants_follow_the_key_collation(
     store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:
-    """MySQL's case-insensitive key folds a case variant into the existing grant, without error."""
-    task_id = _create_scheduled_task(db_uri)
-    for user_id in ("alice@example.com", "Alice@example.com"):
+    """MySQL's case-insensitive keys fold a grantee's variant into one grant and refuse the
+    owner's, whose run-session grant would overwrite the owner's own session grant."""
+    task_id = _create_scheduled_task(db_uri, owner="alice@example.com")
+    for user_id in (
+        "bob@example.com",
+        "Bob@example.com",
+        "alice@example.com",
+        "Alice@example.com",
+    ):
         _ensure_user(store, user_id)
-        store.grant_for_scheduled_task(user_id, task_id, 1)
+        try:
+            store.grant_for_scheduled_task(user_id, task_id, LEVEL_READ)
+        except OmnigentError as error:
+            assert error.code == ErrorCode.INVALID_INPUT, error
 
     folds_case = store._engine.dialect.name == "mysql"
     grants, _ = store.list_for_scheduled_task(task_id)
-    assert len(grants) == (1 if folds_case else 2)
-    assert store.resolve_scheduled_task_access(["ALICE@example.com"], task_id) == (
-        1 if folds_case else None
+    assert {grant.user_id for grant in grants} == (
+        {"bob@example.com"}
+        if folds_case
+        else {"bob@example.com", "Bob@example.com", "Alice@example.com"}
+    )
+    assert store.resolve_scheduled_task_access(["BOB@example.com"], task_id) == (
+        LEVEL_READ if folds_case else None
     )
 
 

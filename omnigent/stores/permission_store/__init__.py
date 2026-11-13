@@ -341,14 +341,17 @@ class PermissionStore(ABC):
 
         Overwrites the level of an existing grant. As for session grants, the
         caller authorizes the request and calls :meth:`ensure_user` first. The
-        task's owner is implicit and holds no grant.
+        task's owner is implicit and holds no grant, and automations are never
+        public.
 
         :param user_id: The grantee, a user or group, e.g. ``"alice@example.com"``.
         :param scheduled_task_id: The task to grant access to.
-        :param level: Numeric permission level (1=read, 2=edit, 3=manage).
+        :param level: A level in
+            :data:`~omnigent.server.session_sharing.SCHEDULED_TASK_GRANT_LEVELS`.
         :returns: The resulting :class:`ScheduledTaskPermission`.
-        :raises OmnigentError: ``NOT_FOUND`` when the task is missing or deleted,
-            or ``FORBIDDEN`` when the store does not support scheduled task grants.
+        :raises OmnigentError: ``INVALID_INPUT`` for the owner, a reserved grantee
+            or a level outside the allowlist; ``NOT_FOUND`` when the task is missing
+            or deleted; ``FORBIDDEN`` when the store does not support these grants.
         """
         raise OmnigentError(
             "Sharing automations is not supported by this server.",
@@ -377,7 +380,8 @@ class PermissionStore(ABC):
     ) -> tuple[list[ScheduledTaskPermission], str | None]:
         """Return a scheduled task's grants with cursor pagination.
 
-        Pages exactly like :meth:`list_for_session`.
+        Pages exactly like :meth:`list_for_session`. Grants can outlive a task whose
+        row was purged, so callers check that the task is live before trusting them.
 
         :param scheduled_task_id: The task to query.
         :param limit: Max grants to return (default 100).
@@ -395,7 +399,8 @@ class PermissionStore(ABC):
     ) -> int | None:
         """Return the highest level any of *principals* holds on a scheduled task.
 
-        Reads grants only: owner and admin rules are the caller's.
+        Reads grants only: owner and admin rules are the caller's. Grants can outlive
+        a task whose row was purged, so callers check that the task is live first.
 
         :param principals: The caller's user ID and any groups they belong to,
             e.g. ``["alice@example.com"]``.
@@ -408,7 +413,9 @@ class PermissionStore(ABC):
         """Delete every grant on a scheduled task.
 
         Call after the task is deleted, so a concurrent grant sees the deletion
-        and is refused instead of leaving a grant behind.
+        and is refused instead of leaving a grant behind. ``ScheduledTaskStore.delete``
+        can remove the task row in the same call; grants this call misses are then
+        orphans that nothing else removes, which is why readers check the task first.
 
         :param scheduled_task_id: The deleted task.
         :returns: The number of grants deleted.
