@@ -128,6 +128,41 @@ def test_read_missing_file_raises_not_found(tmp_path: Path) -> None:
     assert excinfo.value.status == 404
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX FIFOs")
+def test_read_fifo_raises_not_found_without_blocking(tmp_path: Path) -> None:
+    """A FIFO with no writer answers 404 instead of hanging the reader thread."""
+    os.mkfifo(tmp_path / "pipe")
+    reader = WorkspaceReader(tmp_path)
+    with pytest.raises(WorkspaceReaderError) as excinfo:
+        reader.read_file_bytes("pipe")
+    assert excinfo.value.status == 404
+
+
+def test_list_directory_skips_a_non_utf8_name_and_pages_past_it(tmp_path: Path) -> None:
+    """A name that isn't valid UTF-8 can't be sent; every other entry stays reachable."""
+    for name in ("a.txt", "z.txt"):
+        (tmp_path / name).write_text("x")
+    try:
+        with open(os.fsencode(tmp_path) + b"/m\xff.txt", "wb"):
+            pass
+    except OSError:
+        pytest.skip("this filesystem rejects non-UTF-8 names")
+    reader = WorkspaceReader(tmp_path)
+
+    names: list[str] = []
+    after: str | None = None
+    while True:
+        page = reader.list_directory("", limit=1, after=after)
+        names += [e["name"] for e in page.data]
+        if not page.has_more:
+            break
+        after = page.last_id
+
+    assert names == ["a.txt", "z.txt"]
+    listing = reader.list_or_read("", limit=10, order="asc")
+    assert [e["name"] for e in listing["data"]] == ["a.txt", "z.txt"]  # type: ignore[union-attr]
+
+
 def test_read_oversize_file_is_capped_and_flagged(tmp_path: Path, monkeypatch) -> None:
     """A file larger than the byte cap is truncated and marked ``truncated``.
 
