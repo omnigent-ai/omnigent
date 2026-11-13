@@ -48,6 +48,7 @@ function file(
 const tracked = file("edited.py", "modified", 2, 1);
 const deleted = file("gone.py", "deleted", 0, 3);
 const untracked = file("new.py", "created", null, null);
+const countedUntracked = { ...untracked, untracked_lines: 5 };
 
 function rowText(label: string): string | null {
   return screen.queryByText(label)?.parentElement?.textContent ?? null;
@@ -56,6 +57,13 @@ function rowText(label: string): string | null {
 describe("SessionOverviewChanges", () => {
   it.each([
     ["sums tracked lines", GIT, [tracked, deleted, untracked], "Files changed3", "Lines+2 −4"],
+    [
+      "adds counted untracked lines",
+      GIT,
+      [tracked, countedUntracked],
+      "Files changed2",
+      "Lines+7 −1",
+    ],
     ["hides unknown lines", GIT, [untracked], "Files changed1", null],
     ["hides a clean git workspace", GIT, [], null, null],
     ["hides a non-git workspace", { status: "not_git" }, [tracked], null, null],
