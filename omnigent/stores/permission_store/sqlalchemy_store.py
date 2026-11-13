@@ -152,13 +152,34 @@ def _upsert_grant(
     level: int,
     *,
     ensure_minimum: bool = False,
+    keep_existing: bool = False,
 ) -> Insert:
     """Build a grant upsert, replacing the level unless stronger access is preserved.
 
     :param key: The row's primary key columns other than ``workspace_id``.
     :param ensure_minimum: Atomically retain the higher existing or requested level.
+    :param keep_existing: Leave an existing row exactly as it is.
     """
     key_columns = ["workspace_id", *key]
+    if keep_existing:
+        if dialect == "sqlite":
+            return (
+                sqlite_insert(model)
+                .values(**key, level=level)
+                .on_conflict_do_nothing(index_elements=key_columns)
+            )
+        if dialect == "mysql":
+            # ``level = level`` keeps the stored value.
+            return (
+                mysql_insert(model)
+                .values(**key, level=level)
+                .on_duplicate_key_update(level=model.level)
+            )
+        return (
+            pg_insert(model)
+            .values(**key, level=level)
+            .on_conflict_do_nothing(index_elements=key_columns)
+        )
     next_level = case((model.level < level, level), else_=model.level) if ensure_minimum else level
     if dialect == "sqlite":
         return (
@@ -514,6 +535,51 @@ class SqlAlchemyPermissionStore(PermissionStore):
             conversation_id=conversation_id,
             level=granted_level,
         )
+
+    def grant_if_absent(self, user_id: str, conversation_id: str, level: int) -> bool:
+        """Insert a grant unless the grantee holds one. See base class for contract.
+
+        The insert leaves an existing row unchanged, so a stored grant never changes.
+        A locking read finds an existing grant first; on MySQL its gap lock and on
+        SQLite the write lock hold off a concurrent insert. On PostgreSQL and
+        CockroachDB a grant can still commit between the read and the insert, so the
+        insert's ``RETURNING`` row decides whether it wrote one.
+        """
+
+        def write(session: Session) -> bool:
+            require_active_account(session, user_id)
+            held = session.execute(
+                select(SqlSessionPermission.level)
+                .where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.user_id == user_id,
+                    SqlSessionPermission.conversation_id == conversation_id,
+                )
+                .with_for_update()
+            ).first()
+            if held is not None:
+                return False
+            dialect = self._engine.dialect.name
+            insert = _upsert_grant(
+                dialect,
+                SqlSessionPermission,
+                {"user_id": user_id, "conversation_id": conversation_id},
+                level,
+                keep_existing=True,
+            )
+            if dialect in ("postgresql", "cockroachdb"):
+                # ON CONFLICT DO NOTHING returns no row when a concurrent grant won.
+                inserted = session.execute(insert.returning(SqlSessionPermission.user_id))
+                return inserted.first() is not None
+            session.execute(insert)
+            return True
+
+        written = run_write_transaction(
+            self._session_immediate, "grant_permission_if_absent", write
+        )
+        if written:
+            self._invalidate_resolve_cache_for_session(conversation_id)
+        return written
 
     def revoke(self, user_id: str, conversation_id: str) -> bool:
         """Remove a permission grant. See base class for contract."""

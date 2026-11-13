@@ -22,7 +22,13 @@ import httpx
 import pytest
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
-from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+)
 from omnigent.server.managed_hosts import ManagedLaunchTracker
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled import telemetry
@@ -42,6 +48,7 @@ from omnigent.server.scheduled.schedule import (
 )
 from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.scheduled.test_fire import (
     FakeAgentStore,
@@ -484,6 +491,155 @@ def _second_claim(store: SqlAlchemyScheduledTaskStore, claimed: _Claimed) -> Sta
     assert pending is not None
     _, run = pending
     return StartupLease(store, run, now=claimed.clock.now, lease_seconds=_LEASE_SECONDS)
+
+
+def _share_task(permissions: SqlAlchemyPermissionStore, task_id: str, *grantees: str) -> None:
+    for grantee in grantees:
+        permissions.ensure_user(grantee)
+        permissions.grant_for_scheduled_task(grantee, task_id, LEVEL_READ)
+
+
+def _session_levels(permissions: SqlAlchemyPermissionStore, session_id: str) -> dict[str, int]:
+    grants, _ = permissions.list_for_session(session_id)
+    return {grant.user_id: grant.level for grant in grants}
+
+
+def _dispatch_recording_shares(
+    permissions: SqlAlchemyPermissionStore, seen: list[dict[str, int]]
+) -> AsyncMock:
+    """A launch seam that records the session's grants as dispatch finds them."""
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        seen.append(_session_levels(permissions, conv.id))
+
+    return AsyncMock(side_effect=dispatch)
+
+
+async def test_each_claimed_run_shares_its_new_session_with_the_current_grants(
+    store, db_uri, monkeypatch
+) -> None:
+    from omnigent.stores import permission_store
+
+    # Smaller pages, so the grantees span more than one.
+    monkeypatch.setattr(permission_store, "MAX_GRANTS_PAGE_SIZE", 2)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    claimed = _claim(store)
+    grantees = ["alice@example.com", "bob@example.com", "carol@example.com"]
+    _share_task(permissions, claimed.task.id, *grantees)
+    conversations = _ConversationStore()
+    dispatched: list[dict[str, int]] = []
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations, permission_store=permissions),
+        launch_dispatch=_dispatch_recording_shares(permissions, dispatched),
+    )
+
+    await executor.fire(claimed.task, claimed.lease)
+    # Removing a grantee changes later runs only.
+    permissions.revoke_for_scheduled_task("bob@example.com", claimed.task.id)
+    await executor.fire(claimed.task, _second_claim(store, claimed))
+
+    first, second = conversations.ids
+    owner = {RESERVED_USER_LOCAL: LEVEL_OWNER}
+    first_shares = {**owner, **dict.fromkeys(grantees, LEVEL_READ)}
+    second_shares = {**owner, "alice@example.com": LEVEL_READ, "carol@example.com": LEVEL_READ}
+    # Each session was shared before its prompt was dispatched.
+    assert dispatched == [first_shares, second_shares]
+    assert _session_levels(permissions, first) == first_shares
+    assert _session_levels(permissions, second) == second_shares
+    assert [run.status for run in _runs(store, claimed.task)] == ["running", "running"]
+
+
+@pytest.mark.parametrize("replaced", ["before_the_recheck", "after_the_recheck"])
+async def test_a_grantee_replaced_during_a_run_is_not_given_the_session(
+    store, db_uri, monkeypatch, replaced
+) -> None:
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.server.scheduled import run_sharing
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    claimed = _claim(store)
+    accounts.create_user_with_password("alice@example.com", "first-hash")
+    _share_task(permissions, claimed.task.id, "alice@example.com", "bob@example.com")
+    announced: list[str | None] = []
+    monkeypatch.setattr(
+        run_sharing, "_announce_session_added", lambda user_id, _: announced.append(user_id)
+    )
+    # Alice's account is deleted and her name registered again: once the run has read
+    # the session's grants, or as it writes her account row after the recheck.
+    hooked = "list_for_session" if replaced == "before_the_recheck" else "ensure_user"
+    original = getattr(permissions, hooked)
+
+    def replace_alice_first(*args: Any, **kwargs: Any) -> Any:
+        if hooked == "list_for_session" or args[0] == "alice@example.com":
+            monkeypatch.setattr(permissions, hooked, original)
+            assert accounts.delete_user("alice@example.com")
+            accounts.create_user_with_password("alice@example.com", "second-hash")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(permissions, hooked, replace_alice_first)
+    conversations = _ConversationStore()
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations, permission_store=permissions),
+        launch_dispatch=AsyncMock(),
+    )
+
+    await executor.fire(claimed.task, claimed.lease)
+
+    [session_id] = conversations.ids
+    assert _session_levels(permissions, session_id) == {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        "bob@example.com": LEVEL_READ,
+    }
+    assert announced == ["bob@example.com"]
+    assert [run.status for run in _runs(store, claimed.task)] == ["running"]
+
+
+async def test_a_claimed_continue_run_syncs_its_session_once_the_automation_is_shared(
+    store, db_uri
+) -> None:
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+    # Alice was shared by hand at Edit, Carol by hand only.
+    hand_made = {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        RESERVED_USER_PUBLIC: LEVEL_READ,
+        "alice@example.com": LEVEL_EDIT,
+        "carol@example.com": LEVEL_READ,
+    }
+    for user_id, level in hand_made.items():
+        permissions.ensure_user(user_id)
+        permissions.grant(user_id, _CONV_ID, level)
+    conversations = _ExistingConversationStore(
+        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, workspace="/repo")
+    )
+    dispatched: list[dict[str, int]] = []
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations, permission_store=permissions),
+        launch_dispatch=_dispatch_recording_shares(permissions, dispatched),
+    )
+
+    # Nobody has shared the automation yet, so runs leave the session's sharing alone.
+    await executor.fire(claimed.task, claimed.lease)
+    permissions.ensure_user("dave@example.com")
+    permissions.grant("dave@example.com", _CONV_ID, LEVEL_READ)
+    await executor.fire(claimed.task, _second_claim(store, claimed))
+    with_dave = {**hand_made, "dave@example.com": LEVEL_READ}
+    assert _session_levels(permissions, _CONV_ID) == with_dave
+    # Once it is shared, the next run syncs the session to its grants.
+    _share_task(permissions, claimed.task.id, "alice@example.com", "bob@example.com")
+    await executor.fire(claimed.task, _second_claim(store, claimed))
+
+    synced = {
+        RESERVED_USER_LOCAL: LEVEL_OWNER,
+        RESERVED_USER_PUBLIC: LEVEL_READ,
+        "alice@example.com": LEVEL_EDIT,
+        "bob@example.com": LEVEL_READ,
+    }
+    # The sync ran before the third run's prompt was dispatched.
+    assert dispatched == [hand_made, with_dave, synced]
+    assert _session_levels(permissions, _CONV_ID) == synced
+    assert [run.status for run in _runs(store, claimed.task)] == ["succeeded"] * 3
 
 
 async def test_a_second_run_sends_into_a_session_another_run_is_using(store) -> None:

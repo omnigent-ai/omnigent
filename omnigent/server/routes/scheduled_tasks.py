@@ -64,6 +64,7 @@ from omnigent.server.scheduled.harness_settings import (
 )
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
+from omnigent.server.scheduled.run_sharing import delete_task_grants
 from omnigent.server.scheduled.telemetry import log_task_created
 from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
 from omnigent.server.session_orchestration import require_owned_session
@@ -1536,6 +1537,8 @@ def create_scheduled_tasks_router(
                         {SCHEDULED_TASK_SOURCE_LABEL_KEY: task.id},
                     )
             raise
+        # After the task, so a grant racing the delete is refused rather than left behind.
+        await delete_task_grants(permission_store, scheduled_task_id)
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
             request.app.state, "scheduled_task_dispatch_enabled", False
