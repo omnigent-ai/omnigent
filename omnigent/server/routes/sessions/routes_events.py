@@ -2613,6 +2613,9 @@ def register_events_routes(
                     conversation_store,
                     session_id,
                     elicitation_id,
+                    confinement=runner_token_confinement(request)
+                    if isinstance(request, Request)
+                    else None,
                 )
             return {"queued": False}
         if body.type in (_EXTERNAL_SESSION_STATUS_TYPE, _SUBAGENT_STATUS_TYPE):

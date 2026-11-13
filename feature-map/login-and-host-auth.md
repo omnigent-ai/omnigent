@@ -64,7 +64,9 @@ be able to write resources without a separate Omnigent account.
   callback succeeds, another runner's session is denied, permission denials do
   not renew credentials, shared-agent writes and session deletion are denied,
   forks retain their source project, child and descendant listings hide foreign
-  branches behind opaque cursors, and strict mode rejects incompatible runners
+  branches behind opaque cursors, sidebar family metadata is omitted from scoped
+  snapshots, and native approval cards and cleanup stay within the runner's scope.
+  Strict mode rejects incompatible runners
   until they are upgraded. New named child spawns on supporting servers reserve
   before first-input admission; failed pending attempts can be aborted, while
   admitted or uncertain work is retained. Abandoned reservations become eligible
@@ -289,7 +291,7 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   points and are not proved by that recording.
 - **`delegated-runner-credentials` (own environment):**
   `tests/e2e/test_managed_runner_http_auth.py::test_managed_runner_callback_authenticates_end_to_end`
-  starts a real accounts server and delegated runner. Its callback succeeds;
+  uses a real accounts server and runner outbound auth client. Its callback succeeds;
   account and host requests receive scope-denied errors. Component coverage:
   `tests/server/test_account_revocation.py::test_runner_token_is_confined_to_its_runner_sessions`
   checks rebound children and approvals;

@@ -547,6 +547,7 @@ async def _publish_and_wait_for_harness_elicitation(
     :returns: Web verdict, or ``None`` on terminal-side resolution,
         timeout, or disconnect.
     """
+    confinement = runner_token_confinement(request) if isinstance(request, Request) else None
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
     future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
@@ -595,6 +596,7 @@ async def _publish_and_wait_for_harness_elicitation(
                 conversation_store,
                 session_id,
                 event_payload,
+                confinement=confinement,
             )
         disconnect_task = asyncio.create_task(
             _poll_request_disconnect(request),
@@ -664,6 +666,7 @@ async def _publish_and_wait_for_harness_elicitation(
                 elicitation_id,
                 conversation_store,
                 native_delivery_attempt=delivery["attempt"] if delivery is not None else None,
+                confinement=confinement,
             )
         elif published_request:
             _publish_elicitation_resolved(session_id, elicitation_id, action=settled_action)
@@ -674,6 +677,7 @@ async def _publish_and_wait_for_harness_elicitation(
                     session_id,
                     elicitation_id,
                     settled_action,
+                    confinement=confinement,
                 )
 
 
@@ -683,6 +687,7 @@ def _schedule_deferred_elicitation_clear(
     conversation_store: ConversationStore | None,
     *,
     native_delivery_attempt: str | None = None,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> None:
     """
     Clear one elicitation's approval card after the re-park grace, unless
@@ -704,6 +709,7 @@ def _schedule_deferred_elicitation_clear(
         ancestor streams, or ``None`` to keep it session-local.
     :param native_delivery_attempt: Only expire this delivery attempt, never
         a newer attempt or a card already confirmed by the recorder.
+    :param confinement: Retained caller scope for delayed ancestor cleanup.
     """
 
     async def _clear_after_grace() -> None:
@@ -736,6 +742,7 @@ def _schedule_deferred_elicitation_clear(
                 session_id,
                 elicitation_id,
                 reason="unanswered",
+                confinement=confinement,
             )
 
     clear_coroutine = _clear_after_grace()
@@ -15237,7 +15244,7 @@ async def _get_session_snapshot(
         harness=harness,
         agent=agent,
     )
-    if request is not None:
+    if request is not None and runner_token_confinement(request) is None:
         from omnigent.server.session_families import project_families
 
         _, families = await asyncio.to_thread(

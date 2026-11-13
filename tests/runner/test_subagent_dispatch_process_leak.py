@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
@@ -18,6 +20,37 @@ from omnigent.runner.tool_dispatch import execute_tool
 
 PARENT_ID = "conv_parent"
 CHILD_ID = "conv_child_leaked"
+
+
+@asynccontextmanager
+async def _pending_spawn_client(
+    parent: str,
+    child: str,
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> AsyncIterator[tuple[httpx.AsyncClient, asyncio.Queue]]:
+    def route(request: httpx.Request) -> httpx.Response:
+        method, path = request.method, request.url.path
+        if method == "GET" and path == "/v1/info":
+            return httpx.Response(200, json={"pending_child_spawn_v1": True})
+        if method == "GET" and path == f"/v1/sessions/{parent}":
+            return httpx.Response(200, json={"id": parent, "agent_id": "parent-agent"})
+        if method == "GET" and path == f"/v1/sessions/{parent}/spawns/epoch":
+            return httpx.Response(200, json={"epoch": 1})
+        return handler(request)
+
+    auth = httpx.Auth()
+    auth.runner_confined = True
+    inbox = asyncio.Queue()
+    subagent_work._session_inboxes_ref[parent] = inbox
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(route), base_url="http://server", auth=auth
+        ) as client:
+            yield client, inbox
+    finally:
+        subagent_work._session_inboxes_ref.pop(parent, None)
+        subagent_work.unregister_child_session(child)
+        subagent_work.unregister_subagent_work(child)
 
 
 @pytest.mark.asyncio
@@ -273,15 +306,9 @@ async def test_pending_spawn_preserves_exact_receipt_and_work(fault: str | None)
         nonlocal state
         route, method = request.url.path, request.method
         calls.append((method, route))
-        if method == "GET" and route == "/v1/info":
-            return httpx.Response(200, json={"pending_child_spawn_v1": True})
-        if method == "GET" and route == f"/v1/sessions/{parent}":
-            return httpx.Response(200, json={"id": parent, "agent_id": "parent-agent"})
         if method == "GET" and route == f"/v1/sessions/{parent}/child_sessions":
             assert not prepares, "Never reconcile a pending spawn by title"
             return httpx.Response(200, json={"data": []})
-        if method == "GET" and route == f"{path}/epoch":
-            return httpx.Response(200, json={"epoch": 1})
         if method == "POST" and route == path:
             payload = json.loads(request.content)
             prepares.append(payload)
@@ -336,38 +363,31 @@ async def test_pending_spawn_preserves_exact_receipt_and_work(fault: str | None)
             return httpx.Response(200, json={**receipt, "state": state})
         raise AssertionError(f"Unexpected request: {method} {route}")
 
-    auth = httpx.Auth()
-    auth.runner_confined = True
-    inbox = asyncio.Queue()
-    subagent_work._session_inboxes_ref[parent] = inbox
-    try:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handle), base_url="http://server", auth=auth
-        ) as client:
-            call = execute_tool(
-                tool_name="sys_session_send",
-                arguments=json.dumps(
-                    {
-                        "agent": "researcher",
-                        "title": "task",
-                        "args": {
-                            "input": "first",
-                            "file_ids": [source],
-                            "cost_budget": {"max_cost_usd": 2.0},
-                        },
-                    }
-                ),
-                server_client=client,
-                conversation_id=parent,
-                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
-                session_inbox=inbox,
-            )
-            if fault == "input-cancelled":
-                with pytest.raises(asyncio.CancelledError):
-                    await call
-                output = "cancelled"
-            else:
-                output = await call
+    async with _pending_spawn_client(parent, child, handle) as (client, inbox):
+        call = execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(
+                {
+                    "agent": "researcher",
+                    "title": "task",
+                    "args": {
+                        "input": "first",
+                        "file_ids": [source],
+                        "cost_budget": {"max_cost_usd": 2.0},
+                    },
+                }
+            ),
+            server_client=client,
+            conversation_id=parent,
+            agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+            session_inbox=inbox,
+        )
+        if fault == "input-cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            output = "cancelled"
+        else:
+            output = await call
         assert len(prepares) == 1
         assert len(inputs) == (0 if fault in ("mapping", "prepare-unknown") else 1)
         if inputs:
@@ -389,10 +409,6 @@ async def test_pending_spawn_preserves_exact_receipt_and_work(fault: str | None)
                 assert state == "aborted"
         assert not any(method == "DELETE" for method, _ in calls)
         assert ("POST", "/v1/sessions") not in calls
-    finally:
-        subagent_work._session_inboxes_ref.pop(parent, None)
-        subagent_work.unregister_child_session(child)
-        subagent_work.unregister_subagent_work(child)
 
 
 @pytest.mark.asyncio
@@ -407,15 +423,9 @@ async def test_pending_spawn_retries_only_definite_auto_name_rejection(outcome: 
 
     def handle(request):
         route, method = request.url.path, request.method
-        if method == "GET" and route == "/v1/info":
-            return httpx.Response(200, json={"pending_child_spawn_v1": True})
-        if method == "GET" and route == f"/v1/sessions/{parent}":
-            return httpx.Response(200, json={"id": parent, "agent_id": "parent-agent"})
         if method == "GET" and route == f"/v1/sessions/{parent}/child_sessions":
             assert not prepares
             return httpx.Response(200, json={"data": []})
-        if method == "GET" and route == f"{path}/epoch":
-            return httpx.Response(200, json={"epoch": 1})
         if method == "POST" and route == path:
             payload = json.loads(request.content)
             prepares.append(payload)
@@ -461,25 +471,18 @@ async def test_pending_spawn_retries_only_definite_auto_name_rejection(outcome: 
             )
         raise AssertionError(f"Unexpected request: {method} {route}")
 
-    auth = httpx.Auth()
-    auth.runner_confined = True
-    inbox = asyncio.Queue()
-    subagent_work._session_inboxes_ref[parent] = inbox
     arguments = {"agent": "researcher", "args": {"input": "first"}}
     if outcome == "explicit":
         arguments["title"] = "named"
-    try:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handle), base_url="http://server", auth=auth
-        ) as client:
-            output = await execute_tool(
-                tool_name="sys_session_send",
-                arguments=json.dumps(arguments),
-                server_client=client,
-                conversation_id=parent,
-                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
-                session_inbox=inbox,
-            )
+    async with _pending_spawn_client(parent, child, handle) as (client, inbox):
+        output = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(arguments),
+            server_client=client,
+            conversation_id=parent,
+            agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
+            session_inbox=inbox,
+        )
         assert len(prepares) == {"retry": 2, "exhausted": 6}.get(outcome, 1)
         assert len({item["nonce"] for item in prepares}) == len(prepares)
         assert len({item["create"]["title"] for item in prepares}) == len(prepares)
@@ -488,10 +491,6 @@ async def test_pending_spawn_retries_only_definite_auto_name_rejection(outcome: 
             assert json.loads(output)["conversation_id"] == child
         else:
             assert output.startswith("Error")
-    finally:
-        subagent_work._session_inboxes_ref.pop(parent, None)
-        subagent_work.unregister_child_session(child)
-        subagent_work.unregister_subagent_work(child)
 
 
 @pytest.mark.asyncio

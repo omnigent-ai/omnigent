@@ -445,13 +445,12 @@ def test_managed_runner_callback_authenticates_end_to_end(
     auth = _RunnerDatabricksAuth(factory)
     authed = asyncio.run(_get_agent_contents(base_url, contents_path, auth))
     assert authed.status_code == 200, (authed.status_code, authed.text)
-    # The minted owner token resolved to Alice, who owns the session, so the
+    # The minted runner token resolves to Alice, who owns the session, so the
     # real agent bundle comes back.
     assert authed.headers.get("X-Agent-Name")
     assert authed.content[:2] == b"\x1f\x8b", "expected a gzip agent bundle body"
 
-    # The same minted bearer is confined to this runner's sessions: account
-    # and host routes refuse it even after the client's re-mint retry.
+    # Account and host routes reject this scoped bearer without renewing it.
     for path in ("/v1/me", "/v1/hosts"):
         refused = asyncio.run(_get_agent_contents(base_url, path, auth))
         assert refused.status_code == 403, (path, refused.status_code, refused.text)

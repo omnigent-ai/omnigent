@@ -1705,6 +1705,139 @@ def test_runner_events_check_parent_scope(setup_app, monkeypatch):
         assert destinations == ({child_id, parent_id} if same_runner else {child_id})
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller_scope", ["foreign", "same", "interactive"])
+@pytest.mark.parametrize("settlement", ["terminal", "timeout", "delivery"])
+async def test_native_hook_mirrors_respect_runner_scope(
+    setup_app, monkeypatch, caller_scope, settlement
+):
+    import asyncio
+
+    import httpx
+
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions
+
+    _, alice, stores, _ = setup_app
+    runner, parent_id, _runner_id = _runner_for_session(alice, stores, "alice")
+    conversations = stores["conversation_store"]
+    child = runner.post(
+        "/v1/sessions",
+        json={
+            "agent_id": conversations.get_conversation(parent_id).agent_id,
+            "parent_session_id": parent_id,
+        },
+    )
+    assert child.status_code == 201, child.text
+    child_id = child.json()["id"]
+    if caller_scope != "same":
+        conversations.replace_runner_id(parent_id, "other-runner")
+    expected = {child_id} if caller_scope == "foreign" else {child_id, parent_id}
+    ready = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    published = []
+    publish = session_stream.publish
+
+    def record_publish(session_id, event):
+        published.append((session_id, event))
+        result = publish(session_id, event)
+        if event.get("type") == "response.elicitation_request" and session_id == (
+            child_id if caller_scope == "foreign" else parent_id
+        ):
+            loop.call_soon_threadsafe(ready.set)
+        return result
+
+    monkeypatch.setattr(session_stream, "publish", record_publish)
+    monkeypatch.setattr(
+        sessions, "_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S", 0 if settlement == "timeout" else 10
+    )
+    monkeypatch.setattr(sessions, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0)
+    path = "codex-elicitation-request"
+    payload = {
+        "id": 7,
+        "method": "mcpServer/elicitation/request",
+        "params": {
+            "mode": "form",
+            "message": "Choose a display preference",
+            "requestedSchema": {"type": "object", "properties": {}},
+        },
+    }
+    if settlement == "delivery":
+        path = "native-permission-request"
+        payload = {
+            "elicitation_id": "elicit_native_scope",
+            "message": "Choose a display preference",
+            "policy_name": "kiro_native_permission",
+            "native_delivery": {"state": "ready", "attempt": "scope-attempt"},
+        }
+    caller = alice if caller_scope == "interactive" else runner
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=alice.app),
+        base_url="http://testserver",
+        headers=dict(caller.headers),
+        cookies=caller.cookies,
+    ) as client:
+        hook = asyncio.create_task(
+            client.post(f"/v1/sessions/{child_id}/hooks/{path}", json=payload)
+        )
+        try:
+            async with asyncio.timeout(10):
+                await ready.wait()
+                if settlement != "timeout":
+                    elicitation_id = next(
+                        event["elicitation_id"]
+                        for sid, event in published
+                        if sid == child_id and event.get("type") == "response.elicitation_request"
+                    )
+                    resolved = await client.post(
+                        f"/v1/sessions/{child_id}/events",
+                        json={
+                            "type": "external_elicitation_resolved",
+                            "data": {"elicitation_id": elicitation_id},
+                        },
+                    )
+                    assert resolved.status_code == 202, resolved.text
+                response = await hook
+                await asyncio.gather(*tuple(sessions._deferred_elicitation_clear_tasks))
+        finally:
+            if not hook.done():
+                hook.cancel()
+                await asyncio.gather(hook, return_exceptions=True)
+    assert response.status_code == 200, response.text
+    assert response.content == b""
+    for event_type in ("response.elicitation_request", "response.elicitation_resolved"):
+        assert {sid for sid, event in published if event.get("type") == event_type} == expected
+
+
+@pytest.mark.parametrize("owner", ["alice", "admin"])
+def test_runner_snapshot_omits_sidebar_family_metadata(setup_app, owner):
+    admin, alice, stores, _ = setup_app
+    owner_client = alice if owner == "alice" else admin
+    runner, source_id, runner_id = _runner_for_session(owner_client, stores, owner)
+    conversations = stores["conversation_store"]
+    sibling = create_session(owner_client)
+    assert sibling.status_code == 201, sibling.text
+    sibling_id = sibling.json()["session_id"]
+    conversations.add_new_sibling(source_id, sibling_id, user_id=owner)
+    conversations.replace_runner_id(sibling_id, runner_id)
+    renamed = owner_client.patch(
+        f"/v1/sessions/{source_id}", json={"title": "Foreign family representative"}
+    )
+    assert renamed.status_code == 200, renamed.text
+    conversations.replace_runner_id(source_id, "other-runner")
+
+    interactive = owner_client.get(f"/v1/sessions/{sibling_id}")
+    assert interactive.status_code == 200, interactive.text
+    assert interactive.json()["family"]["representative_id"] == source_id
+    assert interactive.json()["family"]["representative_title"] == "Foreign family representative"
+    snapshot = runner.get(f"/v1/sessions/{sibling_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json().get("family") is None
+    assert source_id not in snapshot.text
+    assert "Foreign family representative" not in snapshot.text
+    assert runner.get(f"/v1/sessions/{source_id}").status_code == 403
+
+
 def test_runner_resource_copy_checks_ancestor_scope(setup_app):
     _, alice, stores, _ = setup_app
     runner, bound, runner_id = _runner_for_session(alice, stores, "alice")
