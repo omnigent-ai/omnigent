@@ -143,6 +143,7 @@ it(
       assert.deepEqual(await electronApp.evaluate(() => [...globalThis.fakeBrowserOpened]), [
         verifyUrl,
       ]);
+      assert.equal(await requestState(), "pending", "browser handoff leaves the request running");
       await pause();
     } finally {
       try {
