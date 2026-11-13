@@ -66,7 +66,11 @@ from omnigent.server.schemas import (
 )
 from omnigent.server.workflows import open_store as open_workflow_store
 from omnigent.stores import ConversationStore
-from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+)
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.session_journal_store import JournalSessionNotFoundError, SessionJournalStore
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
@@ -107,6 +111,36 @@ def _same_session(left: str, right: str) -> bool:
         return uuid_to_bytes(left.strip()) == uuid_to_bytes(right)
     except InvalidUuidError:
         return False
+
+
+def _require_attended_session(conversations: ConversationStore, session: Conversation) -> None:
+    """Follow automation provenance through sub-agents and independently created workers."""
+    pending = [session]
+    seen: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current.id in seen:
+            continue
+        seen.add(current.id)
+        if current.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) or current.labels.get(
+            SCHEDULED_TASK_RUN_LABEL_KEY
+        ):
+            raise OmnigentError(
+                "unattended_input_not_allowed: This session is part of an automation. "
+                "No one can answer questions or approve requests. Do not ask for input or "
+                "write needs_input. Choose an option within the user's authorization and "
+                "record the decision, or mark the step failed with the blocker. Continue "
+                "independent work.",
+                code=ErrorCode.CONFLICT,
+            )
+        for ancestor_id in (
+            current.parent_conversation_id,
+            current.labels.get(CREATED_BY_SESSION_LABEL_KEY),
+        ):
+            if ancestor_id and ancestor_id not in seen:
+                ancestor = conversations.get_conversation(ancestor_id)
+                if ancestor is not None:
+                    pending.append(ancestor)
 
 
 def entry_to_response(entry: JournalEntry) -> SessionJournalEntry:
@@ -231,6 +265,8 @@ def create_session_journal_router(
         workflow_id: str | None = None,
     ) -> JournalEntry:
         store = _store()
+        if kind == "status" and payload.get("status") == "needs_input":
+            await asyncio.to_thread(_require_attended_session, conversation_store, session)
         try:
             appended = await asyncio.to_thread(
                 lambda: store.append(

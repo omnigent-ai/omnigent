@@ -13,7 +13,12 @@ from fastapi import FastAPI
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
-from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+    SCHEDULED_TASK_SOURCE_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
@@ -54,10 +59,13 @@ def _session(
     labels: dict[str, str] | None = None,
     title: str | None = None,
     owner: str = ALICE,
+    parent_conversation_id: str | None = None,
 ) -> str:
     """A session *owner* owns, alice by default."""
     conversations = SqlAlchemyConversationStore(db_uri)
-    session = conversations.create_conversation(title=title)
+    session = conversations.create_conversation(
+        title=title, parent_conversation_id=parent_conversation_id
+    )
     SqlAlchemyPermissionStore(db_uri).grant(owner, session.id, 4)
     if labels:
         conversations.set_labels(session.id, labels)
@@ -442,8 +450,9 @@ _ONE_TASK_PLAN = {
 }
 
 
+@pytest.mark.parametrize("origin", ["interactive", "automation_source", "interactive_worker"])
 async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
-    client: httpx.AsyncClient, db_uri: str
+    client: httpx.AsyncClient, db_uri: str, origin: str
 ) -> None:
     """``sys_workflow_request_input`` through the real route, up to the user's answer."""
     import asyncio
@@ -453,7 +462,12 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
     from omnigent.runner.journal_tools import execute_journal_tool
     from omnigent.runtime import pending_elicitations
 
-    session_id = _session(db_uri)
+    labels = {}
+    if origin == "automation_source":
+        labels[SCHEDULED_TASK_SOURCE_LABEL_KEY] = uuid.uuid4().hex
+    elif origin == "interactive_worker":
+        labels[CREATED_BY_SESSION_LABEL_KEY] = _session(db_uri)
+    session_id = _session(db_uri, labels=labels)
     client.headers.update(_headers())
     published: list[dict[str, object]] = []
 
@@ -504,6 +518,80 @@ async def test_a_workflow_question_marks_its_task_and_returns_the_answer(
         "answered": True,
         "answers": [{"question": "Approve the deploy to prod?", "answer": "Approve"}],
     }
+
+
+@pytest.mark.parametrize(
+    "automation_label", [SCHEDULED_TASK_ORIGIN_LABEL_KEY, SCHEDULED_TASK_RUN_LABEL_KEY]
+)
+@pytest.mark.parametrize(
+    "lineage",
+    [(), ("parent",), ("creator",), ("creator", "creator"), ("parent", "creator", "parent")],
+    ids=["automation", "subagent", "worker", "nested-worker", "mixed-descendant"],
+)
+async def test_automation_workflows_cannot_wait_for_user_input(
+    client: httpx.AsyncClient, db_uri: str, automation_label: str, lineage: tuple[str, ...]
+) -> None:
+    """Both tools fail before writing a waiting status or putting a question in the Inbox."""
+    import asyncio
+    import json
+
+    from omnigent.runner.journal_tools import execute_journal_tool
+    from omnigent.runtime import pending_elicitations
+
+    session_id = _session(db_uri, labels={automation_label: uuid.uuid4().hex})
+    for edge in lineage:
+        session_id = _session(
+            db_uri,
+            parent_conversation_id=session_id if edge == "parent" else None,
+            labels={CREATED_BY_SESSION_LABEL_KEY: session_id} if edge == "creator" else None,
+        )
+    client.headers.update(_headers())
+
+    async def run(tool: str, args: dict[str, object]) -> dict:
+        output = await asyncio.wait_for(
+            execute_journal_tool(
+                tool, json.dumps(args), server_client=client, conversation_id=session_id
+            ),
+            timeout=5,
+        )
+        return json.loads(output)
+
+    plan = {
+        **_ONE_TASK_PLAN,
+        "steps": [
+            *_ONE_TASK_PLAN["steps"],
+            {"id": "report", "name": "Report the outcome", "depends_on": []},
+        ],
+    }
+    assert (await run("sys_journal_write_plan", plan))["version"] == 1
+    for tool, args in (
+        (
+            "sys_journal_write_status",
+            {"step": "deploy", "status": "needs_input", "text": "Approve the deploy?"},
+        ),
+        ("sys_workflow_request_input", {"step": "deploy", "questions": [_DEPLOY_QUESTION]}),
+    ):
+        result = await run(tool, args)
+        assert result["error"].startswith("unattended_input_not_allowed:"), result
+        assert "failed" in result["error"] and "authorization" in result["error"]
+        assert pending_elicitations.snapshot_for(session_id) == []
+    journal = f"/v1/sessions/{session_id}/journal"
+    entries = (await client.get(journal)).json()["data"]
+    assert [entry["kind"] for entry in entries] == ["plan"]
+
+    # The agent can record the blocker and finish independent work after the rejection.
+    for step, status, text in (
+        ("deploy", "failed", "Sign-in requires a person"),
+        ("report", "done", "Reported the blocker"),
+    ):
+        assert "error" not in await run(
+            "sys_journal_write_status", {"step": step, "status": status, "text": text}
+        )
+    entries = (await client.get(journal, params={"kind": "status"})).json()["data"]
+    assert [(entry["step"], entry["payload"]["status"]) for entry in entries] == [
+        ("deploy", "failed"),
+        ("report", "done"),
+    ]
 
 
 async def test_a_retried_workflow_question_reuses_its_status_and_question(

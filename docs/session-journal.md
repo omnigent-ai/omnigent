@@ -71,6 +71,10 @@ validation), `invalid_input` (a question or its task failed validation; a
 question needs a current plan that has its task), `entry_too_large` (with
 the size and the limit),
 `session_not_found` and `session_out_of_tree` (for reads of another session).
+`unattended_input_not_allowed` refuses a `needs_input` status or an input
+request from an automation or one of its workers, before writing an entry or
+raising a question. The agent must decide within the user's authorization or
+mark the step `failed` with the blocker, then continue independent work.
 A write's retry, for example while the runner's connection to the server
 reconnects, returns the entry the first attempt wrote instead of adding another.
 
@@ -139,6 +143,13 @@ customize it. No one is watching the run, so nothing in it waits for you:
 the agent answers its own questions with the option it would recommend, and
 says so in the task's status. A task that needs you, such as a sign-in, fails
 saying what it needs, and the agent goes on with the rest.
+
+The journal API enforces this using the session's existing server-owned
+`omnigent.scheduled_task_origin` and `omnigent.scheduled_task_run` labels.
+It follows sub-agent parent links and `omnigent.created_by_session_id` links
+for independent workers, including nested workers. No new unattended flag is
+needed, and the restriction applies while that automation provenance remains.
+An automation's saved source session alone does not identify an unattended run.
 
 Click a workflow on the **Workflows** page to open it: its steps as a graph,
 and its runs, newest first. Each run links to its session and shows how many
