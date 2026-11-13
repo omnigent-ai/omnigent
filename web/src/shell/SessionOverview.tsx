@@ -50,30 +50,30 @@ export function SessionCostButton({
   onOpenChange: (open: boolean) => void;
   children?: ReactNode;
 }) {
-  const chip = (
-    <button
-      type="button"
-      aria-expanded={open}
-      data-testid="header-session-cost"
-      className="hidden h-6 shrink-0 items-center rounded-[6px] px-2 font-mono text-xs tabular-nums text-muted-foreground hover:bg-muted hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground md:inline-flex"
-      // The popover trigger toggles the popover itself.
-      onClick={docked ? () => onOpenChange(!open) : undefined}
-    >
-      <SessionCostValue unavailable="—" />
-      <span className="sr-only"> Session overview</span>
-    </button>
-  );
-  if (docked) return chip;
+  // One trigger for both placements keeps the chip mounted, and focused, when the
+  // layout switches between them; only the popover content depends on placement.
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
-      <PopoverTrigger asChild>{chip}</PopoverTrigger>
-      <PopoverContent
-        align="end"
-        aria-label="Session overview"
-        className="w-64 bg-transparent p-0 shadow-none ring-0 max-md:hidden"
-      >
-        {children}
-      </PopoverContent>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          aria-haspopup={docked ? undefined : "dialog"}
+          data-testid="header-session-cost"
+          className="hidden h-6 shrink-0 items-center rounded-[6px] px-2 font-mono text-xs tabular-nums text-muted-foreground hover:bg-muted hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground md:inline-flex"
+        >
+          <SessionCostValue unavailable="—" />
+          <span className="sr-only"> Session overview</span>
+        </button>
+      </PopoverTrigger>
+      {!docked && (
+        <PopoverContent
+          align="end"
+          aria-label="Session overview"
+          className="w-64 bg-transparent p-0 shadow-none ring-0 max-md:hidden"
+        >
+          {children}
+        </PopoverContent>
+      )}
     </Popover>
   );
 }
@@ -113,7 +113,7 @@ export function SessionOverview({ onClose }: { onClose: () => void }) {
   const tokenCounts = models.map(([, usage]) => usage.totalTokens);
   // A model without a count would make the sum partial, so show none.
   const totalTokens =
-    tokenCounts.length > 0 && tokenCounts.every((count) => count != null)
+    tokenCounts.length > 0 && tokenCounts.every((count) => count !== null)
       ? tokenCounts.reduce((sum, count) => sum + count, 0)
       : null;
   return (
@@ -137,7 +137,7 @@ export function SessionOverview({ onClose }: { onClose: () => void }) {
         </OverviewRow>
         {models.map(([model, usage]) => (
           <OverviewRow key={model} label={model} title={model}>
-            {usage.totalCostUsd != null && formatSessionCostUsd(usage.totalCostUsd)}
+            {usage.totalCostUsd !== null && formatSessionCostUsd(usage.totalCostUsd)}
           </OverviewRow>
         ))}
         {totalTokens !== null && (

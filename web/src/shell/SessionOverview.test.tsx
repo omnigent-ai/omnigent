@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelUsage } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
@@ -96,7 +96,46 @@ describe("SessionOverview", () => {
     rerender(button(true));
     expect(chip()).toHaveAttribute("aria-expanded", "true");
     const popover = screen.queryByRole("dialog", { name: "Session overview" });
-    if (docked) expect(popover).toBeNull();
-    else expect(popover).toHaveTextContent("overview card");
+    if (docked) {
+      expect(popover).toBeNull();
+      expect(chip()).not.toHaveAttribute("aria-haspopup");
+    } else {
+      expect(popover).toHaveTextContent("overview card");
+      expect(chip()).toHaveAttribute("aria-haspopup", "dialog");
+    }
+  });
+
+  it("closes the popover on Escape and returns focus to the chip", async () => {
+    const onOpenChange = vi.fn();
+    const button = (open: boolean) => (
+      <SessionCostButton docked={false} open={open} onOpenChange={onOpenChange}>
+        <button type="button">Hide session overview</button>
+      </SessionCostButton>
+    );
+    const { rerender } = render(button(true));
+    const popover = screen.getByRole("dialog", { name: "Session overview" });
+
+    fireEvent.keyDown(popover, { key: "Escape" });
+    expect(onOpenChange).toHaveBeenCalledExactlyOnceWith(false);
+
+    rerender(button(false));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    const chip = screen.getByTestId("header-session-cost");
+    expect(chip).toHaveAttribute("aria-expanded", "false");
+    // Radix restores focus after the content unmounts.
+    await waitFor(() => expect(chip).toHaveFocus());
+  });
+
+  it("keeps the chip focused when the placement changes", () => {
+    const button = (docked: boolean) => (
+      <SessionCostButton docked={docked} open={false} onOpenChange={() => {}} />
+    );
+    const { rerender } = render(button(true));
+    screen.getByTestId("header-session-cost").focus();
+
+    rerender(button(false));
+    expect(screen.getByTestId("header-session-cost")).toHaveFocus();
+    rerender(button(true));
+    expect(screen.getByTestId("header-session-cost")).toHaveFocus();
   });
 });
