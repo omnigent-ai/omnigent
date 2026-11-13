@@ -97,11 +97,14 @@ describe("WorkflowGraphOverlay", () => {
   });
 
   it("says which failed step keeps a step from starting, in place of its goal", () => {
+    // The run named explore for its own case; the graph names it as its box does.
+    const run = progress("failed", "waiting");
+    run[0] = { ...run[0]!, step: { ...run[0]!.step, name: "Explore the upload failures" } };
     render(
       <WorkflowGraphOverlay
         title="Triage flaky tests"
         steps={STEPS}
-        progress={progress("failed", "waiting")}
+        progress={run}
         onClose={vi.fn()}
       />,
     );

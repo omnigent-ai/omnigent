@@ -97,7 +97,11 @@ function StepsFlow({
 }) {
   const { nodes, edges } = useMemo(() => {
     if (!progress) return layoutWorkflowSteps(steps);
-    const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
+    // Name a failed step as its box does; a step the run added has only the run's name.
+    const names = new Map([
+      ...progress.map((item) => [item.step.id, item.step.name] as const),
+      ...steps.map((step) => [step.id, step.name] as const),
+    ]);
     const failedNames = new Map(
       [...failedUpstream(progress)].map(([id, failed]) => [
         id,
