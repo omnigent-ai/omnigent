@@ -1779,15 +1779,7 @@ function ProjectFolder({
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
-  // A collapsed folder keeps showing the open session until you navigate away; that
-  // row owns its badge, so the header summarizes only the rows it hides.
-  const heldIndex = expanded ? -1 : conversations.findIndex((c) => c.id === activeConversationId);
-  const isHidden = (_row: unknown, index: number) => index !== heldIndex;
-  const marker = projectMarkerState(
-    conversations.filter(isHidden),
-    errors.filter(isHidden),
-    startingConversationId,
-  );
+  const marker = projectMarkerState(conversations, errors, startingConversationId);
   // "Show more" carries the badge of the rows it hides, as a collapsed header does.
   const hiddenMarker =
     expanded && visibleCount < conversations.length
@@ -1908,9 +1900,6 @@ function ProjectFolder({
         active={active}
         marker={marker}
         conversations={display.rows}
-        heldConversations={
-          expanded ? undefined : conversations.filter((_row, index) => index === heldIndex)
-        }
         listRef={listRef}
         activeConversationId={activeConversationId}
         pinnedConversationIds={pinnedConversationIds}
@@ -3024,17 +3013,14 @@ function ConversationList({
     onExitSelectionMode,
   ]);
 
-  // Navigating never opens a folder: a collapsed folder lists only the open
-  // session (its held row), so folders open and close only when the user says so.
-  // A folder's rows in render order: those above "Show more" while expanded,
-  // otherwise the open session it holds under its collapsed header.
+  // Navigating never opens a folder, so folders open and close only when the
+  // user says so. Collapsed folders contribute no visible rows.
   const folderListedRows = useCallback(
     (group: { name: string; conversations: Conversation[] }) => {
       if (expandedProjects.includes(group.name)) return folderVisibleRows(group);
-      const rows = folderConversations.get(group.name)?.conversations ?? group.conversations;
-      return rows.filter((c) => c.id === displayedActiveId);
+      return [];
     },
-    [expandedProjects, folderVisibleRows, folderConversations, displayedActiveId],
+    [expandedProjects, folderVisibleRows],
   );
 
   // Visible rows in render order (collapsed sections excluded) for the numbered
@@ -3045,7 +3031,7 @@ function ConversationList({
         ? []
         : orderSessionFamilies(list, collapsedFamilies);
     // A project's chats are navigable only while the "Projects" group is expanded,
-    // down to the folder's "Show more" (or its held row while collapsed).
+    // down to the folder's "Show more".
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
     const projectVisible = (group: (typeof sections.projectGroups)[number]) =>
       projectsCollapsed ? [] : orderSessionFamilies(folderListedRows(group), collapsedFamilies);
@@ -4412,7 +4398,6 @@ function ConversationSection({
   marker,
   active,
   conversations,
-  heldConversations,
   activeConversationId,
   pinnedConversationIds,
   collapsed,
@@ -4446,8 +4431,6 @@ function ConversationSection({
   /** Whether this section header represents the current page context. */
   active?: boolean;
   conversations: Conversation[];
-  /** Rows still listed while collapsed (a project folder's open session). */
-  heldConversations?: Conversation[];
   /** The active conversation's resolved top-level root id, or null — each row
       derives its own `isActive` by comparing against this. Resolved once by the
       list owner so a row never runs the (multi-step) active-root query itself. */
@@ -4493,7 +4476,7 @@ function ConversationSection({
 }) {
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
-  const rows = isCollapsed ? (heldConversations ?? []) : conversations;
+  const rows = isCollapsed ? [] : conversations;
   const families = sessionFamilyGroups(rows);
   const familyRepresentative = (row: Conversation) =>
     row.family ? families.get(row.family.id)?.[0] : undefined;

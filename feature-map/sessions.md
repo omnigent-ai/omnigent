@@ -114,7 +114,8 @@ the header menu), and each place is a separate entry point.
   rename, pin or archive
   sessions with `sys_session_update` (see
   [session orchestration](session-orchestration.md)).
-- `project-show-more`: an expanded project folder lists its five newest
+- `project-show-more`: a collapsed project folder hides every child row, including
+  the open session. An expanded project folder lists its five newest
   sessions; each Show more slides five more in until none remain. Re-expanding
   starts at five again, the open session stays listed once the sidebar has
   loaded it, and Show more carries the badge of a hidden session that needs
