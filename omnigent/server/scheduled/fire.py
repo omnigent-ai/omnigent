@@ -116,7 +116,11 @@ from omnigent.server.scheduled.harness_settings import (
     scheduled_agent_harness,
     validate_scheduled_permission_mode,
 )
-from omnigent.server.scheduled.schedule import continued_sandbox_host_id, is_trigger_automation
+from omnigent.server.scheduled.schedule import (
+    continued_sandbox_host_id,
+    is_trigger_automation,
+    strip_trigger_header,
+)
 from omnigent.server.scheduled.source_session import (
     SourceCopyIncompleteError,
     SourceHistoryUnsupportedError,
@@ -138,6 +142,7 @@ from omnigent.server.scheduled.telemetry import (
     startup_failure_stage,
 )
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.session_mcp_selection import SessionMcpSelection, session_mcp_selection
 from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
@@ -292,6 +297,11 @@ class _FireRecorder(Protocol):
     records progress on the run it already claimed, under a startup lease.
     """
 
+    @property
+    def managed_host_id(self) -> str | None:
+        """The sandbox host id this fire's managed session is created with and launched under."""
+        ...
+
     async def check(self) -> None:
         """Raise before an external action if the fire may no longer proceed."""
         ...
@@ -326,6 +336,16 @@ class _NewRunRecorder:
         self._task = task
         self._scheduled_at = scheduled_at
         self._session_id: str | None = None
+        # No run row carries an id, so a fresh managed fire chooses one here.
+        self._fresh_host_id = uuid.uuid4().hex
+
+    @property
+    def managed_host_id(self) -> str | None:
+        if self._task.execution_target != "managed_sandbox":
+            return None
+        if self._task.session_mode == "continue":
+            return continued_sandbox_host_id(self._task.id, self._task.workspace_id)
+        return self._fresh_host_id
 
     async def check(self) -> None:
         return None
@@ -369,14 +389,9 @@ class _NewRunRecorder:
         if start is None:
             return
         # Started only after the run exists, so a fast launch failure has a
-        # running run to fail. A continue task keeps one sandbox host.
-        host_id = (
-            continued_sandbox_host_id(task.id, task.workspace_id)
-            if task.session_mode == "continue"
-            else None
-        )
+        # running run to fail.
         try:
-            start(conv, task, host_id, _LEGACY_LAUNCH_ERRORS)
+            start(conv, task, self.managed_host_id, _LEGACY_LAUNCH_ERRORS)
         except Exception as exc:
             _logger.exception(
                 "scheduled fire: managed launch did not start for task %s (session %s)",
@@ -421,7 +436,7 @@ UNATTENDED_RUN_NOTE = (
 
 def _prompt_event(prompt: str) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
-    text = f"{prompt.rstrip()}\n\n{UNATTENDED_RUN_NOTE}"
+    text = f"{strip_trigger_header(prompt).rstrip()}\n\n{UNATTENDED_RUN_NOTE}"
     return SessionEventInput(
         type="message",
         data={"role": "user", "content": [{"type": "input_text", "text": text}]},
@@ -793,7 +808,13 @@ async def _run_fire_for_task(
     try:
         start_fire_stage("session_create")
         effective = await _own_task_agent(deps, effective)
-        conv = await _create_session(deps, effective, labels=_session_labels(task))
+        conv = await _create_session(
+            deps,
+            effective,
+            labels=_session_labels(
+                task, session_mcp_selection(deps.app_state), recorder.managed_host_id
+            ),
+        )
         log_session_created(conv.id)
     except _CannotLaunchScheduledFire as exc:
         _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
@@ -1710,20 +1731,33 @@ def _sandbox_workspaces(task: ScheduledTask) -> list[str]:
     return []
 
 
-def _session_labels(task: ScheduledTask) -> dict[str, str]:
+def _session_labels(
+    task: ScheduledTask,
+    mcp_selection: SessionMcpSelection | None = None,
+    managed_host_id: str | None = None,
+) -> dict[str, str]:
     """Labels a fired session starts with.
 
-    A continue task's sandbox session records the host id it routes by, so a
-    relaunched sandbox keeps connecting to the replica that owns that id.
+    The task's MCP services become the deployment's selection labels, so every
+    run starts with the same services. A managed fire's session records the
+    sandbox host id it was launched under, so the host routes by that id from
+    its first connection and a relaunch keeps the same replica. A task with no
+    services writes no selection labels, so a copied session keeps its own.
     """
+    selection_labels = (
+        (mcp_selection or session_mcp_selection(None)).session_labels(task.mcp_services)
+        if task.mcp_services
+        else {}
+    )
     labels = {
+        **selection_labels,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id,
         **managed_repo_labels(_sandbox_workspaces(task)),
     }
-    if task.execution_target == "managed_sandbox" and task.session_mode == "continue":
+    if task.execution_target == "managed_sandbox" and managed_host_id is not None:
         from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
 
-        labels[REQUESTED_HOST_ID_LABEL_KEY] = continued_sandbox_host_id(task.id, task.workspace_id)
+        labels[REQUESTED_HOST_ID_LABEL_KEY] = managed_host_id
     return labels
 
 
@@ -1924,6 +1958,12 @@ async def _copy_source_session_for_run(
     dropped = run_copy_dropped_label_keys(
         source.labels if source is not None else {}, agent_changed=agent_changed
     )
+    if task.mcp_services and source is not None:
+        # The task's own MCP services replace the copy's rather than adding to them.
+        selection = session_mcp_selection(deps.app_state)
+        dropped = dropped | frozenset(
+            selection.session_labels(selection.selected_services(source.labels))
+        )
     project_id = await _fire_project_id(deps, task)
     try:
         conv = await asyncio.to_thread(
@@ -2640,6 +2680,10 @@ class _ClaimedRunRecorder:
         self._task = task
         self._lease = lease
         self._registration_timeout_s = registration_timeout_s
+
+    @property
+    def managed_host_id(self) -> str | None:
+        return self._lease.run.host_id
 
     async def check(self) -> None:
         await self._lease.check()
