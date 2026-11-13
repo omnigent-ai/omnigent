@@ -35,7 +35,7 @@ import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import type { Host } from "@/hooks/useHosts";
@@ -43,7 +43,10 @@ import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
-import { getCurrentUserId } from "@/lib/identity";
+import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import type { ServerInfo } from "@/lib/capabilities";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 
 let searchParams = new URLSearchParams();
@@ -119,11 +122,35 @@ function Landing({ visit }: { visit: number }) {
   return <NewChatLandingScreen key={visit} />;
 }
 
+const serverInfo = {
+  accounts_enabled: false,
+  single_user: false,
+  login_url: null,
+  needs_setup: false,
+  databricks_features: false,
+  managed_sandboxes_enabled: false,
+  sandbox_provider: null,
+  enabled_connections: [],
+  sharing_mode: "on",
+  public_sharing_enabled: true,
+  server_version: null,
+  smart_routing_enabled: false,
+  smart_routing_sources: { external: false, oss: false },
+  features: {},
+  harness_install_enabled: false,
+  installable_harnesses: [],
+  dictation_available: false,
+} as ServerInfo;
+
 function renderLanding() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(<Landing visit={1} />, {
     wrapper: ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={serverInfo}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
+      </QueryClientProvider>
     ),
   });
 }
@@ -159,6 +186,7 @@ beforeEach(() => {
   window.sessionStorage.clear();
   serverIdentity = "workspace:1";
   vi.mocked(getCurrentUserId).mockReturnValue(null);
+  vi.mocked(authenticatedFetch).mockReset();
   searchParams = new URLSearchParams("o=123&prompt=hello_world");
   replaceSearchParamsMock.mockImplementation((next: URLSearchParams) => {
     searchParams = new URLSearchParams(next);
@@ -171,15 +199,10 @@ afterEach(() => {
 });
 
 describe("embedded prompt link", () => {
-  it("consumes the prompt from the URL", () => {
-    renderLanding();
-    expect(composer()).toHaveValue("hello_world");
-    expect(replaceSearchParamsMock).toHaveBeenLastCalledWith(new URLSearchParams("o=123"));
-  });
-
   it("keeps the prompt when the host remounts the composer in the same commit", () => {
     const { rerender } = renderLanding();
     expect(composer()).toHaveValue("hello_world");
+    expect(replaceSearchParamsMock).toHaveBeenLastCalledWith(new URLSearchParams("o=123"));
     // The new instance renders before the old one's unmount cleanup parks the draft.
     rerender(<Landing visit={2} />);
     expect(composer()).toHaveValue("hello_world");
@@ -252,11 +275,55 @@ describe("embedded prompt link", () => {
     expect(composer()).toHaveValue("");
   });
 
-  it("drops the kept prompt once a session is started", () => {
+  it("keeps the prompt when a blocked submit starts no session", () => {
     renderLanding();
     fireEvent.keyDown(composer(), { key: "Enter" });
     expect(composer()).toHaveValue("hello_world");
+    reloadPage();
+    expect(composer()).toHaveValue("hello_world");
+  });
+
+  it("drops the kept prompt once a session is started", async () => {
+    window.localStorage.setItem(
+      "omnigent:recent-workspaces",
+      JSON.stringify({ host_1: ["/work/repo"] }),
+    );
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        {
+          id: "ag_hello",
+          name: "hello_world",
+          display_name: "Hello World",
+          description: null,
+          harness: "claude-sdk",
+          skills: [],
+        } as AvailableAgent,
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    vi.mocked(authenticatedFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).not.toBeDisabled());
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(authenticatedFetch)
+          .mock.calls.some(([url, init]) => url === "/v1/sessions" && init?.method === "POST"),
+      ).toBe(true),
+    );
     expect(window.sessionStorage.length).toBe(0);
+    reloadPage();
+    expect(composer()).toHaveValue("");
+  });
+
+  it("drops the kept prompt when the text changes after a remount", () => {
+    const { rerender } = renderLanding();
+    rerender(<Landing visit={2} />);
+    expect(composer()).toHaveValue("hello_world");
+    fireEvent.change(composer(), { target: { value: "Edited after remount" } });
     reloadPage();
     expect(composer()).toHaveValue("");
   });

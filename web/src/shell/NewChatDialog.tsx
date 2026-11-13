@@ -2557,20 +2557,26 @@ function NewChatLandingContent({
         };
 
   // A fresh page has no parked draft, so a prompt consumed just before a reload
-  // comes back from sessionStorage.
+  // comes back from sessionStorage. A remount restores it from the parked draft
+  // instead, but still takes over the kept copy so its edits and session start
+  // forget it.
   const [keptLinkedPrompt] = useState(() =>
-    handoff === null && !linkedPrompt?.trim() && landingDraft === null
-      ? readKeptLinkedPrompt()
+    handoff === null && !linkedPrompt?.trim() ? readKeptLinkedPrompt() : null,
+  );
+  const restoresKeptLinkedPrompt = keptLinkedPrompt !== null && landingDraft === null;
+  const keptLinkedTextRef = useRef<string | null>(
+    restoresKeptLinkedPrompt || landingDraft?.message === keptLinkedPrompt
+      ? keptLinkedPrompt
       : null,
   );
-  const keptLinkedTextRef = useRef<string | null>(keptLinkedPrompt);
   // A handoff or prompt link replaces the parked draft's text, and with it the
   // tags that text's tokens pointed at.
-  const restoresDraftText = handoff === null && !linkedPrompt?.trim() && keptLinkedPrompt === null;
+  const restoresDraftText = handoff === null && !linkedPrompt?.trim() && !restoresKeptLinkedPrompt;
   const [message, setMessage] = useState<string>(() => {
     if (handoff !== null) return handoff.text;
     if (linkedPrompt?.trim()) return linkedPrompt;
-    return keptLinkedPrompt ?? restoredDraft?.message ?? "";
+    if (restoresKeptLinkedPrompt) return keptLinkedPrompt ?? "";
+    return restoredDraft?.message ?? "";
   });
   // Filled in once the mention browser below owns the tags.
   const clearTaggedMentionsRef = useRef<() => void>(() => {});
@@ -6002,7 +6008,6 @@ function NewChatLandingContent({
   }
 
   async function handleCreate() {
-    releaseKeptLinkedPrompt();
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
@@ -6097,6 +6102,7 @@ function NewChatLandingContent({
       // Spend the draft only once provisioning starts, after the laptop credential check.
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
+      releaseKeptLinkedPrompt();
       if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
       trackClick("new_chat.start_session", "button");
       if (sandboxRepoSelections.length > 0) {
