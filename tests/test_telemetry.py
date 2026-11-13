@@ -248,16 +248,38 @@ def test_client_user_agent_unknown_component_falls_back_to_cli(
     assert "(" not in client_user_agent()
 
 
-def test_server_request_headers_carry_component_user_agent(
+async def test_server_request_headers_carry_component_user_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The shared server-request header builder names the calling component."""
-    from omnigent.cli_auth import databricks_request_headers
+    """The shared server-request header builder names the calling component.
+
+    Through ``open_server_client`` (request hooks included) a caller's
+    User-Agent in any casing is replaced by the component's, never duplicated.
+    """
+    import httpx
+
+    from omnigent.cli_auth import databricks_request_headers, open_server_client
     from omnigent.telemetry.request_headers import CLIENT_COMPONENT_ENV_VAR
 
     monkeypatch.setenv(CLIENT_COMPONENT_ENV_VAR, "runner")
     headers = databricks_request_headers("http://127.0.0.1:6767")
     assert classify_surface(headers["User-Agent"]) == "runner"
+
+    runner_ua = client_user_agent_for("runner")
+    sent: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers.get_list("User-Agent"))
+        return httpx.Response(200)
+
+    for name in ("User-Agent", "user-agent", "USER-AGENT", "uSeR-aGeNt"):
+        async with open_server_client(
+            "http://127.0.0.1:6767",
+            headers={name: "caller-agent/1.0"},
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            await client.get("http://127.0.0.1:6767/health")
+        assert sent[-1] == [runner_ua], name
 
 
 async def test_sdk_client_sends_sdk_user_agent_unless_overridden() -> None:

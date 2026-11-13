@@ -888,10 +888,11 @@ def open_server_client(
     import httpx
     from omnigent_client._http import is_loopback_url
 
-    pinned = {
-        **(headers or {}),
-        **databricks_request_headers(server_url, bearer_token=bearer_token, host_id=host_id),
-    }
+    # httpx.Headers is case-insensitive: a caller's "user-agent" is replaced, not duplicated.
+    pinned = httpx.Headers(headers or {})
+    pinned.update(
+        databricks_request_headers(server_url, bearer_token=bearer_token, host_id=host_id)
+    )
     kwargs: dict[str, Any] = {}
     from omnigent.session_host import route_known_session_request
 
