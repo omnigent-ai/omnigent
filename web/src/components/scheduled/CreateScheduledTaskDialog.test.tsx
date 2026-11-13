@@ -4926,6 +4926,34 @@ describe("editing template prompts", () => {
     expect(readTriggerWorkerSettings(input.prompt)?.permissionMode).toBe("default");
   });
 
+  it("saves Same as polling session as no worker mode, keeping the poller", async () => {
+    const saved = updateTriggerWorkerSettings(original, {
+      agentId: "ag_claude_native",
+      model: "",
+      effort: "",
+      permissionMode: "default",
+    })!;
+    const task = scheduledTask({
+      prompt: saved,
+      agentId: "ag_claude_native",
+      permissionMode: "auto",
+      sessionMode: "continue",
+      sessionId: "poller",
+    });
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={task} />, {
+      info: { scheduled_task_session_modes: true, session_create_permission_modes: true },
+    });
+    fireEvent.keyDown(screen.getByTestId("task-worker-permission-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Same as polling session" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    // Workers with no mode of their own run in the polling session's.
+    expect(readTriggerWorkerSettings(input.prompt)?.permissionMode).toBe("");
+    expect(input.prompt).not.toContain("permission_mode");
+    for (const key of ["sessionId", "permissionMode"]) expect(input).not.toHaveProperty(key);
+  });
+
   it("changes the polling session's settings on edit only for a new polling session", async () => {
     const saved = updateTriggerWorkerSettings(original, {
       agentId: "ag_claude_native",
@@ -4953,7 +4981,7 @@ describe("editing template prompts", () => {
     expect(screen.getByTestId("task-polling-model-trigger")).toHaveTextContent("Sonnet");
     for (const field of ["model", "effort", "permission"])
       expect(screen.getByTestId(`task-polling-${field}-trigger`)).toBeDisabled();
-    // The redesign's top-row agent and permission pickers stay hidden for a trigger.
+    // A trigger's top-row agent and permission pickers stay hidden on edit.
     expect(screen.queryByTestId("task-agent-picker")).not.toBeInTheDocument();
     expect(screen.queryByTestId("task-permission-trigger")).not.toBeInTheDocument();
     expect(screen.getByTestId("task-matching-settings")).toHaveTextContent("Matching sessions");

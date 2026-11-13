@@ -819,7 +819,6 @@ export function CreateScheduledTaskDialog({
     (agent) =>
       agent.id === (editedWorkerSettings?.agentId ?? editingTask?.agentId ?? effectiveAgentId),
   );
-  // A new trigger's workers use the polling model until they get their own.
   const workerModel = creatingTriggerWorkers
     ? (newTriggerWorkerSettings?.model ?? pickedModel)
     : (editedWorkerSettings?.model ?? "");
