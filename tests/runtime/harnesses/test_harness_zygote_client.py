@@ -11,6 +11,8 @@ protocol paths are fully testable here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import os
 import signal
 import socket
@@ -22,6 +24,7 @@ from omnigent.runner._zygote import (
     _ZYGOTE_TEST_CHILD_EXIT_ENV_VAR,
     ZYGOTE_HARNESS_FD_ENV_VAR,
 )
+from omnigent.runtime.harnesses import _harness_zygote_client
 from omnigent.runtime.harnesses._harness_zygote_client import (
     HarnessZygoteClient,
     ZygoteHarnessProc,
@@ -185,6 +188,106 @@ async def test_fork_harness_raises_when_channel_closed(zygote: ZygoteManager, tm
     client = HarnessZygoteClient(left.fileno())
     with pytest.raises(ZygoteHarnessUnavailable):
         await client.fork_harness(["--harness", "x"], {"PATH": os.environ.get("PATH", "")})
+
+
+@pytest.mark.parametrize("reply", [b"not json\n", b"[]\n", b""])
+async def test_failed_exchange_disables_channel_without_closing_it(reply: bytes) -> None:
+    """A failed exchange must not expose a stale reply to another caller."""
+    client_sock, peer_sock = socket.socketpair()
+    client = HarnessZygoteClient(client_sock.detach())
+    reader, writer = await asyncio.open_connection(sock=peer_sock)
+    poll = asyncio.create_task(client.poll(12345))
+    try:
+        assert json.loads(await asyncio.wait_for(reader.readline(), timeout=5)) == {
+            "cmd": "poll",
+            "pid": 12345,
+        }
+        if reply:
+            writer.write(reply)
+            await writer.drain()
+        else:
+            writer.write_eof()
+        with pytest.raises(ZygoteHarnessUnavailable):
+            await asyncio.wait_for(poll, timeout=5)
+        # A well-formed late reply cannot make the damaged stream reusable.
+        if reply:
+            writer.write(b'{"returncode":7}\n')
+            await writer.drain()
+        with pytest.raises(ZygoteHarnessUnavailable, match="unusable"):
+            await asyncio.wait_for(client.poll(67890), timeout=5)
+        assert client._sock is not None and client._sock.fileno() >= 0
+    finally:
+        assert client._sock is not None
+        with contextlib.suppress(OSError):
+            client._sock.shutdown(socket.SHUT_RDWR)
+        client._sock.close()
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.gather(poll, return_exceptions=True)
+
+
+async def test_cancelled_poll_disables_channel_before_another_request() -> None:
+    """Cancelling the async caller does not stop its blocking socket reader."""
+    client_sock, peer_sock = socket.socketpair()
+    client = HarnessZygoteClient(client_sock.detach())
+    reader, writer = await asyncio.open_connection(sock=peer_sock)
+    poll = asyncio.create_task(client.poll(12345))
+    try:
+        assert json.loads(await asyncio.wait_for(reader.readline(), timeout=5)) == {
+            "cmd": "poll",
+            "pid": 12345,
+        }
+        poll.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await poll
+        with pytest.raises(ZygoteHarnessUnavailable, match="unusable"):
+            await asyncio.wait_for(client.poll(67890), timeout=0.5)
+        assert client._sock is not None and client._sock.fileno() >= 0
+    finally:
+        assert client._sock is not None
+        with contextlib.suppress(OSError):
+            client._sock.shutdown(socket.SHUT_RDWR)
+        client._sock.close()
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.gather(poll, return_exceptions=True)
+
+
+async def test_unresponsive_channel_has_a_bounded_exchange(monkeypatch) -> None:
+    """A wedged forkserver must release the client's lock and worker thread."""
+    monkeypatch.setattr(_harness_zygote_client, "_CONTROL_TIMEOUT_S", 0.05, raising=False)
+    client_sock, peer_sock = socket.socketpair()
+    client = HarnessZygoteClient(client_sock.detach())
+    try:
+        with pytest.raises(ZygoteHarnessUnavailable, match="timed out"):
+            await asyncio.wait_for(client.poll(12345), timeout=1)
+        with pytest.raises(ZygoteHarnessUnavailable, match="unusable"):
+            await client.poll(67890)
+        assert client._sock is not None and client._sock.fileno() >= 0
+    finally:
+        peer_sock.close()
+        assert client._sock is not None
+        client._sock.close()
+
+
+async def test_cancelled_lock_waiter_keeps_the_channel_usable(zygote: ZygoteManager) -> None:
+    """Cancellation before any socket I/O must not disable a healthy client."""
+    client = _client_on(zygote)
+    async with client._lock:
+        poll = asyncio.create_task(client.poll(12345))
+        await asyncio.sleep(0)
+        poll.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await poll
+    assert await client._exchange({"cmd": "ping"}) == {"pong": True}
+
+
+async def test_rejected_request_keeps_the_channel_usable(zygote: ZygoteManager) -> None:
+    """A complete protocol error is a valid response, not transport loss."""
+    client = _client_on(zygote)
+    reply = await client._exchange({"cmd": "unknown"})
+    assert "error" in reply
+    assert await client._exchange({"cmd": "ping"}) == {"pong": True}
 
 
 async def test_wait_surfaces_failure_when_zygote_dies_and_harness_gone(
