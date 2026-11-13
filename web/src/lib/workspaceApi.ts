@@ -1,11 +1,5 @@
-// The workspace API (`omnigent.api.workspace.v1alpha1`): reads a session's
-// workspace files through the session's host.
-//
-// The desktop shell reads straight from the host's local socket with a
-// short-lived token the server grants to the session's owner. Other clients,
-// and the desktop when that fails, call the same API through the server. Both
-// answer exactly like the REST file routes, which stay the fallback whenever
-// neither route is enabled or works.
+// Client for the workspace API (`omnigent.api.workspace.v1alpha1`), which reads
+// a session's workspace files through its host; see readFileViaWorkspaceApi.
 
 import { Code, ConnectError, createClient, type Client } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
@@ -31,14 +25,24 @@ interface DirectGrant {
   expiresAtMs: number;
 }
 
+/** A session's grant request, and the grant once it arrives. */
+interface GrantEntry {
+  pending: Promise<DirectGrant>;
+  grant?: DirectGrant;
+}
+
 // Renew a grant this long before the host would refuse it.
 const GRANT_RENEW_MARGIN_MS = 30_000;
+// A grant request that takes longer is abandoned, so the next read asks again.
+const GRANT_TIMEOUT_MS = 10_000;
 // A route that failed for a session is skipped for this long, then tried again.
 const ROUTE_RETRY_MS = 5 * 60_000;
 // Answers about the request itself, not failures of the route that carried it.
 const ANSWER_CODES = new Set([Code.NotFound, Code.InvalidArgument]);
+// The host is briefly away, e.g. reconnecting: try the next route, keep this one.
+const TRANSIENT_CODES = new Set([Code.Unavailable]);
 
-const grants = new Map<string, Promise<DirectGrant>>();
+const grants = new Map<string, GrantEntry>();
 const failedUntil = new Map<string, number>();
 
 function routesFor(sessionId: string): Route[] {
@@ -55,9 +59,21 @@ function sessionPath(sessionId: string): string {
   return `/v1/sessions/${encodeURIComponent(sessionId)}/workspace`;
 }
 
+/** Settle with `promise`, or reject as soon as `signal` aborts. */
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
 async function requestGrant(sessionId: string): Promise<DirectGrant> {
   const res = await authenticatedFetch(`${sessionPath(sessionId)}/direct-access`, {
     method: "POST",
+    signal: AbortSignal.timeout(GRANT_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as { socket_path: string; token: string; expires_at: number };
@@ -65,13 +81,22 @@ async function requestGrant(sessionId: string): Promise<DirectGrant> {
 }
 
 /** The session's current grant; concurrent reads share one request for it. */
-async function directGrant(sessionId: string): Promise<DirectGrant> {
+function directGrant(sessionId: string): Promise<DirectGrant> {
   const cached = grants.get(sessionId);
-  const grant = cached && (await cached.catch(() => null));
-  if (grant && grant.expiresAtMs - GRANT_RENEW_MARGIN_MS > Date.now()) return grant;
-  // The first read to find it stale renews it for every read waiting with it.
-  if (grants.get(sessionId) === cached) grants.set(sessionId, requestGrant(sessionId));
-  return grants.get(sessionId)!;
+  if (cached && (!cached.grant || cached.grant.expiresAtMs - GRANT_RENEW_MARGIN_MS > Date.now())) {
+    return cached.pending;
+  }
+  const entry: GrantEntry = { pending: requestGrant(sessionId) };
+  entry.pending.then(
+    (grant) => {
+      entry.grant = grant;
+    },
+    () => {
+      if (grants.get(sessionId) === entry) grants.delete(sessionId);
+    },
+  );
+  grants.set(sessionId, entry);
+  return entry.pending;
 }
 
 function directClient(
@@ -91,12 +116,16 @@ function directClient(
       fetch: async (input, init) => {
         const headers = Object.fromEntries(new Headers(init?.headers).entries());
         headers.authorization = `Bearer ${grant.token}`;
-        const response = await send({
-          socketPath: grant.socketPath,
-          path: new URL(String(input)).pathname,
-          headers,
-          body: (init?.body as Uint8Array | undefined) ?? new Uint8Array(),
-        });
+        // The shell can't cancel its call, so a cancelled read just stops waiting.
+        const response = await abortable(
+          send({
+            socketPath: grant.socketPath,
+            path: new URL(String(input)).pathname,
+            headers,
+            body: (init?.body as Uint8Array | undefined) ?? new Uint8Array(),
+          }),
+          init?.signal,
+        );
         return new Response(response.body as Uint8Array<ArrayBuffer>, {
           status: response.status,
           headers: response.headers,
@@ -118,11 +147,23 @@ function serverClient(sessionId: string): WorkspaceClient {
   );
 }
 
-async function clientFor(route: Route, sessionId: string): Promise<WorkspaceClient> {
-  if (route === "server") return serverClient(sessionId);
+async function readFileOn(
+  route: Route,
+  sessionId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<FileContentResponse> {
+  if (route === "server") return readFile(serverClient(sessionId), path, signal);
   const send = workspaceSocketBridge();
   if (!send) throw new Error("The desktop shell can't reach local sockets");
-  return directClient(await directGrant(sessionId), send);
+  const pending = directGrant(sessionId);
+  try {
+    return await readFile(directClient(await abortable(pending, signal), send), path, signal);
+  } catch (error) {
+    // Drop only the grant this read used; a parallel read may have renewed it.
+    if (!signal?.aborted && grants.get(sessionId)?.pending === pending) grants.delete(sessionId);
+    throw error;
+  }
 }
 
 function concat(chunks: Uint8Array[]): Uint8Array {
@@ -155,7 +196,10 @@ async function readFile(
     path,
     content_type: metadata.contentType || null,
     encoding: text ? "utf-8" : "base64",
-    content: text ? new TextDecoder().decode(bytes) : base64Encode(bytes),
+    // Keep a leading BOM, as REST does.
+    content: text
+      ? new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes)
+      : base64Encode(bytes),
     bytes: Number(metadata.size),
     truncated: metadata.truncated,
   };
@@ -164,8 +208,9 @@ async function readFile(
 /**
  * Read a workspace file through the workspace API, on the first route that works.
  *
- * Tries the host's local socket first (desktop shell only), then the server.
- * A route that fails is skipped for the session for a while.
+ * Tries the host's local socket first (desktop shell only, with a short-lived
+ * token the server grants the session's owner), then the server. A route that
+ * fails is skipped for the session for a while; REST is the fallback.
  *
  * :param sessionId: The session whose workspace to read.
  * :param path: Workspace-relative path, e.g. ``"src/main.py"``.
@@ -182,12 +227,12 @@ export async function readFileViaWorkspaceApi(
   /* oxlint-disable no-await-in-loop */
   for (const route of routesFor(sessionId)) {
     try {
-      return await readFile(await clientFor(route, sessionId), path, signal);
+      return await readFileOn(route, sessionId, path, signal);
     } catch (error) {
       signal?.throwIfAborted();
       const code = error instanceof ConnectError ? error.code : null;
       if (code !== null && ANSWER_CODES.has(code)) return null;
-      if (route === "direct") grants.delete(sessionId);
+      if (code !== null && TRANSIENT_CODES.has(code)) continue;
       // A restarted host refuses the old token; the next read gets a new one.
       if (route === "direct" && code === Code.Unauthenticated) continue;
       failedUntil.set(`${route}:${sessionId}`, Date.now() + ROUTE_RETRY_MS);

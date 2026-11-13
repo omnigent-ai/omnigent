@@ -70,12 +70,22 @@ function serve(readFile: () => Uint8Array<ArrayBuffer>): void {
 }
 
 const socket = vi.fn<(request: unknown) => Promise<WorkspaceSocketResponse>>();
+const fromSocket = (body: Uint8Array<ArrayBuffer>, status = 200): WorkspaceSocketResponse => ({
+  status,
+  headers: status === 200 ? CONNECT_HEADERS : { "content-type": "application/json" },
+  body,
+});
+const grantRequests = () =>
+  vi
+    .mocked(authenticatedFetch)
+    .mock.calls.filter(([input]) => String(input).endsWith("/direct-access")).length;
 
 beforeEach(() => {
   vi.mocked(workspaceSocketBridge).mockReturnValue(socket);
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.resetAllMocks();
 });
 
@@ -117,6 +127,16 @@ describe("readFileViaWorkspaceApi", () => {
 
     expect(binary).toMatchObject({ encoding: "base64", content: "/wA=", content_type: null });
     expect(binary?.truncated).toBe(true);
+
+    serve(() =>
+      stream([
+        { metadata: { size: 5n, encoding: ContentEncoding.UTF8 } },
+        { data: new Uint8Array([0xef, 0xbb, 0xbf, 0x68, 0x69]) },
+      ]),
+    );
+    const withBom = await readFileViaWorkspaceApi("s-server", "bom.txt");
+
+    expect(withBom?.content).toBe("\ufeffhi");
   });
 
   it("reads from the host's socket on the desktop, with one grant for many reads", async () => {
@@ -136,7 +156,7 @@ describe("readFileViaWorkspaceApi", () => {
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
     expect(authenticatedFetch).toHaveBeenCalledWith(
       "/v1/sessions/s-direct/workspace/direct-access",
-      { method: "POST" },
+      expect.objectContaining({ method: "POST" }),
     );
     expect(socket).toHaveBeenCalledTimes(2);
     expect(socket.mock.calls[0]![0]).toMatchObject({
@@ -157,13 +177,67 @@ describe("readFileViaWorkspaceApi", () => {
     expect(socket).toHaveBeenCalledTimes(1);
   });
 
-  it("leaves an error answer to REST without giving up on the route", async () => {
-    enable("workspace_api_server_access");
-    serve(() => stream([], { error: { code: "not_found", message: "missing.md" } }));
+  it.each(["not_found", "unavailable"])(
+    "leaves a %s error to REST without giving up on the route",
+    async (code) => {
+      enable("workspace_api_server_access");
+      serve(() => stream([], { error: { code, message: "no" } }));
 
-    expect(await readFileViaWorkspaceApi("s-missing", "missing.md")).toBeNull();
-    expect(await readFileViaWorkspaceApi("s-missing", "missing.md")).toBeNull();
+      expect(await readFileViaWorkspaceApi(`s-${code}`, "missing.md")).toBeNull();
+      expect(await readFileViaWorkspaceApi(`s-${code}`, "missing.md")).toBeNull();
 
-    expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+      expect(authenticatedFetch).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("stops waiting for a stalled grant when the read is cancelled", async () => {
+    enable("workspace_direct_access", "workspace_api_server_access");
+    vi.mocked(authenticatedFetch).mockReturnValue(new Promise<Response>(() => {}));
+    const cancel = new AbortController();
+
+    const read = readFileViaWorkspaceApi("s-stalled", "notes.md", cancel.signal);
+    cancel.abort(new Error("save timed out"));
+
+    await expect(read).rejects.toThrow("save timed out");
+    expect(socket).not.toHaveBeenCalled();
+  });
+
+  it("renews a grant before it expires and after the host restarts", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    enable("workspace_direct_access", "workspace_api_server_access");
+    serve(textFile);
+    socket.mockImplementation(async () => fromSocket(textFile()));
+
+    await readFileViaWorkspaceApi("s-renew", "notes.md");
+    vi.setSystemTime(Date.now() + 280_000); // within the renewal margin
+    await readFileViaWorkspaceApi("s-renew", "notes.md");
+    expect(grantRequests()).toBe(2);
+
+    // A restarted host refuses the old token: the server answers this read,
+    // and the next one goes back to the socket with a new grant.
+    const refused = new TextEncoder().encode('{"code":"unauthenticated"}');
+    socket.mockResolvedValueOnce(fromSocket(refused, 401));
+    expect((await readFileViaWorkspaceApi("s-renew", "notes.md"))?.content).toBe("héllo");
+    await readFileViaWorkspaceApi("s-renew", "notes.md");
+
+    expect(grantRequests()).toBe(3);
+    expect(socket).toHaveBeenCalledTimes(4);
+  });
+
+  it("tries a failed socket again once its back-off ends", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    enable("workspace_direct_access", "workspace_api_server_access");
+    serve(textFile);
+    socket.mockRejectedValueOnce(new Error("socket gone"));
+    socket.mockImplementation(async () => fromSocket(textFile()));
+
+    await readFileViaWorkspaceApi("s-backoff", "notes.md");
+    await readFileViaWorkspaceApi("s-backoff", "notes.md");
+    expect(socket).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(Date.now() + 5 * 60_000 + 1);
+    await readFileViaWorkspaceApi("s-backoff", "notes.md");
+
+    expect(socket).toHaveBeenCalledTimes(2);
   });
 });

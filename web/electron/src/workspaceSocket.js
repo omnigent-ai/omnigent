@@ -1,10 +1,6 @@
-// Calls the workspace API on a host's local socket for the connected server's page.
-//
-// The server tells the page where its host's socket is and gives it a
-// short-lived token; the page hands both here because a page can't open Unix
-// sockets. Main forwards only workspace API calls, and only to a socket that
-// looks like one an Omnigent host made for this user, so a page can't use it to
-// reach other local services.
+// Sends the server page's workspace API calls to a host's local socket, which a
+// page can't open itself. Only API calls, and only to sockets an Omnigent host
+// made for this user, so a page can't reach other local services.
 
 "use strict";
 
@@ -87,7 +83,9 @@ function workspaceSocketRequest(request) {
         response.on("data", (chunk) => {
           size += chunk.length;
           if (size > MAX_RESPONSE_BYTES) {
-            outgoing.destroy(new Error("workspace API response too large"));
+            // Reject first: once the response has started, destroy() reports a generic error.
+            reject(new Error("workspace API response too large"));
+            outgoing.destroy();
             return;
           }
           chunks.push(chunk);
