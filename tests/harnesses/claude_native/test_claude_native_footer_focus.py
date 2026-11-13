@@ -25,13 +25,19 @@ class _FakeClaudeFooter:
     item, then into the agent list. While the footer holds focus a paste is
     lost and Enter acts on the footer. Space hands focus back to the input
     box and, there or in the footer, types a space into it.
+
+    Enter on an agent-list row shows that agent, and a message submitted while
+    a subagent is shown goes to it (``subagent_inbox``) instead of main.
     """
 
     focus: str = "input"
     selected: int = 0
+    viewed: int = 0
     draft: str = ""
     submitted: list[str] = field(default_factory=list)
+    subagent_inbox: list[str] = field(default_factory=list)
     keys: list[str] = field(default_factory=list)
+    view_switch_ignored: bool = False
 
     def pane(self) -> str:
         """
@@ -42,16 +48,21 @@ class _FakeClaudeFooter:
         list_focused = self.focus == "list"
         rows = []
         for idx, name in enumerate(_AGENTS):
-            glyph = "●" if idx == 0 else "◯"
+            glyph = "●" if idx == self.viewed else "◯"
             lead = "❯ " if list_focused and idx == self.selected else "  "
             task = "" if idx == 0 else f"  Sleep and monitor {idx}"
             rows.append(f"{lead}{glyph} {name}{task}")
         hint = "  ↑/↓ to select" if list_focused else "  ⏵⏵ auto mode on · 2 shells"
+        top_rule, composer = _RULE, self.draft
+        if self.viewed:
+            title = f" Sleep and monitor {self.viewed} ─"
+            top_rule = "─" * (len(_RULE) - len(title)) + title
+            composer = self.draft or f"Message @{_AGENTS[self.viewed]}…"
         return "\n".join(
             [
                 "● I started 2 general-purpose agents in the background.",
-                _RULE,
-                f"❯ {self.draft}",
+                top_rule,
+                f"❯ {composer}",
                 _RULE,
                 "  Opus │ medium │ 39.1k/1M $0.32 │ git:master",
                 hint,
@@ -70,6 +81,17 @@ class _FakeClaudeFooter:
             if key == "Space":
                 self.focus = "input"
                 self.draft += " "
+            elif self.focus == "shells" and key in ("Up", "Down"):
+                self.focus, self.selected = ("input" if key == "Up" else "list"), 0
+            elif self.focus == "list" and key == "Up":
+                if self.selected:
+                    self.selected -= 1
+                else:
+                    self.focus = "input"
+            elif self.focus == "list" and key == "Down":
+                self.selected = min(self.selected + 1, len(_AGENTS) - 1)
+            elif self.focus == "list" and key == "Enter" and not self.view_switch_ignored:
+                self.viewed = self.selected
             return
         if key == "Space":
             self.draft += " "
@@ -77,9 +99,13 @@ class _FakeClaudeFooter:
             self.draft = ""
         elif key == "Enter":
             if self.draft.strip():
-                self.submitted.append(self.draft.strip())
+                inbox = self.subagent_inbox if self.viewed else self.submitted
+                inbox.append(self.draft.strip())
             self.draft = ""
-        elif key not in ("Escape", "Up", "Down"):
+        elif key == "Down":
+            if not self.draft:
+                self.focus = "shells"
+        elif key not in ("Escape", "Up"):
             self.draft += key
 
     def paste(self, text: str) -> None:
@@ -181,3 +207,72 @@ def test_a_slash_command_reaches_claude_while_the_footer_holds_focus(
 
     assert tui.submitted == ["/effort high"]
     assert tui.keys[:2] == ["Space", _CLEAR_ONE_ROW_COMPOSER]
+
+
+@pytest.mark.parametrize(
+    ("focus", "selected", "draft"),
+    [
+        ("input", 0, ""),
+        ("input", 0, "half-typed note"),
+        ("shells", 0, ""),
+        ("list", 1, ""),
+        ("list", 2, ""),
+        ("list", 0, ""),
+    ],
+    ids=[
+        "input-box",
+        "draft-in-subagent-box",
+        "shells-item",
+        "pointer-on-shown-subagent",
+        "pointer-on-another-subagent",
+        "pointer-on-main",
+    ],
+)
+def test_a_message_reaches_main_while_the_terminal_shows_a_subagent(
+    focus: str, selected: int, draft: str, bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A message typed while the terminal shows a subagent went to that subagent.
+
+    The web UI's chat is the main conversation, so delivery walks the agent
+    panel back to main first, without Escape or ``x``, which would interrupt
+    or stop the subagent.
+    """
+    tui = _FakeClaudeFooter(focus=focus, selected=selected, viewed=1, draft=draft)
+    _drive(monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="what did the explorer find?")
+
+    assert tui.submitted == ["what did the explorer find?"]
+    assert tui.subagent_inbox == []
+    assert tui.viewed == 0
+    assert "Escape" not in tui.keys
+    assert "x" not in tui.keys
+
+
+def test_a_slash_command_reaches_main_while_the_terminal_shows_a_subagent(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A settings change from the web UI applies to main, not the shown subagent."""
+    tui = _FakeClaudeFooter(viewed=1)
+    _drive(monkeypatch, tui)
+
+    claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert tui.submitted == ["/effort high"]
+    assert tui.subagent_inbox == []
+
+
+def test_a_subagent_view_that_will_not_close_is_refused_before_typing(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When main cannot be shown again, nothing is typed into the subagent's box."""
+    monkeypatch.setattr(claude_native_bridge, "_OCCUPIED_INPUT_DISMISS_TIMEOUT_S", 0.3)
+    tui = _FakeClaudeFooter(focus="list", selected=1, viewed=1, view_switch_ignored=True)
+    _drive(monkeypatch, tui)
+
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied, match="a subagent's view"):
+        inject_user_message(bridge_dir, content="what did the explorer find?")
+
+    assert tui.subagent_inbox == []
+    assert tui.draft == ""

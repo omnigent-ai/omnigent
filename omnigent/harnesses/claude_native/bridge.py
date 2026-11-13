@@ -505,6 +505,16 @@ _SHELL_MODE_SURFACE = "shell mode"
 # What :func:`_occupying_surface` reports when a draft taller than the pane
 # has scrolled the box's glyph row out of view.
 _SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
+# What :func:`_occupying_surface` reports while the terminal shows a subagent,
+# which a typed message would reach instead of the main conversation.
+_SUBAGENT_VIEW_SURFACE = "a subagent's view"
+# The agent panel's first row while another agent is shown; ``● main`` otherwise.
+_AGENT_PANEL_UNSHOWN_MAIN_ROW = re.compile(r"^(?:❯ |  )◯ main(?:\s|$)")
+# An empty input box's placeholder while a subagent is shown.
+_SUBAGENT_COMPOSER_PLACEHOLDER = re.compile(r"^Message @\S.*…$")
+# Re-press a panel key the screen has not acted on after this long. Each key is
+# chosen from the focus on screen, so a repeat that did land is walked back.
+_AGENT_PANEL_STEP_RETRY_S = 0.5
 # Surfaces drawn over the input box advertise their dismissal in the footer
 # ("Esc to cancel", "Esc/Enter/Space to close"), possibly wrapped between words.
 # Escape cannot clear a screen with neither this nor a composer, e.g. a launch wrapper's output.
@@ -4909,9 +4919,10 @@ def inject_user_message(
     Between the two, anything the person left occupying the composer
     from the embedded terminal — a ctrl+r history search, a rewind
     dialog, a ``/config`` panel, ``!`` shell mode — is dismissed with
-    Escape, or cleared when it is a typed shell command (see
-    :func:`_restore_occupied_input`), so the message reclaims the input box
-    instead of being typed into that surface.
+    Escape, or cleared when it is a typed shell command, and a subagent's
+    view is switched back to main (see :func:`_restore_occupied_input`), so
+    the message reclaims the main input box instead of being typed into
+    that surface.
 
     Delivered as one bracketed paste via ``tmux load-buffer`` (from a
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
@@ -7078,6 +7089,11 @@ def _restore_occupied_input(
     The detailed transcript view uses Ctrl+O instead of Escape. Toggle it
     once after two matching captures; repeating it could reopen the view.
 
+    A subagent's view, opened from the agent panel, sends a typed message to
+    that subagent. It is walked back to main through the panel one key at a
+    time (:func:`_step_toward_main_view`), each on a focus two captures agree
+    on, so a stale frame cannot move the selection past main.
+
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
     startup dialogs whose Escape quits Claude Code instead of closing them
@@ -7123,6 +7139,9 @@ def _restore_occupied_input(
     notice_redrawn = False
     transcript_view_seen = False
     transcript_toggled = False
+    previous_focus: _AgentPanelFocus | None = None
+    focus_stepped: _AgentPanelFocus | None = None
+    last_focus_step: float | None = None
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(
@@ -7155,6 +7174,7 @@ def _restore_occupied_input(
             continue
         if surface is None:
             return None
+        focus = _subagent_view_focus(pane) if surface == _SUBAGENT_VIEW_SURFACE else None
         now = time.monotonic()
         if now >= deadline:
             _logger.warning(
@@ -7182,6 +7202,16 @@ def _restore_occupied_input(
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-o")
                 # Repeating a toggle against a stale capture would reopen the view.
                 transcript_toggled = True
+        elif focus is not None:
+            if focus == previous_focus and (
+                focus != focus_stepped
+                or last_focus_step is None
+                or now - last_focus_step >= _AGENT_PANEL_STEP_RETRY_S
+            ):
+                _logger.info("claude-native: switching the terminal from a subagent to main")
+                delivery_diagnostics.record_restore_action("main_view_select")
+                _step_toward_main_view(socket_path, tmux_target, focus)
+                focus_stepped, last_focus_step = focus, now
         elif unclearable:
             # Give it up only on two consecutive hint-less sightings, so a
             # torn frame mid-redraw of a dismissible surface does not hand a
@@ -7208,6 +7238,7 @@ def _restore_occupied_input(
             last_escape = now
         unclearable_seen = unclearable
         transcript_view_seen = surface == _DETAILED_TRANSCRIPT_SURFACE
+        previous_focus = focus
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
@@ -7260,8 +7291,75 @@ def _occupying_surface(pane: str) -> str | None:
         box = _composer_box(pane)
         return _SCROLLED_DRAFT_SURFACE if box is not None else _OVERLAY_SURFACE
     if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
-        return None
+        return _SUBAGENT_VIEW_SURFACE if _subagent_view_focus(pane) is not None else None
     return _SHELL_MODE_SURFACE
+
+
+class _AgentPanelFocus(NamedTuple):
+    """Where keyboard focus sits while the terminal shows a subagent."""
+
+    #: Agent-panel row the pointer marks, ``0`` for main, or ``None`` when no row has it.
+    pointer_row: int | None
+    #: The input box's rows while it holds a draft, ``()`` while it shows its placeholder.
+    draft: tuple[str, ...]
+
+
+def _subagent_view_focus(pane: str) -> _AgentPanelFocus | None:
+    """
+    Return the focus of a subagent's view, or ``None`` while main is shown.
+
+    Claude Code draws its agent panel under the input box with main as the
+    first row, and fills the glyph of the agent the terminal shows
+    (``◯ main`` above ``❯ ● Explore``). A message typed there goes to that agent.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The selected panel row and the input box's draft while a
+        subagent is shown, else ``None``.
+    """
+    lines = pane.splitlines()
+    rules = _composer_frame_rule_indices(lines)
+    box = _composer_box(pane)
+    if len(rules) < 2 or box is None or not box.framed:
+        return None
+    panel = lines[rules[-1] + 1 :]
+    main = next(
+        (idx for idx, line in enumerate(panel) if _AGENT_PANEL_UNSHOWN_MAIN_ROW.match(line)), None
+    )
+    if main is None:
+        return None
+    pointer_row = next(
+        (idx - main for idx in range(main, len(panel)) if panel[idx].startswith("❯ ")), None
+    )
+    # Only an empty box shows the placeholder; a typed space captures as an empty row.
+    empty = _composer_reads_clear(box) and bool(
+        _SUBAGENT_COMPOSER_PLACEHOLDER.match(box.rows[0].strip()[1:].strip())
+    )
+    return _AgentPanelFocus(pointer_row, () if empty else tuple(box.rows))
+
+
+def _step_toward_main_view(socket_path: str, tmux_target: str, focus: _AgentPanelFocus) -> None:
+    """
+    Press the key that moves a subagent's view one step back to main.
+
+    Enter opens the panel row the pointer marks, and main is the first row, so
+    Up walks the pointer there. Down from an empty input box enters the panel;
+    a draft is cleared first, as before a paste. Escape and ``x`` are never
+    sent: in this view they can interrupt or stop the subagent.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param focus: The focus :func:`_subagent_view_focus` read.
+    """
+    if focus.pointer_row is None and focus.draft:
+        # Space returns focus from a footer item to the input box first.
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
+        _send_composer_clear_keys(socket_path, tmux_target, rows=len(focus.draft))
+        return
+    if focus.pointer_row is None:
+        key = "Down"
+    else:
+        key = "Enter" if focus.pointer_row == 0 else "Up"
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
 
 
 def _shell_mode_draft(pane: str) -> bool:
