@@ -3060,15 +3060,24 @@ async def test_scoped_mint_requires_wired_builtin_confinement(custom):
     assert issued == []
 
 
-@pytest.mark.parametrize("scoped", [False, True], ids=["owner", "runner"])
-async def test_connect_hook_retains_authenticated_confinement(scoped: bool) -> None:
+@pytest.mark.parametrize("identity", ["owner", "runner", "binding", "binding-unwired"])
+async def test_connect_hook_retains_authenticated_confinement(identity: str) -> None:
     from omnigent.server.auth import _RUNNER_CONFINEMENT_KEY, RunnerTokenConfinement
 
-    confinement = RunnerTokenConfinement(_RUNNER_ID, lambda _runner, _sid: True)
+    token = "test-recovery-binding"
+    runner_id = token_bound_runner_id(token)
+    bindings = {"owned": runner_id, "foreign": "another-runner"}
+
+    def in_scope(runner: str, session: str) -> bool:
+        return bindings.get(session) == runner
+
+    confinement = RunnerTokenConfinement(runner_id, in_scope)
 
     class TestAuth(_CredentialHeaderAuthProvider):
         def get_user_id(self, request: HTTPConnection) -> str | None:
-            if scoped:
+            if identity.startswith("binding"):
+                return None
+            if identity == "runner":
                 request.scope[_RUNNER_CONFINEMENT_KEY] = confinement
             return "owner@example.com"
 
@@ -3081,16 +3090,38 @@ async def test_connect_hook_retains_authenticated_confinement(scoped: bool) -> N
     app = FastAPI()
     app.include_router(
         create_runner_tunnel_router(
-            registry, auth_provider=TestAuth(), on_runner_connect=on_connect
+            registry,
+            auth_provider=TestAuth(),
+            on_runner_connect=on_connect,
+            resolve_managed_runner_owner=lambda _: "owner@example.com",
+            runner_session_check=None if identity == "binding-unwired" else in_scope,
         ),
         prefix="/v1",
     )
-    communicator = await _connect_route(app, _TUNNEL_PATH)
+    communicator = await _connect_route(
+        app,
+        f"/v1/runners/{runner_id}/tunnel",
+        headers=[(RUNNER_TUNNEL_TOKEN_HEADER.lower().encode(), token.encode())],
+        client_host="198.51.100.10",
+    )
     try:
-        await _send_hello(communicator, registry, connection_id="scope-context")
+        await _send_hello(
+            communicator, registry, runner_id=runner_id, connection_id="scope-context"
+        )
         connection = await asyncio.wait_for(connected, 5)
         assert connection.owner == "owner@example.com"
-        assert connection.confinement is (confinement if scoped else None)
+        if identity == "owner":
+            assert connection.confinement is None
+        else:
+            scope = connection.confinement
+            assert scope is not None
+            if identity == "runner":
+                assert scope is confinement
+            assert scope.runner_id == runner_id
+            assert scope.allows_session("owned") is (identity != "binding-unwired")
+            assert not scope.allows_session("foreign")
+            bindings["owned"] = "another-runner"
+            assert not scope.allows_session("owned")
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         await asyncio.wait_for(communicator.future, 5)

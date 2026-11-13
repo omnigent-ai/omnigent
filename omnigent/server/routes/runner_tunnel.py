@@ -63,6 +63,7 @@ from omnigent.server.auth import (
     LEGACY_RUNNER_TOKENS_ENV,
     RESERVED_USER_LOCAL,
     AuthProvider,
+    RunnerTokenConfinement,
     UnifiedAuthProvider,
     env_var_is_truthy,
     runner_token_confinement,
@@ -247,6 +248,7 @@ def create_runner_tunnel_router(
     auth_provider: AuthProvider | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
+    runner_session_check: Callable[[str, str], bool] | None = None,
     admit_managed_runner: Callable[[str], bool] | None = None,
     mint_managed_runner_token: Callable[[str, int], str | None] | None = None,
     mint_scoped_managed_runner_token: Callable[[str, int], str | None] | None = None,
@@ -271,6 +273,8 @@ def create_runner_tunnel_router(
         Used to re-assign sessions on runner reconnect.
     :param admit_managed_runner: Optional binding-token admission check before
         registration, used by sandbox profiles to fence stale-runner replacement.
+    :param runner_session_check: Server-owned scope lookup for binding-token recovery.
+        Without it, a binding-only connection cannot recover child sessions.
     :param auth_provider: Optional auth provider for user identity
         extraction. When set, runner listing is scoped to the
         caller's own runners and tunnel registration records
@@ -697,8 +701,13 @@ def create_runner_tunnel_router(
             # Durable before the tunnel takes work, so another replica cannot settle
             # this runner's running sessions as orphaned once it is accepted here.
             await session_live_state.stamp_runner_liveness(runner_id)
+            confinement = runner_token_confinement(ws)
+            if binding_token_owner:
+                # A runner binding proves delegated authority, not the owner's
+                # permission to recover sessions assigned to other runners.
+                confinement = RunnerTokenConfinement(runner_id, runner_session_check)
             session = registry.register(
-                runner_id, ws, frame, owner=tunnel_owner, confinement=runner_token_confinement(ws)
+                runner_id, ws, frame, owner=tunnel_owner, confinement=confinement
             )
             session.diagnostics.settings.update(
                 tunnel_side="server",

@@ -326,17 +326,22 @@ def register_items_routes(
         if confinement is not None:
             after = confinement.child_cursor(session_id, after, decode=True)
             before = confinement.child_cursor(session_id, before, decode=True)
-        page = await asyncio.to_thread(
-            conversation_store.list_conversations,
-            limit=limit,
-            after=after,
-            before=before,
-            kind="sub_agent",
-            parent_conversation_id=session_id,
-            order=order,
-            sort_by="created_at",
-            title=title_filter,
-        )
+        try:
+            page = await asyncio.to_thread(
+                conversation_store.list_conversations,
+                limit=limit,
+                after=after,
+                before=before,
+                kind="sub_agent",
+                parent_conversation_id=session_id,
+                order=order,
+                sort_by="created_at",
+                title=title_filter,
+            )
+        except StaleCursorError:
+            if confinement is not None:
+                raise StaleCursorError("") from None
+            raise
         children = page.data
         if confinement is not None:
             children = await asyncio.to_thread(
@@ -385,6 +390,10 @@ def register_items_routes(
         :raises StaleCursorError: If *after* is not a row of the subtree, or
             the tree outgrew one read since the page it came from.
         """
+        confinement = runner_token_confinement(request)
+        public_after = after
+        if confinement is not None:
+            after = confinement.child_cursor(parent.id, after, decode=True)
         page = await asyncio.to_thread(
             conversation_store.list_spawn_tree,
             parent.root_conversation_id or parent.id,
@@ -395,7 +404,7 @@ def register_items_routes(
             if after is not None:
                 # The tree outgrew one read since the first page: this cursor
                 # cannot continue, so the client restarts.
-                raise StaleCursorError(after)
+                raise StaleCursorError(public_after or "")
             return None
         # Rows come in the store's one-level listing order, so grouping keeps
         # each parent's children in the order a per-level walk reads them.
@@ -427,9 +436,22 @@ def register_items_routes(
         if after is not None:
             position = next((i for i, c in enumerate(ordered) if c.id == after), None)
             if position is None:
-                raise StaleCursorError(after)
+                raise StaleCursorError(public_after or "")
             start = position + 1
         window = ordered[start : start + limit]
+        first_id = window[0].id if window else None
+        last_id = window[-1].id if window else None
+        if confinement is not None:
+
+            def visible_window() -> list[Conversation]:
+                # Hide foreign branches so summaries cannot disclose their parent ids.
+                visible = {parent.id}
+                for child in ordered:
+                    if parent_ids[child.id] in visible and confinement.allows_session(child.id):
+                        visible.add(child.id)
+                return [child for child in window if child.id in visible]
+
+            window = await asyncio.to_thread(visible_window)
         await _settle_children(request, window, may_settle)
         summaries = await _child_session_summaries_from_conversations(
             window, parent.id, conversation_store, parent_ids=parent_ids
@@ -437,8 +459,8 @@ def register_items_routes(
         data = [s.model_copy(update={"depth": depths[s.id]}) for s in summaries]
         return PaginatedList(
             data=data,
-            first_id=data[0].id if data else None,
-            last_id=data[-1].id if data else None,
+            first_id=confinement.child_cursor(parent.id, first_id) if confinement else first_id,
+            last_id=confinement.child_cursor(parent.id, last_id) if confinement else last_id,
             has_more=start + limit < len(ordered),
         )
 

@@ -363,7 +363,7 @@ def _require_runner_confined_placement(
     """Keep a runner bearer's new sessions off every host but its own runner.
 
     Sub-agents and rotations inherit or later bind the creating runner.
-    Only a validated native rotation may retain its source's project filing.
+    Validated forks and native rotations may retain their source's project filing.
     """
     if runner_token_confinement(request) is None:
         return
@@ -5453,6 +5453,7 @@ def register_core_routes(
             host_type=body.host_type,
             sandbox_provider=body.sandbox_provider,
             project_id=fork_project_id,
+            inherited_project_id=source.project_id,
         )
 
         # The deep-copied items reference the source's session-scoped file

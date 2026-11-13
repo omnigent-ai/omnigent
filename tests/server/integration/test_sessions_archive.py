@@ -19,7 +19,7 @@ import gzip
 import io
 import tarfile
 import types
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -807,8 +807,9 @@ async def test_archive_passes_the_servers_sandbox_config_to_the_teardown(
     assert passed_host_store is host_store and passed_config is sandbox_config
 
 
+@pytest.mark.parametrize("exhaust_budget", [False, True])
 async def test_scoped_archive_stops_authorized_grandchild_across_excluded_branch(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, exhaust_budget: bool
 ) -> None:
     from omnigent.server.auth import RunnerTokenConfinement, runner_session_in_scope
 
@@ -825,6 +826,10 @@ async def test_scoped_archive_stops_authorized_grandchild_across_excluded_branch
         "scoped", lambda runner, sid: runner_session_in_scope(runner, sid, store.get_conversation)
     )
     stop = AsyncMock()
+    pages = Mock(wraps=store.list_child_conversation_ids_page)
+    monkeypatch.setattr(store, "list_child_conversation_ids_page", pages)
+    if exhaust_budget:
+        monkeypatch.setattr(_sessions_orchestration, "_SCOPED_ARCHIVE_WORK_LIMIT", 8)
     monkeypatch.setattr(_sessions_facade, "_stop_session_via_runner", stop)
     for row in (parent, excluded, allowed, inherited):
         _sessions_common._session_status_cache[row.id] = "running"
@@ -836,6 +841,12 @@ async def test_scoped_archive_stops_authorized_grandchild_across_excluded_branch
         for row in (parent, excluded, allowed, inherited):
             _sessions_common._session_status_cache.pop(row.id, None)
 
+    if exhaust_budget:
+        assert descendants == []
+        stop.assert_not_awaited()
+        assert 0 < pages.call_count <= 8
+        assert all(0 < call.kwargs["limit"] <= 8 for call in pages.call_args_list)
+        return
     assert set(descendants) == {excluded.id, allowed.id, inherited.id}
     assert [call.args[0] for call in stop.await_args_list] == [parent.id, allowed.id, inherited.id]
     assert all(
@@ -879,7 +890,16 @@ async def test_deferred_scoped_archive_rechecks_root_authority(
     host_stop.assert_not_awaited()
 
 
-@pytest.mark.parametrize("dependent", ["foreign-child", "nested-side-chat"])
+@pytest.mark.parametrize(
+    "dependent",
+    [
+        "foreign-child",
+        "nested-side-chat",
+        "budget-exhausted",
+        "binding-after-stop",
+        "budget-after-stop",
+    ],
+)
 async def test_scoped_archive_preserves_worktree_for_excluded_descendant(
     db_uri: str, monkeypatch: pytest.MonkeyPatch, dependent: str
 ) -> None:
@@ -900,14 +920,35 @@ async def test_scoped_archive_preserves_worktree_for_excluded_descendant(
     confinement = RunnerTokenConfinement(
         "scoped", lambda runner, sid: runner_session_in_scope(runner, sid, store.get_conversation)
     )
-    cleanup = AsyncMock()
+    cleanup, host_stop = AsyncMock(), AsyncMock()
+    if dependent in ("binding-after-stop", "budget-after-stop"):
+
+        async def stop_then_change_dependents(*_: object, **__: object) -> bool:
+            if dependent == "binding-after-stop":
+                store.replace_runner_id(child.id, "other")
+            else:
+                monkeypatch.setattr(_sessions_orchestration, "_SCOPED_ARCHIVE_WORK_LIMIT", 4)
+            return True
+
+        host_stop.side_effect = stop_then_change_dependents
+    pages = Mock(wraps=store.list_child_conversation_ids_page)
+    monkeypatch.setattr(store, "list_child_conversation_ids_page", pages)
+    if dependent == "budget-exhausted":
+        monkeypatch.setattr(_sessions_orchestration, "_SCOPED_ARCHIVE_WORK_LIMIT", 4)
     monkeypatch.setattr(_sessions_facade, "_remove_session_worktree_best_effort", cleanup)
     monkeypatch.setattr(_sessions_facade, "_best_effort_stop", AsyncMock())
-    monkeypatch.setattr(_sessions_orchestration, "_stop_host_runner_intentionally", AsyncMock())
+    monkeypatch.setattr(_sessions_orchestration, "_stop_host_runner_intentionally", host_stop)
     await _sessions_orchestration._archive_stop(
         parent.id, store, None, None, confinement=confinement, delete_worktree=True
     )
     cleanup.assert_not_awaited()
+    if dependent in ("binding-after-stop", "budget-after-stop"):
+        host_stop.assert_awaited_once()
+    else:
+        host_stop.assert_not_awaited()
+    if dependent == "budget-exhausted":
+        assert 0 < pages.call_count <= 4
+        assert all(0 < call.kwargs["limit"] <= 4 for call in pages.call_args_list)
 
 
 async def test_pinned_archive_stop_does_not_use_global_runner_fallback(
@@ -973,8 +1014,11 @@ async def test_scoped_archive_retains_runner_with_excluded_dependent(
         _sessions_common._session_status_cache.pop(source.id, None)
 
 
+@pytest.mark.parametrize(
+    "failure", ["lookup-error", "status-budget", "relay-budget", "dependent-budget"]
+)
 async def test_scoped_runner_stop_requires_complete_occupant_listing(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     from unittest.mock import Mock
 
@@ -987,13 +1031,39 @@ async def test_scoped_runner_stop_requires_complete_occupant_listing(
     confinement = RunnerTokenConfinement("scoped", lambda _runner, _sid: True)
     stop_runner = AsyncMock(return_value=True)
     monkeypatch.setattr(_sessions_facade, "_stop_session_host_runner", stop_runner)
-    monkeypatch.setattr(store, "list_runner_session_statuses", Mock(side_effect=RuntimeError))
+    statuses = Mock(wraps=store.list_runner_session_statuses)
+    children = Mock(wraps=store.list_child_conversation_ids_page)
+    monkeypatch.setattr(store, "list_runner_session_statuses", statuses)
+    monkeypatch.setattr(store, "list_child_conversation_ids_page", children)
+    monkeypatch.setattr(_sessions_orchestration, "_SCOPED_ARCHIVE_WORK_LIMIT", 6)
+    monkeypatch.setattr(_sessions_orchestration, "_RUNNER_STOP_STATUS_BATCH_SIZE", 2)
+    if failure == "lookup-error":
+        statuses.side_effect = RuntimeError
+    elif failure == "status-budget":
+        for _ in range(4):
+            store.create_conversation(runner_id="scoped")
+    elif failure == "relay-budget":
+        monkeypatch.setattr(
+            _sessions_orchestration,
+            "_runner_relay_tasks",
+            {f"unrelated-{i}": types.SimpleNamespace(runner_id="other") for i in range(5)},
+        )
+    else:
+        for _ in range(3):
+            store.create_conversation(kind="sub_agent", parent_conversation_id=source.id)
     stopped = await _sessions_orchestration._stop_host_runner_intentionally(
         source.id, source.host_id, "scoped", None, store, confinement=confinement
     )
     assert stopped is False
     stop_runner.assert_not_awaited()
     assert source.id not in _sessions_common._intentional_stop_sessions
+    assert statuses.call_count <= 6
+    assert children.call_count <= 6
+    assert all(0 < call.kwargs["limit"] <= 2 for call in statuses.call_args_list)
+    if failure == "status-budget":
+        assert statuses.call_count == 2
+    if failure != "dependent-budget":
+        children.assert_not_called()
 
 
 async def test_scoped_runner_stop_preserves_authorized_shared_runtime_cleanup(
@@ -1006,7 +1076,20 @@ async def test_scoped_runner_stop_preserves_authorized_shared_runtime_cleanup(
         runner_id="scoped", host_id="1" * 32, workspace="/workspace"
     )
     shared = store.create_conversation(runner_id="scoped")
-    store.create_conversation(kind="sub_agent", parent_conversation_id=shared.id)
+    children = [
+        store.create_conversation(kind="sub_agent", parent_conversation_id=shared.id)
+        for _ in range(2)
+    ]
+    side_chats = [
+        store.create_conversation(runner_id="scoped", side_chat_parent_id=shared.id)
+        for _ in range(2)
+    ]
+    child_pages = Mock(wraps=store.list_child_conversation_ids_page)
+    side_pages = Mock(wraps=store.list_side_chat_ids)
+    monkeypatch.setattr(store, "list_child_conversation_ids_page", child_pages)
+    monkeypatch.setattr(store, "list_side_chat_ids", side_pages)
+    monkeypatch.setattr(_sessions_orchestration, "_SCOPED_ARCHIVE_PAGE_SIZE", 1)
+    monkeypatch.setattr(_sessions_orchestration, "_RUNNER_STOP_STATUS_BATCH_SIZE", 1)
     confinement = RunnerTokenConfinement(
         "scoped", lambda runner, sid: runner_session_in_scope(runner, sid, store.get_conversation)
     )
@@ -1018,6 +1101,19 @@ async def test_scoped_runner_stop_preserves_authorized_shared_runtime_cleanup(
         )
         assert stopped is True
         stop_runner.assert_awaited_once()
+        child_calls = [call for call in child_pages.call_args_list if call.args[0] == shared.id]
+        expected_children = sorted(
+            children, key=lambda row: (row.created_at, row.id), reverse=True
+        )
+        assert [call.kwargs for call in child_calls] == [
+            {"after": None, "limit": 1},
+            *({"after": (row.created_at, row.id), "limit": 1} for row in expected_children),
+        ]
+        side_calls = [call for call in side_pages.call_args_list if call.args[0] == shared.id]
+        assert [call.kwargs for call in side_calls] == [
+            {"after": None, "limit": 1},
+            *({"after": row.id, "limit": 1} for row in sorted(side_chats, key=lambda row: row.id)),
+        ]
     finally:
-        for row in (source, shared):
+        for row in (source, shared, *side_chats):
             _sessions_common._intentional_stop_sessions.pop(row.id, None)

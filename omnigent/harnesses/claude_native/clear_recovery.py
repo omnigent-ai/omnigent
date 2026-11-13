@@ -15,7 +15,10 @@ from omnigent.harnesses.claude_native.bridge import (
     _write_json_file,
     url_component,
 )
-from omnigent.native._native_supersession import post_clear_supersession
+from omnigent.native._native_supersession import (
+    post_clear_supersession,
+    supersession_authority_is_gone,
+)
 
 _logger = logging.getLogger(__name__)
 _PENDING_DIRECTORY = "pending_clear_supersessions"
@@ -60,7 +63,7 @@ async def replay_clear_supersessions(
                 f"/v1/sessions/{url_component(old)}",
                 json={"labels": {BRIDGE_ID_LABEL_KEY: f"{old}-cleared"}},
             )
-            if rekey.status_code in (403, 404):
+            if supersession_authority_is_gone(rekey):
                 completed = True
             else:
                 rekey.raise_for_status()
@@ -70,6 +73,7 @@ async def replay_clear_supersessions(
                     new_session_id=new,
                     agent_name=agent_name,
                     detach_runner=True,
+                    require_notifications=True,
                 )
         except (httpx.HTTPError, ConnectionError):
             _logger.warning("Could not replay clear cleanup for %s", old, exc_info=True)

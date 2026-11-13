@@ -57,12 +57,15 @@ be able to write resources without a separate Omnigent account.
 - `delegated-runner-credentials`: accounts/OIDC runners announcing `scoped-v1` use
   credentials confined to their own session tree. Legacy issuance remains
   enabled through 0.20.x unless disabled by the operator; removal is planned
-  for 0.21.0. Scheduled-task tools, `sys_agent_list` and `sys_session_share` are
-  hidden, global session listing is empty, and host readiness is unavailable.
+  for 0.21.0. Scheduled-task tools, `sys_agent_list`, `sys_project_list`,
+  `sys_project_update`, and `sys_session_share` are hidden, global session listing
+  is empty, and host readiness is unavailable.
   Hosts and interactive user clients keep their own authority. States: own
   callback succeeds, another runner's session is denied, permission denials do
   not renew credentials, shared-agent writes and session deletion are denied,
-  and strict mode rejects incompatible runners until they are upgraded. Header/proxy
+  forks retain their source project, child and descendant listings hide foreign
+  branches behind opaque cursors, and strict mode rejects incompatible runners
+  until they are upgraded. Header/proxy
   providers decline minting without interrupting binding-token callbacks.
   Credential discovery prefers advertised scoped support; legacy custom
   providers work only when legacy issuance is advertised. A scoped selection

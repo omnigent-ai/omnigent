@@ -814,9 +814,13 @@ Update this top-level README with a row in the table above.
   native `/clear`, with no host launch. Multipart uploads require an in-scope
   parent. Bootstrap scope is consumed before binding, transfer or detach.
   `/clear` sends finalization events before detach. Claude journals the old/new
-  pair before consuming its hook cursor and retries bridge re-key/detach failures
-  in the background, including after restart. This covers recorded rotations;
-  creation before journal publication and notice delivery remain best-effort.
+  pair before consuming its hook cursor and retries bridge re-key, finalization
+  notifications, and detach in the background, including after restart. For
+  recorded rotations, required notification failures retain the journal and
+  postpone detach; retries may repeat notifications. Ordinary authentication or
+  proxy failures remain retryable, while a marked scope denial or missing old
+  session ends cleanup. Creation interrupted before journal publication is not
+  covered; this does not guarantee exactly-once replacement creation.
   A missing journal or an unrecoverable detach failure still needs owner repair
   with `PATCH /v1/sessions/{id}` and
   `{"runner_id": ""}`, or restore a failed initial binding using

@@ -224,12 +224,6 @@ def test_fork_inherits_source_project(
         )
 
     resp = client.post(f"/v1/sessions/{conv.id}/fork", json={})
-    if confined:
-        assert resp.status_code == 403
-        assert resp.json()["error"]["code"] == "runner_scope_denied"
-        listed = client.get("/v1/sessions?project=Work")
-        assert [session["id"] for session in listed.json()["data"]] == [conv.id]
-        return
     assert resp.status_code == 201
     fork = resp.json()
     assert fork["project_id"] == project["id"]

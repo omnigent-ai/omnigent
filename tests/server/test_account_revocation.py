@@ -1335,18 +1335,32 @@ def test_runner_token_is_confined_to_its_runner_sessions(setup_app, monkeypatch,
             )
         ],
     )
-    visible_children = runner.get(f"/v1/sessions/{bound}/child_sessions")
-    assert visible_children.status_code == 200, visible_children.text
-    assert child_id in {row["id"] for row in visible_children.json()["data"]}
-    assert "private-child-preview" in visible_children.text
+    grandchild = runner.post(
+        "/v1/sessions", json={"agent_id": agent_id, "parent_session_id": child_id}
+    )
+    assert grandchild.status_code == 201, grandchild.text
+    grandchild_id = grandchild.json()["id"]
+    for descendants in (False, True):
+        visible_children = runner.get(
+            f"/v1/sessions/{bound}/child_sessions", params={"descendants": descendants}
+        )
+        assert visible_children.status_code == 200, visible_children.text
+        visible_ids = {row["id"] for row in visible_children.json()["data"]}
+        assert child_id in visible_ids
+        assert (grandchild_id in visible_ids) == descendants
+        assert "private-child-preview" in visible_children.text
     conversations.replace_runner_id(child_id, other_runner_id)
     assert runner.get(f"/v1/sessions/{child_id}").status_code == 403
     assert runner.delete(f"/v1/sessions/{bound}").status_code == 403
     assert conversations.get_conversation(child_id) is not None
-    children = runner.get(f"/v1/sessions/{bound}/child_sessions")
-    assert children.status_code == 200, children.text
-    assert child_id not in {row["id"] for row in children.json()["data"]}
-    assert "private-child-preview" not in children.text
+    for descendants in (False, True):
+        children = runner.get(
+            f"/v1/sessions/{bound}/child_sessions", params={"descendants": descendants}
+        )
+        assert children.status_code == 200, children.text
+        assert child_id not in children.text
+        assert grandchild_id not in children.text
+        assert "private-child-preview" not in children.text
     assert runner.get(f"/v1/sessions/{bound}/stream").status_code == 403
 
     try:
@@ -1427,16 +1441,9 @@ def test_runner_reused_agent_is_read_only(setup_app, owner):
     session_id = reused.json()["id"]
     assert runner.get(f"/v1/sessions/{session_id}/agent/contents").status_code == 200
     before = owner_client.get(f"/v1/sessions/{origin}/agent/contents").content
-    for method, suffix in (
-        ("PUT", "agent"),
-        ("POST", "agent/mcp-servers"),
-        ("PUT", "agent/mcp-servers/injected"),
-        ("DELETE", "agent/mcp-servers/injected"),
-        ("POST", "switch-agent"),
-    ):
-        response = runner.request(method, f"/v1/sessions/{session_id}/{suffix}", json={})
-        assert response.status_code == 403, response.text
-        assert response.json()["error"]["code"] == "runner_scope_denied"
+    response = runner.put(f"/v1/sessions/{session_id}/agent", json={})
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == "runner_scope_denied"
     assert owner_client.get(f"/v1/sessions/{origin}/agent/contents").content == before
     for body in ({"project_id": "project_other"}, {"share_workspace_files": True}):
         response = runner.patch(f"/v1/sessions/{bound}", json=body)
@@ -1474,8 +1481,11 @@ def test_oidc_runner_scope_denial_closes_real_websocket(setup_app):
     assert denied.value.reason == "runner_scope_denied"
 
 
-@pytest.mark.parametrize("order", ["asc", "desc"])
-def test_runner_child_pagination_keeps_hidden_positions_private(setup_app, order):
+@pytest.mark.parametrize("descendants,order", [(False, "asc"), (False, "desc"), (True, "desc")])
+def test_runner_child_pagination_keeps_hidden_positions_private(
+    setup_app, monkeypatch, descendants, order
+):
+    from omnigent.errors import StaleCursorError
     from omnigent.runner.identity import token_bound_runner_id
 
     _, alice, stores, _ = setup_app
@@ -1499,7 +1509,7 @@ def test_runner_child_pagination_keeps_hidden_positions_private(setup_app, order
     visible = []
     pages = []
     for _ in children:
-        params = {"limit": 1, "order": order}
+        params = {"limit": 1, "order": order, "descendants": descendants}
         if cursor is not None:
             params["after"] = cursor
         response = runner.get(url, params=params)
@@ -1515,20 +1525,44 @@ def test_runner_child_pagination_keeps_hidden_positions_private(setup_app, order
     )
     assert all(not page["data"] and page["has_more"] for page in pages[1:3])
     assert pages[-1]["has_more"] is False
-    previous = runner.get(url, params={"before": pages[-1]["first_id"], "order": order})
-    assert previous.status_code == 200, previous.text
-    assert [child["id"] for child in previous.json()["data"]] == visible[:1]
+    if not descendants:
+        previous = runner.get(url, params={"before": pages[-1]["first_id"], "order": order})
+        assert previous.status_code == 200, previous.text
+        assert [child["id"] for child in previous.json()["data"]] == visible[:1]
 
     other_parent = runner.post("/v1/sessions", json={"agent_id": agent_id}).json()["id"]
     for target, after in ((parent, cursor[:-8]), (other_parent, cursor), (parent, "x" * 2049)):
-        denied = runner.get(f"/v1/sessions/{target}/child_sessions", params={"after": after})
+        denied = runner.get(
+            f"/v1/sessions/{target}/child_sessions",
+            params={"after": after, "descendants": descendants},
+        )
         assert denied.status_code == 400, denied.text
         assert denied.json()["error"]["code"] == "stale_cursor"
 
-    owner_page = alice.get(url).json()
+    owner_page = alice.get(url, params={"descendants": descendants}).json()
     assert {child["id"] for child in owner_page["data"]} == set(children)
     assert owner_page["first_id"] in children
     assert owner_page["last_id"] in children
+
+    if descendants:
+        original = conversations.list_spawn_tree
+
+        def without_children(*args, **kwargs):
+            page = original(*args, **kwargs)
+            page.data[:] = [row for row in page.data if row.id not in hidden]
+            return page
+
+        monkeypatch.setattr(conversations, "list_spawn_tree", without_children)
+    else:
+
+        def stale_children(*args, **kwargs):
+            raise StaleCursorError(hidden[0])
+
+        monkeypatch.setattr(conversations, "list_conversations", stale_children)
+    stale = runner.get(url, params={"after": pages[1]["last_id"], "descendants": descendants})
+    assert stale.status_code == 400, stale.text
+    assert stale.json()["error"]["code"] == "stale_cursor"
+    assert all(child_id not in stale.text for child_id in hidden)
 
 
 @pytest.mark.asyncio

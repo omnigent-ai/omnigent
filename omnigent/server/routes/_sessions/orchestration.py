@@ -774,7 +774,17 @@ async def _best_effort_stop(
         clean them up too; empty when the lookup failed.
     """
     try:
-        descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
+        if confinement is None:
+            descendant_ids = await _collect_descendant_conversation_ids(
+                conversation_store, session_id
+            )
+        else:
+            scoped_tree = await _bounded_archive_session_ids(
+                [session_id], conversation_store, side_chats="ignore"
+            )
+            if scoped_tree is None:
+                return []
+            descendant_ids = scoped_tree[1:]
         status = _session_status_with_child_rollup(session_id, descendant_ids)
         own_status = _session_status_from_cache(session_id)
     except Exception:  # noqa: BLE001
@@ -862,38 +872,70 @@ _SELF_ARCHIVE_TURN_WAIT_S = 60 * 60
 _RUNNER_STOP_STATUS_BATCH_SIZE = 200
 
 
-async def _runner_dependents_in_scope(
+# Charge roots, page queries, returned rows and per-node checks against fixed work.
+_SCOPED_ARCHIVE_WORK_LIMIT = 1024
+_SCOPED_ARCHIVE_PAGE_SIZE = 128
+
+
+async def _bounded_archive_session_ids(
     session_ids: list[str],
     conversation_store: ConversationStore,
-    confinement: RunnerTokenConfinement,
-) -> bool:
-    """Keep a shared runtime when any persisted dependent is outside the caller's scope."""
-    seen = set(session_ids)
-    frontier = session_ids
-    while frontier:
-        for session_id in frontier:
-            if not await asyncio.to_thread(confinement.allows_session, session_id):
-                return False
-        children = await asyncio.to_thread(
-            conversation_store.list_child_conversation_ids_by_parent, frontier
-        )
-        dependents = {child for ids in children.values() for child in ids}
-        for session_id in frontier:
-            after: str | None = None
+    *,
+    side_chats: Literal["include", "reject", "ignore"],
+    confinement: RunnerTokenConfinement | None = None,
+) -> list[str] | None:
+    """Enumerate a bounded tree; incomplete discovery or unauthorized dependents fail closed."""
+    if len(session_ids) > _SCOPED_ARCHIVE_WORK_LIMIT:
+        return None
+    remaining = _SCOPED_ARCHIVE_WORK_LIMIT - len(session_ids)
+    found = list(dict.fromkeys(session_ids))
+    seen = set(found)
+    for session_id in found:
+        if remaining <= 0:
+            return None
+        remaining -= 1
+        if confinement is not None and not await asyncio.to_thread(
+            confinement.allows_session, session_id
+        ):
+            return None
+        for relation in ("child", "side-chat"):
+            if relation == "side-chat" and side_chats == "ignore":
+                continue
+            child_after: tuple[int, str] | None = None
+            side_after: str | None = None
             while True:
-                side_chats = await asyncio.to_thread(
-                    conversation_store.list_side_chat_ids,
-                    session_id,
-                    after=after,
-                    limit=_RUNNER_STOP_STATUS_BATCH_SIZE,
-                )
-                dependents.update(side_chats)
-                if len(side_chats) < _RUNNER_STOP_STATUS_BATCH_SIZE:
+                if remaining <= 1:
+                    return None
+                limit = min(_SCOPED_ARCHIVE_PAGE_SIZE, remaining - 1)
+                if relation == "child":
+                    page = await asyncio.to_thread(
+                        conversation_store.list_child_conversation_ids_page,
+                        session_id,
+                        after=child_after,
+                        limit=limit,
+                    )
+                    ids = [child_id for child_id, _created in page]
+                    if page:
+                        child_after = (page[-1][1], page[-1][0])
+                else:
+                    ids = await asyncio.to_thread(
+                        conversation_store.list_side_chat_ids,
+                        session_id,
+                        after=side_after,
+                        limit=1 if side_chats == "reject" else limit,
+                    )
+                    if ids and side_chats == "reject":
+                        return None
+                    if ids:
+                        side_after = ids[-1]
+                remaining -= 1 + len(ids)
+                for dependent_id in ids:
+                    if dependent_id not in seen:
+                        seen.add(dependent_id)
+                        found.append(dependent_id)
+                if len(ids) < limit:
                     break
-                after = side_chats[-1]
-        frontier = list(dependents - seen)
-        seen.update(frontier)
-    return True
+    return found
 
 
 async def _stop_host_runner_intentionally(
@@ -918,16 +960,23 @@ async def _stop_host_runner_intentionally(
     async with lock:
         statuses: dict[str, str | None] = {}
         after: str | None = None
+        remaining = _SCOPED_ARCHIVE_WORK_LIMIT
         try:
             while True:
+                limit = _RUNNER_STOP_STATUS_BATCH_SIZE
+                if confinement is not None:
+                    if remaining <= 1:
+                        return False
+                    limit = min(limit, remaining - 1)
                 batch = await asyncio.to_thread(
                     conversation_store.list_runner_session_statuses,
                     runner_id,
                     after=after,
-                    limit=_RUNNER_STOP_STATUS_BATCH_SIZE,
+                    limit=limit,
                 )
+                remaining -= 1 + len(batch)
                 statuses.update(batch)
-                if len(batch) < _RUNNER_STOP_STATUS_BATCH_SIZE:
+                if len(batch) < limit:
                     break
                 after = batch[-1][0]
         except Exception:  # noqa: BLE001
@@ -944,13 +993,23 @@ async def _stop_host_runner_intentionally(
             if confinement is not None:
                 return False
         for related_id, handle in _runner_relay_tasks.items():
+            if confinement is not None:
+                if remaining <= 0:
+                    return False
+                remaining -= 1
             if handle.runner_id == runner_id and not handle.task.done():
                 statuses.setdefault(related_id, None)
         statuses.setdefault(session_id, None)
         if confinement is not None:
             # Root ownership alone cannot authorize stopping every runtime on this runner.
-            if not await _runner_dependents_in_scope(
-                list(statuses), conversation_store, confinement
+            if (
+                await _bounded_archive_session_ids(
+                    list(statuses),
+                    conversation_store,
+                    side_chats="include",
+                    confinement=confinement,
+                )
+                is None
             ):
                 return False
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -1136,6 +1195,15 @@ async def _archive_stop(
     )
     if not await still_authorized():
         return
+    if delete_worktree and confinement is not None:
+        # Check directory dependents before stopping its shared runtime.
+        if (
+            await _bounded_archive_session_ids(
+                [session_id], conversation_store, side_chats="reject", confinement=confinement
+            )
+            is None
+        ):
+            return
     if conv.host_id and conv.runner_id:
         try:
             # A sub-agent riding an ancestor's runner leaves it up for the owner.
@@ -1165,18 +1233,14 @@ async def _archive_stop(
     if not await still_authorized():
         return
     if delete_worktree and confinement is not None:
-        # Descendants may inherit this directory without their own host binding.
-        dependents = await _collect_descendant_conversation_ids(conversation_store, session_id)
-        for dependent_id in [session_id, *dependents]:
-            if not await asyncio.to_thread(confinement.allows_session, dependent_id):
-                delete_worktree = False
-                break
-            side_chats = await asyncio.to_thread(
-                conversation_store.list_side_chat_ids, dependent_id, limit=1
+        # Bindings and dependents can change while the runner teardown awaits.
+        if (
+            await _bounded_archive_session_ids(
+                [session_id], conversation_store, side_chats="reject", confinement=confinement
             )
-            if side_chats:
-                delete_worktree = False
-                break
+            is None
+        ):
+            return
     # Runs after the runner teardown so the agent isn't left in a deleted cwd.
     if delete_worktree and conv.git_branch and conv.workspace and conv.host_id:
         from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY

@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 import omnigent.harnesses.claude_native.forwarder as forwarder
+from omnigent.errors import ERROR_CODE_HEADER, ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     prepare_bridge_dir,
@@ -1355,9 +1356,24 @@ async def test_clear_cleanup_retry_preserves_replacement_subagent_worker(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["transport", 503, 403, 404])
+@pytest.mark.parametrize(
+    ("stage", "failure"),
+    [
+        (stage, failure)
+        for stage in ("rekey", "detach")
+        for failure in ("transport", 503, 403, "scope-denied", 404)
+    ]
+    + [
+        (event, 503)
+        for event in (
+            "external_session_status",
+            "external_conversation_item",
+            "external_session_superseded",
+        )
+    ],
+)
 async def test_clear_replay_rekeys_before_notifications_and_detach(
-    tmp_path: Path, failure: str | int
+    tmp_path: Path, stage: str, failure: str | int
 ) -> None:
     from omnigent.harnesses.claude_native.clear_recovery import (
         pending_clear_supersessions,
@@ -1372,10 +1388,16 @@ async def test_clear_replay_rekeys_before_notifications_and_detach(
     def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         requests.append((request.method, request.url.path, body))
-        if not recovered:
-            assert body == {"labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}}
+        operation = (
+            "rekey" if "labels" in body else "detach" if "runner_id" in body else body["type"]
+        )
+        if not recovered and operation == stage:
             if failure == "transport":
                 raise httpx.ConnectError("temporary connection failure", request=request)
+            if failure == "scope-denied":
+                return httpx.Response(
+                    403, headers={ERROR_CODE_HEADER: ErrorCode.RUNNER_SCOPE_DENIED}
+                )
             assert isinstance(failure, int)
             return httpx.Response(failure)
         return httpx.Response(200)
@@ -1386,10 +1408,21 @@ async def test_clear_replay_rekeys_before_notifications_and_detach(
         await replay_clear_supersessions(
             client, pending_clear_supersessions(tmp_path), agent_name="claude-native-ui"
         )
-        assert len(requests) == 1
-        assert requests[0][:2] == ("PATCH", "/v1/sessions/conv_old")
-        transient = failure in ("transport", 503)
+        assert requests[0] == (
+            "PATCH",
+            "/v1/sessions/conv_old",
+            {"labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}},
+        )
+        if stage == "rekey":
+            assert len(requests) == 1
+        elif stage == "detach":
+            assert len(requests) == 5
+        else:
+            assert len(requests) == 4
+            assert all(body != {"runner_id": ""} for _, _, body in requests)
+        transient = failure not in ("scope-denied", 404)
         assert bool(pending_clear_supersessions(tmp_path)) is transient
+        previous_requests = len(requests)
         recovered = True
         await replay_clear_supersessions(
             client, pending_clear_supersessions(tmp_path), agent_name="claude-native-ui"
@@ -1397,15 +1430,21 @@ async def test_clear_replay_rekeys_before_notifications_and_detach(
         assert pending_clear_supersessions(tmp_path) == []
 
     if transient:
-        assert [method for method, _, _ in requests[1:]] == [
+        assert [method for method, _, _ in requests[previous_requests:]] == [
             "PATCH",
             "POST",
             "POST",
             "POST",
             "PATCH",
         ]
-        assert requests[1][2] == {"labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}}
+        assert requests[previous_requests][2] == {
+            "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}
+        }
         assert requests[-1][2] == {"runner_id": ""}
-        assert all(path.startswith("/v1/sessions/conv_old") for _, path, _ in requests)
+        notices = [
+            body for _, _, body in requests if body.get("type") == "external_conversation_item"
+        ]
+        assert all(notice == notices[0] for notice in notices)
     else:
-        assert len(requests) == 1
+        assert len(requests) == previous_requests
+    assert all(path.startswith("/v1/sessions/conv_old") for _, path, _ in requests)

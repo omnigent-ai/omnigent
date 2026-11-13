@@ -5248,14 +5248,13 @@ def create_app(
             ),
         )
 
-    if isinstance(auth_provider, UnifiedAuthProvider):
+    def _runner_session_check(runner_id: str, session_id: str) -> bool:
         from omnigent.server.auth import runner_session_in_scope
 
-        auth_provider.set_runner_session_check(
-            lambda runner_id, session_id: runner_session_in_scope(
-                runner_id, session_id, conversation_store.get_runner_scope
-            )
-        )
+        return runner_session_in_scope(runner_id, session_id, conversation_store.get_runner_scope)
+
+    if isinstance(auth_provider, UnifiedAuthProvider):
+        auth_provider.set_runner_session_check(_runner_session_check)
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
@@ -5290,6 +5289,7 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            runner_session_check=_runner_session_check,
             admit_managed_runner=(
                 sandbox_profiles.admit_runner_connection if sandbox_profiles is not None else None
             ),
