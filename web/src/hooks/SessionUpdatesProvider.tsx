@@ -391,8 +391,12 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
     );
     const scheduleInvalidate = () => reconciler.schedule();
     const childRefetcher = createChildSessionsRefetcher(queryClient);
-    // Child counts, labels and latest rows seen on the stream; see childSessionFrames.
+    // Child counts and latest rows seen on the stream; see childSessionFrames.
     const childFrames = createChildFrameState();
+    const flushImmediateChildRefetches = () => {
+      for (const parentId of childFrames.immediate) childRefetcher.flush(parentId);
+      childFrames.immediate.clear();
+    };
 
     // See commentsFingerprintsRef: invalidate `["comments", id]` (prefix —
     // covers the per-file variants too) when a session's fingerprint moves.
@@ -495,9 +499,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           for (const parentId of childRefetches) {
             childRefetcher.schedule(parentId);
           }
-          // A title change refetches without the coalescing delay.
-          for (const parentId of childFrames.immediate) childRefetcher.flush(parentId);
-          childFrames.immediate.clear();
+          flushImmediateChildRefetches();
           const { missingIds, needsRefetch } = applyItemsToCache(
             queryClient,
             frame.items,
@@ -589,6 +591,7 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
             if (settleFetchedChildSessions(queryClient, childFrames, key[1])) {
               childRefetcher.schedule(key[1]);
             }
+            flushImmediateChildRefetches();
           } else if (event.action.type === "error") childFrames.fetchStarted.delete(key[1]);
         }
       }

@@ -1300,6 +1300,65 @@ describe("SessionUpdatesProvider list invalidation", () => {
     }
   });
 
+  it("refetches at once when a rename that lands during the first fetch was not in its response", async () => {
+    // The frame arrives before any list is cached, so only the settled fetch can apply it.
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    renderProvider(client, ["/"]);
+    const untitled = {
+      id: "child_1",
+      title: null,
+      busy: false,
+      current_task_status: "completed",
+      pending_elicitations_count: 0,
+    };
+    let release: (rows: unknown[]) => void = () => {};
+    const queryFn = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+      )
+      .mockResolvedValueOnce([{ ...untitled, title: "worker:renamed" }]);
+    const observer = new QueryObserver(client, {
+      queryKey: childSessionsQueryKey("conv_a"),
+      queryFn,
+      staleTime: Infinity,
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    try {
+      await waitFor(() => expect(queryFn).toHaveBeenCalledTimes(1));
+      act(() =>
+        frameHandler()({
+          type: "changed",
+          items: [
+            {
+              ...conv("child_1"),
+              parent_session_id: "conv_a",
+              title: "worker:renamed",
+              status: "idle",
+              own_status: "idle",
+              last_task_error: null,
+              child_session_count: 0,
+            },
+          ],
+        }),
+      );
+      await act(async () => release([untitled]));
+
+      await waitFor(() => expect(queryFn).toHaveBeenCalledTimes(2));
+      await waitFor(() =>
+        expect(client.getQueryData(childSessionsQueryKey("conv_a"))).toEqual([
+          expect.objectContaining({ title: "worker:renamed" }),
+        ]),
+      );
+    } finally {
+      unsubscribe();
+    }
+  });
+
   it("finds children added while disconnected from an older server's snapshot", async () => {
     // Older servers send no child_session_count; a reconnect snapshot falls
     // back to refetching mounted tree lists.

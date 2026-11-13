@@ -242,10 +242,19 @@ describe("applyFrameToChildSessions, fields beyond status", () => {
 
   it("refetches when a label the summary displays changes", () => {
     const wrapper = { "omnigent.wrapper": "codex-native-ui" };
-    applyFrameToChildSessions(client, [frameRow("c1", "conv_p", { labels: wrapper })], state);
+    // The cached row was fetched before its wrapper label existed: the first frame
+    // is compared with that row and asks for a refetch now.
     expect([
       ...applyFrameToChildSessions(client, [frameRow("c1", "conv_p", { labels: wrapper })], state),
     ]).toEqual([]);
+    expect([...state.immediate]).toEqual(["conv_p"]);
+    expect(rows(client, "conv_p")![0].labels).toEqual(wrapper);
+    state.immediate.clear();
+
+    expect([
+      ...applyFrameToChildSessions(client, [frameRow("c1", "conv_p", { labels: wrapper })], state),
+    ]).toEqual([]);
+    expect(state.immediate.size).toBe(0);
     expect([
       ...applyFrameToChildSessions(
         client,
@@ -414,6 +423,22 @@ describe("settleFetchedChildSessions", () => {
 
     expect(rows(client, "conv_p")![0].busy).toBe(true);
     expect(state.fetchStarted.has("conv_p")).toBe(false);
+  });
+
+  it("asks for an immediate refetch when a replayed frame renames its child", () => {
+    const client = new QueryClient();
+    const state = createChildFrameState();
+    state.fetchStarted.set("conv_p", { at: 1_000 });
+    // No list is cached yet, so the rename can't be applied on arrival.
+    applyFrameToChildSessions(client, [frameRow("c1", "conv_p", { title: "worker:new" })], state, {
+      now: 1_500,
+    });
+    // The response was read before the rename.
+    client.setQueryData(childSessionsQueryKey("conv_p"), [child("c1")]);
+
+    expect(settleFetchedChildSessions(client, state, "conv_p")).toBe(false);
+    expect([...state.immediate]).toEqual(["conv_p"]);
+    expect(rows(client, "conv_p")![0].title).toBe("worker:new");
   });
 
   it("asks for a reconcile when a count streamed during the fetch disagrees with the list", () => {

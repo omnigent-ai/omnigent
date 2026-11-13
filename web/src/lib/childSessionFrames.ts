@@ -1,14 +1,14 @@
 // Keep cached sub-agent tree lists (`["conversation", <parent>, "child_sessions"]`)
 // in sync with `WS /v1/sessions/updates` frames.
 //
-// A frame row for a watched child carries everything a tree row shows except
-// the message preview, so rows are patched in place. A refetch of the parent's
-// list is scheduled only for what a patch can't place: a child the list doesn't
-// hold yet, a changed child count, a rename or label change (tool, name and
-// routed model derive from them server-side), a finished turn (its preview),
-// or an older server whose rows lack the tree fields. A list that becomes
-// observed again, and an observed list after a socket reconnect, refetch once,
-// since frames that arrived while it was unwatched were never applied to it.
+// Each frame row for a watched child is compared with the cached row it patches,
+// so the first frame corrects a row fetched before its labels or title existed.
+// Rows are patched in place. A parent's list refetches only for what a patch
+// can't place: a child the list doesn't hold, a changed child count, a rename or
+// name-deriving label (now), another summary label or a finished turn (coalesced),
+// or an older server whose rows lack the tree fields. A list that becomes observed
+// again, and an observed list after a socket reconnect, refetch once, since frames
+// that arrived while it was unwatched were never applied to it.
 
 import type { Query, QueryClient } from "@tanstack/react-query";
 import {
@@ -30,8 +30,6 @@ const CHILD_SESSIONS_PAGE_LIMIT = 20;
 export interface ChildFrameState {
   /** Last ``child_session_count`` per session. */
   counts: Map<string, number>;
-  /** Last streamed labels per child, serialized, to spot a label change. */
-  labels: Map<string, string>;
   /** Latest frame row per child and when it arrived. */
   frames: Map<string, { item: SessionListWireItem; at: number }>;
   /** In-flight list fetches by parent id: when each started, and the newest count streamed since. */
@@ -44,7 +42,6 @@ export interface ChildFrameState {
 export function createChildFrameState(): ChildFrameState {
   return {
     counts: new Map(),
-    labels: new Map(),
     frames: new Map(),
     fetchStarted: new Map(),
     immediate: new Set(),
@@ -69,9 +66,7 @@ export function pruneChildFrameState(
       state.counts.delete(id);
     }
   }
-  for (const map of [state.labels, state.frames]) {
-    for (const id of map.keys()) if (!watched.has(id)) map.delete(id);
-  }
+  for (const id of state.frames.keys()) if (!watched.has(id)) state.frames.delete(id);
 }
 
 // Labels the child summary reads for tool and session name, the harness glyph,
@@ -91,13 +86,18 @@ const SUMMARY_LABEL_KEYS = new Set([
   "omnigent.devin_native.subagent_title",
 ]);
 
-function summaryLabels(labels: Record<string, string>): string {
-  return JSON.stringify(
-    Object.entries(labels)
-      .filter(([key, value]) => SUMMARY_LABEL_KEYS.has(key) && value !== "")
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
-  );
-}
+// Summary labels the server derives a child's tool or session name from. A change
+// refetches the list now, without the coalescing delay.
+const NAME_LABEL_KEYS = new Set([
+  "omnigent.wrapper",
+  "omnigent.claude_native.subagent_id",
+  "omnigent.claude_native.description",
+  "omnigent.codex_native.subagent_thread_id",
+  "omnigent.codex_native.agent_nickname",
+  "omnigent.codex_native.agent_role",
+  "omnigent.devin_native.subagent_agent_id",
+  "omnigent.devin_native.subagent_title",
+]);
 
 // A Codex child's tree label is its `tool`, derived server-side from these two
 // labels (see `_codex_subagent_display_tool`). Mirrored so a rename patches in place.
@@ -110,16 +110,16 @@ function codexDisplayTool(labels: Record<string, string>): string {
   return labels[CODEX_NICKNAME_LABEL_KEY] || labels[CODEX_ROLE_LABEL_KEY] || CODEX_DISPLAY_FALLBACK;
 }
 
-/** Whether a summary-label change can't be patched and needs a list refetch. */
-function labelChangeNeedsRefetch(previous: string, current: string): boolean {
-  const before = Object.fromEntries(JSON.parse(previous) as [string, string][]);
-  const after = Object.fromEntries(JSON.parse(current) as [string, string][]);
+function summaryLabels(labels: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(labels).filter(([key, value]) => SUMMARY_LABEL_KEYS.has(key) && value !== ""),
+  );
+}
+
+/** Keys whose values differ between two label maps. */
+function changedLabelKeys(before: Record<string, string>, after: Record<string, string>): string[] {
   const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
-  for (const key of keys) {
-    if (CODEX_DISPLAY_LABEL_KEYS.has(key)) continue;
-    if (before[key] !== after[key]) return true;
-  }
-  return false;
+  return [...keys].filter((key) => before[key] !== after[key]);
 }
 
 function currentTaskStatus(
@@ -139,8 +139,8 @@ function currentTaskStatus(
  *
  * @param row - The cached child summary.
  * @param item - The frame row for the same session.
- * @returns The patched row (the same object when nothing changed) and whether
- *   the parent's list must be refetched for fields a frame doesn't carry.
+ * @returns The patched row (the same object when nothing changed), whether the
+ *   list needs a coalesced refetch, and whether it needs one now.
  */
 function patchChildRow(
   row: ChildSessionInfo,
@@ -159,25 +159,35 @@ function patchChildRow(
     pending_elicitations_count: item.pending_elicitations_count ?? 0,
     ...("task_summary" in item ? { task_summary: item.task_summary ?? null } : {}),
   };
-  // A Codex child's tool follows its nickname label, which the frame carries.
-  if (item.labels?.[WRAPPER_LABEL_KEY] === CODEX_NATIVE_SUBAGENT_WRAPPER) {
-    patch.tool = codexDisplayTool(item.labels);
+  // A finished turn moves the preview, which only the server computes: coalesced.
+  let refetch = row.busy && !busy;
+  // Tool and session name derive from the title server-side: refetch now.
+  let immediate = item.title !== undefined && (item.title ?? null) !== row.title;
+  if (immediate) patch.title = item.title ?? null;
+  if (item.labels !== undefined) {
+    const codex = item.labels[WRAPPER_LABEL_KEY] === CODEX_NATIVE_SUBAGENT_WRAPPER;
+    const diff = changedLabelKeys(summaryLabels(row.labels ?? {}), summaryLabels(item.labels));
+    if (diff.length > 0) patch.labels = item.labels;
+    // A row from a server that sends no labels has nothing to compare against.
+    const unplaced =
+      row.labels === undefined
+        ? []
+        : diff.filter((key) => !(codex && CODEX_DISPLAY_LABEL_KEYS.has(key)));
+    if (unplaced.some((key) => NAME_LABEL_KEYS.has(key))) immediate = true;
+    else if (unplaced.length > 0) refetch = true;
+    // A Codex child's tool follows its nickname label, which the frame carries.
+    if (codex) patch.tool = codexDisplayTool(item.labels);
   }
-  // Tool and session name derive from the title server-side, so a title change
-  // refetches now, without the coalescing delay. A finished turn moves the preview
-  // and waits for the coalesced refetch.
-  const titleChanged = item.title !== undefined && (item.title ?? null) !== row.title;
-  if (titleChanged) patch.title = item.title ?? null;
-  const refetch = row.busy && !busy;
   const changed =
     patch.title !== row.title ||
     patch.tool !== row.tool ||
+    patch.labels !== row.labels ||
     patch.busy !== row.busy ||
     patch.current_task_status !== row.current_task_status ||
     patch.pending_elicitations_count !== row.pending_elicitations_count ||
     patch.task_summary !== row.task_summary ||
     JSON.stringify(patch.last_task_error ?? null) !== JSON.stringify(row.last_task_error ?? null);
-  return { row: changed ? patch : row, refetch, immediate: titleChanged };
+  return { row: changed ? patch : row, refetch, immediate };
 }
 
 /**
@@ -193,7 +203,8 @@ function patchChildRow(
  *   a reconnect), so a row from an older server without
  *   ``child_session_count`` refetches its cached list to catch missed children.
  * @param options.now - Arrival time, e.g. ``Date.now()``.
- * @returns Parent ids whose child list needs a refetch.
+ * @returns Parent ids whose child list needs a coalesced refetch. Lists that need
+ *   one now are added to ``state.immediate``.
  */
 export function applyFrameToChildSessions(
   queryClient: QueryClient,
@@ -225,21 +236,6 @@ export function applyFrameToChildSessions(
   for (const [parentId, group] of byParent) {
     const key = childSessionsQueryKey(parentId);
     const rows = queryClient.getQueryData<ChildSessionInfo[]>(key);
-    for (const item of group) {
-      if (item.labels === undefined) continue;
-      const labels = summaryLabels(item.labels);
-      const previous = state.labels.get(item.id);
-      state.labels.set(item.id, labels);
-      // Compared frame to frame: a change the cached row can't be patched for.
-      if (
-        rows !== undefined &&
-        previous !== undefined &&
-        previous !== labels &&
-        labelChangeNeedsRefetch(previous, labels)
-      ) {
-        refetch.add(parentId);
-      }
-    }
     if (rows === undefined) continue;
     let next = rows;
     for (const item of group) {
@@ -274,13 +270,15 @@ export function applyFrameToChildSessions(
  * sub-agent created between the fetch and the next frame triggers a refetch.
  * A count streamed during the fetch is newer than the response: it is kept,
  * and disagreement with the list returns true so the caller reconciles once.
- * Then re-applies frame rows that arrived while the fetch was in flight: the
- * response may predate them, and the stream won't resend an unchanged row.
+ * Then replays frame rows that arrived while the fetch was in flight, compared
+ * with the fetched row as a live frame is: the response may predate them, and
+ * the stream won't resend an unchanged row. A replay that needs a refetch
+ * returns true or adds to ``state.immediate``, as a live frame does.
  *
  * @param queryClient - The app QueryClient.
  * @param state - Frame-handler state; the parent's fetch start is consumed.
  * @param parentId - Session whose list was fetched, e.g. ``"conv_parent"``.
- * @returns Whether the list must be refetched to match the newer count.
+ * @returns Whether the list must be refetched (coalesced) to match the stream.
  */
 export function settleFetchedChildSessions(
   queryClient: QueryClient,
@@ -296,21 +294,30 @@ export function settleFetchedChildSessions(
   const observed = flight?.count;
   if (observed !== undefined) state.counts.set(parentId, observed);
   else if (shortPage) state.counts.set(parentId, rows.length);
-  const reconcile = observed !== undefined && shortPage && observed !== rows.length;
+  let refetch = observed !== undefined && shortPage && observed !== rows.length;
   if (flight === undefined) return false;
   const startedAt = flight.at;
+  const held = new Set(rows.map((row) => row.id));
+  for (const [id, frame] of state.frames) {
+    if (frame.at < startedAt || frame.item.parent_session_id !== parentId) continue;
+    // A child that arrived during the fetch and isn't in its response is unplaced.
+    if (!held.has(id) && frame.item.archived !== true) refetch = true;
+  }
   const next: ChildSessionInfo[] = [];
   for (const row of rows) {
     const frame = state.frames.get(row.id);
     if (!frame || frame.at < startedAt || frame.item.parent_session_id !== parentId) {
       next.push(row);
     } else if (frame.item.archived !== true) {
-      next.push(patchChildRow(row, frame.item).row);
+      const patched = patchChildRow(row, frame.item);
+      if (patched.refetch) refetch = true;
+      if (patched.immediate) state.immediate.add(parentId);
+      next.push(patched.row);
     }
   }
   const changed = next.length !== rows.length || next.some((row, index) => row !== rows[index]);
   if (changed) queryClient.setQueryData<ChildSessionInfo[]>(key, next);
-  return reconcile;
+  return refetch;
 }
 
 /**
