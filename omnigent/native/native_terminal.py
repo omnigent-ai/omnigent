@@ -12,6 +12,7 @@ import httpx
 
 from omnigent.host.daemon_launch import error_text
 from omnigent.util.http_retry import bounded_retry_after_seconds
+from omnigent.util.server_url import url_component as url_component
 
 DAEMON_HOST_ONLINE_TIMEOUT_S = 30.0
 DAEMON_RUNNER_ONLINE_TIMEOUT_S = 60.0
@@ -87,16 +88,6 @@ def normalize_extra_args(
         if extra_args is None:
             return tuple(legacy_args)
     return tuple(extra_args or ())
-
-
-def url_component(value: str) -> str:
-    """
-    Percent-encode a value for a path component.
-
-    :param value: Raw path component, e.g. ``"conv/abc"``.
-    :returns: Encoded path component, e.g. ``"conv%2Fabc"``.
-    """
-    return urllib.parse.quote(value, safe="")
 
 
 async def post_initial_prompt(

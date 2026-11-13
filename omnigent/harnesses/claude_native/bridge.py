@@ -98,6 +98,7 @@ from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
 from omnigent.runtime.tool_call_deadline import ToolCallDeadline, bind_tool_call_deadline
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.server_url import url_component as url_component
 
 if TYPE_CHECKING:
     import httpx
@@ -3097,16 +3098,6 @@ def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
         # fail-open branch runs before Claude kills it.
         "timeout": HARNESS_HOOK_TIMEOUT_S,
     }
-
-
-def url_component(value: str) -> str:
-    """
-    Percent-encode one URL path component.
-
-    :param value: Raw path component, e.g. ``"conv_abc123"``.
-    :returns: URL-safe component with slashes escaped.
-    """
-    return urllib.parse.quote(value, safe="")
 
 
 # Built-in Claude Code tools that need their own custom UI to be

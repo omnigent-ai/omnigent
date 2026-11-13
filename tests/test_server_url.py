@@ -221,3 +221,13 @@ def test_is_workspace_hosted_url(url: str, expected: bool) -> None:
     non-Databricks targets keep showing their version.
     """
     assert is_workspace_hosted_url(url) is expected
+
+
+@pytest.mark.parametrize("value", ["/", "%", "with spaces", "café/星", ""])
+def test_url_component_matches_stdlib(value: str) -> None:
+    """All native callers share strict path-component encoding."""
+    import urllib.parse
+
+    from omnigent.util.server_url import url_component
+
+    assert url_component(value) == urllib.parse.quote(value, safe="")

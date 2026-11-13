@@ -34,6 +34,15 @@ WORKSPACE_API_PATH = "/api/2.0/omnigent"
 WORKSPACE_UI_PATH = "/omnigent"
 
 
+def url_component(value: str) -> str:
+    """Percent-encode one URL path component, including slashes and percent signs.
+
+    :param value: Raw path component, e.g. ``"conv/abc"``.
+    :returns: Encoded component, e.g. ``"conv%2Fabc"``.
+    """
+    return urllib.parse.quote(value, safe="")
+
+
 def is_workspace_hosted_url(base_url: str) -> bool:
     """Whether *base_url* is a host-sharded deployment mount.
 

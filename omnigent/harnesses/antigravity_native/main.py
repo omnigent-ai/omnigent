@@ -121,7 +121,6 @@ from omnigent.harnesses.antigravity_native.rpc import (
     resolve_cold_start_agy_rpc_port,
     start_cascade,
 )
-from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.claude_native.main import (
     _attach_with_reconnect,
     _AttachOutcome,
@@ -151,6 +150,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.util.server_url import url_component
 
 _logger = logging.getLogger(__name__)
 

@@ -41,7 +41,6 @@ from omnigent.harness_availability import (
     HARNESS_VERSION_TOO_LOW,
     HarnessUnavailableReason,
 )
-from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.claude_native.main import (
     _attach_with_reconnect,
     attach_local_terminal,
@@ -113,6 +112,7 @@ from omnigent.native.native_terminal import (
 from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.server_url import url_component
 
 _logger = logging.getLogger(__name__)
 

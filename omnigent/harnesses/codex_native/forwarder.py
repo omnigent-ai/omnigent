@@ -24,7 +24,6 @@ import httpx
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
-from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.codex_egress import (
     CERTIFICATE_REMEDIATION,
     certificate_failure_message,
@@ -94,6 +93,7 @@ from omnigent.runner.launch_failure import is_codex_provider_auth_failure
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.server_url import url_component
 
 _logger = logging.getLogger(__name__)
 
