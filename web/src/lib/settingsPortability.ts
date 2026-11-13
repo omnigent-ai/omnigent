@@ -13,6 +13,10 @@ import {
   notifyFoldAssistantNarrationChanged,
 } from "./foldNarrationPreferences";
 import {
+  notifyPeerSessionMessageDisplayChanged,
+  PEER_SESSION_MESSAGES_STORAGE_KEY,
+} from "./peerSessionMessagePreferences";
+import {
   notifyProjectFolderPaginationChanged,
   PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
   PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
@@ -51,6 +55,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  PEER_SESSION_MESSAGES_STORAGE_KEY,
   PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
   PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
   SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
@@ -180,6 +185,7 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   notifyHiddenPickerAgentsChanged();
   notifyProjectFolderPaginationChanged();
   notifyFoldAssistantNarrationChanged();
+  notifyPeerSessionMessageDisplayChanged();
   notifySessionRowQuickActionsChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));

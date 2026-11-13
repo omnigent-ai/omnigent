@@ -2265,7 +2265,11 @@ async def test_launch_discards_previous_exit_diagnostics_before_starting(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+        ),
     )
     if launch_fails:
         with pytest.raises(RuntimeError, match="tmux launch failed"):
@@ -2300,7 +2304,11 @@ async def test_launch_replaces_inherited_correlation_and_resets_only_for_new_lau
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+        ),
     )
 
     await instance.launch()
@@ -2348,7 +2356,11 @@ async def test_failed_launch_telemetry_does_not_block_or_reuse_parent_identity(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+        ),
     )
     await instance.launch()
     assert instance.running

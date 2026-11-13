@@ -805,6 +805,40 @@ async def test_edit_grant_allows_post_but_blocks_permission_management(
     )
 
 
+async def test_move_to_managed_sandbox_requires_owner_access(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Moving a session onto a new sandbox is owner-only, like binding a
+    runner: an editor or a manager gets 403 and a user without access 404,
+    and none of them changes the session.
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    session_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+    for target_user, level in (("user-b", LEVEL_EDIT), ("user-d", LEVEL_MANAGE)):
+        resp = await _grant_permission(
+            auth_client,
+            session_id,
+            granter="user-a",
+            target_user=target_user,
+            level=level,
+        )
+        assert resp.status_code == 200
+    owner = {"X-Forwarded-Email": "user-a"}
+    before = (await auth_client.get(f"/v1/sessions/{session_id}", headers=owner)).json()
+
+    for caller, expected_status in (("user-b", 403), ("user-d", 403), ("user-c", 404)):
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/managed-host",
+            json={},
+            headers={"X-Forwarded-Email": caller},
+        )
+        assert resp.status_code == expected_status, (caller, resp.text)
+
+    after = (await auth_client.get(f"/v1/sessions/{session_id}", headers=owner)).json()
+    for field in ("host_id", "workspace", "runner_id", "labels"):
+        assert after[field] == before[field], field
+
+
 async def test_archive_requires_owner_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
@@ -1126,6 +1160,7 @@ async def test_single_user_local_can_access_own_session(
     identity, which gets an owner auto-grant on sessions it creates
     — the bare `omnigent run` / local web UI flow.
     """
+    assert (await local_auth_client.get("/v1/info")).json()["admin_view"] is False
     agent = await create_test_agent(local_auth_client, user="bryan")
 
     # Omit X-Forwarded-Email to trigger the "local" fallback —
@@ -1159,6 +1194,7 @@ async def test_admin_user_bypasses_permission_checks(
     server startup behavior (the CLI calls
     ``ensure_user("local", is_admin=True)``).
     """
+    assert (await auth_client.get("/v1/info")).json()["admin_view"] is True
     agent = await create_test_agent(auth_client, user="bryan")
     s1 = await _create_session_as(auth_client, agent["id"], "user-a")
     session_id = s1["id"]
@@ -1188,6 +1224,42 @@ async def test_admin_user_bypasses_permission_checks(
     assert resp.status_code == 200, (
         f"admin user should be able to list permissions, got {resp.status_code}."
     )
+
+    auth_client.cookies.set("omnigent_admin_view", "off")
+    headers = {"X-Forwarded-Email": "admin-user"}
+    session_url = f"/v1/sessions/{session_id}"
+    assert (await auth_client.get("/v1/sharing", headers=headers)).status_code == 403
+    assert (await auth_client.get(session_url, headers=headers)).status_code in (403, 404)
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
+    ).status_code in (403, 404)
+    assert perm_store.is_admin("admin-user")
+
+    own = await _create_session_as(auth_client, agent["id"], "admin-user")
+    assert (
+        await auth_client.patch(
+            f"/v1/sessions/{own['id']}", headers=headers, json={"title": "Mine"}
+        )
+    ).status_code == 200
+    await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="admin-user", level=LEVEL_READ
+    )
+    assert (await auth_client.get(session_url, headers=headers)).json()[
+        "permission_level"
+    ] == LEVEL_READ
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
+    ).status_code == 403
+
+    auth_client.cookies.set("omnigent_admin_view", "on")
+    assert (await auth_client.get("/v1/sharing", headers=headers)).status_code == 200
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Admin edit"})
+    ).status_code == 200
+    auth_client.cookies.set("omnigent_admin_view", "off")
+    assert (
+        await auth_client.patch(session_url, headers=headers, json={"title": "Denied"})
+    ).status_code == 403
 
 
 # ── Revoke nonexistent: idempotent 204 ──────────────────────
@@ -3184,6 +3256,159 @@ async def test_list_child_sessions_allows_read_grant(
     assert child.id in child_ids, (
         f"read-granted user-b should see the seeded child {child.id!r}, got {child_ids}"
     )
+
+    # Root -> grantless parent (``child``) -> running grandchild. READ on the
+    # root reaches the grandchild only through the chain, so the READ viewer
+    # must list it without settling it; the owner may settle it.
+    grandchild = conv_store.create_conversation(
+        agent_id=agent["id"],
+        kind="sub_agent",
+        title="coder:auth",
+        parent_conversation_id=child.id,
+    )
+    assert conv_store.set_runner_id(grandchild.id, f"runner_{grandchild.id}")
+    conv_store.set_session_live_status(grandchild.id, "running")
+    # Listing the grantless parent has no direct level, in both modes.
+    listing_id = child.id
+    listing_params = {"descendants": "true"} if descendants else None
+
+    resp = await auth_client.get(
+        f"/v1/sessions/{listing_id}/child_sessions",
+        params=listing_params,
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert grandchild.id in [row["id"] for row in resp.json()["data"]]
+    assert conv_store.get_conversation(grandchild.id).live_status == "running"  # type: ignore[union-attr]
+
+    # A direct OWNER grant on the child shows OWNER here, but user-b still
+    # inherits only READ through the root, so the grandchild must not settle.
+    # The grant API tops out at MANAGE, so seed OWNER in the store as ownership does.
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    perm_store.ensure_user("user-b")
+    perm_store.grant("user-b", child.id, LEVEL_OWNER)
+    resp = await auth_client.get(
+        f"/v1/sessions/{listing_id}/child_sessions",
+        params=listing_params,
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert grandchild.id in [row["id"] for row in resp.json()["data"]]
+    assert conv_store.get_conversation(grandchild.id).live_status == "running"  # type: ignore[union-attr]
+
+    resp = await auth_client.get(
+        f"/v1/sessions/{listing_id}/child_sessions",
+        params=listing_params,
+        headers={"X-Forwarded-Email": "user-a"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert conv_store.get_conversation(grandchild.id).live_status == "idle"  # type: ignore[union-attr]
+
+
+async def test_nested_parent_skips_owner_chain_without_settle_candidates(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nested parent with only idle or live children makes no OWNER-chain check.
+
+    The parent-chain OWNER check runs only when a read finds an orphan
+    candidate (running/waiting, no local status, stale heartbeat). Counts
+    OWNER checks and permission-table statements for two reads of the same
+    nested parent: one with only idle and live children, one with a stale
+    running child as a positive control.
+
+    :param auth_client: Permission-enabled test client.
+    :param db_uri: Per-test SQLite database URI, used to seed children.
+    :param monkeypatch: Pytest fixture that wraps ``check_session_access``.
+    """
+    import time
+
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    from omnigent.server.routes.sessions import routes_items
+
+    agent = await create_test_agent(auth_client, user="user-a")
+    root = await _create_session_as(auth_client, agent["id"], "user-a")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    now = int(time.time())
+    live_rid = f"runner_live_{root['id']}"
+    dead_rid = f"runner_dead_{root['id']}"
+    nested = conv_store.create_conversation(
+        kind="sub_agent",
+        title="worker:nested",
+        parent_conversation_id=root["id"],
+        agent_id=agent["id"],
+    )
+    for i in range(3):
+        idle = conv_store.create_conversation(
+            kind="sub_agent",
+            title=f"worker:idle-{i}",
+            parent_conversation_id=nested.id,
+            agent_id=agent["id"],
+        )
+        conv_store.set_session_live_status(idle.id, "idle")
+    live = conv_store.create_conversation(
+        kind="sub_agent",
+        title="worker:live",
+        parent_conversation_id=nested.id,
+        agent_id=agent["id"],
+        runner_id=live_rid,
+    )
+    conv_store.set_session_live_status(live.id, "running")
+    # Heartbeat after the live child exists so its runner_last_seen is fresh.
+    conv_store.touch_runner_liveness([live_rid], now)
+
+    owner_checks: list[int] = []
+    real_check = routes_items.check_session_access
+
+    def spy(user_id, session_id, level, *args, **kwargs):  # type: ignore[no-untyped-def]
+        owner_checks.append(level)
+        return real_check(user_id, session_id, level, *args, **kwargs)
+
+    monkeypatch.setattr(routes_items, "check_session_access", spy)
+
+    perm_statements: list[str] = []
+
+    def count_sql(conn, cursor, statement, params, context, executemany):  # type: ignore[no-untyped-def]
+        if "session_permissions" in statement:
+            perm_statements.append(statement)
+
+    async def list_nested() -> tuple[int, int]:
+        owner_checks.clear()
+        perm_statements.clear()
+        resp = await auth_client.get(
+            f"/v1/sessions/{nested.id}/child_sessions",
+            headers={"X-Forwarded-Email": "user-a"},
+        )
+        assert resp.status_code == 200, resp.text
+        return owner_checks.count(LEVEL_OWNER), len(perm_statements)
+
+    event.listen(Engine, "before_cursor_execute", count_sql)
+    try:
+        idle_live_owner, idle_live_perm = await list_nested()
+        assert idle_live_owner == 0, (
+            f"idle/live-only read ran {idle_live_owner} OWNER-chain check(s)"
+        )
+
+        # Positive control: a stale running child is a settle candidate.
+        dead = conv_store.create_conversation(
+            kind="sub_agent",
+            title="worker:orphan",
+            parent_conversation_id=nested.id,
+            agent_id=agent["id"],
+            runner_id=dead_rid,
+        )
+        conv_store.set_session_live_status(dead.id, "running")
+        conv_store.touch_runner_liveness([dead_rid], now - 3600)
+        cand_owner, cand_perm = await list_nested()
+        assert cand_owner >= 1, "candidate read must run the OWNER check"
+        assert cand_perm > idle_live_perm, (
+            f"candidate read ran {cand_perm} permission statements, idle/live {idle_live_perm}"
+        )
+    finally:
+        event.remove(Engine, "before_cursor_execute", count_sql)
 
 
 # ── SSE stream presence (who-is-viewing circles) ─────────────
