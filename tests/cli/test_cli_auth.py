@@ -931,7 +931,7 @@ def test_refresh_preserves_refresh_expiry_when_payload_omits_it(token_dir, monke
         refresh_expires_at=1_800_000_000,
     )
 
-    def _fake_post(url, *, data=None, timeout=None):
+    def _fake_post(url, *, data=None, headers=None, timeout=None):
         return httpx.Response(
             200,
             json={
