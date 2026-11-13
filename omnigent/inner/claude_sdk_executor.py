@@ -2593,6 +2593,13 @@ class ClaudeSDKExecutor(Executor):
                 with ExitStack() as env_stack:
                     env_stack.enter_context(_unset_env_var("CLAUDECODE"))
                     env_stack.enter_context(_unset_env_var("ANTHROPIC_API_KEY"))
+                    if static_api_key is not None:
+                        # Harness transport commands can contain the literal static key.
+                        for name in (
+                            "HARNESS_CLAUDE_SDK_API_KEY_HELPER",
+                            "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND",
+                        ):
+                            env_stack.enter_context(_unset_env_var(name))
                     if isinstance(sdk_env, dict) and "CLAUDE_CODE_USE_GATEWAY" in sdk_env:
                         env_stack.enter_context(
                             _unset_env_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")

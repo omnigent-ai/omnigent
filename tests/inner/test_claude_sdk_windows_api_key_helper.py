@@ -175,6 +175,13 @@ async def test_failed_client_creation_removes_its_static_key_file(
     paths: list[Path] = []
     key_files_created: list[PrivateStaticKeyFile] = []
     connecting = asyncio.Event()
+    transport_env = {
+        "HARNESS_CLAUDE_SDK_API_KEY_HELPER": _static_cmd("dummy-lifecycle-key"),
+        "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND": _static_cmd("dummy-lifecycle-key"),
+    }
+    for name, value in transport_env.items():
+        monkeypatch.setenv(name, value)
+    connect_env: dict[str, str | None] = {}
 
     def make_key_file(secret: str) -> PrivateStaticKeyFile:
         key_file = PrivateStaticKeyFile(secret)
@@ -193,6 +200,7 @@ async def test_failed_client_creation_removes_its_static_key_file(
                 raise RuntimeError("constructor failed")
 
         async def connect(self) -> None:
+            connect_env.update((name, os.environ.get(name)) for name in transport_env)
             connecting.set()
             if outcome == "connect":
                 raise RuntimeError("connect failed")
@@ -243,6 +251,9 @@ async def test_failed_client_creation_removes_its_static_key_file(
         assert "dummy-lifecycle-key" not in str(failure.value)
         assert not executor._clients
         assert options.stderr is None
+        if outcome != "constructor":
+            assert connect_env == dict.fromkeys(transport_env)
+        assert {name: os.environ.get(name) for name in transport_env} == transport_env
         assert close.await_count == int(outcome != "constructor")
         assert paths and paths[0].parent.exists() == (cleanup_failure is not None)
         if cleanup_failure is not None:

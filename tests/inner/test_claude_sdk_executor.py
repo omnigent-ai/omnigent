@@ -2226,6 +2226,11 @@ class TestSystemMessages(unittest.TestCase):
         listing = ModelListing(source="openai-compatible", verified=True, models=(), note="")
         discovered = []
         captured_options = []
+        transport_env = {
+            "HARNESS_CLAUDE_SDK_API_KEY_HELPER": command,
+            "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND": command,
+        }
+        connect_env = {}
 
         class _ResultMessage:
             def __init__(self, session_id, result):
@@ -2237,7 +2242,14 @@ class TestSystemMessages(unittest.TestCase):
 
             class ClaudeSDKClient(_SDKClient):
                 def __init__(self, options):
+                    super().__init__(options)
                     captured_options.append(options)
+
+                async def connect(self):
+                    child_env = {**os.environ, **self.options.env}
+                    connect_env.update(
+                        (name, child_env[name]) for name in transport_env if name in child_env
+                    )
 
                 async def receive_response(self):
                     yield _ResultMessage("default", "ok")
@@ -2261,6 +2273,7 @@ class TestSystemMessages(unittest.TestCase):
 
         async def _t():
             with (
+                patch.dict(os.environ, transport_env),
                 patch(
                     "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
                     _resolve_gateway_env,
@@ -2325,13 +2338,13 @@ class TestSystemMessages(unittest.TestCase):
                 base64.b64encode(token.encode()).decode(), captured_options[0].settings
             )
             self.assertNotIn(token, captured_options[0].env.values())
-            self.assertNotIn("OMNIGENT_CLAUDE_SDK_HELPER_STATIC_KEY", captured_options[0].env)
+            self.assertEqual(connect_env, {})
             self.assertNotIn("dummy-static", captured_options[0].settings)
             self.assertEqual(discovered[0].api_key, token)
             self.assertIsNone(discovered[0].auth_command)
         else:
             self.assertEqual(settings["apiKeyHelper"], command)
-            self.assertNotIn("OMNIGENT_CLAUDE_SDK_HELPER_STATIC_KEY", captured_options[0].env)
+            self.assertEqual(connect_env, transport_env)
             self.assertEqual(discovered[0].auth_command, command)
             self.assertIsNone(discovered[0].api_key)
         # The CLI talks to the loopback shim; the shim forwards to the
@@ -3989,19 +4002,26 @@ def test_non_databricks_model_without_routing_does_not_raise() -> None:
 
 
 @pytest.mark.asyncio
-async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
-    """``_get_or_create_client`` must strip ``ANTHROPIC_API_KEY`` from
-    ``os.environ`` during the ``connect()`` window so the Claude CLI
-    uses subscription auth instead of a developer API key.
+@pytest.mark.parametrize(
+    "helper_command,is_windows,strip_transport",
+    [
+        pytest.param(None, False, False, id="subscription"),
+        pytest.param("printf %s dummy-connect-key", True, True, id="windows-static"),
+        pytest.param("dummy-auth print-token", True, False, id="windows-dynamic"),
+        pytest.param("printf %s dummy-connect-key", False, False, id="posix-static"),
+    ],
+)
+async def test_anthropic_api_key_stripped_during_connect(
+    monkeypatch, helper_command, is_windows, strip_transport
+):
+    """Strip connection credentials while preserving parent and other helper paths."""
+    from omnigent.inner import claude_sdk_executor as ex
 
-    This test drives ``_get_or_create_client`` with a stub SDK and
-    captures ``os.environ`` at the moment ``connect()`` is invoked,
-    ensuring both ``CLAUDECODE`` and ``ANTHROPIC_API_KEY`` are absent.
-    """
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-
-    # Env snapshot captured inside connect() -- proves the real code
-    # path strips the keys, not just a standalone _unset_env_var call.
+    _, static_api_key = ex._platform_safe_api_key_helper(helper_command, is_windows=is_windows)
+    transport_env = {
+        "HARNESS_CLAUDE_SDK_API_KEY_HELPER": helper_command or "dummy-unused-helper",
+        "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND": "printf %s dummy-parent-gateway-key",
+    }
     connect_env: dict[str, str] = {}
 
     class _StubClient:
@@ -4017,8 +4037,16 @@ async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
             self._transport = None
 
         async def connect(self) -> None:
-            """Record env state at the moment the real code calls connect."""
-            connect_env.update(os.environ)
+            """Capture the credential fields from the SDK's merged child environment."""
+            child_env = {**os.environ, **self.options.env}
+            for name in (
+                *transport_env,
+                "ANTHROPIC_API_KEY",
+                "CLAUDECODE",
+                "HARNESS_CLAUDE_SDK_CWD",
+            ):
+                if name in child_env:
+                    connect_env[name] = child_env[name]
 
         async def disconnect(self) -> None:
             """No-op disconnect."""
@@ -4030,15 +4058,22 @@ async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-secret")
     monkeypatch.setenv("CLAUDECODE", "parent-value")
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_CWD", "dummy-parent-workspace")
+    for name, value in transport_env.items():
+        monkeypatch.setenv(name, value)
 
-    executor = ClaudeSDKExecutor()
-    options = SimpleNamespace()
-    await executor._get_or_create_client(
-        _StubSDK,  # type: ignore[arg-type]
-        session_key="test-session",
-        options=options,
-        model=None,
-    )
+    executor = ex.ClaudeSDKExecutor()
+    options = SimpleNamespace(env={})
+    try:
+        await executor._get_or_create_client(
+            _StubSDK,  # type: ignore[arg-type]
+            session_key="test-session",
+            options=options,
+            model=None,
+            static_api_key=static_api_key,
+        )
+    finally:
+        await executor.close()
 
     # Both keys must be absent at the moment connect() ran.
     assert "ANTHROPIC_API_KEY" not in connect_env, (
@@ -4050,6 +4085,13 @@ async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
     # Both are restored after _get_or_create_client returns.
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test-secret"
     assert os.environ["CLAUDECODE"] == "parent-value"
+    assert connect_env["HARNESS_CLAUDE_SDK_CWD"] == "dummy-parent-workspace"
+    for name, value in transport_env.items():
+        if strip_transport:
+            assert name not in connect_env, f"{name} leaked into the Windows static-key child"
+        else:
+            assert connect_env[name] == value
+        assert os.environ[name] == value
 
 
 @pytest.mark.asyncio
