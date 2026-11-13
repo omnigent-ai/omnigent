@@ -2178,6 +2178,8 @@ export function resetLandingDraft(): void {
 const LINKED_PROMPT_TTL_MS = 60_000;
 
 interface KeptLinkedPrompt {
+  /** Identifies this consumption; `at` only drives expiry. */
+  id: string;
   text: string;
   at: number;
 }
@@ -2195,7 +2197,11 @@ function linkedPromptStorageKey(siblingSourceId: string | null): string | null {
 function keepLinkedPrompt(siblingSourceId: string | null, text: string): KeptLinkedPrompt | null {
   const key = linkedPromptStorageKey(siblingSourceId);
   if (key === null) return null;
-  const kept = { text, at: Date.now() };
+  const kept = {
+    id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+    text,
+    at: Date.now(),
+  };
   try {
     sessionStorage.setItem(key, JSON.stringify({ ...kept, user: getCurrentUserId() }));
   } catch {
@@ -2209,11 +2215,13 @@ function parseKeptLinkedPrompt(raw: string | null): (KeptLinkedPrompt & { user?:
   const kept: unknown = JSON.parse(raw);
   return typeof kept === "object" &&
     kept !== null &&
+    "id" in kept &&
     "text" in kept &&
     "at" in kept &&
+    typeof kept.id === "string" &&
     typeof kept.text === "string" &&
     typeof kept.at === "number"
-    ? { text: kept.text, at: kept.at, user: "user" in kept ? kept.user : undefined }
+    ? { id: kept.id, text: kept.text, at: kept.at, user: "user" in kept ? kept.user : undefined }
     : null;
 }
 
@@ -2231,7 +2239,7 @@ function readKeptLinkedPrompt(siblingSourceId: string | null): KeptLinkedPrompt 
       Date.now() - kept.at < LINKED_PROMPT_TTL_MS &&
       !(viewer !== null && typeof kept.user === "string" && kept.user !== viewer)
     ) {
-      return { text: kept.text, at: kept.at };
+      return { id: kept.id, text: kept.text, at: kept.at };
     }
     sessionStorage.removeItem(key);
   } catch {
@@ -2250,7 +2258,7 @@ function forgetKeptLinkedPrompt(
   try {
     if (owned !== null) {
       const stored = parseKeptLinkedPrompt(sessionStorage.getItem(key));
-      if (stored === null || stored.text !== owned.text || stored.at !== owned.at) return;
+      if (stored === null || stored.id !== owned.id) return;
     }
     sessionStorage.removeItem(key);
   } catch {
@@ -2577,17 +2585,24 @@ function NewChatLandingContent({
           autoSeededBranch: "",
         };
 
-  // Restore from storage only without a parked draft; a remount still takes over
-  // cleanup of the kept copy.
+  // Restore from storage only without a parked draft. A parked draft with the
+  // same text takes over cleanup of the kept copy; a different one (e.g. a
+  // failed create's recovered text) supersedes it.
   const [keptLinkedPrompt] = useState(() =>
     handoff === null && !linkedPrompt?.trim() ? readKeptLinkedPrompt(siblingSourceId) : null,
   );
   const restoresKeptLinkedPrompt = keptLinkedPrompt !== null && landingDraft === null;
-  const keptLinkedRef = useRef<KeptLinkedPrompt | null>(
-    restoresKeptLinkedPrompt || landingDraft?.message === keptLinkedPrompt?.text
-      ? keptLinkedPrompt
-      : null,
+  const [ownsKeptLinkedPrompt] = useState(
+    () => restoresKeptLinkedPrompt || landingDraft?.message === keptLinkedPrompt?.text,
   );
+  const keptLinkedRef = useRef<KeptLinkedPrompt | null>(
+    ownsKeptLinkedPrompt ? keptLinkedPrompt : null,
+  );
+  useEffect(() => {
+    if (keptLinkedPrompt !== null && !ownsKeptLinkedPrompt) {
+      forgetKeptLinkedPrompt(siblingSourceId, keptLinkedPrompt);
+    }
+  }, [keptLinkedPrompt, ownsKeptLinkedPrompt, siblingSourceId]);
   // A handoff or prompt link replaces the parked draft's text, and with it the
   // tags that text's tokens pointed at.
   const restoresDraftText = handoff === null && !linkedPrompt?.trim() && !restoresKeptLinkedPrompt;
