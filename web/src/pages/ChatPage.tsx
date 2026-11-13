@@ -2308,6 +2308,7 @@ export function buildSlashCommandMap(
   showClear = false,
   showPermissions = false,
   showRewind = false,
+  showGoal = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2318,6 +2319,7 @@ export function buildSlashCommandMap(
     if (name === "/clear" && !showClear) continue;
     if (name === "/permissions" && !showPermissions) continue;
     if (name === "/rewind" && !showRewind) continue;
+    if (name === "/goal" && !showGoal) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
@@ -3150,6 +3152,9 @@ function ComposerImpl(
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
   const canStartSideChat = useCanStartSideChat(composerSessionId, permissionLevel);
   const showSide = supportsSideChat(sessionHarness, canStartSideChat);
+  const showGoal =
+    composerSessionId !== null &&
+    (showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl);
   // The built-ins this session offers; a gated-off one leaves a same-named
   // custom command to run as a skill.
   const offeredBuiltinCommands = useMemo(
@@ -3167,6 +3172,7 @@ function ComposerImpl(
         showClear,
         showCodexApprovalMode,
         showRewind,
+        showGoal,
       ),
     [
       showEffort,
@@ -3180,6 +3186,7 @@ function ComposerImpl(
       showClear,
       showCodexApprovalMode,
       showRewind,
+      showGoal,
     ],
   );
   const skillCommands = useMemo(
@@ -3476,6 +3483,13 @@ function ComposerImpl(
    */
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
+      case "/goal": {
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        setGoalDialogOpen(true);
+        return true;
+      }
       case "/new": {
         if (arg) {
           setCommandError("/new does not accept arguments");
@@ -4159,7 +4173,12 @@ function ComposerImpl(
       // executed locally. It must reach the vendor TUI as plaintext so Claude
       // Code opens its side chat and the forwarder relays the answer to the
       // web overlay; fall through to the plaintext send path below.
-      if (cmd !== "/btw" && cmd !== "/side" && cmd in offeredBuiltinCommands) {
+      if (
+        cmd !== "/btw" &&
+        cmd !== "/side" &&
+        !(cmd === "/goal" && arg) &&
+        cmd in offeredBuiltinCommands
+      ) {
         runCommand(() =>
           executeSlashCommand(
             cmd,
@@ -4178,7 +4197,7 @@ function ComposerImpl(
       // Known skill on an in-process session: send a `slash_command` event so
       // the server resolves it. Native-terminal sessions have no
       // `onSendSlashCommand`; their vendor TUI loads the skill from plaintext.
-      if (skill !== null) {
+      if (skill !== null && !(cmd === "/goal" && showGoal)) {
         runCommand(() => sendSkill(skill));
         return;
       }

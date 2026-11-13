@@ -929,6 +929,79 @@ describe("Composer Claude goal control", () => {
   });
 });
 
+describe("Composer goal slash command", () => {
+  beforeEach(() => {
+    setComposerState({ conversationId: "conv_goal", sessionHarness: "codex-native", skills: [] });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.mocked(getGoal).mockReset();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    { showGoalControl: true },
+    { showPollyCodexGoalControl: true },
+    { showClaudeGoalControl: true },
+  ])("opens the existing Goal dialog for bare /goal with %j", async (controls) => {
+    const onSend = vi.fn();
+    vi.mocked(getGoal).mockResolvedValue({ goal: null });
+    useChatStore.setState({ conversationId: "conv_goal", sessionHarness: "codex-native" });
+    renderWithTooltips(<Composer {...composerProps({ onSend, ...controls })} />);
+    fireEvent.change(textarea(), { target: { value: "/goal" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByRole("dialog", { name: "Goal" })).toBeInTheDocument();
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea().value).toBe("");
+  });
+
+  it("opens the native Goal dialog from the slash menu", async () => {
+    const onSend = vi.fn();
+    vi.mocked(getGoal).mockResolvedValue({ goal: null });
+    useChatStore.setState({ conversationId: "conv_goal", sessionHarness: "codex-native" });
+    renderWithTooltips(<Composer {...composerProps({ onSend, showGoalControl: true })} />);
+    fireEvent.change(textarea(), { target: { value: "/go" } });
+    fireEvent.click(screen.getByTestId("slash-menu-item-goal"));
+    expect(await screen.findByRole("dialog", { name: "Goal" })).toBeInTheDocument();
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("sends the full goal objective as a message rather than a skill invocation", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    useChatStore.setState({ conversationId: "conv_goal", sessionHarness: "codex" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({ onSend, onSendSlashCommand, showPollyCodexGoalControl: true })}
+      />,
+    );
+    fireEvent.change(textarea(), {
+      target: { value: "/goal Finish the implementation and pass all tests" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(onSend.mock.calls[0]?.[0]).toBe("/goal Finish the implementation and pass all tests");
+    expect(onSendSlashCommand).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Goal" })).toBeNull();
+  });
+
+  it("preserves a same-named skill when no Goal control is supported", () => {
+    const onSend = vi.fn();
+    const onSendSlashCommand = vi.fn();
+    setComposerState({
+      conversationId: "conv_goal",
+      sessionHarness: "claude-sdk",
+      skills: [{ name: "goal", description: "Project goal skill" }],
+    });
+    renderWithTooltips(<Composer {...composerProps({ onSend, onSendSlashCommand })} />);
+    fireEvent.change(textarea(), { target: { value: "/goal" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(onSendSlashCommand).toHaveBeenCalledWith("goal", "");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Goal" })).toBeNull();
+  });
+});
+
 describe("Composer Codex goal control", () => {
   afterEach(() => {
     cleanup();
