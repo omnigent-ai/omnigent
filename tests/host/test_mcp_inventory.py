@@ -77,6 +77,44 @@ def _write_claude_plugin(config_dir: Path, *, enabled: bool = True) -> None:
     _write_json(config_dir / "settings.json", {"enabledPlugins": {"figma@market": enabled}})
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_unreadable_plugin_install_path_skips_only_that_plugin(home: Path) -> None:
+    """A plugin dir that can't be stat'ed must not drop the rest of the Claude inventory."""
+    config = home / ".claude"
+    cache = config / "plugins" / "cache" / "market"
+    healthy = cache / "figma" / "1.0"
+    _write_json(healthy / ".mcp.json", {"mcpServers": {"figma": _stdio()}})
+    locked_parent = cache / "locked"
+    locked = locked_parent / "tool" / "1.0"
+    _write_json(locked / ".mcp.json", {"mcpServers": {"tool": _stdio()}})
+    _write_json(home / ".claude.json", {"mcpServers": {"github": _stdio()}})
+    _write_json(
+        config / "plugins" / "installed_plugins.json",
+        {
+            "version": 2,
+            "plugins": {
+                "tool@market": [{"scope": "user", "installPath": str(locked)}],
+                "figma@market": [{"scope": "user", "installPath": str(healthy)}],
+            },
+        },
+    )
+    _write_json(
+        config / "settings.json",
+        {"enabledPlugins": {"tool@market": True, "figma@market": True}},
+    )
+
+    locked_parent.chmod(0)
+    try:
+        servers = discover_mcp_servers()
+    finally:
+        locked_parent.chmod(0o755)
+
+    assert [(s["name"], s.get("plugin")) for s in servers if s["harness"] == "claude"] == [
+        ("github", None),
+        ("figma", "figma"),
+    ]
+
+
 def test_reads_each_harness_and_drops_secrets(home: Path) -> None:
     _write_json(
         home / ".claude.json",

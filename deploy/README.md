@@ -308,6 +308,10 @@ For an IdP that cannot supply a fresh `auth_time` (for example, Cloudflare
 Access), set `OMNIGENT_OIDC_REQUIRE_REAUTH=0`. The server still sends
 `prompt=login` and requires PKCE, ticket-specific sign-in, and approval, but it
 no longer verifies that the IdP asked for credentials again.
+If the IdP fails the sign-in when asked to re-authenticate (for example,
+self-managed GitLab), also set `OMNIGENT_OIDC_REAUTH_PROMPT=0` to stop sending
+`prompt=login` and `max_age`. The IdP then reuses its session, so only the
+ticket-specific approval screen confirms the request.
 Polling responses forbid caching, including successful credential responses.
 CLI and Slack display a comparison code; native mobile apps currently rely
 on explicit browser approval without displaying that code in the app. Include
@@ -405,6 +409,21 @@ from the last renewal; disconnected hosts receive no renewals, and an expired
 token cannot open a new connection. Renewal also extends the validity of any
 leaked copy of that token. This setting does not change sandbox lifetime or
 Mac/Arca user-login credentials.
+
+**Stopping archived sessions' sandboxes.** Set `sandbox.stop_on_archive: true`
+(off by default) to stop a session's sandbox when the session is archived, after
+its runner is stopped. It is a per-provider setting: in a `providers:` list, a
+value next to `providers` is every entry's default, and an entry can override it.
+The sandbox is stopped, not deleted, so unarchiving the session and sending a
+message resumes the same sandbox. It applies only to providers that can resume
+a stopped sandbox (`capabilities.resume_stopped`) and implement `stop()`; on a
+provider whose `stop()` raises `SandboxCapabilityError`, the option has no
+effect (the server logs that at debug level). Only a sandbox no other session
+uses is stopped: another session on the same host, or a side chat or sub-agent
+of the session, keeps it running even when archived, and so does a scheduled
+task run's sandbox. Deleting the session still terminates the sandbox, and so does
+the reaper below once a stopped sandbox's host passes its offline limit; the
+next message then starts a fresh sandbox instead.
 
 The optional reaper runs once for the whole `sandbox:` deployment, including
 multi-provider configurations. It queries managed host rows directly and

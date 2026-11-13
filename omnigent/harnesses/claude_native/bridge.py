@@ -1143,6 +1143,8 @@ class ClaudeHookRecord:
         payload's ``error_details`` field, e.g.
         ``"prompt is too long: 120000 tokens (limit 100000)"``. ``None`` when absent.
     :param failure_context: Structured evidence supplied by this hook record.
+    :param completion_output: Authoritative ``Stop`` reply, including an empty
+        reply. ``None`` when absent or malformed; never truncated here.
     """
 
     event_cursor: int
@@ -1167,6 +1169,7 @@ class ClaudeHookRecord:
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
+    completion_output: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1776,9 +1779,6 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
     """
     Whether a permission hook is parked on this session's verdict right now.
 
-    Scans every hook's marker for the session; a stale one (a hook killed
-    mid-wait) is removed on the way so they never accumulate.
-
     :param session_id: Omnigent session id to check, e.g.
         ``"conv_abc123"``.
     :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
@@ -1786,20 +1786,38 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
         :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when none exists, all
         are stale, or the root is unreadable.
     """
+    return bool(fresh_approval_wait_markers(session_id, bridge_dir=bridge_dir))
+
+
+def fresh_approval_wait_markers(session_id: str, *, bridge_dir: Path | None = None) -> list[str]:
+    """
+    Name each permission hook parked on this session's verdict right now.
+
+    Scans every hook's marker for the session; a stale one (a hook killed
+    mid-wait) is removed on the way so they never accumulate. Each hook
+    process owns one marker, so a name identifies one wait.
+
+    :param session_id: Omnigent session id to check, e.g.
+        ``"conv_abc123"``.
+    :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
+    :returns: File names of markers touched within
+        :data:`APPROVAL_WAIT_MARKER_TTL_S`, e.g. ``["<digest>.4242.wait"]``;
+        empty when none exists, all are stale, or the root is unreadable.
+    """
     root = bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME if bridge_dir else _APPROVAL_WAIT_ROOT
     try:
         markers = list(root.glob(f"{_approval_wait_digest(session_id)}.*.wait"))
     except OSError:
-        return False
+        return []
     now = time.time()
-    fresh = False
+    fresh: list[str] = []
     for marker in markers:
         try:
             touched_at = marker.stat().st_mtime
         except OSError:
             continue
         if now - touched_at < APPROVAL_WAIT_MARKER_TTL_S:
-            fresh = True
+            fresh.append(marker.name)
         else:
             clear_approval_wait_marker(marker)
     return fresh
@@ -4672,6 +4690,11 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
+    completion_output: str | None = None
+    if event_name == "Stop" and isinstance(payload, dict):
+        raw_output = payload.get("last_assistant_message")
+        if isinstance(raw_output, str):
+            completion_output = raw_output
     if event_name == "StopFailure" and isinstance(payload, dict):
         failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
         # ``error_details`` is the purpose-built API error field; ``last_assistant_message``
@@ -4732,6 +4755,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         failure_category=failure_category,
         failure_message=failure_message,
         failure_context=failure_context,
+        completion_output=completion_output,
     )
 
 

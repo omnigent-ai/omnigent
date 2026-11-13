@@ -15,7 +15,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, local_single_user_enabled
@@ -274,8 +274,8 @@ async def _authorize_host_for_workspace(
         the ownership check (minimal test wirings).
     :param host_registry: Live host tunnels on this replica.
     :returns: The host's display name for error messages, or ``None``.
-    :raises OmnigentError: ``WRONG_REPLICA`` when the host is live but
-        its tunnel is on another replica.
+    :raises WrongReplicaError: When the host is live but its tunnel is on
+        another replica.
     """
     from omnigent.server.routes._host_launch import resolve_host_owner
 
@@ -292,15 +292,14 @@ async def _authorize_host_for_workspace(
     # → "host is offline" (invalid_input), which the client can't recover
     # from. If the host is live per the store but its tunnel isn't on this
     # replica, the create landed on the wrong replica — surface WRONG_REPLICA
-    # so the client re-addresses WITHOUT the key. A genuinely offline host
+    # naming the slice key that re-addresses it. A genuinely offline host
     # falls through to the invalid_input case. Both are 400; the distinct
     # code, not the status, is what tells the client to re-address rather
     # than give up. Safe to raise here: workspace validation runs BEFORE
     # create_conversation, so no orphan row is left.
     if host_registry is not None and host_registry.get(host_id) is None and host_is_live(host):
-        raise OmnigentError(
-            f"host {host.name or host_id!r} is on another replica; retry",
-            code=ErrorCode.WRONG_REPLICA,
+        raise WrongReplicaError(
+            f"host {host.name or host_id!r} is on another replica", host_id=host_id
         )
     return host.name
 

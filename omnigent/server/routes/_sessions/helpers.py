@@ -71,6 +71,7 @@ from omnigent.errors import (
     ErrorImpact,
     ErrorPhase,
     OmnigentError,
+    WrongReplicaError,
     category_for_code,
     restart_on_stale_cursor,
 )
@@ -2042,6 +2043,7 @@ def _resolve_harness_impl(
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
     agents_by_id: Mapping[str, Agent] | None = None,
+    agent: Agent | None = None,
 ) -> str | None:
     """
     Resolve the canonical harness for a conversation's bound agent.
@@ -2059,6 +2061,8 @@ def _resolve_harness_impl(
     :param agent_store: Optional store for resolving the bound agent.
     :param agent_cache: Optional cache for loading the bound agent spec.
     :param agents_by_id: Optional preloaded agents, avoiding per-session store reads.
+    :param agent: The bound agent row when the caller already holds it, so
+        the store is not read again. Ignored unless it is ``conv``'s agent.
     :returns: The canonical harness (e.g. ``"openai-agents"`` or
         ``"claude-sdk"``), or ``None`` when unavailable.
     """
@@ -2077,7 +2081,7 @@ def _resolve_harness_impl(
 
         if agents_by_id is not None:
             agent = agents_by_id.get(conv.agent_id)
-        else:
+        elif agent is None or agent.id != conv.agent_id:
             if agent_store is None:
                 from omnigent.runtime._globals import _agent_store
 
@@ -3475,7 +3479,10 @@ async def _forward_approval_to_runner(
     :param runner_router: Router used to resolve the bound runner, or
         ``None`` in in-process setups (forward skipped).
     """
-    runner_client = await _get_runner_client(session_id, runner_router)
+    if data.get("action") in ("decline", "cancel"):
+        runner_client = await _get_runner_client(session_id, runner_router, for_control=True)
+    else:
+        runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
         return
     try:
@@ -5940,6 +5947,7 @@ async def _get_runner_client_impl(
     runner_router: RunnerRouter | None,
     *,
     conversation: Conversation | None = None,
+    for_control: bool = False,
 ) -> httpx.AsyncClient | None:
     """
     Get an HTTP client for the runner bound to a session.
@@ -5952,22 +5960,30 @@ async def _get_runner_client_impl(
     :param runner_router: The ``RunnerRouter`` instance, or
         ``None`` for in-process setups.
     :param conversation: An already-loaded conversation to reuse for routing.
+    :param for_control: Route stop, interrupt, and teardown without admitting execution.
     :returns: An ``httpx.AsyncClient`` pointed at the runner,
         or ``None`` if no runner is available.
     """
     from omnigent.runtime import get_runner_client
+    from omnigent.server.runtime_compatibility import RuntimeSupportError
 
     if runner_router is not None:
         try:
+            resolve = (
+                runner_router.client_for_session_control
+                if for_control
+                else runner_router.client_for_session_resources
+            )
             if conversation is None:
-                routed = runner_router.client_for_session_resources(session_id)
+                routed = await asyncio.to_thread(resolve, session_id)
             else:
-                routed = runner_router.client_for_session_resources(
-                    session_id,
-                    conversation=conversation,
-                )
+                routed = await asyncio.to_thread(resolve, session_id, conversation=conversation)
             return routed.client
-        except (LookupError, httpx.HTTPError, OmnigentError):
+        except (LookupError, httpx.HTTPError, OmnigentError) as exc:
+            if isinstance(exc, RuntimeSupportError) or (
+                isinstance(exc, OmnigentError) and exc.code == ErrorCode.RUNNER_CAPABILITY_MISMATCH
+            ):
+                raise
             _logger.debug(
                 "No runner bound for session=%s",
                 session_id,
@@ -7216,6 +7232,7 @@ async def _get_runner_client_for_resource_access_impl(
     session_id: str,
     *,
     conversation: Conversation | None = None,
+    for_control: bool = False,
 ) -> httpx.AsyncClient | None:
     """Return the authoritative runner client for session resources.
 
@@ -7229,10 +7246,16 @@ async def _get_runner_client_for_resource_access_impl(
 
     runner_router = get_runner_router()
     if runner_router is not None:
+        resolve = (
+            runner_router.client_for_session_control
+            if for_control
+            else runner_router.client_for_session_resources
+        )
         if conversation is None:
-            routed_runner = runner_router.client_for_session_resources(session_id)
+            routed_runner = await asyncio.to_thread(resolve, session_id)
         else:
-            routed_runner = runner_router.client_for_session_resources(
+            routed_runner = await asyncio.to_thread(
+                resolve,
                 session_id,
                 conversation=conversation,
             )
@@ -7840,8 +7863,27 @@ async def _forward_session_change_to_runner_impl(
         operation is the authoritative fallback).
     """
     from omnigent.runtime import get_runner_client
+    from omnigent.server.runtime_compatibility import RuntimeSupportError
 
-    runner_client = await _get_runner_client(session_id, runner_router)
+    event_type = event.get("type")
+    try:
+        if event_type in ("interrupt", "cost_approval_popup", "policy_blocked_notice"):
+            runner_client = await _get_runner_client(session_id, runner_router, for_control=True)
+        else:
+            runner_client = await _get_runner_client(session_id, runner_router)
+    except OmnigentError as exc:
+        if event_type not in ("effort_change", "model_change") or not (
+            isinstance(exc, RuntimeSupportError)
+            or exc.code == ErrorCode.RUNNER_CAPABILITY_MISMATCH
+        ):
+            raise
+        _logger.warning(
+            "Session-change forward skipped for session=%s type=%s: %s",
+            session_id,
+            event_type,
+            exc,
+        )
+        return None
     if runner_client is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
@@ -7926,7 +7968,7 @@ async def _stop_session_via_runner_impl(
     """
     from omnigent.runtime import get_runner_client
 
-    runner_client = await _get_runner_client(session_id, runner_router)
+    runner_client = await _get_runner_client(session_id, runner_router, for_control=True)
     if runner_client is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
@@ -9497,6 +9539,7 @@ def _filesystem_attachment_in_history(
     file_store: FileStore | None,
     *,
     up_to_response_id: str | None = None,
+    before_item_id: str | None = None,
     content: Sequence[dict[str, Any]] = (),
 ) -> str | None:
     """Find a retained attachment requiring filesystem tools, using its stored name.
@@ -9505,6 +9548,8 @@ def _filesystem_attachment_in_history(
     :param conversation_store: Store containing the ordered source history.
     :param file_store: Store containing authoritative attachment filenames.
     :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
+    :param before_item_id: Exclusive cutoff: only the items before this one
+        are retained, e.g. ``"msg_abc"``.
     :param content: Additional incoming message blocks to check before stored history.
     :returns: A referenced filesystem attachment's name, or ``None``.
     """
@@ -9532,7 +9577,7 @@ def _filesystem_attachment_in_history(
 
     # Descending order finds the last item of the cutoff response first,
     # matching the fork store's inclusive position cutoff.
-    retained = up_to_response_id is None
+    retained = up_to_response_id is None and before_item_id is None
     items_after: str | None = None
     while True:
         page = conversation_store.list_items(
@@ -9541,6 +9586,9 @@ def _filesystem_attachment_in_history(
         for item in page.data:
             if item.response_id == up_to_response_id:
                 retained = True
+            if before_item_id is not None and item.id == before_item_id:
+                retained = True
+                continue
             if not retained or not isinstance(item.data, MessageData):
                 continue
             for block in item.data.content:
@@ -9605,14 +9653,15 @@ def _load_agent_spec_for_session(*args: Any, **kwargs: Any) -> AgentSpec | None:
 def _load_agent_spec_for_session_impl(
     conv: Conversation,
     agent_store: AgentStore,
+    agent: Agent | None = None,
 ) -> AgentSpec | None:
-    # Split from _build_policy_engine_from_spec so the caller can run the
-    # cheap guardrails/default-policy skip check between the two and avoid
-    # paying for engine construction when no policy could fire. Both halves
-    # are blocking DB/IO, so each is run under asyncio.to_thread.
+    # Split from _build_policy_engine_from_spec so callers can skip engine
+    # construction when no policy could fire; both halves run in to_thread.
+    # A caller already holding conv's agent row passes it to skip the store read.
     if conv.agent_id is None:
         return None
-    agent = agent_store.get(conv.agent_id)
+    if agent is None or agent.id != conv.agent_id:
+        agent = agent_store.get(conv.agent_id)
     if agent is None:
         return None
     agent_cache = cast(AgentCache, get_agent_cache())
@@ -12359,9 +12408,9 @@ def require_filesystem_attachment_runtime(
     if host is not None or runner is not None:
         return
     if host_id and runner_router is not None and runner_router.host_is_on_another_replica(host_id):
-        raise OmnigentError(
+        raise WrongReplicaError(
             "Attachment support must be checked on the host's server replica",
-            code=ErrorCode.WRONG_REPLICA,
+            host_id=host_id,
         )
     raise OmnigentError(
         "Connect an updated Omnigent host before attaching archives, Office documents, "

@@ -155,9 +155,9 @@ class _CliTicket:
     """
 
     created_at: float = field(default_factory=time.time)
-    token: str | None = None
+    token: str | None = field(default=None, repr=False)
     user_id: str | None = None
-    refresh_token: str | None = None
+    refresh_token: str | None = field(default=None, repr=False)
     code_challenge: str = ""
     user_code: str = ""
     denied: bool = False
@@ -357,7 +357,7 @@ def create_auth_router(
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
-        if reauth:
+        if reauth and config.reauth_prompt:
             # Ask the IdP to force the user to re-enter credentials
             # rather than silently reusing an existing IdP session.
             params["prompt"] = "login"

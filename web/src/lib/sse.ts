@@ -905,7 +905,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       type: "session_superseded",
       conversationId,
       targetConversationId,
-      reason: "clear",
+      reason: data.reason === "rewind" ? "rewind" : "clear",
     } satisfies SessionSupersededEvent;
   }
   if (eventType === "session.btw_sidechat") {
@@ -1131,6 +1131,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       ...(p.native_delivery
         ? { nativeDelivery: parseNativePermissionDelivery(p.native_delivery) }
         : {}),
+      ...(p.is_blocking === false ? { isBlocking: false as const } : {}),
       elicitationId,
       targetSessionId:
         typeof targetSessionId === "string" && targetSessionId ? targetSessionId : null,

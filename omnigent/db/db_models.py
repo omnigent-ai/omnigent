@@ -32,6 +32,7 @@ from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
+from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
 from omnigent.util.uuid import normalize_uuid as normalize_uuid
 from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
@@ -1189,7 +1190,7 @@ class SqlComment(OmnigentBase):
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     anchor_metadata: Mapped[str | None] = mapped_column(
-        CompressedText(max_stored_bytes=1_024), nullable=True
+        CompressedText(max_stored_bytes=COMMENT_ANCHOR_MAX_STORED_BYTES), nullable=True
     )
 
     __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
@@ -1801,5 +1802,65 @@ class SqlScheduledTaskRun(OmnigentBase):
             "conversation_id",
             "status",
             "id",
+        ),
+    )
+
+
+class SqlScheduledTaskShare(OmnigentBase):
+    """
+    SQLAlchemy model for the ``scheduled_task_shares`` table.
+
+    One row per user or group an automation is shared with. Each run grants its
+    session to these recipients, and they may also view the automation itself
+    (read-only). These rows are not session grants; those stay in
+    ``session_permissions``. Public shares (``__public__``) are never stored; the
+    application enforces that.
+
+    :param scheduled_task_id: The automation this share belongs to (relates to
+        ``scheduled_tasks.id``). Rows are deleted with their task by the
+        application; there is no DB foreign key (schema Rule R032).
+    :param user_id: The grantee, a user or group ID, e.g. ``"alice@example.com"``.
+        String(128) matches ``session_permissions.user_id``.
+    :param level: The permission level granted on each run's session. No CHECK
+        constraint: the permission store owns the set of valid levels.
+    """
+
+    __tablename__ = "scheduled_task_shares"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    # No database default; the ORM always supplies it.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        default=current_workspace_id,
+    )
+    scheduled_task_id: Mapped[str] = mapped_column(Uuid16, primary_key=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True, nullable=False)
+    # Permission level code, stored as a small integer like scheduled_task_runs.status.
+    level: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+
+    __table_args__ = (
+        # SQLite and D1 ignore VARCHAR lengths: 128 characters at up to four bytes each.
+        CheckConstraint(
+            "length(CAST(user_id AS BLOB)) <= 512",
+            name="ck_scheduled_task_shares_user_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # SQLite and D1 store any value in an integer column.
+        CheckConstraint(
+            "typeof(workspace_id) = 'integer'",
+            name="ck_scheduled_task_shares_workspace_id_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(level) = 'integer'",
+            name="ck_scheduled_task_shares_level_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # Looks up the automations shared with one user; the primary key already
+        # covers the remaining columns.
+        Index(
+            "ix_scheduled_task_shares_user_id",
+            "workspace_id",
+            "user_id",
+            "scheduled_task_id",
         ),
     )

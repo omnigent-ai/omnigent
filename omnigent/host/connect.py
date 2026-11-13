@@ -811,10 +811,11 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_HARNESS_STDERR_ENABLED",
         # Runner release flags must survive CLI -> daemon -> runner.
         "OMNIGENT_FEATURES",
-        # Idle-reap windows the runner reads at boot (``0`` disables reaping).
-        # Numeric tuning knobs, not secrets.
+        # Idle-reap windows and the human-wait hold the runner reads at boot
+        # (``0`` disables each). Numeric tuning knobs, not secrets.
         "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
         "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
+        "OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S",
         # Opaque request-routing headers (dev/test): a JSON header map folded by
         # cli_auth.databricks_request_headers into every client→server connection
         # so a request pins to a specific server instance/replica. Must reach the
@@ -4576,6 +4577,15 @@ class HostProcess:
                 pr_url=cast("str | None", params.get("pr_url")),
                 merge_method=params.get("merge_method"),
                 expected_head=params.get("expected_head"),
+            )
+        if op == "github_merge_as":
+            return pr_resource.merge_pr_as(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                merge_method=params.get("merge_method"),
+                expected_head=params.get("expected_head"),
+                account=params.get("account"),
             )
         if op == "github_disable_auto_merge":
             return pr_resource.disable_pr_auto_merge(
