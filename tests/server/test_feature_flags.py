@@ -26,8 +26,8 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
             Feature.AUTOMATIONS_V2,
             Feature.CLAUDE_OSC_STATUS,
             Feature.CODEX_PLAN_AT_LAUNCH,
-            Feature.CUSTOM_AGENTS_SETTINGS_UI,
             Feature.PEER_SESSION_MESSAGING,
+            Feature.PROJECT_REPOSITORY_CREATION,
             Feature.SESSION_ORCHESTRATION,
             Feature.SIBLING_SESSIONS,
             Feature.SIDEBAR_GROUPING_UI,
@@ -40,13 +40,14 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "canvas": False,
         "arca_shutdown_warnings": False,
         "import_review": False,
-        "custom_agents_settings_ui": True,
         "sidebar_grouping_ui": True,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
         "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
+        "session_overview": False,
+        "project_repository_creation": True,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
@@ -62,9 +63,9 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
-        "custom_agents_settings_ui",
         "harness_install",
         "peer_session_messaging",
+        "project_repository_creation",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
@@ -85,8 +86,8 @@ def test_resolves_comma_separated_enabled_set() -> None:
     [
         "automations_v2",
         "claude_osc_status",
-        "custom_agents_settings_ui",
         "peer_session_messaging",
+        "project_repository_creation",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
@@ -100,8 +101,8 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
         "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
-        "custom_agents_settings_ui",
         "peer_session_messaging",
+        "project_repository_creation",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
@@ -117,12 +118,23 @@ def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> N
         "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
-        "custom_agents_settings_ui",
         "peer_session_messaging",
+        "project_repository_creation",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
     )
+
+
+@pytest.mark.parametrize("override", ["custom_agents_settings_ui", "-custom_agents_settings_ui"])
+def test_retired_feature_is_ignored_with_warning(
+    override: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        flags = resolve_feature_flags({FEATURES_ENV_VAR: f"usage_page,{override}"})
+
+    assert flags == resolve_feature_flags({FEATURES_ENV_VAR: "usage_page"})
+    assert f"{override} has been retired" in caplog.text
 
 
 def test_removed_harness_install_variable_fails_with_migration_hint() -> None:
@@ -146,8 +158,8 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
         "canvas",
         "claude_osc_status",
         "codex_plan_at_launch",
-        "custom_agents_settings_ui",
         "peer_session_messaging",
+        "project_repository_creation",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
