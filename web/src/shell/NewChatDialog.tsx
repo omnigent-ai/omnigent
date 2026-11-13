@@ -2172,19 +2172,19 @@ export function resetLandingDraft(): void {
   landingDrafts.clear();
 }
 
-// An embedding host can remount the composer or reload the page right after
-// the composer strips `?prompt=` from the URL. A remount renders the new
-// composer before the old one's unmount cleanup parks its draft, and a reload
-// drops the module-scoped draft, so the consumed prompt is parked immediately
-// and kept briefly in sessionStorage.
+// An embedding host can remount or reload the page right after the composer
+// strips `?prompt=`, and a remount renders before the old composer parks its
+// draft, so the consumed prompt is parked at once and kept briefly here.
 const LINKED_PROMPT_TTL_MS = 60_000;
 
-// One origin can front many workspaces, and sessionStorage outlives reloads and
-// sign-in changes, so the kept prompt is scoped to the server and to the
-// composer (the same sibling partition as the parked drafts), and nothing is
-// kept without a server identity. It is also dropped when the viewer differs,
-// but only when both viewers are known: the embed resolves identity after
-// first render, so a prompt kept or read before then is not tied to a viewer.
+interface KeptLinkedPrompt {
+  text: string;
+  at: number;
+}
+
+// Scoped to the server and composer (sibling partition); nothing is kept
+// without a server identity. A known viewer mismatch drops it, but identity
+// resolves after first render, so an unknown viewer is not tied to it.
 function linkedPromptStorageKey(siblingSourceId: string | null): string | null {
   const server = getOmnigentServerIdentity();
   return server === null
@@ -2192,36 +2192,46 @@ function linkedPromptStorageKey(siblingSourceId: string | null): string | null {
     : `omnigent:linked-prompt:${JSON.stringify([server, siblingSourceId])}`;
 }
 
-function keepLinkedPrompt(siblingSourceId: string | null, text: string): void {
+function keepLinkedPrompt(siblingSourceId: string | null, text: string): KeptLinkedPrompt | null {
   const key = linkedPromptStorageKey(siblingSourceId);
-  if (key === null) return;
+  if (key === null) return null;
+  const kept = { text, at: Date.now() };
   try {
-    sessionStorage.setItem(key, JSON.stringify({ text, at: Date.now(), user: getCurrentUserId() }));
+    sessionStorage.setItem(key, JSON.stringify({ ...kept, user: getCurrentUserId() }));
   } catch {
     // Without storage only the reload case is lost.
   }
+  return kept;
 }
 
-function readKeptLinkedPrompt(siblingSourceId: string | null): string | null {
+function parseKeptLinkedPrompt(raw: string | null): (KeptLinkedPrompt & { user?: unknown }) | null {
+  if (raw === null) return null;
+  const kept: unknown = JSON.parse(raw);
+  return typeof kept === "object" &&
+    kept !== null &&
+    "text" in kept &&
+    "at" in kept &&
+    typeof kept.text === "string" &&
+    typeof kept.at === "number"
+    ? { text: kept.text, at: kept.at, user: "user" in kept ? kept.user : undefined }
+    : null;
+}
+
+function readKeptLinkedPrompt(siblingSourceId: string | null): KeptLinkedPrompt | null {
   const key = linkedPromptStorageKey(siblingSourceId);
   if (key === null) return null;
   try {
     const raw = sessionStorage.getItem(key);
     if (raw === null) return null;
-    const kept: unknown = JSON.parse(raw);
+    const kept = parseKeptLinkedPrompt(raw);
     const viewer = getCurrentUserId();
     if (
-      typeof kept === "object" &&
       kept !== null &&
-      "text" in kept &&
-      "at" in kept &&
-      typeof kept.text === "string" &&
-      typeof kept.at === "number" &&
       kept.text.trim() !== "" &&
       Date.now() - kept.at < LINKED_PROMPT_TTL_MS &&
-      !(viewer !== null && "user" in kept && typeof kept.user === "string" && kept.user !== viewer)
+      !(viewer !== null && typeof kept.user === "string" && kept.user !== viewer)
     ) {
-      return kept.text;
+      return { text: kept.text, at: kept.at };
     }
     sessionStorage.removeItem(key);
   } catch {
@@ -2230,10 +2240,18 @@ function readKeptLinkedPrompt(siblingSourceId: string | null): string | null {
   return null;
 }
 
-function forgetKeptLinkedPrompt(siblingSourceId: string | null): void {
+/** Forget the kept prompt; with `owned`, only if it is still that record. */
+function forgetKeptLinkedPrompt(
+  siblingSourceId: string | null,
+  owned: KeptLinkedPrompt | null,
+): void {
   const key = linkedPromptStorageKey(siblingSourceId);
   if (key === null) return;
   try {
+    if (owned !== null) {
+      const stored = parseKeptLinkedPrompt(sessionStorage.getItem(key));
+      if (stored === null || stored.text !== owned.text || stored.at !== owned.at) return;
+    }
     sessionStorage.removeItem(key);
   } catch {
     // Nothing was kept.
@@ -2565,8 +2583,8 @@ function NewChatLandingContent({
     handoff === null && !linkedPrompt?.trim() ? readKeptLinkedPrompt(siblingSourceId) : null,
   );
   const restoresKeptLinkedPrompt = keptLinkedPrompt !== null && landingDraft === null;
-  const keptLinkedTextRef = useRef<string | null>(
-    restoresKeptLinkedPrompt || landingDraft?.message === keptLinkedPrompt
+  const keptLinkedRef = useRef<KeptLinkedPrompt | null>(
+    restoresKeptLinkedPrompt || landingDraft?.message === keptLinkedPrompt?.text
       ? keptLinkedPrompt
       : null,
   );
@@ -2576,7 +2594,7 @@ function NewChatLandingContent({
   const [message, setMessage] = useState<string>(() => {
     if (handoff !== null) return handoff.text;
     if (linkedPrompt?.trim()) return linkedPrompt;
-    if (restoresKeptLinkedPrompt) return keptLinkedPrompt ?? "";
+    if (restoresKeptLinkedPrompt) return keptLinkedPrompt?.text ?? "";
     return restoredDraft?.message ?? "";
   });
   // Filled in once the mention browser below owns the tags.
@@ -2592,12 +2610,11 @@ function NewChatLandingContent({
         message: linkedPrompt,
         mentions: undefined,
       });
-      keepLinkedPrompt(siblingSourceId, linkedPrompt);
-      keptLinkedTextRef.current = linkedPrompt;
+      keptLinkedRef.current = keepLinkedPrompt(siblingSourceId, linkedPrompt);
     } else if (handoff !== null) {
       // The handoff replaced the draft, so a prompt kept for this composer is stale.
-      keptLinkedTextRef.current = null;
-      forgetKeptLinkedPrompt(siblingSourceId);
+      keptLinkedRef.current = null;
+      forgetKeptLinkedPrompt(siblingSourceId, null);
     }
     // Consume the link once so returning to the composer preserves edits.
     const remaining = new URLSearchParams(searchParams);
@@ -2618,15 +2635,16 @@ function NewChatLandingContent({
   // back over their work. Any change to the text counts (typing, dictation,
   // slash completion, clearing).
   function releaseKeptLinkedPrompt(): void {
-    if (keptLinkedTextRef.current === null) return;
-    keptLinkedTextRef.current = null;
-    forgetKeptLinkedPrompt(siblingSourceId);
+    const owned = keptLinkedRef.current;
+    if (owned === null) return;
+    keptLinkedRef.current = null;
+    forgetKeptLinkedPrompt(siblingSourceId, owned);
   }
   useEffect(() => {
-    const kept = keptLinkedTextRef.current;
-    if (kept === null || message === kept) return;
-    keptLinkedTextRef.current = null;
-    forgetKeptLinkedPrompt(siblingSourceId);
+    const kept = keptLinkedRef.current;
+    if (kept === null || message === kept.text) return;
+    keptLinkedRef.current = null;
+    forgetKeptLinkedPrompt(siblingSourceId, kept);
   }, [message, siblingSourceId]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);

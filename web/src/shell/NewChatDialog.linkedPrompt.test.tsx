@@ -339,6 +339,7 @@ describe("embedded prompt link", () => {
     renderLanding();
     fireEvent.keyDown(composer(), { key: "Enter" });
     expect(composer()).toHaveValue("hello_world");
+    expect(authenticatedFetch).not.toHaveBeenCalledWith("/v1/sessions", expect.anything());
     reloadPage();
     expect(composer()).toHaveValue("hello_world");
   });
@@ -353,12 +354,36 @@ describe("embedded prompt link", () => {
   });
 
   it("keeps the prompt when the create fails", async () => {
-    allowSessionStart({ ok: false, body: { error: { message: "boom" } } });
+    allowSessionStart({ ok: false, body: { error: { message: "Create failed" } } });
     renderLanding();
     await submitWhenReady();
-    await waitFor(() => expect(composer()).toHaveValue("hello_world"));
+    expect(await screen.findByText(/Create failed/)).toBeVisible();
+    expect(composer()).toHaveValue("hello_world");
     reloadPage();
     expect(composer()).toHaveValue("hello_world");
+  });
+
+  it("does not let an older create forget a newer prompt", async () => {
+    allowSessionStart({ ok: true, body: { id: "conv_a" } });
+    let finishCreate: (response: Response) => void = () => {};
+    vi.mocked(authenticatedFetch).mockImplementation((url, init) =>
+      url === "/v1/sessions" && init?.method === "POST"
+        ? new Promise<Response>((resolve) => {
+            finishCreate = resolve;
+          })
+        : Promise.resolve({ ok: true, json: async () => ({}) } as unknown as Response),
+    );
+    renderLanding();
+    await submitWhenReady();
+    cleanup();
+    searchParams = new URLSearchParams("o=123&prompt=Second+request");
+    renderLanding();
+    expect(composer()).toHaveValue("Second request");
+    await act(async () => {
+      finishCreate({ ok: true, json: async () => ({ id: "conv_a" }) } as unknown as Response);
+    });
+    reloadPage();
+    expect(composer()).toHaveValue("Second request");
   });
 
   it("sends the link's text literally after a mounted link and a remount", async () => {
