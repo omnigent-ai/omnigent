@@ -11,6 +11,7 @@
 
 import { authenticatedFetch } from "./identity";
 import { startTimedInteraction } from "./analyticsEmit";
+import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
 
 export const RANDOM_WORKTREE_BASE_REF = "HEAD";
 
@@ -418,6 +419,8 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
         "Content-Type": "application/json",
         "x-omnigent-automation-source": "ui",
         "x-omnigent-automation-template": templateId,
+        // The source copy takes its browser tools mode from this request.
+        ...browserAgentToolsRequestHeaders(),
       },
       body: JSON.stringify(body),
     });

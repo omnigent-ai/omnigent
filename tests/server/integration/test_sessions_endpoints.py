@@ -2897,6 +2897,9 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             # No renderer subscribes to the session stream in this test,
             # so the turn is stamped headless (browser tools stripped).
             "browser_renderer_available": False,
+            # The advanced browser tools switch was off at creation.
+            "browser_agent_tools": False,
+            "browser_trusted_input": False,
             # The forwarded message is the meta item; its store id lets the
             # runner dedup it on a cold-cache history reload.
             "persisted_item_id": meta["id"],
