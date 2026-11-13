@@ -5112,12 +5112,23 @@ def test_augment_claude_args_keeps_its_own_settings_on_conflict(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("flag", ["disableAllHooks", "allowManagedHooksOnly"])
+@pytest.mark.parametrize(
+    "values",
+    [(True,), (True, False), (False, True)],
+    ids=["disabled", "re-enabled", "disabled-last"],
+)
 def test_augment_claude_args_rejects_settings_that_disable_bridge_hooks(
-    tmp_path: Path, flag: str
+    tmp_path: Path, flag: str, values: tuple[bool, ...]
 ) -> None:
     """Settings cannot silently remove policy gates and lifecycle callbacks."""
-    with pytest.raises(ValueError, match="disables required Omnigent bridge hooks"):
-        augment_claude_args(("--settings", json.dumps({flag: True})), bridge_dir=tmp_path)
+    args = tuple(part for value in values for part in ("--settings", json.dumps({flag: value})))
+    if values[-1]:
+        with pytest.raises(ValueError, match="disables required Omnigent bridge hooks"):
+            augment_claude_args(args, bridge_dir=tmp_path)
+    else:
+        settings = _load_invocation_settings(augment_claude_args(args, bridge_dir=tmp_path))
+        assert settings[flag] is False
+        assert settings["hooks"]["UserPromptSubmit"]
 
 
 @pytest.mark.parametrize(

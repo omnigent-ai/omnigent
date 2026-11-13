@@ -3446,10 +3446,6 @@ def _merge_caller_settings(
     :returns: The merged settings.
     :raises ValueError: Caller settings disable the required bridge hooks.
     """
-    for caller in callers:
-        for flag in ("disableAllHooks", "allowManagedHooksOnly"):
-            if caller.get(flag) is True:
-                raise ValueError(f"Caller {flag}=true disables required Omnigent bridge hooks")
     caller_status = next(
         (caller["statusLine"] for caller in reversed(callers) if "statusLine" in caller), None
     )
@@ -3483,6 +3479,9 @@ def _merge_caller_settings(
                 merged[key] = {**previous, **value}
             else:
                 merged[key] = value
+    for flag in ("disableAllHooks", "allowManagedHooksOnly"):
+        if merged.get(flag) is True:
+            raise ValueError(f"Caller {flag}=true disables required Omnigent bridge hooks")
     if isinstance(caller_status, dict):
         command = caller_status.get("command")
         if isinstance(command, str) and command.strip():
