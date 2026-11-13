@@ -40,15 +40,25 @@ def make_client(respond) -> httpx.AsyncClient:
     )
 
 
+UNNAMED = object()
+
+
 class Replicas:
     """Sessions live on one host: that key is served, other keys get wrong_replica.
 
     ``snapshots`` maps a session id to its snapshot body, for lookups.
     """
 
-    def __init__(self, owner: str | None, snapshots: dict[str, dict] | None = None) -> None:
+    def __init__(
+        self,
+        owner: str | None,
+        snapshots: dict[str, dict] | None = None,
+        *,
+        named: object = UNNAMED,
+    ) -> None:
         self.owner = owner
         self.snapshots = snapshots or {}
+        self.named = named
         self.sends: list[str | None] = []
         self.lookups: list[httpx.Request] = []
         self.wrong_replicas = 0
@@ -63,7 +73,7 @@ class Replicas:
         if key == self.owner:
             return httpx.Response(202, json={"queued": True})
         self.wrong_replicas += 1
-        return wrong_replica()
+        return wrong_replica() if self.named is UNNAMED else named_refusal(self.named)
 
 
 def is_lookup(request: httpx.Request) -> bool:
@@ -85,6 +95,12 @@ def snapshot(host_id: str | None = None, **extra) -> dict:
 
 def wrong_replica() -> httpx.Response:
     return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
+
+
+def named_refusal(slice_key: str | None) -> httpx.Response:
+    """A keyed host's refusal: the body names the key to resend with, or null for keyless."""
+    error = {"code": "wrong_replica", "slice_key": slice_key}
+    return httpx.Response(400, json={"error": error})
 
 
 @pytest.mark.asyncio
@@ -118,6 +134,37 @@ async def test_wrong_replica_looks_up_the_host_and_retries_once_on_it():
     assert len(replicas.lookups) == 1
     assert replicas.wrong_replicas == 1
     assert get_session_host(CHILD) == TARGET_HOST
+
+
+@pytest.mark.asyncio
+async def test_refusal_naming_the_host_retries_on_it_without_a_lookup():
+    replicas = Replicas(TARGET_HOST, named=TARGET_HOST)
+    async with make_client(replicas) as client:
+        response = await client.post(EVENTS, json=PAYLOAD)
+    assert response.status_code == 202
+    assert replicas.sends == [RUNNER_HOST, TARGET_HOST]
+    assert replicas.lookups == []
+    assert get_session_host(CHILD) == TARGET_HOST
+
+
+@pytest.mark.asyncio
+async def test_refusal_naming_no_key_resends_keyless_without_a_lookup():
+    replicas = Replicas(None, named=None)
+    async with make_client(replicas) as client:
+        response = await client.post(EVENTS, json=PAYLOAD)
+    assert response.status_code == 202
+    assert replicas.sends == [RUNNER_HOST, None]
+    assert replicas.lookups == []
+
+
+@pytest.mark.asyncio
+async def test_named_retry_refused_again_goes_keyless_once_without_a_lookup():
+    replicas = Replicas("nobody", named=TARGET_HOST)
+    async with make_client(replicas) as client:
+        response = await client.post(EVENTS, json=PAYLOAD)
+    assert response.status_code == 400
+    assert replicas.sends == [RUNNER_HOST, TARGET_HOST, None]
+    assert replicas.lookups == []
 
 
 @pytest.mark.asyncio

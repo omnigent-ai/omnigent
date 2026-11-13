@@ -165,14 +165,20 @@ def _create_body_host(request: httpx.Request) -> str | None:
     return host_id if isinstance(host_id, str) else None
 
 
-async def _is_wrong_replica_answer(response: httpx.Response) -> bool:
-    """True for a wrong_replica refusal; event streams are never read or retried."""
+async def _wrong_replica_refusal(response: httpx.Response) -> dict | None:
+    """The error object of a wrong_replica refusal, or None. Event streams are never read."""
     if response.status_code != 400:
-        return False
+        return None
     if response.headers.get("content-type", "").startswith("text/event-stream"):
-        return False
+        return None
     await response.aread()
-    return is_wrong_replica(response)
+    try:
+        error = response.json().get("error")
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(error, dict) and error.get("code") == "wrong_replica":
+        return error
+    return None
 
 
 class SessionRoutingTransport(httpx.AsyncBaseTransport):
@@ -182,9 +188,10 @@ class SessionRoutingTransport(httpx.AsyncBaseTransport):
 
     - A cached host keys the request.
     - Otherwise the caller's own key is sent unchanged, with no lookup.
-    - On ``wrong_replica``, the host is looked up and cached. If it differs from the
-      key just used, the request is retried once on it. Otherwise, or if that retry is
-      refused too, one keyless attempt is made and nothing else is retried.
+    - On ``wrong_replica`` that names a slice key in its body, that key is cached and
+      retried once; a null key means resend keyless. Otherwise the host is looked up
+      and cached, and retried once if it differs from the cached host. Whatever
+      remains is one keyless attempt, and nothing else is retried.
 
     A create whose JSON body names a ``host_id`` is keyed by it and never retried.
     Timeouts and other failures propagate unchanged, because delivery is uncertain.
@@ -230,17 +237,31 @@ class SessionRoutingTransport(httpx.AsyncBaseTransport):
         if cached is not None:
             address_request(request, base_url, cached)
         response = await self._send(request)
-        if not await _is_wrong_replica_answer(response):
+        refusal = await _wrong_replica_refusal(response)
+        if refusal is None:
             return response
         await response.aclose()
 
-        resolved, current = await self._resolve_after_refusal(base_url, caller_headers, session_id)
-        if resolved and current is not None and current != cached:
-            address_request(request, base_url, current)
-            response = await self._send(request)
-            if not await _is_wrong_replica_answer(response):
-                return response
-            await response.aclose()
+        if "slice_key" in refusal:
+            # The refusal names the host's key, or null when the request must go keyless.
+            named = refusal["slice_key"]
+            if isinstance(named, str):
+                set_session_host(session_id, named)
+                address_request(request, base_url, named)
+                response = await self._send(request)
+                if await _wrong_replica_refusal(response) is None:
+                    return response
+                await response.aclose()
+        else:
+            resolved, current = await self._resolve_after_refusal(
+                base_url, caller_headers, session_id
+            )
+            if resolved and current is not None and current != cached:
+                address_request(request, base_url, current)
+                response = await self._send(request)
+                if await _wrong_replica_refusal(response) is None:
+                    return response
+                await response.aclose()
         address_request(request, base_url, "")
         return await self._send(request)
 
