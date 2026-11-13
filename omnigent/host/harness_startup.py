@@ -8,7 +8,7 @@ import re
 import shutil
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -34,6 +34,13 @@ class HarnessEnvironment(BaseModel):
     inherit: bool
     variables: dict[str, str]
     unset: list[str]
+
+
+class EnvWrapperLaunch(NamedTuple):
+    environment: HarnessEnvironment
+    chdir: str | None
+    command: str
+    args: list[str]
 
 
 class HarnessStartup(BaseModel):
@@ -117,11 +124,11 @@ def env_wrapper_environment(
         ``${NAME}`` in ``-S`` strings; ``None`` treats such strings as unparsed.
     :returns: The wrapper's ``-i``/``-``/``-u``/``-S``/assignment changes, or
         ``None`` when *command* is not a parseable ``env`` wrapper (e.g. it
-        uses ``-v``) or runs another ``env``. A ``-C``/``--chdir`` directory
+        uses ``-v``). Supported nested wrappers are combined. A ``-C``/``--chdir`` directory
         is reported by :func:`env_wrapper_chdir`.
     """
-    parsed = _parse_env_wrapper(command, args, environ)
-    return parsed[0] if parsed is not None else None
+    parsed = env_wrapper_launch(command, args, environ)
+    return parsed.environment if parsed is not None else None
 
 
 def env_wrapper_chdir(
@@ -135,48 +142,68 @@ def env_wrapper_chdir(
         ``["--chdir=/srv/repo", "claude"]``.
     :param environ: Environment the wrapper starts from; see
         :func:`env_wrapper_environment`.
-    :returns: The last ``-C``/``--chdir`` value, e.g. ``"/srv/repo"``, or
+    :returns: The combined directory of supported layers, e.g. ``"/srv/repo"``, or
         ``None`` when there is none or the wrapper is not parseable.
     """
-    parsed = _parse_env_wrapper(command, args, environ)
-    return parsed[1] if parsed is not None else None
+    parsed = env_wrapper_launch(command, args, environ)
+    return parsed.chdir if parsed is not None else None
 
 
 def env_wrapper_args_start(
     command: str, args: list[str], environ: Mapping[str, str] | None = None
 ) -> int | None:
     """Locate wrapped arguments when they remain an unchanged suffix of the original argv."""
-    parsed = _parse_env_wrapper(command, args, environ)
+    parsed = env_wrapper_launch(command, args, environ)
     if parsed is None:
         return None
-    wrapped_args = parsed[2]
+    wrapped_args = parsed.args
     start = len(args) - len(wrapped_args)
     return start if start >= 0 and args[start:] == wrapped_args else None
 
 
-def _parse_env_wrapper(
-    command: str, args: list[str], environ: Mapping[str, str] | None
-) -> tuple[HarnessEnvironment, str | None, list[str]] | None:
+def env_wrapper_launch(
+    command: str, args: list[str], environ: Mapping[str, str] | None = None
+) -> EnvWrapperLaunch | None:
     """
-    Parse one ``env`` wrapper layer.
+    Parse supported ``env`` layers without resolving paths outside the terminal.
 
     :param command: Configured harness command, e.g. ``"env"``.
     :param args: Arguments passed to *command*.
     :param environ: Environment the wrapper starts from, or ``None``.
-    :returns: Environment changes, the last ``-C`` directory (or ``None``),
-        and wrapped arguments; ``None`` when *command* is not a
-        parseable ``env`` wrapper or its command is another ``env``, whose
-        changes are not modeled.
+    :returns: Combined environment and directory changes, final command and arguments;
+        ``None`` for an unsupported wrapper or more than 32 nested layers.
     """
-    chdirs: list[str] = []
-    try:
-        normalized = _normalize_env_wrapper_args(args, chdirs, environ)
-    except ValueError:
+    if Path(command).name != "env":
         return None
-    unwrapped = _unwrap_env(command, normalized, os.defpath)
-    if unwrapped is None or Path(unwrapped[0]).name == "env":
-        return None
-    return unwrapped[3], (chdirs[-1] if chdirs else None), unwrapped[1]
+    environment = HarnessEnvironment(inherit=True, variables={}, unset=[])
+    chdir: str | None = None
+    for _ in range(32):
+        chdirs: list[str] = []
+        try:
+            normalized = _normalize_env_wrapper_args(args, chdirs, environ)
+        except ValueError:
+            return None
+        unwrapped = _unwrap_env(command, normalized, os.defpath)
+        if unwrapped is None:
+            return None
+        command, args, _, layer = unwrapped
+        if not layer.inherit:
+            environment = HarnessEnvironment(inherit=False, variables={}, unset=[])
+        for name in layer.unset:
+            environment.variables.pop(name, None)
+            if name not in environment.unset:
+                environment.unset.append(name)
+        environment.variables.update(layer.variables)
+        if environ is not None or not layer.inherit:
+            environ = dict(environ) if layer.inherit and environ is not None else {}
+            for name in layer.unset:
+                environ.pop(name, None)
+            environ.update(layer.variables)
+        if chdirs and chdir != "":
+            chdir = str(Path(chdir or ".") / chdirs[-1]) if chdirs[-1] else ""
+        if Path(command).name != "env":
+            return EnvWrapperLaunch(environment, chdir, command, args)
+    return None
 
 
 def _normalize_env_wrapper_args(

@@ -1247,7 +1247,7 @@ def test_claude_terminal_launch_cwd_rejects_an_unsearchable_env_chdir_target(
         ["-S", "CLAUDE_CONFIG_DIR=wrap\\_claude claude"],
         ["-S", "CLAUDE_CONFIG_DIR=wrap/claude claude #comment"],
         ["-S", "CLAUDE_CONFIG_DIR=wrap/claude\vclaude"],
-        ["A=1", "env", "CLAUDE_CONFIG_DIR=wrap/claude", "claude"],
+        ["A=1", "env", "-v", "CLAUDE_CONFIG_DIR=wrap/claude", "claude"],
     ],
     ids=[
         "unmodeled-option",
@@ -1256,7 +1256,7 @@ def test_claude_terminal_launch_cwd_rejects_an_unsearchable_env_chdir_target(
         "escape",
         "comment",
         "version-dependent-separator",
-        "nested-env",
+        "unsupported-nested-env",
     ],
 )
 def test_claude_terminal_launch_env_keeps_pre_wrapper_env_for_unparsed_env_forms(
@@ -1407,8 +1407,16 @@ async def _auto_create_claude_terminal_for_test(
         ("env", ["-C", "sub", "claude", "--settings", "caller.json"]),
         ("env", ["-C", "sub", "--", "claude", "--settings", "caller.json"]),
         ("env", ["-S", "-C sub claude", "--settings", "caller.json"]),
+        (
+            "env",
+            ["-u", "EXAMPLE_UNUSED", "env", "-C", "sub", "claude", "--settings", "caller.json"],
+        ),
+        (
+            "env",
+            ["FOO=1", "claude-wrapper", "--", "--settings", '{"env":{"CONFIG_ONLY":"yes"}}'],
+        ),
         ("env", ["-v", "-C", "sub", "claude", "--settings", "caller.json"]),
-        ("env", ["env", "claude", "--settings", '{"disableAllHooks":true}']),
+        ("env", ["env", "-v", "claude", "--settings", '{"disableAllHooks":true}']),
     ],
     ids=[
         "configured-wrapper",
@@ -1422,6 +1430,8 @@ async def _auto_create_claude_terminal_for_test(
         "configured-env-chdir-settings",
         "configured-env-delimiter-settings",
         "configured-env-split-settings",
+        "configured-nested-env-settings",
+        "configured-env-wrapper-settings",
         "opaque-env-verbose-settings",
         "opaque-nested-env-settings",
     ],
@@ -1472,7 +1482,7 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
             settings = json.loads(Path(created.instance.args[settings_index]).read_text())
             assert settings["env"]["ORDER"] == "caller"
             assert settings["hooks"]["UserPromptSubmit"]
-            opaque_env = command == "env" and prefix[0] in {"-v", "env"}
+            opaque_env = command == "env" and "-v" in prefix
             if command == "claude-wrapper":
                 boundary = prefix.index("--") + 1 if "--" in prefix else len(prefix)
                 assert created.instance.args[:boundary] == prefix[:boundary]

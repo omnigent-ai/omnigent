@@ -73,9 +73,9 @@ from omnigent.errors import (
 )
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import (
-    env_wrapper_args_start,
     env_wrapper_chdir,
     env_wrapper_environment,
+    env_wrapper_launch,
 )
 from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
@@ -8314,6 +8314,29 @@ def _claude_terminal_env_unset(
     ]
 
 
+def _claude_terminal_args_start(spec: TerminalEnvSpec, configured_count: int) -> int:
+    """Keep shell payloads and wrapper-owned options outside Claude settings parsing."""
+    command = Path(spec.command or "").name.removesuffix(".exe")
+    start = 0
+    if command == "env":
+        wrapper = env_wrapper_launch(
+            spec.command or "", list(spec.args), _claude_terminal_pre_wrapper_env(spec)
+        )
+        if wrapper is None:
+            return configured_count
+        start = len(spec.args) - len(wrapper.args)
+        if start < 0 or spec.args[start:] != wrapper.args:
+            return configured_count
+        command = Path(wrapper.command).name.removesuffix(".exe")
+    if command == "claude":
+        return start
+    prefix = spec.args[start:configured_count]
+    if command not in {"sh", "bash", "dash", "zsh", "ksh", "fish", "pwsh", "powershell", "cmd"}:
+        if "--" in prefix:
+            return start + prefix.index("--") + 1
+    return configured_count
+
+
 def _claude_terminal_launch_cwd(spec: TerminalEnvSpec, parent_os_env: OSEnvSpec | None) -> Path:
     """
     Return the directory the native Claude terminal pane starts in.
@@ -9959,25 +9982,6 @@ async def _auto_create_claude_terminal(
         from omnigent.harnesses.claude_native.bridge import record_claude_settings_boundary
 
         configured_prefix = launch_args[: len(launch_args) - len(claude_args)]
-        claude_args_start = 0
-        command_name = Path(launch_command).name.removesuffix(".exe")
-        if command_name in {
-            "sh",
-            "bash",
-            "dash",
-            "zsh",
-            "ksh",
-            "fish",
-            "pwsh",
-            "powershell",
-            "cmd",
-        }:
-            # Shell payloads are opaque; only the appended Claude argv has a known boundary.
-            claude_args_start = len(configured_prefix)
-        elif command_name not in {"claude", "env"}:
-            claude_args_start = len(configured_prefix)
-            if "--" in configured_prefix:
-                claude_args_start = configured_prefix.index("--") + 1
         # Validate the configured executable using the same PATH lookup as tmux.
         resolved_claude = resolve_cli_binary(launch_command)
         if resolved_claude is not None:
@@ -10013,13 +10017,10 @@ async def _auto_create_claude_terminal(
         )
         from omnigent.harnesses.claude_native.bridge import finalize_claude_caller_settings
 
-        if command_name == "env":
-            env_start = env_wrapper_args_start(
-                launch_command, launch_args, _claude_terminal_pre_wrapper_env(env_spec)
-            )
-            claude_args_start = env_start if env_start is not None else len(configured_prefix)
         settings_generation = record_claude_settings_boundary(
-            bridge_dir, launch_args, claude_args_start=claude_args_start
+            bridge_dir,
+            launch_args,
+            claude_args_start=_claude_terminal_args_start(env_spec, len(configured_prefix)),
         )
 
         async def prepare_claude(instance: TerminalInstance) -> None:

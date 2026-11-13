@@ -3643,7 +3643,7 @@ async def finalize_claude_caller_settings(
     A supplied generation binds immutable baseline and boundary metadata. Older
     clients omit it and keep their argv unchanged, without consulting old metadata.
     """
-    from omnigent.host.harness_startup import env_wrapper_chdir
+    from omnigent.host.harness_startup import env_wrapper_launch
     from omnigent.inner.terminal import terminal_pane_environment
 
     if generation is None:
@@ -3656,17 +3656,19 @@ async def finalize_claude_caller_settings(
     environment = instance.os_env
     if environment is None:
         raise ValueError("caller settings require the terminal filesystem environment")
-    workspace = environment.cwd
-    chdir = env_wrapper_chdir(
+    wrapper = env_wrapper_launch(
         instance.command,
         instance.args,
         terminal_pane_environment(
             inherit_env=instance.inherit_env, env=instance.env, env_unset=instance.env_unset
         ),
     )
-    if chdir is not None:
+    workspace: Path | None = environment.cwd
+    if Path(instance.command).name == "env" and wrapper is None:
+        workspace = None
+    elif wrapper is not None and wrapper.chdir is not None:
         # Resolve wrapper paths through the terminal view, including overlay symlinks.
-        workspace = workspace / chdir
+        workspace = environment.cwd / wrapper.chdir
     paths: set[Path] = set()
     has_bridge_settings = False
 
@@ -3685,7 +3687,9 @@ async def finalize_claude_caller_settings(
     for path in paths:
         unavailable_reason: str | None = None
         try:
-            if instance.sandbox_policy is None or not instance.sandbox_policy.active:
+            if not path.is_absolute():
+                unavailable_reason = "unsupported_wrapper_directory"
+            elif instance.sandbox_policy is None or not instance.sandbox_policy.active:
                 contents[path] = await asyncio.to_thread(_read_caller_settings, path)
             else:
                 result = await environment.read(
@@ -3803,6 +3807,10 @@ def _merge_caller_settings(
     for flag in ("disableAllHooks", "allowManagedHooksOnly"):
         if merged.get(flag) is True:
             raise ValueError(f"Caller {flag}=true disables required Omnigent bridge hooks")
+    if "cleanupPeriodDays" in merged:
+        retention = merged["cleanupPeriodDays"]
+        if type(retention) is not int or retention <= 0:
+            raise ValueError("Caller cleanupPeriodDays must be a positive integer")
     if isinstance(caller_status, dict):
         command = caller_status.get("command")
         if isinstance(command, str) and command.strip():

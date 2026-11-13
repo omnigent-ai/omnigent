@@ -5041,8 +5041,9 @@ async def _finalize_test_claude_args(args, *, bridge_dir, os_env_spec, active_ha
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("retention", [42, 0, -1, "x", False, None, 1.5])
 async def test_augment_claude_args_merges_caller_settings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retention: object
 ) -> None:
     """
     A caller ``--settings`` is merged into the invocation settings, not dropped.
@@ -5085,7 +5086,7 @@ async def test_augment_claude_args_merges_caller_settings(
         "permissions": {"allow": ["Read(first.txt)", "Read(second.txt)"]},
         "deniedMcpServers": [{"serverName": "later-denial"}],
         "enabledPlugins": {"other@market": False},
-        "cleanupPeriodDays": 42,
+        "cleanupPeriodDays": retention,
         "customOptions": {"nested": {"later": True}},
     }
     args = augment_claude_args(
@@ -5102,6 +5103,27 @@ async def test_augment_claude_args_merges_caller_settings(
         ap_server_url="https://example.test",
     )
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    if retention != 42:
+        baseline_path = Path(args[max(i for i, arg in enumerate(args) if arg == "--settings") + 1])
+        baseline_bytes = baseline_path.read_bytes()
+        original_args = list(args)
+        with pytest.raises(
+            ValueError, match="cleanupPeriodDays must be a positive integer"
+        ) as error:
+            await _finalize_test_claude_args(
+                args,
+                bridge_dir=bridge_dir,
+                os_env_spec=OSEnvSpec(
+                    type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+                ),
+            )
+        assert str(retention) not in str(error.value)
+        assert args == original_args
+        assert baseline_path.read_bytes() == baseline_bytes
+        assert json.loads(baseline_bytes)["hooks"]["UserPromptSubmit"]
+        assert not list(bridge_dir.glob("claude-settings-*-*.json"))
+        return
 
     args = await _finalize_test_claude_args(
         args,
@@ -5340,9 +5362,27 @@ async def test_unreadable_caller_settings_warn_without_contents_or_argument_chan
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("chdir", [None, "overlay-subdir"])
+@pytest.mark.parametrize(
+    "command,prefix,chdir",
+    [
+        ("claude", [], None),
+        ("env", ["-C", "overlay-subdir", "claude"], "overlay-subdir"),
+        (
+            "env",
+            ["-u", "EXAMPLE_UNUSED", "env", "-C", "overlay-subdir", "claude"],
+            "overlay-subdir",
+        ),
+        ("env", ["-C", "outer", "env", "-C", "inner", "claude"], "outer/inner"),
+        ("env", ["-v", "-C", "overlay-subdir", "claude"], None),
+    ],
+    ids=["plain", "chdir", "auth-wrapped-chdir", "nested-chdir", "opaque-chdir"],
+)
 async def test_caller_settings_reuses_existing_terminal_filesystem_view(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chdir: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    prefix: list[str],
+    chdir: str | None,
 ) -> None:
     from unittest.mock import AsyncMock, Mock
 
@@ -5352,8 +5392,15 @@ async def test_caller_settings_reuses_existing_terminal_filesystem_view(
     path = tmp_path / "settings.json"
     path.write_text('{"env":{"SETTINGS_VIEW":"host"}}')
     environment = Mock(spec=OSEnvironment, cwd=tmp_path)
+    views = {
+        str(path): '{"env":{"SETTINGS_VIEW":"overlay-parent"}}',
+        str(tmp_path / "overlay-subdir" / path.name): '{"env":{"SETTINGS_VIEW":"overlay-subdir"}}',
+        str(
+            tmp_path / "outer" / "inner" / path.name
+        ): '{"env":{"SETTINGS_VIEW":"overlay-nested"}}',
+    }
     environment.read = AsyncMock(
-        return_value={"content": '{"env":{"SETTINGS_VIEW":"overlay"}}', "encoding": "utf-8"}
+        side_effect=lambda selected, **_kwargs: {"content": views[selected], "encoding": "utf-8"}
     )
     instance = TerminalInstance(
         name="claude",
@@ -5362,8 +5409,8 @@ async def test_caller_settings_reuses_existing_terminal_filesystem_view(
         private_dir=tmp_path,
         os_env=environment,
         sandbox_policy=Mock(active=True),
-        command="env" if chdir else "claude",
-        args=(["-C", chdir, "claude"] if chdir else [])
+        command=command,
+        args=prefix
         + augment_claude_args(
             ("--settings", "settings.json"), bridge_dir=tmp_path, defer_caller_settings=True
         ),
@@ -5385,12 +5432,20 @@ async def test_caller_settings_reuses_existing_terminal_filesystem_view(
     )
     settings = _load_invocation_settings(instance.args)
     assert instance.args[-2:] == ["--agent-name", baseline]
-    assert settings["env"]["SETTINGS_VIEW"] == "overlay"
-    environment.read.assert_awaited_once_with(
-        str(tmp_path / chdir / path.name if chdir else path),
-        max_bytes=claude_native_bridge._CALLER_SETTINGS_MAX_BYTES,
-        regular_only=True,
-    )
+    if "-v" in prefix:
+        assert "settings.json" in instance.args
+        assert "SETTINGS_VIEW" not in settings.get("env", {})
+        environment.read.assert_not_awaited()
+    else:
+        selected = str(tmp_path / chdir / path.name if chdir else path)
+        assert (
+            settings["env"]["SETTINGS_VIEW"] == json.loads(views[selected])["env"]["SETTINGS_VIEW"]
+        )
+        environment.read.assert_awaited_once_with(
+            selected,
+            max_bytes=claude_native_bridge._CALLER_SETTINGS_MAX_BYTES,
+            regular_only=True,
+        )
     environment.close.assert_not_called()
     assert json.loads(path.read_text())["env"]["SETTINGS_VIEW"] == "host"
 

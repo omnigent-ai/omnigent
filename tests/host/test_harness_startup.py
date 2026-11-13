@@ -118,7 +118,6 @@ def _real_env_supports_long_split_string() -> bool:
     return probe.returncode == 0
 
 
-# The rows print with printenv because a wrapper that runs another env is not modeled.
 @pytest.mark.parametrize(
     "args",
     [
@@ -145,6 +144,9 @@ def _real_env_supports_long_split_string() -> bool:
         ["-S", "A=/tmp/a\u00a0b /usr/bin/printenv"],
         ["-S", "A=x\u00a0#y /usr/bin/printenv"],
         ["-S", "A=x\x1cB=y /usr/bin/printenv"],
+        ["A=1", "env", "-u", "A", "B=2", "/usr/bin/printenv"],
+        ["A=1", "/usr/bin/env", "-i", "B=2", "/usr/bin/printenv"],
+        ["A=outer", "env", "-S", "A=${A}/inner /usr/bin/printenv"],
     ],
 )
 def test_env_wrapper_environment_matches_real_env(args):
@@ -181,9 +183,9 @@ def test_standalone_dash_ends_env_option_parsing():
     assert startup.env_wrapper_chdir("/usr/bin/env", ["-", "-C", "/", "claude"]) is None
 
 
-def test_nested_env_wrapper_is_not_modeled():
-    """A wrapper that runs another ``env`` reports no changes, so callers fall back."""
-    args = ["-C", "/", "A=1", "env", "CLAUDE_CONFIG_DIR=/srv/claude", "claude"]
+def test_unsupported_nested_env_wrapper_is_not_modeled():
+    """An unsupported inner layer makes the complete wrapper opaque."""
+    args = ["-C", "/", "A=1", "env", "-v", "CLAUDE_CONFIG_DIR=/srv/claude", "claude"]
     assert startup.env_wrapper_environment("/usr/bin/env", args) is None
     assert startup.env_wrapper_chdir("/usr/bin/env", args) is None
 
@@ -214,6 +216,9 @@ def test_env_split_string_keeps_a_word_only_for_set_variables():
         ["-S", "-C sub /bin/pwd"],
         # env applies only the last -C, relative to the starting directory.
         ["-C", "link", "-C", "sub", "/bin/pwd"],
+        ["-C", "sub", "env", "-C", "nested", "/bin/pwd"],
+        ["-C", "link", "env", "-C", "..", "/bin/pwd"],
+        ["-C", "sub", "env", "-C", "/", "/bin/pwd"],
     ],
 )
 def test_env_wrapper_chdir_matches_real_env(tmp_path, args):
@@ -221,6 +226,7 @@ def test_env_wrapper_chdir_matches_real_env(tmp_path, args):
     if not _real_env_supports_chdir():
         pytest.skip("/usr/bin/env lacks -C/--chdir")
     (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "nested").mkdir()
     (tmp_path / "link").symlink_to(tmp_path / "sub")
     chdir = startup.env_wrapper_chdir("/usr/bin/env", args)
     assert chdir is not None
@@ -238,6 +244,9 @@ def test_env_wrapper_chdir_matches_real_env(tmp_path, args):
         (["-S", "-C sub claude", "--settings", "caller.json"], 2),
         (["-S", "claude --name embedded", "--settings", "caller.json"], None),
         (["-C", "sub", "claude"], 3),
+        (["-u", "EXAMPLE_UNUSED", "env", "-C", "sub", "claude", "--settings", "caller.json"], 6),
+        (["env", "-v", "claude", "--settings", "caller.json"], None),
+        ([*(["env"] * 33), "claude"], None),
     ],
 )
 def test_env_wrapper_argument_boundary_preserves_original_suffix(args, expected):
