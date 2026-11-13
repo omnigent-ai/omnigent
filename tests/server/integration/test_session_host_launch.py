@@ -4966,52 +4966,80 @@ async def test_unbinding_child_before_archive_does_not_stop_parents_shared_runne
     )
 
 
+@pytest.mark.parametrize("host_placement", ["local", "remote", "hostless"])
 async def test_stopping_child_does_not_stop_parents_shared_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
+    db_uri: str,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     _shared_runner_family: dict[str, str],
+    host_placement: str,
 ) -> None:
-    """``stop_session`` on a child ends the child's work, not the parent's runner."""
-    from omnigent.runtime import set_runner_client
-    from omnigent.server.routes import sessions as sessions_module
+    """Child control follows its runner even when the host reconnects elsewhere."""
+    from omnigent.runner.routing import RunnerRouter
 
     comm = await _connect_host(app)
     parent = await _inline_launch_session(client, comm)
-    async with _HostFrameResponder(comm) as host:
+    async with _HostFrameResponder(comm):
         child = await _inline_child_session(client, parent["id"])
-        _shared_runner_family.update(parent=parent["id"], child=child["id"])
-        requests: list[httpx.Request] = []
+    _shared_runner_family.update(parent=parent["id"], child=child["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    app.state.tunnel_registry.register(parent["runner_id"], _NoopRunnerWS(), _runner_hello())
+    host_app = app
+    if host_placement == "remote":
+        await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+        await comm.wait(timeout=budget(5.0))
+        host_app = _host_app(db_uri, tmp_path)
+        comm = await _connect_host(host_app)
+        assert app.state.host_registry.get(_HOST_ID) is None
+        assert host_app.state.tunnel_registry.get(parent["runner_id"]) is None
+    elif host_placement == "hostless":
+        for session_id in (child["id"], parent["id"]):
+            store.clear_host_binding(session_id, keep_runner=True)
 
-        def respond(request: httpx.Request) -> httpx.Response:
-            requests.append(request)
-            return httpx.Response(204)
+    requests: list[tuple[str, str]] = []
 
-        fake_runner = httpx.AsyncClient(
-            transport=httpx.MockTransport(respond),
-            base_url="http://runner",
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(204)
+
+    async with (
+        _HostFrameResponder(comm) as host,
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), base_url="http://runner"
+        ) as runner,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=host_app), base_url="http://host-replica"
+        ) as host_client,
+    ):
+        # Keep the real replica-local routing; only replace its HTTP transport.
+        monkeypatch.setattr(RunnerRouter, "_client_for_runner", lambda self, runner_id: runner)
+        stop = await client.post(
+            f"/v1/sessions/{child['id']}/events", json={"type": "stop_session"}
         )
-        monkeypatch.setattr(
-            sessions_module, "_get_runner_client", AsyncMock(return_value=fake_runner)
-        )
-        set_runner_client(fake_runner)
-        try:
-            stop = await client.post(
-                f"/v1/sessions/{child['id']}/events", json={"type": "stop_session"}
-            )
-        finally:
-            set_runner_client(None)
-            await fake_runner.aclose()
         assert stop.status_code in (200, 202), stop.text
-        assert [(request.method, request.url.path) for request in requests] == [
-            ("POST", f"/v1/sessions/{child['id']}/events"),
-            ("DELETE", f"/v1/sessions/{child['id']}"),
-        ]
+        expected_requests = [("POST", f"/v1/sessions/{child['id']}/events")]
+        if host_placement != "hostless":
+            expected_requests.append(("DELETE", f"/v1/sessions/{child['id']}"))
+        assert requests == expected_requests
+        assert host.stopped_runner_ids == []
+        assert store.get_conversation(parent["id"]).runner_id == parent["runner_id"]
 
-    assert parent["runner_id"] not in host.stopped_runner_ids, (
-        f"stopping child {child['id']} asked the host to stop the parent's runner "
-        f"{parent['runner_id']} (stops: {host.stopped_runner_ids})"
-    )
+        if host_placement == "remote":
+            # The owner still needs the host to terminate the dedicated process.
+            owner_stop = await client.post(
+                f"/v1/sessions/{parent['id']}/events", json={"type": "stop_session"}
+            )
+            assert owner_stop.status_code == 400, owner_stop.text
+            assert owner_stop.json()["error"]["code"] == "wrong_replica"
+            assert requests == expected_requests
+            assert host.stopped_runner_ids == []
+            routed_stop = await host_client.post(
+                f"/v1/sessions/{parent['id']}/events", json={"type": "stop_session"}
+            )
+            assert routed_stop.status_code in (200, 202), routed_stop.text
+            assert host.stopped_runner_ids == [parent["runner_id"]]
 
 
 async def test_child_relaunch_does_not_stop_parents_shared_runner(

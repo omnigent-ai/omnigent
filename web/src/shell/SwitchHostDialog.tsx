@@ -294,14 +294,16 @@ function SupportedSwitchHostDialog({
     let stopped = false;
     let released = false;
     try {
-      const originHost = hosts?.find((host) => host.host_id === currentHostId);
-      if (originHost?.status !== "offline") {
+      // A lost launch response can leave a new runner bound. Each retry stops
+      // the current binding before releasing it, even after an earlier release.
+      const currentHost = hosts?.find((host) => host.host_id === currentHostId);
+      if (currentHost?.status !== "offline") {
         try {
           await stopSession(sessionId);
         } catch (e) {
           const detail = e instanceof Error ? e.message : "Couldn't stop the old session.";
           throw new Error(
-            `${detail} Check the original host and stop the session there, then try again.`,
+            `${detail} Check the current host and stop the session there, then try again.`,
             { cause: e },
           );
         }
@@ -550,7 +552,7 @@ function SupportedSwitchHostDialog({
                   <>
                     <span className="text-destructive">
                       {moveState === "stopped"
-                        ? "The old session stopped, but the move didn't finish. "
+                        ? "The session stopped, but the move didn't finish. "
                         : "The session left its old host, but we could not confirm the move completed. Check its current host before retrying. "}
                       Pick a host — including the one it came from — and try again.
                     </span>

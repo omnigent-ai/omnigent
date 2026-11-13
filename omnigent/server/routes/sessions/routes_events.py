@@ -1988,7 +1988,15 @@ def register_events_routes(
             await _require_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
-            await _raise_if_runner_on_another_replica(conv, request.app.state, conversation_store)
+            control_runner = await _get_runner_client(
+                session_id, runner_router, conversation=conv, for_control=True
+            )
+            # Shared-session control follows the runner's tunnel. Its host can
+            # reconnect elsewhere; only the owner needs host-directed termination.
+            if control_runner is None or await _owns_host_runner(conv, conversation_store):
+                await _raise_if_runner_on_another_replica(
+                    conv, request.app.state, conversation_store
+                )
         if body.type in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE):
             startup = getattr(request.app.state, "startup_inputs", None)
             if startup is not None:
@@ -2118,8 +2126,12 @@ def register_events_routes(
                 stop_delivered
                 and not owns_runner
                 and (
-                    conv.parent_conversation_id is not None
-                    or (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY)
+                    (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY)
+                    or (
+                        conv.parent_conversation_id is not None
+                        and await asyncio.to_thread(routing_host_id, conv, conversation_store)
+                        is not None
+                    )
                 )
             ):
                 # A shared-runner chat owns its harness resources, while the
