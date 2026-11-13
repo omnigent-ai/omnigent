@@ -327,6 +327,7 @@ def register_items_routes(
             page.data,
             session_id,
             conversation_store,
+            liveness_lookup=liveness_lookup,
         )
         return PaginatedList(
             data=data,
@@ -408,7 +409,11 @@ def register_items_routes(
         window = ordered[start : start + limit]
         await _settle_children(request, window, may_settle)
         summaries = await _child_session_summaries_from_conversations(
-            window, parent.id, conversation_store, parent_ids=parent_ids
+            window,
+            parent.id,
+            conversation_store,
+            parent_ids=parent_ids,
+            liveness_lookup=liveness_lookup,
         )
         data = [s.model_copy(update={"depth": depths[s.id]}) for s in summaries]
         return PaginatedList(

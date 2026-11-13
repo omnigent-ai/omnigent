@@ -13064,6 +13064,7 @@ async def _child_session_summaries_from_conversations(
     conv_store: ConversationStore,
     *,
     parent_ids: Mapping[str, str] | None = None,
+    liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
 ) -> list[ChildSessionSummary]:
     """
     Build child summaries with one batched message-preview lookup.
@@ -13082,6 +13083,9 @@ async def _child_session_summaries_from_conversations(
     :param parent_ids: Parent id per child id, for children of different
         parents (a whole subtree); a child missing from it gets
         *parent_session_id*.
+    :param liveness_lookup: Bulk liveness lookup; a child whose runner is
+        offline reports zero parked prompts, as the updates stream does.
+        ``None`` keeps the persisted mirror count.
     :returns: One :class:`ChildSessionSummary` per input child, preserving
         input order.
     """
@@ -13097,7 +13101,7 @@ async def _child_session_summaries_from_conversations(
         child_id: _latest_message_preview(message_items)
         for child_id, message_items in message_items_by_child.items()
     }
-    return [
+    summaries = [
         _child_session_summary_from_conversation(
             child,
             (parent_ids or {}).get(child.id, parent_session_id),
@@ -13105,6 +13109,13 @@ async def _child_session_summaries_from_conversations(
         )
         for child in children
     ]
+    if liveness_lookup is not None:
+        liveness = await asyncio.to_thread(liveness_lookup, child_ids)
+        for summary in summaries:
+            # Same rule as the updates stream: a dead runner's parked prompts died with it.
+            if not liveness[summary.id].runner_online:
+                summary.pending_elicitations_count = 0
+    return summaries
 
 
 async def _handle_mcp_tools_call(

@@ -4010,6 +4010,7 @@ def register_events_routes(
                     page.data,
                     session_id,
                     conversation_store,
+                    liveness_lookup=liveness_lookup,
                 )
                 for summary in summaries:
                     events.append(

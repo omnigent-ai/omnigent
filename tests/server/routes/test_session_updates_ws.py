@@ -328,6 +328,7 @@ def test_updates_stream_carries_child_tree_fields(
 def test_child_list_and_stream_agree_on_one_row(
     app: FastAPI,
     stores,
+    liveness_state: dict[str, SessionLiveness],
 ) -> None:
     """
     ``GET child_sessions`` and the updates stream report one child the same way.
@@ -354,19 +355,36 @@ def test_child_list_and_stream_agree_on_one_row(
     # The replica holding the runner mirrored a parked approval to the row.
     conversation_store.set_pending_elicitation_count(child.id, 2)
     sessions_routes._session_status_cache.pop(child.id, None)
+    # Same mirror on a runner-bound child whose runner is offline: both
+    # surfaces must agree on whether its parked prompts still count.
+    offline = conversation_store.create_conversation(
+        kind="sub_agent",
+        title="coder:offline",
+        parent_conversation_id=parent_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+    )
+    stores[2].grant(ALICE, offline.id, LEVEL_OWNER)
+    assert conversation_store.set_runner_id(offline.id, "runner_gone")
+    conversation_store.set_session_live_status(offline.id, "running")
+    conversation_store.set_pending_elicitation_count(offline.id, 3)
+    sessions_routes._session_status_cache.pop(offline.id, None)
+    liveness_state[offline.id] = SessionLiveness(runner_online=False, host_online=None)
 
     client = TestClient(app)
     listed = client.get(
         f"/v1/sessions/{parent_id}/child_sessions", headers={"X-Forwarded-Email": ALICE}
     )
     assert listed.status_code == 200
-    summary = next(row for row in listed.json()["data"] if row["id"] == child.id)
+    rows = {row["id"]: row for row in listed.json()["data"]}
+    summary = rows[child.id]
+    offline_summary = rows[offline.id]
     with client.websocket_connect(
         "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
     ) as ws:
-        ws.send_text(json.dumps({"type": "watch", "session_ids": [child.id]}))
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [child.id, offline.id]}))
         snapshot = _recv_until(ws, {"snapshot"})
-    frame = next(item for item in snapshot["items"] if item["id"] == child.id)  # type: ignore[index]
+    frames = {item["id"]: item for item in snapshot["items"]}  # type: ignore[index]
+    frame = frames[child.id]
 
     assert summary["busy"] is True
     assert frame["own_status"] == "running"
@@ -376,6 +394,10 @@ def test_child_list_and_stream_agree_on_one_row(
     assert summary["last_task_error"] == frame["last_task_error"]
     assert summary["last_task_error"]["code"] == "tool_failed"
     assert summary["pending_elicitations_count"] == frame["pending_elicitations_count"] == 2
+    assert (
+        offline_summary["pending_elicitations_count"]
+        == frames[offline.id]["pending_elicitations_count"]
+    )
 
 
 def test_runner_offline_pushes_changed_frame(
