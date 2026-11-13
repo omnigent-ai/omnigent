@@ -813,8 +813,12 @@ Update this top-level README with a row in the table above.
 - JSON creation by known owner-agent ID permits an unbound top-level session for
   native `/clear`, with no host launch. Multipart uploads require an in-scope
   parent. Bootstrap scope is consumed before binding, transfer or detach.
-  `/clear` finalizes before detach; a failed detach is logged with the old session
-  ID. The owner can repair it with `PATCH /v1/sessions/{id}` and
+  `/clear` sends finalization events before detach. Claude journals the old/new
+  pair before consuming its hook cursor and retries bridge re-key/detach failures
+  in the background, including after restart. This covers recorded rotations;
+  creation before journal publication and notice delivery remain best-effort.
+  A missing journal or an unrecoverable detach failure still needs owner repair
+  with `PATCH /v1/sessions/{id}` and
   `{"runner_id": ""}`, or restore a failed initial binding using
   `{"runner_id": "<runner-id>"}`. Inherited scope stops after 32 parent edges;
   deeper unbound sessions need an explicit owner binding. A nearer conflicting
