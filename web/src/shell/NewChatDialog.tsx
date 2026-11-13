@@ -6166,6 +6166,8 @@ function NewChatLandingContent({
         if (needsDbcert) return;
       }
       // Spend the draft only once provisioning starts, after the laptop credential check.
+      // A composer remounted in this commit would otherwise restore the submitted text.
+      if (draftState.draft !== null) writeLandingDraft(draftState, null);
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
       submittedLinkedPromptRef.current = submittedLinkedPrompt;

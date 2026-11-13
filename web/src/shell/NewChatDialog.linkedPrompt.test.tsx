@@ -235,6 +235,19 @@ function allowSessionStart(response: { ok: boolean; body: unknown }) {
   } as unknown as Response);
 }
 
+/** Hold the session-create POST open and return a function that completes it. */
+function deferCreate(): (response: Response) => void {
+  let finish: (response: Response) => void = () => {};
+  vi.mocked(authenticatedFetch).mockImplementation((url, init) =>
+    url === "/v1/sessions" && init?.method === "POST"
+      ? new Promise<Response>((resolve) => {
+          finish = resolve;
+        })
+      : Promise.resolve({ ok: true, json: async () => ({}) } as unknown as Response),
+  );
+  return (response) => finish(response);
+}
+
 async function submitWhenReady() {
   await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).not.toBeDisabled());
   fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -368,14 +381,7 @@ describe("embedded prompt link", () => {
     ["the same composer", false],
   ])("does not let an older create forget a newer prompt in %s", async (_case, remount) => {
     allowSessionStart({ ok: true, body: { id: "conv_a" } });
-    let finishCreate: (response: Response) => void = () => {};
-    vi.mocked(authenticatedFetch).mockImplementation((url, init) =>
-      url === "/v1/sessions" && init?.method === "POST"
-        ? new Promise<Response>((resolve) => {
-            finishCreate = resolve;
-          })
-        : Promise.resolve({ ok: true, json: async () => ({}) } as unknown as Response),
-    );
+    const finishCreate = deferCreate();
     const { rerender } = renderLanding();
     await submitWhenReady();
     searchParams = new URLSearchParams("o=123&prompt=Second+request");
@@ -391,6 +397,19 @@ describe("embedded prompt link", () => {
     });
     reloadPage();
     expect(composer()).toHaveValue("Second request");
+  });
+
+  it("does not restore a submitted prompt into a same-commit remount while creating", async () => {
+    allowSessionStart({ ok: true, body: { id: "conv_a" } });
+    const finishCreate = deferCreate();
+    const { rerender } = renderLanding();
+    await submitWhenReady();
+    rerender(<Landing visit={2} />);
+    expect(composer()).toHaveValue("");
+    await act(async () => {
+      finishCreate({ ok: true, json: async () => ({ id: "conv_a" }) } as unknown as Response);
+    });
+    expect(composer()).toHaveValue("");
   });
 
   it("sends the link's text literally after a mounted link and a remount", async () => {
