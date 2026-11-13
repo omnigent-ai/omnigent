@@ -3103,6 +3103,65 @@ describe("Extension pages own the header", () => {
   });
 });
 
+describe("Session overview", () => {
+  // Answers the docking breakpoint; other queries keep the jsdom default.
+  function setWideViewport(wide: boolean) {
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: query === "(min-width: 1280px)" ? wide : baseMatchMedia(query).matches,
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+  }
+
+  async function renderOverviewShell(enabled: boolean, workspace: "open" | "collapsed") {
+    writeWorkspacePanelDefault(workspace);
+    mockConversations([{ id: "conv_overview", permission_level: null }]);
+    renderShell("/c/conv_overview", serverInfo({ features: { session_overview: enabled } }));
+    await waitFor(() => expect(document.querySelector("header.chat-header")).not.toBeNull());
+    if (workspace === "open") await waitFor(() => expect(railOpenState()).toBe("open"));
+  }
+
+  const overview = () => screen.queryByRole("complementary", { name: "Session overview" });
+
+  it("adds nothing with the flag off", async () => {
+    setWideViewport(true);
+    await renderOverviewShell(false, "collapsed");
+
+    expect(screen.queryByTestId("header-session-cost")).toBeNull();
+    expect(overview()).toBeNull();
+  });
+
+  it("docks open in a wide window with the workspace collapsed", async () => {
+    setWideViewport(true);
+    await renderOverviewShell(true, "collapsed");
+
+    const toggle = screen.getByTestId("header-session-cost");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(overview()).toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(overview()).toBeNull();
+  });
+
+  it.each([
+    ["a narrow window", false, "collapsed"],
+    ["an open workspace", true, "open"],
+  ] as const)("starts hidden with %s and opens over chat", async (_, wide, workspace) => {
+    setWideViewport(wide);
+    await renderOverviewShell(true, workspace);
+
+    const toggle = screen.getByTestId("header-session-cost");
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(overview()).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("main")).toContainElement(overview());
+    fireEvent.click(screen.getByRole("button", { name: "Hide session overview" }));
+    expect(overview()).toBeNull();
+  });
+});
+
 describe("Right workspace card visibility", () => {
   it.each([true, false])(
     "waits for capabilities before validating restored search (enabled=%s)",
