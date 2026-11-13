@@ -29,6 +29,7 @@ from omnigent.host.daemon_lifecycle import (
     write_daemon_record,
 )
 from omnigent.host.identity import HostIdentity
+from omnigent.telemetry.request_headers import client_user_agent
 from omnigent.util.tls import client_ssl_context
 
 
@@ -1127,7 +1128,10 @@ def test_probe_workspace_id_reads_the_org_header(
     assert call["verify"] is client_ssl_context()
     # The selector is forwarded only when known, no credentials are sent, and
     # a login redirect is never followed.
-    assert call["headers"] == ({"X-Databricks-Org-Id": org_id} if org_id else {})
+    assert call["headers"] == {
+        "User-Agent": client_user_agent(),
+        **({"X-Databricks-Org-Id": org_id} if org_id else {}),
+    }
     assert call["follow_redirects"] is False
 
 

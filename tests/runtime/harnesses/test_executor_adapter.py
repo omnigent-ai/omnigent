@@ -2448,7 +2448,7 @@ class _AcceptingInjectionExecutor:
 
 
 class _OneInjectionCtx:
-    """TurnContext stand-in: yields one injection, then blocks; records emits.
+    """TurnContext stand-in: yields one injection, then blocks; records emits and pulls.
 
     :param injection: The single injection ``_watch_injections`` should
         pull before the queue goes quiet.
@@ -2460,6 +2460,7 @@ class _OneInjectionCtx:
 
         self._injection: Any = injection
         self.emitted: list[Any] = []
+        self.pulls = 0
         self.response_id = "resp_injection"
         self.session_id = "session_injection"
         # Mirror TurnContext: the watcher skips delivery once cancelled.
@@ -2474,6 +2475,7 @@ class _OneInjectionCtx:
         import asyncio as _aio
 
         del timeout
+        self.pulls += 1
         if self._injection is None:
             await _aio.sleep(3600)
         inj, self._injection = self._injection, None
@@ -2492,7 +2494,104 @@ class _OneInjectionCtx:
 @pytest.mark.parametrize(
     ("input_value", "multimodal", "expected_content"),
     [
-        ("steer me", False, "steer me"),
+        pytest.param("steer me", False, "steer me", id="string"),
+        pytest.param(
+            [{"type": "input_text", "text": "steer me"}], False, "steer me", id="flat_blocks"
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Status?"}],
+                }
+            ],
+            False,
+            "Status?",
+            id="message_item_blocks",
+        ),
+        pytest.param(
+            [{"type": "message", "role": "user", "content": "Status?"}],
+            False,
+            "Status?",
+            id="message_item_string",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Status?"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+                    ],
+                }
+            ],
+            False,
+            "Status?",
+            id="message_item_text_and_image",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "older request"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "older reply"}],
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "tool output"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Status?"},
+                        {"type": "input_text", "text": "Be brief."},
+                    ],
+                },
+            ],
+            False,
+            "Status?\nBe brief.",
+            id="history_newest_user_only",
+        ),
+        pytest.param(
+            [
+                {"type": "message", "role": "user", "content": "older request"},
+                {"type": "message", "role": "assistant", "content": "older reply"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "inspect this"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+                    ],
+                },
+                {"type": "message", "role": "assistant", "content": "later reply"},
+            ],
+            True,
+            [
+                {"type": "input_text", "text": "inspect this"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+            ],
+            id="history_newest_user_multimodal",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+                    ],
+                }
+            ],
+            True,
+            [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}],
+            id="message_image_only_multimodal",
+        ),
         (
             [{"type": "input_text", "text": "steer me"}],
             True,
@@ -2531,14 +2630,6 @@ class _OneInjectionCtx:
             "inspect this",
         ),
     ],
-    ids=[
-        "plain-text",
-        "text-block",
-        "text-only-blocks",
-        "image-only",
-        "bang-with-file",
-        "text-only-executor",
-    ],
 )
 async def test_watch_injections_emits_consumed_marker_on_accept(
     input_value: str | list[dict[str, Any]], multimodal: bool, expected_content: Any
@@ -2552,6 +2643,11 @@ async def test_watch_injections_emits_consumed_marker_on_accept(
     re-deliver it in a continuation turn (RUNNER_MESSAGE_INGEST.md
     Part B). A missing/empty marker is exactly what would let the
     duplication regress.
+
+    The runner forwards the message ``content`` verbatim, and the request
+    schema accepts a plain string, flat content blocks, or conversation-shaped
+    ``message`` items (block-list or string ``content``). Every shape must
+    deliver only the newest user message, retaining blocks for capable executors.
     """
     import asyncio as _aio
 
@@ -2585,6 +2681,86 @@ async def test_watch_injections_emits_consumed_marker_on_accept(
     assert isinstance(marker, InjectionConsumedEvent)
     assert marker.type == "injection.consumed"
     assert marker.injection_id == "inj_x"
+
+
+_OLDER_REQUEST = {
+    "type": "message",
+    "role": "user",
+    "content": [{"type": "input_text", "text": "older request"}],
+}
+
+
+@pytest.mark.parametrize(
+    "injection_input",
+    [
+        pytest.param(
+            [
+                _OLDER_REQUEST,
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA=="}
+                    ],
+                },
+            ],
+            id="image_only_newest_user",
+        ),
+        pytest.param(
+            [_OLDER_REQUEST, {"type": "message", "role": "user"}],
+            id="newest_user_without_content",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "older reply"}],
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "tool output"},
+            ],
+            id="assistant_and_tool_only",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_watch_injections_skips_conversation_input_without_newest_user_text(
+    injection_input: list[dict[str, Any]],
+) -> None:
+    """Conversation-shaped input without steerable user text is skipped mid-turn.
+
+    Nothing older is steered in its place and no consumed marker is emitted, so the
+    runner keeps its buffered copy and re-delivers the message as the next turn.
+    """
+    import asyncio as _aio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = _AcceptingInjectionExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
+    ctx = _OneInjectionCtx(
+        CreateResponseRequest(model="m", input=injection_input, injection_id="inj_x")
+    )
+
+    task = _aio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
+    try:
+        # The watcher pulls the next injection only after finishing with this one.
+        for _ in range(200):
+            if ctx.pulls >= 2:
+                break
+            await _aio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(_aio.CancelledError):
+            await task
+
+    # Processed and skipped outright: nothing is steered and no consumed marker is emitted.
+    assert ctx.pulls >= 2, "the watcher never processed the injection"
+    assert executor.received == [], (
+        f"an older request was replayed as the steer: {executor.received!r}"
+    )
+    assert ctx.emitted == [], f"unexpected consumed marker: {ctx.emitted!r}"
 
 
 @pytest.mark.asyncio
