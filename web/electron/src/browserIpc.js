@@ -196,9 +196,18 @@ function goForward(wc) {
   return false;
 }
 
+/** Whether the page is loading, matching Chromium's tab loading indicator. Never throws. */
+function readLoadingState(wc) {
+  try {
+    return !!wc.isLoading?.();
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Track URL, title and history changes for the owning renderer, including
- * detached views. Attached once at create time.
+ * Track URL, title, history and loading changes for the owning renderer,
+ * including detached views. Attached once at create time.
  *
  * @param {object} params
  * @param {string} params.conversationId
@@ -224,6 +233,14 @@ function attachNavListeners({ conversationId, webContents, send }) {
     emitPageMetadata(webContents.getURL(), title);
   });
   webContents.on("did-finish-load", () => emitPageMetadata(webContents.getURL()));
+
+  const emitLoading = (isLoading) => {
+    send("browser-loading-state", { conversationId, isLoading });
+  };
+  webContents.on("did-start-loading", () => emitLoading(true));
+  webContents.on("did-stop-loading", () => emitLoading(false));
+  // The first load starts before these listeners attach.
+  emitLoading(readLoadingState(webContents));
 }
 
 // ── Design mode (point-and-prompt) ─────────────────────────────────────────
@@ -637,6 +654,7 @@ function registerBrowserIpc({
       title: webContents.getTitle(),
       ...(pendingUrl ? { pendingUrl } : {}),
       ...readNavState(webContents),
+      isLoading: readLoadingState(webContents),
     };
   });
 

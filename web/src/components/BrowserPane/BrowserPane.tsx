@@ -126,11 +126,16 @@ interface BrowserPaneBridge {
       canGoForward: boolean;
     }) => void,
   ) => () => void;
+  /** Absent on shells that predate the reload button's loading state. */
+  onBrowserLoadingState?: (
+    callback: (payload: { conversationId: string; isLoading: boolean }) => void,
+  ) => () => void;
   browserHasView?: (conversationId: string) => Promise<{
     exists: boolean;
     url?: string;
     canGoBack?: boolean;
     canGoForward?: boolean;
+    isLoading?: boolean;
   }>;
 }
 
@@ -208,6 +213,8 @@ export function BrowserPane({
   );
   const [canGoBack, setCanGoBack] = useState(false);
   const [canGoForward, setCanGoForward] = useState(false);
+  // Spins the reload icon while the page loads.
+  const [isLoading, setIsLoading] = useState(false);
   // Design-mode toggle: on, the main process injects the in-page picker; submit
   // routing lives in AppShell. This flag only drives the button + enable/disable IPC.
   const [designMode, setDesignMode] = useState(false);
@@ -236,14 +243,16 @@ export function BrowserPane({
     if (!bridge) return;
     let cancelled = false;
     let viewChanged = false;
+    let loadingChanged = false;
 
-    // A newer lifecycle event takes precedence over this asynchronous snapshot.
+    // Newer lifecycle and loading events take precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
       if (!cancelled && !viewChanged && r?.exists) {
         setHasView(true);
         if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
+        if (!loadingChanged) setIsLoading(!!r.isLoading);
       }
     });
 
@@ -258,11 +267,19 @@ export function BrowserPane({
       setHasView(false);
       setCanGoBack(false);
       setCanGoForward(false);
+      setIsLoading(false);
+    });
+    const unsubLoading = bridge.onBrowserLoadingState?.((payload) => {
+      if (payload.conversationId !== conversationId) return;
+      loadingChanged = true;
+      setIsLoading(payload.isLoading);
     });
     return () => {
       cancelled = true;
+      setIsLoading(false);
       unsubCreated?.();
       unsubClosed?.();
+      unsubLoading?.();
     };
   }, [conversationId, browserSupported]);
 
@@ -679,10 +696,16 @@ export function BrowserPane({
           onClick={handleReload}
           disabled={!hasView}
           aria-label="Reload"
+          aria-busy={hasView && isLoading}
           title={chord("Reload", RELOAD_KEYS)}
           className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
         >
-          <RotateCwIcon className="size-4" />
+          <RotateCwIcon
+            className={cn(
+              "size-4",
+              hasView && isLoading && "animate-spin motion-reduce:animate-none",
+            )}
+          />
         </button>
         <input
           type="text"
