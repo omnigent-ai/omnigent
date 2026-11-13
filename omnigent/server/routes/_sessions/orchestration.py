@@ -5440,6 +5440,59 @@ async def _maybe_relaunch_managed_sandbox(
     return True
 
 
+async def _raise_if_managed_wake_misses_host_tunnel(
+    *,
+    conv: Conversation,
+    request_slice_key: str | None,
+    app_state: Any,
+) -> None:
+    """
+    Re-address a request that would wake a managed host off its tunnel's replica.
+
+    A managed host dials the replica that owns its slice key: its own id when
+    the create keyed it, otherwise the default route. A wake run from any other
+    replica lands its tunnel elsewhere, so the request parks for the whole wake
+    and then fails. Answer ``WRONG_REPLICA`` first so the client re-addresses to
+    the key that starts the wake where the tunnel lands. Sharded deployments
+    only: a single replica has nowhere else to send the request.
+
+    :param conv: Session row whose host may need a wake.
+    :param request_slice_key: The slice key that routed the request, or ``None``.
+    :param app_state: ``request.app.state`` — supplies the host registry and store.
+    :raises WrongReplicaError: For a keyed host whose key the request does not carry.
+    :raises OmnigentError: ``WRONG_REPLICA`` (no key to resend) for an unkeyed host
+        reached through a keyed request.
+    """
+    from omnigent.server.managed_hosts import host_slice_key_enabled
+    from omnigent.server.routes._host_launch import _deployment_is_sharded
+
+    host_store = getattr(app_state, "host_store", None)
+    host_registry = getattr(app_state, "host_registry", None)
+    if (
+        conv.host_id is None
+        or host_store is None
+        or host_registry is None
+        or not _deployment_is_sharded()
+    ):
+        return
+    keyed = host_slice_key_enabled(conv.labels, conv.host_id)
+    expected_key = conv.host_id if keyed else None
+    if request_slice_key == expected_key or host_registry.get(conv.host_id) is not None:
+        return
+    host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+    if host is None or host.sandbox_provider is None:
+        return
+    if keyed:
+        raise WrongReplicaError(
+            f"managed host {conv.host_id} wakes on the replica its slice key names",
+            host_id=conv.host_id,
+        )
+    raise OmnigentError(
+        f"managed host {conv.host_id} wakes on the default replica; retry without its slice key",
+        code=ErrorCode.WRONG_REPLICA,
+    )
+
+
 async def _maybe_wake_stale_resumable_managed_sandbox(
     *,
     session_id: str,
@@ -6337,19 +6390,15 @@ async def _run_managed_wake(
                         online_elsewhere = True
                         break
             if host_conn is None:
-                # A host that reads live CROSS-REPLICA means the wake SUCCEEDED: the
-                # sandbox booted and its tunnel registered, just not here. Publishing
-                # a terminal "failed" for that is wrong AND it outlives the recovery —
-                # sandbox_status is cached PER POD and only "ready" evicts it, so the
-                # false failure is served back by every later keyed snapshot read (a
-                # 200, with no wrong-replica signal to correct it). Settle as ready
-                # instead; it clears any stale entry. The runner still has to launch
-                # from the replica that owns the tunnel — the request parked on this
-                # rendezvous is sent there by the WRONG_REPLICA raised in
-                # _maybe_relaunch_managed_sandbox.
+                # The sandbox booted and its tunnel registered on another replica,
+                # which launches the runner. Not "failed" (a per-pod cached failure
+                # would outlive the recovery) and not "ready" (no runner is bound here,
+                # and "ready" must mean one is). Only "ready" evicts the per-pod status
+                # cache, so evict it directly. The parked request gets WRONG_REPLICA
+                # from _maybe_relaunch_managed_sandbox.
                 if online_elsewhere or await asyncio.to_thread(host_store.is_online, host_id):
+                    _session_sandbox_status_cache.pop(session_id, None)
                     tracker.finish(session_id)
-                    _publish_sandbox_status(session_id, "ready")
                     return
                 tracker.fail(session_id, "managed host did not reconnect after wake")
                 _publish_sandbox_status(
@@ -14799,6 +14848,7 @@ __all__ = [
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",
     "_publish_subtree_cost_to_ancestors",
+    "_raise_if_managed_wake_misses_host_tunnel",
     "_read_session_snapshot_inputs",
     "_recover_subagent_status_forward_via_parent",
     "_register_policy_elicitation",

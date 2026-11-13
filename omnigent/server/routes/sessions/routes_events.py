@@ -134,6 +134,7 @@ from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.routes._host_launch import routed_slice_key
 from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
@@ -287,6 +288,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_external_session_usage,
     _persist_host_launch_failure_turn,
     _persist_native_terminal_failure,
+    _raise_if_managed_wake_misses_host_tunnel,
     _recover_side_chat_runner_via_source,
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
@@ -1882,6 +1884,12 @@ def register_events_routes(
                 absent here but the host is live on another replica.
             """
             _app_state = request.app.state
+            if isinstance(request, Request):
+                await _raise_if_managed_wake_misses_host_tunnel(
+                    conv=wake_conv,
+                    request_slice_key=routed_slice_key(request),
+                    app_state=_app_state,
+                )
             if wake_conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
                 session_id=session_id,
                 conv=wake_conv,
@@ -3122,7 +3130,14 @@ def register_events_routes(
         # message, even if we reused the original binding instead of launching
         # a replacement.
         _runner_needs_session_init = False
-        # Item event (message, function_call_output, etc.).
+        # Item event (message, function_call_output, etc.). Only a client request
+        # names the replica it was routed to; startup replays and runner batches don't.
+        if isinstance(request, Request):
+            await _raise_if_managed_wake_misses_host_tunnel(
+                conv=conv,
+                request_slice_key=routed_slice_key(request),
+                app_state=request.app.state,
+            )
         if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
             session_id=session_id,
             conv=conv,

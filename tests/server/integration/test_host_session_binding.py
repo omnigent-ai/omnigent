@@ -21,7 +21,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.entities import Conversation
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerFrame,
@@ -3449,6 +3449,374 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     assert host_deregistered == ["055e31f38d07908f171ebad4ff5cbe9c"]
     # A stale tunnel is torn down, not handed off: its turns stay reconcilable here.
     assert runner_deregistered == [("runner_stale_tunnel", False)]
+
+
+_KEYED_HOST_ID = "5f2a9c81d4e64b0f9a7c3e1b2d8f4a60"
+_UNKEYED_HOST_ID = "7d3e0b5a2c9f4e1d8b6a0f3c5e7d9b12"
+_FOREIGN_SLICE_KEY = "3c1d9e7f5a2b4c6d8e0f1a2b3c4d5e6f"
+_WAKE_SESSION_ID = "3b8e6f1a0c9d4e2b7f5a1c8d6e0b4f93"
+
+
+def _register_managed_wake_host(host_store: HostStore, host_id: str, *, connected: bool) -> None:
+    """Register a resumable managed host; ``connected`` marks it live in the shared DB."""
+    name = f"managed-{host_id[:8]}"
+    host_store.register_managed_host(
+        host_id=host_id,
+        name=name,
+        user_id=RESERVED_USER_LOCAL,
+        token=f"tok-{host_id[:8]}",
+        provider="islo",
+        sandbox_id=f"sb-{host_id[:8]}",
+        token_expires_at=9_999_999_999,
+    )
+    if connected:
+        host_store.upsert_on_connect(host_id=host_id, name=name, user_id=RESERVED_USER_LOCAL)
+
+
+def _managed_wake_session(host_id: str, *, keyed: bool) -> SimpleNamespace:
+    """A session bound to *host_id*; keyed hosts carry the create's requested-host label."""
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+
+    return SimpleNamespace(
+        id=_WAKE_SESSION_ID,
+        host_id=host_id,
+        labels={REQUESTED_HOST_ID_LABEL_KEY: host_id} if keyed else {},
+        workspace="/root/workspace",
+        agent_id=None,
+        sub_agent_name=None,
+        inference_snapshot=None,
+        runner_id=None,
+    )
+
+
+def _resumable_managed_wake_config() -> ManagedSandboxDeployment:
+    fake = FakeSandboxLauncher(can_resume=True)
+    fake.provider = "islo"  # type: ignore[misc]
+    return ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+            provider="islo",
+        )
+    )
+
+
+@pytest.fixture
+def sharded_replica(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mark the deployment host-sharded, where a wrong-replica wake is possible."""
+    from omnigent.server.routes import _host_launch
+
+    monkeypatch.setattr(_host_launch, "_host_sharded", True)
+
+
+@pytest.mark.parametrize("request_slice_key", [None, _FOREIGN_SLICE_KEY])
+async def test_keyed_managed_host_wake_is_rerouted_off_a_foreign_replica(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    sharded_replica: None,
+    request_slice_key: str | None,
+) -> None:
+    """A dormant keyed host is not woken by a request keyed to anything else."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    host_store = HostStore(db_uri)
+    _register_managed_wake_host(host_store, _KEYED_HOST_ID, connected=False)
+    conv = _managed_wake_session(_KEYED_HOST_ID, keyed=True)
+    tracker = ManagedLaunchTracker()
+    calls: list[str] = []
+
+    def _record_wake(**_kwargs: object) -> None:
+        calls.append("wake")
+        tracker.begin(conv.id)
+        tracker.finish(conv.id)
+
+    monkeypatch.setattr(sessions_module, "_kick_managed_wake", _record_wake)
+    app_state = SimpleNamespace(
+        host_store=host_store,
+        host_registry=SimpleNamespace(get=lambda _host_id: None),
+        sandbox_config=_resumable_managed_wake_config(),
+        managed_launches=tracker,
+    )
+
+    with pytest.raises(WrongReplicaError) as exc:
+        await orchestration._raise_if_managed_wake_misses_host_tunnel(
+            conv=conv, request_slice_key=request_slice_key, app_state=app_state
+        )
+        await sessions_module._maybe_relaunch_managed_sandbox(
+            session_id=conv.id,
+            conv=conv,
+            app_state=app_state,
+            conversation_store=SimpleNamespace(),
+        )
+    assert exc.value.code == ErrorCode.WRONG_REPLICA
+    assert exc.value.host_id == _KEYED_HOST_ID
+    assert calls == []
+
+
+async def test_keyed_managed_host_request_on_owning_replica_still_wakes(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    sharded_replica: None,
+) -> None:
+    """The replica the host's key names passes the guard and performs the wake."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    host_store = HostStore(db_uri)
+    _register_managed_wake_host(host_store, _KEYED_HOST_ID, connected=False)
+    conv = _managed_wake_session(_KEYED_HOST_ID, keyed=True)
+    tracker = ManagedLaunchTracker()
+    calls: list[str] = []
+
+    def _record_wake(**_kwargs: object) -> None:
+        calls.append("wake")
+        tracker.begin(conv.id)
+        tracker.finish(conv.id)
+
+    monkeypatch.setattr(sessions_module, "_kick_managed_wake", _record_wake)
+    app_state = SimpleNamespace(
+        host_store=host_store,
+        host_registry=SimpleNamespace(get=lambda _host_id: None),
+        sandbox_config=_resumable_managed_wake_config(),
+        managed_launches=tracker,
+    )
+
+    await orchestration._raise_if_managed_wake_misses_host_tunnel(
+        conv=conv, request_slice_key=_KEYED_HOST_ID, app_state=app_state
+    )
+    assert (
+        await sessions_module._maybe_relaunch_managed_sandbox(
+            session_id=conv.id,
+            conv=conv,
+            app_state=app_state,
+            conversation_store=SimpleNamespace(),
+        )
+        is True
+    )
+    assert calls == ["wake"]
+
+
+@pytest.mark.parametrize("request_slice_key", [None, _FOREIGN_SLICE_KEY])
+async def test_unkeyed_managed_host_wakes_only_from_the_default_route(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    sharded_replica: None,
+    request_slice_key: str | None,
+) -> None:
+    """An unkeyed host dials the default route, so only an unkeyed request may wake it."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    host_store = HostStore(db_uri)
+    _register_managed_wake_host(host_store, _UNKEYED_HOST_ID, connected=False)
+    conv = _managed_wake_session(_UNKEYED_HOST_ID, keyed=False)
+    tracker = ManagedLaunchTracker()
+    calls: list[str] = []
+
+    def _record_wake(**_kwargs: object) -> None:
+        calls.append("wake")
+        tracker.begin(conv.id)
+        tracker.finish(conv.id)
+
+    monkeypatch.setattr(sessions_module, "_kick_managed_wake", _record_wake)
+    app_state = SimpleNamespace(
+        host_store=host_store,
+        host_registry=SimpleNamespace(get=lambda _host_id: None),
+        sandbox_config=_resumable_managed_wake_config(),
+        managed_launches=tracker,
+    )
+
+    if request_slice_key is None:
+        await orchestration._raise_if_managed_wake_misses_host_tunnel(
+            conv=conv, request_slice_key=None, app_state=app_state
+        )
+        assert (
+            await sessions_module._maybe_relaunch_managed_sandbox(
+                session_id=conv.id,
+                conv=conv,
+                app_state=app_state,
+                conversation_store=SimpleNamespace(),
+            )
+            is True
+        )
+        assert calls == ["wake"]
+        return
+
+    # A keyed request for an unkeyed host gets a plain WRONG_REPLICA: the host has
+    # no key to name, so the error must not tell the client to resend with one.
+    with pytest.raises(OmnigentError) as exc:
+        await orchestration._raise_if_managed_wake_misses_host_tunnel(
+            conv=conv, request_slice_key=request_slice_key, app_state=app_state
+        )
+    assert exc.value.code == ErrorCode.WRONG_REPLICA
+    assert not isinstance(exc.value, WrongReplicaError)
+    assert calls == []
+
+
+async def test_managed_wake_guard_is_inert_on_a_single_replica(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single replica has no other replica to re-address to, so it never says wrong_replica."""
+    from omnigent.server.routes import _host_launch
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(_host_launch, "_host_sharded", False)
+    host_store = HostStore(db_uri)
+    _register_managed_wake_host(host_store, _KEYED_HOST_ID, connected=False)
+    conv = _managed_wake_session(_KEYED_HOST_ID, keyed=True)
+
+    await orchestration._raise_if_managed_wake_misses_host_tunnel(
+        conv=conv,
+        request_slice_key=_FOREIGN_SLICE_KEY,
+        app_state=SimpleNamespace(
+            host_store=host_store,
+            host_registry=SimpleNamespace(get=lambda _host_id: None),
+        ),
+    )
+
+
+async def test_wake_settles_without_ready_when_the_tunnel_registers_elsewhere(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A woken host whose tunnel is on another replica never publishes ready here.
+
+    The parked caller gets WRONG_REPLICA and re-addresses to the owning replica,
+    which launches the runner. The cached wake stage is evicted, since only ready
+    evicts the per-pod cache.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+    from omnigent.server.schemas import SandboxStatus
+
+    host_store = HostStore(db_uri)
+    _register_managed_wake_host(host_store, _KEYED_HOST_ID, connected=True)
+    conv = _managed_wake_session(_KEYED_HOST_ID, keyed=True)
+    config = _resumable_managed_wake_config()
+    tracker = ManagedLaunchTracker()
+    tracker.begin(conv.id)
+    launch = tracker.get(conv.id)
+    assert launch is not None
+    _session_sandbox_status_cache[conv.id] = SandboxStatus(stage="connecting")
+    stages: list[str] = []
+    kicks: list[str] = []
+
+    def _record_stage(
+        _session_id: str, stage: str, error: str | None = None, **_kw: object
+    ) -> None:
+        stages.append(stage)
+
+    def _no_second_wake(**_kwargs: object) -> None:
+        kicks.append("unexpected re-kick")
+        raise AssertionError("a settled or in-flight wake must not be kicked again")
+
+    async def _resume_noop(*_args: object, **_kwargs: object) -> None:
+        pass
+
+    monkeypatch.setattr(sessions_module, "_publish_sandbox_status", _record_stage)
+    monkeypatch.setattr(sessions_module, "_kick_managed_wake", _no_second_wake)
+    monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume_noop)
+    host_registry = SimpleNamespace(get=lambda _host_id: None)
+    conversation_store = SimpleNamespace(get_conversation=lambda _session_id: conv)
+    app_state = SimpleNamespace(
+        host_store=host_store,
+        host_registry=host_registry,
+        sandbox_config=config,
+        managed_launches=tracker,
+    )
+
+    wake = asyncio.create_task(
+        sessions_module._run_managed_wake(
+            session_id=conv.id,
+            conv=conv,  # type: ignore[arg-type]
+            sandbox_config=config,
+            tracker=tracker,
+            conversation_store=conversation_store,  # type: ignore[arg-type]
+            host_store=host_store,
+            host_registry=host_registry,  # type: ignore[arg-type]
+            tunnel_registry=None,
+        )
+    )
+    parked = asyncio.create_task(
+        sessions_module._maybe_relaunch_managed_sandbox(
+            session_id=conv.id,
+            conv=conv,  # type: ignore[arg-type]
+            app_state=app_state,
+            conversation_store=conversation_store,  # type: ignore[arg-type]
+        )
+    )
+    wake_result, parked_result = await asyncio.gather(wake, parked, return_exceptions=True)
+
+    assert wake_result is None
+    assert isinstance(parked_result, WrongReplicaError), parked_result
+    assert parked_result.host_id == _KEYED_HOST_ID
+    assert launch.settled.is_set()
+    assert launch.error is None
+    assert tracker.get(conv.id) is None
+    assert "ready" not in stages
+    assert "failed" not in stages
+    assert conv.id not in _session_sandbox_status_cache
+    assert kicks == []
+
+
+async def test_wake_on_the_owning_replica_launches_the_runner_before_ready(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When this replica holds the woken host's tunnel, the wake launches a runner, then ready."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    host_store = HostStore(db_uri)
+    _register_managed_wake_host(host_store, _KEYED_HOST_ID, connected=True)
+    conv = _managed_wake_session(_KEYED_HOST_ID, keyed=True)
+    config = _resumable_managed_wake_config()
+    tracker = ManagedLaunchTracker()
+    tracker.begin(conv.id)
+    launch = tracker.get(conv.id)
+    assert launch is not None
+    stages: list[tuple[str, str | None]] = []
+    launched: list[str] = []
+
+    async def _resume_noop(*_args: object, **_kwargs: object) -> None:
+        pass
+
+    async def _launch_runner(*_args: object, **_kwargs: object) -> object:
+        launched.append("runner")
+        return sessions_module._HostLaunchAttempt(runner_id="runner_owning_replica")
+
+    class _TunnelRegistry:
+        async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> object:
+            del timeout_s
+            return object()
+
+    def _record_stage(
+        _session_id: str, stage: str, error: str | None = None, **_kw: object
+    ) -> None:
+        stages.append((stage, error))
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume_noop)
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(sessions_module, "_publish_sandbox_status", _record_stage)
+
+    await sessions_module._run_managed_wake(
+        session_id=conv.id,
+        conv=conv,  # type: ignore[arg-type]
+        sandbox_config=config,
+        tracker=tracker,
+        conversation_store=SimpleNamespace(get_conversation=lambda _session_id: conv),  # type: ignore[arg-type]
+        host_store=host_store,
+        host_registry=SimpleNamespace(get=lambda _host_id: object()),  # type: ignore[arg-type]
+        tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
+    )
+
+    assert launched == ["runner"]
+    assert stages[-1] == ("ready", None)
+    assert launch.settled.is_set()
+    assert launch.error is None
+    assert tracker.get(conv.id) is None
 
 
 async def test_managed_wake_fails_when_runner_never_reconnects(
