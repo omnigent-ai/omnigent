@@ -924,23 +924,25 @@ class _RunnerCredentialNegotiation:
         if self.selected:
             return self.protocol
         response = client.get(url, headers=headers)
-        if response.status_code not in (404, 405):
-            response.raise_for_status()
-            try:
-                protocols = response.json()["protocols"]
-            except (ValueError, KeyError, TypeError) as exc:
-                raise RuntimeError("invalid runner credential protocol advertisement") from exc
-            if not isinstance(protocols, list) or not all(isinstance(p, str) for p in protocols):
-                raise RuntimeError("invalid runner credential protocol advertisement")
-            if RUNNER_CREDENTIAL_PROTOCOL in protocols:
-                self.protocol = RUNNER_CREDENTIAL_PROTOCOL
-            elif "legacy" in protocols:
-                self.protocol = None
-            else:
-                raise RuntimeError(
-                    "server advertises no supported runner credential protocol; "
-                    "update the runner or auth provider configuration"
-                )
+        if response.status_code in (404, 405):
+            # Older servers commit to this request protocol only after a mint succeeds.
+            return self.protocol
+        response.raise_for_status()
+        try:
+            protocols = response.json()["protocols"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError("invalid runner credential protocol advertisement") from exc
+        if not isinstance(protocols, list) or not all(isinstance(p, str) for p in protocols):
+            raise RuntimeError("invalid runner credential protocol advertisement")
+        if RUNNER_CREDENTIAL_PROTOCOL in protocols:
+            self.protocol = RUNNER_CREDENTIAL_PROTOCOL
+        elif "legacy" in protocols:
+            self.protocol = None
+        else:
+            raise RuntimeError(
+                "server advertises no supported runner credential protocol; "
+                "update the runner or auth provider configuration"
+            )
         self.selected = True
         return self.protocol
 
@@ -982,6 +984,8 @@ class _ManagedMintTokenFactory:
         self._cached_token: str | None = None
         self._cached_expires_at = 0.0
         self._protocol_failure: tuple[str, httpx.Response] | None = None
+        self._admission_factory: Callable[[], str | None] | None = None
+        self._proxy_recovery_retry_at = 0.0
         # Serializes mint/latch state across concurrent callbacks so a
         # decline reset and a re-mint cannot interleave into duplicate
         # mints or a declined-latch alongside a freshly cached token.
@@ -1010,7 +1014,10 @@ class _ManagedMintTokenFactory:
 
     @property
     def uses_scoped_credentials(self) -> bool:
-        """Whether protocol selection requires scoped callback credentials."""
+        """Whether renewal must retain the scoped request protocol.
+
+        Acceptance by an older server does not verify the returned token's scope.
+        """
         return (
             self._negotiation.selected and self._negotiation.protocol == RUNNER_CREDENTIAL_PROTOCOL
         )
@@ -1032,6 +1039,13 @@ class _ManagedMintTokenFactory:
             and now < self._cached_expires_at - _MANAGED_MINT_REFRESH_SKEW_S
         ):
             return self._cached_token
+        if (
+            recover_proxy_auth
+            and self.proxy_auth_failed
+            and self.uses_scoped_credentials
+            and time.monotonic() < self._proxy_recovery_retry_at
+        ):
+            return self._still_valid_cached_token(now)
         try:
             token, expires_at = _mint_managed_owner_token(
                 self._mint_url,
@@ -1092,18 +1106,7 @@ class _ManagedMintTokenFactory:
                 if cached is None:
                     self.proxy_auth_failed = True
                     if recover_proxy_auth and self.uses_scoped_credentials:
-                        try:
-                            admission_factory = _make_auth_token_factory(
-                                self._server_url,
-                                _allow_initial_token=False,
-                                _allow_delegated_mint=False,
-                            )
-                            admission_token = admission_factory() if admission_factory else None
-                        except (ValueError, OSError, ImportError, httpx.HTTPError):
-                            return None
-                        if admission_token:
-                            self._proxy_bearer = admission_token
-                            return self._call_locked(recover_proxy_auth=False)
+                        return self._recover_proxy_auth_locked()
                 return cached
             return self._still_valid_cached_token(now)
         except (httpx.HTTPError, ValueError, KeyError, OSError):
@@ -1112,12 +1115,34 @@ class _ManagedMintTokenFactory:
             # tunnel's / HTTP client's on-401 retry drive the next mint.
             return self._still_valid_cached_token(now)
         self.proxy_auth_failed = False
+        self._proxy_recovery_retry_at = 0.0
         self._cached_token = token
         self._cached_expires_at = expires_at
         # Promote the minted JWT to proxy bearer so subsequent refreshes
         # through the Apps proxy are authenticated with a valid credential.
         self._proxy_bearer = token
         return token
+
+    def _recover_proxy_auth_locked(self) -> str | None:
+        """Reuse the admission source and bound discovery after failed recovery."""
+        try:
+            try:
+                if self._admission_factory is None:
+                    self._admission_factory = _make_auth_token_factory(
+                        self._server_url,
+                        _allow_initial_token=False,
+                        _allow_delegated_mint=False,
+                    )
+                admission_token = self._admission_factory() if self._admission_factory else None
+            except (ValueError, OSError, ImportError, httpx.HTTPError):
+                return None
+            if not admission_token:
+                return None
+            self._proxy_bearer = admission_token
+            return self._call_locked(recover_proxy_auth=False)
+        finally:
+            if self.proxy_auth_failed:
+                self._proxy_recovery_retry_at = time.monotonic() + _AUTH_DISCOVERY_RETRY_INTERVAL_S
 
     def call_with_declined(self) -> tuple[str | None, bool]:
         """Return ``(token, declined)`` as one atomic snapshot.
@@ -1208,15 +1233,17 @@ def _mint_managed_owner_token(
         **databricks_request_headers(server_url, bearer_token=proxy_bearer),
     }
     with httpx.Client(timeout=10.0, trust_env=not is_loopback_url(server_url)) as client:
-        protocol = (negotiation or _RunnerCredentialNegotiation()).select(
-            client, mint_url, headers
-        )
+        negotiation = negotiation or _RunnerCredentialNegotiation()
+        protocol = negotiation.select(client, mint_url, headers)
         if protocol is not None:
             headers[RUNNER_CREDENTIAL_PROTOCOL_HEADER] = protocol
         response = client.post(mint_url, headers=headers)
         response.raise_for_status()
         payload = response.json()
-    return payload["token"], float(payload["expires_at"])
+    token, expires_at = payload["token"], float(payload["expires_at"])
+    # Keep the accepted request protocol; old servers may still issue a legacy token.
+    negotiation.selected = True
+    return token, expires_at
 
 
 def _runner_tunnel_binding_token_from_env() -> str | None:

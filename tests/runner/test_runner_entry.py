@@ -19,6 +19,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -790,10 +791,12 @@ def test_managed_mint_factory_serves_cached_token_when_refresh_fails(
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("refusal_status", [400, 401, 403])
+@pytest.mark.parametrize("discovery_status", [404, 405])
+@pytest.mark.parametrize("refusal_status", [400, 401, 403, 404])
 def test_managed_mint_factory_no_factory_when_server_definitively_refuses(
     monkeypatch: pytest.MonkeyPatch,
     refusal_status: int,
+    discovery_status: int,
 ) -> None:
     """A probe-time mint refusal installs no factory → bare requests.
 
@@ -808,16 +811,14 @@ def test_managed_mint_factory_no_factory_when_server_definitively_refuses(
     :returns: None.
     """
 
-    def _refuses(
-        mint_url: str, server_url: str, binding_token: str, **_kw: object
-    ) -> tuple[str, float]:
-        """Reject the probe mint with the parametrized status."""
-        request = httpx.Request("POST", mint_url)
-        raise httpx.HTTPStatusError(
-            "refused", request=request, response=httpx.Response(refusal_status, request=request)
-        )
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(discovery_status if request.method == "GET" else refusal_status)
 
-    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _refuses)
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        "omnigent.runner._entry.httpx.Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(_handler), **kwargs),
+    )
 
     assert _make_managed_mint_factory("https://s.example.com", "btok") is None
 
@@ -930,7 +931,12 @@ def test_managed_mint_factory_declines_only_legacy_requests_after_boot_failure(
                 next(flow)
         flow.close()
     assert factory.declined is (protocol == "legacy")
-    assert len(calls) == (2 if protocol == "legacy" else 3)
+    if protocol == "legacy":
+        assert len(calls) == 2
+    elif status_code in (401, 403):
+        assert len(calls) == (2 if boot_blip else 1)
+    else:
+        assert len(calls) == 3
     assert len(discoveries) == 1
 
 
@@ -1559,11 +1565,16 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
     :param monkeypatch: Pytest environment patch fixture.
     :returns: None.
     """
+    from omnigent.runner._entry import _RunnerCredentialNegotiation
+
+    negotiation = _RunnerCredentialNegotiation()
+    discoveries = []
     captured: dict[str, str] = {}
 
     def _handler(request: httpx.Request) -> httpx.Response:
         """Capture the outgoing mint request and return a canned token."""
         if request.method == "GET":
+            discoveries.append(request)
             assert RUNNER_CREDENTIAL_PROTOCOL_HEADER not in request.headers
             assert request.headers[RUNNER_TUNNEL_TOKEN_HEADER] == "the-binding-token"
             return (
@@ -1571,6 +1582,7 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
                 if isinstance(advertised, int)
                 else httpx.Response(200, json={"protocols": advertised})
             )
+        assert negotiation.selected == (not isinstance(advertised, int) or bool(captured))
         captured["url"] = str(request.url)
         captured["method"] = request.method
         captured["binding_token"] = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER, "")
@@ -1591,6 +1603,7 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
         "https://s.example.com/v1/runners/runner_token_abc/token",
         "https://s.example.com",
         "the-binding-token",
+        negotiation=negotiation,
     )
 
     assert token == "owner-jwt"
@@ -1599,6 +1612,15 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
     assert captured["binding_token"] == "the-binding-token"
     assert captured["credential_protocol"] == expected_protocol
     assert captured["url"].endswith("/v1/runners/runner_token_abc/token")
+
+    assert negotiation.selected
+    _mint_managed_owner_token(
+        "https://s.example.com/v1/runners/runner_token_abc/token",
+        "https://s.example.com",
+        "the-binding-token",
+        negotiation=negotiation,
+    )
+    assert len(discoveries) == 1
 
 
 def test_mint_managed_owner_token_includes_proxy_bearer_when_provided(
@@ -1638,6 +1660,19 @@ def test_delegated_factory_recovers_proxy_admission_without_changing_callback_sc
     monkeypatch: pytest.MonkeyPatch, recovery: str, rejection_status: int
 ) -> None:
     """Proxy renewal retains the negotiated factory and never returns owner credentials."""
+    from omnigent.runner import _entry as entry
+
+    clock = [100.0]
+    monkeypatch.setattr(entry, "time", SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+    admission_discoveries = []
+    original_factory = entry._make_auth_token_factory
+
+    def _counted_factory(*args: Any, **kwargs: Any) -> Callable[[], str | None] | None:
+        if not kwargs.get("_allow_delegated_mint", True):
+            admission_discoveries.append(1)
+        return original_factory(*args, **kwargs)
+
+    monkeypatch.setattr(entry, "_make_auth_token_factory", _counted_factory)
     mint_call_bearers: list[str | None] = []
     discoveries = []
     credential_reads = []
@@ -1712,6 +1747,27 @@ def test_delegated_factory_recovers_proxy_admission_without_changing_callback_sc
     assert mint_call_bearers[2:] == (
         [] if recovery == "unavailable" else ["Bearer owner-admission-token"]
     )
+
+    assert len(admission_discoveries) == 1
+    if recovery in ("unavailable", "rejected"):
+        first_counts = (len(mint_call_bearers), len(credential_reads))
+        for _ in range(3):
+            assert factory() is None
+        assert (len(mint_call_bearers), len(credential_reads)) == first_counts
+        assert len(admission_discoveries) == 1
+        clock[0] += entry._AUTH_DISCOVERY_RETRY_INTERVAL_S
+        assert factory() is None
+        assert len(mint_call_bearers) > first_counts[0]
+        assert len(credential_reads) > first_counts[1]
+        assert len(admission_discoveries) == (2 if recovery == "unavailable" else 1)
+    elif recovery == "success":
+        factory._cached_expires_at = 0.0
+        assert factory() == "renewed-scoped-jwt"
+        assert len(admission_discoveries) == 1
+    else:
+        with pytest.raises(httpx.HTTPStatusError):
+            factory()
+        assert len(admission_discoveries) == 1
 
 
 def test_runner_databricks_auth_injects_fresh_token_per_request() -> None:
