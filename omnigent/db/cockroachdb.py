@@ -59,6 +59,13 @@ def _parse_crdb_server_version(raw: str) -> Version:
             f"CockroachDB {version} is unsupported. Omnigent requires "
             f"CockroachDB {CRDB_MINIMUM_VERSION} or newer."
         )
+    # Remove support for pre-v25.2 releases in Omnigent v0.24.0.
+    if version < Version("25.2"):
+        _logger.warning(
+            "CockroachDB %s support is deprecated and will be removed in "
+            "Omnigent v0.24.0. Upgrade to CockroachDB v25.2.10 or newer.",
+            version,
+        )
     if version not in CRDB_TESTED_VERSIONS:
         _logger.warning(
             "CockroachDB %s is newer than the minimum but outside Omnigent's "
