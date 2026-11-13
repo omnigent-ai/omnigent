@@ -81,27 +81,32 @@ def register_items_routes(
     """Register the items routes on router."""
 
     async def _may_settle_children(
-        user_id: str | None, session_id: str, displayed_level: int | None
+        user_id: str | None, parent: Conversation, displayed_level: int | None
     ) -> bool:
-        """Whether the caller may settle the orphaned children of *session_id*.
+        """Whether the caller may settle the orphaned children of *parent*.
 
-        The displayed level skips the parent chain, so a sub-agent whose READ
-        is inherited from its root reads as ``None``; ownership is therefore
-        resolved through the chain. Permissions off settles for everyone.
+        Only a top-level session's displayed level is authoritative. A
+        sub-agent's direct grant can be narrower than what its parent chain
+        gives, so it always resolves OWNER through the chain. Permissions off
+        settles for everyone.
 
         :param user_id: The authenticated caller.
-        :param session_id: The parent whose children are listed.
+        :param parent: The session whose children are listed.
         :param displayed_level: The caller's level from the access check.
         :returns: ``True`` when the caller owns the parent (or is admin).
         """
         if permission_store is None:
             return True
-        if displayed_level is not None and displayed_level >= LEVEL_OWNER:
+        if (
+            parent.parent_conversation_id is None
+            and displayed_level is not None
+            and displayed_level >= LEVEL_OWNER
+        ):
             return True
         return await asyncio.to_thread(
             check_session_access,
             user_id,
-            session_id,
+            parent.id,
             LEVEL_OWNER,
             permission_store,
             conversation_store,
@@ -257,7 +262,7 @@ def register_items_routes(
             parent = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if parent is None:
             raise _session_not_found()
-        may_settle = await _may_settle_children(user_id, session_id, access.level)
+        may_settle = await _may_settle_children(user_id, parent, access.level)
         if descendants:
             subtree = await _list_descendant_sessions(
                 request, parent, may_settle, limit=limit, after=after, max_depth=max_depth

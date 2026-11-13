@@ -3281,6 +3281,21 @@ async def test_list_child_sessions_allows_read_grant(
     assert grandchild.id in [row["id"] for row in resp.json()["data"]]
     assert conv_store.get_conversation(grandchild.id).live_status == "running"  # type: ignore[union-attr]
 
+    # A direct OWNER grant on the child shows OWNER here, but user-b still
+    # inherits only READ through the root, so the grandchild must not settle.
+    # The grant API tops out at MANAGE, so seed OWNER in the store as ownership does.
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    perm_store.ensure_user("user-b")
+    perm_store.grant("user-b", child.id, LEVEL_OWNER)
+    resp = await auth_client.get(
+        f"/v1/sessions/{listing_id}/child_sessions",
+        params=listing_params,
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert grandchild.id in [row["id"] for row in resp.json()["data"]]
+    assert conv_store.get_conversation(grandchild.id).live_status == "running"  # type: ignore[union-attr]
+
     resp = await auth_client.get(
         f"/v1/sessions/{listing_id}/child_sessions",
         params=listing_params,
