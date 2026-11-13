@@ -5268,8 +5268,9 @@ def test_pop_caller_settings_passes_unreadable_inputs_through(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("chdir", [None, "overlay-subdir"])
 async def test_caller_settings_reuses_existing_terminal_filesystem_view(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, chdir: str | None
 ) -> None:
     from unittest.mock import AsyncMock, Mock
 
@@ -5289,7 +5290,9 @@ async def test_caller_settings_reuses_existing_terminal_filesystem_view(
         private_dir=tmp_path,
         os_env=environment,
         sandbox_policy=Mock(active=True),
-        args=augment_claude_args(
+        command="env" if chdir else "claude",
+        args=(["-C", chdir, "claude"] if chdir else [])
+        + augment_claude_args(
             ("--settings", "settings.json"), bridge_dir=tmp_path, defer_caller_settings=True
         ),
     )
@@ -5301,7 +5304,9 @@ async def test_caller_settings_reuses_existing_terminal_filesystem_view(
     settings = _load_invocation_settings(instance.args)
     assert settings["env"]["SETTINGS_VIEW"] == "overlay"
     environment.read.assert_awaited_once_with(
-        str(path), max_bytes=claude_native_bridge._CALLER_SETTINGS_MAX_BYTES, regular_only=True
+        str(tmp_path / chdir / path.name if chdir else path),
+        max_bytes=claude_native_bridge._CALLER_SETTINGS_MAX_BYTES,
+        regular_only=True,
     )
     environment.close.assert_not_called()
     assert json.loads(path.read_text())["env"]["SETTINGS_VIEW"] == "host"

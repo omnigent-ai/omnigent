@@ -1395,12 +1395,14 @@ async def _auto_create_claude_terminal_for_test(
             ["--", "--settings", '{"env":{"ORDER":"configured","CONFIG_ONLY":"yes"}}'],
         ),
         ("claude", ["--settings", '{"env":{"ORDER":"configured","CONFIG_ONLY":"yes"}}']),
+        ("env", ["-C", "sub", "claude", "--settings", "caller.json"]),
     ],
     ids=[
         "configured-wrapper",
         "configured-subcommand-wrapper",
         "wrapper-claude-settings",
         "configured-claude-settings",
+        "configured-env-chdir-settings",
     ],
 )
 async def test_auto_create_claude_settings_preserve_configured_argument_boundary(
@@ -1415,6 +1417,9 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
     from omnigent.runner.resource_registry import SessionResourceRegistry
 
     session_id = "conv_configured_settings"
+    (bridge_dir / "caller.json").write_text('{"env":{"CONFIG_ONLY":"parent"}}')
+    (bridge_dir / "sub").mkdir()
+    (bridge_dir / "sub" / "caller.json").write_text('{"env":{"CONFIG_ONLY":"yes"}}')
     registry = Mock(spec=SessionResourceRegistry)
     monkeypatch.setattr(
         orchestration,
@@ -1430,6 +1435,7 @@ async def test_auto_create_claude_settings_preserve_configured_argument_boundary
             "claude",
             "main",
             TerminalEnvSpec(
+                command=kwargs["spec"].command,
                 args=kwargs["spec"].args,
                 os_env=OSEnvSpec(cwd=str(bridge_dir), sandbox=OSEnvSandboxSpec(type="none")),
             ),

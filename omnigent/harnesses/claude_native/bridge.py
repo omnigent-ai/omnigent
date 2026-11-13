@@ -3585,6 +3585,9 @@ async def finalize_claude_caller_settings(
     existing helper under an active sandbox; unsandboxed panes use bounded reads.
     The separate framework baseline is opened without following a symlink.
     """
+    from omnigent.host.harness_startup import env_wrapper_chdir
+    from omnigent.inner.terminal import terminal_pane_environment
+
     start = await asyncio.to_thread(_claude_settings_boundary, bridge_dir, instance.args)
     prefix, args = instance.args[:start], instance.args[start:]
     environment = instance.os_env
@@ -3592,6 +3595,16 @@ async def finalize_claude_caller_settings(
         raise ValueError("caller settings require the terminal filesystem environment")
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     workspace = environment.cwd
+    chdir = env_wrapper_chdir(
+        instance.command,
+        instance.args,
+        terminal_pane_environment(
+            inherit_env=instance.inherit_env, env=instance.env, env_unset=instance.env_unset
+        ),
+    )
+    if chdir is not None:
+        # Resolve wrapper paths through the terminal view, including overlay symlinks.
+        workspace = workspace / chdir
     paths: set[Path] = set()
     has_bridge_settings = False
 
