@@ -7332,28 +7332,19 @@ def _make_recovery_fake_sdk(responses=()):
     from claude_agent_sdk.types import ResultMessage as SDKResultMessage
     from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
     from claude_agent_sdk.types import TextBlock as SDKTextBlock
+    from claude_agent_sdk.types import ToolUseBlock as SDKToolUseBlock
 
     class _Sentinel:
         pass
 
-    sdk_result = SDKResultMessage(
-        subtype="result",
-        session_id="s1",
-        result="recovered",
-        total_cost_usd=0.0,
-        duration_ms=100,
-        duration_api_ms=80,
-        is_error=False,
-        num_turns=1,
-        usage={"input_tokens": 10, "output_tokens": 5},
-    )
+    sdk_result = _sdk_result()
     pending_responses = list(responses)
 
     class _FakeSDK:
         AssistantMessage = SDKAssistantMessage
         TextBlock = SDKTextBlock
         ThinkingBlock = _Sentinel
-        ToolUseBlock = _Sentinel
+        ToolUseBlock = SDKToolUseBlock
         UserMessage = _Sentinel
         SystemMessage = _Sentinel
         StreamEvent = SDKStreamEvent
@@ -7396,10 +7387,12 @@ def _sdk_result(result="recovered", *, is_error=False, model_usage=None):
         subtype="result",
         session_id="s1",
         result=result,
+        total_cost_usd=0.0,
         duration_ms=100,
         duration_api_ms=80,
         is_error=is_error,
         num_turns=1,
+        usage={"input_tokens": 10, "output_tokens": 5},
         model_usage=model_usage,
     )
 
@@ -7639,13 +7632,23 @@ async def test_rebuilt_executor_replays_within_the_window_claude_code_reported()
         ("API Error: 400 prompt is too long: 9000 tokens > 2400 maximum", 3, "turn-3"),
     ],
 )
+@pytest.mark.parametrize("synthetic_error_reply", [False, True])
 async def test_rejected_history_replay_is_retried_once_with_less_history(
-    failure, omitted, oldest_kept
+    failure, omitted, oldest_kept, synthetic_error_reply
 ) -> None:
     """A fresh client that rejects its replay as too long retries with much less history."""
+    from claude_agent_sdk.types import AssistantMessage as SDKAssistantMessage
+    from claude_agent_sdk.types import TextBlock as SDKTextBlock
+
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
-    fake_sdk = _make_recovery_fake_sdk([[_sdk_result(failure, is_error=True)]])
+    rejection = [_sdk_result(failure, is_error=True)]
+    if synthetic_error_reply:
+        error_reply = SDKAssistantMessage(
+            content=[SDKTextBlock(text=failure)], model="<synthetic>", error="invalid_request"
+        )
+        rejection.insert(0, error_reply)
+    fake_sdk = _make_recovery_fake_sdk([rejection])
     executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=16_800)
     messages = [*_long_prior_messages(), {"role": "user", "content": "What next?"}]
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
@@ -7667,13 +7670,15 @@ async def test_rejected_history_replay_is_retried_once_with_less_history(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "case", ["no-history", "model-responded", "unstreamed-reply", "retry-rejected"]
+    "case",
+    ["no-history", "model-responded", "unstreamed-reply", "unstreamed-tool-use", "retry-rejected"],
 )
 async def test_prompt_too_long_fails_the_turn_without_another_replay(case) -> None:
     """Only a first replay that drew no model response is retried, and only once."""
     from claude_agent_sdk.types import AssistantMessage as SDKAssistantMessage
     from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
     from claude_agent_sdk.types import TextBlock as SDKTextBlock
+    from claude_agent_sdk.types import ToolUseBlock as SDKToolUseBlock
 
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
@@ -7692,6 +7697,9 @@ async def test_prompt_too_long_fails_the_turn_without_another_replay(case) -> No
     elif case == "unstreamed-reply":
         reply = SDKAssistantMessage(content=[SDKTextBlock(text="Partial.")], model="m")
         responses = [[reply, too_long]]
+    elif case == "unstreamed-tool-use":
+        tool_use = SDKToolUseBlock(id="tool-1", name="Bash", input={"command": "date"})
+        responses = [[SDKAssistantMessage(content=[tool_use], model="m"), too_long]]
     fake_sdk = _make_recovery_fake_sdk(responses)
     executor = ClaudeSDKExecutor(model="claude-sonnet-4-5", context_window=16_800)
     with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
