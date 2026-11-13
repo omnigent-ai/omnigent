@@ -15,13 +15,15 @@ from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 
 from omnigent.db.db_models import (
+    ConversationBase,
+    SqlConversation,
     SqlFile,
     SqlSessionSpawn,
     SqlSessionSpawnEpoch,
     SqlSessionSpawnMaterialization,
     SqlSessionSpawnPayload,
 )
-from omnigent.db.utils import _build_alembic_config
+from omnigent.db.utils import _build_alembic_config, _ensure_conversation_tables
 
 _PREVIOUS = "27d16059fab9"
 _BRANCH_POINT = "b4e2d7a91c35"
@@ -151,6 +153,50 @@ def test_upgrade_matches_models_and_empty_rollback_preserves_existing_files(data
         ]
     _migrate(database, _REVISION)
     assert set(_TABLES) <= set(sa.inspect(engine).get_table_names())
+
+
+def test_split_conversation_initialization_preserves_data_without_metadata_migrations(
+    tmp_path: Path,
+) -> None:
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'conversations.db'}")
+    marker = SqlSessionSpawnMaterialization.__table__
+    existing = {
+        "workspace_id": 0,
+        "id": "a" * 32,
+        "root_conversation_id": "a" * 32,
+        "created_at": 1,
+        "updated_at": 1,
+        "title": "kept conversation",
+    }
+    try:
+        ConversationBase.metadata.create_all(
+            engine,
+            tables=[
+                table for table in ConversationBase.metadata.sorted_tables if table is not marker
+            ],
+        )
+        with engine.begin() as connection:
+            connection.execute(SqlConversation.__table__.insert(), existing)
+
+        _ensure_conversation_tables(engine)
+        with engine.begin() as connection:
+            connection.execute(marker.insert(), _ROWS[marker.name])
+        _ensure_conversation_tables(engine)
+
+        tables = set(sa.inspect(engine).get_table_names())
+        assert marker.name in tables
+        assert (set(_TABLES) - {marker.name}).isdisjoint(tables)
+        assert "files" not in tables and "alembic_version" not in tables
+        with engine.connect() as connection:
+            assert connection.execute(
+                sa.select(SqlConversation.id, SqlConversation.title)
+            ).all() == [(existing["id"], existing["title"])]
+            assert (
+                connection.execute(sa.select(SqlSessionSpawnMaterialization.nonce)).scalar_one()
+                == (_ROWS[marker.name]["nonce"])
+            )
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.parametrize("previous", ["as1b2c3d4e5f", "c6e9a2b7d481"])
