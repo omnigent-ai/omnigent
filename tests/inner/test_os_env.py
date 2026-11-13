@@ -868,8 +868,9 @@ def test_close_stops_the_helper_and_releases_its_spawner_thread(
     tmp_path: Path, backend: str
 ) -> None:
     """Closing ends the helper and its spawning thread, and can be repeated."""
+    (tmp_path / "notes.txt").write_text("kept\n")
     os_env = _helper_env(tmp_path.resolve(), backend)
-    assert asyncio.run(os_env.shell("true")).get("exit_code") == 0
+    assert asyncio.run(os_env.read("notes.txt")).get("content") == "kept\n"
     helper = os_env._helper._proc
     assert helper is not None
     spawner_threads = list(os_env._helper._spawner._threads)

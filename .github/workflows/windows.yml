@@ -119,6 +119,22 @@ jobs:
           tests/inner/test_codex_staging.py::test_skills_refresh_rejects_junction_root
           -p no:cacheprovider -q
 
+      - name: OS-tool helper process tests (hard)
+        run: >-
+          uv run pytest
+          tests/inner/test_os_env.py::test_read_is_answered_by_a_new_helper_when_the_first_dies_before_replying[none]
+          tests/inner/test_os_env.py::test_close_stops_the_helper_and_releases_its_spawner_thread[none]
+          tests/runner/test_runner_dispatch.py::test_runner_os_env_change_restoring_the_original_leaves_changes[partially-reverted]
+          --reruns 0 -p no:cacheprovider -v
+
+      - name: OS-tool lease ownership tests (hard)
+        run: >-
+          uv run pytest
+          tests/runner/test_runner_dispatch.py::test_runner_os_env_error_is_httpx_transport_safe
+          tests/runner/test_resource_registry.py::test_tool_environment_reuse_checks_session_spec_and_resolved_paths
+          -m "not posix_only"
+          --reruns 0 -p no:cacheprovider -v
+
       - name: Broader unit sweep (non-blocking)
         continue-on-error: true
         run: >-
