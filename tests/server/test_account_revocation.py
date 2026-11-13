@@ -1838,6 +1838,35 @@ def test_runner_snapshot_omits_sidebar_family_metadata(setup_app, owner):
     assert runner.get(f"/v1/sessions/{source_id}").status_code == 403
 
 
+@pytest.mark.parametrize("owner", ["alice", "admin"])
+@pytest.mark.parametrize("source_in_scope", [False, True])
+def test_sidebar_family_creation_requires_interactive_credentials(
+    setup_app, monkeypatch, owner, source_in_scope
+):
+    from omnigent.server.feature_flags import resolve_feature_flags
+
+    admin, alice, stores, _ = setup_app
+    owner_client = alice if owner == "alice" else admin
+    monkeypatch.setattr(
+        owner_client.app.state,
+        "feature_flags",
+        resolve_feature_flags({"OMNIGENT_FEATURES": "sibling_sessions"}),
+    )
+    runner, source_id, _runner_id = _runner_for_session(owner_client, stores, owner)
+    conversations = stores["conversation_store"]
+    source = conversations.get_conversation(source_id)
+    if not source_in_scope:
+        conversations.replace_runner_id(source_id, "other-runner")
+    body = {"agent_id": source.agent_id, "sibling_source_id": source_id}
+    refused = runner.post("/v1/sessions", json=body)
+    assert refused.status_code == 403, refused.text
+    assert "runner_scope_denied" in refused.text
+    assert conversations.get_conversation(source_id).family_id is None
+    interactive = owner_client.post("/v1/sessions", json=body)
+    assert interactive.status_code == 201, interactive.text
+    assert interactive.json()["family"]["id"] == source_id
+
+
 def test_runner_resource_copy_checks_ancestor_scope(setup_app):
     _, alice, stores, _ = setup_app
     runner, bound, runner_id = _runner_for_session(alice, stores, "alice")

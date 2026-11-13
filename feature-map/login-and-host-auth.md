@@ -64,8 +64,8 @@ be able to write resources without a separate Omnigent account.
   callback succeeds, another runner's session is denied, permission denials do
   not renew credentials, shared-agent writes and session deletion are denied,
   forks retain their source project, child and descendant listings hide foreign
-  branches behind opaque cursors, sidebar family metadata is omitted from scoped
-  snapshots, and native approval cards and cleanup stay within the runner's scope.
+  branches behind opaque cursors, sidebar families require interactive credentials,
+  and native approval cards and cleanup stay within the runner's scope.
   Strict mode rejects incompatible runners
   until they are upgraded. New named child spawns on supporting servers reserve
   before first-input admission; failed pending attempts can be aborted, while
