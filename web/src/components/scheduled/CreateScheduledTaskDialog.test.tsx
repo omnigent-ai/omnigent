@@ -12,6 +12,7 @@ import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 import React from "react";
 import userEvent from "@testing-library/user-event";
 import {
+  act,
   cleanup,
   fireEvent,
   render as renderBase,
@@ -667,13 +668,15 @@ describe("prompt-first automation setup", () => {
   });
 
   it("shows DS tooltips for the modal controls", async () => {
+    vi.useFakeTimers();
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
     async function expectTooltip(testId: string, label: string) {
       const trigger = screen.getByTestId(testId);
       fireEvent.pointerMove(trigger.parentElement!, { pointerType: "mouse" });
-      expect(await screen.findByRole("tooltip", {}, { timeout: 2000 })).toHaveTextContent(label);
+      await act(() => vi.advanceTimersByTimeAsync(1000));
+      expect(screen.getByRole("tooltip")).toHaveTextContent(label);
       fireEvent.keyDown(trigger, { key: "Escape" });
-      await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+      expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
     }
     await expectTooltip("task-trigger-type", "Trigger type");
     await expectTooltip("task-schedule-trigger", "Schedule");
@@ -2213,32 +2216,34 @@ describe("CreateScheduledTaskDialog submit", () => {
     );
   });
 
-  it.each(["FREQ=DAILY;BYHOUR=9;BYMINUTE=0", "FREQ=MINUTELY;INTERVAL=60"])(
-    "saves an inclusive end date in the selected timezone for %s",
-    async (rrule) => {
-      vi.useFakeTimers({ toFake: ["Date"] });
-      vi.setSystemTime(new Date("2026-10-01T00:00:00Z"));
-      render(
-        <CreateScheduledTaskDialog
-          open
-          onOpenChange={vi.fn()}
-          editingTask={scheduledTask({ rrule, timezone: "Asia/Singapore" })}
-        />,
-      );
+  describe.each(["FREQ=DAILY;BYHOUR=9;BYMINUTE=0", "FREQ=MINUTELY;INTERVAL=60"])(
+    "inclusive end date for %s",
+    (rrule) => {
       const minutely = rrule.includes("MINUTELY");
-      if (!minutely) {
-        expect(screen.getByLabelText("Time")).not.toHaveAttribute("aria-invalid");
-        expect(
-          within(screen.getByTestId("schedule-fields")).getByLabelText("Timezone"),
-        ).toHaveTextContent("Asia/Singapore");
-      }
-      selectScheduleEnding("On date");
-      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-      if (minutely) {
-        expect(
-          within(screen.getByTestId("schedule-ending-fields")).getByLabelText("Timezone"),
-        ).toHaveTextContent("Asia/Singapore");
-      }
+      beforeEach(() => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        vi.setSystemTime(new Date("2026-10-01T00:00:00Z"));
+        render(
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({ rrule, timezone: "Asia/Singapore" })}
+          />,
+        );
+        if (!minutely) {
+          expect(screen.getByLabelText("Time")).not.toHaveAttribute("aria-invalid");
+          expect(
+            within(screen.getByTestId("schedule-fields")).getByLabelText("Timezone"),
+          ).toHaveTextContent("Asia/Singapore");
+        }
+        selectScheduleEnding("On date");
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+        if (minutely) {
+          expect(
+            within(screen.getByTestId("schedule-ending-fields")).getByLabelText("Timezone"),
+          ).toHaveTextContent("Asia/Singapore");
+        }
+      });
       async function chooseTimezone(search: string, option: string) {
         if (!minutely) openAutomationSection("Schedule");
         await userEvent.click(screen.getByLabelText("Timezone"));
@@ -2248,34 +2253,45 @@ describe("CreateScheduledTaskDialog submit", () => {
         await userEvent.click(await screen.findByRole("menuitemradio", { name: option }));
         if (!minutely) openTopLevelPopover("task-ending-trigger");
       }
-      for (const value of ["0002-06-10", "0020-06-10", "0203-06-10"]) {
-        fireEvent.change(screen.getByLabelText("End date"), { target: { value } });
+      it("rejects past dates without leaving an error after correction", () => {
+        for (const value of ["0002-06-10", "0020-06-10", "0203-06-10"]) {
+          fireEvent.change(screen.getByLabelText("End date"), { target: { value } });
+          expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+          const dateField = screen.getByLabelText("End date");
+          expect(dateField).toHaveAttribute("aria-invalid", "true");
+          expect(dateField).toHaveAccessibleDescription("Choose an end date in the future.");
+          expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
+        }
+        fireEvent.change(screen.getByLabelText("End date"), { target: { value: "2027-06-10" } });
+        expect(screen.getByLabelText("End date")).not.toHaveAttribute("aria-invalid");
+        expect(screen.getByLabelText("End date")).not.toHaveAttribute("aria-describedby");
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+      });
+      it("revalidates the maximum date when its timezone changes", async () => {
+        await chooseTimezone("New_York", "America/New York");
+        fireEvent.change(screen.getByLabelText("End date"), { target: { value: "9999-12-31" } });
+        expect(screen.getByLabelText("End date")).toHaveValue("9999-12-31");
+        expect(screen.getByTestId("schedule-ending-error")).toHaveTextContent(
+          "This end date is unavailable in this timezone",
+        );
         expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-        const dateField = screen.getByLabelText("End date");
-        expect(dateField).toHaveAttribute("aria-invalid", "true");
-        expect(dateField).toHaveAccessibleDescription("Choose an end date in the future.");
-        expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
-      }
-      await chooseTimezone("New_York", "America/New York");
-      fireEvent.change(screen.getByLabelText("End date"), { target: { value: "9999-12-31" } });
-      expect(screen.getByLabelText("End date")).toHaveValue("9999-12-31");
-      expect(screen.getByTestId("schedule-ending-error")).toHaveTextContent(
-        "This end date is unavailable in this timezone",
-      );
-      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-      await chooseTimezone("Singapore", "Asia/Singapore");
-      expect(screen.getByLabelText("End date")).toHaveValue("9999-12-31");
-      expect(screen.queryByTestId("schedule-ending-error")).not.toBeInTheDocument();
-      fireEvent.change(screen.getByLabelText("End date"), { target: { value: "2027-06-10" } });
-      await chooseTimezone("New_York", "America/New York");
-      expect(screen.getByLabelText("End date")).toHaveValue("2027-06-10");
-      expect(screen.getByLabelText("End date")).not.toHaveAttribute("aria-invalid");
-      expect(screen.getByLabelText("End date")).not.toHaveAttribute("aria-describedby");
-      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-      expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(
-        `${rrule};UNTIL=20270611T035959Z`,
-      );
+        await chooseTimezone("Singapore", "Asia/Singapore");
+        expect(screen.getByLabelText("End date")).toHaveValue("9999-12-31");
+        expect(screen.queryByTestId("schedule-ending-error")).not.toBeInTheDocument();
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+      });
+      it("saves the inclusive date after changing the selected timezone", async () => {
+        fireEvent.change(screen.getByLabelText("End date"), { target: { value: "2027-06-10" } });
+        await chooseTimezone("New_York", "America/New York");
+        expect(screen.getByLabelText("End date")).toHaveValue("2027-06-10");
+        expect(screen.getByLabelText("End date")).not.toHaveAttribute("aria-invalid");
+        expect(screen.getByLabelText("End date")).not.toHaveAttribute("aria-describedby");
+        fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+        await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+        expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(
+          `${rrule};UNTIL=20270611T035959Z`,
+        );
+      });
     },
   );
 
