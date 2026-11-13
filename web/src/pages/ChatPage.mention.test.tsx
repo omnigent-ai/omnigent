@@ -17,6 +17,7 @@ import { useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import { swipeDown } from "@/test/touchGestures";
+import { mockMobileViewport } from "@/test/viewport";
 
 // Drill-down "@"-mention browses one directory at a time, so the test stubs
 // both sources: the root listing (useWorkspaceAllFiles) and the per-directory
@@ -495,12 +496,7 @@ describe("Composer @-file-mention browser (native sessions)", () => {
   });
 
   it("keeps the keyboard up while the mobile mention menu scrolls", () => {
-    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
-    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
-      ...mediaQuery,
-      media: query,
-      matches: query === "(max-width: 767.98px)",
-    }));
+    mockMobileViewport();
     renderWithTooltips(
       <div className="app-shell">
         <Composer {...composerProps()} />
@@ -512,6 +508,8 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(textarea()).toHaveFocus();
     expect(textarea()).toHaveValue("@");
     expect(screen.getByTitle("Open src")).toBeVisible();
+    swipeDown(document.querySelector(".app-shell")!);
+    expect(textarea()).not.toHaveFocus();
   });
 
   it("Escape closes the mention menu", () => {

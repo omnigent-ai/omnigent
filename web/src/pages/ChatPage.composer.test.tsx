@@ -28,6 +28,7 @@ import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { swipeDown } from "@/test/touchGestures";
+import { mockMobileViewport } from "@/test/viewport";
 import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
 import {
   clearSessionDrafts,
@@ -310,13 +311,7 @@ function textarea() {
 
 /** Render on a phone-sized viewport inside the app shell the swipe gesture listens on. */
 function renderMobileInShell(ui: ReactElement) {
-  const mediaQuery = window.matchMedia("(max-width: 767.98px)");
-  const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
-    ...mediaQuery,
-    media: query,
-    matches: query === "(max-width: 767.98px)",
-  }));
-  onTestFinished(() => matchMedia.mockRestore());
+  mockMobileViewport();
   return render(
     <MemoryRouter>
       <div className="app-shell">{ui}</div>
@@ -324,12 +319,15 @@ function renderMobileInShell(ui: ReactElement) {
   );
 }
 
-/** Swiping down inside an open composer menu keeps focus, draft, and menu. */
+/** Swiping down inside an open composer menu keeps focus, draft, and menu,
+ * while the same swipe elsewhere in the shell still dismisses. */
 function expectSwipeKeepsMenu(menuTestId: string, draft: string) {
   swipeDown(screen.getByTestId(menuTestId));
   expect(textarea()).toHaveFocus();
   expect(textarea()).toHaveValue(draft);
   expect(screen.getByTestId(menuTestId)).toBeVisible();
+  swipeDown(document.querySelector(".app-shell")!);
+  expect(textarea()).not.toHaveFocus();
 }
 
 function forceDesktopCoarsePointer(): () => void {

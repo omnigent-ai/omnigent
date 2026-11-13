@@ -17,10 +17,9 @@ export const DISMISS_HOLD_MS = 500;
 // downward scrolling must keep the keyboard up.
 export const KEEPS_KEYBOARD_SELECTOR = "[data-keeps-keyboard]";
 
-/** True for touches outside `surface`, on elements with their own touch
- * handling, in marked menus, or in overlays that don't host the focused field. */
+/** True for touches on elements with their own touch handling, in marked
+ * menus, or in overlays inside `surface` that don't host the focused field. */
 function ignoresTouch(target: Element, surface: Element, focused: Element): boolean {
-  if (!surface.contains(target)) return true;
   if (target.closest(OWN_TOUCH_SELECTOR) || target.closest(KEEPS_KEYBOARD_SELECTOR)) return true;
   for (let node: Element | null = target; node && node !== surface; node = node.parentElement) {
     if (getComputedStyle(node).position === "fixed" && !node.contains(focused)) return true;
