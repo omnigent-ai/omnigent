@@ -15,7 +15,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -865,13 +865,13 @@ def _hold_restart_attach_check(
     """
     checking, release = threading.Event(), threading.Event()
 
-    def _held_attach_check(_socket: str, _target: str) -> float | None:
+    def _held_attach_check(_socket: str, _target: str) -> bool | None:
         checking.set()
         release.wait(5)
-        return None
+        return False
 
     monkeypatch.setattr(
-        "omnigent.native.native_cost_popup._tmux_last_client_input_at", _held_attach_check
+        "omnigent.native.native_cost_popup._tmux_client_attached", _held_attach_check
     )
     return checking, release
 
@@ -924,35 +924,15 @@ _TERMINAL_TURN = {"type": "external_session_status", "data": {"status": "running
 
 
 @pytest.mark.asyncio
-async def test_mcp_status_names_a_claude_server_signed_in_since_the_pane_started(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """/mcp offers Reconnect for a server Claude Code could not connect before sign-in."""
-    conv_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
-    app, _closes, _relaunched, statuses = await _open_claude_native_session_before_sign_in(
-        monkeypatch, tmp_path, conv_id
-    )
-
-    async with _runner_client(app) as client:
-        before = await client.get(f"/v1/sessions/{conv_id}/live-mcp-servers")
-        statuses["linear"] = "connected"
-        after = await client.get(f"/v1/sessions/{conv_id}/live-mcp-servers")
-
-    assert before.json() == {"running": True, "partial": True, "servers": []}
-    assert after.json()["partial"] is True
-    [server] = after.json()["servers"]
-    assert (server["name"], server["status"]) == ("linear", "failed")
-    assert server["error"].startswith("Signed in after Claude Code started.")
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("released_sign_in_hold", [False, True], ids=["no-hold", "released-hold"])
 async def test_mcp_reconnect_restarts_an_idle_claude_pane(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, released_sign_in_hold: bool
 ) -> None:
-    """Reconnect relaunches Claude Code, which connects every server as it starts.
+    """/mcp offers Reconnect for a server signed in after Claude Code started; Reconnect
+    relaunches Claude Code, which connects every server as it starts.
 
-    A launcher sign-in hold that no longer waits does not stand in its way.
+    The session builder checks that /mcp listed nothing before the sign-in. A launcher
+    sign-in hold that no longer waits does not stand in the way.
     """
     conv_id = "b1b2c3d4e5f60718293a4b5c6d7e8f90"
     app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
@@ -965,6 +945,11 @@ async def test_mcp_reconnect_restarts_an_idle_claude_pane(
         )
 
     async with _runner_client(app) as client:
+        offered = await client.get(f"/v1/sessions/{conv_id}/live-mcp-servers")
+        assert offered.json()["partial"] is True
+        [server] = offered.json()["servers"]
+        assert (server["name"], server["status"]) == ("linear", "failed")
+        assert server["error"].startswith("Signed in after Claude Code started.")
         resp = await client.post(
             f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": "linear"}
         )
@@ -1164,6 +1149,8 @@ _REFUSALS = {
     "pending_question": "Claude is waiting for an answer",
     "terminal_dialog": "Claude is waiting for an answer",
     "open_on_host": "Claude Code is open in a terminal on the host",
+    "attach_unknown": "Couldn't tell whether Claude Code is open in a terminal on the host",
+    "attached_as_it_restarts": "Claude Code is open in a terminal on the host",
     "sign_in_hold": "Claude Code is waiting for a sign-in",
 }
 
@@ -1175,11 +1162,20 @@ async def test_mcp_reconnect_leaves_a_working_claude_pane_running(
 ) -> None:
     """A restart would cut off work in progress, so the panel says why it waits."""
     conv_id = "c1b2c3d4e5f60718293a4b5c6d7e8f90"
-    if work == "open_on_host":
-        # Bound when the runner app is built: someone attached long ago, idle since.
+    if work in ("open_on_host", "attach_unknown", "attached_as_it_restarts"):
+        # Bound when the runner app is built: someone attached long ago and idle since,
+        # tmux failing to say (an error or a timeout), or someone attaching just as
+        # the restart rechecks under the launch lock.
+        answers = {
+            "open_on_host": [],
+            "attach_unknown": [None],
+            "attached_as_it_restarts": [False],
+        }
+        later = None if work == "attach_unknown" else True
+        pending = iter(answers[work])
         monkeypatch.setattr(
-            "omnigent.native.native_cost_popup._tmux_last_client_input_at",
-            lambda _socket, _target: 1.0,
+            "omnigent.native.native_cost_popup._tmux_client_attached",
+            lambda _socket, _target: next(pending, later),
         )
     app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
         monkeypatch, tmp_path, conv_id
@@ -1546,21 +1542,56 @@ async def test_deleting_the_session_during_a_reconnect_relaunch_leaves_no_pane(
     assert terminals.get(conv_id, "claude", "main") is None
 
 
+class _CancellableGate(asyncio.Event):
+    """An event whose ``cancelled_waits`` is set once a waiter is cancelled while it waits."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled_waits = asyncio.Event()
+
+    async def wait(self) -> Literal[True]:
+        try:
+            return await super().wait()
+        except asyncio.CancelledError:
+            self.cancelled_waits.set()
+            raise
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stalls", ["relaunch", "close"])
 async def test_a_reconnect_past_its_deadline_frees_the_line_and_starts_nothing_late(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stalls: str
 ) -> None:
-    """A stalled relaunch is cancelled at the deadline, so later messages go through."""
+    """A Reconnect stalled past its deadline answers then, and later messages go through.
+
+    A stalled relaunch is cancelled. A stalled close is not: it finishes closing the old
+    pane before a message can start a new one.
+    """
     conv_id = "acb2c3d4e5f60718293a4b5c6d7e8f90"
-    # Long enough to reach the relaunch, which then stalls past it.
+    # Long enough to reach the stalled step.
     monkeypatch.setattr(runner_app, "_CLAUDE_RECONNECT_DEADLINE_S", 1.5)
-    gate = asyncio.Event()
+    relaunch_gate, close_gate = _CancellableGate(), _CancellableGate()
     harness = _ScriptedHarnessClient([])
+    closes_at_relaunch: list[list[str]] = []
     app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
-        monkeypatch, tmp_path, conv_id, relaunch_gate=gate, harness_client=harness
+        monkeypatch,
+        tmp_path,
+        conv_id,
+        relaunch_gate=relaunch_gate if stalls == "relaunch" else None,
+        harness_client=harness,
+        during_relaunch=lambda: closes_at_relaunch.append(list(closes)),
     )
     terminals = app.state.session_resource_registry.terminal_registry
     statuses["linear"] = "connected"
+    message_waits_for_launch = _note_launch_lock_waits(app, conv_id)
+    if stalls == "close":
+        pane = terminals.get(conv_id, "claude", "main")
+
+        async def _stalled_close() -> None:
+            await close_gate.wait()
+            closes.append(conv_id)
+
+        pane.close = _stalled_close  # type: ignore[method-assign]
 
     async with _runner_client(app) as client:
         reconnected = await asyncio.wait_for(
@@ -1573,20 +1604,25 @@ async def test_a_reconnect_past_its_deadline_frees_the_line_and_starts_nothing_l
         assert reconnected.json()["reconnect_error"].startswith(
             "Claude Code didn't start again in time."
         )
-        # The cancelled relaunch brings no pane up once its launch could go on.
-        gate.set()
-        for _ in range(20):
-            await asyncio.sleep(0)  # custom-lint: disable=sleep-then-assert -- let it run
-        assert terminals.get(conv_id, "claude", "main") is None
-        # Reconnect retries nothing after its deadline.
-        assert relaunched == [conv_id]
-        message = await asyncio.wait_for(
-            client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE), timeout=5
-        )
-        assert message.status_code < 300, message.text
+        if stalls == "relaunch":
+            # Cancelled, so it brings no pane up once its launch could go on.
+            await asyncio.wait_for(relaunch_gate.cancelled_waits.wait(), timeout=5)
+            relaunch_gate.set()
+            assert terminals.get(conv_id, "claude", "main") is None
+            # Reconnect retries nothing after its deadline.
+            assert relaunched == [conv_id]
+        message = asyncio.create_task(client.post(f"/v1/sessions/{conv_id}/events", json=_MESSAGE))
+        if stalls == "close":
+            # The message's launch waits for the old pane's close to finish.
+            await asyncio.wait_for(message_waits_for_launch.wait(), timeout=5)
+            assert (closes, relaunched) == ([], [])
+            close_gate.set()
+        assert (await asyncio.wait_for(message, timeout=5)).status_code < 300
         await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=5)
 
+    assert not close_gate.cancelled_waits.is_set()
     assert closes == [conv_id]
+    assert closes_at_relaunch[-1] == [conv_id]
 
 
 @pytest.mark.asyncio

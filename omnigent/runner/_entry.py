@@ -1826,6 +1826,9 @@ def create_app(
         _pane_reaper = getattr(app.state, "native_pane_reaper", None)
         if _pane_reaper is not None:
             await _pane_reaper.shutdown()
+        # A restart's pane close outlives the request that started it; let it finish.
+        if _teardowns := getattr(app.state, "abandoned_native_pane_teardowns", None):
+            await asyncio.wait(set(_teardowns), timeout=10)
         # Host shutdown skips per-session deletion, so close native servers here.
         from omnigent.runner.native import (
             teardown_all_codex_native_app_servers,

@@ -9312,6 +9312,7 @@ def create_runner_app(
     ):
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.native.native_cost_popup import (
+            _tmux_client_attached,
             _tmux_last_client_input_at,
             _tmux_window_activity_at,
         )
@@ -9430,38 +9431,20 @@ def create_runner_app(
                 return await _server_confirms_turn_in_flight(conv_id)
             return False
 
-        async def _reap_native_pane(
-            pane: PaneRef, *, activity_window_s: float = PANE_OUTPUT_BUSY_WINDOW_S
-        ) -> None:
+        # Teardowns still running after the caller that started them was cancelled.
+        _abandoned_pane_teardowns: set[asyncio.Task[None]] = set()
+        app.state.abandoned_native_pane_teardowns = _abandoned_pane_teardowns
+
+        def _settle_abandoned_pane_teardown(teardown: asyncio.Task[None]) -> None:
+            _abandoned_pane_teardowns.discard(teardown)
+            # No caller is left to report it.
+            if not teardown.cancelled() and (error := teardown.exception()) is not None:
+                _logger.warning("native pane teardown failed", exc_info=error)
+
+        async def _tear_down_native_pane(pane: PaneRef, lock: asyncio.Lock) -> None:
+            """Close a reaped pane and its helpers, then free its launch lock."""
             conv_id = pane.conversation_id
-            reaped = pane.instance
-            if reaped is None:
-                reaped = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
-            # Launch and ensure paths hold this lock, so a message that re-creates
-            # the session waits for the reap, then starts its own pane, forwarder,
-            # helper server and relay instead of having them torn down here.
-            lock = _native_terminal_ensure_locks[pane.terminal_name].setdefault(
-                conv_id, asyncio.Lock()
-            )
-            async with lock:
-                current = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
-                if current is not None and current is not reaped:
-                    _logger.info(
-                        "native pane reaper: pane for conversation %s was replaced after "
-                        "it was judged idle; leaving the new one",
-                        conv_id,
-                        extra={"session_id": conv_id},
-                    )
-                    return
-                # A message can reuse the pane while the reap waits for the lock.
-                if await _native_pane_is_busy(pane, activity_window_s=activity_window_s):
-                    _logger.info(
-                        "native pane reaper: pane for conversation %s became busy while "
-                        "the reap waited; leaving it",
-                        conv_id,
-                        extra={"session_id": conv_id},
-                    )
-                    return
+            try:
                 try:
                     await resource_registry.close_terminal(conv_id, pane.terminal_id)
                 finally:
@@ -9478,6 +9461,72 @@ def create_runner_app(
                         session_key="main",
                         publish_event=_publish_event,
                     )
+            finally:
+                lock.release()
+
+        async def _reap_native_pane(
+            pane: PaneRef,
+            *,
+            activity_window_s: float = PANE_OUTPUT_BUSY_WINDOW_S,
+            require_unattached: bool = False,
+        ) -> None:
+            """Close an idle native pane and its helpers, unless it is replaced or busy.
+
+            :param require_unattached: Leave the pane unless tmux confirms no terminal
+                on the host is attached to it.
+            """
+            conv_id = pane.conversation_id
+            reaped = pane.instance
+            if reaped is None:
+                reaped = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+            # Launch and ensure paths hold this lock, so a message that re-creates
+            # the session waits for the reap, then starts its own pane, forwarder,
+            # helper server and relay instead of having them torn down here.
+            lock = _native_terminal_ensure_locks[pane.terminal_name].setdefault(
+                conv_id, asyncio.Lock()
+            )
+            await lock.acquire()
+            teardown: asyncio.Task[None] | None = None
+            try:
+                current = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+                if current is not None and current is not reaped:
+                    _logger.info(
+                        "native pane reaper: pane for conversation %s was replaced after "
+                        "it was judged idle; leaving the new one",
+                        conv_id,
+                        extra={"session_id": conv_id},
+                    )
+                    return
+                # A message can reuse the pane while the reap waits for the lock.
+                if await _native_pane_is_busy(pane, activity_window_s=activity_window_s) or (
+                    require_unattached
+                    and await asyncio.to_thread(
+                        _tmux_client_attached, str(pane.socket_path), "main"
+                    )
+                    is not False
+                ):
+                    _logger.info(
+                        "native pane reaper: pane for conversation %s became busy, or "
+                        "attached on the host, while the reap waited; leaving it",
+                        conv_id,
+                        extra={"session_id": conv_id},
+                    )
+                    return
+                # Committed: a cancelled caller (e.g. a Reconnect past its deadline) must
+                # not leave the process or its helpers half torn down. The task frees the
+                # lock, so a replacement launch waits for it.
+                teardown = asyncio.create_task(
+                    _tear_down_native_pane(pane, lock), name=f"native-pane-teardown-{conv_id}"
+                )
+            finally:
+                if teardown is None:
+                    lock.release()
+            try:
+                await asyncio.shield(teardown)
+            except asyncio.CancelledError:
+                _abandoned_pane_teardowns.add(teardown)
+                teardown.add_done_callback(_settle_abandoned_pane_teardown)
+                raise
 
         app.state.native_pane_reaper = NativePaneReaper(
             list_native_panes=_native_panes_for_reaper,
@@ -9533,10 +9582,15 @@ def create_runner_app(
             ):
                 return "Claude still has background work running. Reconnect once it finishes."
             # Restarting would end a person's local `omnigent claude` attach.
-            if (
-                await asyncio.to_thread(_tmux_last_client_input_at, str(pane.socket_path), "main")
-                is not None
-            ):
+            attached = await asyncio.to_thread(
+                _tmux_client_attached, str(pane.socket_path), "main"
+            )
+            if attached is None:
+                return (
+                    "Couldn't tell whether Claude Code is open in a terminal on the host. "
+                    "Reconnect again in a moment."
+                )
+            if attached:
                 return (
                     "Claude Code is open in a terminal on the host. Restart it there, "
                     "or close that terminal and reconnect."
@@ -9575,9 +9629,13 @@ def create_runner_app(
             if refusal is not None:
                 return refusal
             # Rechecks busyness under the launch lock and tears down the pane's helpers.
-            await _reap_native_pane(pane, activity_window_s=_RESTART_ACTIVITY_WINDOW_S)
+            await _reap_native_pane(
+                pane, activity_window_s=_RESTART_ACTIVITY_WINDOW_S, require_unattached=True
+            )
             if _pane_reaper_registry.get(conv_id, "claude", "main") is instance:
-                return "Claude Code became busy. Reconnect once it finishes."
+                # Left running by the recheck under the launch lock; say what changed.
+                refusal = await _claude_restart_refusal(pane)
+                return refusal or "Claude Code became busy. Reconnect once it finishes."
             return None
 
         def _claude_live_mcp_body(conv_id: str, instance: TerminalInstance) -> _JsonObject:
