@@ -244,35 +244,53 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-it("keeps each cell's single-session draft and tags, and switches that session's permission mode", async () => {
-  fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
+/** A two-cell grid of "first" and "second". */
+const twoCellGrid = () => (
+  <MemoryRouter>
+    <TooltipProvider>
+      <RearrangeableGrid
+        grid={{ id: "two-cells", layout: splitGrid("first", "first", "second", "right")! }}
+      />
+    </TooltipProvider>
+  </MemoryRouter>
+);
+
+it("shares each cell's draft and tags with its single-session composer", () => {
   const mentions = { files: [{ path: "notes.md", isDir: false }], sessions: [] };
   setSessionDraft("second", { text: "Unsent idea", files: [], mentions });
   const subagentTabDraft = { text: "Typed in a sub-agent tab", files: [] };
   useChatStore.getState().updateSideChatComposer("second", () => subagentTabDraft);
-  document.title = "Single session";
-  const tree = () => (
-    <MemoryRouter>
-      <TooltipProvider>
-        <RearrangeableGrid
-          grid={{ id: "controls", layout: splitGrid("first", "first", "second", "right")! }}
-        />
-      </TooltipProvider>
-    </MemoryRouter>
-  );
-  const view = render(tree());
-  expect(document.title).toBe("Test grid");
-  expect(useChatStore.getState().sideChatComposers.second).toMatchObject({
-    text: "Unsent idea",
-    mentions,
-  });
+  const composer = () => useChatStore.getState().sideChatComposers.second;
+  const view = render(twoCellGrid());
+  expect(composer()).toMatchObject({ text: "Unsent idea", mentions });
   act(() =>
     useChatStore
       .getState()
       .updateSideChatComposer("second", (draft) => ({ ...draft, text: "Edited in the grid" })),
   );
   expect(getSessionDraft("second")).toMatchObject({ text: "Edited in the grid", mentions });
+  view.unmount();
+  // Leaving the grid hands the shared composer entry back untouched.
+  expect(composer()).toBe(subagentTabDraft);
+  expect(useChatStore.getState().sideChatComposers.first).toBeUndefined();
 
+  // A single-view edit made meanwhile shows when the grid reopens.
+  setSessionDraft("second", { text: "Edited in single view", files: [] });
+  const reopened = render(twoCellGrid());
+  expect(composer()?.text).toBe("Edited in single view");
+  // Sending clears the cell's draft, and reopening doesn't bring it back.
+  act(() => useChatStore.getState().clearSideChatComposer("second"));
+  expect(getSessionDraft("second")).toBeUndefined();
+  reopened.unmount();
+  render(twoCellGrid());
+  expect(composer()?.text).toBe("");
+});
+
+it("shows each cell's session controls and targets that session's permission mode", async () => {
+  fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
+  document.title = "Single session";
+  const view = render(twoCellGrid());
+  expect(document.title).toBe("Test grid");
   const second = within(screen.getByRole("region", { name: "second" }));
   // An inactive cell keeps the toggle's slot, so activating it never shifts the titlebar.
   expect(second.queryByRole("button", { name: /grid workspace$/ })).toBeNull();
@@ -288,14 +306,10 @@ it("keeps each cell's single-session draft and tags, and switches that session's
   );
   // Like the main composer, an unreachable session's chip can't switch modes.
   fixture.livenessKind = "host_offline";
-  view.rerender(tree());
+  view.rerender(twoCellGrid());
   expect(second.getByRole("button", { name: "Permission mode: Manual" })).toBeDisabled();
   view.unmount();
   expect(document.title).toBe("Single session");
-  // Leaving the grid hands the shared composer entry back untouched.
-  expect(useChatStore.getState().sideChatComposers.second).toBe(subagentTabDraft);
-  expect(useChatStore.getState().sideChatComposers.first).toBeUndefined();
-  expect(getSessionDraft("second")?.text).toBe("Edited in the grid");
 });
 
 it("opens agent-requested files only in the active workspace and respects navigation guards", () => {
