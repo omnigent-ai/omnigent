@@ -653,10 +653,14 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     });
   });
 
-  it("omits host_id and skips setSessionHost on a managed bundled create", async () => {
+  it("sends a client-chosen host_id and routes the session by it on a managed bundled create", async () => {
     vi.mocked(setSessionHost).mockClear();
     vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new", agentId: "ag_pending" });
-    renderLanding({ managed_sandboxes_enabled: true, session_bundle_workspaces: true });
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      request_managed_sandbox_host_id: true,
+      session_bundle_workspaces: true,
+    });
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
     fireEvent.click(screen.getByTestId("test-create-pending"));
@@ -667,11 +671,10 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     await waitFor(() => expect(vi.mocked(createBundledSession)).toHaveBeenCalled());
     await waitFor(() => expect(navigateMock).toHaveBeenCalled());
 
-    // Bundle creates allocate their sandbox host server-side until multipart host_id ships.
     const metadata = vi.mocked(createBundledSession).mock.calls[0][1] ?? {};
     expect(metadata).toMatchObject({ host_type: "managed" });
-    expect("host_id" in metadata).toBe(false);
-    expect(setSessionHost).not.toHaveBeenCalled();
+    expect(metadata.host_id).toMatch(/^[0-9a-f]{32}$/);
+    expect(setSessionHost).toHaveBeenCalledWith("conv_new", metadata.host_id);
   });
 });
 

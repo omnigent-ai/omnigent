@@ -6216,9 +6216,11 @@ function NewChatLandingContent({
         }
         const metadata: Parameters<typeof createBundledSession>[1] = { labels: createLabels };
         if (siblingSourceId) metadata.sibling_source_id = siblingSourceId;
+        // The new sandbox's host id, minted client-side as the JSON create does.
+        const managedBundleHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
         if (sandboxSelected) {
-          // Bundle creates send no host id until the server's multipart host_id is deployed.
           metadata.host_type = "managed";
+          if (managedBundleHostId) metadata.host_id = managedBundleHostId;
           metadata.workspaces = composeSandboxWorkspaces(sandboxRepoSelections);
           if (sandboxProvider !== null) metadata.sandbox_provider = sandboxProvider;
           if (selectedSandboxProfile !== null) {
@@ -6268,6 +6270,8 @@ function NewChatLandingContent({
         data = { id: bundled.id };
         createdSessionId = data.id;
         launchedAgentId = bundled.agentId ?? null;
+        // Route the new session's first requests by the host id it was created with.
+        if (managedBundleHostId) setSessionHost(data.id, managedBundleHostId);
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
