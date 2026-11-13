@@ -776,6 +776,7 @@ def databricks_request_headers(
     """
     from omnigent.telemetry.request_headers import (
         client_identity_headers,
+        pop_client_user_agent,
         telemetry_request_headers,
     )
 
@@ -824,6 +825,9 @@ def databricks_request_headers(
     # Opaque dev/test extra headers (request-routing selectors); no-op in prod
     # (env unset).
     headers.update(_databricks_extra_headers())
+    # The component UA wins over a configured User-Agent in any casing, as on the
+    # WebSocket handshake, so exactly one identity is sent.
+    headers["User-Agent"] = pop_client_user_agent(headers)
     return headers
 
 

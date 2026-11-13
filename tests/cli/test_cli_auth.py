@@ -301,23 +301,22 @@ def test_expired_session_token_still_warns(token_dir, monkeypatch, caplog) -> No
     )
 
 
-def test_databricks_request_headers_org_only(token_dir, monkeypatch) -> None:
+def test_databricks_request_headers_org_only(token_dir) -> None:
     """A recorded ?o= selector surfaces as the workspace-routing header.
 
     When the bare host is the account, the request routes by this header
     (equivalently to ``?o=``). A record with no org id (single-workspace
     host) yields no header, so those callers are unaffected.
     """
-    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+    from omnigent.cli_auth import store_databricks_auth
 
-    # Compare routing headers only; the User-Agent is covered in test_telemetry.
-    monkeypatch.setattr("omnigent.telemetry.request_headers.client_identity_headers", dict)
+    # Compare routing headers only; _routing_headers drops the always-present User-Agent.
     store_databricks_auth(
         server_url="https://acme.databricks.com/api/2.0/omnigent",
         workspace_host="https://acme.databricks.com",
         org_id="2850744067564480",
     )
-    assert databricks_request_headers("https://acme.databricks.com/api/2.0/omnigent") == {
+    assert _routing_headers("https://acme.databricks.com/api/2.0/omnigent") == {
         "X-Databricks-Org-Id": "2850744067564480",
         "X-Databricks-Omnigent-Slice-Key": "client_key",
     }
@@ -326,7 +325,7 @@ def test_databricks_request_headers_org_only(token_dir, monkeypatch) -> None:
         server_url="https://single.example.com/api/2.0/omnigent",
         workspace_host="https://single.example.com",
     )
-    assert databricks_request_headers("https://single.example.com/api/2.0/omnigent") == {
+    assert _routing_headers("https://single.example.com/api/2.0/omnigent") == {
         "X-Databricks-Omnigent-Slice-Key": "client_key",
     }
 
@@ -674,6 +673,46 @@ def test_databricks_request_headers_folds_extra_headers(token_dir, monkeypatch) 
     assert _routing_headers("https://other.example.com", bearer_token="tok") == {
         "Authorization": "Bearer tok",
     }
+
+
+@pytest.mark.parametrize("ua_key", ["User-Agent", "user-agent", "USER-AGENT"])
+async def test_extra_user_agent_never_replaces_component_identity(
+    ua_key: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured User-Agent in any casing cannot displace the component UA.
+
+    Checked on the builder and on the request ``open_server_client`` sends, so
+    exactly one User-Agent reaches the wire and it names this component.
+    """
+    import json
+
+    import httpx
+
+    from omnigent.cli_auth import databricks_request_headers, open_server_client
+    from omnigent.telemetry.request_headers import CLIENT_COMPONENT_ENV_VAR, client_user_agent
+
+    monkeypatch.setenv(CLIENT_COMPONENT_ENV_VAR, "runner")
+    runner_ua = client_user_agent()
+    monkeypatch.setenv(
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
+        json.dumps({ua_key: "caller-agent/1.0", "x-databricks-route-hint": "instance-abc"}),
+    )
+    url = "https://other.example.com"
+
+    built = databricks_request_headers(url)
+    assert [k for k in built if k.lower() == "user-agent"] == ["User-Agent"]
+    assert built["User-Agent"] == runner_ua
+    assert built["x-databricks-route-hint"] == "instance-abc"
+
+    sent: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers.get_list("User-Agent"))
+        return httpx.Response(200)
+
+    async with open_server_client(url, transport=httpx.MockTransport(handler)) as client:
+        await client.get(f"{url}/health")
+    assert sent == [[runner_ua]]
 
 
 def test_load_token_returns_none_for_databricks_record(token_dir) -> None:
