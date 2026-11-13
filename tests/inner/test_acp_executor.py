@@ -53,7 +53,7 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
-from omnigent.inner.sandbox import HarnessSandboxPreparationError
+from omnigent.inner.sandbox import HarnessSandboxValidationError
 
 # ---------------------------------------------------------------------------
 # Construction / argv
@@ -2943,7 +2943,7 @@ def test_acp_executor_init_raises_on_deleted_explicit_cwd(
 ) -> None:
     """Missing cwd diagnostics are preserved as a cause when sandboxing is requested."""
     missing = str(tmp_path / "workspace")
-    expected_error = HarnessSandboxPreparationError if sandbox_requested else RuntimeError
+    expected_error = HarnessSandboxValidationError if sandbox_requested else RuntimeError
     with pytest.raises(expected_error, match="workspace") as failure:
         AcpExecutor(AcpAgentConfig(command="agent"), cwd=missing, os_env=os_env)
     diagnostic = failure.value.__cause__ if sandbox_requested else failure.value
@@ -2953,6 +2953,9 @@ def test_acp_executor_init_raises_on_deleted_explicit_cwd(
         assert failure.value.__cause__ is None
     else:
         assert missing not in failure.value.client_message
+        assert failure.value.client_message == (
+            "The working directory is unavailable. Choose an existing workspace and retry."
+        )
 
 
 @pytest.mark.asyncio
@@ -2981,7 +2984,7 @@ async def test_start_process_guard_raises_clear_error_on_deleted_cwd(
     events = []
     try:
         with (
-            pytest.raises(HarnessSandboxPreparationError)
+            pytest.raises(HarnessSandboxValidationError)
             if sandbox_requested
             else contextlib.nullcontext()
         ) as failure:
@@ -2995,6 +2998,9 @@ async def test_start_process_guard_raises_clear_error_on_deleted_cwd(
         assert type(failure.value.__cause__) is RuntimeError
         assert not error_events
         assert str(workspace) not in failure.value.client_message
+        assert failure.value.client_message == (
+            "The working directory is unavailable. Choose an existing workspace and retry."
+        )
         msg = str(failure.value.__cause__)
     else:
         assert error_events, f"expected ExecutorError, got: {[type(e).__name__ for e in events]}"
@@ -3030,7 +3036,7 @@ async def test_start_process_guard_deleted_process_cwd_relative_cwd(
                 return_value="/workspace/project (deleted)",
             ):
                 with (
-                    pytest.raises(HarnessSandboxPreparationError)
+                    pytest.raises(HarnessSandboxValidationError)
                     if sandbox_requested
                     else contextlib.nullcontext()
                 ) as failure:
@@ -3044,6 +3050,9 @@ async def test_start_process_guard_deleted_process_cwd_relative_cwd(
         assert type(failure.value.__cause__) is RuntimeError
         assert not error_events
         assert "/workspace/project" not in failure.value.client_message
+        assert failure.value.client_message == (
+            "The working directory is unavailable. Choose an existing workspace and retry."
+        )
         msg = str(failure.value.__cause__)
     else:
         assert error_events

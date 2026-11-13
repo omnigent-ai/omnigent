@@ -538,6 +538,9 @@ class HarnessSandboxValidationError(ValueError):
         "fork": "The selected harness does not support os_env.fork.",
         "start_in_scratch": "The selected harness does not support os_env.start_in_scratch.",
         "cwd": "The working directory conflicts with os_env.cwd.",
+        "cwd_unavailable": (
+            "The working directory is unavailable. Choose an existing workspace and retry."
+        ),
         "windows": (
             "The selected harness cannot enforce filesystem or network policy "
             "with windows_jobobject."

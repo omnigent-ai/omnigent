@@ -452,6 +452,22 @@ def _resolve_cwd(cwd: str | None, *, session_id: str | None = None) -> str:
         ) from None
 
 
+def _resolve_policy_cwd(
+    cwd: str | None, os_env: OSEnvSpec | None, *, session_id: str | None = None
+) -> str:
+    """Give confined sessions fixed guidance when their working directory is unavailable."""
+    sandbox_requested = os_env is not None and (
+        os_env.sandbox is None or os_env.sandbox.type != "none"
+    )
+    with harness_sandbox_preparation() if sandbox_requested else contextlib.nullcontext():
+        try:
+            return _resolve_cwd(cwd, session_id=session_id)
+        except RuntimeError as exc:
+            if not sandbox_requested:
+                raise
+            raise HarnessSandboxValidationError(str(exc), reason="cwd_unavailable") from exc
+
+
 class AcpExecutor(Executor):
     """Executor that drives any ACP agent over JSON-RPC 2.0 on stdio."""
 
@@ -478,12 +494,7 @@ class AcpExecutor(Executor):
         """
         self._config = config
         self._extension = extension
-        with (
-            harness_sandbox_preparation()
-            if os_env is not None and (os_env.sandbox is None or os_env.sandbox.type != "none")
-            else contextlib.nullcontext()
-        ):
-            self._cwd = _resolve_cwd(cwd)
+        self._cwd = _resolve_policy_cwd(cwd, os_env)
         self._os_env = os_env
         # Advertise ``clientCapabilities.fs`` so the agent delegates file
         # reads/writes back to us (executed through the Omnigent OSEnvironment,
@@ -585,17 +596,10 @@ class AcpExecutor(Executor):
         # Re-validate cwd before every spawn and respawn: the workspace may have
         # been deleted after __init__, and this error flows through
         # _startup_error_message so the UI also shows the harness-log path.
-        with (
-            harness_sandbox_preparation()
-            if self._os_env is not None
-            and (self._os_env.sandbox is None or self._os_env.sandbox.type != "none")
-            else contextlib.nullcontext()
-        ):
-            _resolve_cwd(self._cwd, session_id=self._session_id)
-            # If the cwd is relative the spawn resolves it against the process cwd;
-            # fail early with a clear message if that directory was also deleted.
-            if not os.path.isabs(self._cwd):
-                _resolve_cwd(None, session_id=self._session_id)
+        _resolve_policy_cwd(self._cwd, self._os_env, session_id=self._session_id)
+        # Relative paths also require an available inherited process directory.
+        if not os.path.isabs(self._cwd):
+            _resolve_policy_cwd(None, self._os_env, session_id=self._session_id)
         # Reset handshake state: this may be a restart after the previous
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
