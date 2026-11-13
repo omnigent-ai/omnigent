@@ -776,7 +776,14 @@ def test_harness_policy_validation_resolves_relative_cwd(
 
 @pytest.mark.parametrize(
     "feature",
-    ["credential_proxy", "none_network", "none_egress", "none_copy_on_write", "windows_jobobject"],
+    [
+        "credential_proxy",
+        "none_network",
+        "none_egress",
+        "none_copy_on_write",
+        "seatbelt_copy_on_write",
+        "windows_jobobject",
+    ],
 )
 def test_harness_policy_validation_rejects_unenforceable_network_or_backend(feature: str) -> None:
     from omnigent.inner.datamodel import (
@@ -796,8 +803,8 @@ def test_harness_policy_validation_rejects_unenforceable_network_or_backend(feat
     elif feature == "none_egress":
         policy.type = "none"
         policy.egress_rules = ["GET api.example.com/**"]
-    elif feature == "none_copy_on_write":
-        policy.type = "none"
+    elif feature in ("none_copy_on_write", "seatbelt_copy_on_write"):
+        policy.type = "none" if feature == "none_copy_on_write" else "darwin_seatbelt"
         policy.write_paths = [WritePathSpec(path="/workspace", copy_on_write=True)]
     else:
         policy.type = feature

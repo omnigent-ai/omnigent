@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol, cast
+from typing import ClassVar, Protocol, cast
 
 from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 from omnigent.util.json_types import JsonValue
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # through the executor's tee.
 _SANDBOX_STRACE_ENV = "OMNIGENT_SANDBOX_STRACE"
 
-# Discard this legacy marker; inherited environment is not proof of containment.
+# Inherited markers are not proof of containment.
 _LAUNCHER_WRAPPED_ENV = "OMNIGENT_LAUNCHER_SPAWN_WRAPPED"
 
 # Hand-off marker for the spawn-time re-exec: the host pass mints the
@@ -528,6 +528,43 @@ def _resolve_grant_root(cwd: Path, root: str) -> Path:
     return path.resolve(strict=False)
 
 
+class HarnessSandboxValidationError(ValueError):
+    """A policy rejection with fixed client guidance separate from diagnostic details."""
+
+    _GUIDANCE: ClassVar[dict[str, str]] = {
+        "type": "The selected harness supports only os_env.type=caller_process.",
+        "fork": "The selected harness does not support os_env.fork.",
+        "start_in_scratch": "The selected harness does not support os_env.start_in_scratch.",
+        "cwd": "The working directory conflicts with os_env.cwd.",
+        "windows": (
+            "The selected harness cannot enforce filesystem or network policy "
+            "with windows_jobobject."
+        ),
+        "none_network": "Sandbox type 'none' cannot enforce network restrictions.",
+        "copy_on_write": "The selected harness requires linux_bwrap for copy_on_write.",
+        "egress_rules": "The selected harness does not support os_env.sandbox.egress_rules.",
+        "credential_proxy": (
+            "The selected harness does not support os_env.sandbox.credential_proxy."
+        ),
+        "git_ssh": "The selected harness does not support os_env.sandbox.git_ssh.",
+        "scan_limit": "os_env.sandbox.cwd_hidden_scan_max_entries must be a positive integer.",
+        "scan_overflow": (
+            "os_env.sandbox.cwd_hidden_scan_overflow must be error, warn or unlimited."
+        ),
+        "sandbox": (
+            "The selected harness cannot enforce os_env.sandbox. Choose a sandbox-capable harness."
+        ),
+    }
+
+    def __init__(self, message: str, *, reason: str = "invalid") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+    @property
+    def client_message(self) -> str:
+        return self._GUIDANCE.get(self.reason, "The requested sandbox policy cannot be enforced.")
+
+
 def validate_harness_sandbox(
     spec: OSEnvSpec,
     harness: str,
@@ -538,10 +575,14 @@ def validate_harness_sandbox(
 ) -> None:
     """Reject policy features a harness cannot enforce before starting its worker."""
     if spec.type != "caller_process":
-        raise ValueError(f"{harness} does not support os_env.type={spec.type!r}")
+        raise HarnessSandboxValidationError(
+            f"{harness} does not support os_env.type={spec.type!r}", reason="type"
+        )
     for feature in ("fork", "start_in_scratch"):
         if getattr(spec, feature):
-            raise ValueError(f"{harness} does not support os_env.{feature}")
+            raise HarnessSandboxValidationError(
+                f"{harness} does not support os_env.{feature}", reason=feature
+            )
     sandbox = spec.sandbox or _default_sandbox_for_platform()
     from .os_env_serialization import validate_sandbox_scan_options
 
@@ -554,32 +595,46 @@ def validate_harness_sandbox(
         and sandbox.type != "none"
         and not cwd.resolve(strict=False).is_relative_to(_resolve_grant_root(cwd, spec.cwd))
     ):
-        raise ValueError(f"{harness}: working directory conflicts with os_env.cwd")
+        raise HarnessSandboxValidationError(
+            f"{harness}: working directory conflicts with os_env.cwd", reason="cwd"
+        )
     if sandbox.type == "windows_jobobject":
-        raise ValueError(
-            f"{harness} cannot enforce filesystem or network policy with windows_jobobject"
+        raise HarnessSandboxValidationError(
+            f"{harness} cannot enforce filesystem or network policy with windows_jobobject",
+            reason="windows",
         )
     if sandbox.type == "none" and (
         not sandbox.allow_network
         or sandbox.requires_network_enforcement
         or sandbox.credential_proxy
     ):
-        raise ValueError(f"{harness}: sandbox type 'none' cannot enforce network restrictions")
+        raise HarnessSandboxValidationError(
+            f"{harness}: sandbox type 'none' cannot enforce network restrictions",
+            reason="none_network",
+        )
     if sandbox.type != "linux_bwrap" and any(
         grant.copy_on_write for grant in sandbox.write_path_specs
     ):
-        raise ValueError(f"{harness} does not support copy_on_write with {sandbox.type!r}")
+        raise HarnessSandboxValidationError(
+            f"{harness} does not support copy_on_write with {sandbox.type!r}",
+            reason="copy_on_write",
+        )
     for feature, supported in (
         ("egress_rules", supports_egress_rules),
         ("credential_proxy", supports_credential_proxy),
         ("git_ssh", False),
     ):
         if getattr(sandbox, feature) and not supported:
-            raise ValueError(f"{harness} does not support os_env.sandbox.{feature}")
+            raise HarnessSandboxValidationError(
+                f"{harness} does not support os_env.sandbox.{feature}", reason=feature
+            )
 
 
-class UnsupportedHarnessSandboxError(ValueError):
+class UnsupportedHarnessSandboxError(HarnessSandboxValidationError):
     """The selected adapter cannot install requested process confinement."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, reason="sandbox")
 
 
 def reject_unsupported_harness_sandbox(spec: OSEnvSpec | None, harness: str) -> None:

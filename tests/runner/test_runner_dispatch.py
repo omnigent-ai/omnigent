@@ -1516,7 +1516,14 @@ def test_spec_resolve_error_detail_names_structured_cause(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
-    ["outage", "unsupported-policy", "codex-policy", "invalid-spec", "private-policy-detail"],
+    [
+        "outage",
+        "unsupported-policy",
+        "codex-policy",
+        "invalid-spec",
+        "private-policy-detail",
+        "private-validator-detail",
+    ],
 )
 async def test_runner_post_releases_turn_when_spec_resolution_fails(
     caplog: pytest.LogCaptureFixture,
@@ -1530,7 +1537,10 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
     from unittest.mock import AsyncMock
 
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-    from omnigent.inner.sandbox import UnsupportedHarnessSandboxError
+    from omnigent.inner.sandbox import (
+        HarnessSandboxValidationError,
+        UnsupportedHarnessSandboxError,
+    )
 
     session_id = f"conv_spec_resolver_failed_{failure}"
     corrected = False
@@ -1559,6 +1569,10 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
             raise ValueError("invalid spec from internal-host:6767/private/agent.yaml")
         if failure == "private-policy-detail":
             raise UnsupportedHarnessSandboxError("private-policy-token at internal-host:6767")
+        if failure == "private-validator-detail":
+            raise HarnessSandboxValidationError(
+                "private-policy-token at internal-host:6767", reason="fork"
+            )
         raise RuntimeError(f"spec resolver unavailable for {agent_id}")
 
     manager = _FakeProcessManager()
@@ -1634,12 +1648,15 @@ async def test_runner_post_releases_turn_when_spec_resolution_fails(
                 "The selected harness cannot enforce os_env.sandbox. "
                 f"Choose a sandbox-capable harness. {detail}"
             )
+        elif failure in ("codex-policy", "private-validator-detail"):
+            detail = f"The selected harness does not support os_env.fork. {detail}"
         assert body["error"]["message"] == detail
         cause = {
             "unsupported-policy": "Antigravity cannot enforce",
             "codex-policy": "Codex does not support os_env.fork",
             "invalid-spec": "invalid spec from internal-host:6767/private/agent.yaml",
             "private-policy-detail": "private-policy-token at internal-host:6767",
+            "private-validator-detail": "private-policy-token at internal-host:6767",
         }[failure]
         assert cause not in response.text
         assert cause in caplog.text

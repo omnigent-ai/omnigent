@@ -397,8 +397,17 @@ def _brokered_codex_spec(
     return spec, sandbox, binding
 
 
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {},
+        {"web_search": False, "disable_native_tools": True},
+        {"web_search": "false", "disable_native_tools": 1},
+    ],
+)
 def test_codex_nonbrokered_credentials_rejected_before_provider_resolution(
     monkeypatch: pytest.MonkeyPatch,
+    settings: dict[str, object],
 ) -> None:
     from unittest.mock import Mock
 
@@ -410,6 +419,7 @@ def test_codex_nonbrokered_credentials_rejected_before_provider_resolution(
         response_path="/v1/responses",
     )
     spec.executor.config["broker_gateway"] = False
+    spec.executor.config.update(settings)
     binding.inject_env = ["UNRELATED_TOKEN"]
     resolve_provider = Mock()
     monkeypatch.setattr(workflow, "_resolve_provider_for_build", resolve_provider)
@@ -542,36 +552,13 @@ def test_locked_codex_gateway_requires_private_renewable_source_and_exact_route(
         _build_codex_spawn_env(spec)
 
 
-@pytest.mark.parametrize(
-    "settings",
-    [
-        {},
-        {"web_search": False, "disable_native_tools": True},
-        {"web_search": "false", "disable_native_tools": 1},
-    ],
-)
-def test_codex_gateway_rejects_ordinary_same_host_proxy(
-    config_home: Path, settings: dict[str, object]
-) -> None:
+def test_codex_gateway_without_proxy_retains_ordinary_auth(config_home: Path) -> None:
     _write_config(config_home, _openai_default_config())
-    binding = CredentialProxyEntry(
-        host="openai.example.com",
-        scheme="bearer",
-        source=CredentialSourceSpec(kind="env", env="PARENT_TOKEN"),
-        inject_env=["OTHER_TOKEN"],
-    )
     sandbox = OSEnvSandboxSpec(
         type="darwin_seatbelt",
         egress_rules=["POST openai.example.com/v1/responses"],
-        credential_proxy=CredentialProxySpec(entries=[binding]),
     )
     spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=sandbox))
-    spec.executor.config.update(settings)
-
-    with pytest.raises(OmnigentError, match="credential_proxy"):
-        _build_codex_spawn_env(spec)
-
-    sandbox.credential_proxy = None
     env = _build_codex_spawn_env(spec)
     assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
     assert "HARNESS_CODEX_ENABLE_WEB_SEARCH" not in env
