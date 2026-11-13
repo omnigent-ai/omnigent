@@ -57,6 +57,7 @@ import { Link, useSearchParams } from "@/lib/routing";
 import { taskMarkerTarget } from "@/lib/taskActivity";
 import { cn } from "@/lib/utils";
 import type { TaskAction } from "@/lib/workflow";
+import { PlanRunButton } from "@/shell/PlanRunButton";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 
 const NO_ENTRIES: JournalEntry[] = [];
@@ -784,6 +785,8 @@ function TasksHeader({
   stuck,
   onSelect,
   onSaveWorkflow,
+  onContinuePlan,
+  onStop,
 }: {
   plan: JournalEntry | null;
   /** The saved workflow the plan came from, or null. */
@@ -794,6 +797,10 @@ function TasksHeader({
   onSelect: (stepId: string) => void;
   /** Opens the composer's Save as workflow dialog; absent when the agent can't save. */
   onSaveWorkflow?: () => void;
+  /** Asks the agent to continue the plan; absent when this viewer can't send. */
+  onContinuePlan?: () => void;
+  /** Stops the agent; offered only while it works. */
+  onStop?: () => void;
 }) {
   const tally = planTally(progress);
   const updatedAt = Math.max(
@@ -839,6 +846,24 @@ function TasksHeader({
                 <span className="text-sm text-muted-foreground">
                   Updated <Ago seconds={updatedAt} />
                 </span>
+              )}
+              {onStop ? (
+                <PlanRunButton
+                  control="stop"
+                  size="icon-xs"
+                  className="self-center"
+                  onClick={onStop}
+                />
+              ) : (
+                onContinuePlan &&
+                paused && (
+                  <PlanRunButton
+                    control="play"
+                    size="icon-xs"
+                    className="self-center"
+                    onClick={onContinuePlan}
+                  />
+                )
               )}
               {onSaveWorkflow && (
                 <DropdownMenu>
@@ -971,6 +996,7 @@ export function TasksPanel({
   const saveWorkflow = useSessionTasksActions((state) => state.saveWorkflow[conversationId]);
   const taskAction = useSessionTasksActions((state) => state.taskAction[conversationId]);
   const stopWork = useSessionTasksActions((state) => state.stopWork[conversationId]);
+  const continuePlan = useSessionTasksActions((state) => state.continuePlan[conversationId]);
   const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
   const empty = progress.length === 0;
@@ -1074,6 +1100,8 @@ export function TasksPanel({
               onSaveWorkflow={
                 saveWorkflow && plan ? () => saveWorkflow(planName(plan) ?? "") : undefined
               }
+              onContinuePlan={continuePlan && (() => continuePlan(planName(plan)))}
+              onStop={stopWork}
             />
             <TaskList
               progress={progress}

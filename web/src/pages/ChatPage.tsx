@@ -123,6 +123,7 @@ import {
   useChatStore,
 } from "@/store/chatStore";
 import {
+  registerContinuePlan,
   registerSaveWorkflow,
   registerStartWorkflow,
   registerStopWork,
@@ -365,6 +366,7 @@ import { SaveWorkflowDialog } from "@/components/composer/SaveWorkflowDialog";
 import { WorkflowDialog, type WorkflowRequest } from "@/components/composer/WorkflowDialog";
 import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import {
+  continuePlanMessage,
   offersSaveWorkflow,
   offersWorkflow,
   savedWorkflowMessage,
@@ -3208,6 +3210,12 @@ function ComposerImpl(
       taskActionRef.current(action, taskName),
     );
   }, [isReadOnly, composerSessionId]);
+  // The Tasks tab's play button asks the agent to pick a stopped plan back up.
+  const continuePlanRef = useRef<(planName: string | null) => void>(() => undefined);
+  useEffect(() => {
+    if (isReadOnly || composerSessionId === null) return;
+    return registerContinuePlan(composerSessionId, (planName) => continuePlanRef.current(planName));
+  }, [isReadOnly, composerSessionId]);
   // While the agent works, a running task's ⋯ menu can stop it, as Stop here does.
   const stopRef = useRef(onStop);
   stopRef.current = onStop;
@@ -4337,6 +4345,11 @@ function ComposerImpl(
     const reason = blockedReasonFor(`${action === "run" ? "run" : "continue"} the task`);
     if (reason) toast.error(reason);
     else sendWorkflowMessage(taskActionMessage(action, taskName));
+  };
+  continuePlanRef.current = (planName) => {
+    const reason = blockedReasonFor("continue the plan");
+    if (reason) toast.error(reason);
+    else sendWorkflowMessage(continuePlanMessage(planName));
   };
 
   const handleSubmit = (e: FormEvent) => {

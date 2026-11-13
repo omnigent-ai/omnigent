@@ -1,11 +1,17 @@
+import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { WorkflowIcon } from "lucide-react";
+import { toast } from "sonner";
 
 import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { Button } from "@/components/ui/button";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import type { StepProgress } from "@/lib/sessionJournal";
+import { interrupt, sendUserMessage } from "@/lib/sessionsApi";
 import { Link, useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { continuePlanMessage } from "@/lib/workflow";
+import { PlanRunButton, type PlanRunControl } from "@/shell/PlanRunButton";
 import { ProgressStrip } from "@/shell/TasksPanel";
 import { openTasksTab } from "@/store/sessionTasksActions";
 
@@ -34,6 +40,54 @@ export function RunTimeline({
         }}
       />
     </div>
+  );
+}
+
+/**
+ * A run's play or stop button, from a page other than its chat: stop
+ * interrupts the run's session, and play asks it to continue the plan. The
+ * lists that show the run refresh once the session takes it.
+ */
+export function RunPlanButton({
+  sessionId,
+  planName,
+  control,
+  refreshKeys,
+  className,
+}: {
+  sessionId: string;
+  /** The plan's name for the play message, e.g. the workflow's. */
+  planName: string | null;
+  control: PlanRunControl;
+  /** The queries that list the run, e.g. `["workflow-runs", workflowId]`. */
+  refreshKeys: readonly (readonly unknown[])[];
+  className?: string;
+}) {
+  const queryClient = useQueryClient();
+  const [pending, setPending] = useState(false);
+  const act = async () => {
+    setPending(true);
+    try {
+      if (control === "stop") {
+        await interrupt(sessionId);
+      } else {
+        const result = await sendUserMessage(sessionId, continuePlanMessage(planName));
+        if (result.denied) toast.error("A policy blocked the message.");
+      }
+      for (const queryKey of refreshKeys) void queryClient.invalidateQueries({ queryKey });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Couldn't reach the session.");
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <PlanRunButton
+      control={control}
+      disabled={pending}
+      className={cn("z-10", className)}
+      onClick={() => void act()}
+    />
   );
 }
 

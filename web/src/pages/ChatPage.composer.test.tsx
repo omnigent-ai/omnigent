@@ -6834,6 +6834,32 @@ describe("Composer workflow entry point", () => {
     error.mockRestore();
   });
 
+  it("continues the plan for the Tasks tab's play button, or says why it can't", () => {
+    setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
+    const onSend = vi.fn();
+    const error = vi.spyOn(toast, "error");
+    const { rerender } = renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+
+    const continuePlan = (planName: string | null) =>
+      act(() => useSessionTasksActions.getState().continuePlan.conv_test?.(planName));
+    continuePlan("Ship the fix");
+    expect(onSend).toHaveBeenLastCalledWith(
+      'Continue the plan "Ship the fix" from where you left off, and work through the tasks that are left.',
+    );
+
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ onSend, unreachable: true })} />
+      </TooltipProvider>,
+    );
+    continuePlan(null);
+    expect(error).toHaveBeenCalledWith(
+      "The session is offline. Reconnect it to continue the plan.",
+    );
+    expect(onSend).toHaveBeenCalledTimes(1);
+    error.mockRestore();
+  });
+
   it("lets the Tasks tab stop the agent only while it works", () => {
     setComposerState({ conversationId: "conv_test", sessionHarness: "openai-agents", skills: [] });
     const onStop = vi.fn();

@@ -22,7 +22,8 @@ import {
   type WorkflowSessionRequest,
   WorkflowSessionDialog,
 } from "@/components/workflows/WorkflowSessionDialog";
-import { RunGraphButton, RunTimeline } from "@/components/workflows/RunTasks";
+import { RunGraphButton, RunPlanButton, RunTimeline } from "@/components/workflows/RunTasks";
+import { planRunControl } from "@/shell/PlanRunButton";
 import {
   WorkflowGraphOverlay,
   WorkflowStepsGraph,
@@ -179,7 +180,13 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
         <>
           <ul className="flex flex-col gap-1" data-testid="workflow-runs">
             {runList.map((run) => (
-              <WorkflowRunRow key={run.id} run={run} now={now} workflowName={workflow.name} />
+              <WorkflowRunRow
+                key={run.id}
+                run={run}
+                now={now}
+                workflowId={workflowId}
+                workflowName={workflow.name}
+              />
             ))}
           </ul>
           {runs.hasNextPage && (
@@ -302,14 +309,20 @@ const RUN_GLYPHS: Record<WorkflowRunState["kind"], StepState> = {
 function WorkflowRunRow({
   run,
   now,
+  workflowId,
   workflowName,
 }: {
   run: WorkflowRun;
   now: Date;
+  workflowId: string;
   workflowName: string;
 }) {
   const state = describeWorkflowRun(run);
   const progress = useMemo(() => runStepProgress(run), [run]);
+  // Stop while the run's session works; play once it stopped with tasks left.
+  const control = run.archived
+    ? null
+    : planRunControl(progress, run.statuses, run.sessionStatus === "running");
   const [graphOpen, setGraphOpen] = useState(false);
   const sessionPath = `/c/${encodeURIComponent(run.sessionId)}`;
   const title = run.title || "Untitled session";
@@ -349,6 +362,15 @@ function WorkflowRunRow({
             <RunTimeline sessionId={run.sessionId} progress={progress} className="mt-3 pr-1" />
           )}
         </div>
+        {control && (
+          <RunPlanButton
+            sessionId={run.sessionId}
+            planName={workflowName}
+            control={control}
+            refreshKeys={[["workflow-runs", workflowId]]}
+            className="relative -my-1"
+          />
+        )}
         <RunGraphButton
           runName={title}
           className="relative -my-1"

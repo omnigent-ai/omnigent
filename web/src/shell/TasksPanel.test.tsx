@@ -16,6 +16,7 @@ import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import {
   openTasksTab,
+  registerContinuePlan,
   registerSaveWorkflow,
   registerStartWorkflow,
   registerStopWork,
@@ -455,6 +456,41 @@ describe("TasksPanel", () => {
       expect(stop).toHaveBeenCalledTimes(1);
     } finally {
       act(withdraw);
+    }
+  });
+
+  it("offers play in the header once the agent stopped with tasks left, and stop while it works", () => {
+    const named = journalPlan(0, ["baseline"], ["ship", ["baseline"]]);
+    named.payload.name = "Ship the fix";
+    showJournal([named, status(1, "baseline", "started")]);
+    setSession({ sessionStatus: "idle" });
+    // Without the composer's action, a viewer gets no play button.
+    renderPanel();
+    expect(screen.queryByTestId("plan-continue")).toBeNull();
+    cleanup();
+
+    const continuePlan = vi.fn();
+    const stop = vi.fn();
+    const withdrawContinue = registerContinuePlan("conv", continuePlan);
+    try {
+      renderPanel();
+      fireEvent.click(screen.getByTestId("plan-continue"));
+      expect(continuePlan).toHaveBeenCalledWith("Ship the fix");
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      cleanup();
+
+      setSession({ sessionStatus: "running" });
+      const withdrawStop = registerStopWork("conv", stop);
+      try {
+        renderPanel();
+        expect(screen.queryByTestId("plan-continue")).toBeNull();
+        fireEvent.click(screen.getByTestId("plan-stop"));
+        expect(stop).toHaveBeenCalledTimes(1);
+      } finally {
+        act(withdrawStop);
+      }
+    } finally {
+      act(withdrawContinue);
     }
   });
 

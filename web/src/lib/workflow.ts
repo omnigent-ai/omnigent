@@ -84,6 +84,18 @@ export function taskActionMessage(action: TaskAction, taskName: string): string 
 }
 
 /**
+ * The message a plan's play button sends once the agent stopped with tasks
+ * left: pick the plan back up and keep going, rather than do one task.
+ *
+ * @param planName The plan's name, e.g. `"Triage flaky tests"`, or null.
+ * @returns e.g. `Continue the plan "Triage flaky tests" from where you left off, and work through the tasks that are left.`
+ */
+export function continuePlanMessage(planName: string | null): string {
+  const plan = planName ? `the plan "${planName}"` : "the plan";
+  return `Continue ${plan} from where you left off, and work through the tasks that are left.`;
+}
+
+/**
  * The message that saves the session's plan as a workflow named *name*.
  *
  * @param skillPrefix The harness's skill prefix, `"/"` or `"$"` for Codex's own CLI.

@@ -1887,6 +1887,14 @@ export function stopSession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "stop_session", data: {} });
 }
 
+/** Send *text* to a session as a plain user message, e.g. from a page other than its chat. */
+export function sendUserMessage(sessionId: string, text: string): Promise<PostEventResponse> {
+  return postEvent(sessionId, {
+    type: "message",
+    data: { role: "user", content: [{ type: "input_text", text }] },
+  });
+}
+
 /** Reconnect or relaunch the existing runner without replaying user input. */
 export function retrySession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "retry_session", data: {} });
@@ -1904,18 +1912,7 @@ export function continueFailedTurn(sessionId: string): Promise<void> {
   const pending = failedTurnContinuations.get(sessionId);
   if (pending) return pending;
 
-  const retry = postEvent(sessionId, {
-    type: "message",
-    data: {
-      role: "user",
-      content: [
-        {
-          type: "input_text",
-          text: "Please continue from where you left off.",
-        },
-      ],
-    },
-  })
+  const retry = sendUserMessage(sessionId, "Please continue from where you left off.")
     .then((result) => {
       if (result.denied) throw new Error("The retry was blocked by a policy");
       if (!result.queued) throw new Error("The retry was not accepted");

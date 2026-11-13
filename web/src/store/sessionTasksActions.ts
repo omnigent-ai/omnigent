@@ -7,6 +7,8 @@ interface SessionTasksActionsState {
   startWorkflow: Readonly<Record<string, () => void>>;
   /** Per session: how its composer saves the plan as a workflow, given the plan's name. */
   saveWorkflow: Readonly<Partial<Record<string, (planName: string) => void>>>;
+  /** Per session: how its composer asks the agent to continue the plan, given its name. */
+  continuePlan: Readonly<Partial<Record<string, (planName: string | null) => void>>>;
   /** Per session: how its composer stops the agent, offered only while it works. */
   stopWork: Readonly<Partial<Record<string, () => void>>>;
   /** Per session: how its composer asks the agent to run or continue a task, given its name. */
@@ -21,7 +23,8 @@ interface SessionTasksActionsState {
 
 /**
  * Actions that cross surfaces for a session's tasks: the composer registers
- * how to start a workflow, save one, run or continue a task, and stop the agent,
+ * how to start a workflow, save one, run or continue a task, continue the plan
+ * and stop the agent,
  * so the Tasks tab can offer them, and the chat's task preview asks the shell to
  * open the Tasks tab.
  */
@@ -29,6 +32,7 @@ export const useSessionTasksActions = create<SessionTasksActionsState>(() => ({
   startWorkflow: {},
   saveWorkflow: {},
   taskAction: {},
+  continuePlan: {},
   stopWork: {},
   tasksTabToOpen: null,
   taskToShow: null,
@@ -69,6 +73,18 @@ export function registerTaskAction(
 }
 
 /**
+ * Offer a session's "continue the plan" action to its Tasks tab.
+ *
+ * @returns A function that withdraws the action, unless another took its place.
+ */
+export function registerContinuePlan(
+  conversationId: string,
+  continuePlan: (planName: string | null) => void,
+): () => void {
+  return registerSessionAction("continuePlan", conversationId, continuePlan);
+}
+
+/**
  * Offer a session's "stop the agent" action to its Tasks tab while the agent works.
  *
  * @returns A function that withdraws the action, unless another took its place.
@@ -77,7 +93,8 @@ export function registerStopWork(conversationId: string, stop: () => void): () =
   return registerSessionAction("stopWork", conversationId, stop);
 }
 
-type SessionActionKey = "startWorkflow" | "saveWorkflow" | "taskAction" | "stopWork";
+type SessionActionKey =
+  "startWorkflow" | "saveWorkflow" | "taskAction" | "continuePlan" | "stopWork";
 
 function registerSessionAction<Key extends SessionActionKey>(
   key: Key,

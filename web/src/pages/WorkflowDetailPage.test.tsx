@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -148,10 +149,13 @@ function mockRuns(runs: WorkflowRun[], state: Record<string, unknown> = {}) {
 const deleteWorkflow = vi.fn();
 
 function renderPage() {
+  // A run's play and stop buttons refresh the runs through the query client.
   return render(
-    <MemoryRouter>
-      <WorkflowDetailPage />
-    </MemoryRouter>,
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter>
+        <WorkflowDetailPage />
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 
@@ -231,6 +235,28 @@ describe("WorkflowDetailPage", () => {
     fireEvent.click(segments[1]!);
     expect(openTasksTab).toHaveBeenCalledWith(session, "fix");
     expect(navigate).toHaveBeenCalledWith(`/c/${session}`);
+  });
+
+  it("offers play on a run that stopped with tasks left, and stop on a running one", () => {
+    mockWorkflow({});
+    mockRuns([
+      run("a".repeat(32), "Stopped run", { done: 1 }, [status("explore", "done")]),
+      {
+        ...run("b".repeat(32), "Running run", { started: 1 }, [status("explore", "started")]),
+        sessionStatus: "running",
+      },
+      run("c".repeat(32), "Finished run", { done: 2 }, [
+        status("explore", "done"),
+        status("fix", "done"),
+      ]),
+    ]);
+    renderPage();
+
+    const [stopped, running, finished] = screen.getAllByTestId("workflow-run");
+    expect(within(stopped!).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
+    expect(within(running!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+    expect(within(finished!).queryByTestId("plan-continue")).toBeNull();
+    expect(within(finished!).queryByTestId("plan-stop")).toBeNull();
   });
 
   it("shows a run on the workflow's graph, where each task stands", () => {
