@@ -1119,6 +1119,7 @@ _LONG_PASTE_CONTENT = "\n".join(
 )
 _LONG_PASTE_TAIL = _LONG_PASTE_CONTENT.splitlines()[-1]
 _PASTE_COMPOSERS = {
+    "ordinary": f"> {_LONG_PASTE_CONTENT.splitlines()[0]}",
     "collapsed": "  [Pasted text #1 +18 lines]",
     "scrolled": f"> ↑ 17 more lines\n  {_LONG_PASTE_TAIL}",
     "wrapped-tail": f"> {_LONG_PASTE_TAIL[:14]}\n  {_LONG_PASTE_TAIL[14:]}",
@@ -1134,7 +1135,7 @@ def _paste_pane(composer: str, *, background_widget: bool, footer: str = "? for 
     return pane + "\n" + footer
 
 
-@pytest.mark.parametrize("draft_style", ["collapsed", "scrolled", "wrapped-tail"])
+@pytest.mark.parametrize("draft_style", list(_PASTE_COMPOSERS))
 @pytest.mark.parametrize("background_widget", [False, True])
 def test_draft_in_input_region_detects_hidden_and_wrapped_pastes(
     draft_style: str, background_widget: bool
@@ -1152,6 +1153,13 @@ def test_draft_in_input_region_detects_hidden_and_wrapped_pastes(
     assert not _mod._draft_in_input_region(empty, needles[0], baseline, extra_needles)
     if draft_style == "wrapped-tail":
         assert not _mod._draft_in_input_region(pane, needles[0], baseline)
+    elif draft_style == "ordinary":
+        assert _mod._draft_in_input_region(pane, needles[0], baseline)
+
+
+@pytest.mark.parametrize(("needle", "matches"), [("temperature", True), ("temperament", False)])
+def test_needle_matches_candidates_across_a_mid_word_wrap(needle: str, matches: bool) -> None:
+    assert _mod._needle_matches_candidates(needle, ["The tempe", "rature is stable"]) is matches
 
 
 @pytest.mark.parametrize(
@@ -2926,51 +2934,6 @@ def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
-
-
-def test_agy_input_region_with_background_task_widget() -> None:
-    """The composer is correctly isolated even when a background task widget sits below it."""
-    sep = "─" * 60
-    content = "1 tinka variantas A. atlik naudojant subagent"
-    pane = (
-        f"previous conversation history\n"
-        f"{sep}\n"
-        f"> {content}\n"
-        f"{sep}\n"
-        f"  ● [18:07:39] cd /workspace/project && uv run pytest tests/... running\n"
-        f"{sep}\n"
-        f"                                        Gemini 3.8 Flash · high · 1 task(s)"
-    )
-    extracted = _mod._agy_input_region(pane)
-    assert f"> {content}" in extracted
-    assert "pytest" not in extracted
-
-
-def test_draft_detected_when_background_task_running() -> None:
-    """Pasted draft is verified when a background task or command runs concurrently."""
-    sep = "─" * 60
-    content = "1 tinka variantas A. atlik naudojant subagent"
-    needle = _mod._submit_needle(content)
-    baseline_pane = (
-        f"previous conversation history\n"
-        f"{sep}\n"
-        f">\n"
-        f"{sep}\n"
-        f"  ● [18:07:39] pytest running\n"
-        f"{sep}\n"
-        f"                                        Gemini 3.8 Flash · high · 1 task(s)"
-    )
-    baseline = _mod._agy_input_region(baseline_pane)
-    draft_pane = (
-        f"previous conversation history\n"
-        f"{sep}\n"
-        f"> {content}\n"
-        f"{sep}\n"
-        f"  ● [18:07:39] pytest running\n"
-        f"{sep}\n"
-        f"                                        Gemini 3.8 Flash · high · 1 task(s)"
-    )
-    assert _mod._draft_in_input_region(draft_pane, needle, baseline)
 
 
 def test_submit_needles_for_long_single_paragraph() -> None:
